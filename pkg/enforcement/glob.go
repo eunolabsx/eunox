@@ -11,42 +11,28 @@ import (
 	"strings"
 )
 
-// errPathMalformedEscape and errPathNUL are the two fail-closed reasons
-// decodePathForConfinement can reject a value. They are distinguished (rather
-// than a single bool) because handleAllowedExtensions treats them differently: a
-// malformed '%' is a legal filename character for an upstream that does not
-// percent-decode, while an embedded NUL is a truncation vector that must always
-// deny.
+// errPathMalformedEscape and errPathNUL are distinguished, not a single bool, because
+// callers treat them differently: a malformed '%' is a legal filename character for a
+// non-decoding upstream, while an embedded NUL is a truncation vector that must always deny.
 var (
 	errPathMalformedEscape = errors.New("malformed percent-escape")
 	errPathNUL             = errors.New("embedded NUL byte")
 )
 
-// decodePathForConfinement folds a value to the form an upstream will resolve
-// before a path-confinement guard inspects its '/'-split segments: '\' folds to
-// '/', the value is percent-decoded once (%2f -> '/', %2e -> '.'), and a decoded
-// '\' is folded again. It returns a non-nil error (errPathMalformedEscape or
-// errPathNUL) for input callers MUST fail closed on rather than matching the
-// literal. An embedded NUL (literal or decoded %00) is rejected because a
+// decodePathForConfinement folds a value to the form an upstream will resolve before a
+// path-confinement guard inspects it: '\' folds to '/', percent-decoded once (%2f -> '/',
+// %2e -> '.'), then '\' folded again. Callers MUST fail closed on a non-nil error rather
+// than match the literal; an embedded NUL (literal or %00) is rejected because a
 // NUL-truncating upstream would resolve a different file than the guard inspects
-// (CWE-158/CWE-626). The single decode pass mirrors an upstream that decodes once,
-// so a doubly-encoded %252e stays %2e. Shared by MatchValueGlob and
-// handleAllowedExtensions so they normalize the same smuggling class in lock-step.
+// (CWE-158/CWE-626). Shared by MatchValueGlob and handleAllowedExtensions so both
+// normalize the same smuggling class in lock-step.
 //
-// errPathNUL wins over errPathMalformedEscape for BOTH spellings of NUL, not just
-// the literal byte: an encoded %00 riding alongside some OTHER malformed escape
-// ("evil.exe%00x%zz.csv") makes url.PathUnescape fail on the whole value, so
-// without this the lenient malformed-escape fallback a caller applies would match
-// the literal form and treat "%00" as three ordinary filename characters while a
-// NUL-truncating upstream opens "evil.exe". Deciding it here, once, means every
-// caller's malformed-escape branch inherits the precedence instead of re-deriving
-// it.
+// errPathNUL wins over errPathMalformedEscape even when the NUL is encoded alongside some
+// OTHER malformed escape (url.PathUnescape fails the whole value), so the lenient fallback
+// callers apply on a malformed escape never treats "%00" as literal characters.
 func decodePathForConfinement(value string) (string, error) {
 	folded := strings.ReplaceAll(value, "\\", "/")
-	// Reject an embedded NUL BEFORE decoding so a literal NUL fails closed
-	// regardless of escape validity: errPathNUL must win over
-	// errPathMalformedEscape, else the lenient malformed-escape branch in
-	// handleAllowedExtensions would match a NUL-bearing path literally.
+	// Check BEFORE decoding so a literal NUL fails closed regardless of escape validity.
 	if strings.IndexByte(folded, 0) >= 0 {
 		return "", errPathNUL
 	}
@@ -64,65 +50,45 @@ func decodePathForConfinement(value string) (string, error) {
 	return decoded, nil
 }
 
-// containsEncodedSeparator reports whether s contains a percent-encoded path
-// separator token (%2f for '/', %5c for '\'), case-insensitively. Two callers:
-// on the runtime fail-closed path when a VALUE cannot be fully percent-decoded (a
-// malformed escape elsewhere in it), so a valid encoded separator riding alongside
-// the bad escape is still caught rather than matched as literal bytes; and at load
-// on a PATTERN's literal text (via patternLiteralsOutsideClasses), where such a
-// token marks a silently dead grant. Sharing one token definition keeps the load
-// rejection and the runtime denial in lock-step.
+// containsEncodedSeparator reports whether s contains a percent-encoded path separator
+// token (%2f, %5c), case-insensitively. Shared by the runtime fail-closed path (a value
+// with an otherwise-malformed escape) and the load-time pattern check, so the two rejection
+// rules stay in lock-step.
 func containsEncodedSeparator(s string) bool {
 	lower := strings.ToLower(s)
 	return strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c")
 }
 
 // containsEncodedNUL reports whether s contains a percent-encoded NUL token (%00),
-// case-insensitively. decodePathForConfinement is its only caller: it can only
-// catch an encoded %00 by inspection AFTER a successful url.PathUnescape, so on the
-// failure arm (some OTHER malformed escape made the unescape fail whole) it uses
-// this to decide whether errPathNUL must still win over errPathMalformedEscape.
+// case-insensitively. decodePathForConfinement's only caller: it can only catch an
+// encoded %00 by inspection AFTER url.PathUnescape fails whole on some OTHER malformed
+// escape, to decide whether errPathNUL must still win over errPathMalformedEscape.
 //
-// That is the one token the confinement rules say must ALWAYS deny: a NUL-truncating
-// upstream (CWE-158/CWE-626) opens "evil.exe" while the guard inspected
-// "evil.exe%00x%zz.csv" and found a permitted ".csv" suffix.
-//
-// Deliberately NOT folded into containsEncodedSeparator despite the identical shape:
-// they answer different questions (a separator means "this value leaves the confined
-// subtree", a NUL means "the upstream will resolve a different path than this"), the
-// separator token is also checked at load against a PATTERN's literal text where NUL
-// has no equivalent meaning, and the denial messages differ.
+// Deliberately NOT folded into containsEncodedSeparator: they answer different questions
+// (leaves the confined subtree vs. resolves a different path), and the separator token is
+// also checked at load against a pattern's literal text where NUL has no such meaning.
 func containsEncodedNUL(s string) bool {
 	return strings.Contains(strings.ToLower(s), "%00")
 }
 
-// globClassPlaceholder stands in for an elided bracket class in
-// patternLiteralsOutsideClasses. It must be a byte that can never form part of an
-// encoded-separator token, so eliding a class cannot splice one into existence.
+// globClassPlaceholder stands in for an elided bracket class. It must be a byte that can
+// never form part of an encoded-separator token, so eliding a class cannot splice one
+// into existence.
 const globClassPlaceholder = '\x00'
 
 // scanPatternLiterals walks a glob pattern once and hands emit each byte path.Match
-// compares LITERALLY — bracket classes elided to a single placeholder, backslash escapes
+// compares LITERALLY — bracket classes elided to a placeholder, backslash escapes
 // resolved to the character they escape.
 //
-// It is the one definition of "what counts as a literal" in a glob pattern, driven by two
-// callers asking two different questions of the same walk: ValidateValueGlob asks whether
-// the literal text hides an encoded path separator, and confinePathStylePattern counts the
-// '/' that path.Match therefore requires. A second hand-mirrored scanChunk walk is exactly
-// how those two would drift apart — and the count enforces subtree confinement, so a drift
-// there is a security boundary moving.
+// One definition of "what counts as a literal", shared by two callers asking different
+// questions of the same walk (does the literal text hide an encoded separator; how many
+// '/' does path.Match require) so a second hand-mirrored walk cannot drift the security
+// boundary the '/' count enforces. The callback form avoids materializing a string for
+// the counter, which runs per pattern on every enforced call.
 //
-// The callback form is what lets them share the walk without sharing a rendering: the
-// counter accumulates an int with no allocation (it runs per path-style allowedValues
-// pattern on every enforced call), while the validator builds a string. Materializing a
-// string for the counter's benefit put a per-request allocation on the enforcement path
-// for a question that needs none.
-//
-// Mirrors path.Match's scanChunk: '[' opens a class and ']' closes an OPEN one (no
-// nesting) while a ']' with no class open is an ordinary literal, and a backslash-escaped
-// character is a single literal unit that neither opens nor closes one. The scan is
-// deliberately literal-only: a token split by a wildcard ("%2*f") still loads, matching
-// the fail-closed direction — this rejects unmatchable grants, it is not a security
+// Mirrors path.Match's scanChunk: '[' opens a class, ']' closes an OPEN one (no nesting;
+// unopened is an ordinary literal), a backslash-escaped character is one literal unit. A
+// token split by a wildcard ("%2*f") still loads — fail-closed direction, not a security
 // boundary.
 func scanPatternLiterals(pattern string, emit func(byte)) {
 	inClass := false
@@ -139,11 +105,9 @@ func scanPatternLiterals(pattern string, emit func(byte)) {
 			}
 			inClass = true
 		case pattern[i] == ']':
-			// A ']' only closes a class that is actually open. With no open '[' it is an
-			// ordinary literal in path.Match's grammar, so it must be EMITTED, not dropped:
-			// swallowing it splices its neighbours together, and two bytes that were never
-			// adjacent in the pattern can then read as an encoded separator ("a%2]f" would
-			// render "a%2f"), rejecting a valid, matchable grant at load.
+			// Unopened ']' is an ordinary literal and must be EMITTED, not dropped:
+			// swallowing it could splice non-adjacent bytes into a false encoded separator
+			// ("a%2]f" -> "a%2f"), rejecting a valid grant at load.
 			if !inClass {
 				emit(pattern[i])
 				break
@@ -157,11 +121,9 @@ func scanPatternLiterals(pattern string, emit func(byte)) {
 	}
 }
 
-// patternLiteralsOutsideClasses renders a glob pattern with every bracket class replaced
-// by a single placeholder, leaving only the characters path.Match compares literally. A
-// '%', '2' or 'f' written INSIDE a class ("[a%2f]") is a class MEMBER — the class consumes
-// one value character — so such a pattern is a live grant and must not be read as an
-// encoded separator. See scanPatternLiterals for the walk.
+// patternLiteralsOutsideClasses renders a glob pattern with bracket classes replaced by a
+// placeholder, leaving only what path.Match compares literally — so "[a%2f]" (a class
+// MEMBER, consuming one value character) is not misread as an encoded separator.
 func patternLiteralsOutsideClasses(pattern string) string {
 	var b strings.Builder
 	b.Grow(len(pattern))
@@ -169,9 +131,8 @@ func patternLiteralsOutsideClasses(pattern string) string {
 	return b.String()
 }
 
-// countPatternPathSeparators counts the '/' characters scanPatternLiterals emits — the
-// separators path.Match treats as required. Allocation-free: it drives the shared walk
-// with a counter rather than materializing the rendered string.
+// countPatternPathSeparators counts the '/' path.Match treats as required, allocation-free
+// by driving the shared walk with a counter instead of materializing the rendered string.
 func countPatternPathSeparators(pattern string) int {
 	n := 0
 	scanPatternLiterals(pattern, func(b byte) {
@@ -182,48 +143,35 @@ func countPatternPathSeparators(pattern string) int {
 	return n
 }
 
-// maxGlobSegments caps the '/'-separated segment count a "**" pattern matches, so
-// an attacker-supplied value's slash count cannot drive an unbounded O(m*n)
-// allocation in matchGlobSegments. 1000 is far above any legitimate path/URI
-// depth; an oversized value fails closed.
+// maxGlobSegments caps the segment count a "**" pattern matches, so an attacker-supplied
+// value's slash count cannot drive an unbounded O(m*n) allocation in matchGlobSegments.
 const maxGlobSegments = 1000
 
-// ValidateValueGlob reports whether pattern is a well-formed allowedValues glob,
-// using the SAME structural decomposition MatchValueGlob applies at runtime so the
-// two cannot disagree. A whole-string path.Match would diverge for a "**"-bearing
-// pattern whose bracket class spans a "/" (e.g. "[a/b]/**"): it parses as one valid
-// class but yields an ErrBadPattern segment at runtime, loading clean yet matching
-// nothing (a silently dead, deny-all policy). Returns path.ErrBadPattern for a
-// malformed pattern, nil otherwise.
+// ValidateValueGlob reports whether pattern is a well-formed allowedValues glob, using the
+// SAME structural decomposition MatchValueGlob applies at runtime so the two cannot
+// disagree (a whole-string path.Match would load a "**" pattern whose bracket class spans
+// a "/" as valid, then silently match nothing at runtime). Returns path.ErrBadPattern for
+// a malformed pattern, nil otherwise.
 func ValidateValueGlob(pattern string) error {
 	// Whole-pattern wildcards match anything and are never path.Match'd at runtime.
 	if pattern == "*" || pattern == "**" {
 		return nil
 	}
-	// A pattern carrying an ENCODED path separator (%2f, %5c) in its LITERAL text is a
-	// silently dead grant: the runtime confinement decodes a candidate value's separators
-	// and denies any that decode to contain one, so the only value such a pattern could
-	// match is itself denied. Reject it at load (like the "."/".." segments below) so the
-	// operator sees the mistake instead of a rule that matches nothing. Write a literal
-	// '/' for a separator. Bracket classes are elided first: "[a%2f]" spells a class whose
-	// members include '%', '2' and 'f', and it matches those values at runtime.
+	// A pattern with an ENCODED separator in its LITERAL text is a silently dead grant:
+	// the runtime confinement denies any value that decodes to contain one. Reject it at
+	// load instead. Bracket classes are elided first, so "[a%2f]" (a class member, not a
+	// separator) is unaffected.
 	if containsEncodedSeparator(patternLiteralsOutsideClasses(pattern)) {
 		return fmt.Errorf("%w: pattern contains an encoded path separator (%%2f/%%5c); the runtime confinement denies any value that decodes to a separator, so the grant would match nothing", path.ErrBadPattern)
 	}
-	// A "**" pattern with more '/'-separated segments than the runtime cap is likewise a
-	// dead grant: matchGlobSegments refuses to match beyond maxGlobSegments. Segment
-	// count is one more than the '/' count, so "count >= cap" is "segments > cap". (A
-	// non-"**" pattern is matched whole by path.Match with no cap, so it is unaffected.)
-	// Reject it at load rather than let it silently match nothing.
+	// A "**" pattern with more segments than matchGlobSegments' runtime cap is likewise a
+	// dead grant (segment count is one more than the '/' count); reject it at load.
 	if strings.Contains(pattern, "**") && strings.Count(pattern, "/") >= maxGlobSegments {
 		return fmt.Errorf("%w: pattern has more than %d path segments, exceeding the runtime match cap; the grant would match nothing", path.ErrBadPattern, maxGlobSegments)
 	}
-	// A pattern segment that is exactly "."/".." can never match: the runtime
-	// confinement scan rejects any value whose corresponding segment decodes to one
-	// first, so the pattern loads clean but is a silently dead, deny-all grant.
-	// Applied to a slashless pattern too — it is a single segment, and
-	// confineSlashlessPattern rejects a "."/".." value the same way the path-style
-	// branch does — so load-time rejection and runtime denial stay in lock-step.
+	// A segment that is exactly "."/".." can never match, since the runtime confinement
+	// scan rejects it first; a silently dead grant otherwise. Applies to a slashless
+	// pattern too (confineSlashlessPattern rejects it the same way).
 	for _, seg := range strings.Split(pattern, "/") {
 		if seg == "." || seg == ".." {
 			return fmt.Errorf("%w: pattern contains an unmatchable %q segment", path.ErrBadPattern, seg)
@@ -248,14 +196,10 @@ func ValidateValueGlob(pattern string) error {
 }
 
 // confinePathStylePattern applies subtree confinement to a path-style ("/"-bearing)
-// allowedValues pattern. It decodes every separator/dot alias an upstream resolves
-// ('\' separators and percent-encoding) before a "."/".." scan, so a value like
-// "/reports/..%2f..%2fetc%2fpasswd" cannot smuggle a traversal past the guard (a
-// malformed escape fails closed). It returns the backslash-folded value (so a
-// '\'-style value still matches a '/'-style pattern; percent-decoding stays scoped
-// to the confinement scan so a legitimately percent-encoded value matches its
-// pattern literally), the per-segment separator-spanning flags for a "**" pattern
-// (nil otherwise, for matchGlobSegments), and ok=false when the value must be denied.
+// allowedValues pattern. It decodes every separator/dot alias an upstream resolves before
+// a "."/".." scan, so a value like "/reports/..%2f..%2fetc%2fpasswd" cannot smuggle a
+// traversal past the guard. Returns the backslash-folded value, the per-segment
+// separator-spanning flags for a "**" pattern (nil otherwise), and ok=false to deny.
 func confinePathStylePattern(pattern, value string) (folded string, valSpansSep []bool, ok bool) {
 	scan, err := decodePathForConfinement(value)
 	if err != nil {
@@ -267,27 +211,19 @@ func confinePathStylePattern(pattern, value string) (folded string, valSpansSep 
 		}
 	}
 	folded = strings.ReplaceAll(value, "\\", "/")
-	// An encoded separator (%2f, or %5c folded to '/') would let a single-segment
-	// element ('*', '?', '[…]') span a '/' the operator scoped to one segment. The
-	// proxy cannot know whether the upstream decodes it, so fail closed. A non-"**"
-	// pattern confines every segment, so one total-'/'-count comparison rejects an
-	// encoded separator anywhere; a "**" pattern is mixed (a "**" segment may span
-	// separators, a co-occurring single-'*' may not), so flag each separator-spanning
-	// value segment for matchGlobSegments instead.
+	// An encoded separator would let a single-segment element span a '/' the operator
+	// scoped to one segment; fail closed since the proxy cannot know if the upstream
+	// decodes it. A non-"**" pattern confines every segment via one total-count
+	// comparison; a "**" pattern is mixed, so flag each spanning segment instead.
 	if !strings.Contains(pattern, "**") {
 		valueSlashes := strings.Count(folded, "/")
 		if strings.Count(scan, "/") != valueSlashes {
 			return folded, nil, false
 		}
-		// Pattern and value must ALSO agree on segment count: without this, a class
-		// that does not exclude '/' (e.g. "[^z]") matches a literal '/' already in the
-		// value via path.Match's whole-value fast path, letting one class element span
-		// TWO value segments the pattern's literal text scoped to one. Count only
-		// pattern-side '/' that path.Match treats as a required separator: a '/' inside a
-		// bracket class is a class MEMBER (the class consumes exactly one value
-		// character, which may or may not be '/'), and an escaped '\/' outside one is a
-		// literal separator. countPatternPathSeparators drives the SAME scan the
-		// load-time encoded-separator check uses, so the two cannot drift.
+		// Pattern and value must ALSO agree on segment count: without this, a class that
+		// does not exclude '/' (e.g. "[^z]") could span TWO value segments via path.Match's
+		// whole-value fast path. countPatternPathSeparators counts only '/' outside a
+		// bracket class, the same scan the load-time check uses.
 		if countPatternPathSeparators(pattern) != valueSlashes {
 			return folded, nil, false
 		}
@@ -307,43 +243,23 @@ func confinePathStylePattern(pattern, value string) (folded string, valSpansSep 
 	return folded, valSpansSep, true
 }
 
-// confineSlashlessPattern reports whether a value is safe to match against a
-// slashless single-segment pattern ('*.csv', 'file-?', '[abc].log', ...).
-// A slashless pattern is by definition a single-segment grant, so no legitimate
-// match can contain a '/': path.Match's '*' and '?' never cross '/', and a
-// character class that DOES match one ('[^0-9]', '[^z]', a range straddling
-// 0x2f like '[.-9]') is precisely the segment-confinement bypass this guards —
-// Go's path.Match applies no '/'-exclusion inside '[…]', so a class consumes a
-// literal '/' like any other rune. Comparing against the raw '/' count (as the
-// path-style branch can, because '**' segments legitimately span separators)
-// would admit such a value; a slashless pattern has no legitimate '/' at all, so
-// forbid it outright after decoding. This also confines an encoded separator
-// (%2f, %5c) or a literal '\' that a lenient upstream would resolve into a
-// subpath ("..%2f..%2fetc%2f..."), the same traversal the slash-bearing branch
-// confines. An embedded NUL always fails closed; a merely malformed '%' is a legal
-// filename char for a non-decoding upstream, so it folds only '\' and matches the
-// literal form — but still denies when a VALID encoded separator rides alongside the
-// bad escape ("..%2f..%2fetc%zz"), which a lenient upstream would resolve. (An
-// encoded NUL riding alongside a bad escape is caught inside decodePathForConfinement
-// itself, which returns errPathNUL for that case, so this fallback need not re-check
-// it.)
+// confineSlashlessPattern reports whether a value is safe to match against a slashless
+// single-segment pattern ('*.csv', 'file-?', ...). A slashless pattern is a single-segment
+// grant, so any '/' is illegitimate — including one matched via a class Go's path.Match
+// does not exclude '/' from (e.g. '[^z]') — so any '/' at all denies, after decoding an
+// encoded separator or '\' a lenient upstream would resolve into a subpath.
 //
-// A bare "."/".." is denied for the same reason confinePathStylePattern denies it
-// segment-by-segment: it names the tool's working directory or its PARENT, so a
-// slashless grant an operator wrote to scope one segment (e.g. ".*" for dotfiles
-// like ".env", or "??") would otherwise also admit the traversal value "..", which
-// the upstream resolves outside the intended directory. The '/'-count guard alone
-// does not catch it — ".." carries no separator — so the dot check must be explicit.
+// A bare "."/".." is also denied (names the tool's working directory or its parent): the
+// '/'-count guard alone would not catch it, since ".." carries no separator.
 func confineSlashlessPattern(value string) bool {
 	scan, err := decodePathForConfinement(value)
 	if errors.Is(err, errPathNUL) {
 		return false
 	}
 	if errors.Is(err, errPathMalformedEscape) {
-		// A valid encoded separator riding alongside the bad escape is still caught
-		// here: url.PathUnescape failed on the whole value, so the token was never
-		// decoded, and matching the literal form would treat "%2f" as an ordinary
-		// filename character while a lenient upstream resolves it as a separator.
+		// A valid encoded separator riding alongside the bad escape must still deny:
+		// url.PathUnescape failed whole, so matching the literal form would treat "%2f"
+		// as an ordinary character while a lenient upstream resolves it as a separator.
 		if containsEncodedSeparator(value) {
 			return false
 		}
@@ -379,19 +295,13 @@ func MatchValueGlob(pattern, value string) bool {
 		return true
 	}
 	// valSpansSep[j] flags a value segment that decodes to span a '/' (an encoded
-	// separator such as %2f). Populated only for a path-style "**" pattern and
-	// consumed by matchGlobSegments, which forbids a single-segment pattern element
-	// from matching such a value while still letting a "**" segment absorb it. Nil
-	// otherwise (the non-"**" path uses the total-count guard below).
+	// separator), consumed by matchGlobSegments to forbid a single-segment pattern
+	// element from matching it while still letting a "**" segment absorb it.
 	var valSpansSep []bool
-	// Path-confinement: a path-style pattern (contains '/') confines a value to a
-	// subtree (e.g. "/reports/**"), while a slashless pattern is a single-segment
-	// grant; both reject a value that traverses or smuggles a separator out of scope.
-	// The two branches are extracted into confine* helpers to keep MatchValueGlob flat.
+	// A path-style pattern confines a value to a subtree; a slashless pattern is a
+	// single-segment grant. Both reject a value that traverses or smuggles a separator.
 	if strings.Contains(pattern, "/") {
 		var ok bool
-		// The path-style branch folds '\' into value and, for a "**" pattern, computes
-		// the per-segment separator flags, so it returns both back for use below.
 		value, valSpansSep, ok = confinePathStylePattern(pattern, value)
 		if !ok {
 			return false
@@ -417,26 +327,18 @@ func MatchValueGlob(pattern, value string) bool {
 	return matchGlobSegments(strings.Split(pattern, "/"), strings.Split(value, "/"), valSpansSep)
 }
 
-// matchGlobSegments matches '/'-split pattern segments against '/'-split value
-// segments. A literal "**" segment matches zero or more value segments; every
-// other segment matches exactly one value segment via path.Match.
+// matchGlobSegments matches '/'-split pattern segments against '/'-split value segments. A
+// literal "**" matches zero or more value segments; every other segment matches exactly
+// one via path.Match. valSpansSep, when non-nil, flags a value segment as consumable only
+// by a "**" segment, so a co-occurring single '*' cannot be widened past its scope.
 //
-// valSpansSep, when non-nil, is index-aligned with val and flags value segments
-// that decode to span a '/' (an encoded separator). Such a segment may be consumed
-// only by a "**" segment, so a single '*' co-occurring with "**" cannot be widened
-// past the one segment the operator scoped. Nil when no per-segment confinement
-// applies.
-//
-// It runs as a bottom-up DP over suffixes: dp[i][j] reports whether pat[i:] matches
-// val[j:]. A "**" segment matches zero segments (dp[i+1][j]) or consumes one and
-// stays (dp[i][j+1]); any other advances both via path.Match. O(len(pat)*len(val))
-// time and space, removing the O(n^k) backtracking the recursive matcher had for k
-// non-adjacent "**" groups — a value-driven DoS since n is attacker-influenced.
+// Runs as a bottom-up DP over suffixes (dp[i][j] == pat[i:] matches val[j:]),
+// O(len(pat)*len(val)) time/space — removing the O(n^k) backtracking the recursive matcher
+// had for k non-adjacent "**" groups, a value-driven DoS since n is attacker-influenced.
 func matchGlobSegments(pat, val []string, valSpansSep []bool) bool {
 	m, n := len(pat), len(val)
-	// n is caller/attacker controlled, so cap it (and m) at maxGlobSegments — far
-	// above any legitimate depth — before the (m+1)*(n+1) DP allocation. Documented
-	// as a hard limit in docs/capability-manifest-guide.md.
+	// n is caller/attacker controlled, so cap it (and m) before the (m+1)*(n+1) DP
+	// allocation. Documented as a hard limit in docs/capability-manifest-guide.md.
 	if n > maxGlobSegments || m > maxGlobSegments {
 		return false
 	}
@@ -456,10 +358,8 @@ func matchGlobSegments(pat, val []string, valSpansSep []bool) bool {
 			}
 			continue
 		}
-		// A non-"**" segment must match exactly one value segment -- and one that
-		// does not itself decode to span a '/', so a single-segment element never
-		// absorbs an encoded separator the operator scoped out (a "**" segment,
-		// handled above, still may).
+		// A non-"**" segment must not itself match a separator-spanning value segment
+		// (a "**" segment, handled above, still may).
 		for j := n - 1; j >= 0; j-- {
 			if len(valSpansSep) > j && valSpansSep[j] {
 				continue // leaves dp[i][j] false: a single segment cannot match a separator-spanning value

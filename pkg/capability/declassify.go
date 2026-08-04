@@ -31,33 +31,22 @@ const MaxDeclassifyApprovals = 32
 
 // DeclassifyDirective clears the named native flow Labels from the session's accumulated
 // set on an ALLOWED call — but only when the request carries a human approval covering
-// them. It is the declassification path: policy states WHERE a label may be dropped,
-// and an approval states that a human agreed to drop it HERE.
+// them. Policy states WHERE a label may be dropped; an approval states that a human
+// agreed to drop it HERE.
 //
-// It is the mirror of labelOutput and the only fail-OPEN direction in the flow layer.
-// labelOutput adds taint, and adding taint can only ever produce more denials; clearing
-// it can only ever produce more allows. That asymmetry is why declassify is not simply
-// "labelOutput with a minus sign":
+// It is the only fail-OPEN direction in the flow layer, unlike labelOutput (which can
+// only add denials), so three things keep it from being "labelOutput with a minus sign":
 //
-//   - An unapproved call carrying this directive is NOT allowed-without-declassifying.
-//     Forwarding it while silently leaving the labels in place would let an author write
-//     a declassification the proxy never performs, and the next sink would deny for a
-//     reason the policy says should not apply — a policy that reads as broken rather than
-//     as enforced. It escalates instead (ESCALATION_REQUIRED), which is the fail-closed
-//     reading of "a human has not approved this yet".
-//   - The escalation is a HARD refusal with AuditOnly unset, exactly as the effect
-//     ceiling's is: a route running --audit downgrades a policy verdict being staged, and
-//     "no human has approved dropping this label" is not a verdict being staged. The one
-//     downgrade that would defeat the control entirely is the one that must not exist.
-//   - An approval must cover EVERY label named here. A partial grant escalates rather
-//     than clearing the covered subset: the directive is what the policy says must be
-//     cleared for the call to make sense, and half-clearing it leaves the operator
-//     believing a label is gone while a later sink still sees it.
+//   - An unapproved call escalates (ESCALATION_REQUIRED) rather than forwarding with the
+//     labels silently left in place — the fail-closed reading of "no human has approved
+//     this yet".
+//   - The escalation is a HARD refusal (AuditOnly unset): --audit never downgrades it,
+//     since "no human approved this" is not a verdict being staged.
+//   - An approval must cover EVERY label named here; a partial grant escalates rather
+//     than clearing the covered subset, so an operator can't believe a label is gone
+//     while a later sink still sees it.
 //
 // Labels are drawn from the closed native vocabulary; an unknown one is a load error.
-// The directive carries no response obligation — like labelOutput, its effect is the
-// engine's per-session state write — so it is valid on any target a declassification can
-// sit at.
 type DeclassifyDirective struct {
 	Labels []string `json:"labels"`
 }
@@ -169,31 +158,19 @@ type DeclassifyApproval struct {
 	// protection as the other two. Absent is fine; empty and absent are the same — EXCEPT
 	// under Once, where it is the ledger's key and therefore mandatory.
 	ID string `json:"id,omitempty"`
-	// Once marks the grant SINGLE-USE: the proxy burns it in the declassify
-	// ledger on the first call that clears a label with it, and every later presentation
-	// escalates ("approval_consumed") instead of clearing again. It is the mechanism behind
-	// "approve clearing this once", which is what an approval workflow almost always means
-	// and what a scope-only grant cannot express.
+	// Once marks the grant SINGLE-USE: burned in the declassify ledger on the first call
+	// that clears a label with it, and every later presentation escalates
+	// ("approval_consumed") instead of clearing again.
 	//
-	// The burn is keyed by ID, not by the grant's content: two approvals that happen to name
-	// the same labels, target, and approver are two separate human decisions, and a content
-	// key would let the first one spend the second. That is why Validate makes ID mandatory
-	// here — a single-use grant with nothing to burn is not enforceable as written, so it is
-	// refused at the token boundary rather than silently degrading to a standing one.
-	//
-	// The ledger lives in the CallCounter, and it is deliberately NOT anchored: the burn is a
-	// property of the approval itself, not of the session or task that spent it. Anchoring it
-	// would leave the replay the flag exists to close — re-entering through a fresh session (or
-	// a fresh task_id, which the caller supplies) gives a fresh ledger and the grant is live
-	// again. It is also written through the counter's atomic admission rather than a
-	// read-then-write on the label store, so two concurrent calls cannot both observe the grant
-	// unspent and both clear.
-	//
-	// The entry is retained for a bounded window (DeclassifyLedgerWindowSec) rather than
-	// forever, because a counter backend has no unbounded key space to spend. The window is
-	// not left as a residual on the guarantee: a token whose remaining lifetime exceeds it is
-	// REFUSED at the boundary (CheckDeclassifyApprovalLifetime), so a grant this proxy admits
-	// can never outlive the memory of its own burn.
+	// Burned by ID, not by content — two approvals naming the same labels/target/approver
+	// are two separate human decisions, and a content key would let the first spend the
+	// second, which is why Validate makes ID mandatory here. The ledger is deliberately
+	// NOT anchored to session/task, since anchoring it would let a fresh session or
+	// task_id reopen the grant; it commits through the counter's atomic admission so two
+	// concurrent calls can't both spend it. The entry is retained only for
+	// DeclassifyLedgerWindowSec (a counter backend has no unbounded key space), and
+	// CheckDeclassifyApprovalLifetime refuses a token whose remaining lifetime would
+	// outlive that window.
 	Once bool `json:"once,omitempty"`
 }
 
@@ -287,52 +264,26 @@ func (a *DeclassifyApproval) LedgerID() string {
 
 // DeclassifyLedgerWindowSec is how long a burned single-use approval is remembered.
 //
-// It is a property of the GRANT, not of the counter that stores the burn, which is why it
-// lives here beside the claim rather than in the engine that writes it. Two layers read it
-// and they must not disagree: the engine sizes the ledger bucket's window with it, and the
-// token boundary refuses a `once` grant whose token would outlive it (see
-// CheckDeclassifyApprovalLifetime). That pairing is what makes "once" unconditional — the
-// burn is written no earlier than the moment the token is presented, so a window this long
-// always outlives a token admitted under the bound.
-//
-// Seven days is chosen against what the burn has to outlive: the TOKEN carrying the grant.
-// Longer is not simply better — the retention is also what bounds the ledger's storage in a
-// backend an operator shares across instances — so the answer is to hold tokens inside the
-// window rather than to keep burns for ever.
+// A property of the GRANT, not the counter, because two layers must not disagree on it:
+// the engine sizes the ledger bucket's window with it, and CheckDeclassifyApprovalLifetime
+// refuses a `once` grant whose token would outlive it — that pairing is what makes "once"
+// unconditional. Seven days bounds it against the TOKEN's lifetime; longer would also grow
+// the ledger's storage in a shared backend without bound.
 const DeclassifyLedgerWindowSec = 7 * 86400
 
 // CheckDeclassifyApprovalLifetime refuses a single-use grant riding a token that would
 // outlive the ledger's memory of the burn.
 //
-// The ledger is a sliding window (DeclassifyLedgerWindowSec), so a burn is forgotten
-// eventually. Without this bound that made `once` a promise with an expiry date attached: a
-// control plane mints a 30-day token carrying `{"once": true}`, the agent spends the grant
-// on day 1, and on day 9 the ledger read comes back empty and the same grant clears a label
-// a second time. The operator believes one human approved one declassification; two
-// happened.
+// Without this bound, `once` is a promise with an expiry date: a 30-day token spends its
+// grant on day 1, the ledger forgets the burn by day 9 (the window is shorter), and the
+// same grant clears the label again — one human approval reads as two. Refusing the TOKEN
+// keeps the guarantee unconditional rather than merely wide, and surfaces the problem at
+// mint time instead of leaving a silent residual.
 //
-// Refusing the TOKEN is the fail-closed reading, and it is the one that keeps the guarantee
-// unconditional rather than merely wide. The alternatives were worse in both directions:
-// lengthening the window trades a narrower replay for unbounded growth in a shared backend,
-// and silently offering a weaker guarantee than the field advertises leaves the operator
-// with no way to discover it. This converts a silent residual into a startup-visible one —
-// the IdP is told, in the token's own terms, to shorten the token or drop `once`.
-//
-// The check is deliberately about REMAINING lifetime rather than total: what has to be
-// outlived is the interval from the moment of the burn (no earlier than now, since the token
-// is being presented) to exp. leeway is the clock-skew grace the same validation applied to
-// exp, added to the remaining lifetime so a token accepted at the edge of that grace is
-// still inside the window.
-//
-// An UNSET exp — the zero Time — is refused for the same reason a token with no exp is: an
-// unbounded lifetime cannot be inside any window. Callers must encode "not established" as
-// the zero Time and not as an epoch instant: time.Unix(0, 0) is a real 1970 timestamp, so
-// it is not IsZero and would read here as a lifetime decades in the past, i.e. comfortably
-// inside the window. That is the fail-OPEN direction on the one property this function
-// exists to guarantee.
-//
-// Standing grants (Once unset) are unaffected — they are replayable for the token's lifetime
-// by design, which is the property the field's own doc states.
+// Checks REMAINING lifetime (exp minus now, plus clock-skew leeway), not total. An UNSET
+// exp is refused rather than treated as unbounded-but-fine: callers must encode "not
+// established" as the zero Time, since time.Unix(0,0) is a real (and fail-open) timestamp
+// that would read as decades in the past. Standing grants (Once unset) are unaffected.
 func CheckDeclassifyApprovalLifetime(approvals []DeclassifyApproval, exp, now time.Time, leeway time.Duration) error {
 	window := time.Duration(DeclassifyLedgerWindowSec) * time.Second
 	for i := range approvals {
@@ -418,15 +369,8 @@ func CoveringDeclassifyApprovals(approvals []DeclassifyApproval, target string, 
 	return out
 }
 
-// There is deliberately no first-covering-grant accessor beside CoveringDeclassifyApprovals.
-// One existed, answering SCOPE alone, and the wrapping-PDP hardening path called it and was
-// wrong to: a single-use grant already burned covers a call on paper, so the scope-only answer
-// read as authorization and left a downgradable refusal in place where the engine hard-escalates.
-// Whether a grant is still LIVE is a question only the engine can answer (the ledger is engine
-// state), so the two callable shapes are the full list — for a caller that will test liveness
-// itself — and enforcement.Engine.DeclassifyVerdictFor, which answers the WHOLE question
-// (resolve the target, select a live grant, build the refusal) rather than handing back a
-// boolean the caller then has to dress. A narrower liveness predicate existed and was removed:
-// answering only the boolean is what left the target resolution and the refusal shape to the
-// call site, which is where they diverged. Re-adding it puts the same footgun back within
-// reach of exactly the code that already picked it up.
+// There is deliberately no first-covering-grant accessor beside CoveringDeclassifyApprovals:
+// a single-use grant already burned covers a call on paper but is not LIVE, and liveness is
+// only answerable by the engine (the ledger is engine state) via
+// enforcement.Engine.DeclassifyVerdictFor. A scope-only accessor existed and was misused by
+// a caller that read it as authorization — do not re-add one.

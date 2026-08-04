@@ -1,12 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Package drift holds the startup manifest-drift-comparison policy — FM-1
-// through FM-6.
+// Package drift holds the startup manifest-drift-comparison policy — FM-1 through FM-6.
 //
-// After the MCP initialize handshake the proxy fetches tools/list from the
-// upstream and compares the live tool set against the capability manifest.
-// These failure modes are detected:
+// After the MCP initialize handshake the proxy fetches tools/list from the upstream and
+// compares the live tool set against the capability manifest. These failure modes are detected:
 //
 //	FM-1  A new upstream tool is matched by a manifest glob — silent over-permission.
 //	FM-2  A manifest resource entry matches no live upstream tool — dead reference.
@@ -15,19 +13,14 @@
 //	FM-5  A live tool's description or parameter descriptions do not match the manifest's descriptionHash pin.
 //	FM-6  The live inputSchema diverges structurally from a constraint's argumentSchema (added-under-closed-schema or retyped parameter).
 //
-// In non-strict mode findings are emitted as structured log lines to stderr and
-// the session continues — EXCEPT FM-5 (description-hash mismatch) and Fm2Pinned (a
-// description-pinned tool absent from the live list), which both abort startup
-// UNCONDITIONALLY (see hasCriticalDrift). With --strict-drift, FM-1, FM-2, FM-4,
-// and FM-6 findings (IsFatal) also abort session establishment. FM-3 and
-// "uncovered" are always advisory.
+// In non-strict mode findings are logged to stderr and the session continues — EXCEPT FM-5 and
+// Fm2Pinned, which both abort startup UNCONDITIONALLY (see hasCriticalDrift). With
+// --strict-drift, FM-1, FM-2, FM-4, and FM-6 (IsFatal) also abort. FM-3 and "uncovered" are
+// always advisory.
 //
-// The comparison is pure (no I/O beyond the stderr log emission). It is shared
-// by two consumers: the transport runtime drives it through the injected
-// CheckFunc hook at session start (MakeDriftCheck), and `validate --live`
-// renders the same findings as an operator report. The package depends only on
-// internal/{config,mcp,pdp} + pkg/{capability,enforcement} + stdlib — never on
-// internal/transport (which imports it), so there is no cycle.
+// The comparison is pure. Shared by two consumers: the transport runtime drives it through
+// the injected CheckFunc hook at session start (MakeDriftCheck), and `validate --live` renders
+// the same findings as an operator report.
 
 package drift
 
@@ -45,24 +38,21 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
-// CheckFunc is the manifest-drift comparison injected into a transport, so the
-// runtime can run the session-start drift check without referencing the policy
-// logic. The transport probes the upstream tool list (it owns the connection) and
-// hands the raw result, server version, and any probe error to the hook, which
-// parses, compares against the manifest, and returns a non-nil error when startup
-// must abort. A nil CheckFunc means no drift checking.
+// CheckFunc is the manifest-drift comparison injected into a transport, so the runtime can
+// run the session-start drift check without referencing the policy logic. The transport
+// probes the upstream tool list and hands the raw result, server version, and any probe error
+// to the hook, which returns a non-nil error when startup must abort. A nil CheckFunc means no
+// drift checking.
 type CheckFunc func(rawToolsListResult json.RawMessage, serverVersion string, probeErr error) error
 
-// matchResource reports whether the resource pattern (its namespace prefix
-// stripped) matches the bare target name. Delegates to
-// enforcement.MatchesResource so the matching semantics live in one place.
+// matchResource reports whether the resource pattern (its namespace prefix stripped) matches
+// the bare target name, delegating to enforcement.MatchesResource.
 func matchResource(pattern, name string) bool {
 	return enforcement.MatchesResource(pdp.StripNamespacePrefix(pattern), name)
 }
 
-// resSpecificity scores how specific a resource pattern (prefix stripped) is
-// against name, via enforcement.ResourceSpecificity — the same algorithm the
-// engine uses, so the two can never rank overlapping globs differently.
+// resSpecificity scores how specific a resource pattern is against name, via
+// enforcement.ResourceSpecificity — the same algorithm the engine uses.
 func resSpecificity(pattern, name string) int {
 	return enforcement.ResourceSpecificity(pdp.StripNamespacePrefix(pattern), name)
 }
@@ -79,15 +69,11 @@ type UpstreamTool struct {
 	OutputSchema map[string]interface{}
 }
 
-// UpstreamTool must stay field-for-field identical to mcp.ToolEntry, which is where the
-// wire decode lives. This assertion is the compiler check for that: a struct conversion
-// compiles only between types with identical fields, so ADDING a field to either one
-// without the other breaks the build here rather than silently leaving the new field
-// zero in ParseToolsListResult's named-field copy — and a zero field means every FM-5
-// descriptionHash is computed over data the upstream actually sent something for. The
-// named copy in ParseToolsListResult covers the other direction (a same-type REORDER,
-// which a conversion would accept while transposing values), so the two together make
-// both failure modes compile errors.
+// UpstreamTool must stay field-for-field identical to mcp.ToolEntry, where the wire decode
+// lives. A struct conversion compiles only between types with identical fields, so ADDING a
+// field to either without the other breaks the build here rather than silently leaving the new
+// field zero. The named copy in ParseToolsListResult covers the other direction (a same-type
+// REORDER), so together both failure modes are compile errors.
 var _ = UpstreamTool(mcp.ToolEntry{})
 
 // Kind classifies a drift finding.
@@ -111,31 +97,21 @@ const (
 	// Fm4 — live server version does not satisfy the manifest's serverVersion pin (FM-4).
 	Fm4 Kind = "fm4"
 	// Fm5 — live tool description does not match the manifest's descriptionHash pin
-	// (FM-5). Always fatal (regardless of --strict-drift): a poisoned description can
-	// steer the model even within the allowed tool set.
+	// (FM-5). Always fatal: a poisoned description can steer the model within the allowed set.
 	Fm5 Kind = "fm5"
-	// Fm2Pinned — a description-pinned exact tool: entry matches no live tool. The
-	// critical variant of FM-2: with the tool absent from tools/list its pin was
-	// never verified, so a later direct call by name could be accepted with an
-	// unverified description. Like FM-5, always fatal.
+	// Fm2Pinned — a description-pinned exact tool: entry matches no live tool. The critical
+	// variant of FM-2: its pin was never verified, so a later direct call by name could be
+	// accepted with an unverified description. Like FM-5, always fatal.
 	Fm2Pinned Kind = "fm2_pinned"
 	// Fm6 — the live inputSchema's parameter surface diverges from the manifest's
-	// argumentSchema in a way FM-3 does not cover: a parameter appears that a closed
-	// schema (additionalProperties:false) did not declare, or a declared parameter
-	// changed type. Warn (fatal only under --strict-drift): unlike the description
-	// pin, benign schema evolution is common, so a structural change must not abort
-	// startup unconditionally. The disappearance of a declared parameter is FM-3, not
-	// FM-6.
+	// argumentSchema in a way FM-3 does not cover: a new parameter under a closed schema, or
+	// a declared parameter's changed type. Warn only, since benign schema evolution is common.
 	Fm6 Kind = "fm6"
 	// Uncovered — upstream tool has no manifest entry (informational; denied by default).
 	Uncovered Kind = "uncovered"
 	// SchemaAbsent — a covering constraint pins one or more arguments, but the live tool
-	// published NO inputSchema at all, so FM-3/FM-6 could not run and those pins went
-	// UNVERIFIED this session. Advisory (never fatal): request-time enforcement of the
-	// pinned arguments is unaffected — only the startup drift signal is absent — and a
-	// tool that omits its inputSchema block may still enforce, so this cannot be treated
-	// as a dropped parameter (a false FM-3). It exists so the gap is visible rather than
-	// silent.
+	// published NO inputSchema, so FM-3/FM-6 could not run and those pins went UNVERIFIED this
+	// session. Advisory (never fatal): request-time enforcement is unaffected.
 	SchemaAbsent Kind = "schema_absent"
 )
 
@@ -149,35 +125,24 @@ type Warning struct {
 	HashExpected  string // manifest descriptionHash pin (FM-5 only)
 	HashActual    string // sha256 of the live description (FM-5 only)
 	Detail        string // human-readable structural-change description (FM-6 only)
-	// LiveToolCount and ExpectedToolCount (Fm2 and Fm2Pinned only) are the
-	// session-wide distinct live tool count and distinct manifest exact-tool
-	// count, so an operator reading one absent-entry finding can judge whether
-	// the WHOLE live list came up short (consistent with truncated pagination)
-	// or just this one entry is stale — the aggregate signal a per-target finding
-	// cannot otherwise convey. Identical across every Fm2/Fm2Pinned Warning from
-	// one CheckManifestDrift call.
+	// LiveToolCount and ExpectedToolCount (Fm2 and Fm2Pinned only) let an operator judge
+	// whether the WHOLE live list came up short or just this one entry is stale. Identical
+	// across every Fm2/Fm2Pinned Warning from one CheckManifestDrift call.
 	LiveToolCount     int
 	ExpectedToolCount int
 }
 
-// IsFatal reports whether this finding aborts session establishment under
-// --strict-drift: FM-1, FM-2, FM-4, FM-6, and Fm2Pinned. FM-3 and uncovered are
-// advisory. Note that FM-5 AND Fm2Pinned are ALSO unconditionally fatal via
-// hasCriticalDrift (independent of --strict-drift); Fm2Pinned appears in both sets,
-// so a strict run reaches it here and a non-strict run still aborts on it there.
+// IsFatal reports whether this finding aborts session establishment under --strict-drift:
+// FM-1, FM-2, FM-4, FM-6, and Fm2Pinned. FM-5 and Fm2Pinned are ALSO unconditionally fatal via
+// hasCriticalDrift, independent of --strict-drift.
 func (w Warning) IsFatal() bool {
 	return w.Kind == Fm1 || w.Kind == Fm2 || w.Kind == Fm4 || w.Kind == Fm6 || w.Kind == Fm2Pinned
 }
 
-// severity returns the log-level label for this finding. Every LogLine case routes
-// through it, so a change to the mapping cannot silently skip a kind — two cases used to
-// hardcode "WARN" instead, and they were the two UNCONDITIONALLY fatal ones.
-//
-// FM-5 and Fm2Pinned are ERROR precisely because they abort startup on their own (see
-// hasCriticalDrift, which is not gated by --strict-drift): a mismatched or unverifiable
-// tool description may carry steering instructions injected into what the model reads,
-// and the one line an operator greps for after a refused boot must not sit at the same
-// level as advisory FM-3.
+// severity returns the log-level label for this finding. Every LogLine case routes through
+// it, so a change to the mapping cannot silently skip a kind. FM-5 and Fm2Pinned are ERROR
+// because they abort startup on their own (hasCriticalDrift), so the line an operator greps
+// for must not sit at the same level as advisory FM-3.
 func (w Warning) severity() string {
 	switch w.Kind {
 	case Uncovered:
@@ -242,8 +207,7 @@ func (w Warning) LogLine() string {
 			w.severity(), w.Resource, w.Tool, w.Argument,
 		)
 	default:
-		// A Kind with no case of its own: still route the level through severity() so an
-		// unmapped kind cannot be the one line that hardcodes a level.
+		// A Kind with no case of its own still routes the level through severity().
 		return fmt.Sprintf(`[eunox] %s drift=%s tool=%q resource=%q`, w.severity(), w.Kind, w.Tool, w.Resource)
 	}
 }
@@ -265,14 +229,10 @@ func CheckManifestDrift(manifest *config.LocalManifest, tools []UpstreamTool, se
 	}
 
 	// ── Per-tool checks: FM-1, FM-3, FM-5, FM-6, and uncovered ────────────────────
-	// Compare each live tool against the constraints the engine could actually select
-	// for it — the maximum-specificity tier (coveringConstraints), the set FM-1, FM-3,
-	// FM-5, and FM-6 all reason about. coveringConstraints is computed ONCE per tool
-	// and shared across the four checks (each previously re-scanned the manifest), and
-	// a single dedupe set spans them: a Warning's Kind is part of its identity, so
-	// findings of different kinds never collide, while a duplicate probe entry or two
-	// variants pinning the same value still report once. Each check's helper documents
-	// why it inspects every covering entry rather than a single best pick.
+	// Compare each live tool against the constraints the engine could actually select for it
+	// (coveringConstraints), computed ONCE per tool and shared across the four checks. A
+	// single dedupe set spans them: Warning's Kind is part of its identity, so findings of
+	// different kinds never collide while a duplicate variant reports once.
 	seen := make(map[Warning]struct{})
 	add := func(ws ...Warning) {
 		for i := range ws {
@@ -291,27 +251,17 @@ func CheckManifestDrift(manifest *config.LocalManifest, tools []UpstreamTool, se
 			add(Warning{Kind: Uncovered, Tool: tool.Name})
 			continue
 		}
-		// liveProps drives FM-3/FM-6; actualHash drives FM-5. Each is derived once per
-		// tool, not once per covering constraint.
+		// liveProps drives FM-3/FM-6; actualHash drives FM-5. Each is derived once per tool.
 		//
-		// A present-but-property-less schema (e.g. {"type":"object"} with no
-		// "properties" block) is the STRONGEST pinned-argument-absent case: the upstream
-		// dropped its entire declared parameter set, so every pinned argument is now
-		// absent. Treat the live parameter set as empty and still run FM-3/FM-6 — only a
-		// wholly absent inputSchema (nil) leaves the set genuinely unknown and skips
-		// them. NOTE: this skip is NOT fail-closed — the pinned arguments simply go
-		// UNVERIFIED this session. The check cannot distinguish a genuinely dropped
-		// parameter from a tool that omits its inputSchema block yet still enforces, so
-		// it emits no finding rather than a false FM-3. (Request-time enforcement of the
-		// pinned arguments is unaffected; only the startup drift signal is absent.) When
-		// hasProps is false, liveProps is nil; a nil-map read is safe (every lookup
-		// reports not-present), so the empty case needs no separate map, and FM-6 over an
-		// empty set correctly emits nothing (a disappeared declared parameter is FM-3,
-		// not FM-6).
+		// A present-but-property-less schema (e.g. {"type":"object"} with no "properties"
+		// block) is the STRONGEST pinned-argument-absent case, so treat the live parameter
+		// set as empty and still run FM-3/FM-6 — only a wholly absent inputSchema (nil)
+		// leaves the set genuinely unknown and skips them. This skip is NOT fail-closed: the
+		// pinned arguments simply go UNVERIFIED, since a tool omitting its inputSchema block
+		// may still enforce and this must not be a false FM-3.
 		liveProps, _ := SchemaProperties(tool.InputSchema)
-		// SchemaProperties reports hasProps==true only for a non-nil schema, so
-		// "hasProps || InputSchema != nil" reduces to "InputSchema != nil": the schema
-		// is known unless it is wholly absent.
+		// SchemaProperties reports hasProps==true only for a non-nil schema, so this reduces
+		// to "InputSchema != nil".
 		schemaKnown := tool.InputSchema != nil
 		actualHash := capability.ComputeToolHash(tool.Description, capability.ToolHashParams(tool.Title, tool.Annotations, tool.InputSchema, tool.OutputSchema))
 		for _, c := range covering {
@@ -321,36 +271,24 @@ func CheckManifestDrift(manifest *config.LocalManifest, tools []UpstreamTool, se
 				add(fm3Warnings(tool, c, liveProps)...)
 				add(fm6Warnings(tool, c, liveProps)...)
 			} else {
-				// The live tool published no inputSchema, so FM-3/FM-6 were skipped above.
-				// Surface an advisory when the constraint actually pins arguments, so the
-				// unverified pins are visible rather than silently skipped.
+				// FM-3/FM-6 were skipped above; surface an advisory when the constraint
+				// actually pins arguments, so the unverified pins are visible.
 				add(schemaAbsentWarnings(tool, c)...)
 			}
 		}
 	}
 
 	// ── FM-2: each tool: manifest entry must match at least one live tool ─────
-	// Non-tool entries (resource:, prompt:, system:) are not verified here —
-	// they refer to MCP primitives other than tools/call and have no live
-	// counterpart in the tools/list response.
+	// Non-tool entries (resource:, prompt:, system:) are not verified here.
 	//
-	// Resolve one Kind per distinct absent target BEFORE emitting: the config layer
-	// intentionally permits duplicate tool: target values within a manifest (a plain
-	// probe entry alongside a descriptionHash-pinned one for the same name), and Kind
-	// is part of a Warning's identity, so routing two differently-Kinded findings for
-	// the same absent target through the seen-based dedup above would let both survive
-	// — one CRITICAL Fm2Pinned and one advisory Fm2 for the same tool, a contradictory
-	// verdict for the operator (see buildLiveReport, which files a target into either
-	// bucket, never both). A first pass over the covering capabilities decides, per
-	// target, whether ANY of them pins it; pinned wins, so the single Warning emitted
-	// below always reflects the worse-case verdict for that target regardless of
-	// manifest order.
-	// targetKind holds the resolved Kind for each distinct absent target, keyed by
-	// target name; the same map serves double duty as the order-tracking set: a
-	// target's first appearance (comma-ok "not yet present") appends it to
-	// absentOrder, and its value tracks the worst-case Kind seen for it so far.
-	// Kind's zero value ("") is distinct from both Fm2 and Fm2Pinned, so an
-	// explicit Fm2 write for an unpinned entry is never confused with "not yet seen".
+	// Resolve one Kind per distinct absent target BEFORE emitting: the config layer permits
+	// duplicate tool: target values (a plain probe entry alongside a pinned one), and Kind is
+	// part of a Warning's identity, so routing two differently-Kinded findings for the same
+	// absent target could let both survive — a contradictory CRITICAL+advisory verdict. A
+	// first pass decides, per target, whether ANY covering capability pins it; pinned wins.
+	// targetKind holds the resolved Kind for each distinct absent target, and doubles as the
+	// order-tracking set: Kind's zero value ("") is distinct from both Fm2 and Fm2Pinned, so
+	// an explicit Fm2 write is never confused with "not yet seen".
 	targetKind := make(map[string]Kind)
 	var absentOrder []string
 	for i := range manifest.Capabilities {
@@ -364,11 +302,9 @@ func CheckManifestDrift(manifest *config.LocalManifest, tools []UpstreamTool, se
 		if _, seen := targetKind[c.Target]; !seen {
 			absentOrder = append(absentOrder, c.Target)
 		}
-		// A description-pinned tool absent from the live list never had its hash
-		// verified, so escalate to the always-fatal Fm2Pinned variant: otherwise an
-		// upstream could hide the pinned tool yet still accept a direct call by name.
-		// Pinned always wins and is never downgraded, so one pinned entry for a
-		// target outranks any number of unpinned duplicates regardless of scan order.
+		// A description-pinned tool absent from the live list never had its hash verified,
+		// so escalate to the always-fatal Fm2Pinned variant. Pinned always wins and is never
+		// downgraded, regardless of scan order.
 		if c.IsPinnedExactTool() {
 			targetKind[c.Target] = Fm2Pinned
 		} else if _, ok := targetKind[c.Target]; !ok {
@@ -376,9 +312,8 @@ func CheckManifestDrift(manifest *config.LocalManifest, tools []UpstreamTool, se
 		}
 	}
 	if len(absentOrder) > 0 {
-		// Only compute the session-wide counts when at least one target is absent —
-		// every manifest entry matching cleanly (the common case) has no Fm2/Fm2Pinned
-		// finding to attach them to, so the counts would go unused.
+		// Only compute the session-wide counts when at least one target is absent, since
+		// the common case has no Fm2/Fm2Pinned finding to attach them to.
 		liveCount, expectedCount := liveAndExpectedToolCounts(manifest, tools)
 		for _, target := range absentOrder {
 			add(Warning{
@@ -393,15 +328,10 @@ func CheckManifestDrift(manifest *config.LocalManifest, tools []UpstreamTool, se
 	return warnings
 }
 
-// liveAndExpectedToolCounts returns the distinct live tool-name count and the
-// distinct manifest exact-tool-name count, the two numbers an Fm2/Fm2Pinned
-// LogLine cites so an operator can judge whether a single manifest entry went
-// stale or the WHOLE live list came up short (the pattern a truncated
-// tools/list response — an empty nextCursor on a non-final page — produces).
-// Deliberately simple: unlike the deleted truncation-floor guard this fed, it
-// backs a diagnostic message only, not a fatal-abort decision, so it needs no
-// per-route caching, no strict/non-strict variant, and no pinned/unpinned
-// partitioning — just two counts computed once per CheckManifestDrift call.
+// liveAndExpectedToolCounts returns the distinct live tool-name count and the distinct
+// manifest exact-tool-name count, cited by an Fm2/Fm2Pinned LogLine so an operator can judge
+// whether one entry went stale or the whole live list came up short. Backs a diagnostic
+// message only, not a fatal-abort decision.
 func liveAndExpectedToolCounts(manifest *config.LocalManifest, tools []UpstreamTool) (live, expected int) {
 	liveNames := make(map[string]struct{}, len(tools))
 	for i := range tools {
@@ -420,12 +350,9 @@ func liveAndExpectedToolCounts(manifest *config.LocalManifest, tools []UpstreamT
 	return len(liveNames), len(expectedNames)
 }
 
-// fm1Warnings returns the FM-1 over-permission finding for one (tool, covering
-// constraint) pair, or nil. A glob match is a potential silent over-permission
-// (exact-name matches are intentional). Inspecting EVERY covering entry — not a
-// single best pick — surfaces both of two equal-specificity globs (e.g. tool:read_*
-// and tool:*_file both matching read_file), each reachable for some caller. Checks
-// the bare name so "tool:read_*" triggers it.
+// fm1Warnings returns the FM-1 over-permission finding for one (tool, covering constraint)
+// pair, or nil. A glob match is a potential silent over-permission; inspecting EVERY covering
+// entry surfaces both of two equal-specificity globs, each reachable for some caller.
 func fm1Warnings(tool UpstreamTool, c *capability.Constraint) []Warning {
 	if !capability.ContainsGlobMeta(pdp.StripNamespacePrefix(c.Target)) {
 		return nil
@@ -433,14 +360,10 @@ func fm1Warnings(tool UpstreamTool, c *capability.Constraint) []Warning {
 	return []Warning{{Kind: Fm1, Tool: tool.Name, Resource: c.Target}}
 }
 
-// fm3Warnings returns the FM-3 findings for one (tool, covering constraint) pair:
-// each pinned argument name (a condition argument or an argumentSchema property)
-// absent from the live inputSchema, so the pin silently stops enforcing if the
-// upstream renamed or dropped it. The caller inspects every covering entry, not a
-// single best pick, so a drift on either of two equal-specificity variants is
-// caught. liveProps is the tool's live "properties" map; it is nil/empty when the
-// live schema declares no properties, in which case every pinned argument is reported
-// absent (nil-map reads are safe).
+// fm3Warnings returns the FM-3 findings for one (tool, covering constraint) pair: each pinned
+// argument name absent from the live inputSchema, so the pin silently stops enforcing if the
+// upstream renamed or dropped it. liveProps is the tool's live "properties" map; nil/empty
+// means every pinned argument is reported absent.
 func fm3Warnings(tool UpstreamTool, c *capability.Constraint, liveProps map[string]interface{}) []Warning {
 	var out []Warning
 	for _, argName := range pinnedArgumentNames(c) {
@@ -452,13 +375,10 @@ func fm3Warnings(tool UpstreamTool, c *capability.Constraint, liveProps map[stri
 	return out
 }
 
-// schemaAbsentWarnings returns a single advisory SchemaAbsent finding for one (tool,
-// covering constraint) pair when the constraint pins arguments but the live tool
-// published no inputSchema (so FM-3/FM-6 could not run for it), or nil when the
-// constraint pins nothing (nothing went unverified, so no advisory). It reports the
-// FIRST unverified argument as a representative in Argument; the finding is about the
-// wholly-absent schema, not a specific missing parameter, so one per (tool,
-// constraint) rather than one per pinned argument.
+// schemaAbsentWarnings returns a single advisory SchemaAbsent finding for one (tool, covering
+// constraint) pair when the constraint pins arguments but the live tool published no
+// inputSchema, or nil when it pins nothing. Reports the FIRST unverified argument as a
+// representative — the finding is about the wholly-absent schema, one per constraint.
 func schemaAbsentWarnings(tool UpstreamTool, c *capability.Constraint) []Warning {
 	pinned := pinnedArgumentNames(c)
 	if len(pinned) == 0 {
@@ -467,12 +387,10 @@ func schemaAbsentWarnings(tool UpstreamTool, c *capability.Constraint) []Warning
 	return []Warning{{Kind: SchemaAbsent, Tool: tool.Name, Resource: c.Target, Argument: pinned[0]}}
 }
 
-// fm5Warnings returns the FM-5 description-hash-mismatch finding for one (tool,
-// covering constraint) pair, or nil. Only exact-name entries carrying a
-// descriptionHash are checked (a glob's hash could be from any tool it expands to,
-// and the glob is already FM-1). Inspecting every covering entry — not a single
-// best pick — verifies both of two equal-specificity pins, each enforced for some
-// caller; skipping the second would be a fail-open for the tool-poisoning defense.
+// fm5Warnings returns the FM-5 description-hash-mismatch finding for one (tool, covering
+// constraint) pair, or nil. Only exact-name entries carrying a descriptionHash are checked
+// (a glob's hash could be from any tool it expands to). Inspecting every covering entry
+// verifies both of two equal-specificity pins; skipping one would be a fail-open.
 func fm5Warnings(tool UpstreamTool, c *capability.Constraint, actualHash string) []Warning {
 	if !c.IsPinnedExactTool() || actualHash == c.DescriptionHash {
 		return nil
@@ -486,18 +404,10 @@ func fm5Warnings(tool UpstreamTool, c *capability.Constraint, actualHash string)
 	}}
 }
 
-// fm6Warnings returns the FM-6 structural-drift findings for one (tool, covering
-// constraint) pair. A constraint's argumentSchema declares the parameter surface
-// the operator reviewed; FM-6 covers the two divergences FM-3 does not — a
-// parameter that APPEARS under a closed schema (additionalProperties:false — the
-// schema asserted these were all the args, so a new one is a silent new sink), and
-// a declared parameter whose TYPE changed (the constraint may now match or reject
-// the wrong shape). Exact tools only (like FM-5): a glob's single argumentSchema
-// cannot be a closed enumeration of every matched tool's parameters, so the
-// added-parameter check against it produces systematic false positives — fatal
-// under --strict-drift; the glob is already surfaced by FM-1. liveProps is the
-// tool's live "properties" map; it is nil/empty when the live schema declares no
-// properties (FM-6 then emits nothing — a disappeared declared parameter is FM-3).
+// fm6Warnings returns the FM-6 structural-drift findings for one (tool, covering constraint)
+// pair: a parameter that APPEARS under a closed schema (additionalProperties:false), or a
+// declared parameter whose TYPE changed. Exact tools only (like FM-5) — a glob's single
+// argumentSchema cannot be a closed enumeration of every matched tool's parameters.
 func fm6Warnings(tool UpstreamTool, c *capability.Constraint, liveProps map[string]interface{}) []Warning {
 	if c.ArgumentSchema == nil || !c.IsExactTool() {
 		return nil
@@ -505,17 +415,12 @@ func fm6Warnings(tool UpstreamTool, c *capability.Constraint, liveProps map[stri
 	return structuralDrift(tool.Name, c, liveProps)
 }
 
-// structuralDrift returns the FM-6 findings for one tool/constraint pair: live
-// parameters not declared by a closed argumentSchema, and declared parameters
-// whose live type changed. liveProps is the tool's live inputSchema "properties"
-// map. The disappearance of a declared parameter is deliberately NOT reported here
-// — that is FM-3.
+// structuralDrift returns the FM-6 findings for one tool/constraint pair: live parameters not
+// declared by a closed argumentSchema, and declared parameters whose live type changed. The
+// disappearance of a declared parameter is deliberately NOT reported here — that is FM-3.
 func structuralDrift(toolName string, c *capability.Constraint, liveProps map[string]interface{}) []Warning {
-	// Arguments a condition names count as reviewed even when a closed argumentSchema
-	// does not list them, mirroring FM-3's pinnedArgumentNames so the two checks
-	// agree on what the operator pinned. conditionArgumentNames already returns
-	// top-level root keys (the granularity the proxy resolves a condition argument
-	// at), so the exclusion applies at the top level only.
+	// Arguments a condition names count as reviewed even when a closed argumentSchema does
+	// not list them, mirroring FM-3's pinnedArgumentNames. Applies at the top level only.
 	reviewed := make(map[string]bool)
 	for _, name := range conditionArgumentNames(c.Conditions) {
 		reviewed[name] = true
@@ -534,21 +439,17 @@ func structuralDrift(toolName string, c *capability.Constraint, liveProps map[st
 	return warnings
 }
 
-// collectStructuralDrift walks a declared argumentSchema against the live
-// inputSchema properties at one nesting level and recurses into declared object
-// properties, so a nested closed schema or a nested type change is checked too.
-// prefix is the dotted argument path to this level ("" at the top); reviewed holds
-// top-level argument names a condition references (applied only at the top level,
-// where the proxy can resolve a condition argument).
+// collectStructuralDrift walks a declared argumentSchema against the live inputSchema
+// properties at one nesting level and recurses into declared object properties. prefix is
+// the dotted argument path to this level; reviewed holds top-level argument names a
+// condition references.
 func collectStructuralDrift(toolName, target string, schema *capability.ArgumentSchema, liveProps map[string]interface{}, prefix string, reviewed map[string]bool, out *[]Warning) {
 	if schema == nil {
 		return
 	}
 
 	// Added parameter under a closed schema: additionalProperties:false asserts the
-	// declared set is exhaustive, so a live parameter outside it is a new, ungated
-	// surface the operator did not review. A top-level argument a condition names is
-	// already reviewed and is skipped.
+	// declared set is exhaustive, so a live parameter outside it is a new, ungated surface.
 	if schema.AdditionalProperties != nil && !*schema.AdditionalProperties {
 		for liveName := range liveProps {
 			if _, declared := schema.Properties[liveName]; declared {
@@ -577,10 +478,9 @@ func collectStructuralDrift(toolName, target string, schema *capability.Argument
 		}
 		full := joinArgPath(prefix, declName)
 
-		// Type change on a declared parameter: only flagged when both the manifest
-		// and the live schema name a single concrete type and the change is not
-		// type-compatible. Unions/nullable types and absent types are left alone to
-		// avoid false positives.
+		// Type change on a declared parameter: only flagged when both name a single
+		// concrete type and the change is not type-compatible. Unions/nullable/absent
+		// types are left alone to avoid false positives.
 		if want, ok := singleConcreteType(declSchema.Type); ok {
 			if got, ok := liveSingleType(liveProp); ok && !typesCompatible(want, got) {
 				*out = append(*out, Warning{
@@ -649,12 +549,10 @@ func liveObjectProperties(prop interface{}) (map[string]interface{}, bool) {
 	return props, true
 }
 
-// typesCompatible reports whether a live JSON-Schema type is policy-compatible
-// with the declared type, so a benign change is not flagged as FM-6 drift. Equal
-// types are compatible; integer and number are mutually compatible because an
-// integer value validates against a number schema and neither direction widens
-// what the manifest's argumentSchema accepts in a policy-relevant way — flagging
-// it would be exactly the false-positive that trains operators to disable the pin.
+// typesCompatible reports whether a live JSON-Schema type is policy-compatible with the
+// declared type, so a benign change is not flagged as FM-6 drift. Equal types are compatible;
+// integer and number are mutually compatible since an integer value validates against a
+// number schema.
 func typesCompatible(want, got string) bool {
 	if want == got {
 		return true
@@ -675,10 +573,9 @@ func hasFatalDrift(warnings []Warning) bool {
 	return false
 }
 
-// hasCriticalDrift reports whether warnings contains an FM-5 or Fm2Pinned finding.
-// Both abort startup unconditionally (not gated by --strict-drift): a mismatched
-// or unverifiable description may carry steering instructions injected into the
-// tool description the model sees.
+// hasCriticalDrift reports whether warnings contains an FM-5 or Fm2Pinned finding. Both abort
+// startup unconditionally (not gated by --strict-drift): a mismatched or unverifiable
+// description may carry steering instructions injected into what the model sees.
 func hasCriticalDrift(warnings []Warning) bool {
 	for i := range warnings {
 		w := &warnings[i]
@@ -689,10 +586,9 @@ func hasCriticalDrift(warnings []Warning) bool {
 	return false
 }
 
-// manifestHasPinnedDescriptions reports whether any exact-name tool: constraint
-// in the manifest carries a non-empty descriptionHash. When true, a tools/list
-// fetch failure at startup must be treated as fatal: without the live tool list
-// there is no way to verify the pinned hashes, so fail-closed requires an abort.
+// manifestHasPinnedDescriptions reports whether any exact-name tool: constraint carries a
+// non-empty descriptionHash. When true, a tools/list fetch failure at startup must be
+// treated as fatal, since there is no way to verify the pinned hashes.
 func manifestHasPinnedDescriptions(manifest *config.LocalManifest) bool {
 	for i := range manifest.Capabilities {
 		if manifest.Capabilities[i].IsPinnedExactTool() {
@@ -702,10 +598,9 @@ func manifestHasPinnedDescriptions(manifest *config.LocalManifest) bool {
 	return false
 }
 
-// evaluateDrift runs CheckManifestDrift against the fetched tool list, emits all
-// findings to stderr, and returns a non-nil error when any finding requires
-// aborting startup: FM-5 and Fm2Pinned (unconditionally, via hasCriticalDrift) or
-// FM-1/2/4/6 (only when strict, via IsFatal).
+// evaluateDrift runs CheckManifestDrift, emits all findings to stderr, and returns a non-nil
+// error when any finding requires aborting startup: FM-5/Fm2Pinned (unconditionally) or
+// FM-1/2/4/6 (only when strict).
 func evaluateDrift(manifest *config.LocalManifest, tools []UpstreamTool, serverVersion string, strict bool) error {
 	warnings := CheckManifestDrift(manifest, tools, serverVersion)
 	emitDriftWarnings(warnings)
@@ -713,10 +608,8 @@ func evaluateDrift(manifest *config.LocalManifest, tools []UpstreamTool, serverV
 		return fmt.Errorf("startup aborted: description integrity check failed — a pinned description mismatched or a description-pinned tool is missing from the live tool list (see warnings above)")
 	}
 	if strict && hasFatalDrift(warnings) {
-		// "strict drift", not "--strict-drift": strictness can come from the flag OR
-		// from `strictDrift:` in a gateway config (per route or under defaults), and an
-		// operator who set it in YAML should not be sent looking for a flag they never
-		// passed.
+		// "strict drift", not "--strict-drift": strictness can come from the flag OR from
+		// `strictDrift:` in a gateway config.
 		return fmt.Errorf("startup aborted by strict drift checking: manifest drift detected (see warnings above)")
 	}
 	return nil
@@ -739,31 +632,21 @@ func anyToolMatches(resource string, tools []UpstreamTool) bool {
 	return false
 }
 
-// BestManifestConstraint returns the highest-specificity tool: constraint whose
-// pattern matches toolName, or nil if none. Only tool: entries are considered.
-// Exported for the validate --live COVERED report, which needs the covering
-// constraint for a clean tool (CheckManifestDrift surfaces no warning for one).
+// BestManifestConstraint returns the highest-specificity tool: constraint whose pattern
+// matches toolName, or nil if none. Exported for the validate --live COVERED report, which
+// needs the covering constraint for a clean tool.
 func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *capability.Constraint {
-	// coveringMatches returns every REACHABLE match with its score already computed,
-	// which since the principal-scope fix can span more than one specificity tier — so
-	// narrow to the top tier here rather than assuming the caller did it, and read the
-	// score off the match instead of re-running resSpecificity for the same
-	// (constraint, tool) pair coveringMatches already scored. Prefer a
-	// descriptionHash-pinned member on a tie purely for what the REPORT displays: the
-	// sole caller is validate --live's COVERED line, which uses the result only for its
-	// Target string, and naming the pinned entry is the more informative answer when
-	// several equally-specific constraints cover the tool. Nothing enforcement-relevant
-	// rides on this pick — CheckManifestDrift runs the FM-5 hash verification for EVERY
-	// covering constraint, not just the one chosen here, so a pin cannot be skipped by
-	// tie-breaking the other way.
+	// coveringMatches returns every REACHABLE match with its score already computed, which
+	// can span more than one specificity tier — narrow to the top tier here. Prefer a
+	// descriptionHash-pinned member on a tie purely for what the REPORT displays; nothing
+	// enforcement-relevant rides on this pick, since CheckManifestDrift verifies FM-5 for
+	// EVERY covering constraint.
 	matches := coveringMatches(manifest, toolName)
 	if len(matches) == 0 {
 		return nil
 	}
-	// Seeded from the first candidate rather than a sentinel, so `top` is non-empty for
-	// ANY scoring resSpecificity could return. A sentinel seed made the non-empty
-	// precondition of the top[0] below depend on every future score staying above it —
-	// an unguarded index resting on a property nothing states.
+	// Seeded from the first candidate rather than a sentinel, so `top` is non-empty for ANY
+	// scoring resSpecificity could return.
 	top := []*capability.Constraint{matches[0].c}
 	best := matches[0].score
 	for _, m := range matches[1:] {
@@ -783,23 +666,18 @@ func BestManifestConstraint(manifest *config.LocalManifest, toolName string) *ca
 	return top[0]
 }
 
-// coveringMatch pairs a covering constraint with its already-computed resSpecificity
-// score against the tool, so coveringMatches' one scan feeds both coveringConstraints
-// (which needs only the constraints) and BestManifestConstraint (which needs the
-// scores too, to find the top tier) without either recomputing resSpecificity for a
-// pair the other already scored.
+// coveringMatch pairs a covering constraint with its already-computed resSpecificity score
+// against the tool, so coveringMatches' one scan feeds both coveringConstraints and
+// BestManifestConstraint without either recomputing the score.
 type coveringMatch struct {
 	c     *capability.Constraint
 	score int
 }
 
-// coveringConstraints returns every tool: constraint matching toolName that some
-// caller can actually be governed by — the set whose drift must be checked. FM-3 uses
-// it (rather than a single best pick) so a pinned-argument drift on any reachable
-// variant is caught, and FM-1/FM-2/FM-6 are fatal under strict drift, so a reachable
-// entry left out of this set is a strict deployment believing it verified drift it did
-// not. Returns nil when nothing matches. A one-line projection over coveringMatches,
-// which owns the reachability computation.
+// coveringConstraints returns every tool: constraint matching toolName that some caller can
+// actually be governed by — the set whose drift must be checked, rather than a single best
+// pick, so a reachable entry is never left unverified under strict drift. A projection over
+// coveringMatches, which owns the reachability computation.
 func coveringConstraints(manifest *config.LocalManifest, toolName string) []*capability.Constraint {
 	matches := coveringMatches(manifest, toolName)
 	if len(matches) == 0 {
@@ -812,31 +690,18 @@ func coveringConstraints(manifest *config.LocalManifest, toolName string) []*cap
 	return out
 }
 
-// coveringMatches computes the reachable set behind coveringConstraints, and hands
-// back each entry's score alongside it so BestManifestConstraint's top-tier scan
-// reads scores that already exist instead of re-deriving them.
+// coveringMatches computes the reachable set behind coveringConstraints, handing back each
+// entry's score so BestManifestConstraint's top-tier scan reads scores that already exist.
 //
-// Reachability is NOT "maximum specificity", because the engine filters by principal
-// BEFORE it scores (FindMatchingCapability skips a principal-scoped constraint whose
-// claims do not match, exactly like a target mismatch; see enforcement.ConstraintScorer
-// for the shared precedence rule this mirrors on the reachability question). A
-// more-specific entry therefore shadows a less-specific one only when it applies to
-// every caller — that is, only when it is UNSCOPED. Given
+// Reachability is NOT "maximum specificity", because the engine filters by principal BEFORE
+// it scores. A more-specific entry shadows a less-specific one only when it applies to every
+// caller (UNSCOPED). Given `tool:read_file {principal: sub=alice}` and unscoped `tool:read_*`,
+// every non-alice caller is governed by the glob, yet a maximum-specificity rule would miss it.
 //
-//	tool:read_file  {principal: {sub: [alice]}}   (exact, scoped)
-//	tool:read_*                                   (glob, unscoped)
-//
-// every caller who is not alice is governed by the glob, yet a maximum-specificity
-// rule sees only the exact entry and never runs the glob's checks.
-//
-// So the cutoff is the highest specificity among the UNSCOPED matches: anything below
-// it is shadowed for every caller and genuinely unreachable, and everything at or
-// above it is reachable for some caller. With no unscoped match at all nothing
-// universally shadows anything, so every match is kept — hence the cutoff seeds from
-// enforcement.NoMatchScore, the same sentinel ConstraintScorer seeds a fresh scan
-// with, rather than a separately hand-derived one. Over-inclusion here costs at most
-// an extra warning about an entry that turns out to be unreachable; under-inclusion
-// silently skips a fatal check.
+// The cutoff is the highest specificity among the UNSCOPED matches: below it is shadowed for
+// every caller; at or above it is reachable for some caller. With no unscoped match, every
+// match is kept — the cutoff seeds from enforcement.NoMatchScore. Over-inclusion costs at most
+// an extra warning; under-inclusion silently skips a fatal check.
 func coveringMatches(manifest *config.LocalManifest, toolName string) []coveringMatch {
 	var matches []coveringMatch
 	cutoff := enforcement.NoMatchScore
@@ -863,12 +728,9 @@ func coveringMatches(manifest *config.LocalManifest, toolName string) []covering
 	return out
 }
 
-// SchemaProperties extracts the "properties" map from a JSON Schema. The second
-// return is true when the schema declares a "properties" object (even empty),
-// meaning the parameter set is known and a pinned argument can be verified against
-// it; false when "properties" is missing or not an object (set unknown). Exported so
-// the CLI's manifest scaffolder (init) shares this one definition rather than keeping
-// a package-main copy that can drift.
+// SchemaProperties extracts the "properties" map from a JSON Schema. The second return is
+// true when the schema declares a "properties" object (even empty); false when missing or
+// not an object. Exported so the CLI's manifest scaffolder (init) shares this one definition.
 func SchemaProperties(schema map[string]interface{}) (map[string]interface{}, bool) {
 	if schema == nil {
 		return nil, false
@@ -880,10 +742,8 @@ func SchemaProperties(schema map[string]interface{}) (map[string]interface{}, bo
 	return props, true
 }
 
-// pinnedArgumentNames returns every argument name a manifest entry pins to a
-// specific upstream parameter: the argument of each condition plus every
-// top-level property (and required name) declared in an argumentSchema. The
-// result is deduplicated and order-stable so FM-3 reports are deterministic.
+// pinnedArgumentNames returns every argument name a manifest entry pins to a specific
+// upstream parameter, deduplicated and order-stable so FM-3 reports are deterministic.
 func pinnedArgumentNames(c *capability.Constraint) []string {
 	seen := make(map[string]bool)
 	var names []string
@@ -921,11 +781,8 @@ func conditionArgumentNames(conditions []capability.Condition) []string {
 			names = append(names, name)
 		}
 	}
-	// Enumerate via the capability.ArgumentNamer interface, not a closed type
-	// switch: every argument-carrying condition implements it (value receiver, so
-	// both forms satisfy), so a future argument-pinning condition is picked up
-	// automatically, closing the silent-FM-3-bypass trap a hand-maintained switch
-	// had. A condition naming no argument does not implement it and is skipped.
+	// Enumerate via the capability.ArgumentNamer interface, not a closed type switch, so a
+	// future argument-pinning condition is picked up automatically.
 	for _, cond := range conditions {
 		if n, ok := cond.(capability.ArgumentNamer); ok {
 			add(capability.ArgumentRootKey(n.ArgumentName()))
@@ -936,19 +793,15 @@ func conditionArgumentNames(conditions []capability.Condition) []string {
 
 // ─── tools/list fetch helpers ─────────────────────────────────────────────────
 
-// Pagination bounds for the startup tools/list probe. MCP list responses are
-// paginated via nextCursor; the drift probe follows the cursor to exhaustion so
-// manifest entries, description pins, and reports cover every page, not just page
-// one. The bounds defend against a malicious upstream that paginates forever or
-// returns an unbounded catalog.
+// Pagination bounds for the startup tools/list probe. The drift probe follows nextCursor to
+// exhaustion so reports cover every page; these bounds defend against a malicious upstream
+// paginating forever or returning an unbounded catalog.
 const (
 	maxToolsListPages = 1000
 	maxToolsListTools = 100000
-	// maxToolsListBytes bounds the total size of accumulated raw tool pages. The
-	// page and tool-count ceilings above still permit up to 1000 pages at the 4
-	// MiB per-message limit already enforced by the transport (jsonrpc.go), i.e.
-	// close to 4 GiB retained in memory during a single startup probe; 64 MiB is
-	// generous for any real-world tool catalog while keeping that worst case bounded.
+	// maxToolsListBytes bounds accumulated raw tool pages: the page/tool-count ceilings above
+	// still permit up to ~4 GiB at the transport's 4 MiB per-message limit, so 64 MiB is a
+	// generous but bounded cap.
 	maxToolsListBytes = 64 << 20
 )
 
@@ -959,14 +812,9 @@ type toolsListPage struct {
 	NextCursor string            `json:"nextCursor,omitempty"`
 }
 
-// toolsListCursorParams builds the params for one paginated tools/list request: the
-// first page (empty cursor) carries no params; subsequent pages carry
-// {"cursor":"..."} per the MCP pagination model.
-//
-// Unexported: ToolsListRequest is the seam every probe uses (both transport drift
-// probes and the CLI live-upstream probes), and it builds the WHOLE request, so a
-// caller assembling a bare params blob would be bypassing the id/method half of the
-// single-sourcing rather than participating in it.
+// toolsListCursorParams builds the params for one paginated tools/list request: the first
+// page carries no params; subsequent pages carry {"cursor":"..."}. Unexported: ToolsListRequest
+// is the seam every probe uses, building the WHOLE request so a caller cannot bypass it.
 func toolsListCursorParams(cursor string) json.RawMessage {
 	if cursor == "" {
 		return nil
@@ -976,21 +824,15 @@ func toolsListCursorParams(cursor string) json.RawMessage {
 	return raw
 }
 
-// ToolsListRequest builds a complete JSON-RPC tools/list request for one pagination
-// page: the given JSON-RPC id plus the cursor params. Single-sourced here so every
-// drift/CLI probe (the two transport session-start probes and the two CLI
-// live-upstream probes) issues an identical request, differing only in the id,
-// instead of hand-building the same literal at four sites.
+// ToolsListRequest builds a complete JSON-RPC tools/list request for one pagination page.
+// Single-sourced so every drift/CLI probe issues an identical request, differing only in id.
 func ToolsListRequest(id *json.RawMessage, cursor string) mcp.RPCMsg {
 	return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: capability.MethodToolsList, Params: toolsListCursorParams(cursor)}
 }
 
-// FetchAllToolPages drives tools/list pagination to exhaustion and returns a
-// single merged {"tools":[...]} result, dropping the cursor. fetchPage sends one
-// request with the given cursor ("" for the first page). Page/tool counts and
-// total accumulated bytes are bounded and a repeated cursor is rejected so a
-// malicious upstream cannot induce infinite pagination or unbounded memory
-// retention. Shared by the HTTP, stdio, and CLI paths.
+// FetchAllToolPages drives tools/list pagination to exhaustion and returns a single merged
+// {"tools":[...]} result, dropping the cursor. Page/tool counts and total bytes are bounded
+// and a repeated cursor is rejected so a malicious upstream cannot induce infinite pagination.
 func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (json.RawMessage, error) {
 	var all []json.RawMessage
 	seen := make(map[string]bool)
@@ -1001,9 +843,8 @@ func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (
 		if err != nil {
 			return nil, err
 		}
-		// Check the raw page against the remaining byte budget BEFORE unmarshaling,
-		// so a single oversized page from a malicious upstream cannot force an
-		// unbounded allocation while being decoded.
+		// Check the raw page against the remaining byte budget BEFORE unmarshaling, so an
+		// oversized page cannot force an unbounded allocation while being decoded.
 		if len(raw) > maxToolsListBytes-totalBytes {
 			return nil, fmt.Errorf("tools/list accumulated more than %d bytes; refusing to page further", maxToolsListBytes)
 		}
@@ -1011,13 +852,9 @@ func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (
 		var p toolsListPage
 		if len(raw) > 0 {
 			// Reject an envelope whose top-level "tools" key is ambiguous (duplicated,
-			// case-variant, or shadowed by a case-variant sibling) BEFORE the plain
-			// json.Unmarshal below, which would silently resolve it to one array with no
-			// error. Without this, a poisoned catalog could pass the drift comparison
-			// (and its unconditionally-fatal FM-5 descriptionHash check) cleanly at
-			// startup, only to be caught later — and more disruptively, as a mid-session
-			// poisonAllPinned — once the runtime list filter (which already refuses this
-			// same shape) saw the identical bytes.
+			// case-variant) BEFORE the plain json.Unmarshal below, which would silently
+			// resolve it to one array — a poisoned catalog could otherwise pass the drift
+			// comparison cleanly at startup.
 			if pdp.ToolsKeyAmbiguous(raw) {
 				return nil, fmt.Errorf("tools/list page carries an ambiguous \"tools\" key (duplicated, case-variant, or both); refusing to trust the decode")
 			}
@@ -1025,10 +862,8 @@ func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (
 				return nil, fmt.Errorf("parsing tools/list page: %w", err)
 			}
 		}
-		// Bound the cumulative tool count across pages before appending, so a long tail
-		// of pages cannot grow "all" past maxToolsListTools. (This page's own size is
-		// already bounded by the maxToolsListBytes check above, before the Unmarshal that
-		// materializes p.Tools.)
+		// Bound the cumulative tool count across pages before appending, so a long tail of
+		// pages cannot grow "all" past maxToolsListTools.
 		if len(p.Tools) > maxToolsListTools-len(all) {
 			return nil, fmt.Errorf("tools/list returned more than %d tools; refusing to page further", maxToolsListTools)
 		}
@@ -1047,40 +882,24 @@ func FetchAllToolPages(fetchPage func(cursor string) (json.RawMessage, error)) (
 
 // ParseToolsListResult decodes the raw JSON result from a tools/list response.
 //
-// It screens the envelope and every entry itself rather than assuming a screened
-// caller. Every in-tree caller today feeds it the merged output of FetchAllToolPages,
-// which already rejected an ambiguous envelope per page and then re-marshaled the
-// result — so for those callers the envelope gate below can never fire. It is kept
-// anyway, and the tradeoff was made deliberately rather than by omission: this is an
-// exported function documented as taking "the raw JSON result from a tools/list
-// response", so the precondition a caller would have to satisfy is invisible at the
-// call site, and getting it wrong reopens a catalog-substitution bypass rather than
-// producing an obvious failure. A guard whose absence is silent belongs on the
-// boundary, not in a comment telling future callers to pre-screen.
+// It screens the envelope and every entry itself rather than assuming a screened caller.
+// Every in-tree caller today feeds it FetchAllToolPages' output, which already screened per
+// page, so this gate can never fire for them — kept anyway, since a guard whose absence is
+// silent belongs on the boundary, not in a comment telling future callers to pre-screen.
 //
-// The guard's cost is accepted rather than offset. Folding the entry screen and the
-// decode into one per-entry pass was tried and measured slower (encoding/json validates
-// before it decodes, so per-entry decodes re-scan the same bytes and add a decoder setup
-// and a heap-escaping value each), so the straightforward shape below stands.
+// Folding the entry screen and decode into one per-entry pass was tried and measured slower
+// (encoding/json validates before it decodes, so per-entry decodes re-scan the same bytes),
+// so the two-pass shape below stands.
 func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	if raw == nil {
 		return nil, nil
 	}
-	// The ENVELOPE is screened before it is decoded, for the reason given at the function:
-	// raw bytes carrying a case-variant "Tools" or a duplicated "tools" decode silently to
-	// ONE array here — Go binds by a case-folding match and keeps the last — which is the
-	// same catalog-substitution bypass ToolsKeyAmbiguous was exported to close on the
-	// runtime list path. The per-entry gate is applied below, on each entry's own bytes.
-	//
-	// Surfacing either as a parse error routes it through driftProbeUnavailable, which is
-	// exactly the right policy: fatal when the manifest carries descriptionHash pins
-	// (integrity cannot be verified), an observable skip otherwise.
-	//
-	// ToolsKeyAmbiguous also reports true on bytes it cannot even walk (truncated JSON, a
-	// non-object top level) — deliberately: this gate must fail closed on uncertainty, not
-	// just on a confirmed duplicate. The message below is worded to match that: it says the
-	// key "could not be verified", not "is ambiguous", so a truncated upstream response is
-	// not misreported to an operator as a duplicate-key attack when it is a transport fault.
+	// The ENVELOPE is screened before it is decoded: raw bytes carrying a case-variant
+	// "Tools" or a duplicated "tools" decode silently to ONE array here (Go binds by a
+	// case-folding match and keeps the last). Surfacing this as a parse error routes it
+	// through driftProbeUnavailable: fatal when descriptionHash pins exist, a skip otherwise.
+	// ToolsKeyAmbiguous also reports true on bytes it cannot walk at all (truncated JSON),
+	// deliberately, so the message below says "could not be verified" rather than "ambiguous".
 	if pdp.ToolsKeyAmbiguous(raw) {
 		return nil, fmt.Errorf("tools/list result's \"tools\" key could not be verified as unambiguous (malformed JSON, or a duplicated/case-variant key); refusing to trust the decode")
 	}
@@ -1090,39 +909,28 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, fmt.Errorf("parsing tools/list result: %w", err)
 	}
-	// Reject an entry whose bytes are ambiguous BEFORE decoding them into the struct the
-	// descriptionHash is computed over. A plain Unmarshal binds object keys to fields by a
-	// case-folding match and keeps the LAST, so an upstream serving both "description" and
-	// "deſcription" (U+017F — already lower case, so a ToLower-based check misses it)
-	// hashes CLEAN against the pin while a case-sensitive host renders the injected value:
-	// the FM-5 startup refusal this whole comparison exists to trigger never fires. The
-	// runtime list filter applies the same gate per entry; sharing pdp.EntryKeysAmbiguous
-	// keeps the two layers from drifting apart on what "believable" means.
+	// Reject an entry whose bytes are ambiguous BEFORE decoding into the struct the
+	// descriptionHash is computed over: a plain Unmarshal binds by a case-folding match and
+	// keeps the LAST, so an upstream serving both "description" and "deſcription" (U+017F)
+	// could hash CLEAN against the pin while a case-sensitive host renders the injected value.
 	for i, entry := range envelope.Tools {
 		if pdp.EntryKeysAmbiguous(entry) {
 			return nil, fmt.Errorf("tools/list entry %d carries duplicate or case-variant keys, so its description cannot be verified against a descriptionHash pin", i)
 		}
 	}
 
-	// One whole-envelope decode, NOT a per-entry json.Unmarshal over the RawMessages the
-	// screen above already holds. That rewrite looks like it removes a redundant pass and
-	// measurably does not: encoding/json validates before it decodes, so N per-entry
-	// decodes re-scan the same total byte volume the bulk decode would have, and add N
-	// decoder setups plus a heap-escaping ToolEntry each. Benchmarked on a 50-tool catalog
-	// it cost ~380 more allocations and ~10 KB more per call for no time saving. The
-	// envelope gate above is therefore paid for honestly rather than offset.
+	// One whole-envelope decode, NOT a per-entry json.Unmarshal: that looked like it removes
+	// a redundant pass but measurably does not (encoding/json validates before it decodes),
+	// costing ~380 more allocations on a 50-tool catalog for no time saving.
 	var result mcp.ToolsListResult
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("parsing tools/list result: %w", err)
 	}
 	tools := make([]UpstreamTool, len(result.Tools))
 	for i, t := range result.Tools {
-		// Field by field, by NAME, rather than a positional UpstreamTool(t) struct
-		// conversion. The two types share three string fields and two
-		// map[string]interface{} fields, so a same-type reorder in mcp.ToolEntry would
-		// still compile as a conversion while silently transposing values into the wrong
-		// fields — and every FM-5 descriptionHash comparison is computed over exactly
-		// these fields. Named assignment makes that mapping compiler-checked.
+		// Field by field, by NAME, rather than a positional UpstreamTool(t) conversion: a
+		// same-type reorder in mcp.ToolEntry would still compile while silently transposing
+		// values, and FM-5's hash is computed over exactly these fields.
 		tools[i] = UpstreamTool{
 			Name:         t.Name,
 			Description:  t.Description,
@@ -1135,36 +943,26 @@ func ParseToolsListResult(raw json.RawMessage) ([]UpstreamTool, error) {
 	return tools, nil
 }
 
-// MakeDriftCheck builds the drift-comparison hook for a route/proxy, or nil when
-// manifest is nil. The returned CheckFunc parses the probed tools/list and runs
-// evaluateDrift; a probe or parse failure is handled by driftProbeUnavailable.
-//
-// A truncated tools/list (an upstream ending pagination early — an empty nextCursor
-// on a non-final page) is NOT special-cased here: a manifest exact tool: entry hidden
-// by truncation is absent from the live list exactly like a removed/renamed one, so it
-// surfaces through the normal FM-2 path below — Fm2Pinned (unconditionally fatal) when
-// the entry is descriptionHash-pinned, or Fm2 (fatal only under --strict-drift)
-// otherwise — with the LogLine text naming truncated pagination as a possible cause.
+// MakeDriftCheck builds the drift-comparison hook for a route/proxy, or nil when manifest is
+// nil. The returned CheckFunc parses the probed tools/list and runs evaluateDrift; a probe or
+// parse failure is handled by driftProbeUnavailable. A truncated tools/list is NOT
+// special-cased: a hidden manifest entry surfaces through the normal FM-2 path, with the
+// LogLine text naming truncated pagination as a possible cause.
 func MakeDriftCheck(manifest *config.LocalManifest, strict bool) CheckFunc {
 	if manifest == nil {
 		return nil
 	}
 	return func(rawToolsListResult json.RawMessage, serverVersion string, probeErr error) error {
 		if probeErr != nil {
-			// serverVersion comes from the completed initialize handshake, not the
-			// tools/list probe, so the FM-4 pin can still be verified even when the probe
-			// failed. Surface it explicitly — otherwise a manifest that pins only
-			// serverVersion would have its one pin silently unverified whenever the probe
-			// fails, and the generic drift=skipped warning would not mention the version.
+			// serverVersion comes from the completed initialize handshake, not the tools/list
+			// probe, so the FM-4 pin can still be verified even when the probe failed.
 			emitServerVersionDrift(manifest, serverVersion)
 			return driftProbeUnavailable(manifest, strict, probeErr)
 		}
 		tools, err := ParseToolsListResult(rawToolsListResult)
 		if err != nil {
 			// A parse failure loses the live tool list just like a probe failure, but
-			// serverVersion still comes from the completed initialize handshake and is
-			// verifiable — so run the same FM-4 emit here rather than let the one pin on a
-			// serverVersion-only manifest go silently unchecked.
+			// serverVersion is still verifiable, so run the same FM-4 emit here.
 			emitServerVersionDrift(manifest, serverVersion)
 			return driftProbeUnavailable(manifest, strict, err)
 		}
@@ -1172,36 +970,28 @@ func MakeDriftCheck(manifest *config.LocalManifest, strict bool) CheckFunc {
 	}
 }
 
-// driftProbeUnavailable maps a tools/list probe (or parse) failure to
-// fatal-or-skip. It is fatal when the manifest has descriptionHash pins (they
-// cannot be verified without the live list) or strict is set (an unreachable probe
-// is indistinguishable from drift). Otherwise it is a logged best-effort skip.
+// driftProbeUnavailable maps a tools/list probe (or parse) failure to fatal-or-skip: fatal
+// when the manifest has descriptionHash pins, or strict is set. Otherwise a logged
+// best-effort skip.
 func driftProbeUnavailable(manifest *config.LocalManifest, strict bool, err error) error {
 	if manifestHasPinnedDescriptions(manifest) {
 		return fmt.Errorf("tools/list unavailable and manifest has descriptionHash pins: cannot verify description integrity: %w", err)
 	}
 	if strict {
-		// Names the mode, not the flag: strictDrift: in a gateway config sets it too.
 		return fmt.Errorf("tools/list unavailable under strict drift checking: cannot verify manifest drift; an unreachable probe is indistinguishable from drift: %w", err)
 	}
-	// Glob-only manifest, non-strict: the skip stays non-blocking, but make it
-	// OBSERVABLE so an operator never mistakes "probe skipped, drift unknown" for
-	// "probe succeeded, no drift detected". Structured (drift=skipped) and explicit
-	// that NO drift was verified this session — a glob entry may now cover upstream
-	// tools added since the manifest was written, and any FM-1..FM-6 finding would go
-	// undetected — naming the probe-failure reason.
+	// Glob-only manifest, non-strict: the skip stays non-blocking, but make it OBSERVABLE so
+	// an operator never mistakes "probe skipped, drift unknown" for "no drift detected".
 	fmt.Fprintf(os.Stderr,
 		"[eunox] WARN drift=skipped tools/list unavailable — manifest drift was NOT verified this session; glob entries may now cover upstream tools added since the manifest was written and any drift would go undetected: %v\n",
 		err)
 	return nil
 }
 
-// serverVersionDrift returns the FM-4 warning when the live serverVersion does not
-// satisfy the manifest's serverVersion pin, or nil when there is no pin or it is
-// satisfied. Split out so the pin can be checked both on the normal path
-// (CheckManifestDrift) and on the probe-failure path (MakeDriftCheck): serverVersion
-// comes from the initialize handshake, so a failed tools/list probe does not prevent
-// FM-4 verification.
+// serverVersionDrift returns the FM-4 warning when the live serverVersion does not satisfy
+// the manifest's pin, or nil otherwise. Split out so the pin can be checked on both the
+// normal path and the probe-failure path, since serverVersion comes from the initialize
+// handshake and survives a failed tools/list probe.
 func serverVersionDrift(manifest *config.LocalManifest, serverVersion string) *Warning {
 	if manifest.ServerVersion == "" || matchServerVersion(manifest.ServerVersion, serverVersion) {
 		return nil
@@ -1213,10 +1003,8 @@ func serverVersionDrift(manifest *config.LocalManifest, serverVersion string) *W
 	}
 }
 
-// emitServerVersionDrift logs the FM-4 warning to stderr when the live serverVersion
-// violates the manifest pin. Shared by both MakeDriftCheck probe-unavailable branches
-// (probe error and tools/list parse failure): serverVersion comes from the completed
-// initialize handshake, so it stays verifiable even when the live tool list is lost.
+// emitServerVersionDrift logs the FM-4 warning to stderr when the live serverVersion violates
+// the manifest pin. Shared by both MakeDriftCheck probe-unavailable branches.
 func emitServerVersionDrift(manifest *config.LocalManifest, serverVersion string) {
 	if w := serverVersionDrift(manifest, serverVersion); w != nil {
 		fmt.Fprintln(os.Stderr, w.LogLine())
@@ -1237,11 +1025,9 @@ func matchServerVersion(constraint, actual string) bool {
 	if constraint == "" {
 		return true
 	}
-	// An absent version never satisfies a non-empty constraint, even "*". FM-4 exists
-	// to surface an upstream that reports no version at all, and "*" is the natural
-	// "don't care" value operators reach for — but strings.Split("", ".") returns
-	// [""] (len 1, NOT an empty slice), so without this guard a trailing-"*" constraint
-	// would see one (empty) component and match, silently swallowing the FM-4 warning.
+	// An absent version never satisfies a non-empty constraint, even "*": strings.Split("",
+	// ".") returns [""] (not empty), so without this guard a trailing-"*" constraint would
+	// match, silently swallowing the FM-4 warning.
 	if actual == "" {
 		return false
 	}
@@ -1250,13 +1036,11 @@ func matchServerVersion(constraint, actual string) bool {
 	for i, c := range cParts {
 		if c == "*" {
 			// A TRAILING "*" matches this component and everything after it; a
-			// NON-trailing "*" matches only its own component and comparison
-			// continues. (Short-circuiting on any "*" would let "*.0" or "1.*.3"
-			// match every version, defeating the FM-4 guard.)
+			// NON-trailing "*" matches only its own component. (Short-circuiting on any "*"
+			// would let "*.0" or "1.*.3" match every version, defeating the FM-4 guard.)
 			if i == len(cParts)-1 {
-				// "any value AT this position and beyond" still requires the actual
-				// version to HAVE a component here, so "1.2.*" does not match a bare
-				// "1.2".
+				// Still requires the actual version to HAVE a component here, so "1.2.*"
+				// does not match a bare "1.2".
 				return i < len(aParts)
 			}
 			if i >= len(aParts) {

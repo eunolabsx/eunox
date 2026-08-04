@@ -21,44 +21,30 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
-// auditRecorder is the subset of the audit sink the enforced-forward path needs.
-// Both *audit.Sink (stdio) and *routeSink (HTTP/gateway) satisfy it, letting the
-// shared forward core record without knowing its transport.
+// auditRecorder is the subset of the audit sink the enforced-forward path needs. Both
+// *audit.Sink (stdio) and *routeSink (HTTP/gateway) satisfy it, letting the shared forward
+// core record without knowing its transport.
 //
-// The invariant is that a missing sink yields a genuine nil INTERFACE, never a non-nil
-// interface wrapping a nil pointer — the typed-nil trap that would turn the core's
-// `rec != nil` "no sink" test into a lie. Two constructions uphold it: asRecorder, which
-// maps a nil concrete pointer to a nil interface, and StdioProxy.rec, which builds its
-// routeSink wrapper only when the underlying sink is non-nil and otherwise returns the
-// untyped nil directly (a &routeSink{} is never the nil pointer asRecorder looks for, so
-// wrapping unconditionally would defeat the check). Never assign a concrete sink pointer
-// to this interface at a call site.
+// A missing sink must yield a genuine nil INTERFACE, never a non-nil interface wrapping a nil
+// pointer — the typed-nil trap that would turn `rec != nil` into a lie. asRecorder and
+// StdioProxy.rec both uphold this; never assign a concrete sink pointer directly.
 type auditRecorder interface {
 	RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string)
-	// RecordDeclassifiedAllow is the allow recorder for a call that ALSO cleared flow
-	// labels under a human approval. It is separate from RecordAllow so the cleared
-	// labels and the approving human can only be stamped together — a declassification
-	// with no named approver is not one the proxy performs, and a widened RecordAllow
-	// would let any of its call sites pass one without the other.
+	// RecordDeclassifiedAllow is the allow recorder for a call that ALSO cleared flow labels
+	// under a human approval. Separate from RecordAllow so the cleared labels and the
+	// approving human can only ever be stamped together.
 	RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver, approvalID string)
 	RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool)
-	// AuditDegraded reports whether the audit trail has lost coverage (a dropped or
-	// failed-to-write record). reason is a short prose note for the host-facing
-	// error and the stderr warning; detail is the discrete counts to stamp into the
-	// structured audit record (nil when healthy, never prose). The
-	// --require-audit=strict gate consults it to fail subsequent forwards closed.
-	// It is retrospective: the loss counters reflect only completed calls, so the
-	// boundary call whose own record is the first lost is still forwarded; the next
-	// call is the first denied.
+	// AuditDegraded reports whether the audit trail has lost coverage. reason is prose for the
+	// host-facing error/stderr warning; detail is discrete counts for the structured record.
+	// Retrospective: the boundary call whose own record is the first lost is still forwarded;
+	// the next call is the first denied.
 	AuditDegraded() (degraded bool, reason string, detail map[string]interface{})
 }
 
-// asRecorder converts a possibly-nil concrete sink pointer (*audit.Sink for stdio,
-// *routeSink for HTTP/gateway) into the auditRecorder interface, returning a genuine
-// nil interface for a nil pointer rather than a non-nil interface wrapping a nil
-// pointer — the typed-nil trap. Every params-construction site routes its sink
-// through this so the core's `rec != nil` stays a true "no sink configured" test
-// (the rule lives here once instead of an inline `var rec; if s != nil` at each).
+// asRecorder converts a possibly-nil concrete sink pointer into the auditRecorder interface,
+// returning a genuine nil interface for a nil pointer rather than one wrapping a nil pointer
+// (the typed-nil trap), so `rec != nil` stays a true "no sink configured" test everywhere.
 func asRecorder[T interface {
 	auditRecorder
 	comparable
@@ -70,59 +56,26 @@ func asRecorder[T interface {
 	return s
 }
 
-// killSubject names WHOSE session a kill-switch record describes and — the load-bearing
-// part — whether this proxy can VOUCH for that name. Only two things can produce one:
+// killSubject names WHOSE session a kill-switch record describes and whether this proxy can
+// VOUCH for that name. Only two things can produce one:
 //
-//   - verifiedSession: an id this proxy actually established (a registry-resolved HTTP
-//     session, or the stdio proxy's own). Safe to stamp as fact, so it populates the
+//   - verifiedSession: an id this proxy actually established. Safe to stamp as fact into the
 //     structured, signed session_id field.
-//   - claimedSession: the raw, client-supplied Mcp-Session-Id header of a request whose
-//     session was NOT resolved. Not safe: a caller holding any valid-but-unrelated
-//     credential (a route's shared bearer, or any JWT valid for that route's audience)
-//     could put an arbitrary — including a real victim's — id in the header and have it
-//     recorded as fact whenever CheckKill fails closed (an active global kill, or a
-//     kill-store error). session_id stays EMPTY and the claimed value survives, clearly
-//     marked unverified, as details.claimed_session_id.
+//   - claimedSession: the raw, client-supplied Mcp-Session-Id header of an UNRESOLVED
+//     session. Not safe — a caller holding any unrelated valid credential could put an
+//     arbitrary (including a victim's) id in the header. session_id stays EMPTY; the value
+//     survives only as details.claimed_session_id, clearly marked unverified.
 //
-// This is a type rather than a `sessionID string` parameter because picking wrong fails
-// SILENTLY: it yields a well-formed, HMAC-chained record asserting a session this proxy
-// never established, which is exactly what the tape is supposed to be trustworthy about.
-// With a plain string the guarantee rested on every future author of a recordKillDenial /
-// recordKillDrop call site knowing the rule; here a call site must STATE which kind of id
-// it holds, and claimedSession takes the *http.Request and never an id, so an unverified
-// value reached the normal way — via the constructors — has no route to the verified
-// field. The zero value is the safe one (empty session_id, no claimed detail), so a
-// hand-written composite literal degrades to recording less, never to forging more.
-// Encapsulation is package-scoped, not file-scoped: a call site inside internal/transport
-// could still write the unexported fields directly (killSubject{verified: someHeaderRead})
-// and defeat this, same as it could hand a raw header to verifiedSession's string
-// parameter. Neither is a compiler-checked impossibility, both are visibly wrong at the
-// call site instead of a plausible-looking choice between two same-shaped helpers. That
-// residual is now partly guarded rather than merely observed: an AST test over the
-// package's own sources (see guardedStructs) fails if a composite literal of this type —
-// including one whose type is elided inside a slice, array or map literal — appears
-// outside the file holding its constructors, so adding one takes a deliberate edit to a
-// security-invariant test. It does NOT cover a zero value mutated field by field
-// (`var k killSubject; k.verified = ...`), which is not a literal at all; that spelling
-// stays visibly wrong at the call site rather than compiler- or test-checked.
+// A type rather than a `sessionID string` param because picking wrong fails SILENTLY — a
+// well-formed signed record asserting a session this proxy never established. The zero value
+// is the safe one, so a hand-written composite literal degrades to recording less, never
+// forging more. An AST test (guardedStructs) fails the build if a composite literal of this
+// type appears outside the file holding its constructors.
 //
-// Scope: this closes the gap for the kill-record recorders specifically, the ~10 call
-// sites recordKillDenial/recordKillDrop had. It does not extend to the general
-// auditRecorder.RecordAllow/RecordDeny surface (enforcedForwardCore, dispatchList,
-// dispatchUnmapped, forwardServerRequest, …), whose forwardParams.sessionID /
-// serverRequestParams.sessionID stay plain strings — "verified" there remains a
-// control-flow fact, not a type guarantee, matching killDropLeg's identical scope caveat
-// below for the "transport" detail.
-//
-// That control-flow fact is stronger than it looks, which is why those two are guarded by
-// the same AST test rather than converted: neither dispatchParams constructor can even
-// RECEIVE a raw header. (*HTTPProxy).dispatchParams takes a resolved *httpSession and
-// reads sess.id; (*StdioProxy).dispatchParams takes no arguments at all. The wrong value
-// is not in scope at either constructor, so the only way to introduce one is the literal
-// the test now catches. Revisit the type conversion if a third dispatchParams-shaped
-// constructor appears, or — the signal that actually matters — if any of them grows a
-// bare sessionID string parameter, since that is the moment the wrong value becomes
-// assignable.
+// Scope: covers the ~10 kill-record call sites only; the general RecordAllow/RecordDeny
+// surface keeps plain-string sessionIDs, where "verified" stays a control-flow fact rather
+// than a type guarantee — safe because no dispatchParams constructor can even receive a raw
+// header.
 type killSubject struct {
 	// verified is the registry-resolved session id, stamped into session_id. Empty for a
 	// claimed subject.
@@ -137,19 +90,15 @@ type killSubject struct {
 	claimed string
 }
 
-// verifiedSession names a session THIS proxy established, whose id is therefore safe to
-// stamp into the signed session_id field. Pass an id that came from session state (an
-// *httpSession's id, the StdioProxy's) rather than one read back off the request: the
-// point of the type is that provenance is visible at the call site.
+// verifiedSession names a session THIS proxy established, safe to stamp into the signed
+// session_id field. Pass an id from session state, never one read back off the request.
 func verifiedSession(id string) killSubject { return killSubject{verified: id} }
 
 // claimedSession names the session id a client claimed in r's Mcp-Session-Id header at a
-// call site that has NOT resolved it against the registry — including one where no session
-// exists at all (a session-creating initialize), where the header is absent and this
-// contributes no detail. Its id never reaches session_id; see killSubject. r is read
-// immediately (not retained): the constructor still takes *http.Request rather than a
-// bare string, so a call site cannot spell "this header is verified" by handing
-// claimedSession something that merely looks like a session id.
+// call site that has NOT resolved it against the registry. Its id never reaches session_id;
+// see killSubject. Takes *http.Request (read immediately, not retained), not a bare string,
+// so a call site cannot spell "this header is verified" by handing it something that merely
+// looks like a session id.
 func claimedSession(r *http.Request) killSubject {
 	return killSubject{claimed: r.Header.Get(SessionHeader)}
 }
@@ -158,27 +107,18 @@ func claimedSession(r *http.Request) killSubject {
 // verified id, or empty for a claimed subject.
 func (k killSubject) auditSessionID() string { return k.verified }
 
-// auditDetails folds a claimed subject's unverified id into base as
-// details.claimed_session_id (bounded and sanitized by addClaimedSessionIDValue), and
-// returns base untouched for a verified subject (k.claimed is always "" there) or a
-// claimed subject whose header was empty — both are a no-op through the same call, so
-// this needs no branch distinguishing them. base may be nil; addClaimedSessionIDValue
-// allocates only when there is something to record.
+// auditDetails folds a claimed subject's unverified id into base as details.claimed_session_id
+// (bounded and sanitized by addClaimedSessionIDValue); a no-op for a verified subject or an
+// empty header, through the same call so no branch is needed to distinguish them.
 func (k killSubject) auditDetails(base map[string]interface{}) map[string]interface{} {
 	return addClaimedSessionIDValue(base, k.claimed)
 }
 
-// recordKillDenial records a kill-switch denial and builds the host-facing denial
-// response. The non-enforced paths — */list, the unmapped-method default, and each
-// transport's local initialize answer — call CheckKill themselves (they do not flow
-// through enforcedForwardCore's embedded kill check), then funnel the deny here so
-// the record shape (the KILL_SWITCH code from normalizeDenial, no condition mutation)
-// and the response envelope are defined once alongside normalizeDenial/denialResult.
-// rec may be nil (no sink configured); the record is skipped then. A kill addresses no
-// sub-target, so the one method name serves as the audit identifier, the method, and
-// the denial target alike (unlike the enforced path, where they can differ); id shapes
-// the response. subj decides whether the session id is recorded as fact (session_id) or
-// as an unverified claim (details.claimed_session_id) — see killSubject.
+// recordKillDenial records a kill-switch denial and builds the host-facing denial response.
+// Non-enforced paths call CheckKill themselves then funnel the deny here so the record shape
+// and response envelope are defined once. rec may be nil (skipped then). A kill addresses no
+// sub-target, so one method name serves as identifier/method/target alike. subj decides
+// whether the session id is recorded as fact or an unverified claim — see killSubject.
 func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, subj killSubject, method string) mcp.RPCMsg {
 	denial := normalizeDenial(deny.Denial)
 	if rec != nil {
@@ -187,16 +127,11 @@ func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.E
 	return denialResult(id, denial.Code, denial.ConditionType, method, "")
 }
 
-// killDropLeg identifies the transport leg a recordKillDrop call site drops a message
-// on, stamped into the audit detail so an operator can distinguish drop sites during an
-// incident. A typed enum (rather than a bare string at each of the 8 call sites) makes a
-// typo'd or duplicated leg a compile error there instead of a silently corrupted
-// "transport" detail — before this type existed, only 3 of those call sites had a test
-// asserting the exact string value, so a mistake would have gone uncaught. This covers the
-// recordKillDrop family only: the "transport" detail has two other producers
-// (recordSessionGateDeny's transportTag, and the server-request-undelivered literal in
-// http_session.go) that stay bare strings, so this narrows the typo surface rather than
-// eliminating it across the whole field.
+// killDropLeg identifies the transport leg a recordKillDrop call site drops a message on,
+// stamped into the audit detail so an operator can distinguish drop sites during an incident.
+// A typed enum (not a bare string at each of the 8 call sites) makes a typo'd leg a compile
+// error rather than a silently corrupted "transport" detail. Covers the recordKillDrop family
+// only; two other producers of the "transport" detail stay bare strings.
 type killDropLeg string
 
 const (
@@ -209,19 +144,12 @@ const (
 	legStdioUpstreamNotification killDropLeg = "stdio-upstream-notification"
 )
 
-// recordKillDrop records a kill-switch denial for a message that is DROPPED rather
-// than answered with a host-facing error — a fire-and-forget notification or a
-// server-initiated message that carries no response envelope to deny into. It mirrors
-// recordKillDenial's record shape (normalizeDenial's KILL_SWITCH code, no condition
-// mutation) and stamps the originating transport leg into the audit detail so the
-// dropped-message provenance stays visible, but returns nothing to send — the caller
-// still owns the drop control flow (ack, continue, return). rec may be nil (record
-// skipped), matching recordKillDenial; construct it via asRecorder so a nil sink is a
-// genuine nil interface. Folding the ~8 hand-mirrored drop-and-record sites here keeps
-// the record shape (identifier/method, the "transport" detail key) from drifting apart.
-// transportLeg is recorded as a plain string (converted from killDropLeg), matching the
-// detail value's shape before this type existed. subj decides how the session id is
-// recorded, exactly as in recordKillDenial — see killSubject.
+// recordKillDrop records a kill-switch denial for a message that is DROPPED rather than
+// answered with a host-facing error — a notification or a server-initiated message with no
+// response envelope to deny into. Mirrors recordKillDenial's record shape and stamps the
+// originating transport leg into the audit detail, but returns nothing to send — the caller
+// owns the drop control flow. rec may be nil (skipped). Folds ~8 hand-mirrored sites so the
+// record shape can't drift apart.
 func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, subj killSubject, identifier, method string, transportLeg killDropLeg) {
 	if rec == nil {
 		return
@@ -232,29 +160,14 @@ func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.Enf
 }
 
 // recordResourceExhausted records a host request refused because a concurrency pool was
-// saturated — the stdio hostSem, the HTTP per-session in-flight cap, or the HTTP
-// per-session notification pool — so a DoS-probe flood against EITHER transport leaves a
-// trace on the tamper-evident tape rather than only a JSON-RPC server-busy reply (or, for
-// a dropped notification, only a line on stderr). Shared by all three saturation sites so
-// they cannot record divergent shapes, or one silently forget to record at all. The
-// refused method is recorded (which method starved), but the identifier is left EMPTY on
-// purpose: the request is refused before its arguments are parsed, so there is no target,
-// and passing the method as the identifier would make deriveTargetFields synthesize a
-// phantom target from a mapped method (tools/call -> target "tools/call", prompts/get ->
-// "get"), polluting target-based audit aggregation. rec may be nil (no sink configured);
-// skipped then, matching recordKillDrop.
+// saturated, so a DoS-probe flood against either transport leaves a trace on the tape rather
+// than only a JSON-RPC server-busy reply. Shared by all three saturation sites so they can't
+// record divergent shapes. The identifier is left EMPTY (no target parsed yet) so
+// deriveTargetFields can't synthesize a phantom target. rec may be nil (skipped).
 //
-// gate is the saturated pool's own admission control, and is required (every call site
-// passes the address of a zero-value-usable field on the session or proxy that owns the
-// pool). It collapses an episode of saturation to one record carrying a
-// detailSuppressedRefusalCount of the refusals elided since — see saturationGate for why a
-// per-refusal record is a lever on the proxy's own availability under --require-audit=strict,
-// and why the gate is scoped to the pool rather than shared. suppressedScopeSession pairs
-// with it: unlike the pre-session bucket's detailSuppressedRefusalScope value
-// (suppressedScopeProxyCategory, spanning every route within one refusal category), this count describes exactly
-// the session whose id sits beside it on the same record — the write site's own scope
-// constant, matching how the pre-session bucket's scope is written at ITS site rather than
-// read off a field (see the const block in record_limiter.go).
+// gate is the saturated pool's own admission control (required), collapsing an episode of
+// saturation to one record carrying a suppressed-refusal count — see saturationGate for why a
+// per-refusal record is a lever on --require-audit=strict.
 func recordResourceExhausted(ctx context.Context, rec auditRecorder, gate *saturationGate, sessionID, method string) {
 	if rec == nil {
 		return
@@ -274,24 +187,17 @@ func recordResourceExhausted(ctx context.Context, rec auditRecorder, gate *satur
 }
 
 // suppressedScopeSession qualifies a saturation gate's rollup (see recordResourceExhausted):
-// the count spans only the one session — indeed only the one pool within it — whose refusals
-// fed the gate, never other sessions or the other pool. Written at this one call site rather
-// than carried on saturationGate itself, for the same reason suppressedScopeProxyCategory is written
-// at recordRefusal rather than carried on the pre-session limiter: a per-scope field would be
-// generality with a single caller.
+// the count spans only the one session (indeed one pool within it) whose refusals fed the
+// gate. Written at this call site rather than carried on saturationGate — a per-scope field
+// would be generality with a single caller.
 const suppressedScopeSession = "session"
 
-// recordDriftRefused writes the startup manifest-drift refusal record, for the same reason
-// recordResourceExhausted exists: both transports refuse a session on this condition, and
-// the record was hand-mirrored at the two sites with already-divergent nil handling (stdio
-// guarded its recorder, the HTTP path relied on routeSink's nil-receiver safety) and
-// different plumbing. Two copies of one record shape is how the same security event ends
-// up with two shapes depending on transport, which breaks any aggregation keyed on it --
-// and how one site silently forgets to record at all when a detail is added later.
+// recordDriftRefused writes the startup manifest-drift refusal record. Both transports refuse
+// a session on this condition; folding the previously hand-mirrored sites here keeps the
+// record shape from drifting apart between transports.
 //
-// The raw drift reason (which names the drifted tools) deliberately stays on stderr; the
-// tape carries only the stable DRIFT_REFUSED category, keeping the fixed-code discipline
-// the other refusal records follow.
+// The raw drift reason (naming the drifted tools) deliberately stays on stderr; the tape
+// carries only the stable DRIFT_REFUSED category.
 func recordDriftRefused(ctx context.Context, rec auditRecorder, sessionID string) {
 	if rec == nil {
 		return
@@ -309,74 +215,59 @@ type forwardParams struct {
 	upstreamTimeMs int
 	callUpstream   func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)
 	// endDecision closes the decision critical section a serialize-relevant transport opened
-	// around this enforced request, and is idempotent. The Decide* handlers call it (via
-	// dispatchParams.finishDecision) IMMEDIATELY after the PDP decision so the upstream
-	// forward runs OUTSIDE the turn; the ONE call that keeps it past the decision — a
-	// declassifying call, whose two phases must not be interleaved — is released HERE, by the
-	// forward core, the moment its commit lands.
+	// around this enforced request, idempotent. Decide* handlers call it immediately after the
+	// PDP decision so the forward runs OUTSIDE the turn; a declassifying call keeps it past the
+	// decision, released HERE by the forward core the moment its commit lands.
 	//
-	// That is why it lives on these params rather than beside the dispatcher's pdp: releasing
-	// it at handler return instead would hold the turn across the audit enqueue and the
-	// client-facing response write, and that write is bounded by a client that may simply stop
-	// reading. Under task anchoring the turn is shared, so a stalled client would be holding up
-	// another session's decisions. nil for a non-serialized request, where every call here is a
-	// no-op. The transports ALSO defer the same release, as a backstop for the paths that
-	// return before deciding.
+	// Lives on these params (not beside the dispatcher's pdp) because releasing at handler
+	// return would hold the turn across the client-facing response write, which is bounded by
+	// a client that may simply stop reading. nil for a non-serialized request. The transports
+	// also defer the same release as a backstop for paths that return before deciding.
 	endDecision func()
 	strictAuditState
 }
 
 // declassifyCommitter is the one method the forward core needs from the PDP: apply the flow
-// label clear an approved declassification authorized, for a call that was decided here and
-// has now actually run. *pdp.JWTPDP, *pdp.ManifestPDP and every other PolicyDecisionPoint
-// satisfy it, so the core stays ignorant of which one it holds.
+// label clear an approved declassification authorized, for a call decided here that has now
+// actually run. Every PolicyDecisionPoint satisfies it, so the core stays ignorant of which
+// one it holds.
 //
-// It is a narrow interface rather than a pdp.PolicyDecisionPoint field because that is all
-// this path may do: the decision has already been made, and nothing below it is allowed to
-// re-decide. The parameter is the decision's own handle for the same reason — the authorized
-// set is unexported, so this path can apply a clear but cannot widen one.
+// A narrow interface (not a pdp.PolicyDecisionPoint field) because that is all this path may
+// do — the decision is already made, and nothing below it may re-decide. The decision's own
+// handle is the parameter for the same reason: the authorized set is unexported, so this path
+// can apply a clear but cannot widen one.
 type declassifyCommitter interface {
 	CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) ([]string, error)
 }
 
-// declassifyCommitTimeout bounds the single flow-store write commitDeclassify makes after
-// the upstream call has returned.
+// declassifyCommitTimeout bounds the single flow-store write commitDeclassify makes after the
+// upstream call returns.
 //
-// It sits on the host's response path AND under the anchor-keyed decision turn, which a
-// declassifying call holds until its commit lands — so an exhausted bound stalls that
-// response and every other decision on the session for its full length. That is why it is
-// shorter than a bound chosen for a background write would be: long enough to ride out an
-// ordinary backend hiccup, short enough that a wedged flow store degrades a session's
-// latency rather than its availability. Failing it is not a refusal — the label simply stays
-// and a later sink over-blocks — so waiting longer buys little and costs the whole session.
+// It sits on the host's response path AND under the anchor-keyed decision turn a
+// declassifying call holds until commit — so an exhausted bound stalls every decision on the
+// session for its full length. Shorter than a background-write bound would be: long enough to
+// ride out a hiccup, short enough that a wedged flow store degrades latency, not availability.
+// Failing it is not a refusal — the label just stays and a later sink over-blocks.
 const declassifyCommitTimeout = 2 * time.Second
 
-// strictAuditState is the --require-audit=strict configuration shared by the
-// host-facing forward path (forwardParams) and the server-initiated sampling path
-// (serverRequestParams). Embedded in both so a future field driving the strict gate
-// is declared once instead of mirrored across the two parameter structs; the fields
-// are promoted, so call sites still read fp.requireAuditStrict / fp.strictAuditWarned
-// unchanged. The gate condition (auditGateTripped) and the one-shot warning
-// (warnStrictAuditOnce) are package functions the two parents' denial methods share —
-// this groups only the configuration both carry.
+// strictAuditState is the --require-audit=strict configuration shared by the host-facing
+// forward path (forwardParams) and the server-initiated sampling path (serverRequestParams).
+// Embedded in both so a future field is declared once instead of mirrored; fields are
+// promoted, so call sites still read fp.requireAuditStrict / fp.strictAuditWarned unchanged.
 type strictAuditState struct {
 	// requireAuditStrict is the --require-audit=strict gate: once a prior record
 	// has been lost, an otherwise-authorized forward is denied fail-closed
 	// (AUDIT_UNAVAILABLE) so no further privileged call reaches the upstream
 	// unaudited. Retrospective (see auditRecorder.AuditDegraded). Off by default.
 	requireAuditStrict bool
-	// strictAuditWarned makes the strict-gate stderr warning one-shot — the gate is
-	// sticky, so it would otherwise log on every forward. The durable per-call
-	// signal is the AUDIT_UNAVAILABLE deny record. nil disables the warning (tests).
+	// strictAuditWarned makes the strict-gate stderr warning one-shot — the gate is sticky, so
+	// it would otherwise log on every forward. nil disables the warning (tests).
 	strictAuditWarned *atomic.Bool
 }
 
-// auditGateTripped reports whether the --require-audit=strict gate should fail a
-// forward closed (strict on, sink present, trail degraded). reason is the prose
-// degradation note (host-facing error + stderr warning); detail is the discrete
-// counts for the structured deny record (nil when not tripped). Shared by the
-// forward core, */list dispatch, and the sampling leg so the gate condition lives
-// once.
+// auditGateTripped reports whether --require-audit=strict should fail a forward closed.
+// reason is prose for the host-facing error/stderr warning; detail is discrete counts for
+// the structured deny record. Shared by the forward core, */list dispatch, and sampling.
 func auditGateTripped(rec auditRecorder, strict bool) (tripped bool, reason string, detail map[string]interface{}) {
 	if !strict || rec == nil {
 		return false, "", nil
@@ -384,9 +275,8 @@ func auditGateTripped(rec auditRecorder, strict bool) (tripped bool, reason stri
 	return rec.AuditDegraded()
 }
 
-// warnStrictAuditOnce emits the "strict mode is now denying forwards" stderr line
-// exactly once per process, on the first trip. Subsequent denials remain visible
-// as AUDIT_UNAVAILABLE records. A nil guard (tests) suppresses it entirely.
+// warnStrictAuditOnce emits the "strict mode is now denying forwards" stderr line once per
+// process, on the first trip; later denials remain visible as AUDIT_UNAVAILABLE records.
 func warnStrictAuditOnce(warned *atomic.Bool, reason string) {
 	if warned != nil && warned.CompareAndSwap(false, true) {
 		fmt.Fprintf(os.Stderr,
@@ -397,26 +287,17 @@ func warnStrictAuditOnce(warned *atomic.Bool, reason string) {
 	}
 }
 
-// warnIfStrictAuditJustDegraded runs recordFn (a RecordAllow/RecordDeny call for a
-// call already forwarded to the upstream) and, under strict mode, emits an
-// immediate, call-scoped SECURITY warning if the trail transitioned from healthy to
-// degraded across that exact call — i.e., this record's own enqueue is plausibly
-// the one that tripped the gate.
+// warnIfStrictAuditJustDegraded runs recordFn (a RecordAllow/RecordDeny for a call already
+// forwarded) and, under strict mode, emits an immediate SECURITY warning if the trail
+// transitioned healthy-to-degraded across that exact call.
 //
-// This narrows, but does not close, the strict gate's documented retrospective
-// window (auditRecorder.AuditDegraded): the gate check in strictAuditDenial runs
-// BEFORE callUpstream, using degradation counters that only reflect prior calls, so
-// the boundary call whose own record is the first lost is still forwarded — the
-// next call is the first one denied. Without this, an operator learns about that
-// boundary call's possible loss only indirectly, once a later request trips
-// AUDIT_UNAVAILABLE. Closing the window fully would require making the record
-// synchronous/blocking under strict mode, trading forward latency for the
-// guarantee; this stays non-blocking and only adds an immediate diagnostic.
+// Narrows, but doesn't close, the strict gate's retrospective window: the gate check runs
+// BEFORE callUpstream using counters that only reflect prior calls, so the boundary call
+// whose own record is the first lost is still forwarded. Closing it fully would require a
+// synchronous record under strict mode; this stays non-blocking, adding only a diagnostic.
 //
-// Best-effort, not exact attribution: concurrent in-flight requests at the exact
-// transition instant may each observe the healthy-to-degraded flip and each warn.
-// That is acceptable — every such call is a genuine candidate for the boundary
-// call, not an unrelated false positive.
+// Best-effort, not exact attribution: concurrent in-flight requests at the transition instant
+// may each warn, which is acceptable — each is a genuine boundary-call candidate.
 func warnIfStrictAuditJustDegraded(strict bool, rec auditRecorder, kind, target string, recordFn func()) {
 	if !strict || rec == nil {
 		recordFn()
@@ -435,14 +316,10 @@ func warnIfStrictAuditJustDegraded(strict bool, rec auditRecorder, kind, target 
 	}
 }
 
-// recordUpstreamFailure records the deny for a callUpstream error and returns the
-// host-facing JSON-RPC error response. Shared by the enforced-forward core and the
-// */list dispatch path (via promotion to dispatchParams) so both produce byte-identical
-// audit records and responses for the same physical upstream outage — a change to the
-// failure record's shape (e.g. stamping a timeout budget) then cannot land on one path
-// and silently drift the other. dispatchList passes the method as both auditID and
-// method (a */list request has no sub-target); the forward core passes the per-target
-// audit id.
+// recordUpstreamFailure records the deny for a callUpstream error and returns the host-facing
+// JSON-RPC error response. Shared by the forward core and */list dispatch so both produce
+// byte-identical records for the same physical outage. dispatchList passes the method as
+// both auditID and method (no sub-target); the forward core passes the per-target audit id.
 func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string, detail map[string]interface{}) mcp.RPCMsg {
 	code, reason, rpcCode := upstreamErrInfo(err, fp.upstreamTimeMs)
 	// This deny records a call already forwarded to (and answered, however badly, by)
@@ -456,51 +333,25 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 	return mcp.ErrorResponse(msg.ID, rpcCode, reason)
 }
 
-// declassifyRefusalDetail reports, for a call this transport is refusing BELOW the
-// decision, that an approved declassification did not take effect — and names the
-// single-use grant the decision spent to authorize it. It returns nil, and touches nothing,
-// for a decision that authorized no clear, which is every call in a deployment with no
-// declassify directive.
+// declassifyRefusalDetail reports, for a call refused BELOW the decision, that an approved
+// declassification did not take effect — and names the single-use grant it spent. Returns nil
+// for a decision that authorized no clear (every call with no declassify directive).
 //
-// There is nothing to UNDO here, and that is the point of the two-phase clear. The clear is
-// applied by commitDeclassify on the success path only, so by the time any of the three
-// refusals below the decision runs (the --require-audit=strict gate, an upstream transport
-// failure, a redaction failure) the labels were never removed and the session is exactly as
-// tainted as the calls it actually made. The compensating restore this replaced ran AFTER
-// the upstream round trip, so it could only ever narrow the window in which a concurrent
-// decision saw the cleared set — never close it — and its own failure arm was the residual
-// fail-open an operator was told to alert on.
+// Nothing to UNDO here, which is the point of the two-phase clear: commitDeclassify applies
+// it only on the success path, so at any refusal below the decision the labels were never
+// removed. The grant is still BURNED (the atomic "once" test belongs with the decision that
+// accepted it) — over-refusal the operator resolves with another approval.
 //
-// The single-use grant is still BURNED, because the burn is the atomic test that makes
-// "once" mean once and so belongs with the decision that accepted it (see burnApproval).
-// That is over-refusal — the operator mints another approval — and it is the fact the record
-// has to carry, since nothing else on the tape would name a grant spent by a call that did
-// not run.
-//
-// Those three refusals are not its only callers, and the doc used to read as though they were.
-// Two more sites reach it: the redaction exit goes through declassifyRedactionDetail (which
-// adds the executed-and-withheld fact when the reply supports it, and falls back to this shape
-// when it does not), and the success path's else-branch calls this for a call that WAS
-// forwarded and delivered but whose reply showed the action failing — an isError result or a
-// JSON-RPC error. That last one rides an ALLOW record, so "not applied" here means the clear
-// did not take effect, never that the request was rejected; see audit.DeclassifyNotAppliedKey,
-// which states the same for the key.
-//
-// It reads nothing but the decision, so it is a package function rather than a method: the
-// server-initiated leg needs the same annotation and has its own params type (see
-// serverRequestParams), and a second copy of "which declassify facts does this refusal carry"
-// is exactly the mirrored shape this file's other shared helpers exist to avoid.
+// Called from five sites beyond its three obvious refusals: declassifyRedactionDetail falls
+// back to this shape, and the success path's else-branch calls it for a delivered reply whose
+// action failed (isError/JSON-RPC error) — riding an ALLOW record there, so "not applied"
+// never means "rejected". A package function (not a method) since it reads only the decision,
+// and the server-initiated leg needs the same annotation via its own params type.
 func declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interface{} {
-	// Either fact on its own is worth a record, and neither implies the other. A refusal
-	// below the decision carries the labels but no spent id when the grant was standing; the
-	// engine's own declassify-leg commit fault carries a spent id but no labels, because the
-	// clear never got as far as being resolved. Both hang off the ONE handle, so they cannot
-	// disagree about which decision they came from — but the presence test is still both
-	// facts, NOT the handle's nil. A handle exists for every APPROVED declassification, and an
-	// approved clear whose labels the anchor was not carrying, under a standing grant, has
-	// neither fact to report: testing the nil instead put a bare flow discriminator on the
-	// tape for a call with no declassification evidence, and let declassifyRedactionDetail
-	// stamp an executed-and-withheld claim on it.
+	// Either fact is worth a record on its own, and neither implies the other; both hang off
+	// the ONE handle so they can't disagree about which decision they came from. Testing the
+	// handle's nil instead (rather than both facts) put a bare flow discriminator on the tape
+	// for a call with no declassification evidence at all.
 	if !dec.Declassification.PendingClear() {
 		return spentGrantDetail(dec)
 	}
@@ -511,13 +362,9 @@ func declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interfac
 }
 
 // spentGrantDetail is the annotation for a call with nothing to clear but a burned single-use
-// grant to name: the flow discriminator and the spent id, or nil when the decision burned
-// nothing.
-//
-// It is the whole record a NO-OP clear produces — the decision authorized labels the anchor
-// was not carrying, so nothing is removed and nothing is "not applied", but the grant is spent
-// for good and this is the only record that will ever name it. Both the success path and the
-// refusal paths reach it, because the fact is the same on each.
+// grant to name, or nil when the decision burned nothing. The whole record a NO-OP clear
+// produces — nothing is "not applied", but the grant is spent for good, and this is the only
+// record that will ever name it. Reached by both the success and refusal paths.
 func spentGrantDetail(dec capability.EnforceResponse) map[string]interface{} {
 	if dec.Declassification.SpentApprovalID() == "" {
 		return nil
@@ -530,33 +377,20 @@ func spentGrantDetail(dec capability.EnforceResponse) map[string]interface{} {
 // declassifyRedactionDetail is declassifyRefusalDetail for the redaction-failure exit — the
 // one refusal below the decision that the upstream may have ANSWERED before it was taken.
 //
-// It exists because the reasoning the other two exits share does not hold here. The strict
-// gate blocks before the forward and an upstream transport failure leaves it unknowable
-// whether a side effect landed, so for both of them "the approved clear did not take effect"
-// is the whole story. Reaching this exit means a reply came back and eunox dropped it rather
-// than forward it unredacted. Sharing one detail shape across all three told an operator
-// reconciling a burned `once` grant that the call might never have happened, when here it may
-// demonstrably have run — the difference between reissuing the approval to retry the work and
-// reissuing it to re-deliver work already done.
+// The other two exits share "the approved clear did not take effect" as the whole story
+// (blocked before the forward, or unknowable whether a side effect landed). Here a reply came
+// back and eunox dropped it rather than forward it unredacted, so it may demonstrably have
+// run — worth distinguishing so an operator knows whether reissuing the approval retries the
+// work or re-delivers work already done.
 //
-// "A reply came back" is NOT the claim, though, and the gate is what makes the difference. The
-// withheld-result key asserts the sanitizing action EXECUTED, and that is decided by the same
-// declassifyCommitted the success path uses — never by the mere presence of a result body.
-// A reply flagged isError, a reply carrying an error member beside a result (which JSON-RPC
-// forbids and a hostile upstream may still emit), or bytes this build cannot interpret all
-// mean the transform did not happen, and every one of them can reach this exit with a
-// non-nil Result that then fails redaction. Stamping "executed" on those would put a fact on
-// the signed tape that the proxy cannot back — and an upstream can produce them at will — so
-// an unsuccessful reply falls back to the plain refusal shape. dec.Decision is checked for the
-// reason the commit gate checks it: the observe path forwards a call whose verdict was a DENY,
-// and a downgraded deny must not be reported as an executed declassification.
+// "Executed" is decided by the same declassifyCommitted the success path uses, never by mere
+// presence of a result body — an isError reply, a hostile result+error envelope, or
+// undecodable bytes all mean the transform did not happen and fall back to the plain refusal
+// shape; stamping "executed" there would put an unbackable fact on the signed tape.
 //
-// The clear stays withheld either way, and that is decided here rather than inherited: the
-// redacted response never reached the host, so nothing sanitized entered the session and the
-// taint still describes it accurately. See audit.DeclassifyResultWithheldKey for the full
-// reasoning and the accepted cost. Returns nil for a decision that authorized no clear and
-// spent no grant, exactly as declassifyRefusalDetail does — a redaction failure on an ordinary
-// call is not a declassification event and gets no flow annotation.
+// The clear stays withheld either way: the redacted response never reached the host, so the
+// taint still accurately describes what entered the session. See
+// audit.DeclassifyResultWithheldKey.
 func declassifyRedactionDetail(dec capability.EnforceResponse, upResp mcp.RPCMsg) map[string]interface{} {
 	detail := declassifyRefusalDetail(dec)
 	if detail == nil {
@@ -577,36 +411,22 @@ func declassifyRedactionDetail(dec capability.EnforceResponse, upResp mcp.RPCMsg
 }
 
 // declassifyDetail starts a declassification detail map with the discriminator every
-// information-flow event on the tape carries, so one filter finds these beside the sink
-// denials and the declassify escalations. Shared by the refusal and commit paths because
-// they had already diverged on it once: the commit-failure record — the one operators are
-// told to alert on — was the only declassification event without it.
-//
-// The reserved `_eunox_declassify_*` keys, not this, are what a rule should MATCH on: two of
-// them ride an allow record whose details is the caller's argument map under --audit, and a
-// bare key there is caller-writable. This is a filter aid, not evidence.
-//
-// The key itself comes from capability.FlowAuditDetailKey rather than a literal spelled here:
-// this is the one producer outside pkg/enforcement, so a package-wide grep no longer catches a
-// divergence, and the records that would silently drop out of an operator's flow filter are
-// precisely the declassification ones nothing else on the tape reports.
+// information-flow event on the tape carries, so one filter finds these beside sink denials
+// and declassify escalations. Shared by refusal and commit paths, which had already diverged
+// on it once. The reserved `_eunox_declassify_*` keys, not this, are what a rule should
+// MATCH on — this is a filter aid, not evidence.
 func declassifyDetail() map[string]interface{} {
 	return map[string]interface{}{capability.FlowAuditDetailKey: true}
 }
 
-// addSpentApproval stamps the single-use declassify grant this call burned, if it burned
-// one. Shared by the allow and refusal paths because the fact is the same on both: a `once`
-// approval is spent by the decision that accepted it, whether the call went on to succeed,
-// to be refused, or to clear nothing at all. One key, one provenance — see
-// audit.DeclassifySpentApprovalKey, and the consumed_approval_id rule it follows.
+// addSpentApproval stamps the single-use declassify grant this call burned, if it burned one.
+// Shared by allow and refusal paths since a `once` approval is spent by the decision that
+// accepted it regardless of outcome. See audit.DeclassifySpentApprovalKey.
 //
-// Bounded before it lands, through the SAME cap the top-level approval_id gets. The id is an
-// IdP-supplied string Validate() places no length limit on, and unlike the engine's own
-// refusal details — which pass through enforcement.BoundDenialDetails — a value written straight into a
-// transport-built details map reaches the tape under only the 1 MiB whole-map cap. Left
-// unbounded, one 500 KB approval id would write 128x the envelope cap per declassification
-// into the tape and the audit queue's byte budget, on exactly the value declassifyRefusal's
-// own doc calls out as one that must not carry an unbounded value onto the signed tape.
+// Bounded through the SAME cap the top-level approval_id gets: the id is an IdP-supplied
+// string with no length limit, and a transport-built details map only gets the 1 MiB
+// whole-map cap — unbounded, one 500 KB approval id would write 128x the envelope cap per
+// declassification into the tape.
 func addSpentApproval(detail map[string]interface{}, dec capability.EnforceResponse) {
 	spent := dec.Declassification.SpentApprovalID()
 	if spent == "" {
@@ -615,32 +435,22 @@ func addSpentApproval(detail map[string]interface{}, dec capability.EnforceRespo
 	detail[audit.DeclassifySpentApprovalKey] = audit.BoundEnvelopeField(spent)
 }
 
-// commitDeclassify applies the label clear an approved declassification authorized, for a
-// call that has now RUN and whose response is about to reach the host. It returns what the
-// clear actually changed — for the allow record's top-level labels_cleared/approver/
-// approval_id triple — and the extra details that record must carry.
+// commitDeclassify applies the label clear an approved declassification authorized, for a call
+// that has now RUN and whose response is about to reach the host. Returns what the clear
+// changed (for the allow record's labels_cleared/approver/approval_id triple) and the extra
+// details.
 //
-// It is the second phase of the clear, and its position is the whole fix: the labels stay
-// visible to every concurrent decision until the sanitizing call has completed, so a sink
-// that the taint exists to stop cannot be allowed while that call is still in flight. That
-// holds without leaning on the decision turn at all, which the transport deliberately
-// releases before the forward, and which is in-process only — two eunox instances against one
-// backend hold independent turns for the same anchor.
+// The second phase of the clear: labels stay visible to every concurrent decision until the
+// sanitizing call completes, so a sink cannot be allowed while it's still in flight. Holds
+// without leaning on the decision turn (deliberately released before the forward, and
+// in-process only).
 //
-// A commit FAULT is not a refusal. The upstream has already executed the action and its
-// (redacted) response is in hand, so there is nothing left to withhold; the honest outcome
-// is to deliver it and record that the clear did not land. The session then keeps taint it
-// should have dropped, which over-blocks a later sink until the operator retries under a new
-// approval — the fail-closed direction, and the mirror of the burn's own accepted
-// over-refusal.
+// A commit FAULT is not a refusal — the upstream already executed the action, so the honest
+// outcome is to deliver it and record the clear didn't land; the session keeps taint it
+// should have dropped, over-blocking until retried under a new approval (fail-closed).
 //
-// committer and sessionID are passed rather than read off a params struct so the two legs that
-// can hold a decision — the host path (forwardParams) and the server-initiated one
-// (serverRequestParams) — share this body instead of mirroring it. It is the shape
-// enforcedForwardCore itself now takes, for the same reason and one stronger: the committer
-// must be the decision point that MADE the decision, and a params field holding a second copy
-// of it is a pair to keep in agreement rather than one value passed down from the dispatcher
-// that holds it.
+// committer and sessionID are passed rather than read off a params struct so the host path
+// and the server-initiated one share this body instead of mirroring it.
 func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessionID string, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
 	decl := dec.Declassification
 	if !decl.PendingClear() {
@@ -659,26 +469,13 @@ func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessio
 	addSpentApproval(detail, dec)
 	cleared, err := commitCleared(ctx, committer, sessionID, decl)
 	if errors.Is(err, capability.ErrDeclassificationCommitted) {
-		// A SECOND commit of one decision, which is a wiring fault rather than a store fault
-		// and must be reported as one. It is unreachable through this transport's call graph
-		// (a decision reaches the commit at most once), and the branch exists because the
-		// handle's single-use claim answers "what if it is called twice" — so this has to
-		// answer it correctly rather than plausibly.
-		//
-		// The facts are the opposite of a commit fault's: the first commit APPLIED the clear,
-		// so the labels are gone, the session is not over-blocking, and there is nothing for
-		// an operator to re-approve. Folding it into the arm below stamped the alert key that
-		// says the clear could not be applied and printed the instruction to retry under a new
-		// approval — telling an operator to reissue an approval for work that already landed,
-		// which is the unsafe direction for an alert to be wrong in.
-		//
-		// Nothing is cleared HERE (this call removed nothing), so the record carries only the
-		// spent grant — through spentGrantDetail, the same producer the no-op-clear path uses,
-		// rather than the map built above. That map is declassifyDetail() plus a spent id that
-		// a STANDING grant does not have, so returning it would put a bare flow discriminator
-		// on the tape for a call with no declassification evidence at all — the shape
-		// declassifyRefusalDetail's own doc identifies as the defect that made it test both
-		// facts rather than the handle's nil.
+		// A SECOND commit of one decision is a wiring fault, not a store fault, and must be
+		// reported as one. Unreachable through this transport's call graph, but the handle's
+		// single-use claim answers "what if it is called twice", so this must answer
+		// correctly rather than plausibly. The first commit already applied the clear, so
+		// folding this into the fault arm below would tell an operator to reissue an
+		// approval for work that already landed — the unsafe direction for an alert to be
+		// wrong in. Nothing is cleared HERE, so the record carries only the spent grant.
 		fmt.Fprintf(os.Stderr,
 			"[eunox] WARN declassify %s %q: the authorized clear was committed twice; the first commit applied it and this one changed nothing (proxy wiring fault, not a flow-store failure — the session is NOT over-tainted)\n",
 			kind, target)
@@ -686,39 +483,27 @@ func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessio
 	}
 	if err != nil {
 		authorized := decl.Labels()
-		// The call ran and the clear did not, so the tape says so. Spelled as its own key
-		// rather than a flag beside the refusal's, because the operator action differs: this
-		// one means the flow store faulted on a call that really happened, and the approval
-		// has to be reissued for the session to reach the state the policy describes.
+		// The call ran and the clear did not, so the tape says so — a distinct key from the
+		// refusal's, since the operator action differs: reissue the approval to reach the
+		// state the policy describes.
 		detail[audit.DeclassifyCommitFailedKey] = authorized
 		fmt.Fprintf(os.Stderr,
 			"[eunox] WARN declassify %s %q ran under an approved declassification, but the flow label(s) %v could not be cleared: %v — the session stays tainted, so a later sink will over-block until the action is retried under a new approval\n",
 			kind, target, authorized, err)
-		// cleared may still be non-empty beside the error (a Remove can delete and then lose
-		// its reply), and it is DISCARDED here rather than reported: labels_cleared is a
-		// signed claim that these labels are gone, and a set that may or may not have landed
-		// cannot back it. The key above carries the whole authorized set instead, which is
-		// the superset an operator has to reconcile either way.
+		// cleared may still be non-empty beside the error (a Remove can delete and lose its
+		// reply); DISCARDED here since labels_cleared is a signed claim these labels are
+		// gone, which an uncertain set cannot back.
 		return nil, detail
 	}
 	return cleared, detail
 }
 
-// declassifyCommitted reports whether the upstream's reply is one an approved
-// declassification may be committed against — i.e. whether the sanitizing action actually
-// SUCCEEDED, not merely whether a message came back.
-//
-// "The call ran" is not the same as "the call did what the approval was granted for". A
-// declassification's whole premise is that some transform completed, so a sanitize that
-// answers with a JSON-RPC error, or an MCP tool result flagged `isError`, must not drop the
-// taint: the data was never sanitized and the next egress would be forwarded on the strength
-// of a step that failed. Both shapes are checked because MCP conveys tool-level failure in
-// the RESULT (`isError: true`) while protocol-level failure uses the error member, and only
-// the second is visible to the transport-failure branch above.
-//
-// Ambiguity reads as failure. Bytes that do not decode, or a non-object result, return false
-// and leave the taint in place — over-blocking, which the operator resolves with another
-// approval, rather than clearing on a reply this build could not interpret.
+// declassifyCommitted reports whether the upstream's reply is one an approved declassification
+// may be committed against — whether the sanitizing action actually SUCCEEDED, not merely
+// whether a message came back. A JSON-RPC error or an `isError` tool result must not drop the
+// taint: the transform never ran. Ambiguity (undecodable bytes, non-object result) reads as
+// failure — over-blocking, resolved with another approval, rather than clearing on a reply
+// this build could not interpret.
 func declassifyCommitted(upResp mcp.RPCMsg) bool {
 	if upResp.Error != nil {
 		return false
@@ -726,10 +511,8 @@ func declassifyCommitted(upResp mcp.RPCMsg) bool {
 	if upResp.Result == nil {
 		return false
 	}
-	// A substring probe before the decode: `isError` is absent from the overwhelming
-	// majority of tool results, and a tool result is the largest body on the wire. A miss is
-	// safe in the only direction that matters — it reads as "no failure flag", which is what
-	// an absent key means.
+	// A substring probe before the decode: `isError` is absent from most tool results, and a
+	// tool result is the largest body on the wire. A miss safely reads as "no failure flag".
 	if !bytes.Contains(upResp.Result, []byte(`"isError"`)) {
 		return true
 	}
@@ -742,21 +525,13 @@ func declassifyCommitted(upResp mcp.RPCMsg) bool {
 	return res.IsError == nil || !*res.IsError
 }
 
-// commitCleared runs the clear on a context that outlives the request.
+// commitCleared runs the clear on a context that outlives the request. The request's own
+// context is wrong: a client disconnecting while its response is being assembled cancels it,
+// failing the commit exactly when the call it sanitizes DID run.
 //
-// The request's own context is the wrong one, and systematically so on the path that
-// matters: the forward has just returned, and a client that disconnects while its response
-// is being assembled cancels that context — after which a context-honouring FlowLabelStore
-// (the Redis backend passes ctx into every pipelined command) fails the commit immediately.
-// The clear would be lost precisely when the call it sanitizes DID run. Every other
-// post-request state operation in this package already detaches for this reason; see the
-// ReleaseSession contract.
-//
-// context.WithoutCancel, NOT context.Background: the anchor the labels are cleared under
-// resolves from the request's validated claims, so a fully detached context would clear the
-// SESSION key for a task-anchored call — leaving the task tainted while deleting a label the
-// session never asked to drop, and reporting success. WithoutCancel keeps the values and
-// drops only the cancellation. See PolicyDecisionPoint.CommitDeclassified's context contract.
+// context.WithoutCancel, NOT context.Background: the anchor resolves from the request's
+// validated claims, so a fully detached context would clear the SESSION key for a
+// task-anchored call — leaving the task tainted while reporting success.
 func commitCleared(ctx context.Context, committer declassifyCommitter, sessionID string, decl *capability.Declassification) ([]string, error) {
 	if committer == nil {
 		// Unreachable through either params constructor, both of which set this from the same
@@ -771,32 +546,16 @@ func commitCleared(ctx context.Context, committer declassifyCommitter, sessionID
 	return committer.CommitDeclassified(commitCtx, sessionID, decl)
 }
 
-// mergeAuditDetails folds extra into base and returns a map the caller OWNS, without
-// mutating either input. It is the package's one "fold extra keys into an audit details
-// map" primitive; both producers of an enforced record's details go through it.
+// mergeAuditDetails folds extra into base and returns a map the caller OWNS, without mutating
+// either input. The package's one "fold extra keys into an audit details map" primitive.
 //
-// Always allocating is the load-bearing part, and it is why the empty-extra shortcut this
-// used to have is gone. base is routinely a map the record is supposed to DESCRIBE rather
-// than one this package owns:
+// Always allocating is load-bearing: base is routinely a map the record is supposed to
+// DESCRIBE rather than one this package owns (the request's own parsed argument map, or the
+// engine's denial.Details) — handing one of those back would let a later-written key (an
+// effect receipt annotation) silently corrupt the request on the signed tape.
 //
-//   - the audit-mode tools/call path passes the request's own parsed argument map straight
-//     through (see dispatchToolsCall), and
-//   - the deny paths pass the engine's denial.Details, read concurrently by nothing else but
-//     owned by the decision, not by the record builder.
-//
-// Handing one of those back means the next key a caller writes into the result — the effect
-// receipt, and any annotation added later — lands in the request's own argument map, so the
-// record silently misreports the request on the signed tape. Returning a fresh map on every
-// call makes that unrepresentable instead of a property of who currently writes what
-// afterwards. The saving it gives up is one shallow map copy on a path that is already
-// serializing, signing and writing an audit record.
-//
-// The one case that allocates nothing is the one where there is nothing to own AND nothing to
-// hand back: a nil base with no extra returns nil, preserving nil-vs-empty (the sink omits a
-// nil details map from the record entirely and marshals an empty one as {}). An EMPTY non-nil
-// base does not take that path — returning it would hand back an input, and "an empty map has
-// nothing to corrupt" is a claim about reads, not about the write that would put the first
-// entry in it. The invariant is total or it is a rule the next caller has to remember.
+// nil base with no extra returns nil (preserving nil-vs-empty for the sink); an EMPTY non-nil
+// base does NOT take that shortcut — returning it would hand back an input.
 func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{} {
 	if base == nil && len(extra) == 0 {
 		return nil
@@ -811,32 +570,18 @@ func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{
 	return out
 }
 
-// strictAuditDenial implements the --require-audit=strict gate for the
-// host-facing path. When strict mode is active and the trail has degraded, it
-// records a fail-closed AUDIT_UNAVAILABLE deny and returns the host-facing denial
-// (ok=true); otherwise ok=false and the caller proceeds. The deny record here may
-// itself be dropped, which is fine — the call is denied either way, so no
-// unaudited privileged call reaches the upstream. Only the forward path needs
-// gating; a hard deny already returns without contacting the upstream.
+// strictAuditDenial implements the --require-audit=strict gate for the host-facing path: when
+// strict mode is active and the trail has degraded, it records a fail-closed AUDIT_UNAVAILABLE
+// deny and returns the host-facing denial (ok=true); otherwise ok=false and the caller proceeds.
 //
-// dec is the decision this gate is refusing below, zero for the paths that run no decision at
-// all (a */list dispatch, a session-creating initialize). Its declassification facts ride the
-// deny record: blocking here means the sanitizing action never runs, so an approved clear did
-// not take effect and a single-use grant the decision burned is named nowhere else.
+// dec is the decision this gate refuses below, zero for paths that run no decision at all. Its
+// declassification facts ride the deny record: blocking here means the sanitizing action never
+// runs, so an approved clear's grant is named nowhere else.
 //
-// The decision is passed rather than a pre-built details map, and that is the whole reason the
-// parameter has this type: the gate returns without reading it at all whenever the audit trail
-// is healthy, which is every call in every healthy deployment. Building the map at the call
-// site allocated it — plus a full copy of the handle's label slice — and handed both straight
-// to the GC on the overwhelming common path, for a value nothing read. Deriving it inside the
-// tripped branch is what the server-initiated twin (strictServerRequestAuditDenial) already
-// does, and there is no reason for the two legs to differ.
-//
-// It is a value rather than a callback for the reason the callback was removed: the caller's
-// version used to have a SIDE EFFECT — undoing a declassification the decision had already
-// committed — which had to be withheld from the non-blocking path, and the closure existed for
-// that. Nothing below the decision mutates state any more, so a closure would now only suggest
-// to the next reader that this gate writes flow state.
+// dec (not a pre-built details map) is the parameter because the gate returns without reading
+// it whenever the trail is healthy — every call in a healthy deployment — so building the map
+// at the call site would allocate for a value nothing reads. A value, not a callback: nothing
+// below the decision mutates state, unlike the compensating version this replaced.
 func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, dec capability.EnforceResponse) (mcp.RPCMsg, bool) {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
@@ -851,12 +596,9 @@ func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, a
 	return denialResult(msg.ID, capability.ErrCodeAuditUnavailable, "", denialTarget, ""), true
 }
 
-// normalizeDenial returns a non-nil DenialInfo for a deny decision. A deny is
-// contractually expected to populate Denial, but PolicyDecisionPoint is an
-// exported seam a third-party PDP could implement with a nil Denial; dereferencing
-// it would panic the request goroutine (fail-open-via-crash). Substitute a generic
-// AUTHORIZATION_FAILED denial so every deny path has structured fields. Shared by
-// the forward core, sampling path, */list dispatch, and the initialize kill-check.
+// normalizeDenial returns a non-nil DenialInfo for a deny decision. A third-party PDP could
+// implement PolicyDecisionPoint with a nil Denial; dereferencing it would panic the request
+// goroutine (fail-open-via-crash), so substitute a generic AUTHORIZATION_FAILED denial.
 func normalizeDenial(d *capability.DenialInfo) *capability.DenialInfo {
 	if d == nil {
 		return &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed}
@@ -864,48 +606,29 @@ func normalizeDenial(d *capability.DenialInfo) *capability.DenialInfo {
 	return d
 }
 
-// isObserveDeny reports whether a deny decision should be downgraded to a logged
-// forward (audit/observe mode) instead of hard-blocked. Kill-switch denials and
-// hard denials (denial.HardDeny==true, e.g. antecedent record failure) are never
-// downgraded: both block even in audit mode and even on a route running under --audit.
-// The enforced forward core and the sampling leg share this so their two observe
-// gates cannot drift: audit is the route-level --audit posture, auditOnly the
-// per-entry enforcement decision.
+// isObserveDeny reports whether a deny decision should be downgraded to a logged forward
+// (audit/observe mode) instead of hard-blocked. Kill-switch and hard denials are never
+// downgraded. Shared by the forward core and the sampling leg so their observe gates agree.
 func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) bool {
-	// denial is always non-nil here: both callers normalize via normalizeDenial
-	// first. A nil denial must not be treated as safe-to-downgrade, so this
-	// intentionally omits a nil guard rather than defaulting nil to observable.
+	// denial is always non-nil here (both callers normalize first); intentionally no nil
+	// guard, since defaulting nil to observable would be the wrong direction to fail in.
 	return !pdp.IsKillSwitchDenial(denial) && !denial.HardDeny && (auditMode || auditOnly)
 }
 
-// enforcedForwardCore is the shared deny/observe/forward/record decision both
-// transports apply to every enforced method (tools/call, resources/read,
-// resources/subscribe, resources/unsubscribe, prompts/get). It returns the JSON-RPC message to deliver
-// to the host — a denial, an upstream transport error, or the upstream's
-// (possibly redacted) response. The transports differ only in delivery.
+// enforcedForwardCore is the shared deny/observe/forward/record decision both transports apply
+// to every enforced method. Returns the JSON-RPC message to deliver to the host — a denial, an
+// upstream transport error, or the (possibly redacted) response. Transports differ only in
+// delivery.
 //
-// Sequence: a hard deny records and returns a structured denial (upstream never
-// called); audit-mode/route-level observe downgrades a deny to a logged forward
-// (but a kill-switch deny always hard-blocks); an upstream transport error records
-// a deny with the upstream error code; on success, redactFields obligations are
-// applied (fail closed) and an allow is recorded with the obligation tokens (one
-// "type:path" per matched redact path; see auditObligationNames) and allowDetails.
+// Sequence: a hard deny records and returns without calling upstream; observe downgrades a
+// deny to a logged forward (kill-switch always hard-blocks); a transport failure records the
+// upstream error code; success applies redactFields obligations (fail closed) and records an
+// allow with obligation tokens and allowDetails.
 //
-// allowDetails computes the allow record's structured details (resources/prompts
-// pass upstreamErrorDetail; tools/call passes its audit-mode argument map).
-// recordObligations controls whether obligation tokens are recorded (the two
-// resources/(un)subscribe legs record none).
-//
-// committer is the decision point that MADE dec, and applies the label clear an approved
-// declassification authorized once the call has actually run. It is a parameter rather than a
-// field on fp — mirroring commitDeclassify one layer down, which takes it for the same reason
-// — because every call site is a dispatchParams handler already holding the deciding PDP. A
-// field would be a second copy of that one value, and "these two must be the same PDP" is an
-// invariant nothing in the language enforces: a site that set the decision point and forgot
-// the derived field compiled, passed every test that did not exercise a declassification, and
-// then silently never cleared a label. Passing it down removes the pair rather than guarding
-// it. nil is legitimate and means the same thing it always did — no decision point is in hand
-// (the session-creating initialize gate, a test), so no decision can carry a clear to commit.
+// committer is the decision point that MADE dec, passed rather than a field on fp so "these
+// two must be the same PDP" cannot silently drift — every call site is a dispatchParams
+// handler already holding it. nil means no decision point is in hand (session-creating
+// initialize, a test), so no clear can be committed.
 func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declassifyCommitter, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(mcp.RPCMsg) map[string]interface{}) mcp.RPCMsg {
 	observe := false
 	var denial *capability.DenialInfo // set on the deny path; reused by the observe branch below
@@ -919,18 +642,10 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		denial = normalizeDenial(dec.Denial)
 		observe = isObserveDeny(denial, fp.audit, dec.AuditOnly)
 		if !observe {
-			// A genuine hard deny: record it (upstream never called) and return.
-			//
-			// The declassify fields ride along, through mergeAuditDetails so the engine's own
-			// details map is never written into. In-tree this is always a no-op — a refusal
-			// carries no declassification handle, because the approval check turns an
-			// unapproved declassification into an escalation BEFORE anything is committed, and the
-			// wrapping JWT layer's own denials all short-circuit above the inner decision
-			// that would burn a grant. It is here so the invariant is structural rather than
-			// a property of who currently sets what: a spent single-use grant that reached a
-			// refusal exit with nothing on the tape naming it is exactly the reconciliation
-			// gap this key exists to close, and an exit that silently could not report one
-			// would reopen it.
+			// A genuine hard deny: record it (upstream never called) and return. The declassify
+			// fields ride along through mergeAuditDetails (engine's own map never written
+			// into) — in-tree always a no-op, but structural so a spent grant reaching a
+			// refusal exit is never silently unreported.
 			if fp.rec != nil {
 				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType,
 					mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), false)
@@ -942,17 +657,12 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		// leaves a stale "forwarded" deny record for a call that was hard-blocked.
 	}
 
-	// --require-audit=strict: once the audit trail has degraded, do not forward an
-	// authorized call (clean allow or audit-mode observe). Fail closed so audit
-	// coverage gates the upstream side effect. Runs BEFORE the observe deny is
-	// recorded so a gate block does not leave an audit_only=true record
-	// contradicting the AUDIT_UNAVAILABLE hard-block.
+	// --require-audit=strict: don't forward an authorized call once the trail has degraded.
+	// Runs BEFORE the observe deny is recorded so a gate block doesn't leave a stale
+	// audit_only=true record contradicting the AUDIT_UNAVAILABLE hard-block.
 	//
-	// This is the FIRST of three exits below the decision, and the decision may have
-	// authorized a flow-label clear under a human approval. Blocking here means the
-	// sanitizing action never runs — so the clear is simply never committed, and the record
-	// says that an approved declassification did not take effect and names the single-use
-	// grant it spent (see declassifyRefusalDetail).
+	// The FIRST of three exits below the decision; blocking here means an approved clear's
+	// sanitizing action never runs (see declassifyRefusalDetail).
 	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, dec); blocked {
 		return denied
 	}
@@ -960,9 +670,8 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// Gate passed: record the observed (audit_only=true) deny and log the downgrade.
 	// denial was set on the deny path above (observe is only true there), so non-nil.
 	if observe {
-		// The same declassify merge the hard-deny arm makes, for the same structural reason:
-		// this was the one exit below the decision that could not report a spent grant, and
-		// "no exit is silent" is only an invariant if it holds at every one of them.
+		// The same declassify merge the hard-deny arm makes: no exit below the decision may
+		// silently fail to report a spent grant.
 		observeDetail := mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec))
 		warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 			if fp.rec != nil {
@@ -977,60 +686,33 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 
 	upResp, fwdErr := fp.callUpstream(ctx, msg)
 	if fwdErr != nil {
-		// The maxCalls quota slot this call consumed is INTENTIONALLY NOT refunded here.
-		// Decide committed the counter atomically WITH the decision (that atomicity is
-		// what makes the limit exact under concurrent requests), and the upstream may
-		// have executed the call before the failure: a write timeout means the request
-		// bytes were already handed to the upstream, and a read/transport failure can
-		// follow a side effect that already happened. A compensating decrement would
-		// therefore hand back quota for calls that did run, and would itself need
-		// double-refund protection across the retry the host is free to make.
+		// The maxCalls quota slot this call consumed is INTENTIONALLY NOT refunded here. Decide
+		// committed the counter atomically WITH the decision, and the upstream may have
+		// executed the call before the failure (a write timeout means the bytes were already
+		// sent), so a compensating decrement would hand back quota for calls that did run.
+		// Accepted cost: an upstream that stops draining stdin can burn a caller's whole
+		// budget on calls that never executed — the fail-closed direction (over-count, never
+		// under-count), visible on the tape via this deny's upstream error code.
 		//
-		// The accepted cost is the converse: an upstream that stops draining stdin under
-		// a tight --upstream-timeout can burn a caller's whole maxCalls budget on calls
-		// that never executed. That is the fail-closed direction (the quota over-counts,
-		// never under-counts), and every consumed slot is on the tape — this branch
-		// records a deny carrying the upstream error code, so an operator reconstructing
-		// a budget can tell executed calls from failed forwards.
-		//
-		// One failure in this branch does NOT fit that rationale: errDuplicateID is
-		// rejected before any byte reaches the upstream, so the call provably did not run
-		// and its slot is a pure over-count. It is accepted rather than special-cased: a
-		// refund path here would have to prove, per error, that nothing was sent — a
-		// property only this one error has today — and getting that wrong in the other
-		// direction hands back quota for a call that DID execute. An over-count on a host
-		// that reuses an in-flight JSON-RPC id is the safe side of that trade.
-		//
-		// The declassification is NOT committed here, even though the upstream MAY have
-		// executed the call (a write timeout means the bytes were already handed over). The
-		// two possible errors are not symmetric: keeping a label for a call that did run
-		// over-blocks a later sink, which the operator resolves with another approval, while
-		// clearing it for a call that did NOT run silently admits the next egress the label
-		// exists to stop. The quota slot above is NOT refunded for the mirror-image reason —
-		// there the fail-closed direction is to keep it spent.
+		// The declassification is likewise NOT committed here: keeping a label for a call
+		// that may have run over-blocks (resolved with another approval), while clearing it
+		// for a call that did NOT run silently admits the egress the label exists to stop.
 		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method, declassifyRefusalDetail(dec))
 	}
 
-	// Apply post-allow obligations (redactFields) before the response reaches the
-	// host. Only tools carry directives, so this is a no-op for other methods. Fail
-	// closed: a redaction error must never forward unredacted data.
+	// Apply post-allow obligations (redactFields) before the response reaches the host. Only
+	// tools carry directives. Fail closed: a redaction error must never forward unredacted data.
 	if len(dec.Obligations) > 0 && upResp.Result != nil {
 		redacted, redactErr := pdp.ApplyRedactObligs(upResp.Result, dec.Obligations)
 		if redactErr != nil {
 			fmt.Fprintf(os.Stderr, "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
-			// Record a deny so the call stays visible on the tape — otherwise an
-			// adversarial upstream could return a redaction-failing response to make
-			// every redactFields-guarded call vanish from the audit trail. Also a
-			// forwarded-then-recorded boundary call, so it gets the same diagnostic.
+			// Record a deny so the call stays visible on the tape — otherwise an adversarial
+			// upstream could return a redaction-failing response to make every redactFields-
+			// guarded call vanish from the audit trail.
 			//
 			// The third exit below the decision, and the only one the upstream may have
-			// ANSWERED before it was taken. The clear is still withheld, but on this exit's
-			// own reasoning rather than the other two's: nothing sanitized reached the host,
-			// so nothing sanitized entered the session, which is what a flow label tracks.
-			// declassifyRedactionDetail decides what the record may CLAIM about that reply —
-			// only a reply declassifyCommitted accepts is reported as an executed action,
-			// since this branch is reachable with an isError result or a hostile
-			// result-plus-error envelope that redaction then fails on.
+			// ANSWERED before it was taken. declassifyRedactionDetail decides what the record
+			// may CLAIM about that reply (see its doc).
 			redactDetail := declassifyRedactionDetail(dec, upResp)
 			warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
@@ -1041,63 +723,43 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		}
 		upResp.Result = redacted
 	}
-	// Independently of the result branch: an error.data payload alongside a redactFields
-	// obligation must be stripped fail-closed. This is a separate `if` (not `else if`) so a
-	// malformed/adversarial upstream that returns BOTH a result and an error — which
-	// JSON-RPC forbids, but a hostile upstream may still emit — cannot forward a
-	// declared-redactable value through error.data by also attaching a (redacted) result.
-	// error.data is a free-form channel (mcp.RPCError.Data, preserved as raw bytes) the
-	// result-shaped redact paths cannot verify, so drop it rather than forward it
-	// unredacted. The obligation is NOT stamped as discharged (oblNames is gated on
-	// upResp.Result != nil below), so the tape does not falsely claim a redaction ran.
+	// Independently of the result branch (separate `if`, not `else if`): a malformed/hostile
+	// upstream returning BOTH a result and an error (which JSON-RPC forbids) must not forward
+	// a redactable value through error.data, a free-form channel the redact paths can't verify.
 	if upResp.Error != nil && upResp.Error.Data != nil && hasRedactFieldsObligation(dec.Obligations) {
 		fmt.Fprintf(os.Stderr, "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
 		upResp.Error.Data = nil
 	}
 
 	var oblNames []string
-	// Only record obligation tokens when there was a result body to redact. On an
-	// allowed call whose upstream returned a JSON-RPC error (upResp.Error != nil,
-	// upResp.Result == nil) the redaction block above is skipped — nothing was
-	// masked — so listing the directive's fields would overstate what happened: the
-	// obligations[] tokens record WHICH fields a redactFields obligation masked, not
-	// merely that one was attached (see auditObligationNames).
+	// Only record obligation tokens when there was a result body to redact — a JSON-RPC error
+	// response skips the redaction block above, so listing fields here would overstate what
+	// happened.
 	if recordObligations && upResp.Result != nil {
 		oblNames = auditObligationNames(dec.Obligations)
 	}
-	// The call has run, SUCCEEDED, and its redacted response is deliverable — which together
-	// are the condition an approved declassification's clear was waiting on. Commit it HERE:
-	// after the last exit that could still refuse, so no refusal can leave a label cleared;
-	// before the record that reports it, so no record can claim a clear that has not landed.
+	// The call has run, SUCCEEDED, and its redacted response is deliverable — the condition an
+	// approved clear was waiting on. Commit HERE: after the last exit that could still refuse,
+	// before the record that reports it.
 	//
-	// declassifyCommitted is the SUCCESS half, and it is not redundant with the exits above.
-	// A sanitize whose upstream answers with a JSON-RPC error, or with a tool result flagged
-	// isError, is delivered to the host and is not a transport failure — so it reaches here
-	// with the transform never performed. Dropping the taint on it would forward the next
-	// egress on the strength of a step that failed. An unsuccessful call is treated exactly
-	// as a refused one: nothing is cleared, and the record says the approved clear did not
-	// take effect.
-	//
-	// A no-op for every call in a deployment with no declassify directive.
+	// declassifyCommitted is the SUCCESS half, not redundant with the exits above: a reply
+	// flagged isError (or a JSON-RPC error) reaches here with the transform never performed
+	// and is treated as a refused call — nothing cleared.
 	var labelsCleared []string
 	var declDetail map[string]interface{}
 	// dec.Decision, not just the pending set: the observe path forwards a call whose verdict
-	// was a DENY, and a downgraded deny must never untaint a session — the same rule
-	// RecordSourceCall states for the audit-mode antecedent write. In-tree a deny carries no
-	// a declassification handle, so this is defense in depth against a PDP that stamps one; the cost
-	// is a field comparison on the one path that already resolved the decision.
+	// was a DENY, and a downgraded deny must never untaint a session (defense in depth against
+	// a PDP that stamps a handle on a deny).
 	if dec.Decision == capability.DecisionAllow && declassifyCommitted(upResp) {
 		labelsCleared, declDetail = commitDeclassify(ctx, committer, fp.sessionID, dec, kind, denialTarget)
 	} else {
 		declDetail = declassifyRefusalDetail(dec)
 	}
 	// The commit was the last thing that had to be inside the decision turn, so release it
-	// HERE rather than at handler return. What follows — the audit enqueue and the
-	// client-facing response write — does not touch the state the turn orders, and the write
-	// is bounded by a client that may simply stop reading. Under task anchoring the turn is
-	// shared, so holding it through that would let one client's backpressure stall another
-	// session's decisions. A no-op for every call that already released after its decision
-	// (finishDecision) and for a non-serialized request; idempotent either way.
+	// HERE rather than at handler return — the audit enqueue and response write that follow
+	// don't touch the turn's state, and under task anchoring holding it would let one
+	// client's backpressure stall another session's decisions. Idempotent; a no-op for a
+	// call that already released after its decision or a non-serialized request.
 	if fp.endDecision != nil {
 		fp.endDecision()
 	}
@@ -1109,20 +771,16 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 			return
 		}
 		// Through mergeAuditDetails, never a write into allowDetails' return: the tools/call
-		// closure's own base under --audit is the caller's live parsed argument map, so an
-		// annotation written into whatever that chain hands back would rewrite the request the
-		// record is supposed to describe. The merge always returns a map this frame owns (see
-		// its doc); nothing here writes into it, and a future annotation must go through extra.
+		// closure's base under --audit is the caller's live parsed argument map, so writing
+		// into whatever that chain hands back would rewrite the request being described.
 		details := mergeAuditDetails(allowDetails(upResp), declDetail)
-		// A call that CLEARED flow labels under a human approval takes the recorder that
-		// carries the approval; every other call takes the plain one. The branch is on what
-		// the commit actually changed, not on what was authorized — an approved directive
-		// whose labels the anchor never held is a permitted no-op, and recording an approver
-		// for it would put a declassification that did not happen on the tape. A no-op clear
-		// under a single-use grant is still visible: declDetail names the spent approval.
+		// A call that CLEARED flow labels takes the recorder that carries the approval; every
+		// other call takes the plain one. The branch is on what the commit actually CHANGED,
+		// not on what was authorized — a no-op clear would otherwise record an approver for a
+		// declassification that never happened.
 		if len(labelsCleared) > 0 {
-			// The declassification's three facts are passed as FIELDS — they are top-level,
-			// signed, and appear together or not at all — never merged into the details map.
+			// The declassification's three facts are passed as FIELDS — top-level, signed, and
+			// appearing together or not at all — never merged into the details map.
 			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, auditID, method, details, oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels, labelsCleared, dec.Declassification.Approver(), dec.Declassification.ApprovalID())
 			return
 		}
@@ -1132,11 +790,9 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	return upResp
 }
 
-// hasRedactFieldsObligation reports whether obligs carries a redactFields directive
-// with at least one path. It gates the fail-closed error.data strip: a redactFields
-// obligation means the manifest declared some field redactable, so an upstream error
-// carrying free-form data cannot be forwarded unverified. A non-redact obligation (or a
-// redactFields with no paths) redacts nothing, so it must not trigger the strip.
+// hasRedactFieldsObligation reports whether obligs carries a redactFields directive with at
+// least one path — gates the fail-closed error.data strip against an upstream error carrying
+// free-form data eunox cannot verify.
 func hasRedactFieldsObligation(obligs []capability.Obligation) bool {
 	for _, ob := range obligs {
 		if ob.Type == capability.DirectiveTypeRedactFields && len(ob.Paths) > 0 {
@@ -1146,28 +802,17 @@ func hasRedactFieldsObligation(obligs []capability.Obligation) bool {
 	return false
 }
 
-// auditObligationNames flattens the obligations applied to an allowed response into
-// the tokens recorded in the audit record's obligations[] field: one "type:path"
-// entry per matched redact path, so the tape captures WHICH fields a redactFields
-// obligation masked, not merely that one ran. The paths are the operator-defined
-// field names from the manifest directive (e.g. "$.ssn", "nested.token"), never the
-// redacted values, so this discloses nothing the masked response does not already
-// reveal to the host (docs/threat-model-mcp.md §6.3). An obligation carrying no
-// paths contributes a bare "type" token so its presence still lands on the tape.
-// Consumers split a token on its FIRST ':' — the prefix is a known obligation type,
-// the remainder the path (which may itself contain ':'). Two forms don't fit that
-// "type:path" shape: the bare-type token (no colon), and the sink's appended
-// "obligations_truncated:N" sentinel (which has a colon but whose prefix is not an
-// obligation type). The audit sink bounds the returned slice before enqueue
-// (boundAuditObligations), so a manifest with many or long redact paths cannot push
-// the record past the scanner window.
+// auditObligationNames flattens the obligations applied to an allowed response into the
+// obligations[] tokens: one "type:path" entry per matched redact path, so the tape captures
+// WHICH fields were masked, never the redacted values (docs/threat-model-mcp.md §6.3).
+// Consumers split a token on its FIRST ':'. The audit sink bounds the returned slice before
+// enqueue (boundAuditObligations).
 func auditObligationNames(obligs []capability.Obligation) []string {
 	if len(obligs) == 0 {
 		return nil
 	}
 	// Capacity is the total token count — one per path, or one bare-type token for an
-	// obligation that carries no paths — not len(obligs), since a single obligation
-	// can carry several paths.
+	// obligation with no paths — not len(obligs), since one obligation can carry several.
 	total := 0
 	for _, ob := range obligs {
 		if len(ob.Paths) == 0 {
@@ -1189,11 +834,9 @@ func auditObligationNames(obligs []capability.Obligation) []string {
 	return names
 }
 
-// upstreamErrorDetail returns a structured audit detail noting that the upstream
-// returned a JSON-RPC error result on an otherwise-allowed call, or nil for a
-// clean success. The proxy's verdict stays "allow", but a forwarded upstream error
-// should not look identical to a success on the tape, so the numeric code is
-// recorded — never the upstream's error message, which can carry sensitive content.
+// upstreamErrorDetail returns a structured audit detail noting that the upstream returned a
+// JSON-RPC error on an otherwise-allowed call, or nil for a clean success. The numeric code
+// is recorded — never the message, which can carry sensitive content.
 func upstreamErrorDetail(upResp mcp.RPCMsg) map[string]interface{} {
 	if upResp.Error == nil {
 		return nil
@@ -1201,48 +844,36 @@ func upstreamErrorDetail(upResp mcp.RPCMsg) map[string]interface{} {
 	return map[string]interface{}{audit.UpstreamErrorCodeKey: upResp.Error.Code}
 }
 
-// serverRequestParams bundles the per-transport bits the shared server-initiated
-// request core needs. forward delivers msg to the host and reports whether a
-// client received it; writeUpstream sends a response back to the upstream
-// initiator; claims carries the session's JWT identity (HTTP only) for the
-// sampling decision and its records. The rest mirror forwardParams.
+// serverRequestParams bundles the per-transport bits the shared server-initiated request core
+// needs. forward delivers msg to the host and reports whether a client received it;
+// writeUpstream sends a response back to the upstream initiator; claims carries the session's
+// JWT identity (HTTP only). The rest mirror forwardParams.
 type serverRequestParams struct {
 	rec       auditRecorder
 	audit     bool
 	sessionID string
 	sourceIP  string
 	claims    *pdp.JWTClaims
-	// pdp is the decision point this leg decides with. Nothing on this leg is DERIVED from
-	// it: a declassification is refused here rather than committed (see forwardServerRequest),
-	// so there is no second field that has to name the same PDP and no constructor step to
-	// forget. A plain field is the whole of it.
+	// pdp is the decision point this leg decides with. Nothing here is DERIVED from it — a
+	// declassification is refused here rather than committed — so a plain field is enough.
 	pdp           pdp.PolicyDecisionPoint
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
-	// decideLock serializes the sampling decision against the host-path
-	// decisions on the same anchor when the policy is flow-/sequenceBlock-relevant. A
-	// flowLabel sink on system:sampling reads the same flow state a host source writes, and
-	// this path runs on the upstream-reader goroutine — outside the host decision turn —
-	// so without it a sampling sink could peek the flow set mid-commit of a host source's
-	// Add and slip the taint. Calling it enters the
-	// decision critical section and returns the end func; nil disables
-	// serialization (a non-flow policy, or a direct test caller). It wraps ONLY the
-	// decision, never the forward. labelOutput on system:sampling is rejected at manifest
-	// load, so sampling is only ever a sink here, never a concurrent writer.
+	// decideLock serializes the sampling decision against host-path decisions on the same
+	// anchor when the policy is flow-relevant, since this path runs on the upstream-reader
+	// goroutine outside the host decision turn and could otherwise peek the flow set
+	// mid-commit of a host source's write. Wraps ONLY the decision, never the forward. nil
+	// disables serialization.
 	//
-	// ok is false when the turn could not be entered within its bound. It exists because this
-	// runs on the session's SINGLE upstream-reader goroutine, which is also the only goroutine
-	// that delivers upstream responses: blocking it for the length of another call's turn
-	// stalls every in-flight request on the session, and under task anchoring that other call
-	// can be on a different session entirely. Failing the sampling request closed costs one
-	// deny-by-default request; waiting costs the session's whole response path.
+	// ok is false when the turn could not be entered within its bound: this runs on the
+	// session's single upstream-reader goroutine, so blocking it for another call's turn
+	// stalls every in-flight request on the session. Failing closed costs one deny-by-default
+	// request; waiting costs the whole response path.
 	decideLock func() (end func(), ok bool)
 	// anchorSplit reports whether this session's host leg has resolved MORE THAN ONE state
-	// anchor, in which case this leg cannot decide at all: it has no host request in scope, so
-	// which task a server-initiated request belongs to is genuinely undetermined, and deciding
-	// against the anchor its captured claims happen to name would peek one bucket while the
-	// host leg taints another. nil where the question cannot arise — stdio (one host connection,
-	// one anchor) and any route that does not anchor state on the task.
+	// anchor, in which case this leg cannot decide at all — it has no host request in scope,
+	// so deciding against the captured claims' anchor would peek one bucket while the host leg
+	// taints another. nil where the question cannot arise (stdio, or non-task-anchored routes).
 	anchorSplit func() bool
 	// strictAuditState (embedded) carries the --require-audit=strict gate, which also
 	// covers the enforced sampling/createMessage path below. See forwardParams.
@@ -1250,65 +881,34 @@ type serverRequestParams struct {
 }
 
 // samplingTurnWait bounds how long the server-initiated leg waits for the decision turn. BOTH
-// transports bound it here: the hazard is a property of where this leg runs, not of which gate
-// it waits on, so stdio and HTTP give the same answer to "what happens when the turn is held by
-// a declassifying call".
+// transports bound it here since the hazard is a property of where this leg runs, not of
+// which gate it waits on. Each server-initiated request runs on its own goroutine
+// (serverRequestPool), so a handler parked here blocks only itself — the bound below is on an
+// unbounded WAIT, not a wedge.
 //
-// It began as a bound on a WEDGE: this leg ran INLINE on the upstream reader, the only
-// goroutine that delivers upstream responses and relays notifications, so every microsecond
-// blocked here was a microsecond in which none of that connection's in-flight calls could
-// complete — and on stdio worse than a stall, since the host call holding the turn was itself
-// waiting for a response only the blocked reader could deliver. That wedge is gone on both
-// transports: each server-initiated request now runs on its own goroutine
-// (serverRequestPool), so a handler parked here blocks only itself.
+//   - perHolder (2s) bounds ONE turn holder, since the turn may be held across a whole upstream
+//     round trip by a declassifying call (see finishDecision), including on a different
+//     session under task anchoring. Bounding the HOLDER (not the waiter's own arrival) is what
+//     keeps a batch of waiters from being refused together for one slow turn.
+//   - total (8s) is the absolute ceiling, since "the queue is moving" must not mean "forever" —
+//     a parked handler holds a pool slot, so a steady stream of sub-2s holders would otherwise
+//     pin slots indefinitely.
 //
-// What remains is a bound on an UNBOUNDED WAIT, and the two parts below are calibrated against
-// that rather than inherited from the wedge:
-//
-//   - perHolder (2s) bounds ONE turn holder. The turn is held across the whole upstream round
-//     trip by a declassifying host call (see finishDecision), and under task anchoring by a call
-//     on a DIFFERENT session sharing the task, so without a bound this leg's wait is limited
-//     only by --upstream-timeout — which may be 0, meaning never. Two seconds is far above a
-//     healthy decision (microseconds on the in-memory backend, one bounded round trip on Redis)
-//     and far below any upstream call worth waiting behind, so exceeding it means a holder that
-//     is stuck rather than busy.
-//
-//     Bounding the HOLDER rather than the waiter's own arrival is what keeps a batch of waiters
-//     from being refused for one slow turn. Inline, request 2 was not read off the pipe until
-//     request 1 finished, so each got a fresh window for free; concurrently, N handlers parked
-//     on one gate started their windows together and expired together. Per-holder restores the
-//     fresh-window property without restoring the serialization: a waiter is refused only when
-//     the request actually holding the turn has held it too long, which is the condition worth
-//     refusing over.
-//
-//   - total (8s) is the absolute ceiling, because "the queue is moving" must not mean "forever".
-//     A parked handler holds one of the pool's slots, so an anchor with a steady stream of
-//     sub-2s holders would otherwise pin slots indefinitely and convert into the pool's own
-//     saturation refusals for later requests. Four holder-windows is enough that a healthy
-//     anchor never reaches it and short enough that a pathological one frees the slot.
-//
-// The refusal a give-up produces stays HARD (see samplingTurnDenial), and that is a choice
-// rather than an inheritance. A turn-wait failure is TRANSIENT, which reads like the pool's
-// retryable -32000 — but it is produced on the decision path, where a downgradable refusal is
-// FORWARDED by an --audit route, and forwarding a sampling request whose decision never ran is
-// exactly what the serialization exists to prevent. Transience buys a retry, not a forward.
+// The refusal on give-up stays HARD (see samplingTurnDenial), not the pool's retryable -32000:
+// forwarding a sampling request whose decision never ran is exactly what serialization exists
+// to prevent, so transience buys a retry, not a forward.
 var samplingTurnWait = turnWait{perHolder: 2 * time.Second, total: 8 * time.Second}
 
-// decideSampling runs the sampling decision under the decision turn when one is configured
-// (see decideLock), releasing it BEFORE the caller forwards to the host — so the flow peek is
-// serialized with host-path label writes while the forward stays concurrent.
+// decideSampling runs the sampling decision under the decision turn when configured (see
+// decideLock), releasing it BEFORE the caller forwards to the host.
 //
 // A turn this leg cannot enter within samplingTurnWait produces a DENY rather than an
-// unserialized decision: the peek would be racing a host source's label write, which is the
-// exact fail-open the serialization exists to close, and the alternative (wait) wedges the
-// session's reader. The refusal is HARD — an --audit route must not downgrade it into the
-// forward it exists to prevent.
-//
-// The release is deferred, so it is panic-safe and runs before the caller's forward.
+// unserialized decision — the peek would race a host source's label write, the exact fail-open
+// serialization exists to close. HARD: an --audit route must not downgrade it into the forward
+// it exists to prevent.
 func (fp serverRequestParams) decideSampling(ctx context.Context) capability.EnforceResponse {
-	// Asked BEFORE the turn, so a decision that cannot be made correctly does not queue for the
-	// right to make it — a session in this state would take that turn on every server-initiated
-	// request for the rest of its life.
+	// Asked BEFORE the turn, so a decision that cannot be made correctly does not queue for
+	// the right to make it.
 	if fp.anchorSplit != nil && fp.anchorSplit() {
 		return samplingAnchorSplitDenial()
 	}
@@ -1318,13 +918,9 @@ func (fp serverRequestParams) decideSampling(ctx context.Context) capability.Enf
 			return samplingTurnDenial()
 		}
 		defer end()
-		// And AGAIN once the turn is held, because the wait between the two is not short: it is
-		// bounded by samplingTurnWait, not by anything about this session, and the host leg can
-		// span its second anchor at any point inside it. The turn provides no ordering here —
-		// the two anchors take DIFFERENT gates, which is the whole reason this refusal exists —
-		// so without the re-check the window between "not split" and the flow peek it guards is
-		// the entire wait, and a taint committed under the other anchor during it is invisible
-		// to the peek that follows. The check is a lock-free atomic read.
+		// And AGAIN once the turn is held: the two anchors take DIFFERENT gates (why this
+		// refusal exists), so without the re-check a taint committed under the other anchor
+		// during the wait would be invisible to the peek that follows. A lock-free atomic read.
 		if fp.anchorSplit != nil && fp.anchorSplit() {
 			return samplingAnchorSplitDenial()
 		}
@@ -1333,8 +929,7 @@ func (fp serverRequestParams) decideSampling(ctx context.Context) capability.Enf
 }
 
 // samplingTurnDenial is the fail-closed response for a sampling request whose decision could
-// not be serialized against the anchor's host-path decisions. It reports the flow layer's own
-// discriminator so the refusal lands beside the other information-flow events on the tape.
+// not be serialized against the anchor's host-path decisions.
 func samplingTurnDenial() capability.EnforceResponse {
 	return samplingFlowDenial(
 		"the sampling decision could not be serialized against concurrent decisions on this anchor; refusing rather than reading flow state mid-write",
@@ -1344,22 +939,14 @@ func samplingTurnDenial() capability.EnforceResponse {
 // samplingAnchorSplitDenial is the fail-closed response for a server-initiated request on a
 // session whose host leg has resolved more than one state anchor.
 //
-// A session on a task-anchored route may span tasks: each host request is decided, keyed and
-// serialized on its own anchor, which is correct however many there are. This leg is the one
-// that cannot be, because it has no host request in scope — which task a
-// sampling/createMessage belongs to is undetermined on such a session, and MCP defines no field
-// an upstream could use to say. Attributing it to the anchor the captured claims name would let
-// the sink peek one bucket while a source taints another, which is the exact fail-open the
-// anchor-keyed turn cannot catch (the leg's turn and its state key would agree with each other
-// and both disagree with the host leg).
+// A session on a task-anchored route may span tasks, each decided on its own anchor — correct
+// for the host leg, but this leg has no host request in scope, so which task a
+// sampling/createMessage belongs to is undetermined. Attributing it to the captured claims'
+// anchor would let the sink peek one bucket while a source taints another.
 //
-// It is HARD, like this leg's other flow refusals: an --audit route downgrades a policy verdict
-// being staged, and this is not one — forwarding would perform the egress whose authorization
-// could not be evaluated. It is also STICKY for the session's life (see noteRequestAnchor): the
-// taint written under the other anchor outlives the request that wrote it, so a session that
-// has spanned cannot become decidable again. A client that needs sampling on a task-anchored
-// route keeps one session per task; one that multiplexes tasks gets every other guarantee and
-// loses this one feature, loudly and on the tape.
+// HARD (forwarding would perform an egress whose authorization couldn't be evaluated) and
+// STICKY for the session's life (see noteRequestAnchor) — a client needing sampling on a
+// task-anchored route keeps one session per task.
 func samplingAnchorSplitDenial() capability.EnforceResponse {
 	return samplingFlowDenial(
 		"this session has issued requests under more than one state anchor, so which task a server-initiated request belongs to is undetermined; refusing rather than reading one task's flow state for another",
@@ -1368,15 +955,11 @@ func samplingAnchorSplitDenial() capability.EnforceResponse {
 
 // samplingDeclassifyDenial is the fail-closed response for a sampling decision that authorized
 // a flow-label clear. This leg cannot commit one — see forwardServerRequest for why "the host
-// received the request" is not "the sanitizing action ran" — so it refuses rather than
-// forwarding the call with an authorization nothing will apply, or applying one on evidence
-// this path does not have.
+// received the request" is not "the sanitizing action ran" — so it refuses.
 //
-// It CARRIES the refused decision's handle. The decision has already burned any single-use
-// grant it accepted, and replacing the response wholesale would leave that grant spent with
-// nothing on the tape naming it — the reconciliation gap the spent-approval key exists to
-// close, reintroduced by the refusal that is supposed to be the safe outcome. The leg's record
-// path reads the handle for exactly that annotation.
+// It CARRIES the refused decision's handle: the decision already burned any single-use grant
+// it accepted, and replacing the response wholesale would leave that grant spent with nothing
+// on the tape naming it.
 func samplingDeclassifyDenial(dec capability.EnforceResponse) capability.EnforceResponse {
 	refusal := samplingFlowDenial(
 		"a declassification cannot be committed on the server-initiated leg: this path learns only that the host received the request, never that the sanitizing action ran",
@@ -1402,28 +985,20 @@ func samplingFlowDenial(message, reason string) capability.EnforceResponse {
 	}
 }
 
-// strictServerRequestAuditDenial applies the --require-audit=strict gate to a
-// server-initiated (upstream -> host) request, sampling and non-sampling alike.
-// When tripped it records the deny, replies AUDIT_UNAVAILABLE to the upstream
-// initiator, warns once, and returns true so the caller returns without
-// forwarding to the host. The server-initiated analogue of strictAuditDenial,
-// failing closed toward the upstream initiator rather than the host.
-// auditGateTripped guarantees fp.rec is non-nil here.
+// strictServerRequestAuditDenial applies the --require-audit=strict gate to a server-initiated
+// (upstream -> host) request, sampling and non-sampling alike: when tripped it records the
+// deny, replies AUDIT_UNAVAILABLE to the upstream initiator, warns once, and returns true. The
+// server-initiated analogue of strictAuditDenial, failing closed toward the initiator.
 //
-// dec is the decision this gate is refusing below, zero for the non-sampling leg (which runs
-// no decision at all). Its declassification facts ride the deny record exactly as they do on
-// the host path: this is a refusal BELOW the decision, so an approved clear did not take
-// effect and a single-use grant the decision burned is named nowhere else.
+// dec is the decision this gate refuses below, zero for the non-sampling leg. Its
+// declassification facts ride the deny record exactly as on the host path.
 func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context, msg mcp.RPCMsg, method string, dec capability.EnforceResponse) bool {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
 		return false
 	}
-	// Record BEFORE replying to the upstream (record-before-act), matching the
-	// hard-deny and observe branches of forwardServerRequest and the host-facing
-	// strictAuditDenial, so a crash between the two cannot leave the upstream answered
-	// with no matching audit record. detail carries discrete counts only; reason prose
-	// stays out of the structured audit field (see strictAuditDenial).
+	// Record BEFORE replying to the upstream (record-before-act), matching the other legs, so
+	// a crash between the two can't leave the upstream answered with no matching record.
 	fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeAuditUnavailable, "",
 		mergeAuditDetails(detail, declassifyRefusalDetail(dec)), false)
 	fp.writeUpstream(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, capability.ErrCodeAuditUnavailable))
@@ -1431,29 +1006,17 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 	return true
 }
 
-// recordForwardOutcome writes the audit record for a forwarded server-initiated
-// request: an allow when a client accepted it, or an ENFORCEMENT_ERROR deny when
-// none could. auditOnly marks the allow as an observe-mode (audit) record. Shared by
-// all three forwardServerRequest legs (non-sampling, sampling-allow, sampling-observe)
-// so the record shape cannot drift between them. No-op when rec is nil.
+// recordForwardOutcome writes the audit record for a forwarded server-initiated request: an
+// allow when a client accepted it, or an ENFORCEMENT_ERROR deny when none could. Shared by all
+// three forwardServerRequest legs so the record shape cannot drift between them.
 //
-// On HTTP, "delivered" means the message was buffered onto an SSE subscriber channel,
-// not that the host's socket received it. If that async delivery later fails (client
-// disconnect, SSE write error), httpSession.failServerRequestDelivery appends a
-// correction deny so the tape does not stand as claiming the host received a request
-// it never did. On stdio, forward always reports delivered.
+// On HTTP, "delivered" means buffered onto an SSE subscriber channel, not that the host's
+// socket received it — httpSession.failServerRequestDelivery appends a correction deny if
+// async delivery later fails. On stdio, forward always reports delivered.
 //
-// Each of the three call sites gates its own forward on strictServerRequestAuditDenial
-// beforehand, the same gate-before/record-after shape as enforcedForwardCore, so this
-// record call gets the same immediate boundary-call diagnostic under strict mode.
-//
-// dec supplies the record's flow fields (labels_out / carried_labels) and, when a clear
-// changed something, the declassification's own signed triple — the same branch the host path
-// takes, on what a commit CHANGED rather than on what was authorized. The non-sampling leg
-// passes the zero decision: it runs no policy decision, so it has no flow state and no
-// declassification to report, and this leg commits no clear at all today (cleared is always
-// nil — see forwardServerRequest). declDetail carries the annotations for a clear that did not
-// land (see declassifyRefusalDetail).
+// dec supplies the record's flow fields and, when a clear changed something, the
+// declassification's signed triple. The non-sampling leg passes the zero decision (commits no
+// clear today). declDetail carries the annotations for a clear that did not land.
 func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method string, delivered, auditOnly bool, dec capability.EnforceResponse, cleared []string, declDetail map[string]interface{}) {
 	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, method, method, func() {
 		if fp.rec == nil {
@@ -1472,34 +1035,22 @@ func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method s
 	})
 }
 
-// forwardServerRequest is the shared handling both transports apply to an
-// upstream-initiated (server→client) request. Non-sampling methods (roots/list,
-// elicitation/create, …) are not policy-enforced — always forwarded, still
-// audited, and still gated by --require-audit=strict (a degraded trail denies
-// them the same as sampling, since they are just as unaudited otherwise).
-// sampling/createMessage is deny-by-default (pdp.DecideSampling checks the
-// kill switch and the manifest opt-in); a denial returns the denial code
-// (SAMPLING_DENIED, CONDITION_FAILED, MAX_CALLS_EXCEEDED, …) to the upstream
-// initiator unless route-level audit mode observes-and-forwards it (a
-// kill-switch denial hard-blocks even then), leaving the two-record
-// deny-then-forward pattern. The transports differ only in fp.forward,
-// fp.writeUpstream, and fp.claims.
+// forwardServerRequest is the shared handling both transports apply to an upstream-initiated
+// (server→client) request. Non-sampling methods (roots/list, elicitation/create, …) are not
+// policy-enforced — always forwarded, still audited, and still gated by --require-audit=strict.
+// sampling/createMessage is deny-by-default (pdp.DecideSampling checks the kill switch and the
+// manifest opt-in); a denial returns the denial code unless route-level audit mode
+// observes-and-forwards it (kill-switch always hard-blocks). Transports differ only in
+// fp.forward, fp.writeUpstream, and fp.claims.
 //
-// Caller contract: msg is a REQUEST (both id and method — mcp.RPCMsg.IsRequest).
-// Both readUpstream loops reach this only inside that gate, and upstream
-// notifications take their own broadcast path there rather than arriving here. Every
-// denial below therefore answers the initiator unconditionally, with no
-// notification arm to skip the reply.
+// Caller contract: msg is a REQUEST (mcp.RPCMsg.IsRequest) — every denial below answers the
+// initiator unconditionally, with no notification arm to skip.
 func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestParams) {
 	const samplingMethod = capability.MethodSamplingCreateMessage
-	// Attach the session's JWT claims BEFORE the method split so both branches'
-	// kill checks (and the sampling decision) see the per-agent dimension:
-	// agentIDFromContext reads the agent_id from these claims, and InMemory/Redis
-	// ShouldBlock only consults killedAgents when agentID != "". Without this the
-	// non-sampling kill check below would silently skip the agent dimension and
-	// forward a killed agent's roots/list, elicitation/create, etc. The records
-	// also carry agent_id/task_id from here. Inert for stdio (claims is always nil
-	// — no JWT identity).
+	// Attach JWT claims BEFORE the method split so both branches' kill checks see the
+	// per-agent dimension (ShouldBlock only consults killedAgents when agentID != "").
+	// Without this, the non-sampling kill check would silently forward a killed agent's
+	// roots/list, elicitation/create, etc. Inert for stdio (claims always nil).
 	if fp.claims != nil {
 		ctx = pdp.WithJWTClaims(ctx, fp.claims)
 	}
@@ -1512,112 +1063,78 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			fp.writeUpstream(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code))
 			return
 		}
-		// --require-audit=strict gates non-sampling server-initiated requests too: a
-		// degraded trail leaves this forward just as unaudited as an enforced one, so
-		// it must fail closed (AUDIT_UNAVAILABLE to the upstream initiator) rather
-		// than forward it silently. Mirrors the sampling branch's identical gate below.
+		// --require-audit=strict gates non-sampling server-initiated requests too: a degraded
+		// trail must fail closed here too, mirroring the sampling branch's gate below.
 		if fp.strictServerRequestAuditDenial(ctx, msg, msg.Method, capability.EnforceResponse{}) {
 			return
 		}
 		delivered := fp.forward(msg)
-		// Non-sampling methods are not policy-enforced, so there is no flow decision, no
-		// labels to record and nothing to commit — hence the zero decision.
+		// Non-sampling methods are not policy-enforced, so there is no flow decision to record.
 		fp.recordForwardOutcome(ctx, msg.Method, delivered, fp.audit, capability.EnforceResponse{}, nil, nil)
 		return
 	}
 
-	// Claims were attached above the method split (so the agent dimension is honored
-	// on both branches); the sampling decision and its records read them from ctx.
+	// Claims were attached above the method split; the sampling decision reads them from ctx.
 	if fp.audit {
 		ctx = enforcement.WithSkipQuota(ctx)
 	}
-	// Serialized against host-path decisions for a flow-/sequenceBlock-relevant session,
-	// so a flowLabel sink on system:sampling cannot read the flow set concurrently with a
-	// host source's label write. The lock covers only the decision's flow peek;
-	// the forward below runs unlocked.
+	// Serialized against host-path decisions for a flow-relevant session, so a flowLabel sink
+	// cannot read the flow set concurrently with a host source's write. Covers only the
+	// decision's flow peek; the forward below runs unlocked.
 	dec := fp.decideSampling(ctx)
-	// A decision on this leg may not authorize a clear, and the check is here rather than in a
-	// comment because the restriction that makes it unreachable lives in another package:
-	// requireSourceDirectiveTarget refuses a declassify directive at LOAD on a system: target
-	// (an egress is a place for a flow sink, not for clearing a label — clearing at an egress
-	// launders it at exactly the point the flow layer exists to gate), and
-	// sampling/createMessage is the only enforced method here.
-	//
-	// Relaxing that restriction must not silently produce a wrong clear on this leg, and it
-	// would: this path has no honest commit point. "Delivered" means the request was buffered
-	// onto an SSE channel or written to stdout, not that the host performed anything — a
-	// server-initiated request is answered later, out of band — so committing on delivery
-	// would drop taint for work that has not happened and may never happen. The host path's
-	// commit gate (a successful reply in hand) has no analogue here. Refusing is the
-	// fail-closed reading, and it is loud: whoever relaxes the load rule sees this, rather
-	// than a tape that says a declassification took effect.
+	// A decision on this leg may not authorize a clear: requireSourceDirectiveTarget refuses a
+	// declassify directive at LOAD on a system: target, but relaxing that must not silently
+	// produce a wrong clear here — this path has no honest commit point. "Delivered" means
+	// buffered onto SSE or written to stdout, not that the host performed anything, so
+	// committing on delivery would drop taint for work that may never happen. Refusing is
+	// loud: whoever relaxes the load rule sees this, rather than a tape claiming success.
 	if dec.Declassification.PendingClear() {
 		dec = samplingDeclassifyDenial(dec)
 	}
 	if dec.Decision == capability.DecisionAllow {
-		// --require-audit=strict gates this enforced method too: a degraded trail
-		// fails an allowed sampling request closed (AUDIT_UNAVAILABLE to the upstream
-		// initiator) rather than forwarding it unaudited. Scope: sampling needs the
-		// system:sampling opt-in, rejected at startup for HTTP upstreams, so this only
-		// bites stdio subprocess upstreams.
+		// --require-audit=strict gates this enforced method too. Scope: sampling needs the
+		// system:sampling opt-in, rejected at startup for HTTP upstreams, so this only bites
+		// stdio subprocess upstreams.
 		if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, dec) {
 			return
 		}
 		delivered := fp.forward(msg)
-		// Carry the sampling decision's flow labels onto the tape: a flowLabel/labelOutput
-		// on the system:sampling constraint mutated session flow-state, so the record must
-		// show labels_out/carried_labels or the tape and state disagree for the sampling leg.
-		// declassifyRefusalDetail is nil for every decision this leg can produce today and
-		// names a burned grant if one ever reaches it — the annotation costs nothing and does
-		// not depend on the load rule holding.
+		// Carry the sampling decision's flow labels onto the tape, or the tape and state
+		// disagree for the sampling leg. declassifyRefusalDetail names a burned grant if one
+		// ever reaches this leg, at no cost otherwise.
 		fp.recordForwardOutcome(ctx, samplingMethod, delivered, fp.audit, dec, nil, declassifyRefusalDetail(dec))
 		return
 	}
 
-	// Same observe gate as enforcedForwardCore, via the shared isObserveDeny.
-	// dec.AuditOnly is always false for sampling today (manifest validation rejects
-	// enforcement: audit on system: targets), but routing through the shared helper
-	// means a future audit-only system: entry can't silently lose observe-mode
-	// behavior here.
+	// Same observe gate as enforcedForwardCore, via the shared isObserveDeny — a future
+	// audit-only system: entry can't silently lose observe-mode behavior here.
 	denial := normalizeDenial(dec.Denial)
 	observe := isObserveDeny(denial, fp.audit, dec.AuditOnly)
 	if !observe {
-		// Hard deny. Record BEFORE replying to the upstream (record-before-act, matching
-		// enforcedForwardCore's hard-deny branch) so a crash between the two cannot leave
-		// the upstream answered with no matching audit record. Reply with the REAL denial
-		// code as both the JSON-RPC code and the message: derive the integer from
-		// denialToJSONRPCCode(denial.Code) rather than a literal so the wire code can never
-		// drift from the mapping table / docs (SAMPLING_DENIED maps to -32001), and send
-		// denial.Code as the message — matching the audit record written just above and the
-		// kill-switch path earlier — so an upstream inspecting the message for diagnostics
-		// sees the actual reason (CONDITION_FAILED, MAX_CALLS_EXCEEDED, …) instead of a
-		// hardcoded "AUTHORIZATION_FAILED" that contradicts the recorded code.
+		// Hard deny. Record BEFORE replying (record-before-act). Reply with the REAL denial code
+		// as both JSON-RPC code and message — derived via denialToJSONRPCCode rather than a
+		// literal, and sending denial.Code as the message so an upstream sees the actual
+		// reason instead of a hardcoded "AUTHORIZATION_FAILED".
 		if fp.rec != nil {
-			// Pass denial.Details (as the tool/resource/prompt path does): a flowLabel deny
-			// on the system:sampling constraint names the blocked provenance class there, and
-			// the deny record carries no carried_labels precisely because details does — so
-			// dropping details would leave the offending label absent from the signed tape.
-			// The declassify annotation rides beside it for the one refusal that can carry a
-			// burned grant with no clear (the engine's own declassify-leg commit fault).
+			// Pass denial.Details: a flowLabel deny on system:sampling names the blocked
+			// provenance class there, which dropping details would leave absent from the tape.
 			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 				mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), false)
 		}
 		fp.writeUpstream(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code))
 		return
 	}
-	// Strict mode gates the audit-mode observe forward too: an observation that
-	// can't be recorded has no audit value, so fail it closed. Runs after the
-	// kill-switch hard-deny above so a kill still surfaces AUTHORIZATION_FAILED.
+	// Strict mode gates the audit-mode observe forward too — an unrecorded observation has no
+	// audit value. Runs after the kill-switch hard-deny above so a kill still surfaces
+	// AUTHORIZATION_FAILED.
 	if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, dec) {
 		return
 	}
-	// Record-before-act: the would-be deny is recorded before both the stderr notice
-	// and the forward (matching enforcedForwardCore's observe branch), so a crash
-	// between the two can never leave a SIEM-visible alert with no corresponding
-	// tamper-evident audit record.
+	// Record-before-act: recorded before both the stderr notice and the forward, so a crash
+	// between them can't leave a SIEM alert with no corresponding audit record.
 	if fp.rec != nil {
-		// Carry denial.Details on the observe path too, for the same reason as the hard-deny
-		// branch above: the would-be flowLabel deny's blocked label must reach the tape.
+		// Carry denial.Details here too: the would-be flowLabel deny's blocked label must
+		// reach the tape.
 		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 			mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), true)
 	}
@@ -1626,14 +1143,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		denial.Code,
 	)
 	delivered := fp.forward(msg)
-	// audit=true: this is the audit-mode observe path. dec is the (downgraded) deny, which
-	// still carries carried_labels (stamped by the engine on flow-relevant denies), so the
-	// observed-forward record shows the accumulated set of the flow that was let through.
+	// audit=true: the observe path. dec (the downgraded deny) still carries carried_labels, so
+	// the record shows the flow that was let through.
 	//
-	// No commit, and NOT because this leg cannot declassify: a downgraded deny is still a
-	// deny, and untainting on one would drop a label for a call policy refused — the same
-	// rule enforcedForwardCore's `dec.Decision == DecisionAllow` gate and RecordSourceCall
-	// both state. The annotation still rides, so an authorization that did not take effect
-	// is visible.
+	// No commit: a downgraded deny is still a deny, and untainting on one would drop a label
+	// for a call policy refused (the same rule enforcedForwardCore's DecisionAllow gate states).
 	fp.recordForwardOutcome(ctx, samplingMethod, delivered, true, dec, nil, declassifyRefusalDetail(dec))
 }

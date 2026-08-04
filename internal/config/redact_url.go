@@ -1,19 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// URL credential redaction for the OPERATOR-FACING surfaces — today the doctor support
-// bundle's URL-bearing config fields and its audit-tail targets — so a userinfo
-// credential or a ?token=/#access_token= secret cannot leak through any of them. It
-// handles the hierarchical, opaque, scheme-less, and unparseable forms and fails safe
-// (never returns the raw value) on anything url.Parse cannot handle.
-//
-// The surface rule, stated once here: this redactor keeps the path and the query
-// parameter NAMES, which is the detail an operator reading their own bundle needs.
-// Anything that reaches a LOG — a startup banner, a validation error, a runtime warning,
-// all of which land in the systemd journal, container stdout, or a CI log — uses the
-// stricter capability.RedactURLForLog instead, which keeps only scheme://host. Neither is
-// a fallback for the other: picking by surface is what keeps one process from redacting
-// the same URL two ways.
+// URL credential redaction for the OPERATOR-FACING surfaces — the doctor support bundle's
+// URL-bearing config fields and its audit-tail targets. Keeps the path and query parameter
+// NAMES (the detail an operator reading their own bundle needs); a LOG-facing surface uses
+// the stricter capability.RedactURLForLog instead, which keeps only scheme://host.
 
 package config
 
@@ -23,11 +14,10 @@ import (
 	"strings"
 )
 
-// RedactURL replaces userinfo (user:pass@) and every non-empty query value with a
-// placeholder, leaving scheme/host/path and query parameter names intact — a
-// credential is as likely in ?api_key=/?token= as in userinfo. A URL with neither is
-// returned unchanged. On a url.Parse failure the raw value is NOT returned (a malformed
-// URL can still carry a credential); a conservative textual redaction is used instead.
+// RedactURL replaces userinfo (user:pass@) and every non-empty query value with a placeholder,
+// leaving scheme/host/path and query parameter names intact. On a url.Parse failure the raw
+// value is never returned (a malformed URL can still carry a credential); falls back to a
+// conservative textual redaction instead.
 func RedactURL(s string) string {
 	if s == "" {
 		return s
@@ -42,10 +32,8 @@ func RedactURL(s string) string {
 		changed = true
 	}
 	if u.RawQuery != "" {
-		// Replace each non-empty query value with a length-tagged placeholder,
-		// preserving parameter order and names. url.URL.String() emits RawQuery
-		// verbatim, so the placeholder stays unencoded. The length is the decoded byte
-		// count (via QueryUnescape), falling back to the raw count on a malformed escape.
+		// url.URL.String() emits RawQuery verbatim, so the placeholder stays unencoded.
+		// Length is the decoded byte count (QueryUnescape), falling back to the raw count.
 		parts := strings.Split(u.RawQuery, "&")
 		queryChanged := false
 		for i, p := range parts {
@@ -54,11 +42,8 @@ func RedactURL(s string) string {
 			}
 			eq := strings.IndexByte(p, '=')
 			if eq < 0 {
-				// A bare token with no "=" is a value with no name (e.g. "?sk_live_abcdef"
-				// or "?<jwt>"); it can be a credential just as readily as a key=value pair.
-				// Redact the whole token to a length-tagged placeholder rather than passing
-				// it through (the redactURLFallback sibling drops such tokens entirely, so
-				// the parseable path must not be strictly less safe).
+				// A bare token with no "=" can be a credential too (e.g. "?sk_live_abcdef");
+				// redact the whole token rather than pass it through unredacted.
 				n := len(p)
 				if decoded, derr := url.QueryUnescape(p); derr == nil {
 					n = len(decoded)
@@ -83,25 +68,17 @@ func RedactURL(s string) string {
 			changed = true
 		}
 	}
-	// The fragment is a credential location too: the OAuth 2.0 implicit flow returns
-	// #access_token=... in the fragment, and other schemes stash bearer tokens there.
-	// u.String() re-emits it verbatim, so drop it entirely (its structure is not
-	// guaranteed key=value, so a whole-component drop is the safe scrub).
+	// The fragment is a credential location too (OAuth 2.0 implicit flow's #access_token=...);
+	// drop it entirely rather than parse it, since its structure is not guaranteed key=value.
 	if u.Fragment != "" || u.RawFragment != "" {
 		u.Fragment = ""
 		u.RawFragment = ""
 		changed = true
 	}
-	// url.Parse accepts opaque ("custom:user:pass@host") and scheme-less
-	// ("user:pass@host/path") credentialed forms, where the userinfo lands in u.Opaque
-	// rather than u.User and the query never populates u.RawQuery, so the userinfo/query
-	// scrubs above cannot reach it. An opaque form has NO "scheme://" authority, so it must
-	// NOT be handed verbatim to redactURLFallback's authority heuristic: that anchors on
-	// the FIRST "://" and scans for the credential's '@' only AFTER it, but a "://"
-	// appearing later inside the opaque data (e.g. "scheme:user:pass@host://x") sits past
-	// the credential, so the scan would miss it and return the value unredacted. When the
-	// opaque part carries an '@' (a possible userinfo credential), redact wholesale;
-	// otherwise the textual fallback still strips any query/fragment on the raw string.
+	// url.Parse's opaque/scheme-less credentialed forms land userinfo in u.Opaque, not
+	// u.User, so the scrubs above miss it; redactURLFallback's "://"-anchored heuristic
+	// can also miss a credential sitting before a later "://" in the opaque data, so an
+	// opaque value carrying '@' is redacted wholesale instead of deferred to it.
 	if u.Opaque != "" {
 		if strings.Contains(u.Opaque, "@") {
 			return "<redacted unparseable URL>"
@@ -109,51 +86,24 @@ func RedactURL(s string) string {
 		return redactURLFallback(s)
 	}
 	if u.Scheme != "" && u.OmitHost && strings.Contains(u.Path, "@") {
-		// A single-slash scheme typo: "https:/alice:SECRET@host/mcp". url.Parse puts the
-		// WHOLE credentialed authority in u.Path, which none of the scrubs above inspect,
-		// so `changed` stayed false and the raw credential was returned verbatim.
-		//
-		// Redact wholesale rather than deferring to redactURLFallback, for the same reason
-		// the opaque branch above does: this value has no authority of its own, and the
-		// fallback's heuristic anchors on the FIRST "://" in the string. A "://" occurring
-		// later — in a query, as in "https:/user:pw@host/x?next=https://portal" — sits PAST
-		// the credential, so the fallback would scan for the userinfo boundary beyond it,
-		// find none, and hand the credential back verbatim.
-		//
-		// The test is positional, taken from url.Parse's own structural verdict rather
-		// than from a substring scan: OmitHost reports that the value carried NO authority
-		// marker at all, which is what makes an '@' in the path suspect. Two shapes must
-		// NOT be caught, and a scan for "//" (or even "://") anywhere in the string gets
-		// both wrong:
-		//
-		//   - "file:///home/a@b/x" has an explicit, empty authority, so OmitHost is false
-		//     and the '@' really is a path character. Its path is preserved.
-		//   - "https:/user:pw@host/x?next=https://portal" and ".../a//b" DO contain "//",
-		//     just not as their own authority marker — a scan would skip them and echo the
-		//     credential, which is exactly the hole this guard was first written with.
-		//
-		// A scheme-LESS value is left alone: "/var/log/eunox@prod/audit.jsonl" is an
-		// ordinary path, and the audit-tail targets this redactor is pointed at are
-		// commonly exactly that. The scheme-less credentialed form "user:pw@host/path"
-		// parses as scheme "user" with an opaque body and is caught by the branch above.
+		// A single-slash scheme typo ("https:/alice:SECRET@host/mcp") puts the whole
+		// credentialed authority in u.Path, unreached by the scrubs above; redact wholesale
+		// rather than defer to redactURLFallback, whose "://"-anchored scan could sit past
+		// the credential. OmitHost (not a substring scan) is what distinguishes this from a
+		// legitimate '@' in a path like "file:///home/a@b/x", where OmitHost is false.
 		return "<redacted unparseable URL>"
 	}
 	if !changed {
-		// A hierarchical "scheme://host/..." with authority credentials always populates
-		// u.User (handled above), so a bare '@' in the path of an opaque-free,
-		// fragment-free URL is not a credential and is correctly returned unchanged
-		// (redacting it would needlessly mangle a legitimate value).
+		// Authority credentials always populate u.User (handled above), so a bare '@' left
+		// in the path here is not a credential.
 		return s
 	}
 	return u.String()
 }
 
-// redactURLFallback conservatively strips userinfo from a URL string url.Parse could
-// not handle. It locates the authority (after "scheme://", up to the first '/', '?', or
-// '#') and replaces anything before its last '@' with "REDACTED". If an '@' still
-// appears past the authority boundary (a malformed URL where the credential cannot be
-// located safely), or the string has no "scheme://" but contains an '@', the whole value
-// is replaced with a placeholder.
+// redactURLFallback conservatively strips userinfo from a URL string url.Parse could not
+// handle, replacing the whole value with a placeholder when the credential's location
+// cannot be determined safely.
 func redactURLFallback(s string) string {
 	const sep = "://"
 	schemeEnd := strings.Index(s, sep)
@@ -173,9 +123,7 @@ func redactURLFallback(s string) string {
 	}
 	at := strings.LastIndex(authority, "@")
 	if at < 0 {
-		// No userinfo in the authority — but this fallback only runs because url.Parse
-		// failed, so an '@' past the authority boundary (credentials hidden after an
-		// unescaped '/') cannot be located safely; replace the whole value.
+		// An '@' past the authority boundary cannot be located safely; replace the whole value.
 		if strings.Contains(tail, "@") {
 			return "<redacted unparseable URL>"
 		}
@@ -185,17 +133,9 @@ func redactURLFallback(s string) string {
 }
 
 // redactRawQuery replaces the query AND fragment components of a raw (possibly
-// unparseable) URL, so a ?api_key=/?token= or #access_token= credential cannot leak
-// through the url.Parse-failure path. The query runs from the first '?' to '#' or end;
-// scheme/host/path are preserved and an empty "?" is left as-is. A non-empty fragment is
-// DROPPED ENTIRELY (delimiter included), matching how the parse-success path (RedactURL)
-// scrubs u.Fragment, so the same #fragment renders identically regardless of which path
-// handled it; a bare '#' is preserved.
-//
-// Unlike RedactURL's per-value scrub, this drops the whole query including parameter
-// names: since the URL would not parse, the query cannot be safely tokenized on '='/'&'
-// (an encoded '%26' could split differently than the server reads it), so wholesale
-// redaction is the safe tradeoff. The same reasoning applies to the fragment.
+// unparseable) URL wholesale, including parameter names: an unparseable query cannot be
+// safely tokenized on '='/'&' (an encoded '%26' could split differently than the server
+// reads it). A non-empty fragment is dropped entirely, matching RedactURL's u.Fragment scrub.
 func redactRawQuery(s string) string {
 	// Split the fragment off first so it is redacted whether or not a query exists.
 	fragMarker := ""

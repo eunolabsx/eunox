@@ -21,29 +21,18 @@ type Directive interface {
 	ToObligation() Obligation
 }
 
-// RedactFieldsDirective masks the listed fields in a tools/call result: each
-// matched field keeps its key but has its value replaced by the placeholder string
-// "[redacted]" (the key's presence is retained; only the value is hidden).
-// Fields are dot-path strings (e.g. "user.ssn", "$.result.secret"); the leading
-// "$." or "$" is optional. A path's final segment that names a field inside array
-// elements redacts it in every element ("users.ssn" masks ssn in each object
-// in the users array). Array-index notation ("users[0].ssn") is NOT supported and
-// is rejected at manifest load: each segment is treated as a literal object key,
-// so an indexed segment would silently match nothing. Redaction recurses through
-// nested objects and array elements, applying to every JSON text content item and
-// to structuredContent; an absent field is a no-op and non-JSON content (images,
-// resource links, _meta) is preserved.
+// RedactFieldsDirective masks the listed fields in a tools/call result: each matched field
+// keeps its key but its value is replaced with "[redacted]". Fields are dot-path strings
+// (e.g. "user.ssn", "$.result.secret"); the leading "$." is optional, and a path landing on
+// an array field redacts it in every element. Array-index notation ("users[0].ssn") is NOT
+// supported and rejected at manifest load — each segment is a literal object key, so an
+// indexed segment would silently match nothing.
 //
-// Directives apply only to tool: targets; one on any other target type is
-// rejected at manifest load.
-//
-// Free-form text (an error string, a "[ERROR] ..." log line) is forwarded
-// unchanged — a dot-path addresses JSON object keys, which such text has none of.
-// A text item that looks like a JSON object (leading '{') but fails to parse —
-// or JSON embedded in surrounding prose — is NOT a clean container: it passes
-// through unredacted (a silent pass, not fail-closed), so such content must be
-// redacted upstream. The response *envelope*, by contrast, fails closed when
-// unparseable.
+// Redaction recurses through nested objects/arrays across every JSON text content item and
+// structuredContent; non-JSON content (images, resource links, _meta) is preserved. A text
+// item that looks like JSON but fails to parse passes through UNREDACTED (silent, not
+// fail-closed) — such content must be redacted upstream. Directives apply only to tool:
+// targets; any other target type is rejected at load.
 type RedactFieldsDirective struct {
 	Fields []string `json:"fields"`
 }

@@ -3,35 +3,21 @@
 
 // The handle that carries an authorized declassification from the decision to the commit.
 //
-// A declassification is applied in two phases: the decision resolves and AUTHORIZES the clear
-// (selecting a covering approval and burning it when it is single-use), and the caller applies
-// it once the sanitizing call has actually run. Splitting them is what keeps the labels
-// visible to every concurrent decision for the whole upstream round trip — see
-// EnforceResponse.Declassification — but it leaves an obligation, and an obligation needs a
-// carrier.
+// A declassification is applied in two phases: the decision AUTHORIZES the clear (selecting
+// a covering approval, burning it if single-use), and the caller applies it once the
+// sanitizing call has actually run — see EnforceResponse.Declassification for why the split
+// keeps labels visible to concurrent decisions during the upstream round trip.
 //
-// The carrier is this type, and it is what the second phase takes INSTEAD of a label slice:
+// This handle is what the second phase takes instead of a raw label slice: the authorized
+// set is unexported and copied out (so the commit phase cannot widen it), it is minted only
+// by a decision that authorized something (nil otherwise), and Claim is single-use so an
+// authorization cannot replay into two clears.
 //
-//   - The authorized set is unexported and copied out, so the phase that applies the clear
-//     cannot widen it. Every gate the declassify surface installs — the approval scope, the
-//     escalation, the single-use ledger — sits on the FIRST phase, so a second phase that
-//     accepted an arbitrary []string was an unauthorized clear primitive: an embedder holding
-//     an engine could remove any label it named, with no approval presented and nothing on the
-//     tape to say so.
-//   - It is minted only by a decision that authorized a declassification, and is nil on every
-//     other call — which is every call in a deployment that does not declassify. The two facts
-//     a record may have to carry (what a clear did not remove, and which single-use grant the
-//     decision burned) hang off this ONE handle, so they cannot disagree about which decision
-//     they came from; as four parallel response fields their populated-together rule was
-//     prose, and had already been broken once.
-//   - Claim is single-use, so an authorization cannot be replayed into two clears.
-//
-// SCOPE, honestly: an embedder can still construct one through NewDeclassification, which
-// exists because the engine that mints handles lives in another package. This narrows the
-// surface from "any label slice reaches the store" to "a caller has to build something that
-// says what it is" — the same scope note the transport's killSubject carries. What it does
-// close completely is the accidental version: the in-tree paths, and any embedder following
-// the response, cannot clear a set the decision did not authorize.
+// SCOPE: an embedder can still construct one via NewDeclassification (exported because the
+// minting engine lives in another package), narrowing "any label slice reaches the store" to
+// "a caller has to build something that says what it is" — the same scope note killSubject
+// carries. What it closes completely is the accidental version: no in-tree path can clear a
+// set the decision did not authorize.
 
 package capability
 
@@ -68,17 +54,10 @@ type Declassification struct {
 	// actually changed, so they are populated only on a handle that authorizes something.
 	approver   string
 	approvalID string
-	// spentApprovalID names an approval the decision BURNED in the ledger, and is empty for
-	// a standing grant (which spends nothing).
-	//
-	// It is a second string rather than a bit over approvalID because the two are not the
-	// same fact, and one handle shape proves it: a decision whose own commit faulted after
-	// burning a grant authorizes NOTHING and still has a spent id to report (see
-	// NewSpentGrantOnly). Derived from approvalID, that handle reported the same string from
-	// ApprovalID() — the top-level signed field reserved for a declassification that actually
-	// took effect — putting one id on the tape with two provenances, which is exactly what
-	// the separate detail key exists to prevent. The two fields are written in ONE place each
-	// (the two constructors below), so there is no pair for a caller to keep in agreement.
+	// spentApprovalID names an approval the decision BURNED in the ledger, empty for a
+	// standing grant. Kept separate from approvalID (rather than derived) because a handle
+	// can have one without the other: see NewSpentGrantOnly, where a commit that faulted
+	// after burning a grant authorizes nothing but must still report the spent id.
 	spentApprovalID string
 	// committed makes the handle single-use. atomic because a decision's response can be
 	// read by more than one goroutine on the transport's response path.
@@ -115,23 +94,14 @@ func NewDeclassification(labels []string, approver, approvalID string, singleUse
 }
 
 // NewSpentGrantOnly mints a handle that authorizes NO clear and exists solely to name a
-// single-use grant a decision already burned.
+// single-use grant a decision already burned — the shape a fault inside the decision
+// produces (the ledger burn has no un-burn, so a commit that faults after burning has still
+// spent the operator's one-shot approval on a call about to be refused).
 //
-// It is the shape a fault inside the decision produces: the ledger burn is atomic with the
-// decision and has no un-burn, so a commit that faults after burning has spent the operator's
-// one-shot approval on a call that is about to be refused. That grant appears on no other
-// record, and an operator reconciling outstanding approvals would otherwise believe it live.
-//
-// The distinction from NewDeclassification(nil, "", id, true) is the whole point of a separate
-// constructor: that call produces a handle whose ApprovalID() and SpentApprovalID() are the
-// same string, and ApprovalID feeds the top-level, HMAC-signed approval_id field, which is
-// reserved for a declassification that actually TOOK EFFECT. One id reaching the tape through
-// two fields with two documented meanings is the collision the separate detail key exists to
-// avoid; a handle that authorizes nothing must not be able to populate the authorizing field
-// at all.
-//
-// It carries no labels, so PendingClear is false and the commit skips it — this cannot become
-// a clear on a refused call.
+// Unlike NewDeclassification(nil, "", id, true), this leaves ApprovalID() empty: that field
+// feeds the top-level, HMAC-signed approval_id reserved for a declassification that actually
+// TOOK EFFECT, and a handle authorizing nothing must not populate it. It carries no labels,
+// so PendingClear is false and the commit skips it.
 func NewSpentGrantOnly(spentApprovalID string) *Declassification {
 	return &Declassification{spentApprovalID: spentApprovalID}
 }

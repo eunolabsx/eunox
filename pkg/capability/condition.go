@@ -25,14 +25,10 @@ const (
 	ConditionTypeCustom            = "custom"
 )
 
-// Several conditions cache a normalized form of their allowlist, built once by
-// Compile at manifest load (see AllowedOperationsCondition, AllowedExtensionsCondition,
-// AllowedTablesCondition, RecipientDomainCondition, IPRangeCondition, TimeWindowCondition).
-// Those caches have NO invalidation: once Compile has run, the accessors serve the
-// cached form and never re-read the source field. The source slices/maps are therefore
-// immutable after load — mutating Operations/Extensions/Tables/Columns/Domains/CIDRs on
-// a compiled condition keeps enforcing the PRE-edit allowlist, silently and in the
-// fail-open direction if the edit was a narrowing. Build a new condition instead.
+// Several conditions cache a normalized allowlist, built once by Compile at manifest load.
+// Those caches have NO invalidation: mutating the source field after Compile keeps
+// enforcing the pre-edit allowlist, silently and fail-open if the edit was a narrowing.
+// Build a new condition instead of mutating a compiled one.
 
 // Condition is the interface for all capability conditions.
 // All conditions have a Type() method returning the discriminator string.
@@ -74,25 +70,15 @@ type IPRangeCondition struct {
 }
 
 // AllowedOperationsCondition limits use to the listed operations (SQL verb,
-// action keyword, etc.).
+// action keyword, etc.). Argument names the tool parameter carrying the operation
+// string; required except for the JWT v0.2 "op=" shorthand, which scans every
+// string argument.
 //
-// Argument names the tool parameter carrying the operation string (e.g. the SQL
-// query); the proxy checks its first word against Operations. Argument is
-// required in manifest policies — empty fails closed — except for the JWT v0.2
-// "op=" shorthand, which leaves it empty and scans every string argument.
-//
-// SCOPE LIMIT — this is a coarse first-token verb gate, not a SQL parser, and the
-// gap is an under-block, not a false denial: only the FIRST whitespace-delimited
-// word is inspected, so Operations ["SELECT"] admits "SELECT 1; DROP TABLE users"
-// and the trailing statement executes upstream if the driver permits multiple
-// statements per call. (A leading CTE/EXPLAIN/SET prefix is the harmless converse:
-// the first token is not the effective verb, so the call is over-denied.) Denying
-// on a bare ';' is not an option — it false-positives on any quoted literal
-// containing one — so the boundary is documented rather than widened. Treat this
-// as defense-in-depth over a read-only database role plus multi-statement
-// execution disabled at the driver, and pair it with argumentSchema or an external
-// policy evaluator for untrusted SQL; never make it the sole control. Kept in
-// lock-step with docs/capability-manifest-guide.md's allowedOperations section.
+// SCOPE LIMIT (security): a coarse first-token verb gate, not a SQL parser — only
+// the FIRST whitespace-delimited word is checked, so Operations ["SELECT"] admits
+// "SELECT 1; DROP TABLE users" if the driver permits multiple statements per call.
+// Treat as defense-in-depth over a read-only DB role with multi-statement execution
+// disabled, never as the sole control. See docs/capability-manifest-guide.md.
 type AllowedOperationsCondition struct {
 	Argument   string   `json:"argument,omitempty"`
 	Operations []string `json:"operations"`

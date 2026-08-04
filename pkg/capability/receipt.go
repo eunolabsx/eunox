@@ -16,57 +16,46 @@ import (
 
 // Effect receipts — the runtime counterpart of the authoring-time contract.
 //
-// An effect contract is an ASSERTION: the operator's manifest (or a reviewed registry
-// entry) says what a call does, and nothing in eunox observes whether the server behaves
-// that way. The design refuses to find out by watching: eunox verifies attestations, it
-// does not monitor servers, and no payload inference or egress observation is on the table.
+// An effect contract is an ASSERTION: the operator's manifest says what a call does, and
+// nothing in eunox observes whether the server behaves that way. A receipt is the honest way
+// to close that loop: a server MAY publish, in a tool RESULT's `_meta`, a SIGNED statement of
+// what it actually did; eunox verifies the signature and checks it against the contract the
+// pre-call decision used, and puts the verdict on the tape. The server says, eunox checks the
+// claim — no observation of the server anywhere in it.
 //
-// A receipt is the honest way to close that loop. A server MAY publish, in a tool RESULT's
-// `_meta`, a SIGNED statement of what it actually did; eunox verifies the signature and
-// checks the statement against the contract the pre-call decision used, and puts the
-// verdict on the tape. The server says, eunox checks the claim — no observation of the
-// server anywhere in it.
+// Four properties are load-bearing:
 //
-// Four properties are load-bearing, and each has a specific failure it prevents:
-//
-//   - VERIFICATION ONLY. The proxy reads the declared receipt block and nothing else. No
-//     server-egress watching, no payload inference.
-//   - FAIL CLOSED ON TRUST. An unsigned or unverifiable receipt earns NOTHING — it records
-//     as such and grants no reduction in friction. Otherwise a malicious server forges
-//     "reversible, 1 row" and buys itself a lower bar, which inverts the control.
-//   - POST-HOC, NEVER RETROACTIVE. The call already happened. A receipt cannot un-forward
-//     it, so an inconsistency is EVIDENCE on the tape and an input to future friction —
-//     never a late denial, which would be a decision made after the side effect.
-//   - ZERO COST WHEN UNCONFIGURED. No receipt handling at all unless an operator configures
-//     the key domain for an upstream. A non-supporting server simply never sets the field,
-//     and value accrues per server, so this needs no ecosystem coordination.
+//   - VERIFICATION ONLY. No server-egress watching, no payload inference.
+//   - FAIL CLOSED ON TRUST. An unsigned or unverifiable receipt earns NOTHING, else a
+//     malicious server could forge "reversible, 1 row" to buy itself a lower bar.
+//   - POST-HOC, NEVER RETROACTIVE. The call already happened; an inconsistency is EVIDENCE
+//     on the tape, never a late denial made after the side effect.
+//   - ZERO COST WHEN UNCONFIGURED. No handling at all unless an operator configures the key
+//     domain for an upstream.
 //
 // The key domain is the server's own, configured PER UPSTREAM — deliberately NOT the JWKS
-// that authenticates CALLERS. A receipt is a statement by the upstream about its own
-// behavior, closer to package signing than to an access token; wiring it to the caller's
-// IdP would mean any party that can mint a caller token can also mint attestations about a
-// server's behavior, which is a different trust question with a different answer. The
-// verification machinery is shared (the same asymmetric-only algorithm allowlist every JWS
-// in this package obeys); only the key set differs.
+// that authenticates CALLERS: a receipt is a statement by the upstream about its own
+// behavior, closer to package signing than to an access token, and wiring it to the caller's
+// IdP would let any party that can mint a caller token also mint server-behavior
+// attestations. The verification machinery (the asymmetric-only algorithm allowlist) is
+// shared with every other JWS in this package; only the key set differs.
 
 // MetaKeyEffectReceipt is the reverse-DNS `_meta` key a server publishes a signed effect
-// receipt under. Namespaced so a non-supporting server, host, or client simply never sets
-// it and nothing changes.
+// receipt under. Namespaced so a non-supporting server, host, or client simply never sets it.
 const MetaKeyEffectReceipt = "io.eunolabs.effect-receipt"
 
-// EffectReceipt is the `_meta` block itself: an envelope carrying one compact JWS. The
-// envelope is deliberately thin — everything that matters is inside the signature, because
-// a field outside it is a field an intermediary can rewrite.
+// EffectReceipt is the `_meta` block itself: an envelope carrying one compact JWS. Kept
+// deliberately thin — everything that matters is inside the signature, since a field outside
+// it is a field an intermediary can rewrite.
 type EffectReceipt struct {
 	// JWS is the compact-serialized signature over the receipt's claims.
 	JWS string `json:"jws"`
 }
 
-// EffectReceiptClaims is what a server attests, as the signed payload of the JWS.
-//
-// It mirrors the contract vocabulary exactly — the same closed effect classes, the same
-// magnitude-and-unit shape — so "consistent with what was declared" is a comparison
-// between like values rather than a translation between two schemas that could drift.
+// EffectReceiptClaims is what a server attests, as the signed payload of the JWS. It mirrors
+// the contract vocabulary exactly (closed effect classes, magnitude-and-unit shape) so
+// "consistent with declared" is a comparison between like values, not a translation between
+// two schemas that could drift.
 type EffectReceiptClaims struct {
 	// Tool is the advertised tool name this receipt is about. It must match the call, or
 	// the receipt attests to something else entirely.
@@ -81,43 +70,37 @@ type EffectReceiptClaims struct {
 	Unit string `json:"unit,omitempty"`
 	// CompensatingAction names what reverses the action, when the server says one exists.
 	CompensatingAction string `json:"compensatingAction,omitempty"`
-	// IssuedAt is the Unix second the receipt was signed. It bounds replay to the
-	// freshness window (see EffectReceiptVerifier.MaxAge) — it does not eliminate replay,
-	// which would need a nonce eunox supplies on the request leg.
+	// IssuedAt is the Unix second the receipt was signed. It bounds replay to the freshness
+	// window (see EffectReceiptVerifier.MaxAge) — it does not eliminate replay, which would
+	// need a nonce eunox supplies on the request leg.
 	IssuedAt int64 `json:"iat"`
 }
 
-// ReceiptVerdict is the closed vocabulary of receipt outcomes. It is closed for the same
-// reason the effect classes are: a verdict a SIEM rule selects on cannot be free-form
-// prose, and "unverifiable" and "inconsistent" are different enough incidents that
-// collapsing them would hide the one that matters.
+// ReceiptVerdict is the closed vocabulary of receipt outcomes, closed for the same reason
+// the effect classes are: a verdict a SIEM rule selects on cannot be free-form prose, and
+// "unverifiable" vs "inconsistent" are different enough incidents to keep distinct.
 type ReceiptVerdict string
 
 const (
 	// ReceiptVerified — the signature verified against the upstream's configured key
 	// domain AND the claims are consistent with the contract the decision used.
 	ReceiptVerified ReceiptVerdict = "verified"
-	// ReceiptMalformed — a receipt block is present but is not a well-formed envelope.
-	// It earns nothing; the shape is the server's to fix.
+	// ReceiptMalformed — a receipt block is present but is not a well-formed envelope. It
+	// earns nothing; the shape is the server's to fix.
 	ReceiptMalformed ReceiptVerdict = "malformed"
 	// ReceiptUnverified — the signature could not be verified: an unknown key, a bad
-	// signature, a stale or future-dated receipt. It earns nothing. This is the fail-closed
-	// case, and it must stay distinct from "no receipt at all": a server that USED to
-	// attest and now cannot is a different event from one that never did.
+	// signature, a stale or future-dated receipt. Fail-closed; kept distinct from "no
+	// receipt at all" (a server that USED to attest and now cannot is a different event).
 	//
-	// It deliberately COLLAPSES what internal/registry's attestation verifier deliberately
-	// SPLITS: there, a key the operator does not hold is inert while a key they do hold
-	// whose signature fails is a hard error. Both choices are right in context, and the
-	// difference is worth naming because an operator reasoning from one about the other
-	// gets it backwards. Here every unverified receipt earns exactly nothing, so grading
-	// them would only invite a consumer to treat some as softer; there, the two are the
-	// difference between "signed by a stranger" and "edited after it was signed", which are
-	// different actions for the human reading the report. See docs/effect-contracts.md,
-	// "Why there are two operator-configured key files".
+	// This deliberately COLLAPSES what internal/registry's attestation verifier SPLITS
+	// (there, an unheld key is inert while a held key's failed signature is a hard error):
+	// here every unverified receipt earns exactly nothing, so grading them would only
+	// invite treating some as softer. See docs/effect-contracts.md, "Why there are two
+	// operator-configured key files".
 	ReceiptUnverified ReceiptVerdict = "unverified"
-	// ReceiptInconsistent — the signature verified, and the server's own account of what
-	// it did contradicts the contract the decision was made against. The strongest signal
-	// this surface produces, and still only evidence: the call already happened.
+	// ReceiptInconsistent — the signature verified, and the server's own account of what it
+	// did contradicts the contract the decision used. The strongest signal this surface
+	// produces, and still only evidence: the call already happened.
 	ReceiptInconsistent ReceiptVerdict = "inconsistent"
 )
 
@@ -135,36 +118,29 @@ const (
 	// receipt names a different one (or none).
 	ReceiptReasonCompensation = "compensating_action"
 	// ReceiptReasonUnknownClass — the receipt's class is outside the closed vocabulary, so
-	// it cannot be shown to sit within the declaration. Fail closed: an unrecognized class
-	// is not a small one.
+	// it cannot be shown to sit within the declaration. Fail closed.
 	ReceiptReasonUnknownClass = "unknown_effect_class"
 	// ReceiptReasonBlastRadiusUnstated — the contract quantified this call's magnitude and
 	// the receipt says nothing about it. Silence is not agreement: a server that moved a
-	// million dollars against a $10 declaration and simply omitted the field would
-	// otherwise record as `verified`, the strongest signal this surface emits, for an
-	// attestation that never covered the one dimension the contract bounded.
+	// million dollars against a $10 declaration and omitted the field would otherwise
+	// record as `verified` for an attestation that never covered the bounded dimension.
 	ReceiptReasonBlastRadiusUnstated = "blast_radius_unstated"
 	// ReceiptReasonClassUnstated — the contract declared a class below the top and the
-	// receipt says nothing about the one it landed in. The same rule as
-	// ReceiptReasonBlastRadiusUnstated, applied to the other declared dimension: a server
-	// that performed an irreversible action against a `reversible` declaration and simply
-	// omitted `class` would otherwise record as `verified`, because every class comparison
-	// below is gated on the field being present. It does not fire when the declaration is
-	// already `irreversible` — an unstated class cannot exceed the top of the vocabulary, so
-	// there is nothing silence could be hiding.
+	// receipt says nothing about the one it landed in (same rule as the blast-radius case).
+	// Does not fire when the declaration is already `irreversible` — an unstated class
+	// cannot exceed the top of the vocabulary, so silence hides nothing there.
 	ReceiptReasonClassUnstated = "effect_class_unstated"
 )
 
-// ReceiptResult is one receipt's outcome. A nil *ReceiptResult means the server published
-// no receipt at all — the default for every non-supporting server, and the one case that
-// records nothing, so an upstream that does not participate costs nothing anywhere.
+// ReceiptResult is one receipt's outcome. A nil *ReceiptResult means the server published no
+// receipt at all — the default for every non-supporting server, and the one case that
+// records nothing.
 type ReceiptResult struct {
 	Verdict ReceiptVerdict
 	// Reasons are the stable inconsistency tokens, sorted, for an inconsistent verdict.
 	Reasons []string
-	// Claims is the verified payload, present for a verified or inconsistent verdict. It
-	// is nil for every unverified one, because an unverified claim must not be read as a
-	// fact about what the server did.
+	// Claims is the verified payload, present for a verified or inconsistent verdict; nil
+	// for every unverified one, since an unverified claim must not be read as fact.
 	Claims *EffectReceiptClaims
 }
 
@@ -172,9 +148,9 @@ type ReceiptResult struct {
 // carries. Scalar values under a single reserved prefix, so a SIEM rule selects every
 // receipt event on one key rather than enumerating them.
 //
-// A claim is recorded ONLY when it was verified. Recording an unverified server's stated
-// class beside a verdict field would put an unauthenticated assertion on the signed tape in
-// a shape a later reader could mistake for a checked fact.
+// A claim is recorded ONLY when it was verified: an unverified server's stated class beside
+// a verdict field would put an unauthenticated assertion on the signed tape in a shape a
+// later reader could mistake for a checked fact.
 func (r *ReceiptResult) AuditDetails() map[string]interface{} {
 	if r == nil {
 		return nil
@@ -204,20 +180,17 @@ func (r *ReceiptResult) AuditDetails() map[string]interface{} {
 // EffectReceiptVerifier verifies receipts against ONE upstream's key domain.
 //
 // The key set is static and supplied at construction — no fetch, on the decision path or
-// off it. That is not an omission: an upstream's receipt-signing keys are part of the
-// operator's configuration for that upstream, exactly as its command line or its URL is,
-// and making the proxy fetch them would put a network dependency behind a check whose whole
-// value is that it is local and unfalsifiable.
+// off it. An upstream's receipt-signing keys are part of the operator's configuration for
+// that upstream, and making the proxy fetch them would put a network dependency behind a
+// check whose whole value is that it is local and unfalsifiable.
 //
 // A nil *EffectReceiptVerifier is the "receipts not configured" value: Verify returns nil
-// without parsing anything, so an operator who configured no key domain pays nothing at
-// all — not a parse, not an allocation, not a map lookup on the result's `_meta`.
+// without parsing anything, so an operator who configured no key domain pays nothing at all.
 type EffectReceiptVerifier struct {
 	keys *jose.JSONWebKeySet
-	// maxAge bounds how old a receipt may be. It is what makes a captured receipt stop
-	// being usable, and it is a BOUND on replay rather than a cure: within the window a
-	// server could re-present one. Eliminating replay needs a nonce eunox supplies on the
-	// request leg, which is a protocol addition rather than a verification detail.
+	// maxAge bounds how old a receipt may be — a BOUND on replay, not a cure: within the
+	// window a server could re-present one. Eliminating replay needs a nonce eunox
+	// supplies on the request leg, a protocol addition rather than a verification detail.
 	maxAge time.Duration
 	// leeway absorbs clock skew between the signing server and this proxy, in both
 	// directions: a receipt dated slightly in the future is skew, not forgery.
@@ -226,31 +199,29 @@ type EffectReceiptVerifier struct {
 
 // Default receipt freshness bounds. The window is short because a receipt describes a call
 // that just completed: anything older is either a replay or a server clock so wrong that
-// its attestations are not worth much either way.
+// its attestations aren't worth much either way.
 const (
 	DefaultReceiptMaxAge = 5 * time.Minute
 	DefaultReceiptLeeway = 60 * time.Second
-	// MaxReceiptKeys bounds the key set a receipt may be trialled against; see
-	// NewEffectReceiptVerifier. It matches the JWKS cache's own per-response cap.
+	// MaxReceiptKeys bounds the key set a receipt may be trialled against; matches the
+	// JWKS cache's own per-response cap.
 	MaxReceiptKeys = 100
 )
 
 // NewEffectReceiptVerifier builds a verifier from a JWKS document — the upstream's own
 // receipt-signing keys, not the caller IdP's.
 //
-// It rejects a key set carrying any symmetric key. A shared secret cannot attest to
-// anything: whoever verifies could also have signed, so a receipt "verified" against one
-// proves nothing about which party produced it — the same reason every other JWS in this
-// package is restricted to asymmetric algorithms.
+// It rejects a key set carrying any symmetric key: whoever verifies an HMAC secret could
+// also have signed with it, so a receipt "verified" against one proves nothing about which
+// party produced it — the same reason every other JWS in this package is asymmetric-only.
 func NewEffectReceiptVerifier(jwksJSON []byte, maxAge, leeway time.Duration) (*EffectReceiptVerifier, error) {
 	var ks jose.JSONWebKeySet
 	if err := json.Unmarshal(jwksJSON, &ks); err != nil {
 		return nil, fmt.Errorf("parsing effect-receipt JWKS: %w", err)
 	}
 	if len(ks.Keys) == 0 {
-		// An empty key set can verify nothing, so every receipt would record as
-		// unverified — indistinguishable from a misconfigured path. Refuse at load, where
-		// the operator sees it.
+		// An empty key set can verify nothing, so every receipt would record as unverified
+		// — indistinguishable from a misconfigured path. Refuse at load instead.
 		return nil, fmt.Errorf("effect-receipt JWKS contains no keys")
 	}
 	for i := range ks.Keys {
@@ -259,19 +230,16 @@ func NewEffectReceiptVerifier(jwksJSON []byte, maxAge, leeway time.Duration) (*E
 		}
 	}
 	if len(ks.Keys) > MaxReceiptKeys {
-		// The kid-less fan-out bound, mirroring the JWKS cache's own cap and for the same
-		// reason: a receipt carrying no kid is trialled against every key, so an unbounded
-		// key set is an unbounded amount of signature verification an upstream can force
-		// on the response path of every call.
+		// The kid-less fan-out bound, mirroring the JWKS cache's own cap: a receipt
+		// carrying no kid is trialled against every key, so an unbounded key set is
+		// unbounded signature verification an upstream can force on the response path.
 		return nil, fmt.Errorf("effect-receipt JWKS carries %d keys, more than the %d a kid-less receipt may be trialled against", len(ks.Keys), MaxReceiptKeys)
 	}
 	if maxAge <= 0 {
 		maxAge = DefaultReceiptMaxAge
 	}
-	// EffectiveLeeway is the shared sentinel resolver: 0 means "default", negative means
-	// "disabled". Hand-rolling it here inverted that — negative meant default and 0 meant
-	// disabled — so an operator disabling skew tolerance would have got 60 seconds of it,
-	// the fail-open direction for a replay bound.
+	// EffectiveLeeway is the shared resolver (0 = default, negative = disabled); hand-rolling
+	// this inverted the two and left "disabled" fail-open at 60s of skew tolerance.
 	leeway = EffectiveLeeway(leeway)
 	return &EffectReceiptVerifier{keys: &ks, maxAge: maxAge, leeway: leeway}, nil
 }
@@ -289,21 +257,17 @@ func ParseEffectReceipt(meta map[string]json.RawMessage) (raw json.RawMessage, o
 // Verify checks a receipt block against this upstream's key domain and against the effect
 // the pre-call decision resolved, and returns the verdict for the tape.
 //
-// It returns nil — recording nothing — when receipts are not configured or the server
-// published none. Every other outcome is a verdict, including the failures: a receipt that
-// cannot be verified is a fact worth recording precisely because it is the shape a forgery
-// takes.
+// It returns nil when receipts are not configured or the server published none. Every other
+// outcome is a verdict, including the failures — a receipt that cannot be verified is a fact
+// worth recording precisely because it is the shape a forgery takes.
 //
-// declared may be nil (a caller with no resolved effect in hand); the consistency check
-// then covers only what does not depend on the declaration — the tool binding and the
-// class vocabulary. It never upgrades a verdict: an absent declaration cannot make an
-// inconsistent receipt consistent, it can only leave less to compare against.
+// declared may be nil (no resolved effect in hand); the check then covers only what doesn't
+// depend on the declaration. It never upgrades a verdict: an absent declaration can only
+// leave less to compare against, never make an inconsistent receipt consistent.
 func (v *EffectReceiptVerifier) Verify(rawMeta json.RawMessage, tool string, declared *ResolvedEffect, now time.Time) *ReceiptResult {
-	// A nil verifier is the documented "receipts not configured" value. A non-nil one with
-	// no key set can only come from a zero-value literal (the fields are unexported, so an
-	// embedder or test double reaching for &EffectReceiptVerifier{} is the natural way) —
-	// it can verify nothing, and must fail CLOSED rather than panic the dispatch goroutine
-	// on attacker-influenced upstream output.
+	// A nil verifier is "receipts not configured". A non-nil one with no key set (a
+	// zero-value literal, e.g. a test double) can verify nothing and must fail CLOSED
+	// rather than panic the dispatch goroutine on attacker-influenced upstream output.
 	if v == nil || v.keys == nil || len(rawMeta) == 0 {
 		return nil
 	}
@@ -313,11 +277,10 @@ func (v *EffectReceiptVerifier) Verify(rawMeta json.RawMessage, tool string, dec
 	}
 	claims, err := v.verifySignature(env.JWS, now)
 	if err != nil {
-		// Deliberately one verdict for every signature-side failure — unknown key, bad
-		// signature, stale, future-dated, unparseable payload. They are all "this cannot be
+		// One verdict for every signature-side failure — they are all "this cannot be
 		// treated as the server's word", and splitting them would invite a consumer to treat
-		// some of them as softer than others, which is exactly the friction reduction an
-		// unverifiable receipt must not earn.
+		// some as softer than others, the friction reduction an unverifiable receipt must
+		// not earn.
 		return &ReceiptResult{Verdict: ReceiptUnverified}
 	}
 	reasons := receiptInconsistencies(claims, tool, declared)
@@ -334,19 +297,17 @@ func (v *EffectReceiptVerifier) verifySignature(compact string, now time.Time) (
 	if err != nil {
 		return nil, fmt.Errorf("parsing effect receipt: %w", err)
 	}
-	// One signature only. A multi-signature JWS would leave "which key vouched for this"
+	// One signature only: a multi-signature JWS would leave "which key vouched for this"
 	// ambiguous, and an attestation whose signer is ambiguous attests to nothing.
 	if len(sig.Signatures) != 1 {
 		return nil, fmt.Errorf("effect receipt must carry exactly one signature, got %d", len(sig.Signatures))
 	}
 	kid := sig.Signatures[0].Header.KeyID
 
-	// FindKeys is the shared selector every JWS path in this package uses: it returns the
-	// keys matching kid, or ALL keys when the receipt carries none. Reusing it (rather than
-	// inlining the same loop) is what keeps the kid-less fan-out identical to the one the
-	// IdP path bounds — and the fan-out is why NewEffectReceiptVerifier caps the key count:
-	// a hostile upstream publishing a kid-less JWS in every result would otherwise force one
-	// signature verification per configured key, synchronously, on every tools/call.
+	// FindKeys is the shared selector every JWS path in this package uses (all keys when
+	// kid is empty), keeping the kid-less fan-out identical to the one the IdP path bounds —
+	// which is why NewEffectReceiptVerifier caps the key count: a hostile upstream
+	// publishing a kid-less JWS would otherwise force one verification per configured key.
 	candidates := FindKeys(v.keys, kid)
 	var payload []byte
 	var verifyErr error
@@ -369,11 +330,10 @@ func (v *EffectReceiptVerifier) verifySignature(compact string, now time.Time) (
 	}
 
 	var claims EffectReceiptClaims
-	// BlastRadius is a typed *json.Number, so the literal's exact text is preserved by the
-	// declared type — a magnitude for a large row count is never widened through float64 and
-	// compared against a value the server never signed. (UseNumber would add nothing here:
-	// it governs decoding into interface{} only.) bytes.NewReader avoids the []byte -> string
-	// -> Reader copy of the whole payload on every verification.
+	// BlastRadius is a typed *json.Number, so the literal's exact text is preserved — a
+	// magnitude for a large row count is never widened through float64 and compared against
+	// a value the server never signed. bytes.NewReader avoids the []byte->string->Reader copy
+	// of the whole payload on every verification.
 	if err := json.NewDecoder(bytes.NewReader(payload)).Decode(&claims); err != nil {
 		return nil, fmt.Errorf("decoding effect receipt claims: %w", err)
 	}
@@ -390,23 +350,20 @@ func (v *EffectReceiptVerifier) verifySignature(compact string, now time.Time) (
 	return &claims, nil
 }
 
-// receiptInconsistencies compares a VERIFIED receipt against the tool called and the
-// effect the decision resolved, returning the stable reason tokens for anything that
-// contradicts the declaration. Sorted, so two identical incidents record identically.
+// receiptInconsistencies compares a VERIFIED receipt against the tool called and the effect
+// the decision resolved, returning the stable reason tokens for anything that contradicts
+// the declaration. Sorted, so two identical incidents record identically.
 //
-// The comparison is one-directional on purpose. A server saying it did something SMALLER or
-// LESS consequential than declared is consistent: the contract is an upper bound the
-// decision was made against, and staying under it is the contract being honored. Only
-// exceeding it is a contradiction. The runtime-dynamic case — a contract that could not be
-// resolved before the call — is likewise consistent by construction, since there is no
-// declared bound to exceed; the receipt is then the only account of what happened, which is
-// exactly the effect this surface exists to carry.
+// The comparison is one-directional on purpose: a server saying it did something SMALLER or
+// LESS consequential than declared is consistent (the contract is an upper bound; staying
+// under it is honoring it), only exceeding it is a contradiction. A contract that could not
+// be resolved before the call (declared == nil) is likewise consistent by construction —
+// there is no bound to exceed, so the receipt is the only account of what happened.
 func receiptInconsistencies(claims *EffectReceiptClaims, tool string, declared *ResolvedEffect) []string {
 	var reasons []string
 	if claims.Tool != tool {
-		// A receipt about another tool is not evidence about this call, however well it is
-		// signed. Reported rather than ignored: a server systematically returning the wrong
-		// tool's receipt is a defect an operator needs to see.
+		// A receipt about another tool is not evidence about this call, however well it's
+		// signed — reported rather than ignored, since it's a defect an operator needs to see.
 		reasons = append(reasons, ReceiptReasonTool)
 	}
 	if claims.Class != "" && !IsEffectClass(claims.Class) {
@@ -417,43 +374,34 @@ func receiptInconsistencies(claims *EffectReceiptClaims, tool string, declared *
 		return reasons
 	}
 	if claims.Class == "" && declared.Class != EffectIrreversible {
-		// Silence is not agreement, on this dimension exactly as on the magnitude one below.
-		// Class is omitempty and every comparison in this function is gated on it being
-		// present, so a receipt carrying only `tool` + `iat` tripped nothing and recorded
-		// `verified` — the strongest signal this surface emits — for an attestation that
-		// never covered the class the contract bounded.
-		//
-		// Not fired at the top of the vocabulary: an unstated class cannot exceed
-		// `irreversible`, so silence there hides nothing and flagging it would report an
-		// inconsistency against a declaration no receipt could contradict.
+		// Silence is not agreement: a receipt carrying only `tool` + `iat` would otherwise
+		// record `verified` for an attestation that never covered the bounded class. Not
+		// fired at the top of the vocabulary — an unstated class cannot exceed
+		// `irreversible`, so silence there hides nothing.
 		reasons = append(reasons, ReceiptReasonClassUnstated)
 	}
 	if claims.Class != "" && IsEffectClass(claims.Class) && !EffectClassAtMost(claims.Class, declared.Class) {
 		reasons = append(reasons, ReceiptReasonClass)
 	}
 	if declared.Quantified() && claims.BlastRadius == nil {
-		// The same rule claimsLessConsequentialThanDeclared applies to an unstated CLASS:
-		// an attestation that omits a declared dimension has not attested to it.
+		// An attestation that omits a declared dimension has not attested to it (same rule
+		// as ClassUnstated above).
 		reasons = append(reasons, ReceiptReasonBlastRadiusUnstated)
 	}
 	if claims.BlastRadius != nil && declared.Quantified() {
 		if actual, ok := ParseBlastRadiusNumber(*claims.BlastRadius); !ok || actual.Cmp(declared.BlastRadius) > 0 {
 			// An unparseable magnitude counts as exceeding: a size that cannot be read
-			// cannot be shown to be within the declaration, which is the same fail-closed
-			// rule the blastRadius condition applies to a call's own arguments.
+			// cannot be shown to be within the declaration — the same fail-closed rule the
+			// blastRadius condition applies to a call's own arguments.
 			reasons = append(reasons, ReceiptReasonBlastRadius)
 		}
 	}
 	if declared.CompensatingAction != "" && claims.CompensatingAction != declared.CompensatingAction &&
 		!claimsLessConsequentialThanDeclared(claims, declared) {
-		// The contract said this action is undone by a specific compensating action. A
-		// server that reports a different one — or none — is reporting that the declared
-		// undo does not apply, which is the mislabel the consequence gate exists to catch.
-		//
-		// Unless the server says it did something STRICTLY less consequential than
-		// declared, in which case the compensation leg is moot: a reversible action needs
-		// no undo, and demanding one would flag every honest server that stayed well inside
-		// its own contract.
+		// A server reporting a different (or no) compensating action is reporting that the
+		// declared undo doesn't apply — unless it says it did something STRICTLY less
+		// consequential than declared, in which case compensation is moot (a reversible
+		// action needs no undo).
 		reasons = append(reasons, ReceiptReasonCompensation)
 	}
 	sort.Strings(reasons)
@@ -461,9 +409,9 @@ func receiptInconsistencies(claims *EffectReceiptClaims, tool string, declared *
 }
 
 // claimsLessConsequentialThanDeclared reports whether a receipt says the action landed
-// strictly BELOW the declared class. A receipt that declares no class says nothing about
-// where it landed, so it does not qualify — an unstated class must not silently excuse a
-// missing compensating action.
+// strictly BELOW the declared class. A receipt declaring no class says nothing about where
+// it landed, so it does not qualify — an unstated class must not silently excuse a missing
+// compensating action.
 func claimsLessConsequentialThanDeclared(claims *EffectReceiptClaims, declared *ResolvedEffect) bool {
 	return claims.Class != "" &&
 		claims.Class != declared.Class &&

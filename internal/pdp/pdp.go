@@ -1075,7 +1075,6 @@ func (p *ManifestPDP) recordObservedHash(name, h, pin string) {
 	p.descMu.Unlock()
 }
 
-// isToolPoisoned reports whether a pinned tool was ever observed poisoned.
 func (p *ManifestPDP) isToolPoisoned(name string) bool {
 	p.descMu.RLock()
 	_, ok := p.poisonedTools[name]

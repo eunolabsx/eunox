@@ -14,20 +14,14 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// Load-time validation for the effect layer: the effectClass and blastRadius
-// conditions, a constraint's effect contract, and the top-level effectCeiling.
-//
-// Everything here fails at LOAD rather than at request time, on the same principle the
-// rest of the grammar follows: a closed typed vocabulary whose misspelled key is a load
-// error is falsifiable, where an evaluate-to-know policy is not. An effect contract that
-// only reveals its problem on the one call that mattered is exactly the failure the typed
-// grammar exists to prevent.
+// Load-time validation for the effect layer: the effectClass and blastRadius conditions, a
+// constraint's effect contract, and the top-level effectCeiling. Everything here fails at
+// LOAD rather than at request time — an effect contract that only reveals its problem on the
+// one call that mattered is exactly the failure the typed grammar exists to prevent.
 
 // validateEffectClass checks an effectClass condition's Allow set against the closed
-// vocabulary. An EMPTY allow is rejected: unlike flowLabel — where an empty allow set
-// means the meaningful "only a clean, unlabeled context reaches this sink" — an empty
-// effect-class allow admits nothing at all, which is a dead constraint an author never
-// intends (they meant to write a class and left it blank).
+// vocabulary. An EMPTY allow is rejected — unlike flowLabel, where it means "only a clean,
+// unlabeled context reaches this sink" — since here it admits nothing at all, a dead constraint.
 func validateEffectClass(i, j int, allow []string) error {
 	if len(allow) == 0 {
 		return fmt.Errorf("capability at index %d, condition %d: effectClass requires a non-empty 'allow' list naming the effect classes this target may perform (valid classes are %s); an empty list admits nothing", i, j, strings.Join(capability.EffectClassVocabulary(), ", "))
@@ -44,11 +38,8 @@ func validateEffectClass(i, j int, allow []string) error {
 // at least one of them present, and a cumulative bound whose two halves are both set.
 func validateBlastRadius(i, j int, c *capability.BlastRadiusCondition) error {
 	// The pair rule, checked FIRST so a half-written velocity bound is reported as the
-	// pairing mistake it is rather than as a missing 'max'. Half the pair silently
-	// disables the other half — a `maxTotal` with no window has no window to sum over, and
-	// a `windowSeconds` with no total bounds nothing — and an authored bound that bounded
-	// nothing is worse than its absence, because the operator would believe a limit was in
-	// force.
+	// pairing mistake it is rather than as a missing 'max' — half the pair silently bounds
+	// nothing, which is worse than its absence since the operator believes a limit is in force.
 	switch {
 	case c.MaxTotal != nil && c.WindowSeconds == 0:
 		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' requires 'windowSeconds', the sliding window it is summed over; a total with no window bounds nothing", i, j)
@@ -79,39 +70,29 @@ func validateBlastRadius(i, j int, c *capability.BlastRadiusCondition) error {
 }
 
 // validateBlastRadiusTotalRange rejects a cumulative bound the counter backends cannot
-// represent exactly. Above MaxWeightedTotal the Redis backend's float64 arithmetic would
-// silently round the threshold to one the operator never authored — so the bound is
-// refused at load rather than enforced approximately at a magnitude where the rounding
-// alone could be thousands.
-//
-// It is separate from validateBlastRadiusNumber because the PER-CALL bound has no such
-// limit: it is compared exactly, in arbitrary precision, and never summed.
+// represent exactly: above MaxWeightedTotal the Redis backend's float64 arithmetic would
+// silently round the threshold, so the bound is refused at load instead. Separate from
+// validateBlastRadiusNumber because the PER-CALL bound is compared exactly and never summed.
 func validateBlastRadiusTotalRange(i, j int, n *json.Number) error {
 	v, ok := capability.ParseBlastRadiusNumber(*n)
 	if !ok {
-		// Already reported by validateBlastRadiusNumber; nothing to add.
-		return nil
+		return nil // already reported by validateBlastRadiusNumber
 	}
-	// Compare the arbitrary-precision value, NOT its float64 narrowing. Rounding first let
-	// 2^53+1 pass — it narrows to exactly 2^53 — so a bound one unit above the
-	// representable maximum loaded clean and was then enforced as a threshold the operator
-	// never authored, which is the failure this check exists to prevent.
+	// Compare the arbitrary-precision value, NOT its float64 narrowing: rounding first let
+	// 2^53+1 pass (it narrows to exactly 2^53), enforcing a threshold the operator never wrote.
 	if v.Cmp(new(big.Float).SetFloat64(callcounter.MaxWeightedTotal)) > 0 {
 		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' must be <= %v (the largest total both counter backends sum exactly), got %q", i, j, callcounter.MaxWeightedTotal, n.String())
 	}
 	if v.Sign() <= 0 {
-		// Zero admits nothing with a positive magnitude and would deny every quantified
-		// call in the window — a limit that looks generous and refuses everything, the same
-		// trap validateBlastRadiusNumber rejects a negative bound for.
+		// Zero admits no positive magnitude, refusing every quantified call while looking
+		// like a generous limit — the same trap validateBlastRadiusNumber rejects for negatives.
 		return fmt.Errorf("capability at index %d, condition %d: blastRadius 'maxTotal' must be > 0, got %q; a zero total admits no quantified call at all", i, j, n.String())
 	}
 	return nil
 }
 
-// validateBlastRadiusNumber checks one bound: a parseable, non-negative number. A
-// negative bound is rejected because a magnitude is non-negative by construction, so a
-// negative bound can never be satisfied — it denies every call, silently, in the shape of
-// a limit that looks generous.
+// validateBlastRadiusNumber checks one bound: a parseable, non-negative number. A negative
+// bound can never be satisfied, silently denying every call while looking like a generous limit.
 func validateBlastRadiusNumber(i, j int, field string, n *json.Number) error {
 	if n == nil {
 		return nil
@@ -126,15 +107,9 @@ func validateBlastRadiusNumber(i, j int, field string, n *json.Number) error {
 	return nil
 }
 
-// validateEffectContract checks a constraint's effect block. The contract is the input
-// every effect check reads, so a malformed one would make all of them wrong at once.
-//
-// The rules themselves live in pkg/capability (capability.ValidateEffectContract), which
-// owns the reversibility vocabulary and the contract digest. This layer only adds the
-// manifest-positional framing, so the registry corpus loader can apply the SAME semantic
-// rules to a corpus entry — before, they were unexported here and unreachable from there,
-// which let an entry with a class typo or a compensable-with-no-action contract validate
-// and digest cleanly, then fail confusingly at manifest load.
+// validateEffectContract checks a constraint's effect block, the input every effect check
+// reads. The rules live in pkg/capability (capability.ValidateEffectContract); this layer only
+// adds the manifest-positional framing so the registry corpus loader can reuse the same rules.
 func validateEffectContract(i int, e *capability.EffectContract) error {
 	if err := capability.ValidateEffectContract(e); err != nil {
 		return fmt.Errorf("capability at index %d: %w", i, err)
@@ -149,11 +124,9 @@ func validateEffectCeiling(c *capability.EffectCeiling) error {
 	return capability.ValidateEffectCeiling(c)
 }
 
-// mergeEffectCeiling folds a file's ceiling into the merged manifest with a conflict
-// check: first non-empty wins, two DIFFERENT ceilings are rejected. Silently dropping one
-// would raise the consequence bound for every capability the other file contributed —
-// the fail-open direction — so a disagreement is an error, exactly as it is for
-// serverVersion and audience.
+// mergeEffectCeiling folds a file's ceiling into the merged manifest with a conflict check:
+// first non-empty wins, two DIFFERENT ceilings are rejected — silently dropping one would
+// raise the consequence bound for every capability the other file contributed (fail-open).
 func mergeEffectCeiling(dst, src *capability.EffectCeiling, srcName string) (*capability.EffectCeiling, error) {
 	switch {
 	case src == nil:
@@ -167,10 +140,8 @@ func mergeEffectCeiling(dst, src *capability.EffectCeiling, srcName string) (*ca
 	}
 }
 
-// effectCeilingKeys and effectContractKeys are the permitted key sets for the nested
-// effect objects, for the recursive unknown-key walk. The reflective field sets keep them
-// in lock-step with the structs: a field added to either type is admitted automatically,
-// where a hand-written list would silently reject the new key.
+// effectCeilingKeys and effectContractKeys are the permitted key sets for the nested effect
+// objects, reflected off the structs so a field added to either type is admitted automatically.
 func effectCeilingKeys() map[string]bool {
 	return jsonFieldKeys(reflect.TypeOf(capability.EffectCeiling{}))
 }
@@ -180,12 +151,9 @@ func effectContractKeys() map[string]bool {
 }
 
 // checkEffectKeys walks the nested objects inside a constraint's effect block and the
-// top-level effectCeiling, rejecting an unknown key. checkManifestKeys covers the
-// TOP-level key of each (both are reflected struct fields), but not their interiors: a
-// typo'd "blastRadious" inside an effect block would otherwise decode to nothing and
-// leave the action silently unquantified — which reads as "no bound declared" and, under
-// a ceiling, as maximum friction, or worse under a bare blastRadius condition as an
-// unbounded call.
+// top-level effectCeiling, rejecting an unknown key that checkManifestKeys' top-level check
+// misses: a typo'd "blastRadious" would otherwise decode to nothing and leave the action
+// silently unquantified.
 func checkEffectKeys(root map[string]interface{}) error {
 	if ceiling, ok := root["effectCeiling"].(map[string]interface{}); ok {
 		if err := checkObjectKeys("effectCeiling", ceiling, effectCeilingKeys()); err != nil {
@@ -261,20 +229,15 @@ func checkByArgumentKeys(path string, raw interface{}) error {
 	return nil
 }
 
-// HasEffectCeiling reports whether the policy sets a consequence bound, so the wiring
-// layer can skip the per-allow ceiling check for a policy that has none. Mirrors
-// PolicyTokens and the engine gate it feeds: a wiring question, not the state-accumulation one (the ceiling reads
-// no accumulated state at all). It stays a direct field test rather than a token declaration
-// because the ceiling is a top-level manifest field, not a condition or directive, so there
-// is no prototype-registry entry to declare it on.
+// HasEffectCeiling reports whether the policy sets a consequence bound, so the wiring layer
+// can skip the per-allow ceiling check for a policy that has none. A direct field test rather
+// than a token declaration, since the ceiling is a top-level field with no registry entry.
 func (m *LocalManifest) HasEffectCeiling() bool {
 	return m != nil && m.EffectCeiling.IsSet()
 }
 
 // EffectAnnotatedCount reports how many capabilities carry an effect contract, for the
-// `validate`/`doctor` operator reports: under a ceiling, an unannotated capability is one
-// that will escalate, so the ratio is the operator's progress meter on the registry
-// flywheel.
+// `validate`/`doctor` operator reports: under a ceiling, an unannotated capability escalates.
 func (m *LocalManifest) EffectAnnotatedCount() int {
 	if m == nil {
 		return 0
@@ -288,15 +251,9 @@ func (m *LocalManifest) EffectAnnotatedCount() int {
 	return n
 }
 
-// EffectUnannotatedTargets names the capabilities carrying NO effect contract, in
-// manifest order, deduplicated.
-//
-// The count alone is a progress meter; this is the worklist. Under an effectCeiling each
-// of these resolves to the fail-closed default (irreversible, unquantified) and therefore
-// escalates, so an operator asking "why is everything hitting the approval queue" needs the
-// names, not a ratio. Order is the manifest's own so the list reads against the file the
-// operator is about to edit; duplicates are dropped because two entries for one target
-// (different principals, different conditions) are one annotation job.
+// EffectUnannotatedTargets names the capabilities carrying NO effect contract, in manifest
+// order, deduplicated — the worklist behind EffectAnnotatedCount's ratio. Order is the
+// manifest's own so the list reads against the file the operator is about to edit.
 func (m *LocalManifest) EffectUnannotatedTargets() []string {
 	if m == nil {
 		return nil

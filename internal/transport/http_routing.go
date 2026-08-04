@@ -21,15 +21,11 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// writeJSONMsg sets the JSON content type and encodes v as the response body. It
-// is a status-less helper: none of its call sites in this file interleave a
-// WriteHeader between setting the header and encoding the body (each sits on its
-// own bodyless-response branch), so a single helper is a drop-in replacement —
-// collapsing the copy-pasted two-line idiom at every enforced-response site into
-// one, so a future site cannot forget the Content-Type header or set a different
-// one. writeKillResponse uses json.Marshal + w.Write instead (folding it in here
-// would add the Encoder's trailing newline to that response body — a harmless
-// but observable byte-level change kept out of scope).
+// writeJSONMsg sets the JSON content type and encodes v as the response body. Status-less:
+// no call site interleaves a WriteHeader between the header and the body, so this collapses
+// the copy-pasted idiom into one place a future site can't forget the header on.
+// writeKillResponse uses json.Marshal + w.Write instead — folding it in here would add the
+// Encoder's trailing newline to that response body.
 func writeJSONMsg(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", CTJSON)
 	_ = json.NewEncoder(w).Encode(v)
@@ -40,33 +36,21 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if !p.checkAuth(w, r) {
 		return
 	}
-	// JWT pre-validation: validate the Bearer token and attach claims to ctx. This
-	// is authentication, not policy — 401 even in audit mode. It runs BEFORE the
-	// route lookup so all handlers see the claims and an unauthenticated caller gets
-	// a uniform 401 regardless of whether the route exists: resolving the route first
-	// would turn a 404-vs-401 split into an oracle for enumerating route names (only
-	// reachable in JWT-only mode, since a static token already gates route disclosure
-	// behind the bearer token in checkAuth).
+	// JWT pre-validation: authentication, not policy — 401 even in audit mode. Runs BEFORE
+	// route lookup so an unauthenticated caller gets a uniform 401 regardless of whether
+	// the route exists; resolving the route first would turn 404-vs-401 into a route-name
+	// enumeration oracle.
 	if p.jwtPDP != nil {
 		authHeader := r.Header.Get("Authorization")
 		ctx, err := p.jwtPDP.ValidateToken(r.Context(), authHeader)
 		if err != nil {
-			// Record a stable error_type CATEGORY, never the raw err.Error(): the go-jose /
-			// validation message can disclose claim values, the accepted algorithm, the
-			// configured issuer, or key-rotation state, and audit logs are commonly forwarded
-			// to third-party SIEMs — the same disclosure the opaque-401 response below avoids.
-			// pdp.ClassifyJWTError maps the failure to one of a fixed set of codes (expired,
-			// invalid_signature, missing_claims, …). recordPreSessionDeny keeps the unverified
-			// Mcp-Session-Id out of the structured session_id (forgery guard). The record is
-			// also unstamped by design (no route/policy fields): this gate runs before route
-			// resolution, for the oracle reason above — see recordPreSessionDeny.
+			// Record a stable error_type CATEGORY, never the raw err.Error(): the go-jose
+			// message can disclose claim values, the accepted algorithm, or key-rotation
+			// state, and audit logs are commonly forwarded to third-party SIEMs.
 			p.recordPreSessionDeny(r, "JWT_INVALID", catJWT, map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
 			w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(authHeader != "", p.oauthMetaURL))
-			// Do not echo the JWT validation error to the caller: the library message
-			// can disclose claim values, the accepted algorithm, or key-rotation state,
-			// letting an unauthenticated client fingerprint the validator. The failure
-			// category is preserved as error_type in the JWT_INVALID audit record above;
-			// the client gets an opaque 401.
+			// Do not echo the validation error to the caller for the same fingerprinting
+			// reason; the category is preserved in the JWT_INVALID record above instead.
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -92,42 +76,24 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 }
 
 // decodeStrictJSON is the single safe way to read a JSON POST body in this package. It
-// gates the Content-Type (415 for anything but application/json — see
-// requireJSONContentType) and then decodes exactly one JSON value from r.Body into v,
-// requiring io.EOF after it: a body carrying a second JSON value (or any other trailing
-// non-whitespace token) is malformed and must be rejected with 400 before any dispatch,
-// rather than silently truncated to its first value — otherwise a multi-token /mcp body
-// could 202-ack an invalid initialize notification, or a /control/kill body could execute
-// a narrower kill while silently ignoring a smuggled trailing {"all":true}. On a refused
-// content type, a decode failure, or trailing data this writes the response itself (415,
-// 400, or 413 for a body that exceeds the MaxBytesReader cap the caller installed on
-// r.Body) and returns false; the caller must return immediately without proceeding. The
-// 400 legs (malformed JSON, trailing data) are recorded via recordRefusal under
-// codeInvalidRequest — the same host-protocol-fault code dispatchRequest already uses for
-// a malformed body once a session exists — through the shared rate-limited pre-session
-// path requireJSONContentType's 415 leg already uses just above. A malformed /mcp or
-// /control/kill body is the same class of probe this package's other transport-level
-// refusals (415, wrong Origin, bad control token) already leave a trace for; a decode
-// failure must not be the one gate that doesn't. The 413 leg is not recorded:
-// MaxBytesReader already bounds the cost of that flood, so it carries no additional
-// attack signal worth a rate-limited write.
+// gates the Content-Type (415), then decodes exactly one JSON value into v, requiring
+// io.EOF after it: a body carrying a trailing token is rejected with 400 rather than
+// silently truncated — otherwise a multi-token /mcp body could 202-ack an invalid
+// initialize notification, or a /control/kill body could execute a narrower kill while
+// ignoring a smuggled trailing {"all":true}. On a refused content type, a decode failure,
+// or trailing data it writes the response itself and returns false; the caller must return
+// immediately. The 400 legs are recorded via recordRefusal (codeInvalidRequest) through
+// the same rate-limited pre-session path as the 415 leg, so a malformed body leaves the
+// same trace other transport-level refusals do; the 413 leg is not recorded since
+// MaxBytesReader already bounds that flood's cost.
 //
-// route is threaded straight to requireJSONContentType and recordRefusal: the /mcp caller
-// (handleMCPPost) already has one resolved by the time it reaches here, so its 415/400
-// records carry that route's stamp exactly like the session-cap refusal, rather than
-// being written through the unstamped proxy-wide sink despite the route being known. The
-// /control/kill caller has no route concept and passes nil, which recordRefusal treats as
-// "write through the proxy-wide sink" — unchanged from before this parameter existed.
+// route is threaded to requireJSONContentType and recordRefusal so the /mcp caller's
+// records carry its route stamp; /control/kill has no route and passes nil, which
+// recordRefusal treats as "write through the proxy-wide sink".
 //
-// The content-type gate lives HERE, rather than being repeated at each handler, for the
-// reason checkOrigin is a mux-wide wrapper: it makes the control unforgettable. Every
-// JSON POST body in this package is read through this function, so a future endpoint
-// gets the gate by construction instead of by remembering a line — and forgetting that
-// line would silently restore the no-preflight CORS-simple-request path the gate closes.
-// (A mux wrapper is the wrong shape for this one: GET and DELETE carry no body.)
-//
-// It runs after the caller has installed MaxBytesReader, which only wraps the reader and
-// consumes nothing, so a refused request still has its body read zero times by us.
+// The content-type gate lives HERE rather than at each handler so every JSON POST body in
+// this package gets it by construction — a mux wrapper is the wrong shape since GET/DELETE
+// carry no body.
 func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string, route *UpstreamRoute) bool {
 	if !p.requireJSONContentType(w, r, route) {
 		return false
@@ -163,28 +129,17 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 }
 
 // writeSessionCreateError maps a newSession/newRemoteSession failure to the right HTTP
-// status. The transient/retryable conditions get a 503 so a client racing a graceful
-// restart or a full/racing proxy retries rather than treating it as a hard failure:
-//   - errSessionLimit — the proxy is at its concurrent-session cap.
-//   - errRacedReap — a global kill swept the registry mid-handshake (see reapGen); the
-//     upstream this initialize started was already torn down, so a retry is safe.
-//   - errShuttingDown — registration was refused because the proxy is draining for a
-//     graceful shutdown (the upstream itself started fine).
+// status. Transient/retryable conditions get a 503: errSessionLimit (concurrent-session
+// cap), errRacedReap (a global kill swept the registry mid-handshake; the upstream this
+// initialize started was already torn down), errShuttingDown (proxy draining). Anything
+// else is an upstream-start failure — the raw error may carry a command path, IP:port, or
+// TLS detail, so it's logged to stderr and returned as a generic 500.
 //
-// Anything else is an upstream-start failure: the raw error can carry the upstream
-// command path, an internal IP:port, or TLS detail, so it is logged to stderr for the
-// operator and returned to the client as a generic 500. Extracted from handleMCPPost so
-// the session-creating initialize branch stays within the nested-complexity budget.
-//
-// errSessionLimit is additionally recorded on the tape, through recordSessionCapDeny —
-// the same helper the pre-spawn slot reservation uses, so the two ways to hit one cap
-// cannot produce two record shapes. It is a saturation refusal exactly like the
-// per-session in-flight cap that recordResourceExhausted covers, but reachable WITHOUT an
-// established session, so it is the cheaper flood for an attacker (hence the rate limit
-// recordSessionCapDeny keeps) and was the one leaving no trace — an incident responder
-// reconstructing an outage saw RESOURCE_EXHAUSTED for in-flight floods and a blank for
-// session-cap floods. The other two legs are benign lifecycle races (a kill sweep, a
-// graceful drain), not attack signal, so they stay status-only.
+// errSessionLimit is additionally recorded via recordSessionCapDeny, the same helper the
+// pre-spawn slot reservation uses, so the two ways to hit one cap can't produce two record
+// shapes — it's reachable WITHOUT an established session, so it's the cheaper flood and was
+// the one leaving no trace. The other two legs are benign lifecycle races, not attack
+// signal, so they stay status-only.
 func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
 	switch {
 	case errors.Is(err, errSessionLimit):
@@ -206,119 +161,80 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// SEC-04: cap request body to prevent memory exhaustion from large payloads.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var msg mcp.RPCMsg
-	// A single JSON-RPC POST body is exactly one JSON value (a batch is a single JSON
-	// array, still one value); decodeStrictJSON fails closed with 400 on any trailing
-	// token BEFORE dispatching — otherwise a multi-token body could 202-ack an invalid
-	// initialize notification or run its first request on an existing session while
-	// the trailer is silently dropped.
+	// A single JSON-RPC POST body is exactly one JSON value; decodeStrictJSON fails closed
+	// on any trailing token BEFORE dispatching, so a multi-token body can't 202-ack an
+	// invalid initialize notification with the trailer silently dropped.
 	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body", route) {
 		return
 	}
 
-	// Arm an entry write deadline as a Slowloris backstop over the pre-dispatch writes
-	// (the 202-ack, an early 4xx). Errors ignored: not every ResponseWriter supports a
-	// write deadline, and the worst case is the prior fixed-timeout behavior.
-	//
-	// This deadline does NOT bound the response write: the actual response encode always
-	// re-arms a fresh httpWriteTimeout window immediately before writing (after the
-	// upstream returns). That decoupling matters most with the budget enabled — the entry
-	// deadline is measured from entry, so all pre-forward work (session gates, CheckKill,
-	// the PDP Decide's counter/kill round-trips) plus the upstream call itself run against
-	// it, and a legitimately slow upstream near its full budget could otherwise leave the
-	// entry deadline already past by encode time, dropping a response for a call that
-	// already executed upstream. With the budget disabled the upstream may take
-	// arbitrarily long, so the entry deadline stays at the fixed backstop and the
-	// pre-encode re-arm is what bounds the client-facing write.
-	//
-	// Through the shared helper, so this site cannot drift from the response-write one: it
-	// also FLOORS the window at httpWriteTimeout, which the hand-written arm here did not.
-	// An --upstream-timeout below httpWriteTimeout used to arm a window SHORTER than the
-	// one every other leg gets, even though how long the client may take to read a response
-	// has nothing to do with how long the upstream was given.
+	// Slowloris backstop over the pre-dispatch writes (202-ack, early 4xx). This does NOT
+	// bound the response write: the actual encode always re-arms a fresh httpWriteTimeout
+	// window right before writing, so a legitimately slow upstream near its full budget
+	// can't leave the entry deadline already past by encode time and drop an already-served
+	// response. Through the shared helper so this site can't drift from the response-write
+	// one, which also FLOORS the window at httpWriteTimeout regardless of --upstream-timeout.
 	rearmWriteDeadline(w, p.upstreamTimeMs)
 
 	sessionID := r.Header.Get(SessionHeader)
 
 	// An initialize request with no session ID creates a new session.
 	//
-	// Require msg.IsRequest(): an initialize *notification* (no id) must never start
-	// an upstream or consume a session slot — a flood would otherwise spawn unbounded
-	// upstreams. It is handled as a stateless notification below.
+	// Require msg.IsRequest(): an initialize *notification* (no id) must never start an
+	// upstream or consume a session slot — handled as a stateless notification below.
 	if msg.Method == mcp.MethodInitialize && sessionID == "" && msg.IsRequest() {
-		// Captured BEFORE the kill gate below, not inside newSession/newRemoteSession.
-		// registerSession rejects a session whose generation is stale, which is what stops a
-		// session established across a global kill's registry sweep from registering into the
-		// fresh map with an upstream the sweep never saw. Capturing it after this gate left a
-		// window — the gate itself does a kill-store round-trip that may do I/O, and a kill
-		// activating and sweeping inside that window yields a startGen EQUAL to the post-sweep
-		// generation, so registerSession sees nothing wrong and admits the session. With no
-		// idle reaper configured (sessionIdleTimeoutMs: 0 is valid) that kill-denied session
-		// then pins a subprocess and a maxSessions slot until the process exits: exactly the
-		// leak the mechanism exists to close.
+		// Captured BEFORE the kill gate below: that gate does a kill-store round-trip that
+		// may do I/O, and a kill activating/sweeping inside that window would otherwise
+		// yield a startGen equal to the post-sweep generation, letting registerSession admit
+		// a kill-denied session that then pins a subprocess/slot until process exit (with no
+		// idle reaper configured, that leak never self-heals).
 		startGen := p.currentReapGen()
-		// Kill-switch check BEFORE spawning anything: a session-creating initialize
-		// must not start an upstream while a global kill (emergency stop) is active.
-		// The empty session id means only the global dimension can match. This is the one
-		// initialize answered outside dispatchRequest (there is no session or
-		// dispatchParams yet), so it repeats the kill gate dispatchRequest applies to
-		// every other locally-answered method.
+		// Kill-switch check BEFORE spawning anything. This is the one initialize answered
+		// outside dispatchRequest (no session/dispatchParams yet), so it repeats the kill
+		// gate dispatchRequest applies to every other locally-answered method.
 		if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
-			// No session exists yet, so there is nothing to vouch for: claimedSession is
-			// the honest subject. The header is empty on this branch (its absence is what
-			// routed the request here), so it contributes no detail today — but should the
-			// branch ever admit one, it lands as an unverified claim rather than as fact.
+			// No session exists yet, so claimedSession is the honest subject rather than fact.
 			// Rate-limited: an unauthenticated caller reaches this record, so an unbounded
-			// write here is an audit-queue flooding primitive (preSessionKillRecorder). A
-			// suppressed record elides only the RECORD; the request is denied either way.
+			// write here is an audit-queue flooding primitive; a suppressed record elides
+			// only the RECORD, the request is denied either way.
 			resp := recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), mcp.MethodInitialize)
 			writeJSONMsg(w, resp)
 			return
 		}
 		// Per-route audience pin BEFORE spawning: a token valid only for ANOTHER route's
 		// audience (accepted by the gateway's shared union validator) must not create a
-		// session on, or contact, this route's upstream. The Decide*/list/sampling paths
-		// embed the same pin, but initialize does not flow through them; without this gate
-		// a cross-audience token could spin up this route's upstream and read its
-		// serverInfo. Mirrors the kill-switch pre-spawn gate above.
+		// session on this route. Initialize doesn't flow through the Decide*/list/sampling
+		// paths that embed the same pin, so without this gate a cross-audience token could
+		// spin up this route's upstream and read its serverInfo.
 		if denied, blocked := p.initAudienceDenial(r.Context(), route, msg); blocked {
 			writeJSONMsg(w, denied)
 			return
 		}
 		// --require-audit=strict: creating a session spawns/contacts an upstream — a
-		// privileged side effect. Once the audit trail has degraded, refuse new
-		// sessions fail-closed rather than spin up an upstream whose traffic cannot be
-		// fully recorded. Mirrors the gate on the enforced-forward, */list, and
-		// sampling paths. (stdio has no equivalent: its single upstream starts before
-		// any traffic.)
+		// privileged side effect — so once the audit trail has degraded, refuse new sessions
+		// fail-closed rather than run traffic that can't be fully recorded.
 		if denied, blocked := p.initStrictAuditDenial(r.Context(), route, msg); blocked {
 			writeJSONMsg(w, denied)
 			return
 		}
 		// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held
-		// across establishment, so concurrent initializes cannot all pass a registry-only
-		// check and each spawn an upstream before any of them registers (see
-		// tryReserveSessionSlot). The defer below drops it on every path.
+		// across establishment, so concurrent initializes can't all pass a registry-only
+		// check and each spawn an upstream before any registers. The defer below drops it.
 		if !p.tryReserveSessionSlot() {
-			// Recorded for the same reason as the errSessionLimit leg of
-			// writeSessionCreateError: this is the cheap pre-spawn twin of that refusal and
-			// the surface an unauthenticated saturation flood reaches first. Both halves go
-			// through the one route-stamped helper, so the two ways to hit the same cap
-			// cannot produce two record shapes.
+			// Recorded for the same reason as writeSessionCreateError's errSessionLimit leg:
+			// this is its cheap pre-spawn twin, and both go through the one route-stamped
+			// helper so the two ways to hit the same cap can't produce two record shapes.
 			p.recordSessionCapDeny(r, route)
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
-		// Released unconditionally when this handler returns — success included. The
-		// reservation covers ESTABLISHMENT, and establishment is over either way by then;
-		// a registered session is bounded from that point by the registry itself. One
-		// owner, one release: letting registerSession convert the reservation on success
-		// instead would double-free it on any failure AFTER registration (the drift
-		// refusal is one) and hand the freed slot to a concurrently establishing session.
+		// Released unconditionally — success included. One owner, one release: letting
+		// registerSession convert the reservation on success instead would double-free it on
+		// any failure AFTER registration (a drift refusal is one).
 		defer p.releaseSessionSlot()
-		// Session establishment (initialize handshake + drift tools/list probe) runs
-		// under sessionStartTimeout, independent of --upstream-timeout. Cover the larger
-		// of the two budgets so the write deadline set above can't fire mid-handshake
-		// when --upstream-timeout is below sessionStartTimeout.
+		// Establishment runs under sessionStartTimeout, independent of --upstream-timeout.
+		// Cover the larger of the two so the write deadline can't fire mid-handshake when
+		// --upstream-timeout is below sessionStartTimeout.
 		startBudget := sessionStartTimeout
 		if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > startBudget {
 			startBudget = b
@@ -331,9 +247,9 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			sess *httpSession
 			err  error
 		)
-		// Capture the client IP before session creation: upstream-initiated sampling
-		// carries no request of its own, so an ipRange condition is evaluated against
-		// this address. Setting it after creation would race the reader goroutine.
+		// Capture before session creation: upstream-initiated sampling carries no request
+		// of its own and is evaluated against this address. Setting it after creation would
+		// race the reader goroutine.
 		clientIP := p.sourceIP(r)
 		if route.transport == "http" {
 			sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen)
@@ -345,10 +261,9 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			return
 		}
 		w.Header().Set(SessionHeader, sess.id)
-		// Answered directly, not through the shared dispatchInitialize kill gate: the
-		// pre-spawn global-dimension CheckKill already ran above, and the session id
-		// minted here is brand new, so it cannot yet be a per-session/agent kill target.
-		// Every other initialize site routes through the dispatcher for that gate.
+		// Answered directly, not through dispatchInitialize's kill gate: the global-dimension
+		// CheckKill already ran above, and the session id minted here is brand new, so it
+		// can't yet be a per-session kill target.
 		resp := sess.buildInitResponse(msg)
 		writeJSONMsg(w, resp)
 		return
@@ -358,24 +273,14 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// An initialize notification (excluded from the session-creation branch above)
 		// expects no response: accept and drop it without allocating session state.
 		if msg.Method == mcp.MethodInitialize && msg.IsNotification() {
-			// Consult the kill switch BEFORE the 202 ack. Under the MCP Streamable HTTP
-			// spec a 202 to an initialize notification is a readiness acknowledgement, so
-			// returning it while a global emergency stop is active would tell the client
-			// the server is ready, and the acceptance would go unaudited. The empty
-			// session id means only the global dimension can match. Mirrors the
-			// session-creating initialize POST branch above and the dispatchList path.
+			// Consult the kill switch BEFORE the 202 ack: a 202 to an initialize
+			// notification is a readiness acknowledgement, so returning it during a global
+			// emergency stop would tell the client the server is ready, unaudited.
 			if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
-				// A notification is fire-and-forget and MUST NOT receive a JSON-RPC
-				// response: msg.ID is nil here, so recordKillDenial's response would
-				// carry the invalid "id":null, and encoding it with no prior
-				// WriteHeader sends an implicit 200 — indistinguishable from a
-				// successful readiness ack to a client that only checks status.
-				// Record the deny directly, exactly like the existing-session
-				// notification kill path below, and ack the drop with a bodyless 202.
-				// claimedSession for the same reason as the session-creating branch above:
-				// no session was established, so nothing here is verified.
-				// Rate-limited for the same reason as the session-creating branch above: no
-				// session was established, so an unauthenticated caller reaches this record.
+				// A notification MUST NOT receive a JSON-RPC response: msg.ID is nil, so
+				// recordKillDenial's response would carry "id":null and, with no prior
+				// WriteHeader, send an implicit 200 indistinguishable from a successful
+				// readiness ack. Record the deny directly and ack the drop with a bodyless 202.
 				recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
@@ -397,41 +302,27 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sessionID string, msg mcp.RPCMsg) {
 	sess := p.getSession(sessionID)
 	if sess == nil {
-		// A killed session is proactively torn out of the registry (reapKilledSession /
-		// reapAllKilledSessions), so its id no longer resolves — but the documented kill
-		// contract is that a killed session's requests are DENIED with KILL_SWITCH, not a
-		// bare 404 that hides why the session vanished. The kill store outlives the reaped
-		// registry entry, so consult it here: a killed session id (or an active global
-		// kill) renders the same KILL_SWITCH deny the request would have gotten had the
-		// session still been present and reached the dispatcher's kill gate below. A
-		// genuinely unknown session id (no kill) still 404s. The POST path handles this
-		// itself rather than via resolveSessionForRoute (used by the GET/SSE path) because
-		// only the request/notification framing here can carry a JSON-RPC KILL_SWITCH body.
+		// A killed session is proactively torn out of the registry, so its id no longer
+		// resolves — but the kill contract is that its requests are DENIED with
+		// KILL_SWITCH, not a bare 404 hiding why the session vanished. The kill store
+		// outlives the reaped registry entry, so consult it: a killed id (or an active
+		// global kill) renders the deny the dispatcher's kill gate would have given had the
+		// session still existed. A genuinely unknown, unkilled id still 404s. Handled here
+		// rather than via resolveSessionForRoute (the GET/SSE path) because only this
+		// request/notification framing can carry a JSON-RPC KILL_SWITCH body.
 		//
-		// sessionID here is the raw, client-supplied header for a session that does not (or
-		// no longer) exist — unverified, unlike every other CheckKill call site's sessionID,
-		// which comes from an established sess.id/p.sessionID via verifiedSession. Stamping
-		// it into the signed session_id field would let anyone whose credential merely
-		// clears CheckKill's fail-closed paths forge kill records against an arbitrary
-		// (including a real victim's) session id. claimedSession(r) below (and at its sibling
-		// call two lines down) is what keeps session_id empty and preserves the claimed value
-		// only as details.claimed_session_id — the same treatment the session-creating and
-		// sessionless-notification initialize branches above give a header that was never
-		// even looked up.
+		// sessionID is the raw, unverified client-supplied header (unlike every other
+		// CheckKill call site's, which comes from an established session). Stamping it into
+		// the signed session_id field would let anyone forge kill records against an
+		// arbitrary session id; claimedSession(r) keeps session_id empty and preserves it
+		// only as details.claimed_session_id.
 		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
 			if msg.IsRequest() {
 				writeJSONMsg(w, recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), msg.Method))
 			} else {
-				// Fire-and-forget (notification / response): record the drop and ack with a
-				// bodyless 202, matching the existing-session notification kill path below.
-				//
-				// Distinguish the two legs the way the live-session path does. The transport
-				// leg detail exists so an operator can tell drop SITES apart during an
-				// incident; collapsing a dropped host response onto "http-notification" here
-				// corrupts exactly that triage signal, and this arm is the one place a
-				// response and a notification share a branch. A response carries no method,
-				// so it is identified as "server-response", matching the live-session kill
-				// record for the same message shape.
+				// Fire-and-forget: record the drop and ack with a bodyless 202. A response
+				// carries no method, so it's identified as "server-response" (distinct from
+				// "http-notification") so an operator can tell the two drop SITES apart.
 				label, leg := msg.Method, legHTTPNotification
 				if msg.IsResponse() {
 					label, leg = "server-response", legHTTPServerResponse
@@ -450,17 +341,10 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	}
 	// Run the session-scoped security gates — the per-route audience pin AND the
 	// session-owner binding — on EVERY host-initiated action on this existing session, not
-	// just the enforced (Decide) methods and not just the initialize echo. The per-request
-	// bearer is re-validated against the gateway's shared union, so a token minted for a
-	// sibling route's audience, or a same-audience SECOND identity that learned this
-	// session's id, would otherwise reach the verbatim-forwarded notification (pushed to
-	// this session's upstream), the response-routing path, the re-initialize echo (which
-	// returns the creating client's captured capabilities), OR an enforced request
-	// dispatched against this session's upstream — none of which the audience pin alone
-	// distinguishes for a same-audience identity. Applying the owner binding here (rather
-	// than only on initialize, the prior scope, which let enforced POSTs drive a victim's
-	// upstream) closes that cross-identity session hijack. Runs before touchRequest so a
-	// refused request does not defer the victim session's idle reaping.
+	// just the enforced (Decide) methods: a same-audience SECOND identity that learned this
+	// session's id could otherwise reach the forwarded notification, response routing, the
+	// re-initialize echo, or an enforced request against a victim's upstream. Runs before
+	// touchRequest so a refused request doesn't defer the victim session's idle reaping.
 	if gate, denied := route.enforceSessionGates(r.Context(), sess, sessionID, msg.Method, "http-post"); denied {
 		if msg.IsRequest() {
 			writeJSONMsg(w, denialResult(msg.ID, gate.code, gate.conditionType, msg.Method, ""))
@@ -475,42 +359,28 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		return
 	}
 	// Note which state anchor this request resolved. On a task-anchored route a session may
-	// legitimately span tasks — an agent runtime multiplexing several over one long-lived MCP
-	// connection is a normal shape — and every host request is decided, keyed and serialized on
-	// its OWN anchor, which is correct however many there are. What cannot be decided that way
-	// is the leg with no host request in scope, so the session records the span and its
-	// server-initiated leg refuses for the rest of its life. See httpSession.noteRequestAnchor.
-	//
-	// Here rather than in the session-gate verdict: that function is check-only and one of its
-	// callers runs it under the session-registry lock, while this is a write and belongs on the
-	// path that actually produces enforced decisions.
+	// legitimately span tasks, and every host request is decided, keyed and serialized on
+	// its OWN anchor — but the server-initiated leg has no host request in scope, so the
+	// session records the span here and that leg refuses for the rest of its life. See
+	// httpSession.noteRequestAnchor. Placed here (a write) rather than in the check-only
+	// session-gate verdict, one of whose callers runs under the session-registry lock.
 	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
-	// Check the kill switch BEFORE touchRequest, so a killed session's denied POSTs
-	// cannot keep deferring its idle reaping. handleKill now tears the session down
-	// proactively (reapKilledSession), but a request racing that teardown could still
-	// arrive first, and gating touchRequest on the kill keeps such a POST from advancing
-	// lastActive/lastRequest and re-deferring reclamation. Gate ONLY touchRequest on the
-	// kill: enforced requests and re-initialize still flow through
-	// the shared dispatcher below, which re-checks the kill (Decide / dispatchInitialize)
-	// and records the precise per-target audit identifier (the tool name for a
-	// tools/call), rather than the coarse method-only record a blanket pre-dispatch
-	// gate would emit. A killed request's Decide denies immediately with no upstream
-	// call, so it does not linger in inFlight and cannot re-defer the reaper.
+	// Check the kill switch BEFORE touchRequest so a killed session's denied POSTs can't
+	// keep deferring idle reaping (a request may race reapKilledSession's proactive
+	// teardown). Gate ONLY touchRequest on it: enforced requests and re-initialize still
+	// flow through the dispatcher below, which re-checks the kill with the precise
+	// per-target audit identifier rather than this coarse method-only check.
 	kill := route.pdp.CheckKill(r.Context(), sessionID)
 	if kill == nil {
 		// A live POST is active host-initiated traffic (distinct from passively holding
 		// an SSE GET open): it defers both the idle reaper and the hard idle ceiling.
 		sess.touchRequest()
 	}
-	// Host notifications are forwarded verbatim only when allowlisted
-	// (isForwardableHostNotification), after the swallowed set
-	// (isSwallowedHostNotification: notifications/initialized, and a mid-session
-	// id-less "initialize" that IsNotification() classifies as a notification even
-	// though the method is ordinarily a request — forwarding it verbatim would let a
-	// client re-trigger the upstream's handshake outside the dispatcher's kill gate
-	// and audit trail, the same swallow the sessionless path above already applies)
-	// and the enforced-method fail-closed reject. These do not flow through the
-	// dispatcher, so the kill is enforced here.
+	// Host notifications are forwarded verbatim only when allowlisted, after the swallowed
+	// set (notifications/initialized, and a mid-session id-less "initialize" — forwarding it
+	// verbatim would let a client re-trigger the upstream's handshake outside the
+	// dispatcher's kill gate) and the enforced-method fail-closed reject. These don't flow
+	// through the dispatcher, so the kill is enforced here.
 	if msg.IsNotification() {
 		if !isSwallowedHostNotification(msg.Method) {
 			if kill != nil {
@@ -518,66 +388,45 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
-			// An enforced method (tools/call, resources/read, resources/subscribe,
-			// resources/unsubscribe, prompts/get) framed as a notification (no id) is a fail-closed reject —
-			// see denyEnforcedMethodNotification, shared with the stdio transport's
-			// equivalent guard so the check and its audit record cannot drift between
-			// the two transports. Checked before the notify-slot acquisition below: no
-			// point reserving a slot for a notification that's about to be denied.
+			// An enforced method framed as a notification (no id) is a fail-closed reject —
+			// shared with the stdio transport's equivalent guard so the check and its audit
+			// record can't drift between transports. Checked before the notify-slot
+			// acquisition below: no point reserving a slot for a notification about to be denied.
 			if denyEnforcedMethodNotification(r.Context(), asRecorder(route.sink), sessionID, msg) {
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
-			// Any notification method outside the forwardable allowlist (notifications/
-			// cancelled, notifications/progress, notifications/roots/list_changed) is a
-			// fail-closed reject — see denyUnmappedHostNotification, shared with the
-			// stdio transport's equivalent guard so a notification-framed novel/unmapped
-			// method cannot reach the upstream invisibly while its request-framed twin
-			// would be denied and logged by dispatchUnmapped. Checked before the
-			// notify-slot acquisition below, mirroring the enforced-method check above.
+			// Any notification method outside the forwardable allowlist is a fail-closed
+			// reject too, so a notification-framed novel/unmapped method can't reach the
+			// upstream invisibly while its request-framed twin would be denied and logged.
 			if denyUnmappedHostNotification(r.Context(), asRecorder(route.sink), sessionID, msg) {
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
 			// Bound concurrent in-flight notification forwards on this session — its own
-			// pool (tryAcquireNotifySlot), deliberately separate from the enforced-request
-			// slot below, so a burst of enforced tool calls (each possibly blocked on the
-			// upstream for the full --upstream-timeout) can never exhaust the notification
-			// pool and start dropping notifications/cancelled, which would leave the very
-			// call the host meant to abort running to completion. Non-blocking: on
-			// saturation drop the notification and log it rather than block the handler
-			// goroutine indefinitely.
+			// pool, deliberately separate from the enforced-request slot below, so a burst of
+			// tool calls blocked on the upstream can never exhaust it and start dropping
+			// notifications/cancelled, leaving the very call the host meant to abort running
+			// to completion. Non-blocking: on saturation drop and log rather than block.
 			if !sess.tryAcquireNotifySlot() {
-				// Record the drop on the tape, exactly as the enforced-request slot's
-				// saturation refusal does ~70 lines below. stderr alone is not the
-				// tamper-evident trail, and the notification most worth having there is
-				// notifications/cancelled: an incident responder asking why a call the host
-				// tried to abort ran to completion needs the drop to be a record, not a line
-				// in a container log that rotation may already have discarded.
-				//
-				// Gated on this pool's own saturationGate, so an established session
-				// flooding notifications writes one record per saturation EPISODE (carrying
-				// the count elided since) rather than one per dropped frame. Ungated, this
-				// was the cheapest audit-write primitive the proxy offers — no upstream
-				// round trip, no response body to await, and a 202 back that is
-				// byte-identical to a successful forward, so a flooding client gets no
-				// signal to back off — and enough records latch AuditDegraded(), which
-				// under --require-audit=strict denies every enforced call on every route.
-				// The stderr line below stays per-drop: it is not the bounded queue.
+				// Record the drop on the tape: an incident responder asking why a call the
+				// host tried to abort ran to completion needs this as a record, not a stderr
+				// line rotation may have discarded. Gated on this pool's own saturationGate so
+				// a flooding session writes one record per saturation EPISODE, not per frame —
+				// ungated this was the cheapest audit-write flooding primitive available (no
+				// upstream round trip, a 202 identical to success) and enough records latch
+				// AuditDegraded(), which under --require-audit=strict denies every route.
 				recordResourceExhausted(r.Context(), asRecorder(route.sink), &sess.notifySaturation, sessionID, msg.Method)
 				fmt.Fprintf(os.Stderr, "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
-			// A plain function-scoped defer suffices here (matching the enforced-request
-			// slot release below): the notification branch always returns two lines below,
-			// so the defer fires effectively immediately, without the allocation of an
-			// immediately-invoked closure to scope an inner defer.
+			// A plain function-scoped defer suffices: the notification branch always returns
+			// two lines below, so it fires effectively immediately.
 			defer sess.releaseNotifySlot()
-			// Re-arm before the forward, mirroring the enforced-request path: forwarding a
-			// notification to the upstream runs against the entry deadline, so a slow
-			// upstream can leave it past by the time the 202 is written and the client sees
-			// a dropped connection for a notification that was in fact delivered.
+			// Re-arm before the forward: this runs against the entry deadline, so a slow
+			// upstream can leave it past by 202-write time and drop a connection for a
+			// notification that was in fact delivered.
 			rearmWriteDeadline(w, p.upstreamTimeMs)
 			sess.forwardNotification(r.Context(), msg)
 		}
@@ -586,28 +435,21 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	}
 
 	if !msg.IsRequest() {
-		// A host response to a server-initiated request the proxy broadcast (e.g. the
-		// sampling/createMessage result) must be routed back to the upstream, which is
-		// blocked awaiting it. Only responses whose ID we forwarded are routed (take
-		// consumes the tracked ID); any other non-request POST is acked and ignored.
+		// A host response to a server-initiated request the proxy broadcast must be routed
+		// back to the blocked upstream. Only responses whose ID we forwarded are routed
+		// (take consumes the tracked ID); any other non-request POST is acked and ignored.
 		if msg.IsResponse() && sess.serverReqs.take(mcp.MsgKey(msg.ID)) {
 			switch {
 			case kill != nil:
-				// Killed: the tracked id is consumed above (no leak), but the response is
-				// NOT routed. A kill does not tear the upstream down; its blocked
-				// server-initiated request is intentionally left unanswered and the upstream
-				// is reclaimed later by the idle reaper's hard ceiling. Record the dropped
-				// host reply so a killed session's suppressed server-response is visible on
-				// the tape, mirroring the notification kill record above; a response carries
-				// no method, so use a fixed "server-response" identifier.
+				// A kill doesn't tear the upstream down; its blocked server-initiated
+				// request is intentionally left unanswered and reclaimed later by the idle
+				// reaper's hard ceiling. Record the dropped reply so it's visible on the tape.
 				recordKillDrop(r.Context(), asRecorder(route.sink), kill, verifiedSession(sess.id), "server-response", "server-response", legHTTPServerResponse)
 			case sess.upWriter != nil:
 				_ = sess.upWriter.Write(msg)
 			default:
-				// Remote-upstream mode has no upWriter to route the response back. take()
-				// already untracked the ID (no leak, no misroute); warn so the drop is
-				// observable. Unreachable today — remote sessions issue no server-initiated
-				// requests, so take returns false — pending a remote-upstream bridge fix.
+				// Remote-upstream mode has no upWriter to route the response back. Unreachable
+				// today (remote sessions issue no server-initiated requests), pending a fix.
 				fmt.Fprintf(os.Stderr,
 					"[eunox] WARNING: dropped host response to a server-initiated request: no upstream writer in remote-upstream mode\n")
 			}
@@ -620,73 +462,48 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	var resp mcp.RPCMsg
 	if msg.Method == mcp.MethodInitialize {
 		// Re-initialize is answered locally from capabilities captured at session start
-		// (the session-ownership binding was already enforced above, before touchRequest).
-		// It routes through the shared dispatcher like every other enforced method, so its
-		// kill gate (a killed session must not re-fetch the full capability set — every
-		// other action on the session is already kill-gated) lives once in
-		// dispatchInitialize instead of being copy-maintained here. It contacts no
-		// upstream, so it is not subject to the in-flight cap below. dispatchInitialize
-		// does not consult strictAuditDenial (unlike the enforced Decide* handlers) —
-		// intentionally: this is a pure local echo of the session's already-captured
-		// capabilities, bound to the already-authenticated owner, not a fresh decision
-		// against upstream state, so there is nothing here for the strict-audit gate to
-		// protect.
+		// (ownership binding already enforced above). Routes through the shared dispatcher
+		// so its kill gate lives once in dispatchInitialize rather than being copy-maintained
+		// here, and is not subject to the in-flight cap below since it contacts no upstream.
+		// dispatchInitialize skips strictAuditDenial intentionally: this is a pure local
+		// echo of already-captured state, not a fresh decision against upstream state.
 		resp = dispatchRequest(ctx, p.dispatchParams(sess, p.sourceIP(r)), msg)
 	} else {
 		// Bound concurrent in-flight enforced requests on this session (the HTTP analogue
-		// of stdio's hostSem). Non-blocking acquire: on saturation reject with a
-		// retryable JSON-RPC busy error rather than dispatch an unbounded handler that
-		// would allocate a reply channel and pending-map entries and block in the
-		// upstream round-trip.
+		// of stdio's hostSem). Non-blocking acquire: on saturation reject with a retryable
+		// busy error rather than dispatch a handler that blocks in the upstream round-trip.
 		if !sess.tryAcquireRequestSlot() {
-			// Record the saturation refusal so a pool-saturation flood against the
-			// network-exposed transport is visible on the tamper-evident tape, mirroring the
-			// stdio hostSem path through the same helper. Without it the exposed transport —
-			// the surface a DoS probe actually reaches — would leave no trace while the local
-			// stdio twin does, backwards from the threat. route.sink carries the route
-			// provenance; asRecorder yields a genuine nil interface when no sink is configured.
-			// Episode-gated on this pool's own gate, like its notification sibling above: the
-			// two pools saturate independently, so one flooding must not elide the other's
-			// record.
+			// Record the saturation refusal, mirroring the stdio hostSem path, so the
+			// network-exposed transport — the surface a DoS probe actually reaches — isn't
+			// the one left with no trace while its local stdio twin has one. Episode-gated
+			// on this pool's own gate so one flooding pool doesn't elide the other's record.
 			recordResourceExhausted(ctx, asRecorder(route.sink), &sess.reqSaturation, sess.id, msg.Method)
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 			return
 		}
-		// Count the request as in-flight so the idle reaper does not tear the session
-		// down while this call blocks on the upstream (lastActive is not refreshed
-		// during the call). Release the counter AND the semaphore slot via defer so a
-		// panic in dispatchRequest — which net/http recovers at the connection level,
-		// skipping any non-deferred cleanup — cannot leave inFlight stuck > 0 (pinning
-		// the session against the reaper forever) or leak a slot (exhausting the cap
-		// after enough panics). Mirrors stdio's deferred hostSem release.
+		// Count the request as in-flight so the idle reaper doesn't tear the session down
+		// while this call blocks on the upstream. Release via defer so a net/http-recovered
+		// panic in dispatchRequest can't leave inFlight stuck (pinning against the reaper)
+		// or leak a slot. Mirrors stdio's deferred hostSem release.
 		sess.inFlight.Add(1)
 		defer func() {
 			sess.inFlight.Add(-1)
 			sess.releaseRequestSlot()
 		}()
 		d := p.dispatchParams(sess, p.sourceIP(r))
-		// Serialize the decision phase for a flow-/sequenceBlock-relevant
-		// route, so a source's state write is not
-		// raced ahead of by a later sink's read on the same ANCHOR. Only enforced methods
-		// take the turn (only they run a PDP decision + state write); the Decide* handler
-		// releases it via finishDecision right after the decision, so the upstream forward
-		// runs outside it, and this defer is the idempotent backstop for the
-		// malformed-params path (which returns before the decision).
+		// Serialize the decision phase for a flow-/sequenceBlock-relevant route, so a
+		// source's state write isn't raced ahead of by a later sink's read on the same
+		// ANCHOR. Only enforced methods take the turn; the Decide* handler releases it via
+		// finishDecision right after the decision, so this defer is the idempotent backstop
+		// for the malformed-params path (which returns before the decision).
 		//
-		// The turn is keyed on the anchor rather than on the session: under task-anchored
-		// state two sessions share one key, and a per-session lock would leave their
-		// decisions unserialized against state they share. Under the default session
-		// anchoring the key IS this session, so this is the same mutual exclusion a
-		// per-session mutex gave.
-		//
-		// sess.route is dereferenced unconditionally by dispatchParams eight lines above,
-		// so a nil-route session cannot reach here — a nil check would only mislead a
-		// reader into believing one can.
+		// Keyed on the anchor rather than the session: under task-anchored state two
+		// sessions share one key, and a per-session lock would leave them unserialized
+		// against state they share. sess.route is dereferenced unconditionally by
+		// dispatchParams above, so a nil-route session can't reach here.
 		if sess.route.serializes() && isEnforcedMethod(msg.Method) {
-			// The release is already idempotent, so the handler's
-			// release-after-decision (finishDecision) and this deferred backstop advance
-			// the turn exactly once between them. A session-anchored route takes it on the
-			// gate held for the session's life; a task-anchored one resolves per request.
+			// The release is idempotent, so finishDecision and this deferred backstop
+			// advance the turn exactly once between them.
 			end := sess.beginDecisionTurn(ctx)
 			d.endDecision = end
 			defer end()
@@ -694,19 +511,11 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		resp = dispatchRequest(ctx, d, msg)
 	}
 
-	// Re-arm a bounded write deadline for the actual response write, ALWAYS — the
-	// upstream call has returned, so this deadline only bounds the client-facing flush.
-	// The deadline armed at handler entry (handleMCPPost) is measured from entry, so all
-	// pre-forward work (session gates, CheckKill, the PDP Decide's counter/kill
-	// round-trips) plus the upstream call itself run against it; with the budget enabled
-	// a slow-but-legitimate upstream near its full window could leave the entry deadline
-	// already past by the time we encode, dropping a response for a call that already
-	// executed (and was already recorded) upstream. A fresh httpWriteTimeout window here
-	// bounds only the client-facing write — so a client that stops reading (TCP zero
-	// window) still cannot block json.Encode, and thus the deferred inFlight/reqSem
-	// release, indefinitely — while decoupling that write from however long pre-forward
-	// work and the upstream took. Budget 0: this leg's window is the fixed floor, which is
-	// exactly what the helper arms with no budget.
+	// Re-arm a bounded write deadline for the response write, ALWAYS — the entry deadline
+	// is measured from handler entry, so with the budget enabled a slow-but-legitimate
+	// upstream near its full window could leave it already past by encode time, dropping an
+	// already-executed response. A fresh window here bounds only the client-facing flush, so
+	// a client that stops reading can't block json.Encode (and the deferred cleanup) indefinitely.
 	rearmWriteDeadline(w, 0)
 	writeJSONMsg(w, resp)
 }
@@ -719,17 +528,13 @@ var (
 	sseKeepaliveFrame = []byte(": keepalive\n\n")
 )
 
-// resolveSessionForRoute looks up the session for sessionID and verifies it is
-// bound to route, writing the canonical 404 (not found) or 409 (wrong route)
-// response and returning nil on a mismatch. The caller must have already required
-// a non-empty sessionID: the 400-on-missing handling differs per method (POST
-// treats a missing id as a session-creating initialize, GET/DELETE reject it), so
-// it stays in each caller. Used by the GET/SSE existing-session path; the POST path
-// inlines the same not-found/wrong-route handling but first renders a KILL_SWITCH
-// JSON-RPC deny for a reaped killed session (which only the POST's request framing can
-// carry — see handleSessionPost). The DELETE path is deliberately NOT routed through
-// here either: it resolves the session under p.mu for an atomic check-and-delete and
-// reports 409 before 404, a different shape that a shared helper would obscure.
+// resolveSessionForRoute looks up the session for sessionID and verifies it is bound to
+// route, writing the canonical 404/409 and returning nil on a mismatch. The caller must
+// have already required a non-empty sessionID (the 400-on-missing handling differs per
+// method). Used by the GET/SSE path; POST inlines the same handling but first renders a
+// KILL_SWITCH deny for a reaped killed session, and DELETE resolves under p.mu for an
+// atomic check-and-delete with 409-before-404 — both different shapes a shared helper
+// would obscure.
 func (p *HTTPProxy) resolveSessionForRoute(w http.ResponseWriter, sessionID string, route *UpstreamRoute) *httpSession {
 	sess := p.getSession(sessionID)
 	if sess == nil {
@@ -749,33 +554,23 @@ func (p *HTTPProxy) resolveSessionForRoute(w http.ResponseWriter, sessionID stri
 type sessionGate struct {
 	code          string
 	conditionType string
-	// reason, when non-empty, is an extra structured detail for the deny record (e.g.
-	// "session_owner_mismatch"). Carried on the verdict so recordSessionGateDeny renders
-	// the identical record for every transport, DELETE included.
+	// reason, when non-empty, is an extra structured detail for the deny record. Carried
+	// on the verdict so recordSessionGateDeny renders the identical record for every
+	// transport, DELETE included.
 	reason string
 }
 
 // sessionGateVerdict runs the two security checks every host-initiated action on an
-// EXISTING session must clear: the per-route audience pin (a token minted for a sibling
-// route's audience, accepted by the gateway's shared union validator, must not act on
-// this route's session) and the session-owner binding (only the JWT identity — issuer+sub —
-// that created the session may act on it; see httpSession.ownerMismatch). Both are
-// properties of the session, so applying them to EVERY host-initiated action is what stops
-// a second same-audience identity that learned a victim's Mcp-Session-Id from driving,
-// notifying, reading, or tearing down the victim's upstream session (the audience pin alone
-// cannot: both share the audience).
+// EXISTING session must clear: the per-route audience pin and the session-owner binding
+// (see httpSession.ownerMismatch). Applying both to EVERY action is what stops a
+// same-audience second identity that learned a victim's Mcp-Session-Id from driving,
+// notifying, reading, or tearing down that session (the audience pin alone can't).
 //
-// It is CHECK-ONLY: no lock, no record — the single source of truth for WHICH gates run,
-// shared by enforceSessionGates (POST/GET: verdict + record) and handleMCPDelete (which
-// needs the two halves separately, see below, then renders its own 403 + record). A gate
-// added to the appropriate half below protects all three transports at once, closing the
-// drift the previous hand-mirrored DELETE copy invited. Returns the denied gate + true on
-// failure, or (_, false) when both pass (a no-pin route and an unbound no-JWT session are
-// no-ops).
-//
-// The gates are split by what they depend on, NOT merely for tidiness: handleMCPDelete
-// must hold the session registry lock across its check-and-delete, and contextGateVerdict
-// is the half that must not run under a lock.
+// CHECK-ONLY: no lock, no record — the single source of truth for WHICH gates run, shared
+// by enforceSessionGates (POST/GET) and handleMCPDelete (which needs the two halves
+// separately, see below). Split by what they depend on: handleMCPDelete holds the session
+// registry lock across its check-and-delete, and contextGateVerdict is the half that must
+// not run under it.
 func (route *UpstreamRoute) sessionGateVerdict(ctx context.Context, sess *httpSession) (sessionGate, bool) {
 	if gate, denied := route.contextGateVerdict(ctx); denied {
 		return gate, true
@@ -783,16 +578,11 @@ func (route *UpstreamRoute) sessionGateVerdict(ctx context.Context, sess *httpSe
 	return sessionOnlyGateVerdict(ctx, sess)
 }
 
-// contextGateVerdict runs the session gates that depend ONLY on the request context — the
-// per-route audience pin — and not on the session object.
-//
-// It is separated so a caller that must hold a lock can run this half BEFORE acquiring it.
-// CheckAudience is a PolicyDecisionPoint method, and PolicyDecisionPoint is an exported
-// seam third parties may implement: every in-tree implementation compares claims and
-// returns, but the contract cannot assume that of an out-of-tree one, and a CheckAudience
-// that touched the network while the global session-registry write lock was held would
-// stall every session lookup, registration, and reap in the proxy. Keeping this half
-// lock-free means the transport never imposes that risk regardless of implementation.
+// contextGateVerdict runs the session gate that depends ONLY on the request context — the
+// per-route audience pin. Separated so a caller that must hold a lock can run this half
+// BEFORE acquiring it: PolicyDecisionPoint is an exported seam third parties may implement,
+// and a CheckAudience that touched the network while the global session-registry write lock
+// was held would stall every lookup, registration, and reap in the proxy.
 func (route *UpstreamRoute) contextGateVerdict(ctx context.Context) (sessionGate, bool) {
 	if deny := route.pdp.CheckAudience(ctx); deny != nil {
 		d := normalizeDenial(deny.Denial)
@@ -802,12 +592,11 @@ func (route *UpstreamRoute) contextGateVerdict(ctx context.Context) (sessionGate
 }
 
 // sessionOnlyGateVerdict runs the session gate that needs the session object — the
-// session-owner binding. It is an in-process comparison over already-validated claims, so this
-// half is safe to run under the registry lock, which is what lets handleMCPDelete keep its
-// check-and-delete atomic.
+// session-owner binding. An in-process comparison over already-validated claims, so it's
+// safe to run under the registry lock, letting handleMCPDelete keep its check-and-delete atomic.
 func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate, bool) {
-	// The reason comes back FROM the check rather than being restated here, so a gate added to
-	// the binding names itself on the record instead of inheriting whatever the caller assumed.
+	// The reason comes back FROM the check rather than being restated here, so a gate added
+	// to the binding names itself on the record instead of inheriting a caller's assumption.
 	if reason, mismatch := sess.ownerMismatch(pdp.JWTClaimsPtr(ctx)); mismatch {
 		return sessionGate{code: capability.ErrCodeAuthorizationFailed, reason: reason}, true
 	}
@@ -815,9 +604,8 @@ func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate
 }
 
 // recordSessionGateDeny writes the fail-closed deny record for a failed session gate,
-// tagged transportTag. method fills the record's method/identifier ("" for the
-// envelope-less GET/DELETE, the request method for a POST). Shared by enforceSessionGates
-// and handleMCPDelete so the record shape lives once alongside the shared verdict.
+// tagged transportTag. Shared by enforceSessionGates and handleMCPDelete so the record
+// shape lives once alongside the shared verdict.
 func (route *UpstreamRoute) recordSessionGateDeny(ctx context.Context, sessionID, method, transportTag string, gate sessionGate) {
 	details := map[string]interface{}{"transport": transportTag}
 	if gate.reason != "" {
@@ -827,10 +615,9 @@ func (route *UpstreamRoute) recordSessionGateDeny(ctx context.Context, sessionID
 }
 
 // enforceSessionGates is the verdict-plus-record half used by the POST and SSE-GET
-// existing-session paths: it runs sessionGateVerdict and, on a denial, writes the record
-// and returns the gate plus true. Kept separate from the check-only verdict so DELETE can
-// run the verdict under p.mu (its atomic check-and-delete) and render its own 403 + record
-// off the same predicate — "which checks run" stays in sessionGateVerdict alone.
+// paths: runs sessionGateVerdict and, on denial, writes the record and returns the gate.
+// Kept separate from the check-only verdict so DELETE can run it under p.mu and render its
+// own 403 + record off the same predicate.
 func (route *UpstreamRoute) enforceSessionGates(ctx context.Context, sess *httpSession, sessionID, method, transportTag string) (sessionGate, bool) {
 	gate, denied := route.sessionGateVerdict(ctx, sess)
 	if denied {
@@ -850,41 +637,24 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	if sess == nil {
 		return
 	}
-	// Opening an SSE stream is a host-initiated action on an existing session: it
-	// delivers that session's upstream server-initiated requests (sampling/createMessage,
-	// elicitation) and notifications, so it must clear the SAME per-route audience pin and
-	// session-owner binding a POST on that session does. Without these a cross-audience
-	// token (gateway union validator) or a same-audience different-sub identity that
-	// learned the victim's Mcp-Session-Id could open the stream and read another client's
-	// server->client traffic — the exact leak the audience pin and owner binding exist to
-	// prevent. A GET carries no JSON-RPC envelope, so a refusal is an HTTP 403 with a
-	// transport-tagged deny record (method/identifier empty), mirroring the kill-switch
-	// refusal. All three checks run before sess.touch() so a refused open does not defer
-	// the victim session's idle reaping.
+	// Opening an SSE stream is a host-initiated action on an existing session: it delivers
+	// that session's server-initiated requests and notifications, so it must clear the SAME
+	// per-route audience pin and session-owner binding a POST does, or a same-audience
+	// identity that learned the victim's Mcp-Session-Id could read another client's
+	// server->client traffic. A GET carries no JSON-RPC envelope, so a refusal is an HTTP
+	// 403 with a transport-tagged deny record. Runs before sess.touch() so a refusal
+	// doesn't defer the victim session's idle reaping.
 	//
 	// route is dereferenced unconditionally: handleMCP 404s an unknown route before
-	// dispatch, so it is never nil here, and route.pdp is non-nil whenever route is
-	// (every route constructor substitutes a concrete PDP). A defensive `if route != nil`
-	// around these gates would be worse than useless — it is a fail-OPEN branch in
-	// security-gate code, silently skipping the audience pin, the owner binding, and the
-	// kill check for whatever construction managed to reach here without a route.
-	//
-	// Per-route audience pin + session-owner binding, via the same helper the POST path
-	// uses: a token minted for a sibling route's audience (accepted by the shared union
-	// validator), or a same-audience second identity that learned the victim's
-	// Mcp-Session-Id, must not open this route's session stream and read another client's
-	// server->client traffic. An unbound, no-JWT session is a no-op.
+	// dispatch, so a defensive nil guard here would be a fail-OPEN branch silently skipping
+	// the security gates for whatever construction reached this point without a route.
 	if _, denied := route.enforceSessionGates(r.Context(), sess, sessionID, "", "sse-get"); denied {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	// Kill-switch check before serving: a killed (or globally emergency-stopped)
-	// session must not OPEN (or re-open) an SSE stream. This guards stream opens only.
-	// A targeted kill now tears the session down proactively (reapKilledSession, which
-	// closes the session and so ends its stream), but this check still matters for the
-	// cases teardown does not cover — a GLOBAL emergency stop, which writes the kill
-	// store without naming a session, and a re-open attempt racing that teardown. A
-	// kill-store error fails closed via CheckKill.
+	// Kill-switch check before serving: a killed (or globally emergency-stopped) session
+	// must not OPEN an SSE stream. A targeted kill tears the session down proactively, but
+	// this still matters for a GLOBAL stop (no session named) and a re-open racing teardown.
 	if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
 		recordKillDrop(r.Context(), asRecorder(route.sink), deny, verifiedSession(sess.id), "", "", legSSEGet)
 		http.Error(w, "session terminated", http.StatusForbidden)
@@ -905,34 +675,23 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 		http.Error(w, "too many concurrent SSE streams for this session", http.StatusTooManyRequests)
 		return
 	}
-	// On stream exit, unsubscribe AND drain: broadcastServerRequest may have buffered
-	// a server-initiated request into ch that the loop never read, leaving its upstream
-	// blocked on a response this departed client will never send. The drain replies an
-	// error upstream for each so it unblocks immediately. r.Context() is captured now
-	// (defer evaluates its arguments immediately): it carries the JWT claims handleMCP
-	// attached before dispatch, for the correction record's agent_id/task_id. Reading
-	// context.Value after r.Context() is later canceled by client disconnect is safe.
+	// On stream exit, unsubscribe AND drain: broadcastServerRequest may have buffered a
+	// server-initiated request into ch that the loop never read, leaving its upstream
+	// blocked; the drain replies an error upstream so it unblocks immediately. r.Context()
+	// is captured now (defer evaluates arguments immediately) since it carries the JWT
+	// claims for the correction record, and reading it after later cancellation is safe.
 	defer sess.removeSubAndDrain(r.Context(), ch)
 
-	// SEC-03: SSE is long-lived, so the fixed server-level httpWriteTimeout (a
-	// per-call Slowloris backstop) must not kill the stream after one budget. But a
-	// permanently cleared deadline lets a stuck reader (a TCP zero/tiny receive
-	// window that never drains) park this goroutine inside a blocked Write forever,
-	// pinning the goroutine and its maxSubsPerSession slot past kill and idle-reap
-	// (none of those teardown paths break a blocked write). So re-arm a bounded
-	// deadline before every write via writeSSE instead: a wedged write trips the
-	// deadline, returns an error, and ends the stream (running the removeSubAndDrain
-	// defer that frees the slot and unblocks any buffered server-initiated request).
-	// r.Context() still enforces clean disconnects.
+	// SEC-03: SSE is long-lived, so the fixed httpWriteTimeout Slowloris backstop must not
+	// kill it after one budget — but a permanently cleared deadline lets a stuck reader park
+	// this goroutine in a blocked Write forever, past kill and idle-reap. So re-arm a
+	// bounded deadline before every write via writeSSE instead: a wedged write trips it,
+	// ends the stream, and runs the removeSubAndDrain defer.
 	rc := http.NewResponseController(w)
 
-	// writeSSE writes one SSE frame from its byte-slice parts, re-arming the bounded
-	// write deadline before each sseWriteChunk-sized write so the deadline measures
-	// per-chunk forward progress — a slow-but-progressing reader is not killed
-	// mid-frame, a stuck (no-progress) reader still trips it — then flushing once.
-	// Returns false on any write or flush error so the caller ends the stream. Taking
-	// []byte parts lets the data path stream the marshaled payload without copying it
-	// into a new string.
+	// writeSSE writes one SSE frame, re-arming the deadline before each sseWriteChunk-sized
+	// write so it measures per-chunk progress — a slow-but-progressing reader isn't killed
+	// mid-frame, a stuck one still trips it. Returns false on any write/flush error.
 	writeSSE := func(parts ...[]byte) bool {
 		for _, part := range parts {
 			for len(part) > 0 {
@@ -955,31 +714,22 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
-	// Flush the response headers and emit an initial keepalive comment so the liveness
-	// clock starts at stream open — there is no unguarded gap before the first
-	// keepalive interval, and an intermediary with a sub-interval idle timeout sees
-	// traffic immediately. writeSSE arms the bounded deadline, so a reader already
-	// wedged at open is detected within sseWriteTimeout rather than never.
+	// Emit an initial keepalive so the liveness clock starts at stream open, with no
+	// unguarded gap before the first interval — writeSSE's deadline detects an
+	// already-wedged reader within sseWriteTimeout rather than never.
 	if !writeSSE(sseKeepaliveFrame) {
 		return
 	}
 
-	// Periodic comment frame on an otherwise-idle stream (after the initial one
-	// above): re-arms the bounded write deadline so a reader that has stopped draining
-	// is detected within sseKeepaliveInterval + sseWriteTimeout, and keeps
-	// intermediaries from idling the connection out.
+	// Periodic comment frame on an otherwise-idle stream: keeps intermediaries from idling
+	// the connection out and re-arms the deadline to detect a stopped-draining reader.
 	keepalive := time.NewTicker(sseKeepaliveInterval)
 	defer keepalive.Stop()
 
-	// Bound the stream to the presenting token's exp. The Bearer was validated once, at
-	// stream open (in handleMCP); without this an expired — or IdP-revoked but not
-	// kill-switched — client keeps receiving server->client traffic until it disconnects
-	// or the idle reaper runs. When the token's lifetime elapses, end the stream so the
-	// client must re-open (and thus re-validate) with a fresh token. A nil channel (no
-	// JWT on this session) never fires, so the non-JWT path is unaffected;
-	// time.NewTimer fires immediately for an already-elapsed exp (fail closed). Bound to
-	// this GET's own token, matching what handleMCP validated. Kill-switch eviction
-	// (sess.evicted) already covers administrative revocation; this covers plain expiry.
+	// Bound the stream to the presenting token's exp: without this an expired — or
+	// IdP-revoked but not kill-switched — client keeps receiving traffic until disconnect or
+	// idle-reap. A nil channel (no JWT) never fires; time.NewTimer fires immediately for an
+	// already-elapsed exp (fail closed). sess.evicted covers revocation; this covers expiry.
 	var tokenExpiry <-chan time.Time
 	var tokenExpiresAt time.Time
 	if claims := pdp.JWTClaimsPtr(r.Context()); claims != nil && !claims.ExpiresAt.IsZero() {
@@ -994,29 +744,22 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 		case msg := <-ch:
 			data, err := json.Marshal(msg)
 			if err != nil {
-				// Consumed from ch but unserializable. If it is a server-initiated
-				// request, the upstream is now blocked awaiting a response the host will
-				// never receive, so unblock it with an error reply. A notification (no ID)
-				// expects no response, so dropping it is correct.
+				// Unserializable. If it's a server-initiated request, the upstream is now
+				// blocked awaiting a response the host will never receive, so unblock it
+				// with an error reply. A notification expects no response, so dropping is correct.
 				sess.failServerRequestDelivery(r.Context(), msg, "proxy: failed to serialize server-initiated request for SSE delivery")
 				continue
 			}
 			if !writeSSE(sseDataPrefix, data, sseFrameEnd) {
-				// The frame was consumed from ch but the write failed (stuck reader or
-				// disconnect). If it is a server-initiated request, unblock the upstream
-				// the same way the serialize-error and drain paths do: removeSubAndDrain
-				// only recovers messages STILL buffered in ch, not this already-consumed
-				// one, so it would otherwise hang until the idle reaper.
+				// removeSubAndDrain only recovers messages STILL buffered in ch, not this
+				// already-consumed one, so it would otherwise hang until the idle reaper.
 				sess.failServerRequestDelivery(r.Context(), msg, "proxy: SSE write failed before delivering server-initiated request")
 				return
 			}
 		case <-keepalive.C:
-			// Re-anchor the expiry bound to the wall clock. time.Until sampled the wall
-			// clock once at stream open, but the resulting timer runs on the monotonic
-			// clock, which does not advance while the host is suspended — so a laptop or
-			// VM suspended mid-stream would otherwise extend the authorized window past
-			// exp by the suspend duration. This tick already fires every few seconds, so
-			// the check is free and bounds the overshoot to one keepalive interval.
+			// Re-anchor to the wall clock: the timer runs on the monotonic clock, which
+			// doesn't advance while the host is suspended, so a suspended laptop/VM would
+			// otherwise extend the authorized window past exp by the suspend duration.
 			if !tokenExpiresAt.IsZero() && !time.Now().Before(tokenExpiresAt) {
 				return
 			}
@@ -1024,15 +767,14 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 				return
 			}
 		case <-sess.evicted:
-			// The session was killed while this stream was open. End it now so a killed
-			// session stops receiving notifications immediately. A reopen attempt is
+			// The session was killed while this stream was open; a reopen attempt is
 			// refused by the kill-switch check at the top of handleMCPGet.
 			return
 		case <-sess.done:
 			return
 		case <-tokenExpiry:
 			// The presenting token's lifetime elapsed; end the stream so a re-open must
-			// carry a fresh token (see the tokenExpiry setup above).
+			// carry a fresh token.
 			return
 		case <-r.Context().Done():
 			return
@@ -1047,57 +789,34 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
 		return
 	}
-	// Run the context-only gate (the audience pin) BEFORE taking p.mu, and carry its
-	// verdict into the locked region. It depends only on the request's claims, never on
-	// the session, so evaluating it early changes no decision — but it keeps the
-	// PolicyDecisionPoint call, whose implementation is an exported seam, off the global
-	// session-registry write lock that serializes every lookup, register, and reap.
-	// The verdict is APPLIED below only once the session is confirmed to exist and to
-	// belong to this route, preserving the 403-vs-404 shape exactly.
+	// Run the context-only gate (audience pin) BEFORE taking p.mu, carrying its verdict
+	// into the locked region: it depends only on request claims, so evaluating it early
+	// changes no decision, but keeps the PolicyDecisionPoint call — an exported seam — off
+	// the global session-registry write lock. Applied below only once the session is
+	// confirmed to exist and belong to this route, preserving the 403-vs-404 shape.
 	audienceGate, audienceDenied := route.contextGateVerdict(r.Context())
 
 	p.mu.Lock()
 	sess, ok := p.sessions[sessionID]
 	if ok && sess.route != route {
-		// A session may only be torn down via the route it was opened on, so a
-		// cross-route DELETE cannot close another upstream's session.
+		// A session may only be torn down via the route it was opened on.
 		p.mu.Unlock()
 		http.Error(w, "session does not belong to this upstream route", http.StatusConflict)
 		return
 	}
 	if ok {
 		// Per-route audience pin + session-owner binding before teardown, mirroring the
-		// SSE-GET stream-open and existing-session POST paths. A DELETE is a host-initiated
-		// action on an existing session, so it must clear the SAME gates: the gateway's
-		// shared union validator accepts a token minted for ANY route's audience, so a
-		// sibling-audience token (or a same-audience different identity that learned the
-		// victim's Mcp-Session-Id) could otherwise tear down another client's session — a
-		// cross-audience teardown / tenant DoS. Enforced only once the session is confirmed
-		// to exist AND belong to this route, which orders the responses 404 (unknown id) /
-		// 409 (wrong route) / 403 (gate refused). That IS a weak existence oracle rather
-		// than the absence of one: a caller holding any accepted token learns from a 403
-		// that the id it presented names a live session on this route. It is accepted
-		// because session ids are server-minted UUIDs — unguessable, so the oracle
-		// confirms only ids the caller already has. What bounds the probe cost is not the
-		// ordering of the PDP call — the context-only audience verdict is computed BEFORE
-		// the registry lookup, to keep an exported-seam call off the session lock — but the
-		// auth check upstream of this handler, which an unauthenticated caller never gets
-		// past. The ordering that survives here is where the verdict is APPLIED: only once
-		// the session is confirmed to exist and to belong to this route. A no-pin /
-		// --jwt-allow-any-audience route and an unbound (no-JWT) session are no-ops. A DELETE
-		// carries no JSON-RPC envelope, so a refusal is an HTTP 403 plus a transport-tagged
-		// deny record (method/identifier empty), matching the GET refusal convention. The
-		// kill switch is deliberately NOT consulted: tearing a session down is always
-		// permitted (cleanup of a killed session must still succeed).
+		// SSE-GET and POST paths: without these a sibling-audience token (or a same-audience
+		// different identity that learned the victim's Mcp-Session-Id) could tear down
+		// another client's session. Enforced only once the session is confirmed to exist AND
+		// belong to this route, ordering responses 404/409/403 — a weak existence oracle
+		// (a 403 confirms a live session id on this route), but session ids are unguessable
+		// UUIDs, and an unauthenticated caller never gets past the auth check upstream of
+		// this handler anyway. The kill switch is deliberately NOT consulted: tearing a
+		// session down is always permitted (a killed session's cleanup must still succeed).
 		//
 		// route is dereferenced unconditionally: handleMCP 404s an unknown route before
-		// dispatch, so it is never nil here, matching handleMCPGet. A defensive nil guard
-		// would be a fail-OPEN branch skipping the audience pin and owner binding. The two
-		// gate halves are applied in the same order sessionGateVerdict applies them —
-		// audience first, already computed above the lock; owner second, a pure field
-		// compare cheap enough to run here — so DELETE clears exactly the gates POST/GET
-		// clear, and a gate added to either half cannot silently skip it. Only the record +
-		// 403 render happen after unlocking.
+		// dispatch, so a defensive nil guard would be a fail-OPEN branch here too.
 		gate, denied := audienceGate, audienceDenied
 		if !denied {
 			gate, denied = sessionOnlyGateVerdict(r.Context(), sess)
@@ -1115,11 +834,9 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
-	// Re-arm the write deadline around the teardown, mirroring the enforced-request path.
-	// The deadline armed at handler entry is measured from entry, and sess.close waits on
-	// the upstream's termination bounded by --shutdown-timeout: with a budget above the
-	// entry window (~15s and up) the deadline is already past by the time the 204 is
-	// written, so the client sees a dropped connection for a teardown that in fact
+	// Re-arm the write deadline around the teardown: sess.close waits on upstream
+	// termination bounded by --shutdown-timeout, and with a budget above the entry window
+	// the deadline would already be past by 204-write time for a teardown that in fact
 	// succeeded. A fresh window bounds only the client-facing write.
 	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally runs on a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this 204 is written, leaking the upstream session. Same rationale as the handleMCPDelete dispatch site.
@@ -1128,36 +845,26 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 
 // handleKill processes POST /control/kill (loopback only).
 //
-// Kill-only, deliberately: this endpoint issues revocations and has no undo. Lifting one
-// is done where the kill state lives (`eunox kill --revive`, Redis-only), because a
-// same-host process that reaches this endpoint holding the control token can already halt
-// the proxy, and an undo here would let it lift the revocation issued against it. The
-// handle it calls through (p.ks) is typed to make that structural rather than a promise —
-// see killActivator, which is where to read before adding a verb to this handler.
+// Kill-only, deliberately: this endpoint issues revocations and has no undo. Lifting one is
+// done where the kill state lives (`eunox kill --revive`, Redis-only), because a same-host
+// process holding the control token can already halt the proxy, and an undo here would let
+// it lift the revocation issued against it. See killActivator before adding a verb here.
 func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
-	// Loopback guard runs first — before the control-token check — so an off-host
-	// caller is rejected by the security boundary rather than learning the endpoint
-	// exists via a 401. Matches handleHealth/handleMetrics.
+	// Loopback guard runs first — before the control-token check — so an off-host caller
+	// is rejected by the security boundary rather than learning the endpoint exists via a 401.
 	if !p.loopbackOnly(w, r) {
 		return
 	}
 
 	// SEC-07: the loopback check stops remote access, but a same-host process (e.g. a
-	// compromised tool subprocess) could reach this endpoint over loopback. Require the
-	// auto-generated control token (written to a 0600 file at startup, independently of
-	// authToken/JWT mode) so the emergency stop is never reachable without it.
+	// compromised tool subprocess) could still reach this endpoint. Require the
+	// auto-generated control token so the emergency stop is never reachable without it.
 	//
-	// This runs BEFORE the method check on purpose. A method check that ran first
-	// would answer a bare GET/PUT/whatever with an unrecorded 405 — confirming the
-	// emergency-stop endpoint exists and is enabled to a caller who never proved they
-	// hold the token, while the same caller sending POST with a wrong token is fully
-	// recorded via CONTROL_AUTH_FAILED below. That is exactly the asymmetry SEC-07
-	// exists to close: a same-host attacker probing this endpoint must not have a
-	// cheaper, invisible way in than the one that's already logged. Checking the
-	// token first collapses every unauthenticated verb to the same recorded 401, so
-	// the endpoint's existence costs nothing extra to confirm; a legitimate operator
-	// who both holds the token and typos the verb gets a less specific error, which is
-	// an acceptable trade against shrinking the endpoint's information surface.
+	// Runs BEFORE the method check on purpose: a method check first would answer a bare
+	// GET/PUT with an unrecorded 405, confirming the endpoint exists to a caller who never
+	// proved they hold the token, while the same caller with a wrong token on POST is fully
+	// recorded below. Checking the token first collapses every unauthenticated verb to the
+	// same recorded 401.
 	if !p.checkControlToken(w, r) {
 		return
 	}
@@ -1172,49 +879,37 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		SessionID string `json:"sessionId"`
 		All       bool   `json:"all"`
 	}
-	// Reject a body carrying a trailing JSON token (e.g. a legitimate
-	// {"sessionId":"..."} followed by a smuggled {"all":true}): without this, only
-	// the first value is decoded and the second is silently dropped, so the kill
-	// actually executed could differ from what a body-only reviewer would expect.
-	// decodeStrictJSON applies the JSON-only content-type gate too, and it runs after the
-	// control-token check above, so a caller without the token learns nothing about the
-	// body this endpoint expects. /control/kill has no route concept, so nil: its refusal
-	// stays on the proxy-wide sink, unchanged from before decodeStrictJSON took a route.
+	// Reject a body carrying a trailing JSON token (e.g. a smuggled {"all":true} after a
+	// legitimate {"sessionId":"..."}): without this the kill actually executed could differ
+	// from what a body-only reviewer would expect. /control/kill has no route concept, so
+	// nil: its refusal stays on the proxy-wide sink.
 	if !p.decodeStrictJSON(w, r, &body, "invalid request body", nil) {
 		return
 	}
 	if body.All {
-		// Propagate a kill-store write failure (fail closed): returning {"ok":true} on
-		// a failed emergency stop would leave the operator believing the system is safe
-		// while requests keep being served. The in-memory backend always returns nil.
+		// Propagate a kill-store write failure (fail closed): returning {"ok":true} on a
+		// failed emergency stop would leave the operator believing the system is safe.
 		if err := p.ks.ActivateGlobal(r.Context()); err != nil {
-			// Log the backend detail (e.g. a Redis error carrying an internal host:port)
-			// for the operator; return a generic message.
 			fmt.Fprintf(os.Stderr, "[eunox] kill switch activation failed: %v\n", err)
 			http.Error(w, "kill switch activation failed", http.StatusInternalServerError)
 			return
 		}
 		// Record BEFORE the teardown: the stop takes effect the moment the store write
-		// returns, and the teardown below waits on every session's close (bounded by the
-		// shutdown budget, which a wedged upstream reader consumes in full). Recording
-		// after it left a window where a crash produced a tape showing KILL_SWITCH denials
-		// with no activation record to explain them — the exact gap this record closes.
+		// returns, but the teardown below is bounded by the shutdown budget — recording
+		// after it left a window where a crash produced KILL_SWITCH denials with no
+		// activation record to explain them.
 		p.recordKillActivated(r, killScopeAll, killDimensionGlobal)
-		// Evict every open SSE stream: writing the kill state stops future operations,
-		// but a stream opened before the kill is long-lived and would keep delivering
-		// notifications until the idle ceiling. This makes the stop total for the
-		// server->client channel too.
-		// Re-arm the write deadline before the sweep: it waits on EVERY session's close,
-		// each bounded by --shutdown-timeout, so with a non-trivial budget the entry
-		// deadline is long past by the time the success body is written. The operator then
-		// sees `eunox kill` fail on a stop that actually took effect — the worst possible
-		// moment for a misleading result.
+		// Evict every open SSE stream too: a stream opened before the kill is long-lived
+		// and would otherwise keep delivering notifications until the idle ceiling.
+		// Re-arm the write deadline before the sweep: it waits on EVERY session's close, so
+		// with a non-trivial shutdown budget the entry deadline would otherwise be long past
+		// by success-body time, making `eunox kill` look like it failed on a stop that
+		// actually took effect.
 		rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 		p.evictAllSessionStreams()
-		// Proactively tear every session down (close upstreams, free maxSessions slots)
-		// rather than leaving reclamation to the idle reaper, which does not run when
-		// sessionIdleTimeoutMs is 0 — otherwise killed-but-undead sessions would pin
-		// capacity and 503 new initializes.
+		// Proactively tear every session down rather than leaving reclamation to the idle
+		// reaper, which does not run when sessionIdleTimeoutMs is 0 — otherwise
+		// killed-but-undead sessions would pin capacity and 503 new initializes.
 		p.reapAllKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this response is written. Same rationale as the handleMCPDelete close() site.
 		p.writeKillResponse(w, killScopeAll, killDimensionGlobal)
 		return
@@ -1230,14 +925,10 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	}
 	// Recorded before the teardown, same ordering as the global path above.
 	p.recordKillActivated(r, body.SessionID, killDimensionSession)
-	// End this session's open SSE stream(s), same reason as the global path above.
-	// Write deadline re-armed for the same reason as the global path: the teardown below
-	// waits on the session's close, bounded by --shutdown-timeout.
 	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	p.evictSessionStreams(body.SessionID)
-	// Proactively tear the killed session down (close its upstream, free its
-	// maxSessions slot) instead of relying on the idle reaper, which does not run when
-	// sessionIdleTimeoutMs is 0 — see reapKilledSession.
+	// Proactively tear the killed session down instead of relying on the idle reaper,
+	// which does not run when sessionIdleTimeoutMs is 0 — see reapKilledSession.
 	p.reapKilledSession(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
 	p.writeKillResponse(w, body.SessionID, killDimensionSession)
 }
@@ -1246,38 +937,22 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 // distinguishing it from a targeted kill, whose scope is the killed session id.
 const killScopeAll = "all"
 
-// recordKillActivated writes the audit record for a SUCCESSFUL /control/kill
-// activation. Every refusal of this endpoint already lands on the tape
-// (CONTROL_AUTH_FAILED, LOOPBACK_REJECTED, ORIGIN_REJECTED), and every request the
-// activation goes on to block lands as a KILL_SWITCH denial — but the activation
-// itself, the single administrative act that explains the whole run of denials that
-// follows, left no trace at all. An auditor reconstructing an incident could see the
-// proxy stop serving without any signed evidence of when it was stopped or that the
-// stop was authorized.
+// recordKillActivated writes the audit record for a SUCCESSFUL /control/kill activation.
+// Every refusal of this endpoint already lands on the tape, and every request the
+// activation blocks lands as a KILL_SWITCH denial — but the activation itself, the single
+// administrative act explaining that whole run of denials, otherwise left no trace.
 //
-// Recorded as an ALLOW: the request was authenticated by the control token and
-// performed, so it is a permitted action, not a refusal. It is emitted after the
-// kill-store write succeeds — so the tape never claims a stop that did not take effect (a
-// failed ActivateGlobal/KillSession returns 500 before reaching here) — and BEFORE the
-// stream eviction and session teardown, which are resource reclamation rather than part
-// of the stop. The kill is in force the moment the store write returns, while the
-// teardown waits on every session's close and is bounded only by the shutdown budget, so
-// recording after it left a window in which a crash produced a tape full of KILL_SWITCH
-// denials with no activation record to explain them. scope is the killed session id, or
-// killScopeAll for a whole-proxy stop; it goes in details rather than the structured
-// target field, which is reserved for MCP tool/resource/prompt targets this
-// administrative action has none of.
+// Recorded as an ALLOW (authenticated and performed, not a refusal), emitted after the
+// kill-store write succeeds and BEFORE stream eviction/session teardown: the kill is in
+// force the moment the store write returns, while teardown is bounded only by the shutdown
+// budget, so recording after it left a window where a crash produced KILL_SWITCH denials
+// with no activation record. scope goes in details rather than the structured target
+// field, which is reserved for MCP tool/resource/prompt targets. No credential and no
+// session_id are recorded (a global stop addresses no single session).
 //
-// The record carries no credential — the control token is never recorded, matching the
-// CONTROL_AUTH_FAILED refusal path — and no session_id: a global stop addresses no
-// single session, and a targeted one names its session in details.scope, where it
-// cannot be confused with an authenticated session binding.
-// dimension distinguishes the two kills this endpoint can issue. It is a separate field
-// from scope because their VALUES collide: a session id is operator-settable, so one can
-// literally be "all", and `{"sessionId":"all"}` would otherwise produce a record
-// byte-identical to a deployment-wide stop. An incident responder reading the signed tape
-// has to be able to tell "one session was revoked" from "everything was halted", and a
-// structured field with two possible meanings cannot answer that.
+// dimension is a separate field from scope because their VALUES collide: a session id is
+// operator-settable and could literally be "all", so `{"sessionId":"all"}` would otherwise
+// be indistinguishable from a deployment-wide stop.
 func (p *HTTPProxy) recordKillActivated(r *http.Request, scope, dimension string) {
 	if p.sink == nil {
 		return
@@ -1291,14 +966,11 @@ func (p *HTTPProxy) recordKillActivated(r *http.Request, scope, dimension string
 
 // writeKillResponse writes the kill endpoint's
 // {"ok":true,"killed":<target>,"dimension":<global|session>} success body. Every route
-// honors the kill switch (including wiretap), so the response carries no
-// partial-coverage caveat.
+// honors the kill switch, so the response carries no partial-coverage caveat.
 //
-// The dimension is reported for the same reason the audit record carries it: a session
-// whose id is "all" would otherwise produce a response indistinguishable from the
-// deployment-wide stop, and `eunox kill` prints this body verbatim, so the operator would
-// have no signal either. It matches the field the Redis transport's own result line uses,
-// so one output shape describes both transports.
+// dimension is reported for the same reason the audit record carries it: a session whose
+// id is "all" would otherwise produce a response indistinguishable from the deployment-wide
+// stop, and `eunox kill` prints this body verbatim.
 func (p *HTTPProxy) writeKillResponse(w http.ResponseWriter, killed, dimension string) {
 	w.Header().Set("Content-Type", CTJSON)
 	resp := map[string]interface{}{"ok": true, "killed": killed, "dimension": dimension}

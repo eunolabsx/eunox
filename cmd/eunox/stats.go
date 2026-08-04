@@ -19,10 +19,8 @@ import (
 	"github.com/eunolabs/eunox/internal/audit"
 )
 
-// cmdStats runs the `stats` subcommand and returns the process exit code
-// (rather than calling os.Exit itself), so tests can drive every branch. args
-// carries the subcommand's own arguments (os.Args[2:] in a real invocation),
-// threaded from run.
+// cmdStats runs the `stats` subcommand, returning the exit code (rather than calling
+// os.Exit) so tests can drive every branch.
 func cmdStats(args []string) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -89,33 +87,20 @@ type auditStatsSummary struct {
 	observed     int // denials with audit_only=true  (call was forwarded)
 	escalated    int // decision=escalate: refused pending human approval (never forwarded)
 	declassified int // allows that cleared a flow label under a human approval (labels_cleared present)
-	// The four declassification facts that live in `details` rather than in a top-level
-	// field, because none of them is a declassification that HAPPENED — which is all the
-	// signed labels_cleared/approver/approval_id triple may describe. Without a count here
-	// each was byte-indistinguishable from an ordinary allow or an ordinary UPSTREAM_ERROR
-	// deny in everything this tool reported, so a policy whose sanitizing step had stopped
-	// working, or an approval queue quietly draining, looked exactly like a healthy run.
-	//
 	// declassifyCommitFailed is the one to alert on: the call RAN and the clear did not
 	// land, so the session keeps taint it should have dropped and every later sink
 	// over-blocks until a new approval is issued.
 	declassifyCommitFailed int
 	// declassifyNotApplied is benign — the call was refused below the decision, so the
-	// labels were never removed — but it is what explains a spent grant beside it.
+	// labels were never removed — but it explains a spent grant beside it.
 	declassifyNotApplied int
-	// declassifyResultWithheld counts the refusals where the action EXECUTED and eunox
-	// dropped its result (response redaction failed). It usually overlaps the count above but
-	// is NOT a strict subset — a no-op clear under a single-use grant carries no not-applied
-	// labels — so it is reported on its own line. Counted separately because the operator's
-	// remedy differs: the sanitizing work is already done, so the re-minted approval
-	// re-delivers rather than re-runs. It is a proxy- or manifest-side defect rather than
-	// anything the caller or the upstream did, so a non-zero count means a redactFields
-	// directive and a real response shape disagree.
+	// declassifyResultWithheld counts refusals where the action EXECUTED and eunox dropped
+	// its result (response redaction failed) — not a strict subset of the count above, and
+	// its remedy differs: the sanitizing work is already done, so a re-minted approval
+	// re-delivers rather than re-runs.
 	declassifyResultWithheld int
-	// spentApprovals counts single-use grants this log shows being burned, which is the
-	// reconciliation signal: an operator asking "which of my outstanding one-shot approvals
-	// are still live?" cannot answer it from approval_id, which appears only when the clear
-	// changed something.
+	// spentApprovals counts single-use grants this log shows being burned — the
+	// reconciliation signal for "which of my outstanding one-shot approvals are still live?".
 	spentApprovals  int
 	other           int // records with a decision outside "allow" | "deny" | "escalate"
 	blockedDenials  map[denialKey]int
@@ -156,12 +141,8 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 		switch rec.Decision {
 		case "allow":
 			out.allowed++
-			// A declassification is an allow that ALSO dropped a flow label under a
-			// human approval. It is counted separately, not bucketed apart: the record
-			// is a genuine allow, and the count answers "how often did a human agree to
-			// drop taint" — the other half of the approval queue the escalate count
-			// reports, and the number an operator watches for a policy whose sanitizing
-			// step has quietly become routine.
+			// Counted separately, not bucketed apart: the record is a genuine allow, and
+			// this answers "how often did a human agree to drop taint".
 			if len(rec.LabelsCleared) > 0 {
 				out.declassified++
 			}
@@ -175,9 +156,8 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 				out.blockedDenials[k]++
 			}
 		case audit.DecisionEscalate:
-			// An escalation is a refusal — the upstream was never called — so it is
-			// tallied with the blocked denials AND counted separately, because "needs a
-			// human" is the operator's queue of work while a plain deny is not.
+			// Tallied with the blocked denials AND counted separately: "needs a human" is
+			// the operator's own queue of work.
 			k := denialKey{tool: statsTarget(rec.TargetType, rec.Target, rec.Method), code: rec.DenialCode}
 			out.escalated++
 			out.blocked++
@@ -194,25 +174,13 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 }
 
 // declassifyProbe is the byte pattern addDeclassifyDetails scans a raw record for before
-// paying for a second decode. Hoisted so the conversion is not redone per record, and
-// derived from the producer's own key prefix so the two cannot drift.
+// paying for a second decode, derived from the producer's own key prefix so the two can't drift.
 var declassifyProbe = []byte(audit.DeclassifyDetailPrefix)
 
-// addDeclassifyDetails tallies the declassification facts that ride in a record's `details`
-// map. It is the only place this tool reads details at all, and it reads exactly four keys.
-//
-// It probes the WHOLE record line rather than a captured `details` field, and decodes only
-// on a hit. Capturing details on the outer struct — even as a json.RawMessage — is not free:
-// RawMessage.UnmarshalJSON copies the bytes, and on a tools/call allow under --audit those
-// bytes are the caller's entire argument map, the largest field on the line. Probing the
-// line the scanner already holds costs one substring scan and no allocation, on records that
-// essentially never carry these keys.
-//
-// A miss is safe in the only direction that matters: an unrecognizable payload reads as "no
-// declassification facts", which is what the tool reported before it read details at all.
-// Scanning the whole line can only produce a false POSITIVE (the prefix appearing outside
-// details), which costs one wasted decode and no miscount — the decode below looks the keys
-// up inside `details` specifically.
+// addDeclassifyDetails tallies the declassification facts riding in a record's `details`
+// map. It probes the WHOLE line rather than capturing `details` on the outer struct — a
+// RawMessage would copy the caller's entire argument map on most records — and decodes only
+// on a hit. A miss reads as "no declassification facts", the safe direction.
 func (s *auditStatsSummary) addDeclassifyDetails(line []byte) {
 	if !bytes.Contains(line, declassifyProbe) {
 		return
@@ -260,10 +228,8 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 	if s.declassified > 0 {
 		wf("  (declassified = %d allow(s) cleared a flow label under a human approval; every one names its approver in the record.)\n", s.declassified)
 	}
-	// Called out rather than listed, and FIRST among the declassification notes: this is the
-	// one that means a session is not in the state the policy describes. The call ran, its
-	// approved clear did not land, so the taint is still there and every later sink governed
-	// by it over-blocks until a fresh approval is issued.
+	// FIRST among the declassification notes: means a session is not in the state the
+	// policy describes — the approved clear did not land, so taint remains.
 	if s.declassifyCommitFailed > 0 {
 		wf("\n  ATTENTION: %d approved declassification(s) could not be applied after the call had already run\n", s.declassifyCommitFailed)
 		wln("  (the flow store faulted at the commit; those sessions keep taint the policy says the action cleared,")
@@ -273,13 +239,8 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 		wf("  (declassify-not-applied = %d refused call(s) whose approved clear was therefore never made; the labels were never removed, so nothing is under-tainted.)\n",
 			s.declassifyNotApplied)
 	}
-	// Its own line, not "of those": it usually accompanies the count above but can stand
-	// alone (a no-op clear under a single-use grant leaves no not-applied labels), so a
-	// subset phrasing would print under a heading that was never emitted. The remedy is what
-	// makes it worth separating — on every other refusal below the decision it is unknown
-	// whether the upstream ran anything, so a re-minted approval retries the work, while here
-	// the work is done and only its delivery failed. A non-zero count is also a signal in its
-	// own right: a redactFields directive and the real response shape disagree.
+	// Its own line, not "of those": can stand alone (a no-op clear leaves no not-applied
+	// labels), and the remedy differs — the work is done, only delivery failed.
 	if s.declassifyResultWithheld > 0 {
 		wf("  (declassify-result-withheld = %d refused call(s) whose action had already EXECUTED upstream, with the result dropped because response redaction failed;\n"+
 			"   the sanitizing work is done, so a fresh approval re-delivers rather than re-runs it. Check the redactFields paths against the real response shape.)\n",

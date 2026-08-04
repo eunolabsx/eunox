@@ -50,15 +50,10 @@ func (m *LocalManifest) anyDirective(pred func(capability.Directive) bool) bool 
 }
 
 // anyTokenState reports whether any condition or directive on any capability entry has a
-// cross-call state class satisfying pred. It is the one walk both derived policy properties
-// (NeedsDecisionTurn, AccumulatesSharedState) read, over the class each token DECLARES on its
-// pkg/capability prototype-registry entry rather than over a list of token types spelled out
-// here — which is what keeps a newly added accumulating token from silently reporting neither.
-//
-// An UNCLASSIFIED token (one whose registry entry declares no class, or a discriminator this
-// build does not model) is treated as the strongest class, so it satisfies every predicate:
-// the build-time completeness test is what stops it from ever shipping, and the runtime answer
-// while it exists is "serialize, and warn" rather than "neither".
+// cross-call state class satisfying pred, read from the class each token DECLARES on its
+// pkg/capability prototype-registry entry rather than a hand-maintained list here — which
+// keeps a newly added accumulating token from silently reporting neither. An UNCLASSIFIED
+// token is treated as the strongest class, so it satisfies every predicate until it ships.
 func (m *LocalManifest) anyTokenState(pred func(capability.StateAccumulation) bool) bool {
 	if m == nil {
 		return false
@@ -85,41 +80,18 @@ func (m *LocalManifest) anyTokenState(pred func(capability.StateAccumulation) bo
 }
 
 // AccumulatesSharedState reports whether this policy depends on state that outlives a single
-// call — a maxCalls or cumulative blastRadius budget, the sequenceBlock antecedent history, the
-// flow-label set. All of it is PER-PROCESS under the default in-memory backends, so the
-// multi-instance advisory warns on it: three replicas without a shared Redis enforce a
-// maxCalls of 20 as 60, and a source recorded on one instance is invisible to a sink on
-// another.
-//
-// It replaced four hand-written per-token predicates ORed together at each of its two call
-// sites (the stdio host's and the gateway's). Those were four places to forget for one
-// question, and forgetting was silent in the direction that matters: the operator who most
-// needs the advisory is the one running a policy the list has not caught up with.
+// call (a maxCalls/blastRadius budget, sequenceBlock history, the flow-label set). All of it
+// is PER-PROCESS under the default in-memory backends, so the multi-instance advisory warns on
+// it: three replicas without shared Redis enforce a maxCalls of 20 as 60.
 func (m *LocalManifest) AccumulatesSharedState() bool {
 	return m.anyTokenState(capability.StateAccumulation.AccumulatesSharedState)
 }
 
 // PolicyTokens returns the set of condition and directive discriminators this policy carries,
-// sorted and deduplicated. The route builder hands it to enforcement.WithPolicyTokens, which is
-// what lets the engine decide which optional subsystems to wire.
-//
-// It is a FACT about the manifest, and that is the whole of its job. It used to be a
-// conclusion — UsesEngineSubsystem, which asked whether any token depended on a named engine
-// facility and was answered from the subsystem each token DECLARES on its pkg/capability
-// prototype-registry entry. That declaration describes the handler this build ships for the
-// token, and the thing that actually reads a store is the handler:
-// enforcement.WithConditionHandler can replace the handler for any type, including one whose
-// shipped handler touches nothing, so a policy of nothing but allowedValues could report "no
-// flow token" while its registered handler read the flow set through a store the engine was
-// then built never to populate. Naming the tokens and letting the engine intersect them with
-// its own registry removes that gap, and removes the possibility of the two disagreeing at all.
-//
-// A token this build does not model still appears here verbatim; the engine treats an
-// unclassifiable one as depending on every subsystem, which is the cheap direction (the skips
-// are optimizations) and the same rule the declaration side applies.
-//
-// A nil manifest (a route with no policy) carries no token. That is DISTINCT from not calling
-// WithPolicyTokens at all — see its doc — which is why the empty result is still passed on.
+// sorted and deduplicated, fed to enforcement.WithPolicyTokens to decide which optional engine
+// subsystems to wire. It reports a FACT rather than a conclusion, so the engine's own handler
+// registry — which a caller can replace via enforcement.WithConditionHandler — decides subsystem
+// use rather than this layer guessing it from the token's declared default handler.
 func (m *LocalManifest) PolicyTokens() []string {
 	seen := map[string]struct{}{}
 	// The discriminator methods have value receivers, so a typed-nil entry would panic on the
@@ -146,89 +118,43 @@ func (m *LocalManifest) PolicyTokens() []string {
 }
 
 // NeedsDecisionTurn reports whether this policy's decisions must be SERIALIZED on the state
-// anchor: whether any of its tokens does a NON-ATOMIC read-then-write against accumulated
-// state — one call committing what a later one reads back, with a window in between. Both
-// transports gate their decision turn on it.
-//
-// Non-atomic is the whole of the predicate, and stating it loosely is how the wrong tokens get
-// counted: maxCalls and a cumulative blastRadius also accumulate state that a later call reads
-// back, and deliberately need NO turn, because AdmitAll admits or refuses a whole batch of
-// buckets indivisibly. A flowLabel sink peeking a set a labelOutput source Adds to, and a
-// sequenceBlock reading an antecedent marker an earlier call recorded, have no such atomicity:
-// a host that pipelines the source and the sink lets the sink's read run before the source's
-// write commits, which is the fail-open the turn exists to close. Everything else keeps full
-// decision parallelism.
-//
-// The classification is DECLARED BY THE TOKEN — on its pkg/capability prototype-registry entry,
-// beside the grammar revision — and this derives from it rather than naming the tokens that
-// happen to accumulate today. The predicate was previously spelled out twice (once per
-// transport) and then once as a literal disjunction of two per-token predicates; both shapes
-// have the same failure, and it is silent: a new accumulating condition simply is not in the
-// list, both transports run its decisions unserialized, and every completeness test still
-// passes. A token that declares nothing now fails the build instead
-// (TestTokenStateAccumulation_EveryRegisteredTokenDeclaresAClass), and is treated as needing
-// the turn until it does.
-//
-// A nil manifest (a route with no policy) accumulates nothing and needs no turn.
+// anchor: whether any token does a NON-ATOMIC read-then-write against accumulated state (a
+// flowLabel sink peeking what a labelOutput source Adds, a sequenceBlock reading an antecedent
+// an earlier call recorded) with a window a pipelined host could race through. maxCalls and a
+// cumulative blastRadius need no turn — AdmitAll admits a whole batch atomically. The
+// classification is DECLARED BY THE TOKEN, not a hand-maintained list, so a new accumulating
+// token defaults to needing the turn rather than silently running unserialized.
 func (m *LocalManifest) NeedsDecisionTurn() bool {
 	return m.anyTokenState(capability.StateAccumulation.NeedsSerializedDecisions)
 }
 
-// HasDeclassify reports whether this policy carries a declassify directive — the one
-// token whose satisfaction depends on a channel (a validated JWT) that not every host
-// transport has. The startup check consults it to refuse a manifest whose declassification
-// could never be approved; it is single-sourced here beside the other policy predicates so
-// that check and the engine's own gate cannot drift on what counts as declassifying.
+// HasDeclassify reports whether this policy carries a declassify directive — the one token
+// whose satisfaction depends on a channel (a validated JWT) not every host transport has. The
+// startup check consults it to refuse a manifest whose declassification could never be approved.
 func (m *LocalManifest) HasDeclassify() bool {
 	return m != nil && m.anyDirective(capability.IsDeclassifyDirective)
 }
 
 // HonorsAttributionInterface reports whether this policy admits the client-supplied
-// attribution interface (the `io.eunolabs.context-manifest` block in a request's `_meta`).
-//
-// It is the grammar gate for a wire-side token, and it exists for the same reason
-// checkTokenGrammarVersion gates the manifest-side ones: a token introduced by a later
-// grammar revision must not change behavior for an operator running an earlier one. This
-// one cannot ride checkTokenGrammarVersion itself because the token never appears in the
-// manifest — it arrives on a REQUEST, so there is nothing to reject at load, and the gate
-// has to be a runtime predicate the transport consults.
-//
-// Under "0.1" the block is IGNORED rather than rejected, which is the conservative
-// direction: the interface is union-only (a declaration may only tighten a call's labels,
-// never widen them), so ignoring it falls back to the conservative session join — the
-// stricter reading. Rejecting instead would make a `0.1` operator's calls start failing on
-// a `_meta` key that is not part of their grammar, which is a behavior change in the
-// opposite, breaking direction.
-//
-// A nil manifest (a route with no policy) has no schema version and therefore no opt-in,
-// so it reports false.
-//
-// It asks revisionAdmits rather than comparing to the introducing revision, which is the same
-// rule the manifest-side gates apply: a revision published after the one that introduced the
-// interface still contains it. An equality check would silently turn the interface OFF for a
-// policy on a later revision — and "off" here means the client's declaration is ignored, which
-// is quiet rather than loud.
+// attribution interface (the `io.eunolabs.context-manifest` block in a request's `_meta`). It
+// is the grammar gate for a wire-side token that never appears in the manifest — it arrives on
+// a REQUEST, so there is nothing to reject at load, making this a runtime predicate rather than
+// a load-time check like checkTokenGrammarVersion. Under "0.1" the block is IGNORED rather than
+// rejected: the interface is union-only, so ignoring it falls back to the stricter conservative
+// join instead of breaking a "0.1" operator's calls on a `_meta` key outside their grammar.
+// A nil manifest reports false. Uses revisionAdmits, not an equality check against the
+// introducing revision, so a later revision still contains the interface.
 func (m *LocalManifest) HonorsAttributionInterface() bool {
 	return m != nil && revisionAdmits(strings.TrimSpace(m.SchemaVersion), ManifestSchemaVersion02)
 }
 
-// HasSamplingGrant reports whether the manifest grants server-initiated sampling:
-// a system: target whose bare name matches sampling/createMessage (by the same
-// enforcement.MatchesResource matcher the engine uses; note that system: targets
-// reject glob metacharacters at load, so in practice only the exact
-// "system:sampling/createMessage" is loadable — the matcher is used for
-// engine-consistency, not to admit "system:*") AND whose actions permit it ("allow" or "*").
-//
-// This is single-sourced beside the other manifest-policy predicates so the startup
-// HTTP-upstream sampling guard and ManifestPDP.DecideSampling cannot drift: it
-// applies the SAME grant rule DecideSampling enforces at runtime (a matching system:
-// constraint whose actions contain "allow"). It is action-aware — a prior transport-
-// layer copy checked only the target's presence and ignored the entry's actions, so a
-// future system-namespace action or relaxed validation could have desynchronized the
-// startup guard from enforcement. It deliberately ignores principal scoping and
-// conditions: it answers "could this manifest grant sampling at all" — the
-// conservative (fail-closed for its single consumer) question the startup guard
-// needs, not a per-request decision.
+// HasSamplingGrant reports whether the manifest grants server-initiated sampling: a system:
+// target matching sampling/createMessage (via the same enforcement.MatchesResource matcher the
+// engine uses, for consistency, though system: targets reject glob metacharacters at load so in
+// practice only the exact target is loadable) whose actions permit it ("allow" or "*"). Applies
+// the SAME grant rule ManifestPDP.DecideSampling enforces at runtime, so the startup
+// HTTP-upstream sampling guard cannot drift from it. Ignores principal scoping and conditions
+// deliberately — it answers "could this manifest grant sampling at all", not a per-request one.
 func (m *LocalManifest) HasSamplingGrant() bool {
 	if m == nil {
 		return false

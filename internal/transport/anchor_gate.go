@@ -1,27 +1,13 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// The decision turn, keyed on the state ANCHOR rather than on the session.
+// The decision turn, keyed on the state ANCHOR (the validated task under task anchoring, else
+// the session) rather than on the session, so two sessions sharing a task share one turn
+// instead of racing each other's flow-label/antecedent/budget state.
 //
-// Serializing a session's decision phase closes the source->sink race within one connection
-// (see serialize.go). It is the wrong unit under WithTaskAnchoredState: the accumulated state
-// — the flow-label set, the antecedent history, the budgets — is keyed on the validated task
-// there, and two sessions can share one task. A per-session gate hands those two sessions
-// independent turns, so the serialization does not span the state it is serializing.
-//
-// This registry hands out ONE gate per anchor instead, so two sessions sharing a task share a
-// turn and the turn spans the key the state lives on. Under the default session anchoring the
-// key IS the session id, so the behavior is byte-for-byte what a per-session mutex gave — an
-// operator who has not enabled task anchoring cannot be affected by this.
-//
-// SCOPE, stated rather than implied: this is an in-PROCESS gate. Two eunox instances sharing
-// one Redis backend still hold independent turns for the same task, so the residual the
-// per-session gate had across sessions remains across INSTANCES. Closing that needs a
-// distributed lease on the decision path — a store round trip per declassifying call, held
-// across an upstream round trip — which is a different trade than this one and is recorded in
-// docs/threat-model-mcp.md rather than assumed away here. What bounds the damage in both
-// deployments is the decision-time intersection: the labels a clear may remove are resolved
-// inside the decision, so a taint acquired after that point cannot be laundered by it.
+// In-process only: two eunox instances on one Redis backend still hold independent turns for
+// the same task (see docs/threat-model-mcp.md); the decision-time label intersection bounds
+// the damage either way.
 
 package transport
 
@@ -35,46 +21,28 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
-// serializes reports whether this route runs its decisions under a turn — i.e. whether its
-// policy is flow- or sequenceBlock-relevant. It reads the gate registry's presence rather
-// than a parallel bool, so "serialized" and "has somewhere to serialize on" cannot disagree.
+// serializes reports whether this route decides under a turn. Reads the gate registry's
+// presence rather than a parallel bool so the two states cannot disagree.
 func (r *UpstreamRoute) serializes() bool { return r != nil && r.decideGates != nil }
 
-// decisionAnchor is the anchor this route serializes a request's decision on: the validated
-// task when the route anchors state on the task and the caller presented one, the session
-// otherwise.
+// decisionAnchor is the anchor a request's decision serializes on: the validated task when the
+// route anchors state on the task and the caller presented one, else the session.
 //
-// It resolves through enforcement.ResolveStateAnchor — the SAME function the engine's own key
-// builder resolves through — rather than re-deriving the fallback here. A turn taken on a key
-// the state does not live on is not serialization at all, and two independent readings of
-// "which anchor is this" is exactly where the gate and the key come to disagree, silently,
-// since nothing in the process ever compares them. The claim lookup likewise goes through
-// pdp.TaskAnchor, which reads the same claim through the same resolver the key builder uses,
-// so the two agree even about the cases that are NOT a task (a padded claim, a numeric one).
+// Resolves through enforcement.ResolveStateAnchor — the same function the engine's own key
+// builder uses — so the turn and the state key cannot silently come to disagree about which
+// anchor this is. Returns the resolved StateAnchor (not its rendered key) so a session caching
+// a gate can compare resolutions without rendering one.
 //
-// It returns the resolved enforcement.StateAnchor rather than its rendered key, because one
-// caller has to COMPARE two resolutions: a session caching a gate must be able to ask whether
-// this request resolves the anchor it cached, and a comparable two-string struct answers that
-// without rendering anything. Key() is applied where the registry is actually addressed.
-//
-// claims must be the VALIDATED claims — the transport's HTTP entry point verifies the bearer
-// token before dispatch and attaches them to the request context. Resolving this from an
-// unverified token would let a caller choose which turn it takes, and therefore choose not to
-// share one.
-//
-// The session fallback is exactly the engine's: a request with no token is anchored on its
-// session, and so is one whose token carries no task id (which the engine refuses outright
-// under task anchoring — a turn on the session is the right one for a call that is about to
-// be denied).
+// claims must be VALIDATED: resolving from an unverified token would let a caller choose which
+// turn it takes. The session fallback matches the engine's: no token, or a token with no task
+// id, anchors on the session.
 func (r *UpstreamRoute) decisionAnchor(sessionID string, claims *pdp.JWTClaims) enforcement.StateAnchor {
 	return resolveDecisionAnchor(r != nil && r.taskAnchored, claims, sessionID)
 }
 
-// resolveDecisionAnchor is the one place a transport turns (its anchoring setting, a request's
-// validated claims, a session id) into the turn's anchor. Both transports call it — a second
-// hand-rolled copy of the fallback branching is the shape this whole seam exists to remove,
-// and the engine's key builder resolving through enforcement.ResolveStateAnchor while a
-// transport re-derived it is precisely how the turn and the key would come to disagree.
+// resolveDecisionAnchor is the one place a transport turns its anchoring setting, a request's
+// claims, and a session id into the turn's anchor — both transports share it so the fallback
+// logic can't diverge from the engine's own key builder.
 func resolveDecisionAnchor(taskAnchored bool, claims *pdp.JWTClaims, sessionID string) enforcement.StateAnchor {
 	id, hasTask := "", false
 	if taskAnchored {
@@ -89,62 +57,43 @@ func (r *UpstreamRoute) decisionAnchorFromContext(ctx context.Context, sessionID
 	return r.decisionAnchor(sessionID, pdp.JWTClaimsPtr(ctx))
 }
 
-// anchorGates hands out one decision gate per anchor key, refcounted so an idle anchor holds
-// no memory. A gateway route serves an unbounded number of sessions over its lifetime, and a
-// map that only ever grew would be a slow leak keyed by session id.
+// anchorGates hands out one refcounted decision gate per anchor key, so an idle anchor holds
+// no memory on a long-lived gateway route serving an unbounded number of sessions.
 //
-// The map, the key, the refcount and the delete-at-zero are the shared keyedRegistry
-// (keyed_registry.go); this type is the TURN — a one-slot channel per anchor — and nothing
-// else. Its reclaim trigger is the plain one (no holders left), so it supplies no idle
-// predicate; stdio's FIFO, which must also outlive the tickets it handed out, supplies one.
+// The map/key/refcount machinery is the shared keyedRegistry (keyed_registry.go); this type is
+// only the TURN itself. Its reclaim trigger is the plain one (no holders left); stdio's FIFO,
+// which must also outlive the tickets it handed out, supplies its own.
 type anchorGates struct {
 	reg keyedRegistry[*anchorGate]
 }
 
-// anchorGate is one anchor's turn.
-//
-// The turn is a one-slot channel rather than a sync.Mutex because one caller has to be able to
-// GIVE UP: the server-initiated leg bounds its wait (see turnWait), and a mutex offers no
-// bounded acquire. A token in the channel means the turn is held; taking the turn is a send,
-// releasing it a receive.
-//
-// The embedded keyedEntry is the registry's bookkeeping (this gate's key and refcount), which
-// a holder can keep for a whole session and take turns on without going back through the map —
-// the registry round trip is what the per-request path pays, and a session-anchored route has
-// nothing to look up. The turn channel itself is guarded by nothing: a send/receive IS the
-// synchronization.
+// anchorGate is one anchor's turn: a one-slot channel rather than sync.Mutex because the
+// server-initiated leg must be able to GIVE UP on a bounded wait (see turnWait), which a mutex
+// cannot offer. The embedded keyedEntry lets a holder keep the gate across many turns without
+// a map lookup; the turn channel itself is guarded by nothing — a send/receive IS the sync.
 type anchorGate struct {
 	keyedEntry
 	turn chan struct{}
-	// handoffs counts how many times this turn has been TAKEN. A bounded waiter reads it to
-	// tell "the holder is stuck" from "the queue is moving": its window bounds one HOLDER, so
-	// it gives up only when the count has not changed across a whole window. An atomic rather
-	// than a field under the registry mutex, because the turn itself is guarded by nothing and
-	// taking a lock to observe it would be the only lock on this path.
+	// handoffs counts turns TAKEN, so a bounded waiter can tell "the holder is stuck" from "the
+	// queue is moving" (its window bounds one HOLDER). Atomic, not mutex-guarded, since the
+	// turn channel itself is guarded by nothing.
 	handoffs atomic.Uint64
 }
 
 // entry exposes this gate's registry bookkeeping (keyedRegistryValue).
 func (a *anchorGate) entry() *keyedEntry { return &a.keyedEntry }
 
-// newAnchorGates builds an empty registry. One per route: routes carry independent policies
-// and their own key namespace, so a task id shared by two routes addresses two different sets
-// of state and must not share a turn.
+// newAnchorGates builds an empty registry, one per route: a task id shared by two routes
+// addresses different state and must not share a turn.
 func newAnchorGates() *anchorGates {
 	g := &anchorGates{}
 	g.reg.init(func() *anchorGate { return &anchorGate{turn: make(chan struct{}, 1)} }, nil)
 	return g
 }
 
-// hold returns this anchor's gate with a reference taken, plus the func that drops it. The
-// gate stays in the registry until every holder has dropped, so a caller may keep one across
-// many turns. See keyedRegistry.hold for why holding one matters on the per-request path — a
-// session-anchored route resolves a CONSTANT anchor, while task-anchored routes still resolve
-// per request, because there the anchor genuinely varies per call and cross-session sharing is
-// the entire point.
-//
-// A nil registry yields a nil gate and a no-op drop, so a non-serialized route needs no branch
-// at the call site.
+// hold returns this anchor's gate with a reference taken, plus the func that drops it, so a
+// caller may keep one gate across many turns (see keyedRegistry.hold). A nil registry yields a
+// nil gate and a no-op drop, so a non-serialized route needs no branch.
 func (g *anchorGates) hold(key string) (gate *anchorGate, drop func()) {
 	if g == nil {
 		return nil, func() {}
@@ -152,17 +101,9 @@ func (g *anchorGates) hold(key string) (gate *anchorGate, drop func()) {
 	return g.reg.hold(key)
 }
 
-// acquire takes the turn for key under w's give-up rule (an unbounded w waits forever). It is
-// the per-request path: it holds a reference only for the length of the turn, which is what
-// keeps a route's gate map from growing one entry per anchor it has ever served.
-//
-// The registry lock is held only across the map operations, never across the turn itself —
-// otherwise one session's decision would block every other anchor's lookup. The gate is
-// leaf-level: nothing else is locked under it, so it cannot participate in a cycle, and a
-// request only ever holds one.
-//
-// A nil registry is a no-op returning a no-op release, so a non-serialized route needs no
-// branch at the call site.
+// acquire takes the turn for key under w's give-up rule, holding a registry reference only for
+// the turn's length so the map doesn't grow one entry per anchor ever served. The registry
+// lock covers only the map operation, never the turn itself. A nil registry is a no-op.
 func (g *anchorGates) acquire(key string, w turnWait) (end func(), ok bool) {
 	if g == nil {
 		return func() {}, true
@@ -177,31 +118,16 @@ func (g *anchorGates) acquire(key string, w turnWait) (end func(), ok bool) {
 		drop()
 		return nil, false
 	}
-	// Composed rather than wrapped in a third sync.OnceFunc: both halves are already
-	// idempotent, so a guard over them would only allocate a second Once for a property they
-	// each carry — on the path this file calls the microsecond decision path.
+	// Composed rather than wrapped in a sync.OnceFunc: both halves are already idempotent.
 	return func() { release(); drop() }, true
 }
 
-// take waits for this gate's turn and returns the idempotent release, or ok=false when w's
-// give-up rule fires first (an unbounded w waits forever). It touches no registry state: a
-// caller holding the gate across many turns (a session's cached gate) needs the turn and
-// nothing else.
+// take waits for this gate's turn under w's give-up rule and returns the idempotent release.
 //
-// The release is idempotent (sync.OnceFunc), matching decisionSerializer.begin: a handler
-// releases right after its decision and defers the same func as a backstop.
-//
-// The turn is re-checked on the give-up arm, which is what gives this leg the stdio twin's
-// turn-first guarantee (see decisionSerializer.beginWithin). A two-arm select over a free
-// turn and an expired timer resolves UNIFORMLY in Go, so a caller could be refused a turn
-// that was available at that instant — a hard turn_unavailable sampling denial for a decision
-// that could have run. The two legs are meant to answer identically; only this one lacked the
-// property.
-//
-// The window is per HOLDER, exactly as the stdio twin's is: an expiry that finds the handoff
-// count changed means this waiter was queued behind work that completed, not stalled by
-// anything, so it takes a fresh window — up to w.total, which is what keeps a moving queue from
-// meaning an unbounded wait. See turnWait.
+// The turn is re-checked on the give-up arm: Go's select resolves a free-turn-vs-expired-timer
+// race uniformly, so without the recheck a caller could be refused a turn that was in fact
+// available at that instant. The window is per HOLDER (see turnWait): an expiry that finds the
+// handoff count unchanged since it started means the holder is stuck, not that the queue moved.
 func (a *anchorGate) take(w turnWait) (end func(), ok bool) {
 	if a == nil {
 		return func() {}, true
@@ -238,16 +164,14 @@ func (a *anchorGate) take(w turnWait) (end func(), ok bool) {
 	}
 }
 
-// held records that this caller now holds the turn and returns the idempotent release. The
-// count is bumped on ACQUIRE rather than on release so a waiter that opened its window while
-// the turn was free (and saw it taken and handed back within one window) still observes the
-// change.
+// held records that this caller now holds the turn and returns the idempotent release. Bumped
+// on ACQUIRE (not release) so a waiter whose window opened while the turn was free still
+// observes a handoff that happened within it.
 func (a *anchorGate) held() func() {
 	a.handoffs.Add(1)
 	return sync.OnceFunc(func() { <-a.turn })
 }
 
-// size reports how many gates are live. Test-only: the refcounting is what keeps a long-lived
-// gateway from accumulating one entry per session it has ever served, and that is invisible
-// from the outside otherwise.
+// size reports how many gates are live. Test-only visibility into the refcounting that keeps a
+// long-lived gateway from accumulating one entry per session it has ever served.
 func (g *anchorGates) size() int { return g.reg.size() }

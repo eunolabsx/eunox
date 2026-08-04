@@ -27,17 +27,14 @@ import (
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
-// killControlURL builds the http://host:port/control/kill URL. net.JoinHostPort
-// brackets an IPv6 literal (--host ::1 → http://[::1]:3000/...); "%s:%d" would
-// emit the unparseable ::1:3000, leaving the endpoint unreachable over IPv6.
+// killControlURL builds the http://host:port/control/kill URL. net.JoinHostPort brackets
+// an IPv6 literal; "%s:%d" would emit the unparseable ::1:3000.
 func killControlURL(host string, port int) string {
 	return fmt.Sprintf("http://%s/control/kill", net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
-// cmdKill runs the `kill` subcommand and returns the process exit code (rather
-// than calling os.Exit itself), so tests can drive every branch. args carries
-// the subcommand's own arguments (os.Args[2:] in a real invocation), threaded
-// from run.
+// cmdKill runs the `kill` subcommand, returning the exit code (rather than calling
+// os.Exit) so tests can drive every branch.
 func cmdKill(args []string) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -92,11 +89,9 @@ Flags:
 	controlToken := fs.String("control-token", "", "Control token for the HTTP /control/kill endpoint. If empty, read from\nEUNOX_CONTROL_TOKEN or --control-token-path (default ~/.eunox/control.token),\nwhere the running proxy wrote it.")
 	controlTokenPath := fs.String("control-token-path", "", "Path to the control-token file the proxy wrote (default ~/.eunox/control.token).\nUsed when --control-token and EUNOX_CONTROL_TOKEN are unset.")
 
-	// Permit flags on either side of the positional: Go's flag package stops at the
-	// first non-flag token, so a plain fs.Parse would reject "eunox kill all --port 3001"
-	// (target first) while accepting "--port 3001 all" — a foot-gun on the emergency-stop
-	// path. parseFlagsAndPositionals (used by `validate` for the same reason) peels the
-	// positional and re-parses the rest, so order does not matter.
+	// Go's flag package stops at the first non-flag token, so a plain fs.Parse would reject
+	// "eunox kill all --port 3001" while accepting "--port 3001 all" — a foot-gun on the
+	// emergency-stop path. parseFlagsAndPositionals makes order not matter.
 	pos, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -109,21 +104,16 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
 		return 1
 	}
-	// The agent dimension is Redis-only. /control/kill has no agent concept, and giving
-	// it one would widen what a same-host process holding the control token can reach —
-	// the same reasoning that keeps --revive off that transport. Checked here, before the
-	// transport split below, so the rejection does not depend on which branch runs.
+	// The agent dimension is Redis-only: giving /control/kill an agent concept would widen
+	// what a same-host process holding the control token can reach.
 	if target.kind == killTargetAgent && *redisAddr == "" {
 		fmt.Fprintf(os.Stderr, "eunox kill: --agent requires --redis-addr; the HTTP control endpoint has no agent dimension, and an in-memory kill switch is cleared by restarting the proxy\n")
 		return 1
 	}
 
-	// Redis transport: write the kill directly to the shared kill-switch state —
-	// the only revocation path for a stdio proxy launched with --redis-addr, which
-	// has no HTTP /control/kill endpoint. Reject a mix of Redis and HTTP-transport
-	// flags rather than silently picking one transport and ignoring flags meant
-	// for the other, matching the package's fail-loud posture on conflicting flags
-	// elsewhere (e.g. cmdProxy's --audit/--config check).
+	// Redis transport: the only revocation path for a stdio proxy, which has no HTTP
+	// /control/kill endpoint. Reject a mix of Redis and HTTP-transport flags rather than
+	// silently picking one and ignoring flags meant for the other.
 	if *redisAddr != "" {
 		return runRedisKillTransport(fs, redisKillRequest{
 			addr:           *redisAddr,
@@ -141,13 +131,9 @@ Flags:
 			return 1
 		}
 	}
-	// Revocation is undone where the kill-switch state actually lives. The HTTP
-	// /control/kill endpoint is deliberately a one-way emergency stop -- a same-host
-	// process that reaches it holding the control token can already halt the proxy, and
-	// giving that same reach an undo would let it lift the very revocation issued
-	// against it. Without --redis-addr the state is also in-memory and process-local, so
-	// restarting the proxy clears it. Reject rather than fall through to a kill: a flag
-	// that inverts the verb must never be silently dropped on the emergency-stop path.
+	// The HTTP /control/kill endpoint is deliberately a one-way emergency stop: a same-host
+	// process holding the control token could otherwise lift the very revocation it issued.
+	// Reject rather than silently drop the flag on the emergency-stop path.
 	if *revive {
 		fmt.Fprintf(os.Stderr, "eunox kill: --revive requires --redis-addr; the HTTP control endpoint has no revive, and an in-memory kill switch is cleared by restarting the proxy\n")
 		return 1
@@ -155,31 +141,21 @@ Flags:
 	return killViaControlEndpoint(*host, *port, *controlToken, *controlTokenPath, target)
 }
 
-// runRedisKillTransport handles the --redis-addr branch of `eunox kill`: it rejects the
-// flag combinations that would be silently dropped on this transport, then performs the
-// write. Split out of cmdKill so the subcommand's body stays the flag surface plus a
-// two-way transport choice; the rejection rules are the part that grows with every new
-// dimension, and they are easier to review as one block than interleaved with parsing.
+// runRedisKillTransport handles the --redis-addr branch of `eunox kill`: rejects flag
+// combinations that would be silently dropped on this transport, then performs the write.
+// Split out of cmdKill so the growing rejection rules are one block to review.
 func runRedisKillTransport(fs *flag.FlagSet, req redisKillRequest) int {
-	// Reject a mix of Redis and HTTP-transport flags rather than silently picking one
-	// transport and ignoring flags meant for the other, matching the package's fail-loud
-	// posture on conflicting flags elsewhere (e.g. cmdProxy's --audit/--config check).
 	for _, name := range []string{"port", "host", "control-token", "control-token-path"} {
-		// flagWasSet reports only flags the operator actually passed (unlike comparing
-		// against defaults, which cannot distinguish an explicit --port=3000 from the
-		// unset default), so it detects a flag mix that would otherwise be silently
-		// dropped.
+		// flagWasSet reports only flags actually passed, distinguishing an explicit
+		// --port=3000 from the unset default.
 		if flagWasSet(fs, name) {
 			fmt.Fprintf(os.Stderr, "eunox kill: --%s is an HTTP-transport flag and has no effect with --redis-addr set; remove --%s or drop --redis-addr\n", name, name)
 			return 1
 		}
 	}
 	// A tombstone lifetime is meaningless where no tombstone is written: --revive deletes
-	// one instead of creating it, "all" activates the global switch, which carries no
-	// per-session expiry at all (setBlock only reads sessionKillTTL on its kill&&session
-	// path -- see pkg/killswitch/redis.go), and an agent kill is permanent by design.
-	// Accepting the flag silently in any of the three would suggest it did something it
-	// didn't.
+	// rather than creates one, "all" carries no per-session expiry, and an agent kill is
+	// permanent. Accepting the flag silently in any case would suggest it did something.
 	if req.ttlFlagSet {
 		switch {
 		case req.revive:
@@ -200,22 +176,19 @@ func runRedisKillTransport(fs *flag.FlagSet, req redisKillRequest) int {
 	return 0
 }
 
-// killViaControlEndpoint POSTs the kill to a running HTTP proxy's loopback
-// /control/kill endpoint and returns the process exit code. Kill-only: the endpoint is
-// a one-way emergency stop (see the --revive rejection in cmdKill), and session-or-global
-// only — the agent dimension is rejected before this is reached.
+// killViaControlEndpoint POSTs the kill to a running HTTP proxy's loopback /control/kill
+// endpoint. Kill-only and session-or-global only — --revive and the agent dimension are
+// rejected before this is reached.
 func killViaControlEndpoint(host string, port int, controlToken, controlTokenPath string, target killTarget) int {
 	var body map[string]interface{}
 	if target.kind == killTargetGlobal {
 		body = map[string]interface{}{"all": true}
 	} else {
-		// A session id, including the literal "all" reached via --session all: the
-		// endpoint distinguishes the two dimensions by KEY, not by the id's spelling, so
-		// {"sessionId":"all"} is unambiguous where the positional alone is not.
+		// The endpoint distinguishes the two dimensions by KEY, not by the id's spelling,
+		// so {"sessionId":"all"} (via --session all) is unambiguous.
 		body = map[string]interface{}{"sessionId": target.id}
 	}
 
-	// Resolve the control token the proxy requires on /control/kill.
 	tok, err := transport.ResolveControlToken(controlToken, controlTokenPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
@@ -224,11 +197,8 @@ func killViaControlEndpoint(host string, port int, controlToken, controlTokenPat
 
 	data, _ := json.Marshal(body)
 	killURL := killControlURL(host, port)
-	// Bound the request: kill is the emergency-stop path, often invoked exactly
-	// when the proxy is wedged (accept loop alive, handlers stuck) or the port is
-	// blackholed. http.DefaultClient has no timeout, so an unbounded Do would hang
-	// with no output and leave the operator unsure whether revocation landed. The
-	// sibling Redis path is already bounded at 10s; match it here.
+	// Bound the request: kill is often invoked exactly when the proxy is wedged, and
+	// http.DefaultClient has no timeout of its own. Matches the Redis path's 10s.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, killURL, bytes.NewReader(data)) //nolint:gosec // G107: URL constructed from user-specified --host/--port flags; one-shot CLI request
@@ -253,29 +223,20 @@ func killViaControlEndpoint(host string, port int, controlToken, controlTokenPat
 	return 0
 }
 
-// killTargetAll is the positional that addresses the whole deployment rather than one
-// session: it activates the global kill switch, and with --revive deactivates it.
-//
-// This overloading of the id space is why --session exists. A session id is
-// operator-settable on a stdio proxy, so one can literally be "all", and a positional
-// cannot express the difference — `--session all` is the escape hatch.
+// killTargetAll is the positional that activates the global kill switch rather than one
+// session. This overloads the id space, which is why --session exists: a session id is
+// operator-settable and can literally be "all", so `--session all` is the escape hatch.
 const killTargetAll = "all"
 
-// killTargetKind names which of the three kill dimensions an invocation addresses. They
-// are genuinely separate stores, not spellings of one: a global stop is a single flag, a
-// session kill is a tombstone with a lifetime, and an agent kill is permanent. Making the
-// dimension an explicit field rather than inferring it from the id's spelling is what
-// lets "all" mean a session id when the operator says so.
+// killTargetKind names which of the three kill dimensions an invocation addresses — genuinely
+// separate stores (a global flag, a session tombstone, a permanent agent kill), not spellings
+// of one, so a dimension is never inferred from the id's spelling.
 type killTargetKind int
 
 const (
-	// killTargetUnset is the ZERO value, and is never a valid target. It is first on
-	// purpose: with the global switch in this slot, a killTarget nobody filled in — the
-	// value returned alongside every resolveKillTarget error, or a redisKillRequest
-	// literal that omits the field — would mean "halt the entire deployment". The most
-	// destructive dimension must not be what you get by writing nothing, least of all on
-	// the emergency-stop path. Every consumer rejects this kind explicitly rather than
-	// letting it fall through a default arm.
+	// killTargetUnset is the zero value and never valid. It's first on purpose: if it sat
+	// in the global slot, a killTarget nobody filled in would mean "halt the deployment" —
+	// the most destructive dimension must not be what you get by writing nothing.
 	killTargetUnset killTargetKind = iota
 	// killTargetGlobal is the deployment-wide switch. It carries no id.
 	killTargetGlobal
@@ -291,13 +252,9 @@ type killTarget struct {
 	id string
 }
 
-// dimension renders the target's kind for the machine-readable result line. Once two id
-// dimensions exist, {"ok":true,"killed":"x"} alone is ambiguous — an operator (or a
-// script) cannot tell which store moved.
-// Every arm is explicit and the default fails loudly rather than inventing a plausible
-// value: an unmapped kind that rendered as "global" while the switches below performed a
-// session write would put a wrong dimension on the one line an operator reads to confirm
-// what an emergency stop actually did.
+// dimension renders the target's kind for the machine-readable result line — with two id
+// dimensions in play, {"ok":true,"killed":"x"} alone can't tell a script which store moved.
+// Every arm is explicit and the default fails loudly rather than inventing a plausible value.
 func (t killTarget) dimension() string {
 	switch t.kind {
 	case killTargetAgent:
@@ -313,26 +270,17 @@ func (t killTarget) dimension() string {
 	}
 }
 
-// resolveKillTarget turns the positional argument and the two targeting flags into
-// exactly one target, or an error naming what to drop.
-//
-// Exactly one of the three must be supplied. Accepting more than one and picking a
-// precedence would mean an operator on the emergency-stop path can type two targets and
-// have one silently ignored — the same fail-loud posture the transport-flag checks in
-// cmdKill already take.
-// sessionSet/agentSet report whether the operator actually PASSED each flag, rather than
-// whether its value is non-empty. `--session "$SID"` with SID unset is a supplied target
-// whose id happens to be empty, not an absent one: counting it as absent would silently
-// drop a target the operator typed (and, with a positional also present, resolve to the
-// other one) — the very outcome the exactly-one rule exists to prevent. An explicitly
-// empty id instead reaches the store's own empty-id guard and fails with a precise error.
+// resolveKillTarget turns the positional argument and the two targeting flags into exactly
+// one target, or an error naming what to drop — accepting more than one and picking a
+// precedence would let an operator type two targets and have one silently ignored.
+// sessionSet/agentSet report whether the flag was actually PASSED, not whether its value is
+// non-empty: `--session "$SID"` with SID unset is a supplied target with an empty id, not an
+// absent one, and must not silently fall through to the positional or a default.
 func resolveKillTarget(pos []string, sessionFlag string, sessionSet bool, agentFlag string, agentSet bool) (killTarget, error) {
 	if len(pos) > 1 {
 		return killTarget{}, fmt.Errorf("expected exactly one argument: <session-id|all>")
 	}
-	// Build the candidate list once, so the count and the selection cannot disagree: a
-	// fourth dimension added later is one append plus one arm, not a counter that can
-	// drift from the arms it guards.
+	// Build the candidate list once, so the count and the selection cannot disagree.
 	var found []killTarget
 	if len(pos) == 1 {
 		if pos[0] == killTargetAll {
@@ -343,7 +291,7 @@ func resolveKillTarget(pos []string, sessionFlag string, sessionSet bool, agentF
 	}
 	if sessionSet {
 		// No killTargetAll special case on purpose: --session addresses a session id
-		// verbatim, which is what makes it the escape hatch for one named "all".
+		// verbatim — the escape hatch for one literally named "all".
 		found = append(found, killTarget{kind: killTargetSession, id: sessionFlag})
 	}
 	if agentSet {
@@ -359,12 +307,9 @@ func resolveKillTarget(pos []string, sessionFlag string, sessionSet bool, agentF
 	}
 }
 
-// redisKillRequest is one resolved `eunox kill --redis-addr` invocation. The fields are
-// named rather than positional because several are same-typed knobs whose transposition
-// would be silent — swapping the two booleans would invert the verb, and the TTL pair
-// only means anything read together. The target carries its own dimension as a typed
-// field for the same reason: with three dimensions in play, a bare id string is a value
-// whose meaning depends on a convention the struct does not state.
+// redisKillRequest is one resolved `eunox kill --redis-addr` invocation. Fields are named
+// rather than positional since several are same-typed knobs whose transposition would be
+// silent (swapping the two booleans inverts the verb).
 type redisKillRequest struct {
 	addr     string
 	password string
@@ -373,21 +318,16 @@ type redisKillRequest struct {
 	target killTarget
 	// revive inverts the operation: lift the revocation instead of issuing it.
 	revive bool
-	// sessionKillTTL is the --killswitch-session-ttl flag in its operator-facing form
-	// (0 = default, negative = never expire), and ttlFlagSet records whether the
-	// operator actually passed it — the two are only meaningful together, since 0 is
-	// both the unset default and a legitimate explicit value.
+	// sessionKillTTL is --killswitch-session-ttl (0=default, negative=never expire);
+	// ttlFlagSet records whether it was actually passed, since 0 is also the unset default.
 	sessionKillTTL time.Duration
 	ttlFlagSet     bool
 }
 
 // runRedisKill writes a kill (or, with revive, its undo) directly to the shared Redis
-// kill-switch state, matching the HTTP /control/kill semantics: "all" activates the
-// global switch; any other value kills that session. The Set is durable; live
-// subscribers are notified via pub/sub, and any instance that missed the at-most-once
-// message converges on its next reconcile tick. The only out-of-band revocation channel
-// for a stdio proxy — and, with revive, the only way to lift a revocation without
-// hand-deleting keys in redis-cli.
+// kill-switch state, matching /control/kill semantics. The Set is durable; live subscribers
+// are notified via pub/sub, and any instance that misses the message converges on its next
+// reconcile tick.
 func runRedisKill(req redisKillRequest) error {
 	rdb, err := buildRedisClient(req.addr, req.password, req.useTLS)
 	if err != nil {
@@ -401,19 +341,12 @@ func runRedisKill(req redisKillRequest) error {
 		return err
 	}
 
-	// The tombstone's TTL is stamped by whichever process WRITES the key, so it is
-	// resolved only on the path that writes one: a global kill carries no expiry, an
-	// agent kill never expires, and a revive deletes rather than writes.
+	// The TTL is resolved only on the path that actually writes a tombstone: a global kill
+	// carries no expiry, an agent kill never expires, and a revive deletes rather than writes.
 	var opts []killswitch.RedisOption
 	if !req.revive && req.target.kind == killTargetSession {
-		// The published-TTL lookup gets its own, shorter budget carved out of the outer
-		// 10s: it is a coordination nicety, not the kill itself, and if it shared the
-		// full context a slow-but-not-down Redis could let the lookup consume most of
-		// the budget before the actual write below ever runs — turning a kill that
-		// would have succeeded pre-lookup into a timeout. On expiry
-		// ReadPublishedSessionKillTTL returns a context error, which resolveSessionKillTTL
-		// already treats like any other read failure: fall back to the local value and
-		// warn, never block the write.
+		// A shorter budget carved out of the outer 10s: a slow-but-not-down Redis could
+		// otherwise let this coordination lookup consume the budget the actual write needs.
 		ttlCtx, ttlCancel := context.WithTimeout(ctx, sessionKillTTLLookupTimeout)
 		effective := resolveSessionKillTTL(ttlCtx, rdb, req.sessionKillTTL, req.ttlFlagSet)
 		ttlCancel()
@@ -436,26 +369,18 @@ func runRedisKill(req redisKillRequest) error {
 		}
 		printRedisResult("killed", req.target)
 	case killTargetAgent:
-		// Agent kills never expire. That is deliberate — an identity revoked for cause
-		// should not be re-admitted by a clock — and it is why --revive --agent ships in
-		// the same change: a permanent revocation primitive with no undo is the asymmetry
-		// this dimension exists to avoid repeating.
+		// Agent kills never expire — an identity revoked for cause should not be
+		// re-admitted by a clock.
 		if err := ks.KillAgent(ctx, req.target.id); err != nil {
 			return fmt.Errorf("kill agent %q: %w", req.target.id, err)
 		}
 		printRedisResult("killed", req.target)
-		// An agent kill lands in Redis whatever the proxy is running, but it is only
-		// CONSULTED where the proxy has a JWT identity to match it against: a stdio proxy
-		// has no HTTP listener and so cannot take --jwks-uri at all, and an HTTP proxy
-		// without it never populates an agent id either. Reporting a clean success while
-		// the revocation is inert is the failure this warning exists to prevent -- the
-		// operator has to know to check, since this command cannot see how the proxy was
-		// started.
+		// The kill is only CONSULTED where the proxy validates JWTs (--jwks-uri, HTTP);
+		// a stdio proxy or one without it will not match it, so warn since this command
+		// can't see how the proxy was started.
 		fmt.Fprintf(os.Stderr, "eunox kill: the agent kill is written, but a proxy only consults agent identity when it validates JWTs (--jwks-uri, HTTP transport). A stdio proxy, or an HTTP proxy without --jwks-uri, will not match it -- kill the session ids instead there.\n")
 	default:
-		// Fail closed on a kind no arm handles rather than defaulting to a session write:
-		// a dimension added to the enum without updating this switch would otherwise
-		// revoke the wrong store while reporting success.
+		// Fail closed on a kind no arm handles rather than defaulting to a session write.
 		return fmt.Errorf("internal: unhandled kill target kind %d (%s); refusing to guess which kill dimension was meant", req.target.kind, req.target.dimension())
 	}
 	return nil
@@ -465,28 +390,13 @@ func runRedisKill(req redisKillRequest) error {
 // 10s budget; see the call site for why it must be shorter than the outer context.
 const sessionKillTTLLookupTimeout = 3 * time.Second
 
-// reviveViaRedis lifts a revocation: for the global target it deactivates the switch (the
-// exact inverse of `kill all`), and otherwise removes one session's tombstone or one
-// agent's kill.
-//
-// Deactivating the global switch deliberately leaves per-session and per-agent kills in
-// place — the three are separate kill dimensions, and clearing entities an operator
-// revoked individually while they only meant to lift the deployment-wide stop would be a
-// fail-open. Those are revived one id at a time.
-//
-// That same reasoning is why there is no `--reset`. The kill switch's Reset clears the
-// global flag, every agent kill, and every session tombstone in one call, which is this
-// same fail-open with a wider radius; a confirmation prompt in front of it is not a
-// design. If clearing many stale session tombstones ever becomes a real operational pain,
-// the shape to build is a session-SCOPED sweep backed by a SCAN over the session-kill
-// prefix — never Reset, whose blast radius crosses dimensions the operator did not name.
-//
-// Takes the concrete *killswitch.Redis rather than the killswitch.Manager interface on
-// purpose: the "revive is reachable only via the Redis transport" invariant this PR's
-// other checks enforce at the CLI-flag layer (cmdKill's --redis-addr gate above) should
-// also hold structurally, so a future refactor cannot reuse this helper against an
-// in-memory or HTTP-proxy-held Manager and silently reintroduce an undo on the loopback
-// /control/kill path — which must never exist (see the --revive rejection in cmdKill).
+// reviveViaRedis lifts a revocation: deactivates the global switch, or removes one session's
+// tombstone or one agent's kill. Deactivating the global switch deliberately leaves
+// per-session/per-agent kills in place — clearing entities an operator revoked individually
+// while only meaning to lift the deployment-wide stop would be a fail-open (same reason
+// there is no `--reset`). Takes the concrete *killswitch.Redis, not the Manager interface, so
+// "revive is Redis-only" holds structurally and can't be reused against an in-memory or
+// HTTP-proxy-held Manager to reintroduce an undo on the loopback /control/kill path.
 func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget) error {
 	switch target.kind {
 	case killTargetGlobal:
@@ -496,17 +406,14 @@ func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget
 		printRedisResultWithNote("revived", target,
 			"per-session and per-agent kills are unaffected; revive those by id")
 	case killTargetAgent:
-		// The undo for a kill that never expires. Without it an agent revocation would be
-		// remediable only by a library call or a hand-written redis-cli DEL.
+		// The undo for a kill that never expires otherwise.
 		if err := ks.ReviveAgent(ctx, target.id); err != nil {
 			return fmt.Errorf("revive agent %q: %w", target.id, err)
 		}
 		printRedisResult("revived", target)
 	case killTargetSession:
-		// ReviveSession is idempotent: an id that was never killed (or whose tombstone
-		// already expired) deletes nothing and still succeeds, so the command is safe to
-		// re-run and reports the state the operator asked for either way. ReviveAgent
-		// above behaves the same way.
+		// Idempotent: an id never killed (or already expired) deletes nothing and still
+		// succeeds, so the command is safe to re-run.
 		if err := ks.ReviveSession(ctx, target.id); err != nil {
 			return fmt.Errorf("revive session %q: %w", target.id, err)
 		}
@@ -518,13 +425,8 @@ func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget
 	return nil
 }
 
-// printRedisResult writes the {"ok":true,"<verb>":<id>,"dimension":...,"via":"redis"}
-// line the Redis transport reports on success, marshaled rather than formatted so an id
-// carrying a quote or backslash cannot break the JSON a caller parses.
-//
-// The dimension is carried explicitly because the id alone no longer identifies what
-// moved: the same string can name a session or an agent, and a script reacting to the
-// output needs to know which store it just changed.
+// printRedisResult writes the {"ok":true,"<verb>":<id>,"dimension":...,"via":"redis"} line,
+// marshaled rather than formatted so an id carrying a quote can't break the JSON.
 func printRedisResult(verb string, target killTarget) {
 	printRedisResultWithNote(verb, target, "")
 }
@@ -532,10 +434,8 @@ func printRedisResult(verb string, target killTarget) {
 // printRedisResultWithNote is printRedisResult plus an operator-facing note, used where
 // the result needs a caveat about what it deliberately did NOT do.
 func printRedisResultWithNote(verb string, target killTarget, note string) {
-	// The global switch addresses no individual entity, so killTarget carries no id for
-	// it (see the field's doc). Deriving the reported "all" here rather than having each
-	// global call site hand-build a killTarget that violates that invariant keeps one
-	// spelling of the global target in the program.
+	// killTarget carries no id for the global switch; derive "all" here rather than have
+	// each call site hand-build a killTarget that violates that invariant.
 	id := target.id
 	if target.kind == killTargetGlobal {
 		id = killTargetAll
@@ -549,21 +449,9 @@ func printRedisResultWithNote(verb string, target killTarget, note string) {
 }
 
 // resolveSessionKillTTL decides the lifetime this session tombstone is written with,
-// preferring the value the proxy published to Redis at startup over this command's own
-// flag. Takes only the two fields of redisKillRequest it actually reads (rather than the
-// whole struct) so a reader of the signature does not have to check the body to learn
-// this is independent of target/revive/addr/password/useTLS.
-//
-// The TTL is applied by whichever process writes the tombstone, and this command is one
-// of the two writers — the only out-of-band revocation channel a stdio proxy has. As two
-// independent flags they could disagree with no diagnostic, and the failure runs one
-// way: an expiring tombstone LIFTS the kill, re-admitting a session an operator revoked.
-// Adopting the published value removes the disagreement entirely for the common case
-// (no flag passed here at all). Where the two still disagree, the conflict itself is
-// resolved by killswitch.ResolveSessionKillTTLConflict — the exported decision policy, so
-// a future non-CLI writer of tombstones can reuse it rather than re-derive the direction.
-// Every fallback is announced on stderr so the resolved lifetime is never silent, and
-// stdout stays the machine-readable result line.
+// preferring the proxy's published Redis value over the local flag — an expiring tombstone
+// LIFTS the kill, so a silent disagreement re-admits a session an operator revoked. Every
+// fallback is announced on stderr; stdout stays the machine-readable result line.
 func resolveSessionKillTTL(ctx context.Context, rdb goredis.Cmdable, sessionKillTTL time.Duration, ttlFlagSet bool) time.Duration {
 	local := killswitch.NormalizeSessionKillTTL(sessionKillTTL)
 	published, ok, err := killswitch.ReadPublishedSessionKillTTL(ctx, rdb)
@@ -579,14 +467,10 @@ func resolveSessionKillTTL(ctx context.Context, rdb goredis.Cmdable, sessionKill
 		}
 		return local
 	case !ttlFlagSet:
-		// Deliberately adopts the published value OUTRIGHT, without the longerTombstone
-		// safe-direction policy the flag-set branch below applies. The asymmetry reads
-		// like an oversight and is not: flooring this branch at the local default would
-		// make the publish inert for a proxy configured deliberately SHORTER than the
-		// default, and would print a mismatch line on every kill against one when nothing
-		// is misconfigured. The published value is only trusted here because a stale one
-		// cannot survive — the key carries an expiry the running proxy refreshes, so a
-		// value that is readable at all belongs to a proxy that is running now.
+		// Adopts the published value OUTRIGHT (no longer-wins comparison): flooring at the
+		// local default would make the publish inert for a proxy configured deliberately
+		// shorter. Trusted because a stale value can't survive — the key's own expiry is
+		// refreshed by the running proxy.
 		fmt.Fprintf(os.Stderr, "eunox kill: session-kill TTL %s (published by the proxy on this Redis).\n", killswitch.DescribeSessionKillTTL(published))
 		return published
 	default:

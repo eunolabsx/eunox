@@ -16,16 +16,14 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// patternCache memoizes compiled regexps keyed by source pattern. argumentSchema
-// patterns are static (manifest-loaded, never JWT-supplied), so the map is bounded
-// and never sees attacker input; caching removes a regexp.Compile from the
-// per-request hot path.
+// patternCache memoizes compiled regexps keyed by source pattern. Patterns are static
+// (manifest-loaded, never JWT-supplied), so the map is bounded and never sees attacker
+// input; caching removes a regexp.Compile from the per-request hot path.
 var patternCache sync.Map // map[string]*regexp.Regexp
 
-// compilePattern returns the compiled form of pattern, memoizing successful
-// compilations in patternCache. A pattern that fails to compile is not cached
-// (it is rejected at manifest load by CompileSchemaPatterns, so the enforcement
-// path never sees one; the error is still returned here for direct callers).
+// compilePattern returns the compiled form of pattern, memoizing successful compilations.
+// A pattern that fails to compile is not cached — CompileSchemaPatterns rejects it at
+// manifest load, so the enforcement path never sees one.
 func compilePattern(pattern string) (*regexp.Regexp, error) {
 	if v, ok := patternCache.Load(pattern); ok {
 		return v.(*regexp.Regexp), nil
@@ -39,15 +37,10 @@ func compilePattern(pattern string) (*regexp.Regexp, error) {
 	return actual.(*regexp.Regexp), nil
 }
 
-// CompileSchemaPatterns walks an argument schema tree and compiles every `pattern`
-// it carries, at manifest load time: a malformed pattern is rejected up front
-// rather than as a per-request denial, and each valid one is primed into
-// patternCache so the hot path is a cache hit. Returns the first error in
-// deterministic order.
-//
-// schemaPath roots the error message (e.g. "capabilities[0].argumentSchema");
-// nested subschemas extend it with ".properties.<name>" and ".items" to match the
-// load-time keyword validator. A nil schema is a no-op.
+// CompileSchemaPatterns walks an argument schema tree and compiles every `pattern` at
+// manifest load time, so a malformed pattern is rejected up front and each valid one is
+// primed into patternCache for a hot-path cache hit. Returns the first error in
+// deterministic order. A nil schema is a no-op.
 func CompileSchemaPatterns(schemaPath string, schema *capability.ArgumentSchema) error {
 	return compileSchemaPatterns(schemaPath, schema)
 }
@@ -99,32 +92,20 @@ func schemaValidateValue(jsonPath string, val interface{}, schema *capability.Ar
 		return nil
 	}
 
-	// Unwrap a NAMED scalar type (type Path string, type Port int) to its predeclared
-	// underlying type before anything inspects the value. Such a value is not assignable
-	// to interface{}.(string) / .(int), so it matches no arm of the type switches that
-	// follow — enum's DeepEqual, schemaCheckType's schemaJSONTypeOf, toFloat64's
-	// coercion, and the keyword dispatch all miss it. Under a TYPELESS schema that means
-	// every declared pattern/minLength/maxLength/minimum/maximum is silently skipped, a
-	// fail-open. Only a direct (library) caller of the exported ValidateArgumentSchema
-	// can produce one: the proxy's own JSON path yields stdlib decode types exclusively.
-	// Named COMPOSITES (a named slice or map) are normalized further down by
-	// schemaValidateNativeComposite, which needs the schema in hand.
+	// Unwrap a NAMED scalar type (type Path string) to its predeclared underlying type: it
+	// is not assignable to interface{}.(string), so it matches no type-switch arm below,
+	// silently skipping every declared keyword (fail-open) under a typeless schema. Only a
+	// direct library caller can produce one. Named composites are normalized further down.
 	val = unwrapNamedScalar(val)
 
-	// The enum check runs before the FLOAT COERCION below so a json.Number is compared
-	// at full int64 precision by numericEqual; flattening to float64 first (as the
-	// keyword checks require) would round an integer above 2^53 into a different enum
-	// entry. unwrapNamedScalar above is not that coercion — it preserves json.Number
-	// untouched and only removes a named type's wrapper, keeping the value identical.
+	// Runs before the FLOAT COERCION below so a json.Number is compared at full int64
+	// precision; flattening to float64 first would round an integer above 2^53 into a
+	// different enum entry.
 	if len(schema.Enum) > 0 {
 		matched := false
 		for _, allowed := range schema.Enum {
-			// Unwrap the ENTRY as well as the argument. reflect.DeepEqual is
-			// type-identity-sensitive, so unwrapping only one side would break a match that
-			// held before: an embedder writing `Enum: []interface{}{Path("/srv/a")}` against
-			// an argument of the same named type matched by identity, and numericEqual
-			// cannot rescue it (its toFloat64 is a concrete type switch a named type does
-			// not satisfy). Unwrapping both compares by value, which is what an enum means.
+			// Unwrap the ENTRY too: DeepEqual is type-identity-sensitive, so unwrapping only
+			// the argument would break a match against a named-type enum entry.
 			allowed = unwrapNamedScalar(allowed)
 			// numericEqual bridges bare-int enum values and json.Number/float64
 			// request arguments, matching EvaluateAllowedValues.
@@ -140,34 +121,27 @@ func schemaValidateValue(jsonPath string, val interface{}, schema *capability.Ar
 		// below: in JSON Schema enum and type are independent and must all hold.
 	}
 
-	// The un-coerced argument is retained so schemaValidateNumber can compare an
-	// integral value against an integral minimum/maximum at full int64 precision
-	// rather than the rounded float64 below (an integer >= 2^53 rounds during
-	// coercion and would otherwise slip past a bound it actually exceeds).
+	// Retained un-coerced so schemaValidateNumber can compare an integral value against
+	// an integral minimum/maximum at full int64 precision rather than the rounded float64
+	// below (an integer >= 2^53 would otherwise slip past a bound it exceeds).
 	original := val
 
-	// Normalize a non-float64 numeric argument to float64 — the type the number
-	// keyword checks, schemaCheckType, and the type switch below expect. A
-	// json.Number or a programmatic bare int/uint/float32 would otherwise match no
-	// case and silently pass minimum/maximum/type (a fail-open). The enum check
-	// above deliberately precedes this so large integers keep full precision.
+	// Normalize a non-float64 numeric to float64: without this a json.Number or bare
+	// int/uint/float32 matches no type-switch arm and silently passes minimum/maximum/type.
 	if _, isFloat := val.(float64); !isFloat {
 		if f, ok := toFloat64(val); ok {
 			val = f
 		}
 	}
 
-	// Fail closed on a json.Number whose magnitude overflows float64 (e.g. 1e400):
-	// it survives the coercion above and, not being a type-switch arm below, would
-	// fall through to "return nil" and silently bypass minimum/maximum.
+	// Fail closed on a json.Number whose magnitude overflows float64 (e.g. 1e400): it
+	// would otherwise fall through to "return nil", bypassing minimum/maximum.
 	if n, isNum := val.(json.Number); isNum {
 		return fmt.Errorf("%s: numeric value %q out of representable range", jsonPath, n.String())
 	}
 
-	// Fail closed on a non-finite float. strconv.ParseFloat (and therefore toFloat64)
-	// accepts "NaN"/"Inf"/"Infinity", so a programmatic or relaxed-decoder argument
-	// can coerce to NaN, which satisfies neither v < min nor v > max and would bypass
-	// both bounds. Reject every non-finite value uniformly, like the overflow guard.
+	// Fail closed on a non-finite float (toFloat64 accepts "NaN"/"Inf"), which would
+	// otherwise satisfy neither v < min nor v > max and bypass both bounds.
 	if f, ok := val.(float64); ok && (math.IsNaN(f) || math.IsInf(f, 0)) {
 		return fmt.Errorf("%s: non-finite numeric value", jsonPath)
 	}
@@ -193,26 +167,17 @@ func schemaValidateValue(jsonPath string, val interface{}, schema *capability.Ar
 		// Booleans and JSON null carry no length/range keyword to enforce.
 		return nil
 	default:
-		// A value that is none of the JSON-decoded shapes above is something only a
-		// direct (library) caller of the exported ValidateArgumentSchema can hand-build
-		// — e.g. a native []string / []int / map[string]int. Without this arm it would
-		// fall through and silently pass declared items/minItems/maxItems (and object)
-		// keywords (a fail-open); normalize and route it through the same validators the
-		// JSON shape uses so the restriction is enforced.
+		// A value that is none of the JSON-decoded shapes above (a native []string,
+		// []int, map[string]int from a direct library caller) would otherwise silently
+		// pass declared items/minItems/maxItems keywords (fail-open).
 		return schemaValidateNativeComposite(jsonPath, val, schema)
 	}
 }
 
-// schemaValidateNativeComposite normalizes a Go value that is none of the
-// JSON-decoded types schemaValidateValue's type switch models — the native
-// composites a direct ValidateArgumentSchema caller can pass (e.g. []string, []int,
-// map[string]int) — and routes it through the array/object validators so its
-// items/minItems/maxItems (or object) keywords are enforced rather than silently
-// skipped. A slice/array becomes []interface{}; a string-keyed map becomes
-// map[string]interface{}. A non-string map key cannot model a JSON object, so it
-// fails closed. Any other kind (a struct, a pointer, a channel) carries no schema
-// keyword this validator checks and passes, matching the prior behavior for
-// non-composite values.
+// schemaValidateNativeComposite normalizes a native Go value schemaValidateValue's type
+// switch does not model, routing it through the array/object validators so its
+// items/minItems/maxItems keywords are enforced rather than silently skipped. A
+// non-string map key cannot model a JSON object, so it fails closed.
 func schemaValidateNativeComposite(jsonPath string, val interface{}, schema *capability.ArgumentSchema) error {
 	rv := reflect.ValueOf(val)
 	switch nativeCompositeJSONType(val) {
@@ -236,9 +201,8 @@ func schemaValidateNativeComposite(jsonPath string, val interface{}, schema *cap
 		}
 		return schemaValidateObject(jsonPath, m, schema)
 	default:
-		// A non-string-keyed map cannot model a JSON object; reject it rather than silently
-		// pass, matching schemaJSONTypeOf classifying it "unknown". Any other kind (struct,
-		// pointer, channel) carries no array/object keyword to enforce and passes.
+		// A non-string-keyed map cannot model a JSON object; reject rather than silently
+		// pass. Any other kind carries no array/object keyword to enforce and passes.
 		if rv.Kind() == reflect.Map {
 			return fmt.Errorf("%s: object key is not a string", jsonPath)
 		}
@@ -284,15 +248,10 @@ func schemaJSONTypeOf(val interface{}) string {
 	case nil:
 		return "null"
 	}
-	// A direct ValidateArgumentSchema caller can pass a native Go composite (e.g.
-	// []string, []int, map[string]int) that none of the JSON-decoded cases above model.
-	// Classify it through the SAME helper schemaValidateNativeComposite uses, so the
-	// up-front schemaCheckType agrees with the validator that normalizes and validates
-	// these. Absent this, a schema that declares type: array/object — the standard way to
-	// write such a schema — rejects a valid native composite as "unknown" before the
-	// native-composite path is ever reached, making schemaValidateNativeComposite dead code
-	// for any typed schema. Anything the helper does not recognize (a struct, a pointer, a
-	// non-string-keyed map) stays "unknown" and fails closed at the type check.
+	// Classify a native Go composite through the SAME helper schemaValidateNativeComposite
+	// uses: without this, a schema declaring type: array/object rejects a valid native
+	// composite as "unknown" before reaching the native-composite path, making that path
+	// dead code for any typed schema.
 	if t := nativeCompositeJSONType(val); t != "" {
 		return t
 	}
@@ -300,33 +259,23 @@ func schemaJSONTypeOf(val interface{}) string {
 }
 
 // unwrapNamedScalar returns val converted to the predeclared type underlying its named
-// scalar type (type Path string -> string, type Port int -> int64), or val unchanged
-// when it is not one.
-//
-// "Named" is decided by comparing the type's own name to its kind's name: a predeclared
-// int reports Name() == "int" == Kind().String() and is left alone, while a defined
-// `type Port int` reports "Port" and is unwrapped. json.Number is excluded explicitly:
-// it is a named string type, but it carries NUMERIC semantics that the enum comparison
-// and the float coercion downstream already model exactly, and flattening it to a plain
-// string would lose them.
-//
-// Integers unwrap to int64 (unsigned to uint64) rather than float64 so compareToBound
-// keeps its int64-exact path for values at or above 2^53.
+// scalar type (type Path string -> string), or val unchanged when it is not one.
+// json.Number is excluded: it carries NUMERIC semantics the enum comparison and float
+// coercion downstream already model exactly, which flattening to string would lose.
+// Integers unwrap to int64 (unsigned to uint64) so compareToBound keeps its int64-exact
+// path for values at or above 2^53.
 func unwrapNamedScalar(val interface{}) interface{} {
 	switch val.(type) {
 	case nil, string, bool, float64, json.Number, map[string]interface{}, []interface{}:
-		// Every shape the proxy's own JSON path can produce exits here without touching
-		// reflect. The two composites matter as much as the scalars: schemaValidateValue
-		// recurses into every object property and array element, so leaving them to the
-		// reflect probe below would charge two reflect calls per node of the argument
-		// tree, on every enforced request, to learn that there is nothing to unwrap.
+		// Every shape the proxy's own JSON path produces exits here without touching
+		// reflect, including the two composites: schemaValidateValue recurses into every
+		// node, so leaving them to the reflect probe below would cost two reflect calls
+		// per node just to learn there is nothing to unwrap.
 		return val
 	}
 	rt := reflect.TypeOf(val)
-	// A predeclared type reports Name() == Kind().String() ("int" == "int"). A named type
-	// reports its own name ("Port" != "int"). An UNNAMED type reports "" (never equal to
-	// a kind name), so it falls through to the kind switch below, which has no arm for a
-	// composite kind and returns it unchanged.
+	// A predeclared type reports Name() == Kind().String(); a named type reports its own
+	// name. An unnamed type falls through to the kind switch, which has no composite arm.
 	if rt == nil || rt.Name() == rt.Kind().String() {
 		return val // predeclared: nothing to unwrap
 	}
@@ -348,13 +297,10 @@ func unwrapNamedScalar(val interface{}) interface{} {
 	return val
 }
 
-// nativeCompositeJSONType classifies a native Go composite — a value none of the
-// JSON-decoded shapes model — by the JSON type it represents: "array" for a slice or
-// array, "object" for a string-keyed map. It returns "" for anything else (a scalar,
-// struct, pointer, or non-string-keyed map). schemaJSONTypeOf and
-// schemaValidateNativeComposite both classify through this single helper, so the up-front
-// type check and the validator dispatch cannot drift apart about which native value is an
-// array versus an object — the exact agreement the typed-schema fix depends on.
+// nativeCompositeJSONType classifies a native Go composite by the JSON type it
+// represents ("array"/"object", "" otherwise). Shared by schemaJSONTypeOf and
+// schemaValidateNativeComposite so the up-front type check and the validator dispatch
+// cannot drift on which native value is an array versus an object.
 func nativeCompositeJSONType(val interface{}) string {
 	switch rv := reflect.ValueOf(val); rv.Kind() {
 	case reflect.Slice, reflect.Array:
@@ -434,15 +380,10 @@ func compareToBound(raw interface{}, f, bound float64) int {
 			}
 		}
 	}
-	// Both sides are integers but at least one is outside int64 range, so the arm
-	// above did not fire and the float64 fallback would round them together: an
-	// argument of 9223372036854775809 coerces to float64(2^63), compares EQUAL to a
-	// maximum of 9223372036854775808, and passes a bound it strictly exceeds. Exact
-	// rationals keep the boundary where the manifest put it.
-	//
-	// Integers only, for the same reason numericEqual restricts its exact arm: a
-	// fractional bound and its float64 coercion are different rationals, and comparing
-	// those exactly would move a working fractional boundary rather than fix one.
+	// Both sides are integers but outside int64 range, so the float64 fallback would
+	// round them together (9223372036854775809 vs a maximum of 9223372036854775808
+	// would compare equal). Integers only, like numericEqual's exact arm: a fractional
+	// bound's float64 coercion is a different rational and must not be compared exactly.
 	if rr, ok := exactIntegerRat(raw); ok {
 		if br, ok := exactIntegerRat(bound); ok {
 			return rr.Cmp(br)

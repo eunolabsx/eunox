@@ -14,29 +14,19 @@ import (
 	"strings"
 )
 
-// Effect contracts — the "what may break" axis.
+// Effect contracts — the "what may break" axis. Information-flow control answers *who may
+// know*; effect contracts answer *what may break*: how consequential an action is,
+// independent of who may take it. Same enforcement point, same manifest, two axes.
 //
-// Information-flow control answers *who may know*: a labelOutput source asserts
-// provenance and a flowLabel sink refuses a class that must not reach it. Effect
-// contracts answer the other half, *what may break*: how consequential an action is,
-// independent of who is allowed to take it. Same enforcement point, same manifest, two
-// axes.
+// The vocabulary is a CLOSED, typed set (three effect classes, a numeric blast radius, an
+// idempotency flag, a compensating action) because a portable, hash-pinnable registry
+// cannot pin a general policy-language blob — "what does this do" would require executing
+// it. A partner's complex escalation predicate can still be delegated through the `policy`
+// condition instead.
 //
-// The vocabulary is a CLOSED, typed set — three effect classes, a numeric blast radius,
-// an idempotency flag, a compensating action — precisely because a portable
-// effect-contract registry has to hash-pin what a contract MEANS. A registry of general
-// policy-language blobs is neither reviewable nor pinnable ("what does this do" would
-// need executing it), so a general policy language and a portable effect standard are
-// mutually exclusive. That is why effect stays a schema and not a program, while a
-// partner's complex escalation PREDICATE can still be delegated through the `policy`
-// condition.
-//
-// Nothing here infers effect from a payload. A contract is asserted by policy (or by a
-// registry entry an operator pinned), exactly as a flow label is; the argument-
-// parameterized form (ByArgument) is a static decision table resolved from the call's
-// own arguments, never a runtime callout. Genuinely server-state-dependent effect is
-// carried after the fact by a signed receipt, and defaulted conservatively before the
-// call.
+// Nothing here infers effect from a payload: a contract is asserted, exactly as a flow
+// label is. The argument-parameterized form (ByArgument) is a static decision table
+// resolved from the call's own arguments, never a runtime callout.
 
 // Effect class discriminators — the closed reversibility vocabulary, ordered from least
 // to most consequential. Flat and totally ordered on purpose: three classes an operator
@@ -250,30 +240,16 @@ func (EffectClassCondition) ConditionType() string { return ConditionTypeEffectC
 func (c EffectClassCondition) MarshalJSON() ([]byte, error) { return marshalCondition(c) }
 
 // BlastRadiusCondition bounds the quantitative size of one call's effect ("no refund over
-// $500") — the magnitude an argument-level allowlist cannot express, because the argument
-// is legal at every value and only its SIZE is the problem.
+// $500") — a magnitude an argument-level allowlist cannot express, since the argument is
+// legal at every value and only its SIZE is the problem. A call whose size cannot be
+// quantified FAILS the condition (an unestablished size must not read as small).
 //
-// A call whose blast radius cannot be quantified — no contract, or a contract naming an
-// argument the call did not supply — FAILS the condition. An action whose size cannot be
-// established must not be treated as small.
-//
-// CUMULATIVE velocity is the second half: `maxTotal` over `windowSeconds` bounds the
-// SUMMED magnitude of a session's calls to this target — "no more than $2,000 of refunds
-// an hour". The per-call bound catches the $5,000 refund; it does not catch four hundred
-// individually-permitted $10 refunds, which is the shape a compromised or prompt-injected
-// agent actually produces. Every one of those calls is legal, and only the aggregate is
-// catastrophic, so the aggregate is precisely what per-call authorization structurally
-// cannot see.
-//
-// It is backed by a WEIGHTED CallCounter.AdmitAll bucket — the same admission maxCalls
-// commits through, summing magnitudes instead of counting entries, not a second accounting
-// system (which is why the two compose atomically on one capability). An
-// over-limit call writes NOTHING, exactly as an over-limit maxCalls does: recording the
-// weight of a refused call would let a burst of rejections extend its own lockout past the
-// window that actually spent the budget.
-//
-// An UNQUANTIFIED call fails a cumulative bound for the same reason it fails the per-call
-// one: an action whose size cannot be established must not contribute 0 to a sum.
+// CUMULATIVE velocity (`maxTotal` over `windowSeconds`) is the second half: it bounds the
+// SUMMED magnitude of a session's calls to the target, catching four hundred individually-
+// permitted $10 refunds where the per-call bound only catches one $5,000 refund — exactly
+// the shape a compromised or prompt-injected agent produces. It is backed by a WEIGHTED
+// CallCounter.AdmitAll bucket (the same admission maxCalls commits through), and an
+// over-limit call writes NOTHING, so a burst of rejections cannot extend its own lockout.
 type BlastRadiusCondition struct {
 	// Max bounds one call's magnitude. Optional only in the sense that a condition
 	// declaring a cumulative bound instead still bounds something; a condition declaring
@@ -482,37 +458,23 @@ const (
 )
 
 // NumericLiteralBounded reports whether s is a DECIMAL numeric literal small enough to
-// parse into an arbitrary-precision value without materializing a huge intermediate.
-//
-// The accepted grammar is exactly
+// parse into an arbitrary-precision value without materializing a huge intermediate: the
+// grammar
 //
 //	[+-]? ( digits [ "." [digits] ] | "." digits ) ( [eE] [+-]? digits )?
 //
-// within MaxNumericLiteralLen bytes and with an exponent magnitude within
-// MaxNumericLiteralExp. Naming the grammar IS the bound. big.Float.SetString and
-// big.Rat.SetString accept a good deal more than decimal — a binary exponent
-// ("1p1000000"), a hex-float mantissa ("0x1p64"), digit-separating underscores
-// ("1_000"), a rational ("1/3"), the Inf spellings — and a guard that scanned only for
-// an 'e'/'E' exponent bounded none of them. "1p1000000" is nine caller-supplied bytes
-// whose magnitude is a power of TWO the decimal scan never looks at; it parses to a
-// value whose Text('f', -1) render costs seconds of CPU and hundreds of megabytes,
-// synchronously, inside the per-session decision.
+// within MaxNumericLiteralLen bytes and an exponent within MaxNumericLiteralExp.
+// big.Float/big.Rat SetString accept more than decimal (binary/hex-float exponents,
+// underscore separators, rationals), and a guard that only scanned for 'e'/'E' would miss
+// e.g. "1p1000000" — nine bytes whose Text('f', -1) render costs seconds of CPU and
+// hundreds of megabytes. Restricting to decimal also keeps the value a caller WRITES the
+// same as the value compared (SetString reads "0x1p4" as 16, not as hex-float notation).
 //
-// Restricting to decimal is also the only way the value a caller WRITES is the value
-// the bound compares: SetString reads "0x1p4" as 16 and "1_000" as 1000 — Go literal
-// semantics, not the decimal a policy author or a tool schema means.
-//
-// It lives here, in the package that owns the shared literal grammar, because THREE
-// layers need the identical bound against the identical input class: the JSON-RPC id
-// parse (internal/mcp), the exact numeric comparison behind allowedValues
-// (pkg/enforcement), and the blast-radius parse below. Two of those had hand-rolled
-// copies and the third had none — which is exactly how a guard that everyone "mirrors"
-// ends up missing from the one place a caller can actually reach.
-//
-// Anything outside the grammar — a non-decimal form, an unparseable literal, an
-// over-bound length or exponent — reports false, so every caller falls back to its own
-// documented not-exact path (a float64 comparison, a raw-bytes id, an unquantified
-// blast radius). Each of those is the conservative direction for that caller.
+// Shared by three layers needing the identical bound against the identical input class —
+// the JSON-RPC id parse (internal/mcp), allowedValues' exact numeric comparison
+// (pkg/enforcement), and the blast-radius parse below — so it lives here rather than as
+// three copies that could drift. Anything outside the grammar reports false, so callers
+// fall back to their own conservative not-exact path.
 func NumericLiteralBounded(s string) bool {
 	if s == "" || len(s) > MaxNumericLiteralLen {
 		return false
@@ -695,16 +657,11 @@ func (t *EffectByArgument) match(args map[string]interface{}) (EffectCase, bool)
 	return EffectCase{}, false
 }
 
-// lookup matches a case key case-insensitively, the way an operator writes SQL verbs and
-// enum-ish argument values.
-//
-// On a fold collision it resolves to the lexicographically SMALLEST matching key rather
-// than to whichever one Go's randomized map iteration reached first. The loader rejects
-// two case- or whitespace-variant keys that fold together (validateEffectByArgument), so a
-// manifest can no longer produce a collision — but a programmatically built contract still
-// can, and under map-order iteration that made the resolved effect class differ between
-// two identical calls. A nondeterministic verdict is disqualifying for a layer whose whole
-// claim is determinism, so the tie is broken stably here as well as rejected at load.
+// lookup matches a case key case-insensitively. On a fold collision it resolves to the
+// lexicographically SMALLEST matching key rather than Go's randomized map order: the loader
+// rejects such collisions in a manifest, but a programmatically built contract can still
+// produce one, and a nondeterministic verdict is disqualifying for a layer whose whole claim
+// is determinism.
 //
 // Tracking the smallest match in one pass, rather than materializing and sorting the key
 // set, keeps that determinism allocation-free: this runs up to twice per enforced call

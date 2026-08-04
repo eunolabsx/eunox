@@ -1,9 +1,8 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Redis client construction for the eunox proxy. When --redis-addr is set,
-// the call counter and kill-switch manager are Redis-backed so their state
-// persists across restarts and is shared between proxy instances.
+// Redis client construction for the eunox proxy: with --redis-addr, the call counter and
+// kill-switch manager are Redis-backed, so state persists and is shared between instances.
 
 package main
 
@@ -16,9 +15,8 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// buildRedisClient constructs a single-node Redis client from host:port
-// parameters. The returned client is not yet connected — callers must Ping
-// before use.
+// buildRedisClient constructs a single-node Redis client. The returned client is not yet
+// connected — callers must Ping before use.
 func buildRedisClient(addr, password string, useTLS bool) (*goredis.Client, error) {
 	if addr == "" {
 		return nil, fmt.Errorf("redis address must not be empty")

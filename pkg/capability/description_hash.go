@@ -13,34 +13,18 @@ import (
 	"strconv"
 )
 
-// ComputeToolHash returns the "sha256:<lowercase-hex>" hash of a tool's
-// model-facing instruction surface: its top-level description plus the description
-// of every input parameter (paramDescriptions maps a canonical parameter PATH to
-// its description, as produced by ParamDescriptions — covering descriptions under
-// every subschema-valued keyword at any depth, not just top-level properties). Both
-// are prompt content the host model reads when deciding how to call the tool, so both
-// are pinned
-// against an upstream that rewrites them to inject instructions (tool poisoning /
-// rug-pull, FM-5). A parameter description is just as much an injection surface as
-// the top-level description — at any nesting depth — so leaving it unpinned would
-// let an attacker move a payload one level down and evade the pin.
+// ComputeToolHash returns the "sha256:<lowercase-hex>" hash of a tool's model-facing
+// instruction surface: its top-level description plus every input parameter description
+// (at any nesting depth, via ParamDescriptions). Both are prompt content the host model
+// reads, so both are pinned against an upstream that rewrites them to inject instructions
+// (tool poisoning / rug-pull, FM-5); leaving nested descriptions unpinned would let an
+// attacker move a payload one level down. Parameter STRUCTURE (names, types, required) is
+// deliberately excluded — that's FM-6, at lower severity, and folding it in would make this
+// always-fatal pin fire on benign schema evolution.
 //
-// The structural shape of the parameters (names, types, required) is deliberately
-// excluded — that is FM-6's concern, at a lower severity. Folding it in here would
-// make this always-fatal pin fire on benign schema evolution (e.g. a new optional
-// parameter), which is exactly the false positive that trains operators to disable
-// a pin.
-//
-// Encoding is canonical and unambiguous: parameters are sorted by name and every
-// field is length-prefixed, so no two distinct (description, paramDescriptions)
-// inputs can collide by concatenation (e.g. {"ab",""} vs {"a","b"}). The format
-// matches the manifest's descriptionHash field, so a recomputed hash compares
-// directly against a constraint's DescriptionHash.
-//
-// Note: this is not the old description-only hash even when paramDescriptions is
-// empty (the length prefix differs), and the path-keyed nested-description coverage
-// changes the keys for top-level parameters too, so pins generated before this
-// coverage must be regenerated with `eunox init --pin-descriptions`.
+// Encoding is canonical (sorted, length-prefixed fields, so no two distinct inputs collide
+// by concatenation) and matches the manifest's descriptionHash field. Pins generated before
+// nested-description coverage must be regenerated with `eunox init --pin-descriptions`.
 func ComputeToolHash(description string, paramDescriptions map[string]string) string {
 	h := sha256.New()
 	writeLenPrefixed(h, description)
@@ -182,46 +166,30 @@ var (
 	}
 )
 
-// frameSeg appends one unambiguously-framed segment to a path key: a 1-byte kind
-// tag, an 8-byte big-endian length, then the segment bytes. Because every segment is
-// tag- and length-prefixed, the concatenation is INJECTIVE — a property whose literal
-// name contains a path metacharacter (e.g. ".", "[", "]", "$") can never produce the
-// same key as a synthesized keyword/name/index segment, and nested-object paths never
-// collide with a dotted property name. That injectivity is load-bearing for FM-5: a key
-// collision in the returned map would let one description silently overwrite another (Go
-// map last-write-wins), letting an upstream rug-pull a nested description while a
-// colliding sibling key holds the hash constant.
+// frameSeg appends one unambiguously-framed segment to a path key: a 1-byte kind tag, an
+// 8-byte big-endian length, then the segment bytes. Tag+length prefixing makes the
+// concatenation INJECTIVE, so a property literally named "$defs" or "a.b" can never collide
+// with a synthesized segment — load-bearing for FM-5, since a map-key collision would let
+// one description silently overwrite another (Go map last-write-wins).
 func frameSeg(prefix string, tag byte, seg string) string {
 	var lenbuf [8]byte
 	binary.BigEndian.PutUint64(lenbuf[:], uint64(len(seg)))
 	return prefix + string(tag) + string(lenbuf[:]) + seg
 }
 
-// ParamDescriptions extracts every model-facing description string from a JSON
-// Schema inputSchema, keyed by a canonical, collision-free path. It recurses through
-// EVERY subschema-valued keyword the spec defines — object "properties" and
-// "patternProperties", array "items"/"prefixItems", "$defs"/"definitions",
-// "dependentSchemas"/"dependencies" (draft 2019-09 and its draft-07 predecessor), the
-// "allOf"/"anyOf"/"oneOf" combinators, and the applicator keywords
-// "additionalProperties"/"unevaluatedProperties"/"additionalItems"/
-// "unevaluatedItems"/"propertyNames"/"contains"/"not"/"if"/"then"/"else"/
-// "contentSchema" (see the schema*Keywords tables) — plus the root schema's own
-// "description" (under paramRootDescriptionKey) — so a "description" anywhere in the
-// schema is captured. Every such string is prompt content the host model reads, so it
-// is the FM-5 injection surface; covering only a subset would let an upstream rug-pull a
-// description hidden under an unwalked keyword without changing the hash.
+// ParamDescriptions extracts every model-facing description string from a JSON Schema
+// inputSchema, keyed by a canonical, collision-free path. It recurses through EVERY
+// subschema-valued keyword the spec defines (see the schema*Keywords tables), plus the root
+// schema's own "description" (under paramRootDescriptionKey), so nothing is left as an
+// unwalked FM-5 rug-pull hiding place. Paths are built from frameSeg segments rather than a
+// dotted string, so a property literally named "$defs" or "a.b" cannot collide with a
+// synthesized path.
 //
-// Each path is built from frameSeg segments (a kind tag + length-prefixed payload per
-// step), NOT a human-readable dotted string, so a key is a pure function of the
-// (keyword, name, index) sequence and independent of which metacharacters appear in a
-// property name: a property literally named "$defs", "a.b", or "tags[]" cannot collide
-// with the synthesized $defs / nested-object / items paths. Entries without a (string,
-// non-empty) description are omitted. Returns an empty, non-nil map when the schema
-// carries no descriptions. Recursion is depth-bounded (maxParamDescriptionDepth);
-// past the bound it records paramDescriptionOverflowKey and stops, so an over-deep
-// schema fails closed (distinct hash) rather than silently dropping the unpinned
-// tail. Shared by the drift check, the runtime PDP, and `init` so they pin and verify
-// identical input.
+// Entries without a (string, non-empty) description are omitted; returns an empty, non-nil
+// map when the schema carries none. Recursion is depth-bounded
+// (maxParamDescriptionDepth); past it, records paramDescriptionOverflowKey and stops rather
+// than silently dropping the unpinned tail. Shared by the drift check, the runtime PDP, and
+// `init` so they pin and verify identical input.
 func ParamDescriptions(inputSchema map[string]interface{}) map[string]string {
 	out := map[string]string{}
 	// The root inputSchema object has no keyword pointing at it, so collectParam-

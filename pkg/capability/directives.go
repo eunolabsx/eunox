@@ -127,29 +127,17 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	return target, nil
 }
 
-// directivePrototypes is THE registry of directive discriminators this build models,
-// the directive twin of conditionPrototypes: the decoder instantiates from it
-// (newDirective), the closed vocabulary is derived from it (knownDirectiveTypes), the
-// manifest loader's per-type permitted-key sets are reflected off its prototypes
-// (NewDirectivePrototype), and its schemaVersion gate reads the entry's Since
-// (TokenSince) — so adding a directive type means adding it HERE, not in three
-// hand-maintained tables that drift one entry at a time.
+// directivePrototypes is THE registry of directive discriminators this build models, the
+// directive twin of conditionPrototypes: the decoder, the closed vocabulary
+// (knownDirectiveTypes), the manifest loader's per-type key sets, and the schemaVersion gate
+// all derive from it, so adding a type means adding it HERE rather than in hand-maintained
+// tables that drift apart (a prior switch-plus-two-literals split let a fourth directive
+// ship with no schema branch).
 //
-// It replaces a switch plus two literals that had already drifted apart. The one that
-// mattered is KnownDirectiveTypes: the published schema's drift guard derives its
-// expectation from it and compares only COUNTS, so a fourth directive added to the
-// switch and forgotten in the literal left `want` and `branches` both at three and
-// shipped a token with no schema branch — the exact outcome the guard exists to
-// prevent.
-//
-// State follows the same rule as on the condition registry (see tokenstate.go): redactFields
-// masks fields in one response and remembers nothing, while labelOutput writes the flow-label
-// set a later sink reads back and declassify clears it and burns a single-use grant — both
-// non-atomic read-then-writes, and both reasons a policy carrying them needs the decision turn.
-//
-// Uses follows the rule in subsystem.go, and the split is the same one: redactFields reads no
-// engine facility at all, while the two flow directives write and clear the flow-label set —
-// so a policy carrying either must NOT have the flow path skipped out from under it.
+// State and Uses follow the same rules as the condition registry (tokenstate.go,
+// subsystem.go): redactFields masks one response and remembers nothing, while labelOutput
+// and declassify write/clear the flow-label set — non-atomic read-then-writes that need the
+// decision turn and must not have the flow path skipped out from under them.
 var directivePrototypes = map[string]tokenSpec[Directive]{
 	DirectiveTypeRedactFields: {New: func() Directive { return &RedactFieldsDirective{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
 	DirectiveTypeLabelOutput:  {New: func() Directive { return &LabelOutputDirective{} }, Since: SchemaVersion02, State: StateNonAtomic, Uses: []EngineSubsystem{SubsystemFlowLabels}},

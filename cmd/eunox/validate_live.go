@@ -67,11 +67,8 @@ func buildLiveReport(manifest *config.LocalManifest, tools []drift.UpstreamTool,
 // bucketing switch (including an unrecognized Kind) directly, without needing
 // CheckManifestDrift to actually produce one.
 func classifyDriftWarnings(manifest *config.LocalManifest, tools []drift.UpstreamTool, driftWarnings []drift.Warning) liveReport {
-	// FM-1 accumulates as a slice, not a map keyed by tool name: CheckManifestDrift
-	// can now return two FM-1 findings for one tool (two equal-specificity globs both
-	// matching it), and keying by tool name would drop all but the last — re-hiding an
-	// over-permission the drift check deliberately surfaced. fm1Tools tracks which
-	// tools have any FM-1 so the COVERED classification below can still exclude them.
+	// FM-1 accumulates as a slice, not a map keyed by tool name: two equal-specificity
+	// globs can both match one tool, and keying would drop all but the last.
 	var fm1 []drift.Warning
 	fm1Tools := make(map[string]bool)
 	fm2 := make(map[string]drift.Warning)
@@ -90,10 +87,8 @@ func classifyDriftWarnings(manifest *config.LocalManifest, tools []drift.Upstrea
 			// the stale entry simply never matches.
 			fm2[w.Resource] = *w
 		case drift.Fm2Pinned:
-			// Critical: a descriptionHash-pinned tool is absent upstream, so its
-			// integrity cannot be verified and the proxy REFUSES TO START (same gate
-			// as FM-5). Surfaced distinctly from an advisory stale entry — deleting
-			// the entry would lower security by dropping the pin.
+			// Critical: a descriptionHash-pinned tool is absent upstream, so its integrity
+			// cannot be verified and the proxy REFUSES TO START (same gate as FM-5).
 			fm2Pinned[w.Resource] = *w
 		case drift.Fm3:
 			fm3 = append(fm3, *w)
@@ -108,19 +103,15 @@ func classifyDriftWarnings(manifest *config.LocalManifest, tools []drift.Upstrea
 		case drift.Uncovered:
 			uncoveredSet[w.Tool] = true
 		default:
-			// A drift.Kind this report doesn't recognize yet. Route it into a visible
-			// bucket instead of silently dropping it — a switch with no default here
-			// previously let an unhandled Kind vanish from the report while
-			// "Result: ok" printed, the exact fail-open shape the rest of this codebase
-			// guards against.
+			// A drift.Kind this report doesn't recognize yet — route it into a visible
+			// bucket rather than silently dropping it, which previously let "Result: ok"
+			// print with an unhandled Kind vanished from the report.
 			unclassified = append(unclassified, *w)
 		}
 	}
 
-	// Tools with an outstanding FM-3 (argument drift), FM-5 (description-hash
-	// mismatch), or FM-6 warning must NOT also appear in COVERED: a contradictory
-	// [OK]/[FAIL] pair would let an operator scanning COVERED miss the warning. COVERED
-	// means "covered with no outstanding issues".
+	// A tool with an outstanding FM-3/FM-5/FM-6 warning must NOT also appear in COVERED,
+	// or a contradictory [OK]/[FAIL] pair could let an operator miss the warning.
 	warnedTools := make(map[string]bool)
 	for i := range fm3 {
 		warnedTools[fm3[i].Tool] = true
@@ -208,11 +199,8 @@ func countPhrase(n int, singular, plural string) string {
 	}
 }
 
-// sortedWarnings drains a resource-name -> Warning map into a slice ordered by
-// resource, so the drift report is deterministic (Go randomizes map iteration order).
-// Used by the FM-2 and FM-2-pinned sections. FM-1 is not keyed here: one tool can
-// carry several glob findings, so it accumulates a slice and sorts inline (see
-// buildLiveReport).
+// sortedWarnings drains a resource-name -> Warning map into a slice ordered by resource,
+// so the drift report is deterministic. Used by the FM-2 and FM-2-pinned sections.
 func sortedWarnings(m map[string]drift.Warning) []drift.Warning {
 	out := make([]drift.Warning, 0, len(m))
 	for k := range m {
@@ -271,9 +259,8 @@ func renderLiveReport(rep liveReport, out io.Writer) int {
 		}
 		for i := range rep.fm2Pinned {
 			w := &rep.fm2Pinned[i]
-			// FM-2Pinned ("tool absent, hash can't be checked") is the startup-blocking
-			// counterpart to FM-5 ("tool present, hash wrong"). Mark CRITICAL so it is
-			// not mistaken for an advisory stale entry below.
+			// The startup-blocking counterpart to FM-5; marked CRITICAL so it isn't
+			// mistaken for an advisory stale entry below.
 			wf("  [FAIL] %s  — DESCRIPTION-PINNED tool absent upstream (CRITICAL: proxy startup aborts; descriptionHash cannot be verified)\n", w.Resource)
 		}
 		for i := range rep.fm1Warnings {
@@ -332,10 +319,8 @@ func renderLiveReport(rep liveReport, out io.Writer) int {
 	schemaAbsentCount := len(rep.schemaAbsent)
 	unclassifiedCount := len(rep.unclassified)
 
-	// SchemaAbsent is advisory (never one of FM-1..FM-6) — drift.go classifies it as
-	// "advisory, never fatal" and the runtime hook forwards on it, so it must not gate
-	// exit here. The documented contract is "exit 0 == no FM-1..FM-6 findings"; a
-	// SchemaAbsent-only report stays exit 0 (its [WARN] line is still rendered above).
+	// SchemaAbsent is advisory (never one of FM-1..FM-6), so a SchemaAbsent-only report
+	// stays exit 0 (its [WARN] line is still rendered above).
 	if fm1Count == 0 && fm2Count == 0 && fm2PinnedCount == 0 && fm3Count == 0 && fm4Count == 0 && fm5Count == 0 && fm6Count == 0 && unclassifiedCount == 0 {
 		wln("Result: ok — all manifest entries match live tools; no glob matches, hash mismatches, or argument drift detected.")
 		if schemaAbsentCount > 0 {
@@ -406,11 +391,8 @@ func renderLiveReport(rep liveReport, out io.Writer) int {
 	return 1
 }
 
-// cmdValidate runs the `validate` subcommand and returns the process exit code
-// (rather than calling os.Exit itself), so tests can drive every branch —
-// including the fail-closed error paths — without terminating the test binary.
-// args carries the subcommand's own arguments (os.Args[2:] in a real
-// invocation), threaded from run.
+// cmdValidate runs the `validate` subcommand, returning the exit code (rather than
+// calling os.Exit) so tests can drive every branch including the fail-closed error paths.
 func cmdValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -451,9 +433,8 @@ Flags:
 	authHeader := fs.String("upstream-auth-header", "", `Header forwarded to the upstream in "Name: Value" format.`)
 	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the upstream (development only).")
 
-	// Split off a stdio subprocess command after the first standalone "--".
-	// Manifest files are positional too, so "--" is the only unambiguous boundary;
-	// Go's flag package consumes "--", so we split before parsing.
+	// Split off a stdio subprocess command after the first standalone "--", before
+	// parsing (Go's flag package would otherwise consume it).
 	rawArgs := args
 	var stdioCmd []string
 	for i, a := range rawArgs {
@@ -464,29 +445,21 @@ Flags:
 		}
 	}
 
-	// Allow flags and positional manifest files to be interspersed (see
-	// parseFlagsAndPositionals); a single fs.Parse would treat --live in
-	// "validate manifest.yaml --live" as a filename.
+	// Allow flags and positional manifest files to be interspersed; a single fs.Parse
+	// would treat --live in "validate manifest.yaml --live" as a filename.
 	files, err := parseFlagsAndPositionals(fs, rawArgs)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
-		// 2, not 1: exit 1 is reserved for "drift warnings present, operator review
-		// required", which a CI pipeline is expected to gate on. A usage error
-		// exiting 1 is indistinguishable from a clean run that found drift, so a
-		// misspelled flag reads as a policy finding. Every usage rejection below
-		// exits 2 for the same reason.
+		// 2, not 1: exit 1 is reserved for "drift warnings present", which CI gates on,
+		// so a usage error must not read as a policy finding.
 		return 2
 	}
 
-	// Track whether --transport was set explicitly so we can reject it in modes
-	// where it has no effect rather than ignoring it.
 	transportSet := flagWasSet(fs, "transport")
-	// Whether any live-upstream flag was supplied at all — computed once and
-	// referenced at both guard sites below (the --config mutual-exclusion check and
-	// the non---live rejection) so the two hand-maintained copies of this 5-term
-	// predicate cannot drift out of lockstep with each other.
+	// Computed once and referenced at both guard sites below so the two copies of this
+	// predicate cannot drift out of lockstep.
 	upstreamFlagsGiven := *upstreamURL != "" || *authHeader != "" || *tlsSkipVerify || transportSet || len(stdioCmd) > 0
 
 	// Mode selection: --config is mutually exclusive with positional manifests
@@ -515,9 +488,8 @@ Flags:
 		return 2
 	}
 
-	// --transport, the upstream-* flags, and a stdio command only select how to
-	// reach a live upstream, so they are meaningless without --live. Reject up
-	// front rather than silently dropping them in a syntax-only check.
+	// These flags only select how to reach a live upstream, so meaningless without
+	// --live; reject rather than silently dropping them.
 	if !*live && upstreamFlagsGiven {
 		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
 		return 2
@@ -537,19 +509,14 @@ Flags:
 		}
 	}
 	if !ok {
-		// A parse/validate failure is exit code 2 ("connection or parse error"), not 1
-		// ("drift warnings present"), matching the documented codes and the --config
-		// path (LoadGatewayConfig returns 2) so a CI script keyed on the codes does not
-		// mislabel a corrupt manifest as drift.
+		// Exit 2 ("parse error"), not 1 ("drift"), so a CI script keyed on codes does
+		// not mislabel a corrupt manifest as drift.
 		return 2
 	}
 
-	// Cross-file merge-conflict detection (config.MergeManifests) must run even in
-	// the syntax-only (non-live) path: `validate a.yaml b.yaml` (no --config, no
-	// --live) previously returned 0 right after the per-file syntax check above,
-	// so two positional manifests with a genuine merge conflict passed while the
-	// equivalent --config route (validateConfigRoutes, which always merges) would
-	// have failed, and `proxy` itself refuses to boot on the same conflict.
+	// Must run even in the syntax-only path, or two positional manifests with a genuine
+	// merge conflict would pass while the equivalent --config route (which always
+	// merges) — and `proxy` itself — would refuse to boot on the same conflict.
 	merged, err := config.MergeManifests(manifests)
 	if err != nil {
 		// A merge conflict is a parse-class error (exit 2), not drift.
@@ -557,18 +524,14 @@ Flags:
 		return 2
 	}
 
-	// Effect-contract coverage of the MERGED policy, which is what actually decides:
-	// annotating is what buys a capability out of maximum friction, so the ratio (and the
-	// names) is the operator's progress meter. Advisory — it never affects the exit code,
-	// since an unannotated capability is a conservative default, not a defect.
+	// Advisory — never affects the exit code, since an unannotated capability is a
+	// conservative default, not a defect.
 	writeEffectCoverage(os.Stdout, "", merged, true)
 
 	if !*live {
 		return 0
 	}
 
-	// Live drift check. buildInitUpstreamSpec (shared with `init`) validates the
-	// http/stdio flag combination, then we introspect the upstream as `init` does.
 	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, stdioCmd)
 	if err != nil {
 		// A missing/incoherent upstream wiring is a connection error (exit 2), not drift.
@@ -594,15 +557,9 @@ Flags:
 	return runValidateLive(merged, info.Tools, info.ServerVersion, os.Stdout)
 }
 
-// writePolicyLoadResults prints one FAIL/OK line per outcome.LoadResults entry to out,
-// each indented by prefix, so validate and doctor cannot diverge on how a
-// route's per-file manifest load result is reported — both format the exact same
-// transport.PolicyLoadResult slice through this one function instead of
-// hand-mirroring the loop.
-//
-// It takes the WRITER, like reportRouteOutcome and every other report writer here. Taking
-// the wf closure instead meant each caller converted its writer into one — and doctor,
-// which holds only a writer, spelled that conversion out inline at the call site.
+// writePolicyLoadResults prints one FAIL/OK line per outcome.LoadResults entry to out, each
+// indented by prefix, so validate and doctor cannot diverge on how a route's per-file
+// manifest load result is reported.
 func writePolicyLoadResults(out io.Writer, prefix string, results []transport.PolicyLoadResult) {
 	wf, _ := writers(out)
 	for _, lr := range results {
@@ -614,25 +571,15 @@ func writePolicyLoadResults(out io.Writer, prefix string, results []transport.Po
 	}
 }
 
-// reportRouteOutcome prints outcome's FAIL/OK/policy-config report for one route
-// and reports whether its startup-fatal checks were satisfied. skip is true when
-// the route's live-drift introspection (or, without --live, the route entirely)
-// must not proceed: a no-policy route that fails closed at startup, a non-live
-// no-policy route, or any policy'd-route load/merge/startup-check failure. code is
-// the route's exit-code contribution (0 clean, 2 a startup-fatal failure) —
-// factored out of validateConfigRoutes's loop body to keep its nesting flat.
-//
-// It takes the WRITER, not the (wf, wln) closure pair, because the coverage report it
-// ends with takes one: handing this function closures meant rebuilding an io.Writer from
-// them through a dedicated adapter, purely to undo the conversion its own caller had just
-// done. Same reason writePolicyLoadResults takes one.
+// reportRouteOutcome prints outcome's FAIL/OK/policy-config report for one route and
+// reports whether its startup-fatal checks were satisfied. skip is true when the route's
+// live-drift introspection must not proceed. Factored out of validateConfigRoutes's loop
+// body to keep its nesting flat.
 func reportRouteOutcome(out io.Writer, outcome transport.RouteManifestOutcome, live bool) (code int, skip bool) {
 	wf, wln := writers(out)
 	if outcome.NoPolicy {
-		// A policyless route is only legal when it will actually boot. Flag a
-		// config the proxy would refuse to start as FAIL rather than green-lighting
-		// it or (under --live) connecting to an upstream that would never serve
-		// traffic.
+		// Flag a config the proxy would refuse to start as FAIL rather than green-lighting
+		// it or connecting to an upstream that would never serve traffic.
 		if outcome.NoPolicyReason != "" {
 			wf("  FAIL  this route fails closed at startup: %s.\n", outcome.NoPolicyReason)
 			return 2, true
@@ -642,8 +589,7 @@ func reportRouteOutcome(out io.Writer, outcome transport.RouteManifestOutcome, l
 		} else {
 			wln("  (no policy configured — route is allow-all)")
 		}
-		// Without --live there is nothing further to report; with --live, the
-		// caller falls through to introspection for visibility (no manifest to
+		// With --live, fall through to introspection for visibility (no manifest to
 		// drift-check, but the upstream connection is still worth showing).
 		return 0, !live
 	}
@@ -660,23 +606,15 @@ func reportRouteOutcome(out io.Writer, outcome transport.RouteManifestOutcome, l
 		wf("  FAIL  %v\n", outcome.StartupErr)
 		return 2, true
 	}
-	// Advisory, and never part of the exit code: an unannotated capability is the
-	// fail-closed default working as intended, not a config defect. Per route, because
-	// the ceiling and the capabilities it governs are both per route.
+	// Advisory, never part of the exit code: an unannotated capability is the
+	// fail-closed default working as intended, not a config defect.
 	writeEffectCoverage(out, "  ", outcome.Merged, true)
 	return 0, false
 }
 
-// validateConfigRoutes walks every upstream in cfg, validating each route's
-// manifest(s) and — when live is set — introspecting the declared upstream and
-// reporting drift. A no-policy route the proxy would refuse to start is reported
-// FAIL and skipped (never introspected, since the upstream would never serve); a
-// valid no-policy route -- which on a gateway means audit/wiretap mode ONLY, since a
-// policyless enforce route is refused at startup -- is introspected under --live for
-// visibility but contributes no drift findings.
-//
-// Exit code is the maximum across routes: 0 clean, 1 drift, 2 parse/connection
-// failure.
+// validateConfigRoutes walks every upstream in cfg, validating each route's manifest(s)
+// and — when live is set — introspecting the declared upstream and reporting drift. Exit
+// code is the maximum across routes: 0 clean, 1 drift, 2 parse/connection failure.
 func validateConfigRoutes(ctx context.Context, cfg *config.GatewayConfig, live bool, out io.Writer) int {
 	wf, wln := writers(out)
 
@@ -688,13 +626,9 @@ func validateConfigRoutes(ctx context.Context, cfg *config.GatewayConfig, live b
 		}
 		wf("── route %q (transport: %s) ──\n", u.Name, u.Transport)
 
-		// Reproduce the proxy's actual startup policy-load decision so validate cannot
-		// green-light a config `proxy` would refuse to boot: load and merge this
-		// route's manifests (the cross-file merge-conflict detection lives in
-		// MergeManifests itself), then run the same startup-fatal check LoadUpstreamPDP
-		// folds in — the expectVersion pin, the sampling/createMessage-on-http guard,
-		// and the stdio-host audience-pin guard — directly against the merged result,
-		// via the shared walk both validate and doctor use.
+		// Reproduces the proxy's actual startup policy-load decision, via the shared
+		// walk both validate and doctor use, so validate cannot green-light a config
+		// `proxy` would refuse to boot.
 		outcome := transport.WalkRouteManifests(cfg, u)
 
 		exitCode, skip := reportRouteOutcome(out, outcome, live)
@@ -724,18 +658,10 @@ func validateConfigRoutes(ctx context.Context, cfg *config.GatewayConfig, live b
 		}
 		wf("  Connecting to upstream...  ok (%d tool(s), server version: %s)\n\n", len(info.Tools), versionLabel)
 
-		// outcome.NoPolicy is the allow-all/no-policy route: every policy file loaded
-		// cleanly to reach here (outcome.LoadFailed would have continued above), so
-		// outcome.Merged covers a policy'd route and there is nothing to drift-check
-		// for a policyless one.
 		if outcome.NoPolicy {
-			// Allow-all route with --live: nothing to drift-check against.
 			wln("  (no manifest to compare against)")
 			continue
 		}
-		// outcome.Merged was produced by WalkRouteManifests above (a merge failure
-		// already FAILed the route), so the live drift check reuses it rather than
-		// re-merging.
 		code := runValidateLive(outcome.Merged, info.Tools, info.ServerVersion, out)
 		if code > worst {
 			worst = code

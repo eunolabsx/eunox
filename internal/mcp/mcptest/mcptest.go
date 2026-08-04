@@ -1,18 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Package mcptest holds MCP message shapes used only by tests to assemble
-// mock-upstream fixtures. They live here, out of the production internal/mcp
-// surface, because the proxy never decodes them: a tools/call RESULT is forwarded
-// (and redacted over its raw bytes via JSONPath) but never parsed into a struct, so
-// modeling ToolCallResult/Content as production types would misrepresent what
-// internal/mcp actually enforces.
-//
-// The resources/list and prompts/list result shapes are here for the same reason.
-// Their entries ARE filtered in production, but by list filters in internal/pdp that
-// decode their own inline structs (pdp carries no internal/mcp dependency) and
-// preserve unknown fields over the raw bytes; nothing in the tree decodes these
-// structs outside tests.
+// Package mcptest holds MCP message shapes used only by tests to assemble mock-upstream
+// fixtures, kept out of internal/mcp because production never decodes them: a tools/call
+// result is redacted over its raw bytes, not parsed into a struct, and resources/list and
+// prompts/list entries are filtered by internal/pdp's own inline structs instead.
 package mcptest
 
 import "encoding/json"

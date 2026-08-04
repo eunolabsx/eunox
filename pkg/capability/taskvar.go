@@ -10,30 +10,21 @@ import (
 )
 
 // Task-context variables let a manifest bind an argument to the CALLER's own verified
-// identity instead of to a literal — "the task id this argument names must be the task id
-// in the token", written once for every task rather than once per task.
-//
-// The whole surface is three properties of the validated JWT, and it is closed:
+// identity instead of to a literal — written once rather than once per task. The surface is
+// three properties of the validated JWT, and it is closed:
 //
 //	${task.id}        the mcp.task_id claim
 //	${task.agent}     the mcp.agent_id claim
 //	${task.principal} the token subject (sub)
 //
-// Three rules make them safe, and each is load-enforced rather than left to convention:
+// Three rules make them safe, each load-enforced rather than left to convention:
 //
-//  1. A reference must be the WHOLE value. "${task.id}" is a reference; "job-${task.id}"
-//     is a load error. Interpolating into surrounding text would make the result a
-//     glob-matched string built partly from an IdP-supplied claim, which is a pattern
-//     whose meaning the manifest author did not write.
-//  2. A resolved value is compared by EXACT equality, never as a glob — unlike every
-//     other allowedValues string entry. A claim value of "*" would otherwise become an
-//     allow-anything wildcard the token holder chose for themselves.
-//  3. An unresolvable reference DENIES (no token, or the claim absent/empty). It never
-//     falls back to the literal text and never matches an empty argument: the condition
-//     exists to bind a value to an identity, and "there is no identity" is not a match.
-//
-// The variables are claim-populated and validated — eunox consumes tokens and never mints
-// them — so what a reference can express is bounded by what the operator's IdP asserts.
+//  1. A reference must be the WHOLE value ("job-${task.id}" is a load error) — interpolating
+//     into surrounding text would build a glob pattern partly from an IdP-supplied claim.
+//  2. A resolved value is compared by EXACT equality, never as a glob, so a claim value of
+//     "*" cannot become an allow-anything wildcard the token holder chose for themselves.
+//  3. An unresolvable reference DENIES rather than falling back to the literal text or
+//     matching empty: "there is no identity" is not a match.
 const (
 	// TaskVarID resolves to the validated token's mcp.task_id claim.
 	TaskVarID = "task.id"
@@ -44,11 +35,10 @@ const (
 	TaskVarPrincipal = "task.principal"
 )
 
-// taskVarClaims maps each variable to the flat input.claims key it reads. Those three
-// keys are RESERVED in the claims map (see the PDP's reservedClaimKeys): they are filled
-// authoritatively from the validated token's canonical fields and a same-named custom
-// claim cannot shadow them, so a reference cannot be pointed at attacker-chosen data by
-// an IdP template that happens to emit a top-level "sub".
+// taskVarClaims maps each variable to the flat input.claims key it reads. Those three keys
+// are RESERVED in the claims map (see the PDP's reservedClaimKeys): filled authoritatively
+// from the validated token's canonical fields, so a same-named custom claim cannot shadow
+// them and point a reference at attacker-chosen data.
 var taskVarClaims = map[string]string{
 	TaskVarID:        "task_id",
 	TaskVarAgent:     "agent_id",
@@ -66,31 +56,26 @@ func TaskVarNames() []string {
 	return out
 }
 
-// ContainsVariableRef reports whether s carries a "${...}" reference anywhere. It is
-// deliberately broader than ParseVariableRef: the LOADER uses it to find every value that
-// wants to be a variable, so a misspelled or embedded one is a load error instead of a
-// literal string that silently never matches. A value with no "${" at all is an ordinary
-// literal and never reaches the variable machinery.
+// ContainsVariableRef reports whether s carries a "${...}" reference anywhere. Deliberately
+// broader than ParseVariableRef: the LOADER uses it to find every value that wants to be a
+// variable, so a misspelled or embedded one is a load error instead of a literal string that
+// silently never matches.
 //
-// It is applied ONLY under the grammar revision that defines the variable surface. Under
-// "0.1" a "${" is what it has always been — an ordinary character in a literal value, with
-// no glob meaning — so a manifest whose allowlist carries template-shaped text keeps
-// loading. Applying this check to "0.1" turned an existing, valid document into a startup
-// failure over a surface that revision does not have.
+// Applied ONLY under the grammar revision that defines the variable surface — under "0.1" a
+// "${" is an ordinary character with no glob meaning, so applying this check there would
+// turn an existing, valid document into a startup failure over a surface it doesn't have.
 func ContainsVariableRef(s string) bool {
 	return strings.Contains(s, "${")
 }
 
-// IsTaskVarRef reports whether s is EXACTLY one recognized task-context variable. It is
-// the narrow test the RUNTIME matchers use, where ContainsVariableRef is the wide test the
+// IsTaskVarRef reports whether s is EXACTLY one recognized task-context variable — the
+// narrow test the RUNTIME matchers use, where ContainsVariableRef is the wide test the
 // loader uses.
 //
-// The distinction is load-bearing in two directions. A manifest value must not be a
-// half-formed reference (the loader's job, and a load error). But a value that merely looks
-// reference-ish and names nothing in the closed set — "${STAGE}" in a caller's JWT
-// capability claim, say — is a LITERAL that must keep matching itself: those values never
-// pass through the manifest loader, so treating them as references would void a grant with
-// no error anywhere to grep for.
+// A value that merely looks reference-ish and names nothing in the closed set (e.g.
+// "${STAGE}" in a caller's JWT capability claim) is a LITERAL that must keep matching
+// itself: those values never pass through the manifest loader, so treating them as
+// references would void a grant with no error anywhere to grep for.
 func IsTaskVarRef(s string) bool {
 	name, ok := ParseVariableRef(s)
 	if !ok {
@@ -101,11 +86,8 @@ func IsTaskVarRef(s string) bool {
 }
 
 // TaskVarClaimKey returns the flat input.claims key a variable reads, and whether the name
-// is in the closed set at all. It is IsTaskVarRef's second half, exposed so a caller that
-// has ALREADY parsed the reference can finish the classification without re-parsing —
-// enforcement's allowedValues matcher decides "skip as a reference" and "resolve against
-// the claim" from one classification, and re-deriving the second from a different predicate
-// is how the two came to disagree about what a recognized reference is.
+// is in the closed set. It is IsTaskVarRef's second half, exposed so a caller that has
+// ALREADY parsed the reference can finish classifying without re-parsing.
 func TaskVarClaimKey(name string) (string, bool) {
 	key, known := taskVarClaims[name]
 	return key, known
@@ -126,10 +108,9 @@ func ParseVariableRef(s string) (string, bool) {
 }
 
 // ValidateVariableRef checks a manifest string value that contains a "${" and reports why
-// it is not a usable reference, or nil when it is one. It is the closed-grammar gate for
-// the variable surface: a misspelled `${task.identifier}` is a LOAD ERROR, matching every
-// other token in this grammar, rather than an inert literal that quietly denies every call
-// at runtime.
+// it is not a usable reference, or nil when it is one — the closed-grammar gate that makes a
+// misspelled `${task.identifier}` a LOAD ERROR rather than an inert literal that quietly
+// denies every call at runtime.
 func ValidateVariableRef(s string) error {
 	name, ok := ParseVariableRef(s)
 	if !ok {
@@ -151,9 +132,9 @@ func bracketed(names []string) []string {
 }
 
 // ResolveTaskVar returns the value a variable resolves to from the request's validated
-// claims. ok is false when the variable is unknown, there are no claims (no token), the
-// claim is absent, or it is present but empty or not a string — every one of which the
-// caller must turn into a DENY rather than into a match against "".
+// claims. ok is false when the variable is unknown, there is no token, the claim is absent,
+// or it is empty/non-string — every case the caller must turn into a DENY, never a match
+// against "".
 func ResolveTaskVar(name string, claims map[string]interface{}) (string, bool) {
 	key, known := taskVarClaims[name]
 	if !known || claims == nil {

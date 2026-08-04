@@ -65,20 +65,14 @@ func main() {
 	os.Exit(run(os.Args))
 }
 
-// run dispatches the subcommand in args (program name at args[0], like os.Args)
-// and returns the exit code. Kept separate from main so tests can assert the
-// code without terminating the test binary; main holds the only os.Exit in the
-// binary — every subcommand returns its code rather than exiting.
-//
+// run dispatches the subcommand in args and returns the exit code. Kept separate from
+// main (the only os.Exit in the binary) so tests can assert the code without terminating.
 // Every subcommand takes its own arguments (args[2:]) as a parameter rather than
-// re-reading the global os.Args: the dispatch and the flag parsing then read the
-// same argument vector, so a caller that is not main cannot pick a subcommand
-// while its flags come from the real process arguments.
+// re-reading the global os.Args, so dispatch and flag parsing read the same vector.
 func run(args []string) int {
 	if len(args) < 2 {
-		// A bare invocation prints usage and exits 0 (not a usage error): package
-		// validators like winget launch the installed binary with no args and flag
-		// any non-zero exit. Printing help is also conventional CLI behavior.
+		// Exit 0, not a usage error: package validators like winget launch the installed
+		// binary with no args and flag any non-zero exit.
 		printUsage(os.Stdout)
 		return 0
 	}
@@ -167,21 +161,15 @@ Run 'eunox <subcommand> --help' for per-command flags.
 // proxy subcommand
 // -----------------------------------------------------------------
 
-// defaultMaxCallCounterKeys bounds the in-memory call counter's key set. Each
-// (session, tool) pair is one map entry, reclaimed only on the periodic Cleanup,
-// so a deployment minting a fresh session per request could otherwise grow the
-// map without bound and OOM. A backstop far above any realistic live-session
-// count, not a policy; --max-call-counter-keys tunes it (0 disables). A call
-// under a new key past the ceiling is refused — fail-closed for maxCalls,
-// fail-open for sequenceBlock (skipped antecedent leaves a later check unable to
-// block); see the threat model's "In-memory store footprint" note.
+// defaultMaxCallCounterKeys bounds the in-memory call counter's key set: each (session,
+// tool) pair is one map entry reclaimed only on periodic Cleanup, so an uncapped map could
+// OOM. A call under a new key past the ceiling fails closed for maxCalls, fail-open for
+// sequenceBlock; see the threat model's "In-memory store footprint" note.
 const defaultMaxCallCounterKeys = 1_000_000
 
-// defaultMaxSessions caps concurrent client sessions for the HTTP transport.
-// Each session owns one upstream subprocess or remote connection, so an uncapped
-// listener lets an unauthenticated client (off-loopback bind) spawn upstreams
-// without bound — a fork-bomb DoS. A backstop far above realistic use, not a
-// policy; tune via listen.maxSessions / --max-sessions, or 0 for uncapped.
+// defaultMaxSessions caps concurrent client sessions for the HTTP transport: each session
+// owns one upstream, so an uncapped listener lets an unauthenticated client fork-bomb the
+// proxy. Tune via listen.maxSessions / --max-sessions, or 0 for uncapped.
 const defaultMaxSessions = 512
 
 // proxyCLIFlags holds the parsed `proxy` subcommand flags. registerProxyFlags
@@ -225,21 +213,11 @@ type proxyCLIFlags struct {
 	strictDrift          *bool
 }
 
-// auditRequirement is the --require-audit value — a three-state knob over how
-// missing audit coverage is handled:
-//
-//	strict (default)  sink-open failure fatal at startup, plus a runtime
-//	                  fail-closed gate: once the audit trail degrades (record
-//	                  dropped under back-pressure, or a log write fails), every
-//	                  enforced call and */list enumeration is denied
-//	                  (AUDIT_UNAVAILABLE) rather than forwarded unrecorded.
-//	on                sink-open failure fatal at startup, but the runtime gate is
-//	                  off: a later dropped record is counted and warned, not denied.
-//	off               sink-open failure warns; the proxy continues unaudited.
-//
-// It implements flag.Value with IsBoolFlag so a bare/truthy --require-audit
-// selects "strict", the omitted default — the proxy fails closed on audit loss
-// out of the box.
+// auditRequirement is the --require-audit value — a three-state knob over how missing
+// audit coverage is handled: strict (default: sink-open failure fatal, plus a runtime
+// fail-closed gate once the audit trail degrades), on (fatal at startup only), or off
+// (warns and continues unaudited). Implements flag.Value with IsBoolFlag so a bare
+// --require-audit selects "strict".
 type auditRequirement int
 
 const (
@@ -385,42 +363,27 @@ Flags:
 	fs.PrintDefaults()
 }
 
-// cmdProxy runs the `proxy` subcommand and returns the process exit code (rather than
-// calling os.Exit itself), matching every other subcommand so tests can drive its
-// branches — including the fail-closed startup rejections — without terminating the
-// test binary. args carries the subcommand's own arguments (os.Args[2:] in a real
-// invocation), threaded from run.
-//
-// The return value is NAMED so the deferred audit-sink Close can fail the command: it
-// is the last thing to run, and a Close error means buffered records may not have
-// reached disk, which for an audit tool is the failure the product exists to prevent.
-// Returning normally (rather than calling os.Exit anywhere in here) is what guarantees
-// that flush happens at all — an os.Exit skips defers, which is why this function
-// previously needed a deferred-exit trick to get the flush and a non-zero status at
-// once.
+// cmdProxy runs the `proxy` subcommand, returning the exit code (rather than calling
+// os.Exit) so tests can drive every branch including the fail-closed startup rejections.
+// The return value is NAMED so the deferred audit-sink Close can fail the command: a Close
+// error means buffered records may not have reached disk, the failure an audit tool exists
+// to prevent.
 func cmdProxy(args []string) (exitCode int) {
-	// ContinueOnError, like every sibling subcommand: an ExitOnError flag set would
-	// terminate the process inside Parse, reintroducing exactly the untestable exit
-	// this function no longer has.
+	// ContinueOnError, like every sibling subcommand: ExitOnError would terminate the
+	// process inside Parse, reintroducing the untestable exit this function avoids.
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	fs.Usage = func() { printProxyUsage(fs) }
 
 	f := registerProxyFlags(fs)
 
-	// Parse the args run() threaded down, NOT the os.Args global. Under ExitOnError a
-	// caller that forgot to set os.Args killed the process loudly; under
-	// ContinueOnError the same mistake would quietly parse the surrounding binary's
-	// own flags (a test harness's -test.timeout, say) and return a usage error for a
-	// branch that was never reached. Taking the slice makes the dispatch contract
-	// run() documents actually hold for this subcommand.
+	// Parse the args run() threaded down, NOT the os.Args global — under ContinueOnError a
+	// forgotten slice would quietly parse the surrounding binary's own flags instead.
 	if err := fs.Parse(args); err != nil {
-		// Parse has already written the error and the usage text to stderr.
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
-		// 2 for a usage error, matching what the flag package's ExitOnError mode exited
-		// with before and `validate`'s documented convention: it keeps a misspelled flag
-		// distinguishable from a startup rejection (1).
+		// 2 for a usage error, matching validate's convention: distinguishable from a
+		// startup rejection (1).
 		return 2
 	}
 
@@ -429,9 +392,8 @@ func cmdProxy(args []string) (exitCode int) {
 		return 1
 	}
 
-	// Reject negative numeric limit flags at the flag leg, matching the config validator
-	// (gateway_config.go). Extracted into a pure helper so each guard is independently
-	// unit-testable.
+	// Matching the config validator (gateway_config.go); extracted so each guard is
+	// independently unit-testable.
 	if err := validateProxyNumericFlags(f); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
@@ -478,10 +440,8 @@ func cmdProxy(args []string) (exitCode int) {
 		sid = uuid.New().String()
 	}
 
-	// Detect every jwks-gated flag the operator activated, generically over the single
-	// jwksGatedFlags list (value detection for zero-default flags, explicit-set for the
-	// non-zero-default ones like --jwt-leeway), so the fail-closed guard below reads one
-	// precomputed list rather than re-enumerating each flag.
+	// Precomputed generically over jwksGatedFlags so the fail-closed guard below reads one
+	// list rather than re-enumerating each flag.
 	gatedJWTFlagsSet := gatedFlagsSetWithoutJWKS(fs)
 
 	pf := proxyFlags{
@@ -512,40 +472,26 @@ func cmdProxy(args []string) (exitCode int) {
 		httpOnlyFlagsSet:     httpOnlyFlagsSetOnStdio(fs),
 	}
 
-	// Fail closed if any JWT flag (including --jwt-experimental-capabilities) was supplied
-	// without --jwks-uri, so a forgotten --jwks-uri cannot leave the gateway serving
-	// unauthenticated while the operator believes JWT auth is on. One guard covers every
-	// jwks-gated flag so the set cannot drift. Transport-agnostic (also catches the stdio
-	// case, where --jwks-uri is itself rejected).
-	//
-	// Deliberately checked here, before buildCallCounterAndKillSwitch/
-	// openConfiguredAuditSink below: those have real side effects (a Redis
-	// connection attempt, minting a fresh audit key/log file on disk), so a flag
-	// error the operator can trivially fix should be reported before anything is
-	// touched, not after.
+	// Fail closed if any JWT flag was supplied without --jwks-uri, so a forgotten flag
+	// cannot leave the gateway serving unauthenticated. Checked before
+	// buildCallCounterAndKillSwitch/openConfiguredAuditSink, which have real side effects
+	// (a Redis dial, minting an audit key/log), so a trivially-fixable flag error is
+	// reported before anything is touched.
 	if err := validateJWTFlagsRequireJWKS(pf); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
 	}
 
-	// Reject a flag that cannot take effect under the configured host transport
-	// (--jwks-uri/--oauth-* and the HTTP-listener flags on stdio; --session-id on a
-	// gateway). Checked HERE, with the rest of the flag validation and before the first
-	// side effect, for the same reason as the two guards around it — cfg.HostTransport()
-	// is already known, and these rejections previously sat inside the serve functions,
-	// where they only fired after the Redis dial, the audit key/log creation, and the
-	// session-kill TTL publish had all already happened.
+	// Reject a flag that cannot take effect under the configured host transport, before
+	// the first side effect — these checks used to sit inside the serve functions, firing
+	// only after the Redis dial and audit key/log creation had already happened.
 	if err := validateTransportConditionalFlags(cfg.HostTransport(), pf); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
 	}
 
-	// Fail closed if a Redis-only flag (--killswitch-fail-open, --redis-password, …) was
-	// set without --redis-addr: those configure the Redis-backed counter/kill switch that
-	// is never built without the backend, so the operator's intent would silently
-	// evaporate. Checked here, before buildCallCounterAndKillSwitch, for the same reason
-	// as the JWT guard above — report a trivially-fixable flag error before anything with
-	// side effects (a Redis dial, minting an audit key) runs.
+	// Fail closed if a Redis-only flag was set without --redis-addr, before any side effect
+	// runs — same reasoning as the JWT guard above.
 	if err := validateRedisFlagsRequireRedisAddr(fs, *f.redisAddr); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
@@ -560,10 +506,8 @@ func cmdProxy(args []string) (exitCode int) {
 	}
 	counter, flowStore, ks, ksRedis := backends.counter, backends.flowStore, backends.killSwitch, backends.ksRedis
 	if rdb := backends.redis; rdb != nil {
-		// Release the connection pool on every exit below, not only the ping-failure
-		// path that already did it. Registered before the audit sink's defer so it runs
-		// AFTER that flush: the sink's close must not race a pool teardown the kill
-		// switch could still be reading through.
+		// Registered before the audit sink's defer so it runs AFTER that flush: the sink's
+		// close must not race a pool teardown the kill switch could still be reading through.
 		defer func() { _ = rdb.Close() }()
 	}
 
@@ -576,17 +520,12 @@ func cmdProxy(args []string) (exitCode int) {
 	}
 	if sink != nil {
 		defer func() {
-			// A Close failure means buffered records may not have reached disk. For
-			// an audit tool that silent loss is the failure mode the product exists
-			// to prevent, so surface it as a non-zero exit. This runs on every return
-			// path below (that is why the return is named), and last among the defers
-			// registered here, so it flushes after the kill switch has stopped.
+			// Registered last among the defers here, so it flushes after the kill switch
+			// has stopped.
 			if err := sink.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "[eunox] Fatal: audit sink close failed; the audit trail may be incomplete: %v\n", err)
-				// Only ever UPGRADE from success. A flush failure must not overwrite a
-				// more specific non-zero code the function already chose (this file
-				// already uses 2 for a usage error), which an unconditional assignment
-				// would silently rewrite to 1.
+				// Only ever UPGRADE from success; must not overwrite a more specific
+				// non-zero code (e.g. 2 for a usage error) the function already chose.
 				if exitCode == 0 {
 					exitCode = 1
 				}
@@ -595,24 +534,16 @@ func cmdProxy(args []string) (exitCode int) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// Both teardowns are deferred, not left to the signal goroutine below: that
-	// goroutine only runs when a signal actually arrives, so on every ordinary return
-	// (a serve error, or a clean shutdown) the context would otherwise stay live and
-	// the SIGINT/SIGTERM relay stay registered. In the binary that is invisible because
-	// the process exits — but cmdProxy now RETURNS rather than calling os.Exit, so an
-	// in-process caller would leak the ctx-bound cleanup goroutine (StartCleanup below)
-	// and, worse, keep the OS default signal disposition disabled for the whole process
-	// once Notify has diverted it. signal.Stop is idempotent, so the goroutine's own
-	// call remains correct.
+	// Both teardowns are deferred rather than left to the signal goroutine below, which
+	// only runs on an actual signal: cmdProxy RETURNS rather than calling os.Exit, so an
+	// in-process caller would otherwise leak the ctx-bound cleanup goroutine and keep the
+	// OS default signal disposition disabled once Notify has diverted it.
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
-	// stopSigWatch releases the relay goroutine on a signal-LESS return. It blocks on a
-	// channel nothing will ever send to once signal.Stop has un-registered the relay, so
-	// without this every in-process cmdProxy call leaks one goroutine for the life of the
-	// process — invisible in the binary (which exits), not in a host embedding this. Same
-	// pattern the live-upstream probe already uses for its own relay.
+	// Releases the relay goroutine on a signal-LESS return; without it every in-process
+	// cmdProxy call leaks one goroutine for the process's life.
 	stopSigWatch := make(chan struct{})
 	defer close(stopSigWatch)
 	go func() {
@@ -622,36 +553,23 @@ func cmdProxy(args []string) (exitCode int) {
 			return
 		}
 		cancel()
-		// Stop relaying SIGINT/SIGTERM into sigCh once the first one has triggered
-		// graceful shutdown: this goroutine only ever reads once, so without this a
-		// second signal (an operator's repeated Ctrl+C when a graceful shutdown
-		// hangs) is captured into the channel's one buffer slot and then silently
-		// swallowed forever — nothing reads it, and the OS's default terminate-on-
-		// signal behavior never gets a chance to run either, since Notify diverted
-		// it. Stop un-registers the relay, so a second signal reverts to the
-		// default behavior (immediate termination) — the operator's forced-kill
-		// escape hatch when graceful shutdown wedges.
+		// Stop relaying after the first signal triggers shutdown: this goroutine only
+		// ever reads once, so a second signal would otherwise be silently swallowed in
+		// the channel's one buffer slot. Un-registering reverts to the OS default
+		// (immediate termination) — the operator's forced-kill escape hatch.
 		signal.Stop(sigCh)
 	}()
 
-	// The effective session-kill TTL is published to shared Redis by the ready hook each
-	// transport invokes once it is actually standing — after the bind AND the control-token
-	// write for the gateway, after the upstream handshake and drift check for stdio — NOT
-	// here. The write overwrites whatever another instance published, so a process that dies
-	// on the way up — a rejected flag, a BuildRoutes failure, a bind collision, a missing
-	// upstream binary, a refused drift check — must not have written it: `eunox kill` and
-	// this proxy's own diagnostics would be left trusting a lifetime nothing enforces. That
-	// is the same clobber-then-die bug already fixed once for the control-token file, and it
-	// is why the hook is threaded all the way into the transports rather than called after
-	// the fallible startup steps that happen to precede this line.
+	// Published by the ready hook once the transport is actually standing (after the bind
+	// for the gateway, after the drift check for stdio) — NOT here — so a process that dies
+	// on the way up cannot overwrite a running proxy's advertised lifetime with one nothing
+	// enforces (the same clobber-then-die bug already fixed once for the control-token file).
 	onServeReady := func(context.Context) {}
 	if ksRedis != nil {
 		onServeReady = func(ctx context.Context) { publishSessionKillTTL(ctx, ksRedis) }
 		ksRedis.Start(ctx)
-		// Join the Redis kill-switch's pub/sub listener and reconcile loop on
-		// shutdown; otherwise they outlive cmdProxy and may touch the shared Redis
-		// client after teardown. Stop() blocks on wg.Wait. Registered after Start
-		// so (LIFO) it runs before earlier defers, while sink.Close stays last.
+		// Join the pub/sub listener and reconcile loop on shutdown, or they outlive
+		// cmdProxy. Registered after Start so (LIFO) it runs before earlier defers.
 		defer ksRedis.Stop()
 	}
 	startInMemorySweeps(ctx, counter, flowStore)
@@ -670,12 +588,9 @@ func cmdProxy(args []string) (exitCode int) {
 	return 0
 }
 
-// resolveRedisPassword returns the Redis AUTH password with flag > env precedence:
-// the explicit --redis-password flag if set, otherwise EUNOX_REDIS_PASSWORD. A
-// password passed via argv is world-readable in /proc/<pid>/cmdline for the
-// process's lifetime, so the env fallback (mirroring EUNOX_CONTROL_TOKEN and the
-// config ${VAR} expansion) lets an operator keep it off the command line. The flag
-// wins so an explicit value is never silently overridden by a stray env var.
+// resolveRedisPassword returns the Redis AUTH password with flag > env precedence. A
+// password passed via argv is world-readable in /proc/<pid>/cmdline, so the
+// EUNOX_REDIS_PASSWORD fallback lets an operator keep it off the command line.
 func resolveRedisPassword(flagVal string) string {
 	if flagVal != "" {
 		return flagVal
@@ -684,39 +599,22 @@ func resolveRedisPassword(flagVal string) string {
 }
 
 // buildCallCounterAndKillSwitch builds the shared call counter, flow-label store, and
-// kill-switch manager, Redis-backed when redisAddr is set (state survives restarts,
-// shared across instances) and in-memory otherwise. The flow-label store is a seam
-// distinct from the counter (session-lifetime provenance, not a sliding window) but is
-// wired from the same backend so a flow policy gets multi-instance parity exactly as
-// maxCalls/sequenceBlock do. ksRedis is non-nil only in
-// the Redis case, so cmdProxy can start its reconcile loop.
-//
-// The *goredis.Client is returned too (nil without --redis-addr) so the caller can
-// release the connection pool on EVERY exit path. Only the ping-failure branch closed
-// it before, on a rationale — "buildRedisClient hands back a live pool with its own
-// goroutines" — that applies just as much to the paths that succeed and later return.
-// In a long-running proxy the process exit collects it either way; for the in-process
-// callers this function was made returnable FOR, one pool and its dialer accumulated
-// per call.
-//
-// A Redis config or connectivity error is returned rather than exited on, so the
-// caller owns the exit code and the failure path is drivable from a test.
-// upstreamBackends bundles the shared decision state buildCallCounterAndKillSwitch
-// wires. A struct rather than a return list: the list had grown to six values, two of
-// which encode the same bit (ksRedis and redis are both non-nil exactly when
-// --redis-addr is set), so cmdProxy tested one condition under two names and a reader
-// could not tell which was authoritative. The next backend would have made it seven.
+// kill-switch manager, Redis-backed when redisAddr is set and in-memory otherwise. ksRedis
+// is non-nil only in the Redis case, so cmdProxy can start its reconcile loop. The
+// *goredis.Client is returned too (nil without --redis-addr) so the caller can release the
+// connection pool on EVERY exit path, not only the ping-failure branch. A Redis config or
+// connectivity error is returned rather than exited on, so the failure path is testable.
+// upstreamBackends bundles the shared decision state. A struct rather than a six-value
+// return list: two of those values encoded the same bit (ksRedis/redis both non-nil
+// exactly when --redis-addr is set), so a reader could not tell which was authoritative.
 type upstreamBackends struct {
 	counter    capability.CallCounter
 	flowStore  capability.FlowLabelStore
 	killSwitch killswitch.Manager
-	// ksRedis is the Redis kill switch, non-nil only with --redis-addr, so cmdProxy can
-	// start its reconcile loop and publish the session-kill TTL.
+	// ksRedis is the Redis kill switch, non-nil only with --redis-addr.
 	ksRedis *killswitch.Redis
 	// redis is the shared connection pool behind counter/flowStore/ksRedis, non-nil only
-	// with --redis-addr. The CALLER owns closing it — buildRedisClient hands back live
-	// goroutines, and every return path here, not just the ping failure, must release
-	// them.
+	// with --redis-addr. The CALLER owns closing it on every return path.
 	redis *goredis.Client
 }
 
@@ -727,19 +625,11 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 	stderrLog := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	var (
 		counter capability.CallCounter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
-		// WithMaxKeys is the flow store's fail-closed admission ceiling, sized to the same
-		// bound as the counter, and the logger is what makes the approach to it visible: at
-		// the ceiling every new anchor's first labelled call fails closed, and an operator
-		// who learns that from a denied call has already hit the cliff.
-		//
-		// The idle bound is enabled ONLY under task anchoring, and that scoping is the
-		// point rather than caution. A session-anchored key already has a reclamation path
-		// — the transport's teardown — so expiring it would age a taint out from under a
-		// session that is merely quiet, which is the fail-open this store exists to
-		// prevent. A TASK-anchored key has no teardown owner at all (reclaiming it on
-		// disconnect would let an agent launder a task's taint by reconnecting), so an
-		// idle bound is the only reclamation it can safely have, and without one the
-		// ceiling above is an availability cliff a long-lived proxy walks into.
+		// WithMaxKeys is the flow store's fail-closed admission ceiling. The idle bound is
+		// enabled ONLY under task anchoring: a session-anchored key already reclaims via
+		// teardown, but a task-anchored key has no teardown owner (reclaiming on disconnect
+		// would let an agent launder a task's taint by reconnecting), so idle expiry is the
+		// only safe reclamation it can have.
 		flowStore capability.FlowLabelStore = flowlabelstore.NewInMemory(
 			append(flowStoreOptions(taskAnchored),
 				flowlabelstore.WithMaxKeys(maxCallCounterKeys),
@@ -755,38 +645,23 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 			return upstreamBackends{}, fmt.Errorf("Redis configuration error: %w", err) //nolint:staticcheck // ST1005: "Redis" is a proper noun, not a capitalized sentence
 		}
 		if err := pingRedis(context.Background(), rdb); err != nil {
-			// Close the client before abandoning it: buildRedisClient hands back a live
-			// connection pool with its own goroutines. This branch used to call os.Exit,
-			// which made the leak unobservable; now that it returns, an in-process caller
-			// (the tests this function was made returnable for) would accumulate one pool
-			// and its dialer per failed attempt. Mirrors the kill subcommand's client.
+			// Close before abandoning: buildRedisClient hands back a live connection pool
+			// with its own goroutines, which an in-process caller would otherwise accumulate.
 			_ = rdb.Close()
 			return upstreamBackends{}, err
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Redis backend enabled (%s). State persists across restarts.\n", redisAddr)
 		counter = callcounter.NewRedis(rdb)
-		// Share the same client: a Redis flow store gives a flow policy the same
-		// multi-instance parity as the counter (a source on one instance, a sink on
-		// another), and reclaims an orphaned session's set by idle TTL if Clear never lands.
+		// Share the same client so a flow policy gets the same multi-instance parity as
+		// the counter, and reclaims an orphaned session's set by idle TTL if Clear never lands.
 		flowStore = flowlabelstore.NewRedis(rdb)
-		// WithReconcileInterval(0) keeps the default; a positive value tunes kill
-		// propagation and (fail-closed) the post-recovery denial window.
-		//
-		// WithLogger wires a real logger so the kill switch's degraded-mode breadcrumbs
-		// (initial-refresh-failed, pub/sub-subscription-unconfirmed, background-refresh
-		// failed/recovered) actually emit: every one is gated on a non-nil logger, so
-		// without this an operator watching for a Redis partition sees nothing in the log
-		// (HealthStatus on /healthz still reflects the state). Structured stderr matches
-		// where the other [eunox] startup lines already go.
+		// WithLogger: the kill switch's degraded-mode breadcrumbs are gated on a non-nil
+		// logger, so without this an operator watching for a Redis partition sees nothing.
 		ksRedis = killswitch.NewRedis(rdb,
 			killswitch.WithFailOpen(killswitchFailOpen),
 			killswitch.WithReconcileInterval(killswitchReconcile),
-			// WithSessionKillTTL(0) keeps the 30-day default. It is wired to a flag rather
-			// than left hardwired because the expiry LIFTS the kill: a deployment that pins
-			// and reuses one --session-id (the normal way to run a long-lived stdio agent)
-			// can outlive the default, and the revoked session is then re-admitted with no
-			// operator action. Both directions need to be reachable -- raise it past the
-			// longest session, or make it permanent -- so it cannot be a constant.
+			// Wired to a flag rather than hardwired: expiry LIFTS the kill, and a deployment
+			// pinning one --session-id can outlive the default, re-admitting a revoked session.
 			killswitch.WithSessionKillTTL(killswitchSessionTTL),
 			killswitch.WithLogger(stderrLog))
 		ks = ksRedis
@@ -798,21 +673,16 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 		if killswitchReconcile > 0 {
 			fmt.Fprintf(os.Stderr, "[eunox] Kill switch: reconcile interval %s (--killswitch-reconcile-interval); bounds kill-propagation and fail-closed post-recovery denial windows.\n", killswitchReconcile)
 		}
-		// State the session-tombstone lifetime unconditionally, including the default. It
-		// is the one kill-switch setting whose expiry LIFTS a revocation, so an operator
-		// running a pinned, reused --session-id needs to see the number without having to
-		// know the flag exists to ask for it.
+		// Stated unconditionally, including the default: the one kill-switch setting whose
+		// expiry LIFTS a revocation, so an operator needs to see the number unprompted.
 		fmt.Fprintf(os.Stderr, "[eunox] Kill switch: %s (--killswitch-session-ttl). Agent kills never expire.\n", sessionKillTTLNotice(killswitchSessionTTL))
-		// The TTL is published later, from cmdProxy, once startup is past every step
-		// that can still fail and exit the process — see that call site.
+		// Published later, from cmdProxy, once startup is past every step that can fail.
 	}
 	return upstreamBackends{counter: counter, flowStore: flowStore, killSwitch: ks, ksRedis: ksRedis, redis: rdb}, nil
 }
 
 // flowStoreOptions returns the anchor-lifetime options for the in-memory flow store: an
-// idle bound under task anchoring, and none otherwise. It is a function rather than an
-// inline conditional so the reason lives in one place — see the call site, and
-// flowlabelstore.WithMemoryIdleTTL for why the default is off.
+// idle bound under task anchoring, none otherwise. See the call site for why.
 func flowStoreOptions(taskAnchored bool) []flowlabelstore.InMemoryOption {
 	if !taskAnchored {
 		return nil
@@ -821,14 +691,10 @@ func flowStoreOptions(taskAnchored bool) []flowlabelstore.InMemoryOption {
 }
 
 // startInMemorySweeps arms the background reclamation for whichever in-process backends are
-// in use, and is a no-op for the Redis ones (which reclaim by TTL server-side).
-//
-// The flow store's sweep is the one that is easy to miss the point of: the lazy expiry on
-// its access paths never runs for an anchor nothing accesses AGAIN, which is precisely what
-// an abandoned one is — a task whose agent has stopped using it, with no teardown that owns
-// it. Without the sweep the map holds every such task until it hits the admission ceiling,
-// after which every flow-relevant source call fails closed for the life of the process. The
-// store declines to start one when it expires nothing at all, which is the default.
+// in use; a no-op for the Redis ones (TTL server-side). The flow store's sweep matters most:
+// lazy expiry never runs for an abandoned task nothing accesses again, so without the sweep
+// the map holds every such task until it hits the admission ceiling and every flow-relevant
+// call fails closed.
 func startInMemorySweeps(ctx context.Context, counter capability.CallCounter, flowStore capability.FlowLabelStore) {
 	if mem, ok := counter.(*callcounter.InMemory); ok {
 		mem.StartCleanup(ctx, callcounter.DefaultCleanupInterval)
@@ -838,27 +704,11 @@ func startInMemorySweeps(ctx context.Context, counter capability.CallCounter, fl
 	}
 }
 
-// publishSessionKillTTL advertises the effective session-tombstone lifetime on the
-// shared Redis so `eunox kill --redis-addr` writes tombstones with the SAME lifetime.
-// That command is the only out-of-band revocation channel a stdio proxy has, so it
-// writes tombstones itself; as two independent flags the pair could disagree with no
-// diagnostic, and the disagreement fails one way — the CLI's shorter default expires a
-// kill the operator configured to outlast it, silently re-admitting the session.
-//
-// Advisory, so a failure warns rather than aborts startup: this proxy enforces its own
-// configured value regardless, and the CLI falls back to its flag exactly as it did
-// before the key existed. A prior value that differs is reported too — the key is
-// last-writer-wins, so two differently configured proxies on one Redis leave `eunox
-// kill` adopting whichever started last.
-//
-// parent is the ready hook's context, and the write is bounded BY it rather than detached
-// from it. That is what makes the abandonment case safe: the gateway's post-bind hook runs
-// on its own goroutine and is abandoned at hookCtx expiry, so a caller that merely CHECKED
-// ctx.Err() before calling would still let a doomed proxy's SET land — replacing a running
-// proxy's advertised TTL with one nothing enforces, exactly the clobber this hook's
-// placement exists to prevent. Deriving from parent cancels the round-trip instead. The 5s
-// cap still applies on top, so a Redis that answered PING and then stalled cannot hang the
-// boot even when parent has no deadline.
+// publishSessionKillTTL advertises the effective session-tombstone lifetime on shared Redis
+// so `eunox kill --redis-addr` writes tombstones with the SAME lifetime; as two independent
+// flags they could otherwise disagree, silently re-admitting a revoked session. Advisory —
+// a failure warns rather than aborts startup. Bounded by parent (the ready hook's context,
+// not a detached one) so an abandoned hook's write cannot land after the proxy has died.
 func publishSessionKillTTL(parent context.Context, ksRedis *killswitch.Redis) {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
@@ -874,10 +724,8 @@ func publishSessionKillTTL(parent context.Context, ksRedis *killswitch.Redis) {
 }
 
 // sessionKillTTLNotice renders the startup line describing how long a session-kill
-// tombstone survives, resolving the flag's two sentinel values through the same
-// killswitch.NormalizeSessionKillTTL the option applies (0 = the 30-day default,
-// negative = never expire) so the banner cannot claim one lifetime while Redis
-// enforces another.
+// tombstone survives, resolved through the same normalizer the option applies so the
+// banner cannot claim one lifetime while Redis enforces another.
 func sessionKillTTLNotice(ttl time.Duration) string {
 	effective := killswitch.NormalizeSessionKillTTL(ttl)
 	if effective == 0 {
@@ -900,22 +748,16 @@ func warnAuditFlagOverridden(flagName, flagRepr, cfgField, cfgRepr string) {
 	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %s is overridden by the config's %s %s; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", flagName, flagRepr, cfgField, cfgRepr)
 }
 
-// openConfiguredAuditSink resolves the audit-sink settings (config's audit block
-// takes precedence over the CLI flags so every route shares one tape) and opens
-// the sink. Under --require-audit an open failure is returned as an error for the
-// caller to exit on (fail closed); otherwise it warns and returns a nil sink with a
-// nil error, so the proxy continues unaudited.
+// openConfiguredAuditSink resolves the audit-sink settings (config's audit block takes
+// precedence over the CLI flags so every route shares one tape) and opens the sink. Under
+// --require-audit an open failure is returned as an error to exit on (fail closed);
+// otherwise it warns and returns a nil sink with a nil error.
 func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated
-	// The config's audit block takes precedence over an explicit --audit-log/
-	// --audit-key-path flag here (unlike the reader subcommands — suggest, stats,
-	// audit-verify — where applyConfigAuditDefaults leaves an explicitly-set flag
-	// untouched and the config only fills an EMPTY one). That inversion is
-	// intentional for `proxy` (every route must share one tape, so the config is
-	// authoritative), but a silently-overridden explicit flag is easy to miss —
-	// warn so an operator who passed --audit-log expecting it to be honored sees
-	// why it wasn't.
+	// The config's audit block takes precedence over an explicit flag here (unlike the
+	// reader subcommands, which leave an explicit flag untouched) since every route must
+	// share one tape — but warn, since a silently-overridden flag is easy to miss.
 	if cfg.Audit.Log != "" {
 		if auditLog != "" && auditLog != cfg.Audit.Log {
 			warnAuditFlagOverridden("--audit-log", fmt.Sprintf("%q", auditLog), "audit.log", fmt.Sprintf("%q", cfg.Audit.Log))
@@ -928,11 +770,7 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 		}
 		auditKey = cfg.Audit.KeyPath
 	}
-	// Warn on a silently-overridden explicit flag here too. These two are overridden by
-	// the same config-wins rule as --audit-log/--audit-key-path above, and an operator who
-	// passed a rotation size or retention count and got the config's instead has exactly
-	// the same "why wasn't my flag honored" question — it was only the two string flags
-	// that said so.
+	// Warn on a silently-overridden explicit flag here too, same rule as above.
 	if cfg.Audit.RotateSizeBytes > 0 {
 		// 0 is this flag's "use the built-in default" spelling, so a non-zero value is an
 		// explicit one (same test the string flags use against "").
@@ -941,15 +779,9 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 		}
 		auditRotate = cfg.Audit.RotateSizeBytes
 	}
-	// A present config value wins, including an explicit 0 ("keep all rotated files"),
-	// so config can disable a non-zero --audit-retain flag; an absent key (nil) leaves
-	// the flag's value in force. config.ResolveInt holds exactly this precedence rule
-	// (shared with maxSessions/sessionIdleTimeout), so the audit-retention path cannot
-	// drift from the other resolved options.
-	//
-	// Explicitness comes from auditRetainSet (flagWasSet), not from a non-zero value: 0 is
-	// a MEANINGFUL setting here ("keep all"), so an operator can be overridden while
-	// passing the flag's zero value.
+	// A present config value wins, including an explicit 0 ("keep all"), via
+	// config.ResolveInt (shared with maxSessions/sessionIdleTimeout). Explicitness comes
+	// from auditRetainSet, not a non-zero value, since 0 is meaningful here too.
 	if cfg.Audit.RetainRotated != nil && auditRetainSet && *cfg.Audit.RetainRotated != auditRetain {
 		warnAuditFlagOverridden("--audit-retain", fmt.Sprintf("%d", auditRetain), "audit.retainRotated", fmt.Sprintf("%d", *cfg.Audit.RetainRotated))
 	}
@@ -965,22 +797,16 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 	return sink, nil
 }
 
-// buildAuditWiretapConfig synthesizes a zero-config `transport: stdio` gateway
-// in audit (observe) mode from the operator's --audit arguments. Exactly one
-// upstream is configured: a subprocess (positional args after `--`) or a remote
-// HTTP server (--upstream-url). No manifest is referenced — every call is
-// forwarded and logged, nothing is blocked. Used by `proxy --audit`.
+// buildAuditWiretapConfig synthesizes a zero-config `transport: stdio` gateway in audit
+// (observe) mode from the operator's --audit arguments. Exactly one upstream is configured
+// (subprocess or --upstream-url); no manifest is referenced. Used by `proxy --audit`.
 func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string, tlsSkipVerify bool) (*config.GatewayConfig, error) {
 	if len(positional) > 0 && upstreamURL != "" {
 		return nil, fmt.Errorf("--audit: pick exactly one upstream — positional `-- <command>` OR --upstream-url, not both")
 	}
-	// Reject a whitespace-only credential HERE, as an operator flag error. The value is
-	// copied verbatim into the synthesized config below, where Validate's own
-	// whitespace-only guard would also reject it — but that failure is reported as
-	// "internal: synthesized wiretap config rejected", the marker reserved for "the
-	// binary built something invalid, file a bug". A shell-quoting slip in
-	// --upstream-auth-header is the operator's to fix, not a eunox defect, so it must
-	// not be dressed up as one.
+	// Reject a whitespace-only credential HERE, as an operator flag error, rather than let
+	// Validate's own guard report it as "internal: synthesized wiretap config rejected" —
+	// the marker reserved for "the binary built something invalid".
 	if authHeader != "" && strings.TrimSpace(authHeader) == "" {
 		return nil, fmt.Errorf("--upstream-auth-header is whitespace-only, which is not a usable credential — pass a real header value, or omit the flag to forward no auth header")
 	}
@@ -992,10 +818,8 @@ func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string
 	u := config.UpstreamConfig{Name: "wiretap"}
 	switch {
 	case len(positional) > 0:
-		// --upstream-auth-header/--upstream-tls-skip-verify configure a REMOTE HTTP
-		// upstream; a positional subprocess upstream has neither, so they would be
-		// silently dropped. Reject rather than let the operator believe an auth header or
-		// a TLS posture took effect (matches buildInitUpstreamSpec's stdio rejection).
+		// A positional subprocess upstream has neither auth header nor TLS posture, so
+		// reject rather than let the operator believe either took effect.
 		if authHeader != "" || tlsSkipVerify {
 			return nil, fmt.Errorf("--audit: --upstream-auth-header/--upstream-tls-skip-verify apply only to a remote --upstream-url upstream, not a positional `-- <command>` subprocess")
 		}
@@ -1019,10 +843,9 @@ func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string
 	return cfg, nil
 }
 
-// flagWasSet reports whether the named flag was passed explicitly on the command line
-// (flag.Visit visits only the flags that were set), for flags whose default value cannot
-// distinguish "explicitly set to the default" from "unset" — e.g. --jwt-leeway (non-zero
-// default) and --transport.
+// flagWasSet reports whether the named flag was passed explicitly (flag.Visit visits only
+// flags that were set), for flags whose default cannot distinguish "explicitly set to the
+// default" from "unset" (e.g. --jwt-leeway).
 func flagWasSet(fs *flag.FlagSet, name string) bool {
 	set := false
 	fs.Visit(func(f *flag.Flag) {
@@ -1033,11 +856,9 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 	return set
 }
 
-// jwksGatedFlags is the single authoritative list of flag names that require --jwks-uri:
-// each configures bearer-token validation (or the experimental capability intersection),
-// which runs ONLY when --jwks-uri stands up the JWT authenticator. validateJWTFlagsRequireJWKS
-// is the one guard that reads it; keeping the names here (and every jwks-gated flag listed)
-// stops a second, parallel guard from drifting out of sync.
+// jwksGatedFlags is the single authoritative list of flag names that require --jwks-uri.
+// validateJWTFlagsRequireJWKS is the one guard that reads it, so a second parallel guard
+// cannot drift out of sync.
 var jwksGatedFlags = []string{
 	"jwt-issuer",
 	"jwt-audience",
@@ -1048,16 +869,10 @@ var jwksGatedFlags = []string{
 	"jwt-leeway",
 }
 
-// flagDefaultIsZero reports whether a flag's default is its type's zero value, by
-// comparing DefValue to the stdlib zero renderings for the flag types every gated flag
-// uses: string (""), int ("0"), bool ("false"), and time.Duration ("0s"). Every flag in
-// jwksGatedFlags is one of these, so the set is exhaustive for the project's flags and
-// trivially reviewable; a future gated flag whose type renders its zero differently (an
-// enum "none", a slice "[]", …) must add that rendering here.
-//
-// A zero-default flag can be detected by VALUE (a non-zero value can only come from
-// the operator, and an explicit --flag=<zero> carries no JWT intent so it is spared);
-// a non-zero-default flag cannot, so it must be detected by explicit-set.
+// flagDefaultIsZero reports whether a flag's default is its type's zero value, comparing
+// DefValue against the stdlib zero renderings (string/int/bool/duration). A zero-default
+// flag can be detected by VALUE; a non-zero-default flag needs explicit-set detection
+// instead, since value alone can't distinguish a chosen default from unset.
 func flagDefaultIsZero(f *flag.Flag) bool {
 	switch f.DefValue {
 	case "", "0", "false", "0s":
@@ -1067,32 +882,17 @@ func flagDefaultIsZero(f *flag.Flag) bool {
 	}
 }
 
-// gatedFlagsSetWithoutJWKS returns the "--"-prefixed names of every jwks-gated flag
-// that the operator activated, driving BOTH detection halves off the single
-// jwksGatedFlags list so the two inventories cannot drift: a new gated flag added to
-// jwksGatedFlags is guarded automatically, with no second per-flag block to forget.
-// Detection is chosen per flag by how the operator's intent is observable:
-//
-//   - zero-default flag (string/bool/…): active when its current value differs from its
-//     zero default (value detection). This spares an explicit --flag=false/"" that
-//     carries no JWT intent, unlike a pure explicit-set model.
-//   - non-zero-default flag (e.g. --jwt-leeway): value detection is blind (its default
-//     already differs from zero, so --flag=<default> looks like unset), so it is active
-//     when passed explicitly — including --flag=<default> — the fail-safe direction.
-//
-// A pure function of the parsed FlagSet for testability.
+// gatedFlagsSetWithoutJWKS returns the "--"-prefixed names of every jwks-gated flag the
+// operator activated, driving both detection halves off jwksGatedFlags so a newly gated
+// flag is covered automatically. A pure function of the parsed FlagSet for testability.
 func gatedFlagsSetWithoutJWKS(fs *flag.FlagSet) []string {
 	return explicitlyActiveFlags(fs, jwksGatedFlags)
 }
 
-// explicitlyActiveFlags returns the "--"-prefixed names of every flag in names
-// that the operator activated: a zero-default flag (see flagDefaultIsZero) is
-// detected by VALUE (a non-zero value can only come from the operator), while a
-// non-zero-default flag (e.g. --max-sessions, whose default is
-// defaultMaxSessions, not 0) is detected by explicit-set (fs.Visit), since value
-// alone cannot distinguish an operator-chosen default from an unset flag. Shared
-// by gatedFlagsSetWithoutJWKS (jwksGatedFlags) and httpOnlyFlagsSetOnStdio
-// (httpOnlyProxyFlags) so the two detection halves cannot drift apart.
+// explicitlyActiveFlags returns the "--"-prefixed names of every flag in names that the
+// operator activated: value detection for a zero-default flag, explicit-set for a
+// non-zero-default one (see flagDefaultIsZero). Shared by gatedFlagsSetWithoutJWKS and
+// httpOnlyFlagsSetOnStdio so the two detection halves cannot drift apart.
 func explicitlyActiveFlags(fs *flag.FlagSet, names []string) []string {
 	var out []string
 	for _, name := range names {
@@ -1113,15 +913,9 @@ func explicitlyActiveFlags(fs *flag.FlagSet, names []string) []string {
 	return out
 }
 
-// httpOnlyProxyFlags is the single authoritative list of flag names that apply
-// only to transport: http (the gateway shape): each configures HTTP-listener
-// behavior a stdio host has no socket to apply. serveStdioHost's rejection guard
-// reads this list (alongside the --jwks-uri/--oauth-* flags it already rejects
-// directly, which stand up JWT/OAuth-metadata serving rather than merely
-// configuring an already-standing listener), so a future HTTP-only flag added
-// here is covered automatically instead of silently no-oping on a stdio host —
-// the fate these five (control-token-path, session-idle-timeout, max-sessions,
-// unsafe-bind-all, trust-forwarded-for) suffered before this list existed.
+// httpOnlyProxyFlags is the single authoritative list of flag names that apply only to
+// transport: http; serveStdioHost's rejection guard reads it so a future HTTP-only flag is
+// covered automatically instead of silently no-oping on a stdio host.
 var httpOnlyProxyFlags = []string{
 	"control-token-path",
 	"session-idle-timeout",
@@ -1138,23 +932,13 @@ func httpOnlyFlagsSetOnStdio(fs *flag.FlagSet) []string {
 }
 
 // validateTransportConditionalFlags rejects flags that cannot take effect under the
-// configured host transport. Every one of them is a silent no-op otherwise, which would
-// let an operator believe a security-relevant setting (JWT validation, a fixed session ID,
-// a control-token path) took effect when nothing reads it.
-//
-// It runs from cmdProxy the moment the transport is known — right after the config loads,
-// BEFORE the Redis dial, the audit key/log creation, and the session-kill TTL publish.
-// These checks used to live inside the serve functions, i.e. after all of that: a doomed
-// process (one stray flag) still dialed Redis, minted or opened an audit log, and
-// published its TTL over a running proxy's value before failing. Validation belongs before
-// side effects; cmdProxy's own comment already claimed this ordering, and this is what
-// makes the claim true for the transport-conditional half.
+// configured host transport — each would otherwise silently no-op, letting an operator
+// believe a security-relevant setting took effect. Runs from cmdProxy the moment the
+// transport is known, before the Redis dial and audit key/log creation.
 func validateTransportConditionalFlags(hostTransport string, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	if hostTransport == config.HostTransportHTTP {
-		// --session-id is a stdio-only concept (a gateway mints its own Mcp-Session-Id
-		// per client session, per-route). pf.sessionIDSet (not pf.sessionID, which is
-		// never empty — cmdProxy falls back to a fresh UUID when the flag is unset)
-		// tracks whether the operator actually passed it.
+		// pf.sessionIDSet (not pf.sessionID, which is never empty — cmdProxy falls back to
+		// a fresh UUID) tracks whether the operator actually passed it.
 		if pf.sessionIDSet {
 			return fmt.Errorf("--session-id requires transport: stdio (a gateway mints its own Mcp-Session-Id per client session)")
 		}
@@ -1174,29 +958,19 @@ func validateTransportConditionalFlags(hostTransport string, pf proxyFlags) erro
 	if pf.oauthAuthzServer != "" {
 		return fmt.Errorf("--oauth-authorization-server requires transport: http (a stdio host has no HTTP listener)")
 	}
-	// Every other HTTP-only flag (--control-token-path, --session-idle-timeout,
-	// --max-sessions, --unsafe-bind-all, --trust-forwarded-for): all configure the
-	// HTTP listener this stdio host does not stand up, so — like --jwks-uri and
-	// the --oauth-* flags above — silently accepting them would let an operator
-	// believe they took effect. httpOnlyFlagsSetOnStdio (precomputed into
-	// pf.httpOnlyFlagsSet) is the single source of truth for this list, so a
-	// future HTTP-only flag added there is covered automatically.
+	// Every other HTTP-only flag: httpOnlyFlagsSetOnStdio (precomputed into
+	// pf.httpOnlyFlagsSet) is the single source of truth, so a future HTTP-only flag is
+	// covered automatically.
 	if len(pf.httpOnlyFlagsSet) > 0 {
 		return fmt.Errorf("%s requires transport: http (a stdio host has no HTTP listener)", strings.Join(pf.httpOnlyFlagsSet, ", "))
 	}
 	return nil
 }
 
-// redisGatedFlags is the single authoritative list of proxy flags that take effect
-// ONLY when --redis-addr configures a Redis backend: each is read inside the
-// `redisAddr != ""` branch of buildCallCounterAndKillSwitch, so without --redis-addr
-// the proxy runs on the in-memory call counter / kill switch and every one is silently
-// dropped. An operator who sets --killswitch-fail-open expecting a fail-open outage
-// posture, or --redis-password expecting an authenticated connection, gets neither and
-// no diagnostic. (--max-call-counter-keys is deliberately NOT here: it is the inverse —
-// active in-memory and ignored WHEN --redis-addr is set — so it is meaningful without
-// Redis.) cmdKill already rejects the redis-password/redis-tls mix without --redis-addr;
-// this is the proxy-path equivalent.
+// redisGatedFlags is the single authoritative list of proxy flags that take effect ONLY
+// when --redis-addr configures a Redis backend; without it each is silently dropped.
+// --max-call-counter-keys is deliberately NOT here — it's the inverse, meaningful without
+// Redis.
 var redisGatedFlags = []string{
 	"redis-password",
 	"redis-tls",
@@ -1206,24 +980,10 @@ var redisGatedFlags = []string{
 }
 
 // validateProxyNumericFlags rejects negative values for the proxy's numeric limit flags,
-// matching the config validator (gateway_config.go): each of these treats <= 0 as
-// "unlimited / disabled / use-the-default", so a NEGATIVE value silently does the
-// opposite of the operator's intent —
-//
-//   - --max-sessions / --session-idle-timeout / --max-call-counter-keys: a negative
-//     silently disables the documented cap (a fail-open the config leg refuses).
-//   - --shutdown-timeout: the transports clamp a non-positive value to the 5000ms
-//     default, so a negative silently becomes the opposite of a "shorter grace" intent.
-//   - --upstream-timeout: this one has a legitimate NEGATIVE sentinel
-//     (transport.UpstreamTimeoutUnset, -1) meaning "defer to the config", so only values
-//     BELOW it are rejected. ResolveUpstreamTimeout defers on any negative, so a sign typo
-//     for a 5s bound (--upstream-timeout -5000) silently became the 30s default — the
-//     same silent-opposite-of-intent the other three guards exist to catch.
-//
-// Returns the first offending flag's error (without the "eunox proxy: " prefix the caller
-// adds), or nil. A pure function so every guard is unit-testable independently of
-// cmdProxy, which reports it and returns exit code 1. 0 stays a valid
-// "unlimited / disabled / default" spelling for every flag.
+// matching the config validator: each treats <= 0 as "unlimited/disabled/default", so a
+// negative value would silently do the opposite of the operator's intent. --upstream-timeout
+// is the exception with a legitimate negative sentinel (transport.UpstreamTimeoutUnset), so
+// only values below it are rejected. A pure function so every guard is unit-testable.
 func validateProxyNumericFlags(f *proxyCLIFlags) error {
 	switch {
 	case *f.maxSessions < 0:
@@ -1236,21 +996,14 @@ func validateProxyNumericFlags(f *proxyCLIFlags) error {
 		return errors.New("--shutdown-timeout must be >= 0 (0 = use the default)")
 	case *f.upstreamTimeout < transport.UpstreamTimeoutUnset:
 		return fmt.Errorf("--upstream-timeout must be >= %d (0 disables the timeout, %d defers to the config); a value below that is not a sentinel and would silently defer instead of setting the bound you meant", transport.UpstreamTimeoutUnset, transport.UpstreamTimeoutUnset)
-	// The two audit knobs mirror the config's fail-closed rejection (Validate rejects a
-	// negative audit.rotateSizeBytes / audit.retainRotated). They live HERE, with every
-	// other numeric flag guard, rather than as a second pair of inline checks in cmdProxy
-	// with their own error-printing: a negative value silently coerces in audit.Open
-	// (rotate-size < 0 -> the 100 MiB default, retain < 0 -> keep-all), which hides the
-	// operator's misconfiguration, and that is the same class this function exists for.
+	// Mirrors the config's fail-closed rejection: audit.Open silently coerces a negative
+	// value (rotate-size -> 100 MiB default, retain -> keep-all), hiding a misconfiguration.
 	case *f.auditRotateSize < 0:
 		return errors.New("--audit-rotate-size must be >= 0 (0 = use the default size)")
 	case *f.auditRetainRotated < 0:
 		return errors.New("--audit-retain must be >= 0 (0 = keep all rotated files)")
-	// A DURATION flag, guarded here for the same reason as the ints beside it: the Redis
-	// kill switch clamps a non-positive reconcile interval to the 30s default, so a sign
-	// typo meant to SHORTEN the kill-propagation (and fail-closed recovery) window
-	// silently produced the default instead, with no diagnostic, on a revocation-latency
-	// knob.
+	// The Redis kill switch clamps a non-positive reconcile interval to the 30s default, so
+	// a sign typo meant to shorten it silently produces the default with no diagnostic.
 	case *f.killswitchReconcile < 0:
 		return errors.New("--killswitch-reconcile-interval must be >= 0 (0 = use the 30s default)")
 	}
@@ -1258,13 +1011,9 @@ func validateProxyNumericFlags(f *proxyCLIFlags) error {
 }
 
 // validateRedisFlagsRequireRedisAddr fails closed when any Redis-gated proxy flag is set
-// without --redis-addr. Without the backend those flags are silently ignored (the proxy
-// falls back to in-memory state), so an operator's fail-open/auth/TLS/reconcile intent
-// evaporates unobserved — the exact silent-drop the fail-loud posture elsewhere (the
-// --audit/--config and JWT-without-JWKS guards) refuses. Reject the mismatch at startup.
-// A no-op when --redis-addr is set or no such flag was given. Detection is driven off the
-// single redisGatedFlags list via explicitlyActiveFlags (value detection for these
-// zero-default flags), so a new Redis-only flag added to the list is guarded automatically.
+// without --redis-addr — without the backend those flags are silently ignored, so an
+// operator's fail-open/auth/TLS/reconcile intent evaporates unobserved. A no-op when
+// --redis-addr is set or no such flag was given.
 func validateRedisFlagsRequireRedisAddr(fs *flag.FlagSet, redisAddr string) error {
 	if redisAddr != "" {
 		return nil
@@ -1293,10 +1042,8 @@ type proxyFlags struct {
 	jwtAllowAnyIssuer               bool
 	jwtLeeway                       time.Duration
 	// gatedJWTFlagsSet holds the "--"-prefixed names of every jwks-gated flag the operator
-	// activated, precomputed generically from the FlagSet by gatedFlagsSetWithoutJWKS
-	// (both value- and explicit-set detection). The require-jwks guard reads this list
-	// directly rather than re-enumerating each flag, so both halves of the guard are
-	// driven off the single jwksGatedFlags inventory and cannot drift.
+	// activated, precomputed by gatedFlagsSetWithoutJWKS so the require-jwks guard can't
+	// drift from the jwksGatedFlags inventory.
 	gatedJWTFlagsSet                []string
 	jwksAllowInsecure               bool
 	jwtExperimentalCaps             bool // --jwt-experimental-capabilities: enable the EXPERIMENTAL mcp.capabilities (JWT v0.2) intersection
@@ -1304,10 +1051,8 @@ type proxyFlags struct {
 	unsafeBindAll, trustFwdFor      bool
 	shutdownMs, upstreamTimeoutMs   int
 	sessionID, configPath           string
-	// sessionIDSet is whether --session-id was explicitly passed (unlike
-	// sessionID, which is never empty: cmdProxy substitutes a fresh UUID when the
-	// flag is unset). serveHTTPGateway's rejection guard reads this, since
-	// --session-id is stdio-only.
+	// sessionIDSet is whether --session-id was explicitly passed (unlike sessionID, which
+	// is never empty: cmdProxy substitutes a fresh UUID when unset).
 	sessionIDSet       bool
 	strictDrift        bool // global --strict-drift override (promotes drift to fatal on policed routes)
 	requireAuditStrict bool // --require-audit=strict: runtime fail-closed gate when the audit trail degrades
@@ -1317,20 +1062,15 @@ type proxyFlags struct {
 	redisConfigured      bool   // --redis-addr was set; drives the multi-instance state advisory
 	controlTokenPath     string // --control-token-path: where to write the /control/kill control token; HTTP only
 
-	// httpOnlyFlagsSet holds the "--"-prefixed names of every HTTP-only flag
-	// (httpOnlyProxyFlags) the operator activated, precomputed generically from
-	// the FlagSet by httpOnlyFlagsSetOnStdio. serveStdioHost's rejection guard
-	// reads this list directly rather than re-enumerating each flag.
+	// httpOnlyFlagsSet holds the "--"-prefixed names of every HTTP-only flag the operator
+	// activated, precomputed by httpOnlyFlagsSetOnStdio.
 	httpOnlyFlagsSet []string
 }
 
-// validateJWTAudienceConfig enforces fail-closed audience pinning for --jwks-uri
-// mode: --jwt-audience must be set so a token minted for another relying party
-// of the same IdP cannot be replayed against eunox. Bypassed only with explicit
-// --jwt-allow-any-audience; a no-op when jwksURI is empty (JWT mode off). A
-// whitespace-only value counts as unset: the validator collapses it to no pin
-// (sanitizeAudiences/normalizeAudience), so accepting it here would silently reject
-// every token instead of surfacing the misconfiguration.
+// validateJWTAudienceConfig enforces fail-closed audience pinning for --jwks-uri mode:
+// --jwt-audience must be set so a token minted for another relying party cannot be replayed
+// against eunox, bypassable only with --jwt-allow-any-audience. A no-op when jwksURI is
+// empty.
 func validateJWTAudienceConfig(jwksURI, jwtAudience string, allowAnyAudience bool) error {
 	if jwksURI == "" {
 		return nil
@@ -1338,23 +1078,17 @@ func validateJWTAudienceConfig(jwksURI, jwtAudience string, allowAnyAudience boo
 	if strings.TrimSpace(jwtAudience) == "" && !allowAnyAudience {
 		return fmt.Errorf(`--jwks-uri requires --jwt-audience (the expected "aud" claim) so a token minted for another service cannot be replayed against eunox; pass --jwt-allow-any-audience to accept any audience (not recommended)`)
 	}
-	// A PADDED audience is as broken as an empty one, and worse to diagnose: it survives
-	// the trim check above and is then stored and compared VERBATIM against a token's
-	// "aud", so it matches nothing and every call on every route is denied with an opaque
-	// AUTHORIZATION_FAILED. A trailing space is easy to acquire from a shell heredoc or a
-	// YAML block scalar. The manifest loader already refuses the same shape on its own
-	// 'audience' field; the flag must not be the looser leg.
+	// A padded audience is worse to diagnose than an empty one: it's stored and compared
+	// verbatim, so it matches nothing and denies every call with an opaque error.
 	if jwtAudience != strings.TrimSpace(jwtAudience) {
 		return fmt.Errorf("--jwt-audience %q has leading or trailing whitespace; the audience is matched verbatim against a token's \"aud\" claim, so this value would never match and would silently deny every call", jwtAudience)
 	}
 	return nil
 }
 
-// jwtAudienceBypassWarning returns the warning to emit when audience pinning is
-// disabled, or "" when pinning is active. Keyed on --jwt-allow-any-audience, not
-// on whether --jwt-audience is empty: pdp.JWTPDP skips the audience check entirely
-// when AllowAnyAudience is set, so a configured --jwt-audience is silently ignored
-// when both flags are passed — exactly the dangerous case that must still warn.
+// jwtAudienceBypassWarning returns the warning to emit when audience pinning is disabled,
+// or "" when active. Keyed on --jwt-allow-any-audience, not on whether --jwt-audience is
+// empty: both flags together silently ignore a configured audience, the case that must warn.
 func jwtAudienceBypassWarning(allowAnyAudience bool, jwtAudience string) string {
 	if !allowAnyAudience {
 		return ""
@@ -1367,9 +1101,8 @@ func jwtAudienceBypassWarning(allowAnyAudience bool, jwtAudience string) string 
 }
 
 // validateJWTIssuerConfig enforces fail-closed issuer pinning for --jwks-uri mode:
-// --jwt-issuer must be set so a token from another issuer whose signing key is
-// served by the same JWKS endpoint cannot be replayed against eunox. Bypassed only
-// with explicit --jwt-allow-any-issuer; a no-op when jwksURI is empty (JWT mode off).
+// --jwt-issuer must be set so a token from another issuer sharing the JWKS endpoint
+// cannot be replayed against eunox. Bypassed only with --jwt-allow-any-issuer.
 func validateJWTIssuerConfig(jwksURI, jwtIssuer string, allowAnyIssuer bool) error {
 	if jwksURI == "" {
 		return nil
@@ -1380,11 +1113,8 @@ func validateJWTIssuerConfig(jwksURI, jwtIssuer string, allowAnyIssuer bool) err
 	return nil
 }
 
-// jwtIssuerBypassWarning returns the warning to emit when issuer pinning is
-// disabled, or "" when pinning is active. Keyed on --jwt-allow-any-issuer, not on
-// whether --jwt-issuer is empty: pdp.JWTPDP skips the issuer check entirely when
-// AllowAnyIssuer is set, so a configured --jwt-issuer is silently ignored when both
-// flags are passed — exactly the dangerous case that must still warn.
+// jwtIssuerBypassWarning returns the warning to emit when issuer pinning is disabled, or
+// "" when active. Keyed on --jwt-allow-any-issuer, mirroring jwtAudienceBypassWarning.
 func jwtIssuerBypassWarning(allowAnyIssuer bool, jwtIssuer string) string {
 	if !allowAnyIssuer {
 		return ""
@@ -1396,19 +1126,10 @@ func jwtIssuerBypassWarning(allowAnyIssuer bool, jwtIssuer string) string {
 	return msg
 }
 
-// validateJWTFlagsRequireJWKS fails closed when any JWT flag is set without --jwks-uri. Every
-// --jwt-*/--jwks-allow-insecure-http flag configures bearer-token validation (or the
-// experimental capability intersection), which runs ONLY when --jwks-uri stands up the JWT
-// authenticator; the whole wiring block is gated on `jwksURI != ""`, so without it these flags
-// are silently ignored and the gateway serves every request UNAUTHENTICATED while the operator
-// believes JWT auth is enforced. Reject that mismatch at startup rather than no-op it.
-//
-// This is the SINGLE guard for the "these flags require --jwks-uri" contract. The set of
-// activated jwks-gated flags is precomputed once by gatedFlagsSetWithoutJWKS over the single
-// jwksGatedFlags inventory (both value- and explicit-set detection), so both halves of the
-// guard are driven off ONE list: a new --jwt-* flag added to jwksGatedFlags is covered
-// automatically, with no second per-flag block that could be forgotten. A no-op when --jwks-uri
-// is set (JWT mode on) or no such flag was given.
+// validateJWTFlagsRequireJWKS fails closed when any JWT flag is set without --jwks-uri:
+// without it these flags are silently ignored and the gateway serves every request
+// UNAUTHENTICATED while the operator believes JWT auth is enforced. The single guard for
+// this contract, driven off the precomputed pf.gatedJWTFlagsSet.
 func validateJWTFlagsRequireJWKS(pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	if pf.jwksURI != "" || len(pf.gatedJWTFlagsSet) == 0 {
 		return nil
@@ -1416,10 +1137,8 @@ func validateJWTFlagsRequireJWKS(pf proxyFlags) error { //nolint:gocritic // hug
 	return fmt.Errorf("JWT flag(s) %s set without --jwks-uri: they configure bearer-token validation (or the experimental capability intersection), which runs only when --jwks-uri stands up the JWT authenticator — without it the gateway serves every request UNAUTHENTICATED. Set --jwks-uri to enable JWT authentication, or remove these flags", strings.Join(pf.gatedJWTFlagsSet, ", "))
 }
 
-// jwtExperimentalCapsWarning returns the startup warning to emit when the experimental
-// mcp.capabilities claim schema (JWT v0.2) is enabled, or "" when it is off. Mirrors
-// jwtAudienceBypassWarning/jwtIssuerBypassWarning so every JWT-mode advisory is a
-// named, testable helper rather than an inline Fprintf.
+// jwtExperimentalCapsWarning returns the startup warning for the experimental
+// mcp.capabilities claim schema (JWT v0.2), or "" when off.
 func jwtExperimentalCapsWarning(experimentalCaps bool) string {
 	if !experimentalCaps {
 		return ""
@@ -1427,20 +1146,17 @@ func jwtExperimentalCapsWarning(experimentalCaps bool) string {
 	return "--jwt-experimental-capabilities is set; enforcement of the mcp.capabilities claim schema (JWT v0.2) is EXPERIMENTAL and the claim format may change before 1.0."
 }
 
-// validateJWKSURIScheme enforces a tamper-resistant channel for the JWKS endpoint,
-// the root of trust for every token. https is always accepted; http only to a
-// loopback host, unless --jwks-allow-insecure-http is set. A plaintext fetch to a
-// remote host would let an attacker substitute the key set and forge capability
-// claims, so it fails closed by default.
+// validateJWKSURIScheme enforces a tamper-resistant channel for the JWKS endpoint, the
+// root of trust for every token: https always accepted, http only to loopback unless
+// --jwks-allow-insecure-http is set, since a remote plaintext fetch would let an attacker
+// substitute the key set.
 func validateJWKSURIScheme(jwksURI string, allowInsecure bool) error {
 	if jwksURI == "" {
 		return nil
 	}
 	u, err := url.Parse(jwksURI)
 	if err != nil {
-		// url.Parse returns a *url.Error whose Error() embeds the raw input, so wrapping it
-		// with %w would print a credentialed JWKS URI in full at startup. Report the
-		// redacted URL and the parse reason separately.
+		// %w would print a credentialed JWKS URI in full (*url.Error embeds the raw input).
 		var uerr *url.Error
 		if errors.As(err, &uerr) {
 			return fmt.Errorf("--jwks-uri %s is not a valid URL: %v", capability.RedactURLForLog(jwksURI), uerr.Err)
@@ -1460,20 +1176,11 @@ func validateJWKSURIScheme(jwksURI string, allowInsecure bool) error {
 	}
 }
 
-// validateOAuthURI rejects an OAuth metadata URI (the --oauth-resource identifier or
-// an authorization-server URI) that is unsafe to publish in an RFC 9728
-// protected-resource metadata document / WWW-Authenticate challenge: it must be an
-// absolute https URI with a host, no fragment, and no character illegal in an HTTP
-// quoted-string, and must carry no residual ${VAR}/$VAR reference left by an unset
-// environment variable (which would publish the literal text — the same fail-closed
-// posture the listen.authToken / upstreamAuthHeader credential guards take). label names
-// the source for the operator (e.g. "--oauth-resource"). Single-sourced so a hardening
-// fix to one metadata URI cannot miss the other.
-//
-// allowEmpty governs the empty-string policy, which differs by source: the resource URI
-// may be empty (the metadata endpoint is then simply not published), but an
-// authorization-server URI may not — an empty entry would be published as "" in the RFC
-// 9728 authorization_servers array, so it fails closed.
+// validateOAuthURI rejects an OAuth metadata URI unsafe to publish in an RFC 9728
+// protected-resource document: must be an absolute https URI with a host, no fragment, no
+// HTTP-quoted-string-illegal character, and no residual ${VAR} reference. label names the
+// source for the operator. allowEmpty differs by source: the resource URI may be empty
+// (endpoint not published), an authorization-server URI may not.
 func validateOAuthURI(label, uri string, allowEmpty bool) error {
 	if uri == "" {
 		if allowEmpty {
@@ -1511,11 +1218,9 @@ func validateOAuthURI(label, uri string, allowEmpty bool) error {
 	return nil
 }
 
-// newJWKSHTTPClient returns the HTTP client used to fetch the JWKS. Its redirect
-// policy re-applies validateJWKSURIScheme to every redirect target: checking the
-// configured URI alone is not enough, since a valid https endpoint could 302 the
-// key fetch onto plaintext remote http, reopening the key-substitution path. A
-// redirect to a disallowed scheme aborts the fetch.
+// newJWKSHTTPClient returns the HTTP client used to fetch the JWKS. Its redirect policy
+// re-applies validateJWKSURIScheme to every redirect target, since a valid https endpoint
+// could 302 the key fetch onto plaintext remote http, reopening the key-substitution path.
 func newJWKSHTTPClient(allowInsecure bool) *http.Client {
 	return &http.Client{
 		Timeout: 10 * time.Second,
@@ -1526,18 +1231,10 @@ func newJWKSHTTPClient(allowInsecure bool) *http.Client {
 			if err := validateJWKSURIScheme(req.URL.String(), allowInsecure); err != nil {
 				return fmt.Errorf("JWKS redirect blocked: %w", err)
 			}
-			// The JWKS is the root of trust for every token, so a redirect must not leave
-			// the configured HOST: the scheme check above still passes an https->https hop,
-			// so without this an IdP open-redirect (or a compromised redirector) could point
-			// the key fetch at an attacker host and substitute the key set, forging
-			// capability claims. via[0] is the original request (the configured --jwks-uri);
-			// require every redirect target to share its hostname. Port and path may change
-			// (an IdP may relocate the key set within its own host), but the host may not —
-			// with one exception: a hop between two loopback spellings (localhost <->
-			// 127.0.0.1) never leaves the machine, so it has no on-path attacker surface (and
-			// the scheme check above already confined any plaintext http hop to loopback).
-			// Allowing it keeps the loopback dev flow working even though the hostname string
-			// differs; every other cross-host hop is still refused.
+			// A redirect must not leave the configured HOST — the scheme check above still
+			// passes an https->https hop, so without this an IdP open-redirect could point
+			// the key fetch at an attacker host. One exception: a hop between loopback
+			// spellings (localhost <-> 127.0.0.1) never leaves the machine.
 			if len(via) > 0 {
 				origHost := via[0].URL.Hostname()
 				targetHost := req.URL.Hostname()
@@ -1552,17 +1249,9 @@ func newJWKSHTTPClient(allowInsecure bool) *http.Client {
 }
 
 // warnNoRedisSharedState prints the multi-instance advisory when a policy depends on state
-// that outlives a single call (a maxCalls or cumulative blastRadius budget, sequenceBlock's
-// call-ordering history, the flow-label set) but no Redis backend is configured: the in-memory
-// backends are per-process, so running more than one instance silently multiplies quotas,
-// de-syncs kills, and lets a sequenceBlock or flowLabel gate fail open when a session's
-// antecedent (or a source's taint) and the call it should block land on different instances.
-// Shared by the stdio and gateway serve paths so the wording and trigger cannot drift.
-//
-// Both call sites pass ONE derived predicate — config.AccumulatesSharedState, over the class
-// each token declares on its prototype-registry entry — rather than a disjunction of per-token
-// predicates, so a policy using a newly added accumulating token is warned about without this
-// advisory being edited.
+// that outlives a single call but no Redis backend is configured: the in-memory backends
+// are per-process, so running more than one instance silently multiplies quotas and lets a
+// sequenceBlock/flowLabel gate fail open across instances.
 func warnNoRedisSharedState(redisConfigured, policyUsesSharedState bool) {
 	if redisConfigured || !policyUsesSharedState {
 		return
@@ -1582,15 +1271,10 @@ func anyRouteTaskAnchored(cfg *config.GatewayConfig) bool {
 }
 
 // warnTaskAnchoringWithoutJWT prints the advisory for a route that opts into task-anchored
-// state on a proxy that never validates a token. The anchor is derived from the VALIDATED
-// mcp.task_id claim; with no JWT integration no request carries claims at all, so every one of
-// them takes the token-less session fallback and the option does exactly nothing — a clean
-// startup and a silently unchanged deployment, which is the shape the --strict-drift notice
-// beside it exists to prevent for its own flag.
-//
-// It is a notice rather than a startup refusal because the combination is legitimate mid-
-// rollout: an operator may enable the config key before the IdP starts minting the claim, and
-// the fallback keeps that state safe rather than merely quiet.
+// state on a proxy that never validates a token: with no JWT integration every request
+// takes the token-less session fallback and the option does nothing. A notice rather than a
+// refusal, since the combination is legitimate mid-rollout (config enabled before the IdP
+// starts minting the claim).
 func warnTaskAnchoringWithoutJWT(jwtConfigured, taskAnchored bool) {
 	if jwtConfigured || !taskAnchored {
 		return
@@ -1599,19 +1283,10 @@ func warnTaskAnchoringWithoutJWT(jwtConfigured, taskAnchored bool) {
 }
 
 // warnTaskAnchoringWithoutRedis prints the advisory for task-anchored state on the
-// in-memory backends. A task-anchored key deliberately OUTLIVES its session — teardown
-// does not reclaim it, or an agent could launder a task's taint by reconnecting — so the
-// per-process stores accrue one key per distinct task id, reclaimed only by their idle
-// TTL. That is enough to keep a single instance bounded, which is why this is a notice and
-// not a refusal; what it is not enough for is a deployment running more than one instance,
-// where two PEPs each hold half the task's state and the cross-PEP property the option
-// exists to provide silently does not hold.
-//
-// It is a notice rather than a startup refusal for the reason the JWT one beside it is:
-// making a correctness knob depend on a deployment-topology knob would refuse a
-// single-instance configuration that is perfectly sound, and a mid-rollout operator
-// enabling the key before wiring Redis gets a working proxy plus a line telling them what
-// is missing.
+// in-memory backends. A task-anchored key deliberately OUTLIVES its session, so a single
+// instance stays bounded via idle TTL — but more than one instance means two PEPs each
+// hold half the task's state, silently defeating the cross-PEP property the option exists
+// to provide.
 func warnTaskAnchoringWithoutRedis(redisConfigured, taskAnchored bool) {
 	if redisConfigured || !taskAnchored {
 		return
@@ -1619,29 +1294,21 @@ func warnTaskAnchoringWithoutRedis(redisConfigured, taskAnchored bool) {
 	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: taskAnchoredState is enabled but no --redis-addr is set — task-anchored flow labels, budgets and antecedents live in this process only, and a task key outlives the session that created it (nothing tears it down; in this mode the in-memory stores reclaim one idle for %s). A single instance is bounded; more than one will not share a task's state. Configure --redis-addr for multi-instance deployments.\n", flowlabelstore.DefaultIdleTTL)
 }
 
-// resolveOAuthMetadata builds the RFC 9728 protected-resource metadata document
-// (and its URL) for the gateway, or returns (nil, "", nil) when no resource URI is
-// configured — in which case the metadata endpoint is simply not published. It fails
-// closed on an invalid resource / authorization-server URI, and on an authorization
-// server configured without a resource to publish it in. Config takes precedence over
-// the flags.
+// resolveOAuthMetadata builds the RFC 9728 protected-resource metadata document (and its
+// URL), or returns (nil, "", nil) when no resource URI is configured. Fails closed on an
+// invalid URI or an authorization server configured with no resource. Config takes
+// precedence over the flags.
 func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.OAuthResourceMetadata, string, error) { //nolint:gocritic // hugeParam: pf is a small flag bundle
-	// Resolve the RFC 9728 protected-resource URI (config takes precedence over the
-	// flag). The metadata document is published only when this is set: --jwks-uri
-	// without --oauth-resource is valid and simply does not expose the metadata
-	// endpoint — but it must never serve a document missing the REQUIRED `resource`
-	// field.
+	// The metadata document is published only when this is set — --jwks-uri without
+	// --oauth-resource is valid and simply doesn't expose the endpoint.
 	oauthResource := cfg.Listen.OAuthResource
 	oauthResourceLabel := "listen.oauthResource"
 	if oauthResource == "" {
 		oauthResource = pf.oauthResource
 		oauthResourceLabel = "--oauth-resource"
 	} else if pf.oauthResource != "" && pf.oauthResource != cfg.Listen.OAuthResource {
-		// Config wins, matching the audit-path precedence above — but say so. The
-		// resource URI is what a client's token audience is checked against, so an
-		// operator who passed --oauth-resource and got a metadata document naming a
-		// different resource would otherwise debug a token-audience mismatch with no
-		// hint that their flag was dropped.
+		// Config wins, matching the audit-path precedence above — but say so, or an
+		// operator debugs a token-audience mismatch with no hint their flag was dropped.
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-resource %q is overridden by the config's listen.oauthResource %q; the config takes precedence.\n", pf.oauthResource, cfg.Listen.OAuthResource)
 	}
 	if err := validateOAuthURI(oauthResourceLabel, oauthResource, true); err != nil {
@@ -1649,21 +1316,15 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	}
 
 	var oauthAuthzServers []string
-	// validateAuthz is set for the two operator-supplied sources
-	// (listen.oauthAuthorizationServers and --oauth-authorization-server). The --jwt-issuer
-	// fallback is exempt: it is the issuer already wired into JWT validation and may be
-	// a loopback http URL in dev (under --jwks-allow-insecure-http), so forcing https on
-	// it here would be a regression.
+	// validateAuthz covers the two operator-supplied sources. The --jwt-issuer fallback is
+	// exempt: it may be a loopback http URL in dev, so forcing https on it would regress.
 	var validateAuthz bool
 	switch {
 	case len(cfg.Listen.OAuthAuthorizationServers) > 0:
 		oauthAuthzServers = cfg.Listen.OAuthAuthorizationServers
 		validateAuthz = true
 		if pf.oauthAuthzServer != "" && (len(oauthAuthzServers) != 1 || oauthAuthzServers[0] != pf.oauthAuthzServer) {
-			// Same rule as the resource URI above: config wins, but an explicitly-passed
-			// flag is never discarded in silence. Name the flag as REGISTERED
-			// (--oauth-authorization-server); an operator who greps --help for the name in
-			// this message must find it, and --oauth-authz-server does not exist.
+			// Config wins, but an explicitly-passed flag is never discarded in silence.
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --oauth-authorization-server=%q is overridden by listen.oauthAuthorizationServers=%v from the config file; the config value is published.\n", pf.oauthAuthzServer, oauthAuthzServers)
 		}
 	case pf.oauthAuthzServer != "":
@@ -1672,20 +1333,16 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	case pf.jwtIssuer != "":
 		oauthAuthzServers = []string{pf.jwtIssuer}
 	}
-	// Validate every explicitly-configured authorization-server URI before it enters
-	// the RFC 9728 metadata document, mirroring the validateOAuthResourceURI guard on
-	// the resource field: reject a residual ${VAR}/$VAR literal (unset env ref) and any
-	// non-https / malformed URI. Fail closed before any metadata is built.
+	// Validate every explicitly-configured authorization-server URI before it enters the
+	// metadata document. Fail closed before any metadata is built.
 	if validateAuthz {
 		for _, server := range oauthAuthzServers {
 			if err := validateOAuthURI("oauth authorization server", server, false); err != nil {
 				return nil, "", err
 			}
 		}
-		// The authorization server is only ever published inside the RFC 9728 metadata
-		// document, which is served only when a resource URI is set. An explicit
-		// authorization server with no --oauth-resource is therefore a silent no-op;
-		// fail closed rather than drop it.
+		// Published only inside the metadata document, which requires a resource URI —
+		// an explicit authorization server with no resource is a silent no-op otherwise.
 		if oauthResource == "" {
 			return nil, "", fmt.Errorf("an OAuth authorization server is configured but --oauth-resource / listen.oauthResource is not set; the authorization server is only published in the RFC 9728 metadata document, which requires a resource URI")
 		}
@@ -1702,22 +1359,14 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	}, transport.BuildOAuthMetadataURL(oauthResource), nil
 }
 
-// gatewayJWTLayer stands up the gateway's JWT layer from the flags: it validates the
-// JWT-adjacent flag combinations, emits the bypass warnings, and wraps every route's
-// manifest PDP in a pdp.JWTPDP sharing one JWKS validator (the per-route
-// JWT-intersect-manifest composition). It returns a nil PDP when --jwks-uri is unset,
-// which is the "no JWT mode" case the caller's later checks key on.
-//
-// It is a function rather than an inline block because the validation and warning arms
-// dominate serveHTTPGateway's branch count on their own, and every one of them answers the
-// same question: is this a JWT deployment, and is it configured safely. routes is mutated
-// in place by WrapRoutesWithJWT.
+// gatewayJWTLayer stands up the gateway's JWT layer from the flags: validates JWT-adjacent
+// flag combinations, emits bypass warnings, and wraps every route's manifest PDP in a
+// pdp.JWTPDP sharing one JWKS validator. Returns a nil PDP when --jwks-uri is unset. routes
+// is mutated in place by WrapRoutesWithJWT.
 func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.Manager, pf proxyFlags) (*pdp.JWTPDP, error) { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	if pf.jwksURI == "" {
 		return nil, nil
 	}
-	// Fail closed on audience pinning and on a plaintext JWKS endpoint before
-	// standing up the JWT PDP.
 	if err := validateJWTAudienceConfig(pf.jwksURI, pf.jwtAudience, pf.jwtAllowAnyAudience); err != nil {
 		return nil, err
 	}
@@ -1730,11 +1379,8 @@ func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.M
 	if w := jwtAudienceBypassWarning(pf.jwtAllowAnyAudience, pf.jwtAudience); w != "" {
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
 	}
-	// --jwt-allow-any-audience also voids per-route manifest 'audience' pins (the
-	// wrapper skips per-route narrowing when AllowAnyAudience is set). The generic
-	// bypass warning above names only the --jwt-audience flag, so call out the dead
-	// manifest pin explicitly — otherwise an operator who pinned a route's audience
-	// in its policy manifest has no signal that the pin no longer enforces.
+	// --jwt-allow-any-audience also voids per-route manifest 'audience' pins; the generic
+	// bypass warning above names only the flag, so call out the dead manifest pin too.
 	if pf.jwtAllowAnyAudience {
 		if name, pinned := transport.FirstRouteAudiencePin(routes); pinned {
 			fmt.Fprintf(os.Stderr, "[eunox] WARNING: --jwt-allow-any-audience voids the manifest 'audience' pin on route %q; that route now accepts tokens for any audience. Remove --jwt-allow-any-audience to enforce the pin.\n", name)
@@ -1746,16 +1392,8 @@ func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.M
 	if w := jwtExperimentalCapsWarning(pf.jwtExperimentalCaps); w != "" {
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s\n", w)
 	}
-	// Describe what is actually enforced: the manifest intersection with
-	// mcp.capabilities runs only when the experimental flag is on. With it off,
-	// identity-only tokens are validated and a token carrying mcp.capabilities is
-	// rejected, so claiming "intersecting" unconditionally would mislead operators.
 	// Redact before printing: some IdPs gate the JWKS endpoint behind a query key or
-	// basic-auth userinfo, and this banner goes to the same stderr the systemd journal,
-	// container logs, and the doctor bundle collect. That is a log surface, so it takes
-	// the strict log-facing redactor (scheme://host only) the other banner and
-	// validation-error sites use; the JWKS URI — the root of trust for token
-	// verification — must not be the exception.
+	// basic-auth userinfo, and this banner goes to the same stderr logs/bundles collect.
 	safeJWKS := capability.RedactURLForLog(pf.jwksURI)
 	if pf.jwtExperimentalCaps {
 		fmt.Fprintf(os.Stderr, "[eunox] JWT PDP enabled (JWKS URI: %s); intersecting per-route manifests with experimental mcp.capabilities claims\n", safeJWKS)
@@ -1784,8 +1422,8 @@ func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.M
 // serveHTTPGateway serves cfg's upstreams over an HTTP listener, one /mcp/<name>
 // route each (the gateway shape).
 func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, pf proxyFlags, onServeReady func(context.Context)) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
-	// drift.MakeDriftCheck is passed as the per-route hook factory; BuildRoutes
-	// wires it inside, so this layer never reaches into route internals.
+	// drift.MakeDriftCheck is the per-route hook factory; BuildRoutes wires it inside, so
+	// this layer never reaches into route internals.
 	routes, err := transport.BuildRoutes(cfg, sink, counter, flowStore, ks, pf.strictDrift, drift.MakeDriftCheck)
 	if err != nil {
 		return err
@@ -1813,92 +1451,61 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
-	// Concurrency controls (config takes precedence over the flag). 0 ⟹ unlimited
-	// sessions / no idle reaping. An explicit listen.maxSessions overrides the flag
-	// even at 0, so config can still express "unlimited" despite the flag's non-zero
-	// default backstop.
+	// Config takes precedence over the flag; an explicit listen.maxSessions overrides even
+	// at 0, so config can still express "unlimited" despite the flag's non-zero default.
 	maxSessions := transport.ResolveMaxSessions(pf.maxSessions, cfg.Listen.MaxSessions)
-	// A present config value wins, including an explicit 0 ("no idle reaping"), so config
-	// can disable a non-zero --session-idle-timeout flag; an absent key (nil) leaves the
-	// flag's value in force. Mirrors ResolveMaxSessions.
+	// Mirrors ResolveMaxSessions: a present config value wins, including an explicit 0.
 	sessionIdleMs := transport.ResolveSessionIdleTimeout(pf.sessionIdleTimeoutMs, cfg.Listen.SessionIdleTimeoutMs)
-	// listen.trustedProxyHops is config-only (no flag): the chain depth is a property of
-	// the deployment's topology, not something to toggle per invocation. Leaving it 0 when
-	// the key is absent lets the constructor apply the single-proxy default.
+	// listen.trustedProxyHops is config-only (no flag): a property of deployment topology.
 	var trustedProxyHops int
 	if h := cfg.Listen.TrustedProxyHops; h != nil {
 		trustedProxyHops = *h
 	}
 
 	// Fail closed when a route manifest declares an `audience` pin but no --jwks-uri was
-	// set: the pin is a JWT concept consulted only when the JWT PDP is stood up (below),
-	// so without --jwks-uri it is silently dead config and the route serves every request
-	// unauthenticated — the config-file form of the silently-ignored-JWT-auth footgun the
-	// --jwt-* flag guard (validateJWTFlagsRequireJWKS) closes for the CLI form.
+	// set: the config-file form of the footgun validateJWTFlagsRequireJWKS closes for the CLI.
 	if pf.jwksURI == "" {
 		if name, pinned := transport.FirstRouteAudiencePin(routes); pinned {
 			return fmt.Errorf("route %q declares an audience pin in its policy manifest but --jwks-uri is not set: the audience pin is a JWT concept that is only enforced in JWT mode, so without --jwks-uri it is silently ignored and the route serves every request unauthenticated. Set --jwks-uri to enable JWT authentication, or remove the manifest 'audience' field", name)
 		}
 	}
 
-	// Per-route JWT∩manifest intersection: wrap each route's PDP in a pdp.JWTPDP
-	// whose Inner is that route's manifest PDP, sharing one JWKS validator.
 	gwJWTPDP, err := gatewayJWTLayer(routes, ks, pf)
 	if err != nil {
 		return err
 	}
 
-	// listen.authToken and --jwks-uri are mutually exclusive: the static token
-	// check runs first and 401s every IdP JWT before the JWT PDP runs, silently
-	// disabling JWT auth. Fail closed with a clear error.
+	// Mutually exclusive: the static token check runs first and 401s every IdP JWT
+	// before the JWT PDP runs, silently disabling JWT auth.
 	if cfg.Listen.AuthToken != "" && gwJWTPDP != nil {
 		return fmt.Errorf("listen.authToken and --jwks-uri are mutually exclusive: JWT mode handles all authentication, but the static token check runs first and rejects every IdP JWT. Remove listen.authToken when --jwks-uri is set")
 	}
 
-	// Resolve and validate the RFC 9728 protected-resource metadata (nil when no
-	// resource URI is configured — the endpoint is then simply not published).
 	oauthMeta, oauthMetaURL, err := resolveOAuthMetadata(cfg, pf)
 	if err != nil {
 		return err
 	}
-	// Publishing the metadata document announces "this resource is protected; present a
-	// bearer token" — to any unauthenticated client, since the endpoint is
-	// unauthenticated by design. With NEITHER --jwks-uri nor listen.authToken the
-	// gateway validates no bearer token at all, so it would advertise a protection it
-	// does not enforce and a client would present a credential that is never checked.
-	// Fail closed, the same way validateJWTFlagsRequireJWKS rejects every other
-	// JWT-adjacent flag set without a JWKS endpoint; these two --oauth-* flags were its
-	// only gap.
-	//
-	// listen.authToken counts as validation even though it is a static shared secret
-	// rather than OAuth: checkAuth rejects every unauthenticated request and already
-	// serves the metadata URL as the resource_metadata hint on its 401 challenge, so
-	// that pairing is a supported deployment, not the unenforced-advertisement hole.
+	// Publishing the metadata document announces "this resource is protected" to any
+	// unauthenticated client. With NEITHER --jwks-uri nor listen.authToken the gateway
+	// validates no bearer token at all, so fail closed rather than advertise a protection
+	// it cannot enforce. listen.authToken counts as validation even though it's a static
+	// secret: checkAuth already serves the metadata URL as its 401 hint.
 	if oauthMeta != nil && gwJWTPDP == nil && cfg.Listen.AuthToken == "" {
 		return fmt.Errorf("--oauth-resource / listen.oauthResource publishes RFC 9728 protected-resource metadata, but no bearer-token validation is configured: set --jwks-uri (or listen.authToken) so presented tokens are actually verified, or remove the --oauth-* settings so the gateway does not advertise a protection it cannot enforce")
 	}
 
-	// Generate a fresh loopback control token for POST /control/kill, written to a
-	// 0600 file the operator (and `eunox kill`) can read. It authenticates the
-	// emergency-stop endpoint independently of listen.authToken / JWT mode, so a
-	// same-host process cannot trigger it merely by reaching loopback. Fail closed
-	// if it cannot be minted or persisted: the endpoint must not come up unauthed.
+	// Fail closed if the control token cannot be minted or persisted: the endpoint must
+	// not come up unauthed.
 	controlToken, err := transport.GenerateControlToken()
 	if err != nil {
 		return fmt.Errorf("kill control endpoint: %w", err)
 	}
-	// Persist it only AFTER the listener binds (AfterListen). The write deliberately
-	// overwrites whatever token sits at the shared default path, so doing it here —
-	// before the bind — meant an operator who accidentally started a second proxy got a
-	// clean "address already in use" failure from the doomed process that had already
-	// replaced the RUNNING proxy's token on disk: `eunox kill` then presents a token the
-	// live proxy rejects, and the loopback emergency stop stays broken until restart, in
-	// exactly the confused-deployment situation where it matters most.
+	// Persist it only AFTER the listener binds: writing before the bind meant a second,
+	// doomed proxy could clobber a running proxy's token on disk before hitting its own
+	// "address already in use" failure, breaking `eunox kill` until restart.
 	//
-	// Close over the one field this needs, not pf itself: capturing pf would heap-promote
-	// the whole flag bundle (every string/slice field) for as long as the proxy runs — this
-	// closure fires once, at startup, and Serve() drops the reference right after (see
-	// HTTPGatewayOptions.AfterListen), so only the needed path should outlive that.
+	// Close over the one field this needs, not pf itself, which would heap-promote the
+	// whole flag bundle for the proxy's lifetime.
 	controlTokenPath := pf.controlTokenPath
 	writeControlToken := func(ctx context.Context) error {
 		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken)
@@ -1906,24 +1513,10 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 			return fmt.Errorf("kill control endpoint: %w", werr)
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Control token for POST /control/kill written to %s (0600). 'eunox kill' reads it from there; override with --control-token-path / --control-token / EUNOX_CONTROL_TOKEN.\n", controlTokenFile)
-		// The session-kill TTL publish shares this hook for the same reason the token write
-		// is in it: both overwrite shared, last-writer-wins state that `eunox kill` then
-		// trusts, so neither may be performed by a process that never reaches the accept
-		// loop (a bind collision being the concrete case).
-		//
-		// Published LAST, after the token write has succeeded. A failed token write aborts
-		// startup — this proxy is going down — so publishing first meant the one startup
-		// failure that survives the bind still clobbered a running proxy's TTL, the exact
-		// failure moving these effects behind the bind was meant to end. Nothing needs to
-		// run after the publish, so ordering it second costs nothing.
-		//
-		// The hook runs under a bounded post-bind context that a shutdown landing in that
-		// window cancels, and that runAfterListen ABANDONS at expiry. Passing ctx through is
-		// what makes the abandonment safe — publishSessionKillTTL bounds its Redis round-trip
-		// by it, so a hook the server has already given up on cannot land a write. The early
-		// return below is only a fast path (skip a round-trip that would fail anyway);
-		// returning nil rather than an error is deliberate, since a cancelled startup is not
-		// a token-write failure and Serve treats the shutdown itself as the outcome.
+		// The session-kill TTL publish shares this hook and is ordered LAST, after the
+		// token write succeeds, so a startup failure surviving the bind can't clobber a
+		// running proxy's TTL. ctx is passed through so an abandoned hook (shutdown landing
+		// in this window) cannot land a write; the early return is a fast path, not an error.
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -1964,9 +1557,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	u := &cfg.Upstreams[0] // validate() guarantees exactly one upstream for transport: stdio
 	auditMode := cfg.AuditModeFor(u)
 
-	// Fail-closed per-upstream startup guards (config-declared strictDrift requires a
-	// policy; a policyless upstream must be in audit mode). Single-sourced in config so
-	// this stdio host and transport.BuildRoutes cannot drift on what they refuse.
+	// Single-sourced in config so this stdio host and transport.BuildRoutes cannot drift.
 	if err := cfg.StartupPolicyError(u); err != nil {
 		return err
 	}
@@ -1976,38 +1567,27 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	if err != nil {
 		return err
 	}
-	// Resolved once the manifest is known, through the same resolver the gateway
-	// uses, so the two transports cannot diverge.
+	// Same resolver the gateway uses, so the two transports cannot diverge.
 	strictDrift := transport.ResolveStrictDrift(configStrict, pf.strictDrift, manifest != nil)
 	if pf.strictDrift && manifest == nil {
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: --strict-drift had no effect: upstream %q has no policy to check drift against.\n", u.Name)
 	}
 
-	// The three open-posture notices (per-entry AUDIT NOTICE, whole-route AUDIT MODE
-	// banner, TLS-skip WARNING) go through the shared transport helper so the stdio host
-	// and the gateway routes cannot drift on wording. routePath is "" — a stdio host runs
-	// a single upstream on stdin/stdout with no /mcp mount.
-	// AuditOnlyCount is nil-safe (a policyless upstream has none), so no guard here.
+	// Through the shared transport helper so the stdio host and gateway routes cannot
+	// drift on wording. routePath is "" — a stdio host has no /mcp mount.
 	transport.PrintRoutePolicyNotices(os.Stderr, u.Name, "", manifest.AuditOnlyCount(), auditMode, u.UpstreamTLSSkipVerify)
-	// The remote-HTTP-upstream "server-initiated requests are not serviced" NOTICE is
-	// emitted once, in the transport layer (StdioProxy.connectUpstream via
-	// printRemoteUpstreamNotice), so it is not duplicated here.
 
 	upstreamTimeMs := transport.ResolveUpstreamTimeout(pf.upstreamTimeoutMs, cfg.Defaults.UpstreamTimeoutMs)
 
 	warnNoRedisSharedState(pf.redisConfigured, manifest.AccumulatesSharedState())
-	// THIS upstream's resolved posture, not the config's. A stdio host runs exactly one
-	// upstream, so scanning every upstream in the file made it advise about a route this
-	// process is not serving — and stay silent when the one it IS serving turned the option
-	// off per-route while a sibling left it on.
+	// THIS upstream's resolved posture, not the config's: a stdio host runs exactly one
+	// upstream, so scanning the whole file would advise about a route not being served here.
 	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", cfg.ResolvedTaskAnchoredState(u))
 	warnTaskAnchoringWithoutRedis(pf.redisConfigured, cfg.ResolvedTaskAnchoredState(u))
 
-	// This upstream's own receipt-signing key domain, from the same local-file loader the
-	// gateway routes use. Absent (the default) leaves the verifier nil and the whole
-	// surface disabled; a configured-but-unreadable key set is fatal, since an operator
-	// who wired one asked for the check and a path typo that degraded to "no receipt ever
-	// verifies" is indistinguishable from a server that stopped signing.
+	// Absent (the default) leaves the verifier nil; a configured-but-unreadable key set is
+	// fatal, since a path typo degrading to "no receipt ever verifies" is indistinguishable
+	// from a server that stopped signing.
 	receipts, err := transport.LoadEffectReceiptVerifier(cfg.BaseDir, u.EffectReceiptKeys)
 	if err != nil {
 		return fmt.Errorf("upstream %q: %w", u.Name, err)
@@ -2028,31 +1608,22 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		UpstreamTimeMs:        upstreamTimeMs,
 		Audit:                 auditMode,
 		RequireAuditStrict:    pf.requireAuditStrict,
-		// Serialize the decision phase when the policy reads/writes accumulated state a
-		// source commits and a later call reads (flow labels or sequenceBlock), so a
-		// pipelining host cannot race a sink ahead of its source. A policy that accumulates
-		// nothing keeps full parallelism. The predicate is single-sourced in config so this
-		// host and the gateway's route builder cannot drift on which policies need a turn.
+		// Serialize the decision phase only when the policy accumulates state a source
+		// commits and a later call reads, so a pipelining host cannot race a sink ahead of
+		// its source; a policy that accumulates nothing keeps full parallelism.
 		SerializeDecisions: manifest.NeedsDecisionTurn(),
-		// The operator's task-anchoring setting for THIS upstream — the same value handed to
-		// LoadUpstreamPDP above, so the engine's state key and the proxy's decision turn are
-		// built from one bit rather than two. Inert on stdio as shipped (nothing attaches
-		// validated claims here); see the option's own doc for why it is wired regardless.
+		// Same value handed to LoadUpstreamPDP above, so the engine's state key and the
+		// decision turn are built from one bit rather than two.
 		TaskAnchoredState: cfg.ResolvedTaskAnchoredState(u),
 		// Admit the client-supplied attribution interface only under the draft
-		// schemaVersion that contains it; a published-grammar policy ignores the block.
+		// schemaVersion that contains it.
 		HonorAttribution: manifest.HonorsAttributionInterface(),
-		// The signed effect receipts this upstream publishes, verified against its own key
-		// domain — never the caller IdP's. nil when unconfigured, which disables the surface.
+		// Verified against this upstream's own key domain — never the caller IdP's.
 		EffectReceipts: receipts,
 		DriftCheck:     drift.MakeDriftCheck(manifest, strictDrift),
-		// The stdio host has no bind step, so the transport fires the ready hook itself,
-		// from inside Start once the session is live. Calling it here instead would put it
-		// ahead of Start's own fallible steps — spawning the upstream, the initialize
-		// handshake, the drift check — so a proxy that never came up (a missing upstream
-		// binary is the ordinary case) would still have overwritten the session-kill TTL a
-		// RUNNING proxy published, which is the clobber-then-die failure the gateway's
-		// post-bind hook exists to prevent. See cmdProxy's onServeReady.
+		// The stdio host has no bind step, so the transport fires this itself from inside
+		// Start once the session is live — calling it here would run ahead of Start's own
+		// fallible steps, letting a proxy that never came up clobber a running proxy's TTL.
 		OnReady: onServeReady,
 	})
 	return proxy.Start(ctx)
@@ -2082,23 +1653,12 @@ func parseFlagsAndPositionals(fs *flag.FlagSet, args []string) ([]string, error)
 }
 
 // bindExposesAllInterfaces reports whether bindHost (already stripped of any surrounding
-// IPv6 brackets) will make the listener accept connections on every interface.
-//
-// Comparing the PARSED address rather than the string catches every IP-literal spelling of
-// the unspecified address uniformly — "0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0" — which a
-// literal "0.0.0.0"/"::" string match does not.
-//
-// But net.ParseIP is not the whole grammar the RESOLVER accepts. "0" and hex/octal
-// shorthands like "0x0" or "00" are not Go IP literals, so ParseIP returns nil and the
-// guard was skipped entirely — yet on a cgo-resolver build getaddrinfo("0") resolves to
-// 0.0.0.0 and the listener binds every interface with no --unsafe-bind-all and no warning.
-// A host that is entirely numeric (optionally 0x/0-prefixed) is an inet_aton-style integer
-// address, not a DNS name, so it is decoded here rather than trusted to ParseIP. A value
-// of zero is the unspecified address.
-//
-// Deliberately no DNS lookup: resolving an operator-supplied name at startup would be
-// background network activity for a check that must work offline, and a NAME that resolves
-// to 0.0.0.0 is not a shape any real deployment uses.
+// IPv6 brackets) will make the listener accept connections on every interface. Comparing
+// the PARSED address catches every unspecified-address spelling ("0.0.0.0", "::", "::0",
+// …) uniformly. net.ParseIP alone misses inet_aton-style integer hosts ("0", "0x0") that a
+// cgo resolver's getaddrinfo still resolves to 0.0.0.0, so those are decoded separately.
+// Deliberately no DNS lookup: resolving an operator-supplied name would be background
+// network activity for a check that must work offline.
 func bindExposesAllInterfaces(bindHost string) bool {
 	if ip := net.ParseIP(bindHost); ip != nil {
 		return ip.IsUnspecified()
@@ -2107,42 +1667,32 @@ func bindExposesAllInterfaces(bindHost string) bool {
 		// An empty host in "host:port" means all interfaces to net.Listen.
 		return true
 	}
-	// inet_aton-style integer form: strconv handles the 0x / 0o / leading-0 octal bases
-	// the resolver accepts. Any parse failure means this is a name, not an integer.
+	// strconv handles the 0x / 0o / leading-0 bases the resolver accepts; a parse failure
+	// means this is a name, not an integer.
 	if n, err := strconv.ParseUint(bindHost, 0, 64); err == nil {
 		return n == 0
 	}
 	return false
 }
 
-// refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent.
-// It is the binding of the shared guard in internal/config for the writers that truncate
-// an operator-supplied destination (--output, the doctor bundle); see
-// config.RefuseNonRegularPath for what the guard covers.
+// refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent;
+// see config.RefuseNonRegularPath for what the guard covers.
 func refuseNonRegularOutput(path string) error {
 	return config.RefuseNonRegularPath(path, "output file")
 }
 
 // writeGeneratedFile writes content to path at mode 0600, refusing to clobber a
-// pre-existing file unless force is set. It closes two gaps in a plain
-// os.WriteFile(path, …, 0o600): (1) O_CREATE applies the mode only on CREATION, so a
-// pre-existing looser-mode file (e.g. 0644 from a prior run or a restore) would keep
-// that mode and leave a generated config's cleartext upstream credential group/world-
-// readable — force overwrites re-tighten the mode to 0600; (2) O_TRUNC silently
-// clobbers, so without force an existing file is refused (O_EXCL) rather than
-// destroying an operator's hand-edited manifest. Mirrors how the audit key/log paths
-// are hardened (internal/audit tightenKeyFileMode + never-overwrite).
+// pre-existing file unless force is set. Closes two gaps in a plain os.WriteFile:
+// O_CREATE applies the mode only on creation (force re-tightens to 0600), and O_TRUNC
+// silently clobbers (without force, O_EXCL refuses instead).
 func writeGeneratedFile(path, content string, force bool) (err error) {
 	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
 	if force {
 		if err := refuseNonRegularOutput(path); err != nil {
 			return err
 		}
-		// config.OpenNoFollow (O_NOFOLLOW on unix, 0 elsewhere) closes the Lstat->open
-		// race the guard above cannot: the guard inspects the path, then OpenFile resolves
-		// it again, and a link planted in that window would be followed — truncating the
-		// TARGET, which the Chmod below would then re-mode to 0600 as well. O_EXCL already
-		// refuses a symlink for free, which is why only the force path needs the flag.
+		// config.OpenNoFollow closes the Lstat->open race the guard above cannot; O_EXCL
+		// already refuses a symlink for free, which is why only the force path needs it.
 		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow
 	}
 	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
@@ -2152,21 +1702,17 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 		}
 		return err
 	}
-	// Surface the close (which flushes): an error-swallowing deferred Close would let a
-	// delayed write error (e.g. on NFS) be announced as a complete write. Keep the first
-	// error if the body already set one.
+	// Surface the close (which flushes), or a delayed write error (e.g. NFS) would be
+	// announced as a complete write.
 	defer func() {
 		if cerr := f.Close(); cerr != nil && err == nil {
 			err = fmt.Errorf("closing %q: %w", path, cerr)
 		}
 	}()
 	if force {
-		// O_TRUNC kept a pre-existing file's (possibly looser) mode; re-tighten it BEFORE
-		// writing so a regenerated credential-bearing config never lands at a group/world-
-		// readable mode, and tighten on the open fd rather than os.Chmod(path), which would
-		// re-resolve the path (following a symlink). On failure the (already-truncated) file
-		// is left empty and the error returned — fail closed rather than write the
-		// credential at a loose mode.
+		// Re-tighten BEFORE writing so a regenerated credential-bearing config never lands
+		// at a loose mode; on the open fd rather than os.Chmod(path), which would re-resolve
+		// and could follow a symlink.
 		if cerr := f.Chmod(0o600); cerr != nil {
 			return fmt.Errorf("tightening mode of %q to 0600: %w", path, cerr)
 		}
@@ -2181,9 +1727,8 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 // audit-log readers (suggest / stats / audit-verify)
 // -----------------------------------------------------------------
 
-// auditLogMissingHint returns a first-run-friendly message for when the audit log
-// does not exist yet — what the log is and how to produce one, instead of a raw
-// OS error. cmdName is the subcommand, used in the message and re-run command.
+// auditLogMissingHint returns a first-run-friendly message for a missing audit log — what
+// it is and how to produce one, instead of a raw OS error.
 func auditLogMissingHint(cmdName, logPath string) string {
 	return fmt.Sprintf(
 		"eunox %s: no audit log yet at %s.\n\n"+
@@ -2194,23 +1739,16 @@ func auditLogMissingHint(cmdName, logPath string) string {
 		cmdName, logPath, cmdName)
 }
 
-// openAuditChain opens the FULL audit chain — every rotated sibling plus the
-// active base, discovered via audit.LogChainFiles — for a read-only reporting
-// command, returning one concatenated reader (oldest record first) and a closer.
-// Reading only the active base segment (the previous behavior) silently dropped
-// every rotated file, so stats showed a partial histogram and suggest mined an
-// incomplete usage set. audit.OpenLogChain opens one file at a time, so the fd
-// count stays bounded even under the unbounded keep-all retention default. On
-// error the returned message is the full text to print to stderr verbatim
-// (either the first-run hint from auditLogMissingHint or a discovery-error
-// line); the caller prints it and exits 1.
+// openAuditChain opens the FULL audit chain — every rotated sibling plus the active base —
+// for a read-only reporting command, returning one concatenated reader (oldest record
+// first) and a closer. audit.OpenLogChain opens one file at a time, so the fd count stays
+// bounded even under keep-all retention. On error the returned message is the full text to
+// print to stderr verbatim; the caller prints it and exits 1.
 func openAuditChain(cmdName, logPath string) (reader io.Reader, closeAll func(), err error) {
 	files, ferr := audit.LogChainFiles(logPath)
 	if ferr != nil {
-		// Pre-formatted via Sprintf (not a literal Errorf format string) so the
-		// trailing newline — by design, this message is printed verbatim to
-		// stderr like auditLogMissingHint below — doesn't trip the "error
-		// strings must not end in punctuation/newline" checks.
+		// Pre-formatted via Sprintf, not Errorf, so the deliberate trailing newline
+		// doesn't trip the "error strings must not end in punctuation" checks.
 		msg := fmt.Sprintf("eunox %s: discovering rotated audit logs: %v\n", cmdName, ferr)
 		return nil, nil, fmt.Errorf("%s", msg)
 	}

@@ -15,28 +15,20 @@ const redactedPath = "/[redacted]"
 // in a log line or an error message. Only scheme://host survives; a non-empty path is
 // replaced with "/[redacted]".
 //
-// It is deliberately STRICTER than the operator-facing redactor used by the doctor support
-// bundle (config.RedactURL), which preserves query parameter NAMES, reports each secret's
-// decoded length, and keeps the path. That detail is appropriate for a bundle the operator
-// asked for and reads themselves — its audit tail is a record of which resource URIs were
-// allowed and denied, so the path there IS the content. It is a length oracle and a
-// credential leak in a startup banner or a validation error, which lands in the systemd
-// journal, container stdout, or a CI log — commonly a lower protection tier than the config
-// file the secret came from.
+// Deliberately STRICTER than the operator-facing redactor used by the doctor support bundle
+// (config.RedactURL), which preserves query parameter names, secret lengths, and the path —
+// appropriate there since the bundle's audit tail needs the path as content, but a length
+// oracle and credential leak in a startup banner or CI log, a commonly lower protection tier
+// than the config file the secret came from.
 //
-// The path is dropped because for whole families of endpoints the path IS the credential:
-// a Slack incoming webhook (https://hooks.slack.com/services/T…/B…/<secret>), a Telegram
-// bot API URL (https://api.telegram.org/bot<token>/…), a presigned object URL. Stripping
-// userinfo and the query while echoing those verbatim leaks the whole secret — and the
-// most likely way such a URL reaches a validation error is a scheme typo, which parses
-// fine and fails the scheme check with the path intact. scheme://host still identifies
-// which endpoint the message is about, which is what a log line needs.
+// The path is dropped because for whole families of endpoints the path IS the credential (a
+// Slack webhook, a Telegram bot URL, a presigned object URL): stripping userinfo/query while
+// echoing the path verbatim would leak the whole secret, and the likeliest way such a URL
+// reaches a validation error is a scheme typo that leaves the path intact.
 //
-// An unparseable input is not echoed back: returning the raw string on a parse failure
-// would leak exactly the credentialed URLs most likely to be malformed. Such input is
-// reduced to everything before the first "?" or "#" with any userinfo segment stripped and
-// any path replaced, and falls back to a fixed placeholder if even that cannot be done
-// safely.
+// An unparseable input is not echoed back — that would leak exactly the credentialed URLs
+// most likely to be malformed. It is reduced to everything before the first "?"/"#" with
+// userinfo stripped and the path replaced, falling back to a fixed placeholder otherwise.
 func RedactURLForLog(raw string) string {
 	if raw == "" {
 		return ""
@@ -50,12 +42,10 @@ func RedactURLForLog(raw string) string {
 	if u.Opaque != "" {
 		return u.Scheme + ":<redacted>"
 	}
-	// No authority (u.Host == "") — most often a scheme-less value such as
-	// "hooks.slack.com/services/…", the commonest upstreamUrl mistake. url.Parse puts
-	// the operator's HOST and path together in u.Path, so replacing u.Path wholesale
-	// would erase the one identifying detail the message exists to carry, leaving a
-	// bare "/[redacted]". Hand it to the textual splitter, which cuts at the first "/"
-	// and so keeps the host while still redacting everything after it.
+	// No authority (u.Host == "") — most often a scheme-less value like
+	// "hooks.slack.com/services/…". url.Parse puts host and path together in u.Path, so
+	// replacing it wholesale would erase the one identifying detail the message needs; hand
+	// it to the textual splitter, which cuts at the first "/" instead.
 	if u.Host == "" {
 		return coarseRedactURLForLog(raw)
 	}
@@ -64,14 +54,11 @@ func RedactURLForLog(raw string) string {
 	u.ForceQuery = false
 	u.Fragment = ""
 	u.RawFragment = ""
-	// Drop any path-embedded secret. RawPath must be overwritten too, not just Path:
-	// url.URL.String() emits RawPath whenever it is a valid encoding of Path, so a
-	// stale RawPath from a percent-escaped input would print the original path and
-	// silently defeat the replacement. Setting both to the same literal keeps String()
-	// on the RawPath branch (net/url's validEncoded admits '[' and ']' verbatim), so
-	// the placeholder is not re-escaped into "%5Bredacted%5D". A bare "/" carries
-	// nothing and is left alone so a host-root URL is not made to look like it had a
-	// path.
+	// RawPath must be overwritten too, not just Path: url.URL.String() emits RawPath
+	// whenever it validly encodes Path, so a stale RawPath from percent-escaped input would
+	// print the original path and defeat the replacement. Setting both to the same literal
+	// also keeps String() from re-escaping '['/']' into "%5Bredacted%5D". A bare "/" is left
+	// alone so a host-root URL isn't made to look like it had a path.
 	if u.Path != "" && u.Path != "/" {
 		u.Path = redactedPath
 		u.RawPath = redactedPath
@@ -81,8 +68,7 @@ func RedactURLForLog(raw string) string {
 
 // coarseRedactURLForLog handles input url.Parse rejected, and the parse-succeeded but
 // authority-less case above. It keeps only the portion before the first query/fragment
-// delimiter, strips any "user:pass@" authority segment, and replaces the path with
-// "/[redacted]" for the reasons on RedactURLForLog.
+// delimiter, strips any "user:pass@" authority segment, and replaces the path.
 func coarseRedactURLForLog(raw string) string {
 	cut := raw
 	if i := strings.IndexAny(cut, "?#"); i >= 0 {
@@ -92,8 +78,8 @@ func coarseRedactURLForLog(raw string) string {
 	prefix, rest := "", cut
 	if i := strings.Index(cut, "//"); i >= 0 {
 		prefix, rest = cut[:i+2], cut[i+2:]
-		// Strip userinfo: everything up to the last "@" of the authority, where the
-		// authority ends at the first "/".
+		// Strip userinfo: everything up to the last "@" before the authority ends (the
+		// first "/").
 		end := len(rest)
 		if s := strings.IndexByte(rest, '/'); s >= 0 {
 			end = s
@@ -106,17 +92,14 @@ func coarseRedactURLForLog(raw string) string {
 	// containing "/" ("//svc:pa/ss@host/x"), which puts the authority boundary inside the
 	// password so the strip above finds no "@" before it. Bail to the fixed placeholder.
 	//
-	// This must run BEFORE the path replacement below, not after: that replacement drops
-	// everything from the first "/" onward, which for this shape DELETES the very "@" the
-	// check keys on — so a post-replacement check passes a half-stripped credential
-	// ("//svc:pa/[redacted]") straight through to stderr.
+	// Must run BEFORE the path replacement below: that replacement drops everything from
+	// the first "/" onward, which for this shape DELETES the very "@" the check keys on.
 	if strings.ContainsAny(rest, "@") {
 		return "<redacted url>"
 	}
-	// Replace the path. A bare "/" is kept verbatim: it carries nothing to leak. The
-	// boundary is the first "/", which also covers scheme-less input
-	// ("hooks.slack.com/services/T/B/secret") and a path-only value ("/services/T/B/…"),
-	// where the whole string is the path and the result is a bare "/[redacted]".
+	// Replace the path. A bare "/" is kept verbatim (nothing to leak). The boundary is the
+	// first "/", which also covers scheme-less input and a path-only value, where the whole
+	// string is the path and the result is a bare "/[redacted]".
 	if i := strings.IndexByte(rest, '/'); i >= 0 && rest[i:] != "/" {
 		rest = rest[:i] + redactedPath
 	}

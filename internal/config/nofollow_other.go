@@ -5,8 +5,6 @@
 
 package config
 
-// OpenNoFollow is 0 on platforms with no O_NOFOLLOW equivalent (Windows, js/wasm): the
-// portable Lstat guard in RefuseNonRegularPath remains the only symlink check there,
-// which is why every caller keeps that guard rather than replacing it with the flag.
-// See nofollow_unix.go for the rationale.
+// OpenNoFollow is 0 on platforms with no O_NOFOLLOW equivalent (Windows, js/wasm), where
+// RefuseNonRegularPath's portable Lstat guard remains the only symlink check. See nofollow_unix.go.
 const OpenNoFollow = 0

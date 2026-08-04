@@ -17,33 +17,27 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Redis is a Redis-backed call counter. Unconditional increments (IncrementAndGet)
-// run as an atomic MULTI/EXEC transaction; the check-and-record quota admission
-// (AdmitAll) runs as an atomic Lua script so the totals and the conditional adds cannot
-// race — across every bucket of a batch, not just within one. Every path stamps a per-key TTL (windowSec *
-// cleanupMarginFactor) so idle counters are reclaimed without a separate sweep.
+// Redis is a Redis-backed call counter. IncrementAndGet runs as an atomic MULTI/EXEC
+// transaction; AdmitAll runs as an atomic Lua script so totals and conditional adds cannot
+// race across a batch. Every path stamps a per-key TTL (windowSec*cleanupMarginFactor) so
+// idle counters are reclaimed without a separate sweep.
 type Redis struct {
 	client redis.Cmdable
 	now    func() time.Time
 	// instanceID is a one-time random suffix folded into every ZADD member so two
-	// replicas pointed at the same Redis can never emit the same member. Without it,
-	// two processes whose seq atomics line up at the same UnixNano tick would produce
-	// identical members; ZADD would then update the score instead of inserting, so
-	// ZCARD does not advance and the counter under-counts across replicas — a
-	// fail-open in the multi-instance deployment this backend exists to support.
+	// replicas can never emit the same member — without it, two processes whose seq
+	// atomics line up at the same tick would collide and under-count (fail-open).
 	instanceID string
 	// seq is an atomic counter appended to each member so two calls in the same
-	// nanosecond within one process produce distinct members. Cross-process
-	// uniqueness comes from instanceID.
+	// nanosecond within one process produce distinct members.
 	seq atomic.Int64
-	// maxWeightedEntries bounds the live entries one weighted (key, window) may hold,
+	// maxWeightedEntries bounds live entries one weighted (key, window) may hold,
 	// mirroring InMemory. Defaults to MaxWeightedEntriesPerKey; lowered only by tests.
 	maxWeightedEntries int
 }
 
-// redisOption configures the Redis counter. It is unexported because the only
-// option (a custom clock) exists solely for deterministic tests; the external
-// test package reaches it through WithRedisTimeFunc in export_test.go.
+// redisOption configures the Redis counter. Unexported: its only use (a custom clock) is
+// for deterministic tests, reached externally via WithRedisTimeFunc in export_test.go.
 type redisOption func(*Redis)
 
 // withTimeFunc sets a custom time function so the same-tick collision regression
@@ -55,47 +49,30 @@ func withTimeFunc(fn func() time.Time) redisOption {
 }
 
 // withRedisMaxWeightedEntries lowers the per-key weighted retention ceiling, so a test
-// can reach it without writing MaxWeightedEntriesPerKey entries. Unexported for the same
-// reason as its in-memory twin: the ceiling is a package invariant, not an operator knob.
+// can reach it without writing MaxWeightedEntriesPerKey entries.
 func withRedisMaxWeightedEntries(n int) redisOption {
 	return func(r *Redis) {
 		r.maxWeightedEntries = n
 	}
 }
 
-// redisWindowKey is the Redis key for one (key, windowSec) counter's sorted set.
-// Keying by window means the same key under two windows addresses two independent
-// counters. Single source for the "callcounter:<key>:<windowSec>" format so the
-// increment, admit, and peek paths cannot drift.
-//
-// Built on storageKey — the in-memory backend's identical (key, windowSec) composition
-// — rather than a second fmt.Sprintf of the same scheme. The two backends must agree on
-// how a (key, windowSec) pair collapses into one string (that is what makes their window
-// isolation structurally equivalent), and this path runs per enforced call, so the shared
-// spelling is both cheaper and the reason a change to one composition cannot silently
-// miss the other.
+// redisWindowKey is the Redis key for one (key, windowSec) counter's sorted set. Built on
+// storageKey — the in-memory backend's identical composition — rather than a second
+// fmt.Sprintf, so the two backends cannot silently diverge on how a pair collapses to a string.
 func redisWindowKey(key string, windowSec int) string {
 	return "callcounter:" + storageKey(key, windowSec)
 }
 
-// newMember builds a unique sorted-set member for one inserted call: the instance
-// id, the call's nanosecond timestamp, and the next sequence number. Timestamp and
-// seq are zero-padded to fixed width so lexicographic member order matches insertion
-// order for same-score (same-microsecond) entries; otherwise a tie breaks at a digit
-// boundary ("...-10" before "...-9") and rank-trimming could discard the newest
-// member. The seq.Add advance makes two buckets or two same-tick calls never
-// collide. 20 digits cover the full uint64 range. The encoding is kept byte-identical
-// across all three increment paths, so this is their single source.
+// newMember builds a unique sorted-set member: instance id, nanosecond timestamp, and
+// sequence number, zero-padded so lexicographic order matches insertion order for
+// same-score entries (an unpadded tie could let rank-trimming discard the newest member).
 func (r *Redis) newMember(now time.Time) string {
 	return fmt.Sprintf("%s-%020d-%020d", r.instanceID, now.UnixNano(), r.seq.Add(1))
 }
 
-// NewRedis creates a Redis-backed call counter.
-//
-// Panics if crypto/rand cannot supply the per-instance entropy used to make ZADD
-// members unique across replicas — effectively impossible on a healthy host, and a
-// silent fallback would risk reintroducing the cross-replica collision the entropy
-// prevents.
+// NewRedis creates a Redis-backed call counter. Panics if crypto/rand cannot supply the
+// per-instance entropy for ZADD member uniqueness — a silent fallback would risk
+// reintroducing the cross-replica collision the entropy prevents.
 func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -113,15 +90,11 @@ func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
 	return r
 }
 
-// IncrementAndGet atomically records a call for key and window via a MULTI/EXEC
-// transaction, returning the in-window count capped at maxEntries. A sorted set
-// scored by timestamp gives accurate sliding-window counting; trimming to the
-// newest maxEntries members keeps it bounded, mirroring InMemory.
+// IncrementAndGet atomically records a call via a MULTI/EXEC transaction, returning the
+// in-window count capped at maxEntries by trimming to the newest members, mirroring InMemory.
 func (r *Redis) IncrementAndGet(ctx context.Context, key string, windowSec, maxEntries int) (int64, error) {
-	// Reject an out-of-range window before computing the TTL: an overflowing
-	// windowSec wraps the Expire to a non-positive TTL, so the key expires
-	// immediately and the counter resets every call (a fail-open bypass). A
-	// non-positive maxEntries is rejected (see checkMaxEntries).
+	// An overflowing windowSec wraps the Expire to a non-positive TTL, expiring the key
+	// immediately and resetting the counter every call (fail-open); see checkMaxEntries.
 	if err := checkWindowSec(windowSec); err != nil {
 		return 0, err
 	}
@@ -138,40 +111,24 @@ func (r *Redis) IncrementAndGet(ctx context.Context, key string, windowSec, maxE
 	cutoff := now.Add(-time.Duration(windowSec) * time.Second).UnixMicro()
 	member := r.newMember(now)
 
-	// Use a transactional pipeline (MULTI/EXEC) for atomicity
 	pipe := r.client.TxPipeline()
-
-	// Remove expired entries
 	pipe.ZRemRangeByScore(ctx, windowKey, "-inf", strconv.FormatInt(cutoff, 10))
-
-	// Add current timestamp
 	pipe.ZAdd(ctx, windowKey, redis.Z{Score: float64(nowUnixMicro), Member: member})
-
-	// Cap to the newest maxEntries: drop all but the highest-scored maxEntries
-	// members (negative stop -(maxEntries+1) leaves the top untouched; a no-op below
-	// the cap). Keeping the newest keeps presence/count correct as entries age out,
-	// matching InMemory. The stop is computed in int64 so maxEntries+1 cannot wrap to
-	// a no-op trim (checkMaxEntries already caps at math.MaxInt32).
+	// Drop all but the highest-scored maxEntries members (negative stop leaves the top
+	// untouched below the cap), keeping the newest as InMemory does. int64 so
+	// maxEntries+1 cannot wrap to a no-op trim (checkMaxEntries caps at math.MaxInt32).
 	pipe.ZRemRangeByRank(ctx, windowKey, 0, -(int64(maxEntries) + 1))
-
-	// Count entries in window (post-trim)
 	countCmd := pipe.ZCard(ctx, windowKey)
-
-	// Set TTL for cleanup, with a cleanupMarginFactor margin (not +1s) so entries at
-	// the window start are not evicted before the ZREMRANGEBYSCORE cleanup fires
-	// under high app/Redis clock skew. Cleanup-only; the margin's storage cost is
-	// negligible.
+	// cleanupMarginFactor margin (not +1s) so window-start entries are not evicted before
+	// the ZREMRANGEBYSCORE cleanup fires under high app/Redis clock skew.
 	pipe.Expire(ctx, windowKey, time.Duration(windowSec)*cleanupMarginFactor*time.Second)
 
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("redis pipeline: %w", err)
 	}
-	// Defence in depth on the value used for enforcement. A command error inside EXEC
-	// (e.g. WRONGTYPE) leaves countCmd.Val() at zero, and returning 0 would report no
-	// in-window calls and fail open. Exec's aggregated error normally surfaces this,
-	// but re-checking countCmd.Err() keeps the fail-closed guarantee local to the
-	// command whose Val() we return.
+	// Defence in depth: a command error inside EXEC (e.g. WRONGTYPE) leaves countCmd.Val()
+	// at zero, which would fail open by reporting no in-window calls if not re-checked.
 	if err := countCmd.Err(); err != nil {
 		return 0, fmt.Errorf("redis pipeline ZCard: %w", err)
 	}
@@ -179,15 +136,11 @@ func (r *Redis) IncrementAndGet(ctx context.Context, key string, windowSec, maxE
 	return countCmd.Val(), nil
 }
 
-// admitAllScript is the multi-bucket admission: it prunes and totals every bucket under
-// that bucket's OWN accounting, and ZADDs a member into all of them only if EVERY bucket
-// has headroom — otherwise records nothing and reports the first blocking bucket.
-// Evaluating check and all-or-nothing commit in one script makes a multi-condition
-// admission atomic.
-//
-// A counted bucket totals with ZCARD (O(1)); a weighted one sums the per-member weights.
-// Mixing the two in one script is what lets "no more than 20 refunds an hour AND no more
-// than $2,000 an hour" be one atomic decision instead of two that can disagree.
+// admitAllScript is the multi-bucket admission: prunes and totals every bucket under its
+// own accounting, and ZADDs into all of them only if EVERY bucket has headroom — otherwise
+// records nothing and reports the first blocker. Check-and-commit in one script makes a
+// multi-condition admission atomic, so mixing counted (ZCARD) and weighted (summed) buckets
+// lets e.g. "20 refunds/hour AND $2,000/hour" be one atomic decision instead of two.
 //
 //	KEYS[i]               sorted-set key for bucket i (1..#KEYS)
 //	ARGV[1]               now (microseconds; score for new members)
@@ -195,24 +148,20 @@ func (r *Redis) IncrementAndGet(ctx context.Context, key string, windowSec, maxE
 //	ARGV[#ARGV]           maxWeightedEntries (per-key weighted retention ceiling; 0 = unbounded)
 //
 // Reply: {admitted (1|0), deniedIndex (1-based; 0 when admitted), total (string), retryAfterMicros},
-// or an ERROR reply when a weighted bucket is at the retention ceiling — which the caller
-// surfaces as an infrastructure fault and the engine denies on (see MaxWeightedEntriesPerKey).
+// or an ERROR reply when a weighted bucket is at its retention ceiling (the engine denies on it).
 //
-// The total is a STRING, not a Redis integer: it is a magnitude, routinely fractional (a
-// currency amount), and %.17g round-trips a float64 exactly where Redis integer replies
-// truncate and Lua's own tostring (%.14g) would silently round a total in the upper range
-// of what MaxWeightedTotal admits — turning an exact budget into an approximate one at
-// exactly the magnitudes where the bound matters most. Timestamps are MICROSECONDS throughout: Lua numbers are
-// float64, exact only to 2^53.
+// total is a STRING, not a Redis integer: it is routinely fractional, and %.17g round-trips
+// a float64 exactly where Lua's own tostring (%.14g) would silently round it in the upper
+// range MaxWeightedTotal admits. Timestamps are MICROSECONDS throughout (Lua numbers are
+// float64, exact only to 2^53).
 var admitAllScript = redis.NewScript(`
 local now = tonumber(ARGV[1])
 local n = #KEYS
 local totals = {}
 local counts = {}
--- Positional, not ARGV[#ARGV]: with the trailing argument omitted, #ARGV lands on the
--- last bucket's WEIGHT and would be read as a ceiling (a weight of 5 silently refusing
--- every key holding 5 entries). Indexing past the per-bucket block yields nil instead, so
--- a caller invoking this script directly without it fails closed and diagnosably.
+-- Positional, not ARGV[#ARGV]: omitting the trailing argument would make #ARGV land on the
+-- last bucket's WEIGHT instead. Indexing past the block yields nil, so a direct caller
+-- missing it fails closed and diagnosably.
 local maxWeightedEntries = tonumber(ARGV[2 + n*7])
 if maxWeightedEntries == nil then
   return redis.error_reply('callcounter: admitAll requires the trailing weighted-entry ceiling argument')
@@ -226,10 +175,8 @@ local function entry_weight(m)
 end
 
 local function refresh_ttls()
-  -- Refresh the TTL on every non-admitting path: a bucket that is never admitted would
-  -- otherwise count its TTL down from the last admit and could expire mid-window,
-  -- silently resetting the quota. Gate on EXISTS so the invariant is "refresh whenever
-  -- present, never re-create an absent key".
+  -- Refresh TTL on every non-admitting path too, or a bucket that's never admitted could
+  -- expire mid-window and silently reset. EXISTS-gated: refresh, never re-create.
   for i = 1, n do
     local base = 1 + (i-1)*7
     if redis.call('EXISTS', KEYS[i]) == 1 then
@@ -271,8 +218,8 @@ if denied > 0 then
   local total = totals[denied]
   local retry = 0
   if counted == 1 then
-    -- The last entry that must age out is the (total-limit)-th oldest; read it directly
-    -- rather than walking, so a large quota does not pay a linear scan on the deny path.
+    -- The last entry to age out is the (total-limit)-th oldest; read it directly rather
+    -- than walking, so a large quota does not pay a linear scan on the deny path.
     local idx = total - limit
     local pivot = redis.call('ZRANGE', KEYS[denied], idx, idx, 'WITHSCORES')
     if pivot[2] then
@@ -295,11 +242,9 @@ if denied > 0 then
 end
 
 -- Every bucket has headroom. Before writing ANY of them, check the weighted retention
--- ceiling across the whole batch, so the commit stays all-or-nothing against it the way
--- it is against the quota. A weighted bucket's entry count is not bounded by its own
--- limit -- arbitrarily many sub-threshold magnitudes fit under one total -- and each
--- later admission re-sums the set inside this blocking script. An error reply is the
--- fail-closed refusal; nothing has been written yet, so no partial commit escapes.
+-- ceiling across the whole batch, so the commit stays all-or-nothing against it too --
+-- a weighted bucket's entry count is not bounded by its own limit. Nothing has been
+-- written yet, so an error reply here has no partial commit to undo.
 if maxWeightedEntries > 0 then
   for i = 1, n do
     local base = 1 + (i-1)*7
@@ -319,34 +264,26 @@ for i = 1, n do
   local weight = tonumber(ARGV[base+7])
   if counted == 1 then weight = 1 end
   local post = totals[i] + weight
-  -- A weight that cannot move the total is admitted WITHOUT being recorded: it can never
-  -- affect a future decision, and recording it is the one case that would grow a key
-  -- without bound.
+  -- A weight that cannot move the total is admitted WITHOUT being recorded -- it could
+  -- never affect a future decision, and recording it would grow a key without bound.
   if post ~= totals[i] then
     redis.call('ZADD', KEYS[i], now, ARGV[base+2])
   end
   redis.call('EXPIRE', KEYS[i], ARGV[base+4])
   if post > maxTotal then maxTotal = post end
 end
--- Report the maximum post-admission total across buckets per the capability.CallCounter
--- contract, mirroring the in-memory backend (no single binding bucket on admit).
+-- Report the maximum post-admission total across buckets, mirroring InMemory (no single
+-- binding bucket on admit).
 return {1, 0, string.format('%.17g', maxTotal), 0}
 `)
 
-// AdmitAll admits a call against several quota buckets atomically, mixing counted and
-// weighted accountings in one script (see admitAllScript and the capability.CallCounter
-// contract).
-//
-// This is a multi-key EVAL: the buckets carry distinct windowSec suffixes, so on a Redis
-// Cluster they hash to different slots and the script returns CROSSSLOT. The binary wires a
-// single-node client, where slots do not apply; if a cluster client is ever wired, that
-// error surfaces here and the engine maps it to a deny, so the constraint fails CLOSED
-// rather than silently over-admitting.
+// AdmitAll admits against several quota buckets atomically, mixing counted and weighted
+// accountings in one script (see admitAllScript). This is a multi-key EVAL: buckets carry
+// distinct windowSec suffixes, so on a Redis Cluster they can hash to different slots and
+// CROSSSLOT surfaces here, which the engine maps to a deny (fails closed, never over-admits).
 func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
-	// Validate the batch before the Redis call, failing closed as the single-bucket paths
-	// do: two buckets sharing a Redis window key would ZADD two members into one sorted set
-	// (double-count), diverging from the fail-closed InMemory backend. checkBuckets is
-	// shared with InMemory so both reject the same inputs identically.
+	// checkBuckets is shared with InMemory: without it, two buckets sharing a window key
+	// would ZADD two members into one set (double-count), diverging from InMemory.
 	if e := checkBuckets(buckets); e != nil {
 		return false, 0, 0, 0, e
 	}
@@ -363,7 +300,7 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 		ttlSec := int64(b.WindowSec) * cleanupMarginFactor
 		counted := 0
 		// A counted bucket's member carries NO weight suffix, so a later weighted read of
-		// the same key reads it as 1 — the sense in which maxCalls is this with weight 1.
+		// the same key reads it as 1.
 		member := r.newMember(now)
 		if b.Counted {
 			counted = 1
@@ -372,9 +309,8 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 		}
 		argv = append(argv, cutoff, member, b.Limit, ttlSec, windowMicros, counted, b.Weight)
 	}
-	// Trailing, batch-wide: the script reads it as ARGV[#ARGV] rather than as an eighth
-	// per-bucket field, since the ceiling is one package invariant and not a per-bucket
-	// property.
+	// Trailing, batch-wide (not an eighth per-bucket field): the ceiling is one package
+	// invariant, not a per-bucket property.
 	argv = append(argv, r.maxWeightedEntries)
 
 	res, runErr := admitAllScript.Run(ctx, r.client, redisKeys, argv...).Result()
@@ -384,11 +320,9 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 	return parseAdmitAllReply(res)
 }
 
-// parseAdmitAllReply decodes the {admitted, deniedIndex, total, retryAfterMicros} array
-// admitAllScript returns, converting the script's 1-based deniedIndex to a 0-based slice
-// index. Each element is type-checked so a changed encoding (a go-redis upgrade, a
-// Redis-compatible proxy, a mock) fails closed with a structured error rather than
-// defaulting to a zero value — a zero total would read as an unspent budget and admit.
+// parseAdmitAllReply decodes admitAllScript's reply, converting the 1-based deniedIndex to
+// 0-based. Each element is type-checked so a changed encoding fails closed with a
+// structured error rather than defaulting to a zero value that would read as unspent budget.
 func parseAdmitAllReply(res interface{}) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	arr, ok := res.([]interface{})
 	if !ok || len(arr) != 4 {
@@ -420,31 +354,22 @@ func parseAdmitAllReply(res interface{}) (admitted bool, deniedIndex int, total 
 	return false, int(deniedRaw) - 1, total, time.Duration(retryMicros) * time.Microsecond, nil
 }
 
-// weightMemberSep separates a sorted-set member's uniqueness prefix from the WEIGHT it
-// carries. One key holds both the timestamp (the score) and the magnitude (the member
-// suffix), so a weighted counter needs no second key to stay consistent with its own
-// expiry — the weight ages out with the entry that carried it, atomically, because they
-// are the same element.
-//
-// The separator is a byte the uniqueness prefix cannot contain: newMember emits only hex,
-// digits, and '-'. A member WITHOUT it is a plain counted call and reads as weight 1, which
-// is what lets a key a counted bucket wrote be summed by a weighted one without a
-// migration — the sense in which the weighted total generalizes the count.
+// weightMemberSep separates a member's uniqueness prefix from its WEIGHT. One key holds
+// both the timestamp (score) and magnitude (suffix), so the weight ages out atomically with
+// its entry. The separator is a byte newMember's hex/digit/'-' prefix cannot contain; a
+// member WITHOUT it is a plain counted call and reads as weight 1.
 const weightMemberSep = "|"
 
-// newWeightedMember builds a sorted-set member carrying both the per-instance uniqueness
-// of newMember and this call's weight. 'g' with -1 precision emits the shortest form that
-// round-trips through Lua's tonumber (itself a float64 parse), so the weight summed by the
-// script is bit-identical to the one this process admitted.
+// newWeightedMember builds a member carrying newMember's uniqueness plus this call's
+// weight. 'g' with -1 precision emits the shortest form round-tripping through Lua's
+// tonumber, so the script sums a bit-identical weight.
 func (r *Redis) newWeightedMember(now time.Time, weight float64) string {
 	return r.newMember(now) + weightMemberSep + strconv.FormatFloat(weight, 'g', -1, 64)
 }
 
-// Peek returns the number of entries recorded for key within the window WITHOUT
-// adding one. It is the read-only counterpart of IncrementAndGet used by
-// sequenceBlock to test whether a tool has already run. windowSec must match the
-// recording value so the same sorted-set bucket is consulted; the engine uses
-// sequenceHistoryWindowSec for both, so they agree.
+// Peek returns the entry count for key within the window WITHOUT adding one. windowSec
+// must match the recording value so the same sorted-set bucket is consulted; the engine
+// uses sequenceHistoryWindowSec for both, so they agree.
 func (r *Redis) Peek(ctx context.Context, key string, windowSec int) (int64, error) {
 	if err := checkWindowSec(windowSec); err != nil {
 		return 0, err
@@ -455,10 +380,9 @@ func (r *Redis) Peek(ctx context.Context, key string, windowSec int) (int64, err
 	// Integer-microsecond cutoff, matching the mutating paths.
 	cutoff := now.Add(-time.Duration(windowSec) * time.Second).UnixMicro()
 
-	// Count entries strictly newer than the cutoff. The "(" prefix makes the lower
-	// bound exclusive so this shares the mutating path's expiry predicate (which
-	// drops scores <= cutoff). Without it, ZCOUNT's inclusive lower bound would count
-	// an entry exactly at the cutoff and keep stale history alive at the window edge.
+	// The "(" prefix makes the lower bound exclusive, matching the mutating path's
+	// drops-scores-<=-cutoff predicate; ZCOUNT's default inclusive bound would keep stale
+	// history alive at the window edge.
 	count, err := r.client.ZCount(ctx, windowKey, "("+strconv.FormatInt(cutoff, 10), "+inf").Result()
 	if err != nil {
 		return 0, fmt.Errorf("redis zcount: %w", err)

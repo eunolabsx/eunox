@@ -1,17 +1,11 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// contracts: the operator-facing surface of the effect layer's authoring-time half.
-//
-// It verifies a contract corpus — every entry loaded, every declared digest recomputed
-// against its content, duplicate ids reported — and prints the `effect.ref` pin an author
-// copies into a manifest. Both were reachable only from `go test` before, which meant a
-// corpus you were handed could not be checked without writing Go, and pinning an entry
-// meant hand-computing a digest.
-//
-// Everything here is LOCAL. eunox never fetches the registry, on the decision path or off
-// it, and this must not become the path that starts: the digest is over the contract's own
-// content, so verification and pinning both work offline against files on disk.
+// contracts: the operator-facing surface of the effect layer's authoring-time half. Verifies
+// a contract corpus (loads every entry, recomputes each declared digest, reports duplicate
+// ids) and prints the `effect.ref` pin an author copies into a manifest — previously reachable
+// only from `go test`. Everything is local: the digest is over the contract's own content, so
+// this works offline and must stay that way.
 
 package main
 
@@ -27,16 +21,13 @@ import (
 	"github.com/eunolabs/eunox/internal/registry"
 )
 
-// defaultContractsDir is the corpus shipped in this repository. It is a convenience for
-// the common case, not a lookup path: nothing searches for a corpus, and a directory that
-// is not there is an error rather than a silent empty result.
+// defaultContractsDir is a convenience default, not a search path: a missing directory is
+// an error rather than a silent empty result.
 const defaultContractsDir = "registry/contracts"
 
-// reportUnreadableCorpusDir explains a corpus directory that could not be read, adding
-// where the path came from when the operator did not choose it. The default is
-// CWD-relative, so a bare `eunox contracts` from an installed binary dead-ends on a path
-// nothing in the output identifies as a default — the first-run experience for anyone not
-// standing in a checkout.
+// reportUnreadableCorpusDir explains an unreadable corpus directory, naming the default
+// explicitly when the operator did not pass --dir — a bare `eunox contracts` run outside a
+// checkout otherwise dead-ends on a CWD-relative path nothing identifies as the default.
 func reportUnreadableCorpusDir(resolved, requested string, statErr error) {
 	fmt.Fprintf(os.Stderr, "eunox contracts: cannot read corpus directory %q: %v\n", resolved, statErr)
 	if requested == defaultContractsDir {
@@ -44,9 +35,8 @@ func reportUnreadableCorpusDir(resolved, requested string, statErr error) {
 	}
 }
 
-// cmdContracts runs the `contracts` subcommand and returns the process exit code (rather
-// than calling os.Exit itself), so tests can drive every branch — including the failure
-// paths — without terminating the test binary.
+// cmdContracts runs the `contracts` subcommand, returning the exit code (rather than
+// calling os.Exit) so tests can drive every branch including the failure paths.
 func cmdContracts(args []string) int {
 	fs := flag.NewFlagSet("contracts", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -106,8 +96,7 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox contracts: unexpected argument %q; the corpus directory is given with --dir\n", rest[0])
 		return 2
 	}
-	// Two query modes that each print one value and exit. Combining them would have to pick
-	// one silently, so it is a usage error instead.
+	// Combining the two query modes would have to pick one silently; reject instead.
 	if *ref != "" && *attestPayload != "" {
 		fmt.Fprintln(os.Stderr, "eunox contracts: --ref and --attest-payload each print one value; pass only one")
 		return 2
@@ -119,10 +108,8 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", err)
 		return 2
 	}
-	// LoadCorpus globs, so a missing directory yields an empty corpus rather than an
-	// error. Reporting "0 contracts, valid" for a path that does not exist would be a
-	// clean bill of health for something never read — the exact shape the loader's own
-	// fail-on-first-invalid rule exists to prevent one level down.
+	// LoadCorpus globs, so a missing directory yields an empty corpus, not an error —
+	// stat it ourselves first so a typo'd --dir doesn't report "0 contracts, valid".
 	if info, statErr := os.Stat(resolved); statErr != nil {
 		reportUnreadableCorpusDir(resolved, *dir, statErr)
 		return 2
@@ -133,25 +120,15 @@ Flags:
 
 	contracts, err := registry.LoadCorpus(resolved)
 	if err != nil {
-		// The loader fails on the FIRST invalid entry — a bad digest, an unknown class, a
-		// duplicate id — and its message already names the file and the reason.
+		// LoadCorpus fails on the first invalid entry; its message names the file and reason.
 		fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", err)
 		return 2
 	}
 
-	// Signature verification is opt-in, because it needs a key file only the operator can
-	// supply — there is no default trust store and nothing is fetched to build one. Without
-	// --trust-keys the corpus verifies exactly as it did before (digest integrity), and the
-	// listing simply omits the column rather than printing an unverified one that reads like
-	// a verdict.
-	//
-	// It runs BEFORE the --ref and --attest-payload branches, not after. Those two are the
-	// moments a decision is made — an author copies a pin, a publisher signs — so they are
-	// exactly where a tampered entry has to STOP the command (exit 2) and a trusted reviewer's
-	// DISPUTE has to reach the operator (a stderr warning; a dispute is advisory and does not
-	// change the exit code). Returning early made `--ref` with `--trust-keys` exit 0 having
-	// verified nothing, which is the false assurance the listing's own column rule exists to
-	// avoid.
+	// Signature verification is opt-in (needs an operator-supplied key file; nothing is
+	// fetched) and runs BEFORE the --ref/--attest-payload branches: those are the moments an
+	// author commits to an entry, so a tampered one must stop the command there rather than
+	// let `--ref --trust-keys` exit 0 having verified nothing.
 	var statuses map[string]registry.AttestationStatus
 	if *trustKeys != "" {
 		store, storeErr := registry.LoadTrustStore(*trustKeys)
@@ -163,9 +140,8 @@ Flags:
 		for i := range contracts {
 			st, verifyErr := contracts[i].VerifyAttestations(store)
 			if verifyErr != nil {
-				// A trusted key whose signature does not verify is tampering, not a
-				// reporting nuance: stop rather than print a corpus listing with one row
-				// quietly saying "-".
+				// A trusted key whose signature fails to verify is tampering: stop rather
+				// than print a listing with one row quietly saying "-".
 				fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", verifyErr)
 				return 2
 			}
@@ -186,19 +162,10 @@ Flags:
 	return 0
 }
 
-// writeAttestPayload prints the exact bytes a signer covers for one entry, so a publisher can
-// sign them with their own tooling. eunox verifies attestations and never mints them — it
-// holds no signing key and has no subcommand that would want one — so the deliverable here is
-// the payload, not a signature.
-//
-// The digest that goes into the payload is the one LoadCorpus already recomputed from the
-// entry's content, so a signature made from this output is bound to the content in the file
-// rather than to whatever the file happened to declare.
-//
-// It warns on a DISPUTE for the same reason --ref does, and the case is if anything stronger:
-// putting a signature on an entry is a more durable commitment than pasting a pin, and a
-// publisher who is about to make one is exactly who needs to know that a reviewer they trust
-// read the entry and disagreed.
+// writeAttestPayload prints the exact bytes a signer covers for one entry — eunox verifies
+// attestations and never mints them, so the deliverable is the payload, not a signature. The
+// digest is the one LoadCorpus already recomputed from content, binding a signature to the
+// file's actual bytes rather than its declared digest.
 func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, statement string, statuses map[string]registry.AttestationStatus) int {
 	c := findContract(contracts, id)
 	if c == nil {
@@ -210,16 +177,13 @@ func writeAttestPayload(out io.Writer, contracts []registry.Contract, id, role, 
 		fmt.Fprintf(os.Stderr, "eunox contracts: %v\n", err)
 		return 2
 	}
-	// No trailing newline: the payload is the signed byte string, and a shell
-	// redirection of this output has to be the bytes and nothing else.
+	// No trailing newline: the payload is the exact signed byte string.
 	wf(out, "%s", payload)
 	return 0
 }
 
-// findContract returns the entry with this id, or nil. It is one linear walk shared by the
-// two single-entry commands rather than a copy in each: they had the same scan and the same
-// not-found message differing only in the flag name, which is two places to edit for one
-// lookup and two places for the message to drift.
+// findContract returns the entry with this id, or nil — one linear walk shared by the two
+// single-entry commands so the lookup and not-found message can't drift between them.
 func findContract(contracts []registry.Contract, id string) *registry.Contract {
 	for i := range contracts {
 		if contracts[i].ID == id {
@@ -229,24 +193,17 @@ func findContract(contracts []registry.Contract, id string) *registry.Contract {
 	return nil
 }
 
-// reportUnknownContractID is the shared not-found path; askedBy names the flag that asked,
-// so the message points at the one the operator actually typed. An unknown id is an error
-// rather than empty output for both callers: a pin an author pastes, and a payload a
-// publisher signs, both have to come from an entry that exists.
+// reportUnknownContractID is the shared not-found path; askedBy names the flag the operator
+// typed so the message points at it. Errors rather than empty output either way — the pin an
+// author pastes and the payload a publisher signs both must come from an entry that exists.
 func reportUnknownContractID(id, askedBy string) int {
 	fmt.Fprintf(os.Stderr, "eunox contracts: no contract with id %q in the corpus (run without %s to list the ids it holds)\n", id, askedBy)
 	return 2
 }
 
 // warnIfDisputed reports a trusted key's DISPUTE of the entry a single-entry command is about
-// to hand over, on stderr so the value on stdout stays pipeable. Nothing when the caller passed
-// no --trust-keys (statuses is nil) or nobody disputed.
-//
-// It is one function rather than a line in each caller because the two callers are the two
-// moments an author commits to an entry — pasting a pin, signing an attestation — and a warning
-// that fires at one and not the other is the shape that silently regresses. It deliberately
-// does not change the exit code: a dispute is a community-advisory signal, not a verdict eunox
-// is in a position to issue.
+// to hand over, on stderr so stdout stays pipeable. It never changes the exit code — a dispute
+// is a community-advisory signal, not a verdict eunox is in a position to issue.
 func warnIfDisputed(id string, statuses map[string]registry.AttestationStatus) {
 	st, ok := statuses[id]
 	if !ok || len(st.Disputed) == 0 {
@@ -255,14 +212,8 @@ func warnIfDisputed(id string, statuses map[string]registry.AttestationStatus) {
 	fmt.Fprintf(os.Stderr, "eunox contracts: WARNING %q is DISPUTED by %v (a trusted key you configured); read their reasoning before relying on it\n", id, st.Disputed)
 }
 
-// writeContractRef prints the pin for one contract id. An unknown id is an error, not an
-// empty line: a pin an author pastes has to come from an entry that exists.
-//
-// When attestations were verified (--trust-keys), a DISPUTE on the entry being pinned is
-// reported on stderr rather than swallowed. Printing the pin anyway is deliberate — a dispute
-// is a community-advisory signal and not a verdict eunox is in a position to issue — but the
-// one moment an author is about to commit to an entry is the moment they need to know someone
-// who read it disagreed.
+// writeContractRef prints the pin for one contract id, warning on stderr (not blocking) if a
+// trusted key disputed the entry — printed anyway since a dispute is advisory, not a verdict.
 func writeContractRef(out io.Writer, contracts []registry.Contract, id string, statuses map[string]registry.AttestationStatus) int {
 	c := findContract(contracts, id)
 	if c == nil {
@@ -273,14 +224,10 @@ func writeContractRef(out io.Writer, contracts []registry.Contract, id string, s
 	return 0
 }
 
-// writeContractCorpus lists a verified corpus: one row per entry with the fields a
-// reviewer selects on, plus the pin. The digest each row carries has already been
-// recomputed from the entry's content by LoadCorpus, so a listed row is a verified one.
-//
-// statuses is nil unless the caller passed --trust-keys, in which case each row gains an
-// ATTESTATION column reporting what verified. The column is omitted entirely rather than
-// filled with a placeholder when no trust store was given: a column of "-" beside every entry
-// reads as "nobody signed these", when the truth is "nothing was checked".
+// writeContractCorpus lists a verified corpus: one row per entry with the fields a reviewer
+// selects on, plus the pin. statuses is nil unless --trust-keys was passed; the ATTESTATION
+// column is then omitted entirely rather than filled with placeholders — a column of "-"
+// beside every entry would read as "nobody signed these" when the truth is "nothing checked".
 func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contract, statuses map[string]registry.AttestationStatus) {
 	wf(out, "OK    %s  (%d contract(s), every declared digest matches its content)\n", dir, len(contracts))
 	if len(contracts) == 0 {
@@ -289,10 +236,9 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 	}
 	wln(out)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	// One row shape, assembled as cells and joined once, rather than a header literal and a
-	// row call per column set. The two-copy form was four places to edit for a new column,
-	// and the copies could drift so that the header and the rows disagreed on column count —
-	// which tabwriter renders as a silently misaligned table, not an error.
+	// One row shape, assembled as cells and joined once: a header literal plus a separate
+	// per-column row call could drift on column count, which tabwriter renders as a
+	// silently misaligned table rather than an error.
 	writeRow := func(cells []string) { wf(tw, "%s\n", strings.Join(cells, "\t")) }
 	header := []string{"ID", "TOOL", "CLASS", "REVIEW"}
 	if statuses != nil {
@@ -305,9 +251,8 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 		c := &contracts[i]
 		class := c.Effect.Class
 		if c.Effect.ByArgument != nil {
-			// An argument-parameterized contract has no single class; saying which argument
-			// selects one is more useful than printing the base block's class as if it were
-			// the answer for every call.
+			// No single class for an argument-parameterized contract; name the selecting
+			// argument instead of printing the base block's class as if it applied to every call.
 			class = "by " + c.Effect.ByArgument.Argument
 		}
 		cells := []string{c.ID, c.Tool, class, c.Attestation.Review}
@@ -325,10 +270,7 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 	_ = tw.Flush()
 	wln(out)
 	if disputed > 0 {
-		// Repeated below the table because the table is what gets scrolled past. A dispute
-		// is the one row state that should change what an operator does next, and it is
-		// deliberately not an error exit: someone who looked disagreeing is a signal to weigh,
-		// not a verdict eunox is in a position to issue.
+		// Repeated below the table since the table itself is what gets scrolled past.
 		wf(out, "%d entr(y/ies) carry a DISPUTE from a key you trust. A dispute is a community-advisory\n", disputed)
 		wln(out, "signal, not a scanner verdict: read the disputing party's reasoning before pinning.")
 		wln(out)
@@ -339,24 +281,10 @@ func writeContractCorpus(out io.Writer, dir string, contracts []registry.Contrac
 }
 
 // writeEffectCoverage reports how much of a manifest carries an effect contract, and names
-// what does not.
-//
-// The ratio is the operator's progress meter on the registry flywheel, and the names are
-// the worklist: under an effectCeiling every unannotated capability resolves to the
-// fail-closed default (irreversible, unquantified) and therefore ESCALATES, so "how much of
-// my policy is annotated" is the question that predicts the approval queue. Without this it
-// was answerable only by reading YAML.
-//
-// listTargets governs whether the worklist NAMES the capabilities or only counts them: the
-// operator-facing `validate` path names them (that is the point), while the doctor bundle —
-// which is written to be pasted into a public bug report — counts them, since a capability
-// target is a resource URI or a tool name and every other line of that bundle is
-// deliberately a count or a digest.
-//
-// Printed for every manifest, ceiling or not. A policy with no ceiling still benefits from
-// knowing the ratio before it adds one — that is precisely when the answer changes what
-// happens — so the line states which regime it is reporting under rather than staying
-// silent until a ceiling exists.
+// what does not — under an effectCeiling every unannotated capability escalates, so this
+// ratio predicts the approval queue. listTargets names the capabilities (validate) vs. only
+// counting them (the doctor bundle, which is pasted into public bug reports and must not
+// leak resource URIs / tool names).
 func writeEffectCoverage(out io.Writer, prefix string, m *config.LocalManifest, listTargets bool) {
 	if m == nil {
 		return
@@ -372,11 +300,8 @@ func writeEffectCoverage(out io.Writer, prefix string, m *config.LocalManifest, 
 		return
 	}
 	if !listTargets {
-		// The doctor bundle is generated to be pasted into a public bug report, and every
-		// other manifest line there is a count or a digest — never a target. A capability
-		// target is a resource URI or a tool name ("resource:postgres://prod-billing/*"),
-		// so listing them here would make this the one place the bundle leaks manifest
-		// contents. The ratio still tells the reader what they need.
+		// The doctor bundle is pasted into public bug reports; a target like
+		// "resource:postgres://prod-billing/*" would leak manifest contents.
 		wf(out, "%s  unannotated: %d (run `eunox validate` locally to list them)\n", prefix, len(unannotated))
 		return
 	}

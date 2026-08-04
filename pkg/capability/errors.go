@@ -34,19 +34,12 @@ const (
 	ErrCodeOperationNotPermitted = "OPERATION_NOT_PERMITTED"
 	ErrCodeValueNotPermitted     = "VALUE_NOT_PERMITTED"
 	// ErrCodeEnforcementError is a reserved, fail-closed code for an internal
-	// enforcement-engine failure while evaluating a matched constraint's conditions
-	// — a request that can be neither allowed nor cleanly rejected by policy. It is
-	// distinct from CAPABILITY_DENIED and CONDITION_FAILED. No enforcement-engine
-	// condition path emits it today (condition handlers, including an unreachable
-	// MaxCalls backend, still resolve to CONDITION_FAILED); the PDP keeps it as a
-	// defensive guard so a future internal error denies with a distinct, matchable
-	// code rather than falling open. The transport layer DOES emit it on reachable
-	// fail-closed paths — a redaction-obligation failure, an undelivered
-	// server-initiated request, and a malformed */list response — so it does appear
-	// on the tape. The resource-read and prompt-get paths also reuse it for a
-	// resource:/prompt: constraint carrying a tool-only argumentSchema (rejected at
-	// load, so likewise unreachable), denying rather than forwarding with the schema
-	// silently skipped. Maps to JSON-RPC -32603.
+	// enforcement-engine failure — a request that can be neither allowed nor cleanly
+	// rejected by policy. No condition path emits it today; the PDP keeps it as a
+	// defensive guard so a future internal error denies distinctly rather than falling
+	// open. The transport layer does emit it on reachable fail-closed paths (a
+	// redaction failure, an undelivered server-initiated request, a malformed */list
+	// response). Maps to JSON-RPC -32603.
 	ErrCodeEnforcementError = "ENFORCEMENT_ERROR"
 	// ErrCodeAuditUnavailable denies an otherwise-authorized call under
 	// --require-audit=strict when the audit trail has degraded (a record dropped
@@ -64,30 +57,16 @@ const (
 	// typo cannot diverge the wire/audit code, and denialToJSONRPCCode maps it
 	// explicitly to -32001 so the wire code, the mapping, and the docs stay in lockstep.
 	ErrCodeSamplingDenied = "SAMPLING_DENIED"
-	// ErrCodeEscalationRequired refuses an action that requires human approval rather
-	// than a policy verdict alone. Two things produce it:
+	// ErrCodeEscalationRequired refuses an action needing human approval rather than a
+	// policy verdict alone: either an effectCeiling escalation (consequence exceeds the
+	// bound) or a declassify directive with no approval covering the labels it clears.
+	// It is a REFUSAL, not a pending state — fail-closed to "not forwarded".
 	//
-	//   - the effectCeiling under onExceed: escalate, for an action whose CONSEQUENCE
-	//     (irreversibility, blast radius, or the absence of a compensating action)
-	//     exceeds the bound; and
-	//   - a declassify directive with no approval covering the labels it clears —
-	//     "no human has agreed to drop this flow label here".
-	//
-	// It is a REFUSAL, not a pending state: it resolves fail-closed to "not forwarded",
-	// carrying the reason so the operator (or a control plane) knows what to approve.
-	//
-	// What a host may do about it differs by producer, and the audit record's
-	// condition_type distinguishes them. A CEILING escalation is not satisfiable by
-	// retrying: the same call escalates again until the ceiling or the contract
-	// changes. A DECLASSIFY escalation IS satisfiable without any policy change — a
-	// token carrying an approval that covers the labels at that exact target clears it —
-	// so a control plane driving an approval workflow retries after the human acts. The
-	// proxy still holds no approval workflow itself; it verifies the evidence a human
-	// decision produced.
-	//
-	// On the wire it shares -32003 with the other condition-failure codes; the symbolic
-	// code and the audit record's decision=escalate are what distinguish "a human must
-	// decide" from "policy said no".
+	// A ceiling escalation is not satisfiable by retrying (it escalates again until the
+	// ceiling or contract changes); a declassify escalation IS, once a token carrying a
+	// covering approval is presented — the audit record's condition_type distinguishes
+	// them. Shares -32003 with the other condition-failure codes on the wire; the
+	// symbolic code and decision=escalate are what distinguish it.
 	ErrCodeEscalationRequired = "ESCALATION_REQUIRED"
 )
 

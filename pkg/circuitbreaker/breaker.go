@@ -61,18 +61,12 @@ func DefaultConfig() Config {
 // drive it through the package-level [Do]; [Breaker.State] and [Breaker.Stats]
 // expose its state read-only. Every state-machine method below is internal.
 //
-// Contract: each admitted probe (an allowProbe call returning true) must be followed
-// by exactly one outcome on the returned probe (success, failure, or drop). A probe
-// that never reports wedges the breaker in half-open indefinitely — including at the
-// DEFAULT HalfOpenMaxProbes of 1, where the single admitted probe fills the window on
-// its own, so the qualifier this once carried ("when HalfOpenMaxProbes > 1") described
-// the one configuration the hazard does not need. [Do] honors the contract even when
-// the guarded call panics.
+// Contract: each admitted probe must be followed by exactly one outcome (success, failure,
+// or drop), even at the default HalfOpenMaxProbes of 1 — a probe that never reports wedges
+// the breaker in half-open indefinitely. [Do] honors this even when the guarded call panics.
 //
-// Concurrency: the probe returned by allowProbe is generation-aware, so a late
-// outcome from a reopened half-open window is dropped rather than misapplied (which
-// could otherwise close the breaker on a stale success). [Do] is the only production
-// caller and reports outcomes exclusively through that probe.
+// Concurrency: the probe returned by allowProbe is generation-aware, so a late outcome from
+// a reopened half-open window is dropped rather than misapplied (closing on a stale success).
 type Breaker struct {
 	config Config
 
@@ -82,14 +76,10 @@ type Breaker struct {
 	lastFailureTime  time.Time
 	halfOpenProbes   int
 	halfOpenSuccess  int
-	// halfOpenGen identifies the current half-open window, so a late outcome from a
-	// window that has already ended is dropped rather than counted toward the new
-	// state. It is incremented at two sites: Open->HalfOpen (opening a new window) and
-	// HalfOpen->Closed (closing the breaker after enough successes). The third window-
-	// ending transition, the HalfOpen->Open re-trip in recordFailure, deliberately does
-	// not bump it — recordFailure and recordSuccess both return early while the state
-	// is Open, which already discards every stale outcome, and the next Open->HalfOpen
-	// bump supersedes the generation before probes are admitted again.
+	// halfOpenGen identifies the current half-open window, so a late outcome from an
+	// ended window is dropped rather than counted toward the new state. Bumped at
+	// Open->HalfOpen and HalfOpen->Closed; the HalfOpen->Open re-trip does NOT bump it,
+	// since recordFailure/recordSuccess already discard stale outcomes while Open.
 	halfOpenGen      uint64
 	lastTransitionAt time.Time
 	totalFailures    int64
@@ -98,11 +88,9 @@ type Breaker struct {
 	now func() time.Time
 }
 
-// probe is the outcome handle for one admitted request, returned by allowProbe.
-// Exactly one of success or failure must be called. It records the half-open
-// generation it was admitted under so a late outcome from a reopened window is
-// dropped rather than counted toward the new one. The zero probe (returned when
-// admission is refused) is inert.
+// probe is the outcome handle for one admitted request, returned by allowProbe. It records
+// the half-open generation it was admitted under so a late outcome from a reopened window
+// is dropped. The zero probe (admission refused) is inert.
 type probe struct {
 	b   *Breaker
 	gen uint64
@@ -122,10 +110,8 @@ func (p probe) failure() {
 	}
 }
 
-// drop releases the probe's reserved half-open slot without counting it as success
-// or failure, for an outcome that says nothing about upstream health (e.g. a
-// client-initiated cancellation). A closed-state probe reserved no slot and a
-// superseded-generation drop has nothing to release, so both are no-ops.
+// drop releases the probe's reserved half-open slot without counting success or failure,
+// for an outcome that says nothing about upstream health (e.g. client cancellation).
 func (p probe) drop() {
 	if p.b != nil {
 		p.b.recordDrop(p.gen)
@@ -140,13 +126,9 @@ func WithClock(fn func() time.Time) Option {
 	return func(b *Breaker) { b.now = fn }
 }
 
-// New creates a new circuit breaker with the given configuration. Sanitizing is the
-// package's single config-handling philosophy: any non-positive field is replaced by
-// its DefaultConfig value to keep the breaker fail-safe (a non-positive value would
-// otherwise be degenerate — tripping on the first failure, no back-pressure, or no
-// probes), so New never fails and cfg is immutable afterward. A caller that wants to
-// reject a degenerate config rather than have it silently corrected should compare
-// against DefaultConfig before calling.
+// New creates a new circuit breaker. A non-positive field is replaced by its DefaultConfig
+// value to stay fail-safe (a degenerate config would otherwise trip on the first failure,
+// give no back-pressure, or admit no probes), so New never fails.
 func New(cfg Config, opts ...Option) *Breaker {
 	def := DefaultConfig()
 	if cfg.FailureThreshold <= 0 {
@@ -169,11 +151,9 @@ func New(cfg Config, opts ...Option) *Breaker {
 	return b
 }
 
-// allowProbe returns whether the breaker permits a request — always in closed state,
-// in open state only once cooldown has elapsed (transitioning to half-open), and in
-// half-open up to HalfOpenMaxProbes — together with a probe bound to the current
-// half-open generation, so a late outcome from a prior window cannot be misapplied.
-// On refused admission it returns (false, zero probe). This is the path [Do] uses.
+// allowProbe returns whether the breaker permits a request — always closed, only past
+// cooldown when open, up to HalfOpenMaxProbes when half-open — with a probe bound to the
+// current generation. Refused admission returns (false, zero probe). This is the path [Do] uses.
 func (b *Breaker) allowProbe() (bool, probe) {
 	admitted, gen := b.allow()
 	if !admitted {
@@ -191,12 +171,9 @@ func (b *Breaker) allow() (admitted bool, gen uint64) {
 
 	switch b.state {
 	case StateClosed:
-		// A closed-state admission stamps the current generation but reserves NO
-		// half-open slot. If the breaker concurrently trips and advances to a new
-		// window before this probe reports, the stale-generation outcome is dropped by
-		// the guard — harmless: the probe held no slot in the new window, and the
-		// totals still count (they increment before the guard). Crediting it would be
-		// wrong (a stale failure re-opens, a stale success could close prematurely).
+		// Stamps the current generation but reserves NO half-open slot. If the breaker
+		// concurrently trips before this probe reports, the stale-generation guard drops
+		// it harmlessly (the totals still count, incremented before the guard).
 		return true, b.halfOpenGen
 	case StateOpen:
 		now := b.now()
@@ -210,10 +187,8 @@ func (b *Breaker) allow() (admitted bool, gen uint64) {
 			// Clear the trip-time failure count so the snapshot reads HalfOpen with
 			// ConsecutiveFails=0, not alongside a stale FailureThreshold.
 			b.consecutiveFails = 0
-			// Record the LOGICAL transition instant (when cooldown elapsed), not the
-			// later first-probe `now`, so lastTransitionAt does not jump forward when
-			// the first probe arrives and a "time in half-open" dashboard sees no
-			// spurious second transition. State()/Stats() project this same value.
+			// Record the LOGICAL transition instant (when cooldown elapsed), not the later
+			// first-probe `now`, so a "time in half-open" dashboard sees no spurious jump.
 			b.lastTransitionAt = b.lastFailureTime.Add(b.config.CooldownDuration)
 			return true, b.halfOpenGen
 		}
@@ -230,25 +205,18 @@ func (b *Breaker) allow() (admitted bool, gen uint64) {
 }
 
 // recordSuccess records a successful request reported by a probe admitted under
-// generation gen. In half-open state the breaker closes only once every admitted
-// probe has succeeded (HalfOpenMaxProbes successes); until then it stays half-open so
-// a later failure can still re-open it. A success whose gen no longer matches the
-// current half-open window is a stale outcome and is dropped (after being counted in
-// the throughput total).
+// generation gen. In half-open state the breaker closes only once HalfOpenMaxProbes have
+// succeeded; a gen mismatch marks a stale outcome from an ended window and is dropped.
 func (b *Breaker) recordSuccess(gen uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// totalSuccesses is observability-only: a throughput counter of every reported
-	// success, including ones the state machine drops below. Do not derive net state
-	// from it. Incremented before the guards so the count is independent of the drop
-	// path. Mirrors totalFailures.
+	// totalSuccesses is observability-only, counting every reported success including
+	// ones dropped below; do not derive net state from it. Mirrors totalFailures.
 	b.totalSuccesses++
 
-	// A success reported while Open did not come from an admitted probe (allow leaves
-	// Open before returning true). Ignore it, symmetric to recordFailure, so it
-	// cannot zero consecutiveFails and make a snapshot report an opened breaker with
-	// no preceding failures.
+	// A success reported while Open did not come from an admitted probe. Ignore it,
+	// symmetric to recordFailure, so it cannot zero consecutiveFails spuriously.
 	if b.state == StateOpen {
 		return
 	}
@@ -269,21 +237,17 @@ func (b *Breaker) recordSuccess(gen uint64) {
 			b.state = StateClosed
 			b.halfOpenProbes = 0
 			b.halfOpenSuccess = 0
-			// Bump the generation to close the window. Without it, a slower sibling
-			// probe from this window (HalfOpenMaxProbes > 1) failing after the close
-			// would pass recordFailure's guard (now Closed, gen still matching) and
-			// spuriously re-open a healthy breaker; the bump makes it a mismatch.
+			// Bump the generation: without it, a slower sibling probe from this window
+			// failing after the close would pass recordFailure's guard and re-open spuriously.
 			b.halfOpenGen++
 			b.lastTransitionAt = b.now()
 		}
 	}
 }
 
-// recordDrop releases a half-open probe slot without counting the outcome as
-// success or failure, leaving consecutiveFails, the success tally, and the cooldown
-// clock untouched. This is the neutral outcome for a client-initiated cancellation.
-// Only a live half-open probe holds a slot; outside HalfOpen or for a superseded
-// generation there is nothing to release, so those are no-ops.
+// recordDrop releases a half-open probe slot without counting success or failure, leaving
+// consecutiveFails, the success tally, and the cooldown clock untouched. Only a live
+// half-open probe holds a slot; outside HalfOpen or a superseded generation it's a no-op.
 func (b *Breaker) recordDrop(gen uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -295,29 +259,21 @@ func (b *Breaker) recordDrop(gen uint64) {
 	}
 }
 
-// recordFailure records a failed request reported by a probe admitted under
-// generation gen. In closed state it opens the circuit once consecutive failures
-// reach the threshold; in half-open state any failure re-opens it. A failure reported
-// while already open is counted in the throughput total but otherwise ignored — it
-// did not come from an admitted probe, so advancing the cooldown clock could keep the
-// breaker open indefinitely under a trickle of out-of-band failures. A failure whose
-// gen no longer matches the current half-open window is a stale outcome and is dropped
-// (after being counted in the throughput total).
+// recordFailure records a failed request reported by a probe admitted under generation
+// gen. In closed state it opens the circuit at the failure threshold; in half-open, any
+// failure re-opens it. A failure while already open, or from a stale generation, is
+// counted in the throughput total but otherwise dropped.
 func (b *Breaker) recordFailure(gen uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// totalFailures is observability-only: a throughput counter of every reported
-	// failure, including ones the state machine drops below. Do not derive net state
-	// from it. Incremented before the guards so the count is independent of the drop
-	// path. Mirrors totalSuccesses.
+	// totalFailures is observability-only, counting every reported failure including
+	// ones dropped below; do not derive net state from it. Mirrors totalSuccesses.
 	b.totalFailures++
 
-	// A failure reported while already open did not come from an admitted probe
-	// (allow leaves Open before returning true), so it violates the admit-before-record
-	// contract. It must not touch the cooldown clock or consecutiveFails: restarting
-	// the cooldown on every stray failure would trap the breaker open under a trickle
-	// of out-of-band failures.
+	// A failure reported while already open did not come from an admitted probe, and
+	// must not touch the cooldown clock: restarting it on every stray failure could trap
+	// the breaker open under a trickle of out-of-band failures.
 	if b.state == StateOpen {
 		return
 	}
@@ -329,9 +285,8 @@ func (b *Breaker) recordFailure(gen uint64) {
 	}
 
 	b.consecutiveFails++
-	// Capture the instant once so the cooldown anchor (lastFailureTime) and the
-	// reported transition time (lastTransitionAt) are identical for this single trip;
-	// two b.now() calls would diverge under a step-advancing test clock.
+	// Capture the instant once so lastFailureTime and lastTransitionAt agree for this
+	// trip; two b.now() calls would diverge under a step-advancing test clock.
 	now := b.now()
 	b.lastFailureTime = now
 
@@ -342,40 +297,31 @@ func (b *Breaker) recordFailure(gen uint64) {
 			b.lastTransitionAt = now
 		}
 	case StateHalfOpen:
-		// Any failure from an admitted half-open probe re-opens the breaker,
-		// even if an earlier probe in this window already succeeded.
+		// Any failure from an admitted half-open probe re-opens the breaker, even if an
+		// earlier probe in this window already succeeded.
 		b.state = StateOpen
 		b.halfOpenSuccess = 0
-		// Pin consecutiveFails to FailureThreshold on the re-trip. The ++ above ran in
-		// half-open and would otherwise leave it growing as FailureThreshold+k.
-		// FailureThreshold satisfies "State==Open implies consecutiveFails>=
-		// FailureThreshold", never grows, and needs no read-side Stats() projection.
+		// Pin to FailureThreshold on the re-trip (the ++ above would otherwise leave it
+		// growing as FailureThreshold+k), satisfying "Open implies >= FailureThreshold".
 		b.consecutiveFails = b.config.FailureThreshold
 		b.lastTransitionAt = now
 	}
 }
 
 // projectedState reports the logical state, consecutive-failure count, and last
-// transition time, sampling the clock EXACTLY ONCE. While the breaker is physically
-// Open but past cooldown it projects HalfOpen with the reset counters, mirroring the
-// real transition allow() performs; otherwise it returns the physical fields.
+// transition time, sampling the clock EXACTLY ONCE. While physically Open but past
+// cooldown it projects HalfOpen with reset counters, mirroring allow()'s real transition.
 //
-// State() and Stats() both route through this so that WITHIN A SINGLE call the
-// snapshot is internally consistent (one now() sample backs every field). It does
-// NOT extend across calls: a State() then Stats() can straddle the cooldown boundary
-// and disagree, so a caller needing both fields to agree should call Stats() once and
-// read Stats.State. Must be called under b.mu.RLock (or b.mu.Lock).
+// State() and Stats() both route through this so a single call's snapshot is internally
+// consistent; it does NOT extend across calls — a caller needing both fields to agree
+// should call Stats() once. Must be called under at least b.mu.RLock.
 func (b *Breaker) projectedState() (state State, consecutiveFails int, lastTransitionAt time.Time) {
 	if b.state == StateOpen && b.now().Sub(b.lastFailureTime) >= b.config.CooldownDuration {
-		// The projection can run in the gap between cooldown elapsing and the first
-		// admitted probe, while b.state is still Open. Report ConsecutiveFails=0 (so
-		// the snapshot is never "HalfOpen with FailureThreshold", reading as both
-		// recovering and failing) and LastTransitionAt=cooldown-elapsed instant (so a
-		// "half-open since" dashboard does not include the whole cooldown).
+		// The gap between cooldown elapsing and the first admitted probe: report
+		// ConsecutiveFails=0 (not "HalfOpen with FailureThreshold") and the
+		// cooldown-elapsed instant (so a "half-open since" dashboard excludes the cooldown).
 		return StateHalfOpen, 0, b.lastFailureTime.Add(b.config.CooldownDuration)
 	}
-	// The HalfOpen->Open re-trip needs no projection: recordFailure already sets
-	// consecutiveFails to FailureThreshold, so the invariant holds in the field.
 	return b.state, b.consecutiveFails, b.lastTransitionAt
 }
 
@@ -419,15 +365,11 @@ type Stats struct {
 	LastTransitionAt time.Time `json:"lastTransitionAt,omitempty"`
 }
 
-// MarshalJSON omits the two time.Time fields when zero. encoding/json never treats
-// a struct (including time.Time) as "empty", so the `omitempty` tags are ignored and
-// a zero time would serialize as "0001-01-01T00:00:00Z", misleading dashboards into
-// reading a fresh breaker as having last failed in year 1. This marshaler emits each
-// time field only when non-zero.
+// MarshalJSON omits the two time.Time fields when zero: encoding/json never treats a
+// struct as "empty", so `omitempty` is ignored and a zero time would serialize as
+// "0001-01-01T00:00:00Z", misleading a dashboard into reading a fresh breaker as failed in year 1.
 func (s Stats) MarshalJSON() ([]byte, error) { //nolint:gocritic // hugeParam: a value receiver is required so a Stats value (returned by Breaker.Stats) satisfies json.Marshaler; a pointer receiver would not be in a value's method set when passed to json.Marshal
-	// alias shares Stats' layout but not its MarshalJSON, breaking the recursion. Its
-	// same-named time fields are shadowed by the outer pointer fields below, so the
-	// zero times never serialize.
+	// alias shares Stats' layout but not its MarshalJSON, breaking the recursion.
 	type alias Stats
 	out := struct {
 		alias

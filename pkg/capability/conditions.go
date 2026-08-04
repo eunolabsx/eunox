@@ -324,31 +324,16 @@ func jsonFieldNames(v any) map[string]bool {
 }
 
 // conditionPrototypes is THE registry of condition discriminators this build models: each
-// maps to a constructor for its zero value and the grammar revision that introduced it.
-// Everything else that needs to enumerate, instantiate or CLASSIFY condition types derives
-// from it — newCondition, the "did you mean" hint (knownConditionTypes), the manifest
-// loader's per-type permitted-key sets (ConditionJSONKeys), and its schemaVersion gate
-// (TokenSince) — so adding a condition type means adding it HERE, not in three
-// hand-maintained tables that drift one entry at a time.
-//
-// Since is part of the entry rather than a table elsewhere for the reason the registry itself
-// exists: a classification kept in a separate map can hold a DIFFERENT answer, and the
-// direction that fails (a later revision's token filed as base grammar) admits a "0.2"
-// predicate under a "0.1" manifest — the one thing the gate is there to prevent. Beside the
-// constructor there is one line to read and no second place to forget.
-//
-// redactFields is deliberately absent — it is a directive, and has its own migration error
-// pointing at directives.
-// State is part of the entry for the same reason and against the same failure: "which tokens
-// accumulate cross-call state" was asked in five hand-written spellings, and a new
-// state-accumulating condition missing from the one that gates the decision turn runs its
-// decisions unserialized — the source->sink race, reopened silently, with every completeness
-// test still green. See tokenstate.go for the rule that sets it.
-//
-// Uses is the third declaration and closes the same gap one layer over, on the engine's two
-// skip gates: a condition that reads the flow-label set but is absent from a hand-written
-// "does this policy use flow control" predicate has that path skipped out from under it. See
-// subsystem.go.
+// maps to a constructor, the grammar revision that introduced it (Since), its cross-call
+// state class (State; see tokenstate.go), and the engine subsystems it reads (Uses; see
+// subsystem.go). Everything that enumerates, instantiates, or classifies condition types
+// derives from this one map — newCondition, the "did you mean" hint, the manifest loader's
+// per-type key sets, and the schemaVersion gate — so adding a type means adding it HERE, not
+// in hand-maintained tables that drift one entry at a time. A classification kept in a
+// separate table can silently disagree (e.g. admitting a "0.2" predicate under "0.1"), or
+// leave a state-accumulating condition's decisions unserialized, or leave the flow path
+// skipped for a policy that reads it. redactFields is deliberately absent — it is a
+// directive, with its own migration error pointing there.
 var conditionPrototypes = map[string]tokenSpec[Condition]{
 	ConditionTypeTimeWindow:        {New: func() Condition { return &TimeWindowCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
 	ConditionTypeIPRange:           {New: func() Condition { return &IPRangeCondition{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},

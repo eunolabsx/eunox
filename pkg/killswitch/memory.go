@@ -16,12 +16,10 @@ type InMemory struct {
 	killedAgents   map[string]bool
 	killedSessions map[string]bool
 
-	// observers receive a Revocation the moment this backend gains one. Every kill here is
-	// issued in-process, so a consumer that reclaims at its own /control/kill handler is
-	// already covered — but a consumer calling Kill* on the Manager DIRECTLY is not, and it
-	// is the same reclaim either way. Implementing it on both backends keeps the consumer
-	// free of a "which backend is this" test, which is where a reclaim path that only ever
-	// runs under Redis comes from.
+	// observers receive a Revocation the moment this backend gains one — a consumer
+	// calling Kill* directly on the Manager needs it too, not just one reclaiming at its
+	// own /control/kill handler. Implemented on both backends so a consumer needs no
+	// "which backend is this" test.
 	observers revocationObservers
 }
 
@@ -57,7 +55,7 @@ func (m *InMemory) ActivateGlobal(_ context.Context) error {
 	m.globalActive = true
 	m.mu.Unlock()
 	// Notified outside the lock, and only on a state CHANGE: re-activating an already-active
-	// stop reclaims nothing new, and an observer's documented response re-enters this backend.
+	// stop reclaims nothing new, and an observer may re-enter this backend.
 	if gained {
 		m.observers.notify(Revocation{Global: true})
 	}
@@ -75,7 +73,7 @@ func (m *InMemory) DeactivateGlobal(_ context.Context) error {
 // KillAgent blocks the specified agent.
 func (m *InMemory) KillAgent(_ context.Context, agentID string) error {
 	// Reject an empty ID: ShouldBlock skips empty IDs, so recording one would be a
-	// silent no-op that blocks nothing and leaves a phantom "" entry in Status.
+	// silent no-op leaving a phantom "" entry in Status.
 	if agentID == "" {
 		return fmt.Errorf("killswitch: KillAgent: agentID must not be empty")
 	}
@@ -148,8 +146,7 @@ func (m *InMemory) Status(_ context.Context) (*Status, error) {
 	return buildStatus(m.globalActive, m.killedAgents, m.killedSessions), nil
 }
 
-// ObserveRevocations implements [Manager]. See its doc for the contract; here every
-// revocation is issued in-process, so an observer is called synchronously on the goroutine
-// that called Kill* — after the state is committed and outside the lock, so it may re-ask
-// ShouldBlock and see the kill it was told about.
+// ObserveRevocations implements [Manager]. Every revocation is issued in-process, so an
+// observer is called synchronously on the calling goroutine, after state is committed and
+// outside the lock, so it may re-ask ShouldBlock and see the kill it was told about.
 func (m *InMemory) ObserveRevocations(fn func(Revocation)) func() { return m.observers.observe(fn) }

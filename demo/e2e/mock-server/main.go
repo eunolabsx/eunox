@@ -1,27 +1,11 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// mock-server is the upstream MCP server for the eunox end-to-end test
-// suite (demo/e2e). Unlike the minimal demo mocks (which expose three tools
-// over a single transport), this server implements the FULL enforced MCP
-// surface so the e2e host can drive every policy path through the real proxy:
-//
-//   - tools/list, tools/call            (incl. redactable + malformed payloads)
-//   - resources/list, resources/read,
-//     resources/subscribe,
-//     resources/templates/list
-//   - prompts/list, prompts/get
-//   - sampling/createMessage            (server-initiated; stdio only)
-//   - ping, completion/complete         (proxy denies these by default)
-//
-// It speaks BOTH transports so one binary serves both legs of the suite:
-//
-//	mock-server --transport stdio              # newline-delimited JSON-RPC on stdin/stdout
-//	mock-server --transport http --port 8090   # MCP Streamable HTTP on :8090/mcp
-//
-// Every response is deterministic so the host's assertions never flake. The
-// server is intentionally not wired to any real storage; its sole purpose is
-// to give eunox a realistic, fully-featured upstream to enforce against.
+// mock-server is the upstream MCP server for the eunox end-to-end test suite.
+// Unlike the minimal demo mocks (three tools, one transport), it implements the
+// full enforced MCP surface so the e2e host can drive every policy path, and
+// speaks both stdio and HTTP so one binary serves both legs of the suite.
+// Responses are deterministic; it is not wired to any real storage.
 package main
 
 import (
@@ -44,16 +28,12 @@ const (
 	serverName         = "e2e-mock-server"
 	serverVersion      = "1.0.0"
 
-	// samplingReqID is the JSON-RPC id the server uses for the single
-	// server-initiated sampling/createMessage request it emits when the host
-	// calls the trigger_sampling tool. The reply (or proxy denial) is matched
-	// against this id.
+	// samplingReqID is the JSON-RPC id of the server-initiated sampling/createMessage
+	// request trigger_sampling emits; the reply (or proxy denial) is matched against it.
 	samplingReqID = "e2e-sampling-1"
 
-	// bigResponseSize is the byte length of the big_response tool's payload.
-	// At 2 MiB it is comfortably larger than the 1 MiB audit-detail bound (so a
-	// pass proves the forwarded MCP response is not truncated by audit capping)
-	// yet safely under the proxy's 4 MiB per-message stdio reader cap.
+	// bigResponseSize: 2 MiB, comfortably larger than the 1 MiB audit-detail bound
+	// (proves forwarding isn't truncated by audit capping) yet under the proxy's 4 MiB cap.
 	bigResponseSize = 2 << 20
 )
 
@@ -79,10 +59,9 @@ func (m *rpcMsg) isNotification() bool { return m.ID == nil && m.Method != "" }
 // ─────────────────────────────────────────────────────────────────────────────
 // Catalog: tools, resources, prompts, resource templates.
 //
-// The proxy filters */list responses to permitted entries, so this catalog
-// deliberately includes entries the e2e policy does NOT permit (write_file,
-// secret_tool, file:///data/secret.txt, internal_secret_prompt). The host
-// asserts those never appear in the filtered lists.
+// Deliberately includes entries the e2e policy does NOT permit (write_file,
+// secret_tool, file:///data/secret.txt, internal_secret_prompt) so the host
+// can assert the proxy's */list filtering excludes them.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type toolDef struct {
@@ -161,12 +140,8 @@ var promptList = []promptDef{
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool dispatch — returns a tools/call result map, or an rpcError for an
-// unknown tool. A nil error with a non-nil result is the success path.
-//
-// conn is non-nil only on the stdio transport; it is required for the
-// server-initiated sampling round-trip (trigger_sampling). On HTTP the round
-// trip is not supported (documented limitation), so trigger_sampling
-// reports "skipped-http" there.
+// unknown tool. conn is non-nil only on stdio, needed for trigger_sampling's
+// server-initiated round-trip (unsupported on HTTP, which reports "skipped-http").
 // ─────────────────────────────────────────────────────────────────────────────
 
 func textResult(text string) map[string]interface{} {
@@ -228,24 +203,20 @@ func toolCallResult(name string, args map[string]interface{}, conn *stdioConn) (
 		}, nil
 
 	case "get_malformed":
-		// Looks like a JSON object (leading '{') but is truncated/invalid. The proxy
-		// redacts cleanly-parseable JSON only and never fails closed over content it
-		// cannot parse, so this body passes through UNCHANGED and the "secret" field is
-		// NOT redacted — the accepted residual (redact such data upstream).
+		// Looks like JSON (leading '{') but is truncated/invalid. redactFields only
+		// acts on cleanly-parseable JSON, so this passes through unredacted (accepted residual).
 		return textResult(`{"secret":"x", "oops"`), nil
 
 	case "get_plaintext":
-		// Free-form text (not JSON) under a redactFields directive must pass
-		// through unchanged — there are no JSON object keys to redact.
+		// Free-form text under a redactFields directive: no JSON keys to redact.
 		return textResult("Revenue: $12,400,000 (plain text, secret=hunter2)"), nil
 
 	case "trigger_sampling":
 		return triggerSampling(conn), nil
 
 	case "big_response":
-		// A large response forwarded intact verifies the proxy does not truncate
-		// big upstream payloads (and that audit-detail capping is independent of
-		// the forwarded body). The host asserts the exact byte length.
+		// Forwarded intact so the host can assert the proxy doesn't truncate big
+		// payloads and that audit-detail capping is independent of the forwarded body.
 		return textResult(strings.Repeat("A", bigResponseSize)), nil
 
 	case "secret_tool":
@@ -257,14 +228,12 @@ func toolCallResult(name string, args map[string]interface{}, conn *stdioConn) (
 }
 
 // triggerSampling emits a server-initiated sampling/createMessage request and
-// blocks for the proxy's verdict, reflecting the outcome back to the caller as
-// a deterministic marker ("sampling:allowed" / "sampling:denied"). This makes
-// the otherwise-asynchronous, hard-to-observe sampling decision assertable by
-// the host without any timing races.
+// blocks for the proxy's verdict, returning a deterministic marker
+// ("sampling:allowed"/"sampling:denied") so the async decision is assertable
+// without timing races.
 func triggerSampling(conn *stdioConn) map[string]interface{} {
 	if conn == nil {
-		// HTTP transport: full sampling round-trip is unsupported upstream of the
-		// proxy (documented limitation), so we do not attempt it.
+		// HTTP: full sampling round-trip is unsupported upstream (documented limitation).
 		return textResult("sampling:skipped-http")
 	}
 
@@ -277,10 +246,8 @@ func triggerSampling(conn *stdioConn) map[string]interface{} {
 			`"maxTokens":16,"systemPrompt":"e2e"}`),
 	})
 
-	// Read until we see the reply (or proxy denial) for OUR sampling id. The host
-	// serializes its requests so nothing else is expected here, but guarding on
-	// the id keeps the round-trip robust against a stray notification or
-	// out-of-band line rather than classifying the first line unconditionally.
+	// Guard on the id rather than classifying the first line unconditionally, so a
+	// stray notification or out-of-band line can't be mistaken for our verdict.
 	want := `"` + samplingReqID + `"`
 	for {
 		line, ok := conn.readLine()
@@ -302,9 +269,7 @@ func triggerSampling(conn *stdioConn) map[string]interface{} {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Method handling shared by both transports. dispatch returns the response
-// message to send for a request, or ok=false when no response is due (a
-// notification). conn is non-nil only on stdio.
+// Method handling shared by both transports. conn is non-nil only on stdio.
 // ─────────────────────────────────────────────────────────────────────────────
 
 func initializeResult() map[string]interface{} {
@@ -321,9 +286,8 @@ func initializeResult() map[string]interface{} {
 	}
 }
 
-// dispatch computes the result/error for a single request message. It returns
-// (result, rpcError); exactly one is non-nil. It is never called for
-// notifications.
+// dispatch returns (result, rpcError) for a request, exactly one non-nil;
+// never called for notifications.
 func dispatch(msg *rpcMsg, conn *stdioConn) (interface{}, *rpcError) {
 	switch msg.Method {
 	case "initialize":
@@ -521,20 +485,16 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON-RPC body", http.StatusBadRequest)
 		return
 	}
-	// A single JSON-RPC POST body is exactly one JSON value. Decode a second value
-	// and require io.EOF: any trailing non-whitespace token (a stray second message,
-	// or garbage) means the body is malformed and must be rejected before we
-	// dispatch the first value or allocate a session off a clean-looking initialize.
+	// A POST body is exactly one JSON value; decoding a second and requiring io.EOF
+	// catches trailing garbage before we dispatch or allocate a session off it.
 	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
 		http.Error(w, "invalid JSON-RPC body: trailing data after JSON-RPC message", http.StatusBadRequest)
 		return
 	}
 
-	// Only a real initialize REQUEST (carrying an id) creates a session and responds.
-	// An id-less initialize is a notification: per JSON-RPC/MCP the server must not
-	// respond and must not mutate state, so let it fall through to the session check
-	// below (which rejects it for lacking a session) rather than allocating a session
-	// and writing an initialize result.
+	// Only an initialize REQUEST (with an id) creates a session; an id-less
+	// initialize is a notification and per JSON-RPC/MCP must not mutate state,
+	// so it falls through to the session check below instead.
 	if msg.Method == "initialize" && msg.isRequest() {
 		sid := newSessionID()
 		s.mu.Lock()
@@ -545,11 +505,8 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Every other message — request OR notification — requires an established session.
-	// Validating it before the notification fast path keeps the fixture honest to the
-	// request path: a notification (e.g. notifications/initialized) without a valid
-	// session is rejected rather than silently accepted, so the e2e suite cannot miss a
-	// proxy that drops the upstream session header while forwarding notifications.
+	// Validating the session before the notification fast path means a proxy that
+	// drops the upstream session header on a forwarded notification gets caught.
 	sid := r.Header.Get(sessionHeader)
 	if sid == "" {
 		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)

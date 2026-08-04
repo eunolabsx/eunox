@@ -1,25 +1,22 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Remote HTTP upstream for the stdio host (transport: stdio with an upstream
-// whose own transport is http).
+// Remote HTTP upstream for the stdio host (transport: stdio with an upstream whose own
+// transport is http).
 //
-// httpUpstream bridges the StdioProxy's message-level upstream I/O (a Write of an
-// rpcMsg and a Read of the next) onto a remote MCP HTTP server: a Write POSTs the
-// message and, for a request, queues the response for a later Read. This lets the
-// StdioProxy's async machinery (the handshakes, callUpstream's pending map, the
-// readUpstream loop) drive a remote HTTP upstream unchanged.
+// httpUpstream bridges the StdioProxy's message-level upstream I/O (a Write of an rpcMsg
+// and a Read of the next) onto a remote MCP HTTP server: a Write POSTs the message and,
+// for a request, queues the response for a later Read. This lets the StdioProxy's async
+// machinery (the handshakes, callUpstream's pending map, the readUpstream loop) drive a
+// remote HTTP upstream unchanged.
 //
-// KNOWN LIMITATION: like the HTTP gateway's remote-upstream path, this bridge is
-// strictly request/response — one POST per host request, reading only that POST's
-// own response body. No persistent inbound stream (no SSE GET) is opened, so the
-// upstream has no channel to deliver a server-initiated request
-// (sampling/createMessage, roots/list, elicitation/create): one is never seen,
-// enforced, audited, or forwarded. Servicing it would require opening an upstream
-// SSE GET stream and a new reader path (deliberately out of scope). A
-// system:sampling/createMessage opt-in for an HTTP upstream is therefore rejected
-// at startup (route.go) rather than loaded as a silently inert grant. Reach the
-// upstream over stdio if server-initiated requests must be enforced.
+// KNOWN LIMITATION: like the HTTP gateway's remote-upstream path, this bridge is strictly
+// request/response — one POST per host request, reading only that POST's own response
+// body. No persistent inbound stream (no SSE GET) is opened, so a server-initiated request
+// (sampling/createMessage, roots/list, elicitation/create) is never seen, enforced,
+// audited, or forwarded. A system:sampling/createMessage opt-in for an HTTP upstream is
+// therefore rejected at startup (route.go) rather than loaded as a silently inert grant.
+// Reach the upstream over stdio if server-initiated requests must be enforced.
 
 package transport
 
@@ -72,11 +69,10 @@ type httpUpstream struct {
 	// reportErr, when set, delivers a request POST's TRANSPORT failure directly to the
 	// waiting caller keyed by the upstream nonce (msg.ID) and reports whether one was
 	// found, so callUpstream returns an error and the decision is recorded as a
-	// deny/UPSTREAM_ERROR (matching the gateway) rather than an allow. The StdioProxy
-	// wires it to reportUpstreamErr, which delivers only while the caller is still in
-	// flight; a nil reportErr, a false return (no live caller — a handshake/probe POST,
-	// or one already abandoned), or a POST with no id leaves the pre-existing in-band
-	// synthesized-error fallback unchanged.
+	// deny/UPSTREAM_ERROR (matching the gateway) rather than an allow. Wired to
+	// reportUpstreamErr, which delivers only while the caller is still in flight; a nil
+	// reportErr, a false return (handshake/probe POST, or one already abandoned), or a
+	// POST with no id leaves the in-band synthesized-error fallback unchanged.
 	reportErr func(upKey string, err error) bool
 
 	mu     sync.Mutex
@@ -107,22 +103,19 @@ func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkip
 
 // notifyPostTimeout bounds a fire-and-forget POST (the Write path) so a stalling
 // upstream cannot pin a maxInflightPosts slot indefinitely and wedge the read loop
-// on a full semaphore. It is deliberately INDEPENDENT of --upstream-timeout: even
-// when that is disabled, a notification must still release its slot. Generous,
-// since notifications complete quickly.
+// on a full semaphore. Deliberately INDEPENDENT of --upstream-timeout: even when
+// that's disabled, a notification must still release its slot.
 const notifyPostTimeout = 30 * time.Second
 
-// spawnPost runs h.post under the in-flight semaphore (maxInflightPosts). When the
-// cap is reached the caller blocks until a slot frees (backpressure) or the bridge
-// closes, at which point the message is dropped, matching the fire-and-forget
-// contract. The slot is released when post() returns, on an independent goroutine
-// that completes as readUpstream drains `incoming`, so a blocked spawn never
-// deadlocks against its own release.
+// spawnPost runs h.post under the in-flight semaphore (maxInflightPosts). When the cap is
+// reached the caller blocks until a slot frees (backpressure) or the bridge closes, at
+// which point the message is dropped, matching the fire-and-forget contract. The slot is
+// released when post() returns, on an independent goroutine that completes as readUpstream
+// drains `incoming`, so a blocked spawn never deadlocks against its own release.
 //
-// bound, when > 0, caps the POST's own duration (applied inside the goroutine).
-// The Write path passes notifyPostTimeout so a slot always frees even with the
-// per-call timeout disabled; postWithCtx passes 0 because its ctx already carries
-// the per-call deadline.
+// bound, when > 0, caps the POST's own duration. The Write path passes notifyPostTimeout
+// so a slot always frees even with the per-call timeout disabled; postWithCtx passes 0
+// because its ctx already carries the per-call deadline.
 func (h *httpUpstream) spawnPost(ctx context.Context, msg mcp.RPCMsg, bound time.Duration) {
 	select {
 	case h.sem <- struct{}{}:
@@ -147,16 +140,13 @@ func (h *httpUpstream) spawnPost(ctx context.Context, msg mcp.RPCMsg, bound time
 // fire-and-forget paths (init handshake, forwarded host notifications, sampling
 // denial responses) where no per-call timeout applies. Satisfies msgSink.
 //
-// Write can block on the maxInflightPosts semaphore. serveHost (stdio.go) forwards
-// host notifications through Write on its read-loop goroutine, so that loop can
-// block here under load. That is deadlock-free only because this bridge never
-// delivers server-initiated requests (KNOWN LIMITATION above): incoming carries
-// responses only, so the read loop has no upstream-request reply to route and
-// cannot wedge against a blocked Write. Opening an upstream SSE stream here would
-// reintroduce that reply path and must revisit this coupling.
+// Write can block on the maxInflightPosts semaphore; serveHost (stdio.go) forwards host
+// notifications through it on its read-loop goroutine, which can block here under load.
+// Deadlock-free only because this bridge never delivers server-initiated requests (KNOWN
+// LIMITATION above): incoming carries responses only, so the read loop has no
+// upstream-request reply to route and cannot wedge against a blocked Write. Opening an
+// upstream SSE stream here would reintroduce that reply path and must revisit this coupling.
 func (h *httpUpstream) Write(msg mcp.RPCMsg) error {
-	// notifyPostTimeout bounds the POST so a stalling upstream cannot pin this slot
-	// forever when --upstream-timeout is disabled.
 	h.spawnPost(h.ctx, msg, notifyPostTimeout)
 	return nil
 }
@@ -218,26 +208,20 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 	switch {
 	case err != nil:
 		// Surface the TRANSPORT failure to the waiting caller as an ERROR, delivered
-		// directly through the shared byUpstreamID routing channel (reportErr ->
-		// deliverUpstreamError), so awaitNonced returns it and enforcedForwardCore/dispatch
-		// classify it through the shared upstreamErrInfo — recording a deny/UPSTREAM_ERROR
-		// that MATCHES the gateway's callRemoteUpstream path for the same infra failure,
-		// rather than the allow-carrying-upstream_error_code the in-band-only path used to
-		// record. Once delivered this way there is nothing further to do: the routing
-		// channel IS the delivery, so return without touching incoming at all.
+		// directly through the shared byUpstreamID routing channel, so
+		// enforcedForwardCore/dispatch record a deny/UPSTREAM_ERROR matching the
+		// gateway's callRemoteUpstream path rather than an allow with an
+		// upstream_error_code. Once delivered the routing channel IS the delivery, so
+		// return without touching incoming.
 		//
-		// reportErr reports false when there is no live caller to deliver to — a
-		// handshake/probe POST (it reads the bridge directly, never registering in
-		// byUpstreamID) or one already abandoned (per-call timeout, upstream exit) — in
-		// which case fall through to the synthesized in-band response below instead. That
-		// response is still classified through upstreamErrInfo so the host sees only the
-		// failure CLASS: the raw err.Error() must never be forwarded, because for a remote
-		// HTTP upstream it can carry the endpoint URL and up to MaxUpstreamErrBodyBytes of
-		// upstream body (DoMCPHTTP wraps both into the error). upstreamErrInfo confines
-		// that raw text to operator stderr and returns a generic reason + the JSON-RPC
-		// code. bound=0: the POST already carried the per-call --upstream-timeout
-		// deadline, so no separate bound applies here; a deadline expiry is attributed to
-		// the request deadline.
+		// reportErr reports false when there's no live caller to deliver to (a
+		// handshake/probe POST, or one already abandoned), in which case fall through
+		// to the synthesized in-band response below. That response is still classified
+		// through upstreamErrInfo so the host sees only the failure CLASS: raw
+		// err.Error() must never be forwarded, since for a remote HTTP upstream it can
+		// carry the endpoint URL and upstream body text. bound=0: the POST already
+		// carried the per-call deadline, so a deadline expiry is attributed to the
+		// request deadline.
 		if h.reportErr != nil && h.reportErr(mcp.MsgKey(msg.ID), err) {
 			return
 		}
@@ -245,23 +229,21 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		resp = mcp.ErrorResponse(msg.ID, rpcCode, reason)
 	case resp.JSONRPC == "" && resp.Result == nil && resp.Error == nil:
 		// An empty/zero RPCMsg here is a 200 OK whose body is {}, null, or any JSON
-		// object lacking the jsonrpc/result/error fields: DoMCPHTTP's plain-JSON path
-		// decodes such a body to a zero-value RPCMsg with a nil error. (A real 202
-		// Accepted to a request is turned into a non-nil error by DoMCPHTTP and taken
-		// by the err != nil arm above, so it never reaches here.) Surface what was
-		// actually observed instead of forwarding an empty result to the host.
+		// object lacking jsonrpc/result/error: DoMCPHTTP's plain-JSON path decodes such
+		// a body to a zero-value RPCMsg with a nil error. (A real 202 Accepted to a
+		// request becomes a non-nil error, taken by the err != nil arm above.) Surface
+		// what was actually observed instead of forwarding an empty result to the host.
 		resp = mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "upstream returned an empty or non-JSON-RPC response for request "+msg.Method+" (expected a JSON-RPC result or error)")
 	default:
 		// Correlate by shape via the shared rule. A non-response reply — e.g. one
-		// carrying a `method` field, request/notification shape — must NEVER enter
-		// `incoming`: readUpstream would reclassify a method-bearing reply with this id as
-		// a server-initiated request and route it to the host, but this bridge is
-		// documented to deliver responses only (the Write-path deadlock-freedom argument
-		// depends on it). A malicious upstream knows the nonce id, so id-equality alone is
-		// insufficient. A mismatched id is refused (fail closed) whether it rides a result
-		// OR an error — re-stamping a mismatched error would let an adversarial upstream
-		// inject one caller's error into another's reply. On any refusal, unblock the caller
-		// with an error for THIS request instead of forwarding the bad reply onto `incoming`.
+		// carrying a `method` field — must NEVER enter `incoming`: readUpstream would
+		// reclassify it as a server-initiated request and route it to the host, but
+		// this bridge is documented to deliver responses only (the Write-path
+		// deadlock-freedom argument depends on it). A malicious upstream knows the
+		// nonce id, so id-equality alone is insufficient; a mismatched id is refused
+		// (fail closed) whether it rides a result or an error — re-stamping a
+		// mismatched error would let an adversarial upstream inject one caller's error
+		// into another's reply.
 		if correlated, cerr := correlateUpstreamReply(msg, resp); cerr != nil {
 			resp = mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, cerr.Error())
 		} else {
@@ -296,12 +278,10 @@ func (h *httpUpstream) Read() (mcp.RPCMsg, error) {
 }
 
 // readCtx is Read with caller cancellation: it also returns when ctx is canceled
-// (surfacing ctx.Err()). The plain Read selects only on incoming/done, and done is
-// closed only by close() — which a startup probe stuck before the background reader
-// runs never reaches — so a probe whose parent context is canceled, or which exceeds
-// its deadline, would otherwise block forever (e.g. when spawnPost drops the POST on
-// an already-canceled ctx, leaving nothing in-flight to deliver to incoming). Used by
-// the stdio bridge's tools/list drift probe.
+// (surfacing ctx.Err()). The plain Read selects only on incoming/done, and done is closed
+// only by close(), which a startup probe stuck before the background reader runs never
+// reaches — so a probe whose context is canceled or exceeds its deadline would otherwise
+// block forever. Used by the stdio bridge's tools/list drift probe.
 func (h *httpUpstream) readCtx(ctx context.Context) (mcp.RPCMsg, error) {
 	select {
 	case msg := <-h.incoming:

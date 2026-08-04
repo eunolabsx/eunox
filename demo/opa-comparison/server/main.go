@@ -1,10 +1,9 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Package main is the MCP tool server for the OPA-comparison demo.
-// It exposes all tools used across scenarios 1–3 so that both the
-// eunox proxy and the OPA sidecar can be exercised against the
-// same upstream without running separate binaries.
+// Package main is the MCP tool server for the OPA-comparison demo, exposing
+// all tools across scenarios 1-3 so both eunox and the OPA sidecar can be
+// exercised against the same upstream.
 package main
 
 import (
@@ -73,10 +72,8 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	// A single JSON-RPC POST body is exactly one JSON value. Decode a second value
-	// and require io.EOF: any trailing non-whitespace token (a stray second message,
-	// or garbage) means the body is malformed and must be rejected before we
-	// dispatch the first value or allocate a session off a clean-looking initialize.
+	// A POST body is exactly one JSON value; decoding a second and requiring io.EOF
+	// catches trailing garbage before we dispatch or allocate a session off it.
 	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
 		http.Error(w, "bad request: trailing data after JSON-RPC message", http.StatusBadRequest)
 		return
@@ -162,7 +159,6 @@ func (s *server) requireSession(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// toolDef describes one MCP tool for the tools/list response.
 type toolDef struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description"`
@@ -263,7 +259,6 @@ func allTools() []toolDef {
 	}
 }
 
-// handleToolsList writes the tools/list response.
 func handleToolsList(w http.ResponseWriter, msg rpcMsg) { //nolint:gocritic // hugeParam: rpcMsg passed by value intentionally
 	writeMsg(w, rpcMsg{
 		JSONRPC: "2.0",
@@ -272,7 +267,6 @@ func handleToolsList(w http.ResponseWriter, msg rpcMsg) { //nolint:gocritic // h
 	})
 }
 
-// handleToolsCall routes to the appropriate tool handler.
 func handleToolsCall(w http.ResponseWriter, msg rpcMsg) { //nolint:gocritic // hugeParam: rpcMsg passed by value intentionally
 	var params struct {
 		Name      string                 `json:"name"`
@@ -307,8 +301,7 @@ func handleToolsCall(w http.ResponseWriter, msg rpcMsg) { //nolint:gocritic // h
 	})
 }
 
-// dispatchTool executes the named tool with the given args and returns a text result.
-// Returns "" for unknown tools.
+// dispatchTool executes the named tool and returns a text result, or "" if unknown.
 func dispatchTool(name string, args map[string]interface{}) string {
 	str := func(key string) string {
 		if v, ok := args[key]; ok {
@@ -385,13 +378,9 @@ func mustMarshal(v interface{}) json.RawMessage {
 	return b
 }
 
-// newSessionID returns a cryptographically random, globally unique session ID.
-// The Streamable HTTP session header gates access to a client's server-side
-// session, so a predictable sequential counter (opa-cmp-1, opa-cmp-2, ...) let a
-// peer observe or guess another client's ID and address its live session, and
-// repeated after every process restart. 128 random bits formatted as a UUID
-// match demo/mock-mcp-server and the MCP transport spec's requirement that
-// assigned session IDs be globally unique and cryptographically secure.
+// newSessionID must be unguessable: the session header gates access to a
+// client's server-side session, so a predictable counter would let a peer
+// address another client's live session. Matches demo/mock-mcp-server.
 func newSessionID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
