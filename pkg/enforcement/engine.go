@@ -1501,6 +1501,17 @@ var knownObligationTypes = map[string]bool{
 // allow would, or the transport forwards the response unredacted. The allow path and the
 // downgrade path therefore call the SAME function, so they cannot drift on which
 // directives translate to which obligations.
+//
+// On the error return, the obligations slice carries whatever was VALIDLY collected
+// BEFORE the offending directive, not nil: evaluateMatched calls this up front and stamps
+// the result onto a later, unrelated forwarded deny via a deferred closure — a pure
+// condition can deny (and get downgraded/forwarded under audit mode) without ever
+// consulting the error return at all, ordered deliberately so an engine bug in one
+// directive cannot preempt that condition's own verdict. Discarding the partial
+// obligations there would silently forward that unrelated deny with a real redactFields
+// obligation dropped, reaching the host unmasked. A caller that DOES act on the error
+// return (returning it as a hard block) simply ignores the accompanying slice, so this
+// costs those callers nothing.
 func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
 	var obligations []capability.Obligation
 	// The delegation chain's composed redactFields, first so it applies even to a
@@ -1537,7 +1548,7 @@ func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *
 				HardDeny: true,
 				Message:  fmt.Sprintf("unhandled obligation type %q from directive %T; register it in knownObligationTypes and implement its consumer", ob.Type, dir),
 			})
-			return nil, &resp
+			return obligations, &resp
 		}
 		obligations = append(obligations, ob)
 	}

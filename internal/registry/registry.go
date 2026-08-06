@@ -18,12 +18,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -46,18 +46,29 @@ type Contract struct {
 	// Server identifies the MCP server that advertises the tool.
 	Server ServerRef `json:"server"`
 	// Summary is a one-line description of what the tool does. Prose, for a human
-	// reviewer — never parsed, and never an input to any decision.
+	// reviewer — never parsed, and never an input to any decision. NOT covered by
+	// AttestationPayload (see Signatures below): a signature does not attest to this text.
 	Summary string `json:"summary,omitempty"`
 	// Notes records the REASONING behind a class, especially where the obvious reading
-	// is wrong — the part of a contract a reviewer actually reviews.
+	// is wrong — the part of a contract a reviewer actually reviews. NOT covered by
+	// AttestationPayload: a signature does not attest to this text.
 	Notes string `json:"notes,omitempty"`
 	// Attestation records who authored the entry and what review it's had —
-	// deliberately modest: authorship/review state, not a verification claim.
+	// deliberately modest: authorship/review state, not a verification claim. NOT covered
+	// by AttestationPayload: the Attestation block itself is provenance ABOUT a signature,
+	// not content a signature covers.
 	Attestation Attestation `json:"attestation"`
-	// Signatures turns the Attestation block above from an unverifiable label into
-	// something a second party asserted with a key; verified LOCALLY, never on the
-	// decision path (attest.go). Deliberately OUTSIDE the digest — including them would
-	// be circular, since each signature is over that digest.
+	// Signatures turns the effect content into something a second party asserted with a
+	// key; verified LOCALLY, never on the decision path (attest.go). Deliberately OUTSIDE
+	// the digest — including them would be circular, since each signature is over that
+	// digest.
+	//
+	// SCOPE: AttestationPayload covers only id, effect content digest, role, and
+	// statement — never Summary, Notes, Server, or the Attestation provenance block above.
+	// A distributed entry can have its reviewer-facing Notes rewritten or its Server.Name
+	// swapped and still pass VerifyAttestations; a signature attests to "this entry's
+	// effect content", not to the entry as a whole. Reviewers evaluating a signed entry's
+	// prose should treat it as unauthenticated.
 	Signatures []Signature `json:"signatures,omitempty"`
 	// Digest is EffectContractDigest of Effect — the value a manifest pins after the
 	// '@' in `effect.ref`. Stored, not only computed, so the file is self-describing.
@@ -245,11 +256,26 @@ func LoadCorpus(dir string) ([]Contract, error) {
 	out := make([]Contract, 0, len(paths))
 	seen := make(map[string]string, len(paths))
 	for _, p := range paths {
-		data, err := readBoundedFile(boundedRead{
-			path:      p,
-			what:      "contract",
-			max:       maxContractFileBytes,
-			overLimit: "refusing to buffer it rather than decoding a corpus entry that cannot be one",
+		// The trust-store loader already guards this (attest.go); a corpus entry needs
+		// the same floor. os.ReadDir's DirEntry.IsDir() above only excludes directories —
+		// a FIFO or other special file named "*.json" would still reach
+		// config.ReadBoundedFile below, whose io.ReadAll(io.LimitReader(...)) blocks
+		// forever waiting for a writer that will never come, hanging the CLI on a
+		// directory an attacker (or a stray mkfifo) can plant into.
+		if err := config.RefuseNonRegularPath(p, "contract"); err != nil {
+			return nil, err
+		}
+		data, err := config.ReadBoundedFile(config.BoundedRead{
+			Path: p,
+			What: "contract",
+			Max:  maxContractFileBytes,
+			// RefuseNonRegularPath alone leaves a Lstat->open TOCTOU: a symlink swapped
+			// in after the check and before this open would substitute an arbitrary
+			// file's content into the corpus, or reintroduce the FIFO hang the check
+			// above exists to close. O_NOFOLLOW closes it the same way readTrustStoreFile
+			// does for the trust store.
+			Flags:     config.OpenNoFollow,
+			OverLimit: "refusing to buffer it rather than decoding a corpus entry that cannot be one",
 		})
 		if err != nil {
 			return nil, err
@@ -277,43 +303,6 @@ func LoadCorpus(dir string) ([]Contract, error) {
 // (a multi-gigabyte .json) that would otherwise be buffered whole before
 // strictDecodeJSON could reject it — an OOM where an error belongs.
 const maxContractFileBytes = 1 << 20
-
-// boundedRead is one bounded whole-file read's parameters — a struct rather than
-// positional args, since two are strings that read identically at a call site and
-// swapping them would garble every error message this produces.
-type boundedRead struct {
-	// path is the file to read; what names its kind for the error messages ("contract").
-	path, what string
-	// max is the inclusive byte bound: a file exactly this size still loads.
-	max int64
-	// flags are any extra open flags the caller's own threat model needs, beyond O_RDONLY
-	// (the trust store's O_NOFOLLOW). Zero for a caller that needs none.
-	flags int
-	// overLimit completes the over-size error; each caller states what refusing buys
-	// IT, since a truncated read means something different for a key set than a single entry.
-	overLimit string
-}
-
-// readBoundedFile reads a file whole under a size bound, erroring rather than
-// truncating. Shared by both operator-supplied paths this package reads (trust store,
-// corpus entry) so a fat-fingered path produces an error, not an OOM.
-func readBoundedFile(rd boundedRead) ([]byte, error) {
-	f, err := os.OpenFile(rd.path, os.O_RDONLY|rd.flags, 0) //nolint:gosec // G304: operator-supplied path (trust store, or a corpus entry under the caller's --dir)
-	if err != nil {
-		return nil, fmt.Errorf("reading %s %q: %w", rd.what, rd.path, err)
-	}
-	defer func() { _ = f.Close() }()
-	// Read one byte past the bound so a file exactly at the limit still loads and
-	// anything larger is detectable without reading it all.
-	data, err := io.ReadAll(io.LimitReader(f, rd.max+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading %s %q: %w", rd.what, rd.path, err)
-	}
-	if int64(len(data)) > rd.max {
-		return nil, fmt.Errorf("%s %q is larger than %d bytes; %s", rd.what, rd.path, rd.max, rd.overLimit)
-	}
-	return data, nil
-}
 
 // sortedKeys renders a validation set for a deterministic error message. The collect-and-sort
 // is sortedSet's (attest.go); this is that plus the join, so one function orders a set in this

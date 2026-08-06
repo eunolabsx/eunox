@@ -622,7 +622,11 @@ func completeToolsListing(params, result json.RawMessage) bool {
 	var res struct {
 		NextCursor string `json:"nextCursor"`
 	}
-	if err := json.Unmarshal(result, &res); err != nil {
+	// mcp.DecodeParams here too: a plain json.Unmarshal keeps the LAST of a duplicate
+	// "nextCursor" key, so `{"nextCursor":"page2","nextCursor":""}` would decode to "" and
+	// mark a truncated page COMPLETE — the exact ambiguity this function's own doc says it
+	// reports false on, and the params side above is already hardened against.
+	if err := mcp.DecodeParams(result, &res); err != nil {
 		return false
 	}
 	return res.NextCursor == ""

@@ -133,7 +133,7 @@ func TestVerifyAuditLog_MalformedTimeReportedOnUnverifiableRecord(t *testing.T) 
 func TestInterpretAuditTail_FileShrinkReportsError(t *testing.T) {
 	// Stat said 4096 bytes; ReadAt returned 0 with EOF (file vanished/truncated).
 	buf := make([]byte, 4096)
-	line, err := interpretAuditTail(buf, 0, io.EOF, 4096)
+	line, err := interpretAuditTail(buf, 0, io.EOF, 4096, 0)
 	if line != "" {
 		t.Fatalf("expected empty line on shrink, got %q", line)
 	}
@@ -147,7 +147,7 @@ func TestInterpretAuditTail_FileShrinkReportsError(t *testing.T) {
 // n>0 — a non-empty shrink) still extract the last line from the bytes read.
 func TestInterpretAuditTail_PartialAndFullReads(t *testing.T) {
 	full := []byte("{\"seq\":1}\n{\"seq\":2}\n")
-	if got, err := interpretAuditTail(full, len(full), nil, int64(len(full))); err != nil || got != `{"seq":2}` {
+	if got, err := interpretAuditTail(full, len(full), nil, int64(len(full)), 0); err != nil || got != `{"seq":2}` {
 		t.Fatalf("full read: got (%q, %v), want (`{\"seq\":2}`, nil)", got, err)
 	}
 	// Partial read paired with io.EOF: the buffer is sized to exactly the bytes
@@ -159,7 +159,7 @@ func TestInterpretAuditTail_PartialAndFullReads(t *testing.T) {
 	content := "{\"seq\":1}\n{\"seq\":2}"
 	buf := make([]byte, 64)
 	copy(buf, content)
-	if _, err := interpretAuditTail(buf, len(content), io.EOF, 64); !errors.Is(err, errAuditFileShrunk) {
+	if _, err := interpretAuditTail(buf, len(content), io.EOF, 64, 0); !errors.Is(err, errAuditFileShrunk) {
 		t.Fatalf("partial read: expected errAuditFileShrunk, got %v", err)
 	}
 }
@@ -2298,6 +2298,73 @@ func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
 
 	if _, err := tailLineFromWindow(f, window, start, newSize, winSize); !errors.Is(err, errAuditTailProbe) {
 		t.Fatalf("error = %v, want it to wrap errAuditTailProbe (a re-read we cannot complete is not a clean tail)", err)
+	}
+}
+
+// TestTruncatePartialTail_WhitespaceFillsWholeWindowFailsClosed pins the fix for a real
+// record hidden behind a whitespace run larger than the scan window (an appended blank-line
+// run needs only append access, exactly the adversary the tamper-evidence model assumes).
+// The tail window scans nothing but whitespace and ends at a newline, so this is the
+// ENDS-AT-BOUNDARY path (no orphan to truncate), not the clipped-record path the tests
+// above cover. Before the fix, an all-whitespace window read as "the log is empty," which
+// silently rewinds the chain and reissues seqs with no chain_resume_failed marker — the
+// exact silent-break M3 closes. It must instead fail closed the same way the newline-less
+// overflow case does: the last real record's boundary cannot be located within the window.
+func TestTruncatePartialTail_WhitespaceFillsWholeWindowFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	r1 := `{"seq":1,"decision":"allow"}`
+	// A blank-line run well past the window under test, terminated by a newline so the
+	// tail ends at a record boundary (not an orphan fragment) — the ends-at-boundary path.
+	whitespace := strings.Repeat("\n", 200)
+	content := r1 + "\n" + whitespace
+	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("open O_RDWR: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// A window well inside the whitespace run: entirely blank, and not at file offset 0.
+	const winSize = 40
+	rb, last, err := truncatePartialTailWindowed(f, winSize)
+	if err == nil {
+		t.Fatalf("truncatePartialTailWindowed: got (rb=%d, last=%q, nil), want errAuditTailUnbounded", rb, last)
+	}
+	if !errors.Is(err, errAuditTailUnbounded) {
+		t.Fatalf("error = %v, want it to wrap errAuditTailUnbounded", err)
+	}
+	// recoverPartialTail's own switch already maps errAuditTailUnbounded to a fatal,
+	// fail-closed resume error (the case beside errAuditTailTruncate/errAuditTailProbe);
+	// this test pins the primitive that switch dispatches on.
+}
+
+// TestReadLastAuditLine_WhitespaceFillsWholeWindowFailsClosed is the rotated-sibling half
+// of the same fix: readLastAuditLine backs newestRotatedSiblingWithTail's sibling walk,
+// which treats ("", nil) as "this sibling holds no records" and silently moves on to an
+// older one. A real record hidden behind a whitespace run larger than the scan window must
+// not be reported that way — it would rewind the chain past a sibling that actually holds
+// higher seqs, the same duplicate-seq cascade the active-log path guards against.
+func TestReadLastAuditLine_WhitespaceFillsWholeWindowFailsClosed(t *testing.T) {
+	rec := `{"seq":1,"decision":"allow"}`
+	whitespace := strings.Repeat("\n", auditScanBufferBytes+10)
+	buf := []byte(rec + "\n" + whitespace)
+	size := int64(len(buf))
+	start := tailWindowStart(size, auditScanBufferBytes)
+	if start == 0 {
+		t.Fatalf("test setup: window must not start at file offset 0 (size=%d)", size)
+	}
+
+	got, err := interpretAuditTail(buf[start:], len(buf)-int(start), nil, size, start)
+	if err == nil {
+		t.Fatalf("interpretAuditTail = (%q, nil), want errAuditTailUnbounded", got)
+	}
+	if !errors.Is(err, errAuditTailUnbounded) {
+		t.Fatalf("error = %v, want it to wrap errAuditTailUnbounded", err)
 	}
 }
 

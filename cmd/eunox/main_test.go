@@ -84,6 +84,10 @@ func TestCmdProxy_ExitCodes(t *testing.T) {
 		{"jwt flag without --jwks-uri", []string{"eunox", "proxy", "--config", cfgPath, "--jwt-issuer", "https://idp.invalid"}, 1},
 		{"redis flag without --redis-addr", []string{"eunox", "proxy", "--config", cfgPath, "--killswitch-fail-open"}, 1},
 		{"unparseable config", []string{"eunox", "proxy", "--config", writeTempFile(t, "\tnot: [yaml")}, 1},
+		// D2/#220: an explicitly-empty --session-id must not silently fall back to a
+		// random UUID — an operator pinning --session-id "$SID" for a later
+		// `eunox kill "$SID"` must find out $SID was unset, not mint an unkillable session.
+		{"empty session-id", []string{"eunox", "proxy", "--config", cfgPath, "--session-id", ""}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -350,6 +354,11 @@ func TestParseFlagsAndPositionals(t *testing.T) {
 		{"positionals only", []string{"a.yaml", "b.yaml"}, false, "", []string{"a.yaml", "b.yaml"}},
 		{"flags only", []string{"--live"}, true, "", nil},
 		{"empty", nil, false, "", nil},
+		// D5/#220: a "--" terminator must protect the WHOLE remainder, not just the token
+		// right after it — dash-prefixed positionals past the first one used to be
+		// re-parsed as flags and rejected with "flag provided but not defined".
+		{"terminator protects the whole remainder", []string{"--live", "--", "-a.yaml", "-b.yaml"}, true, "", []string{"-a.yaml", "-b.yaml"}},
+		{"terminator with no flags before it", []string{"--", "-a.yaml", "-b.yaml"}, false, "", []string{"-a.yaml", "-b.yaml"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

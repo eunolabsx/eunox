@@ -293,6 +293,13 @@ func rejectCoercedGatewayNumerics(n *yaml.Node, path string) error {
 	return nil
 }
 
+// maxGatewayConfigFileBytes bounds a gateway config file read against a misdirected path
+// (a fat-fingered --config pointed at a data file or disk image) that would otherwise be
+// buffered whole before the strict decode could reject it — an OOM where an error
+// belongs. Generous relative to a real config (a route list, even a large one, is well
+// under a megabyte).
+const maxGatewayConfigFileBytes = 32 << 20
+
 // GatewayConfig is the top-level eunox config file.
 type GatewayConfig struct {
 	// SchemaVersion is the config grammar version (e.g. "0.1"). Required; an absent or
@@ -468,9 +475,14 @@ func gatewaySchemaVersionFromNode(root *yaml.Node) (version string, numeric bool
 // string values, not the raw text — so an env value can never be re-interpreted as YAML syntax.
 // An unset reference is left untouched rather than blanked. See expandEnvRefs/envRefRe.
 func LoadGatewayConfig(path string) (*GatewayConfig, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator-supplied config path (CLI argument)
+	raw, err := ReadBoundedFile(BoundedRead{
+		Path:      path,
+		What:      "gateway config",
+		Max:       maxGatewayConfigFileBytes,
+		OverLimit: "refusing to buffer it rather than parsing a gateway config that cannot be one",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("reading gateway config %q: %w", path, err)
+		return nil, err
 	}
 	if err := errIfBinaryConfig("gateway config", path, raw); err != nil {
 		return nil, err

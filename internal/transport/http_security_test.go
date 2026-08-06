@@ -436,6 +436,34 @@ func TestOriginAllowed_BracketedIPv6Bind(t *testing.T) {
 	}
 }
 
+// TestOriginAllowed_AllowlistFoldIsASCIIOnly pins #219's Low-priority internal-consistency
+// fix: originAllowed's allowlist comparison must fold like this file's own isJSONMediaType
+// (asciiEqualFold), not strings.EqualFold's Unicode folding — a mismatch between the two
+// case-insensitive comparisons this file makes would be surprising even though it is not
+// practically exploitable (RFC 6454 origins are ASCII scheme://host[:port], and Go's URL
+// parser lower-cases the scheme it extracts, so a non-ASCII scheme never reaches the
+// allowlist compare in production).
+func TestOriginAllowed_AllowlistFoldIsASCIIOnly(t *testing.T) {
+	proxy := newHTTPProxy(httpProxyOptions{
+		Port:           3000,
+		Bind:           "127.0.0.1",
+		AllowedOrigins: []string{"HTTPS://App.Example.COM"},
+	})
+	// Ordinary ASCII case-insensitivity still holds — the configured entry and an
+	// ASCII-case variant of it must match, matching operator expectations for a
+	// case-insensitive allowlist.
+	if !proxy.originAllowed("https://app.example.com") {
+		t.Error("originAllowed must still fold ordinary ASCII case, regardless of which comparison implements it")
+	}
+	// U+017F (LATIN SMALL LETTER LONG S) case-folds to 'S' under Unicode rules
+	// (strings.EqualFold("HTTPS://APP.EXAMPLE.COM", "HTTPſ://APP.EXAMPLE.COM") is true) but
+	// must NOT be treated as equal to an ASCII 's' by the ASCII-only comparison this file
+	// uses elsewhere for exactly this reason (see isJSONMediaType).
+	if proxy.originAllowed("HTTPſ://APP.EXAMPLE.COM") {
+		t.Error("originAllowed must not fold U+017F to ASCII 's' — that is Unicode case folding, not the ASCII-only rule this file otherwise uses")
+	}
+}
+
 // TestBuildAllowedOriginHosts_WildcardSpellingsExcluded pins that no spelling of
 // the unspecified (all-interfaces) address is ever added to the Origin allowlist —
 // "0.0.0.0", "::", and the alternate IPv6 wildcard spellings "::0" and the fully

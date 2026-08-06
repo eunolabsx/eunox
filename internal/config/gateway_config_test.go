@@ -22,6 +22,26 @@ func writeConfig(t *testing.T, cfg string) string {
 	return p
 }
 
+// TestLoadGatewayConfig_BoundsFileRead pins #219's Low-priority fix: a fat-fingered
+// --config path pointed at a large data file or disk image must produce an error, not an
+// attempt to buffer it whole into memory.
+func TestLoadGatewayConfig_BoundsFileRead(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "huge.yaml")
+	f, err := os.Create(p) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := f.Truncate(maxGatewayConfigFileBytes + 1); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	_ = f.Close()
+
+	_, err = LoadGatewayConfig(p)
+	if err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("an oversized gateway config must be refused rather than buffered, got %v", err)
+	}
+}
+
 // LoadGatewayConfig parses, strictly decodes, env-expands, and validates a
 // well-formed stdio gateway config. This exercises the loader in its own package
 // rather than only through the cmd/ binary.

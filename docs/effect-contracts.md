@@ -120,13 +120,17 @@ without writing Go. All of it is **local**: nothing is fetched, here or on the d
 path.
 
 With `--trust-keys` it additionally verifies each entry's signed attestations against a
-local trusted-key file and adds an `ATTESTATION` column: who **attests** to the entry, and
-who **disputes** it. A digest establishes that an entry is what it says it is; a signature
-establishes *who is saying it*, which is the half a hash cannot supply. A signature by a key
-the file does not hold is reported as unverified rather than erroring — a corpus may be
-signed by parties you have not chosen to trust — while a signature by a key it **does** hold
-that fails to verify stops the command, because the only way to produce one is to edit an
-entry after it was signed. eunox verifies attestations and never mints them; `--attest-payload`
+local trusted-key file and adds an `ATTESTATION` column: who **attests** to the entry's
+*effect content*, and who **disputes** it. A digest establishes that the effect content is
+what it says it is; a signature establishes *who is saying so*, which is the half a hash
+cannot supply. A signature by a key the file does not hold is reported as unverified rather
+than erroring — a corpus may be signed by parties you have not chosen to trust — while a
+signature by a key it **does** hold that fails to verify stops the command, because the
+only way to produce one is to edit the effect content after it was signed. The signed
+payload is deliberately narrow — id, effect content digest, role, statement — and does
+**not** cover `summary`, `notes`, `server`, or the `attestation` provenance block itself:
+those are prose and provenance a reviewer should evaluate independently, not authenticated
+by the signature. eunox verifies attestations and never mints them; `--attest-payload`
 prints the exact bytes a publisher signs with their own key. Format and worked examples:
 [`registry/README.md`](../registry/README.md#vendor-attestation-and-community-review).
 

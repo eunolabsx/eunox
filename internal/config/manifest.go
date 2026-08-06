@@ -15,7 +15,6 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"os"
 	stdpath "path"
 	"reflect"
 	"regexp"
@@ -29,6 +28,13 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 )
+
+// maxManifestFileBytes bounds a manifest file read against a misdirected path (a
+// fat-fingered flag pointed at a data file or disk image) that would otherwise be
+// buffered whole before the strict decode could reject it — an OOM where an error
+// belongs. Generous relative to a real manifest (typically tens of KB even with hundreds
+// of capability entries).
+const maxManifestFileBytes = 32 << 20
 
 // LocalManifest declares the capabilities an agent requires.
 type LocalManifest struct {
@@ -60,9 +66,14 @@ type LocalManifest struct {
 // node is then converted to JSON so capability.Constraint's polymorphic JSON unmarshalling is
 // reused unchanged.
 func LoadManifest(path string) (*LocalManifest, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // G304: path is a user-specified manifest file path (CLI argument)
+	data, err := ReadBoundedFile(BoundedRead{
+		Path:      path,
+		What:      "manifest",
+		Max:       maxManifestFileBytes,
+		OverLimit: "refusing to buffer it rather than parsing a manifest that cannot be one",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("reading manifest %q: %w", path, err)
+		return nil, err
 	}
 	if err := errIfBinaryConfig("manifest", path, data); err != nil {
 		return nil, err

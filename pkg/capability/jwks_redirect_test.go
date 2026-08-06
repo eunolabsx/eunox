@@ -116,6 +116,51 @@ func TestJWKSCache_SameHostRedirectAllowed(t *testing.T) {
 	}
 }
 
+// downgradingRoundTripper answers every request with a canned response whose Request field
+// reports the SAME host but a plaintext scheme, simulating what resp.Request looks like
+// after net/http follows a same-host https->http redirect (the final hop's URL, per
+// net/http's documented "last request in a redirect chain" semantics) without this test
+// needing a real TLS listener to produce it.
+type downgradingRoundTripper struct {
+	body string
+}
+
+func (rt *downgradingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	finalURL := *req.URL
+	finalURL.Scheme = "http"
+	finalReq := req.Clone(req.Context())
+	finalReq.URL = &finalURL
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(rt.body)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Request:    finalReq,
+	}, nil
+}
+
+// TestJWKSCache_SchemeDowngradeRedirectRefused pins that the same-origin floor blocks a
+// same-host redirect that downgrades https to http, not just a cross-host hop. Without this,
+// an IdP served at https://idp.example.com/jwks.json redirecting to
+// http://idp.example.com/jwks.json passes the hostname check and fetches the root of trust
+// for token verification over plaintext, where it can be tampered with in transit.
+func TestJWKSCache_SchemeDowngradeRedirectRefused(t *testing.T) {
+	t.Parallel()
+
+	const attackerKeys = `{"keys":[{"kty":"oct","kid":"attacker","k":"AAAA"}]}`
+	c := NewJWKSCache(JWKSCacheConfig{
+		JWKSURL: "https://idp.example.com/.well-known/jwks.json",
+		Client:  &http.Client{Transport: &downgradingRoundTripper{body: attackerKeys}},
+	})
+
+	_, err := c.fetchKeys(context.Background())
+	if err == nil {
+		t.Fatal("an https->http downgrade redirect must fail closed even on the same host")
+	}
+	if !strings.Contains(err.Error(), "not https") {
+		t.Fatalf("error should name the scheme downgrade, got: %v", err)
+	}
+}
+
 // nilRequestRoundTripper answers every request with a canned response whose Request field is
 // left nil, simulating a caller-supplied RoundTripper that builds its own *http.Response
 // rather than going through the standard net/http machinery that always populates it (the

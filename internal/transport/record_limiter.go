@@ -45,13 +45,20 @@ const (
 	// POSTs). A kill record for a session this proxy already established is written
 	// unlimited — it's the record an operator most needs during an emergency stop.
 	catKill refusalCategory = "kill"
+	// catAudience bounds the PRE-SESSION per-route audience-pin refusal (the
+	// session-creating initialize's initAudienceDenial). A caller holding one valid
+	// token for any SIBLING route's audience (accepted by the gateway's shared union
+	// JWT validator) reaches this on every route whose audience it fails, with no
+	// session or upstream ever spawned — the same cheap-flood shape catKill exists to
+	// bound, one credential away rather than zero.
+	catAudience refusalCategory = "audience"
 )
 
 // refusalCategories is authoritative: a category added above but omitted here falls to the
 // shared unknown bucket instead of getting its own (see
 // TestRefusalCategories_AllHaveTheirOwnBucket).
 var refusalCategories = []refusalCategory{
-	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation, catKill,
+	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation, catKill, catAudience,
 }
 
 // perCategoryFloor keeps every category's bucket alive even where plain division would

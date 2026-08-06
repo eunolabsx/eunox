@@ -1412,7 +1412,12 @@ func matchClaimBare(prefix capability.TargetType, bareName, targetName string) b
 	globPart, claimQuery, hasQuery := claimGlobParts(prefix, bareName)
 	if hasQuery {
 		tPath, tQuery, tHasQuery := strings.Cut(targetName, "?")
-		// A query-bearing claim pins its query: the target must carry the same one.
+		// A query-bearing claim pins its query via an EXACT, order-sensitive byte
+		// comparison — not a normalized one. "?a=1&b=2" does not match "?b=2&a=1" even
+		// though the two are semantically identical query strings; this is a documented
+		// pin (docs/capability-manifest-guide.md § 3), not an oversight, so a caller
+		// whose client reorders or re-encodes query parameters gets an opaque
+		// AUTHORIZATION_FAILED rather than a silently normalized match.
 		if !tHasQuery || claimQuery != tQuery {
 			return false
 		}

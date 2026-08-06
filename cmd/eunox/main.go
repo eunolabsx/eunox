@@ -435,6 +435,17 @@ func cmdProxy(args []string) (exitCode int) {
 		return 1
 	}
 
+	sessionIDSet := flagWasSet(fs, "session-id")
+	if sessionIDSet && *f.sessionID == "" {
+		// An explicitly-empty value (e.g. a unit file pinning --session-id "$SID" for a
+		// later `eunox kill "$SID"` where $SID turned out unset) must not silently fall
+		// through to a random UUID: kill.go:276-279 already refuses the identical mistake
+		// on the kill side ("a supplied-but-empty target must not silently fall through …
+		// or a default"), and both killswitch backends reject empty ids outright. Minting a
+		// fresh id here instead would make the pinned emergency kill match nothing.
+		fmt.Fprintf(os.Stderr, "eunox proxy: --session-id was passed but empty; unset the flag entirely for a random UUID, or pass a non-empty id\n")
+		return 1
+	}
 	sid := *f.sessionID
 	if sid == "" {
 		sid = uuid.New().String()
@@ -461,7 +472,7 @@ func cmdProxy(args []string) (exitCode int) {
 		shutdownMs:           *f.shutdownTimeout,
 		upstreamTimeoutMs:    *f.upstreamTimeout,
 		sessionID:            sid,
-		sessionIDSet:         *f.sessionID != "",
+		sessionIDSet:         sessionIDSet,
 		configPath:           *f.configPath,
 		strictDrift:          *f.strictDrift,
 		requireAuditStrict:   f.requireAudit.strict(),
@@ -1646,6 +1657,18 @@ func parseFlagsAndPositionals(fs *flag.FlagSet, args []string) ([]string, error)
 		rest := fs.Args()
 		if len(rest) == 0 {
 			return positionals, nil
+		}
+		// A literal "--" terminator makes EVERY remaining token positional, dash-prefixed
+		// or not: flag.Parse consumes the "--" itself (it never appears in Args()) and
+		// stops all further flag interpretation for the rest of that call. Re-parsing the
+		// tail on the next loop iteration would silently re-enable flag parsing for
+		// anything after the first token, so `eunox validate -- -a.yaml -b.yaml` failed on
+		// -b.yaml with "flag provided but not defined" — the terminator protected only the
+		// token right after it instead of the whole remainder, contradicting the flag
+		// package's own convention. Detected by checking whether the token immediately
+		// before where rest begins in THIS call's args was "--".
+		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+			return append(positionals, rest...), nil
 		}
 		positionals = append(positionals, rest[0])
 		args = rest[1:]

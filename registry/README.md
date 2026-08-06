@@ -159,12 +159,15 @@ excluded (a contract cannot contain its own digest). Two entries whose contracts
 
 ## Vendor attestation and community review
 
-A content digest establishes that an entry **is what it says it is**. It says nothing about
-*who* is saying it, and nothing about whether anyone else has looked. Those are the two
-things that turn a corpus of files into a corpus with a trust model.
+A content digest establishes that an entry's **effect content** is what it says it is. It
+says nothing about *who* is saying it, and nothing about whether anyone else has looked.
+Those are the two things that turn a corpus of files into a corpus with a trust model.
 
-An entry may carry a `signatures` array: Ed25519 statements over the entry's content digest,
-each naming the key that made it, the **role** its signer claims, and **what** they claim.
+An entry may carry a `signatures` array: Ed25519 statements over the entry's effect content
+digest, each naming the key that made it, the **role** its signer claims, and **what** they
+claim. The signed payload does **not** cover `summary`, `notes`, `server`, or the
+`attestation` provenance block itself (see "Producing a signature" below) — those are prose
+a reviewer should read on their own merits, not text a signature authenticates.
 
 ```jsonc
 "signatures": [
@@ -228,10 +231,14 @@ without this the two would be the same grant.
    would make every entry's usability depend on collecting every publisher's key — those are
    reported as `unverified(n)`, which is a materially different state from unsigned, and
    which is reported *alongside* whatever did verify rather than being replaced by it. But a
-   signature by a key you *did* configure that does not verify means the entry was **edited
-   after it was signed**, and that stops the command. The signature is checked **before** the
-   `roles` restriction is applied, so a key you trust only as a reviewer still surfaces
-   tampering on a vendor-role signature rather than being written off as a stranger's mark.
+   signature by a key you *did* configure that does not verify means the entry's **effect
+   content was edited after it was signed** (id/digest/role/statement — see "Producing a
+   signature" for the exact payload), and that stops the command. The signature is checked
+   **before** the `roles` restriction is applied, so a key you trust only as a reviewer
+   still surfaces tampering on a vendor-role signature rather than being written off as a
+   stranger's mark. A rewritten `summary`, `notes`, or `server` field does **not** trip this
+   — those fields sit outside the signed payload entirely, so verification passing is not a
+   claim that the whole entry, prose included, is unmodified.
 
 `--trust-keys` composes with `--ref` and `--attest-payload`: verification runs first, so
 copying a pin or producing a signing payload cannot succeed against an entry a trusted key

@@ -379,7 +379,12 @@ func (m *InMemory) AdmitAll(_ context.Context, buckets []capability.QuotaBucket)
 	}
 	for i := range states {
 		st := &states[i]
-		if st.record && st.writeWeighted && m.maxWeightedEntries > 0 &&
+		// Gated on the BUCKET's own accounting, not the key's current format: a counted
+		// bucket's own limit is its retention (mirrors the Lua script's `counted ~= 1`
+		// gate), so it must not be bound by a weighted ceiling on a key another bucket
+		// happened to leave in weighted format — that would cap maxCalls at a bound no
+		// operator wrote.
+		if st.record && !st.b.Counted && m.maxWeightedEntries > 0 &&
 			len(st.valid) >= m.maxWeightedEntries {
 			return false, 0, 0, 0, m.errWeightedEntryLimit()
 		}

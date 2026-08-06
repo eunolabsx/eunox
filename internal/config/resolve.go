@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math"
 	"os"
@@ -108,4 +109,43 @@ func RefuseNonRegularPath(path, subject string) error {
 		return fmt.Errorf("refusing a non-regular %s %q (mode %v): it must be a regular file, not a symlink or other special file", subject, path, fi.Mode())
 	}
 	return nil
+}
+
+// BoundedRead is one bounded whole-file read's parameters — a struct rather than
+// positional args, since Path/What are both strings that read identically at a call site
+// and swapping them would garble every error message ReadBoundedFile produces.
+type BoundedRead struct {
+	// Path is the file to read; What names its kind for the error messages ("manifest",
+	// "gateway config", "contract", "attestation trust store").
+	Path, What string
+	// Max is the inclusive byte bound: a file exactly this size still loads.
+	Max int64
+	// Flags are any extra open flags the caller's own threat model needs, beyond
+	// O_RDONLY (e.g. OpenNoFollow for a trust root). Zero for a caller that needs none.
+	Flags int
+	// OverLimit completes the over-size error; each caller states what refusing buys IT,
+	// since a truncated read means something different for a key set than a manifest.
+	OverLimit string
+}
+
+// ReadBoundedFile reads Path whole, refusing anything past Max bytes rather than
+// buffering an operator-supplied file of unbounded size — every loader here reads a path
+// named on the command line or in another config file, so a fat-fingered path pointed at a
+// data file or disk image must produce an error, not an OOM. Reads one byte past the bound
+// so a file exactly at the limit still loads and anything larger is detectable without
+// reading it all.
+func ReadBoundedFile(rd BoundedRead) ([]byte, error) {
+	f, err := os.OpenFile(rd.Path, os.O_RDONLY|rd.Flags, 0) //nolint:gosec // G304: operator-supplied path
+	if err != nil {
+		return nil, fmt.Errorf("reading %s %q: %w", rd.What, rd.Path, err)
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, rd.Max+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading %s %q: %w", rd.What, rd.Path, err)
+	}
+	if int64(len(data)) > rd.Max {
+		return nil, fmt.Errorf("%s %q is larger than %d bytes; %s", rd.What, rd.Path, rd.Max, rd.OverLimit)
+	}
+	return data, nil
 }

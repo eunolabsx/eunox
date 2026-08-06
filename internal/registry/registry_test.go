@@ -235,6 +235,43 @@ func TestLoadCorpusBoundsEachEntryRead(t *testing.T) {
 	}
 }
 
+// TestLoadCorpusRejectsANonRegularEntry pins #219's Low-priority fix: os.ReadDir's
+// DirEntry.IsDir() excludes directories but not other special files, so a FIFO named
+// "*.json" would reach config.ReadBoundedFile's io.ReadAll(io.LimitReader(...)) and hang
+// the CLI forever waiting for a writer that never comes — the trust-store loader already
+// guards this (RefuseNonRegularPath), and LoadCorpus needs the same floor. A symlink
+// stands in for the special-file case here since it is portable across CI platforms; the
+// fix is the same os.Lstat-based check either way, not a FIFO-specific one.
+func TestLoadCorpusRejectsANonRegularEntry(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "real.json")
+	e := &capability.EffectContract{Class: capability.EffectReversible}
+	d, err := capability.EffectContractDigest(e)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	entry := Contract{
+		SchemaVersion: SchemaVersion, ID: "acme/server.tool", Tool: "tool",
+		Server:      ServerRef{Name: "acme-server"},
+		Attestation: Attestation{Author: "acme", Source: SourceAuthored, Review: ReviewPending},
+		Digest:      d, Effect: e,
+	}
+	body, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(target, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	link := filepath.Join(dir, "acme.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := LoadCorpus(dir); err == nil {
+		t.Fatal("a non-regular corpus entry must be refused, not opened")
+	}
+}
+
 // TestLoadCorpusRejectsAnUnknownField pins strict decoding: a misspelled key in a corpus
 // entry decodes to nothing, and "nothing" in an effect contract means the fail-closed
 // default rather than what the author wrote — a difference the file itself would hide.

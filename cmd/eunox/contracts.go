@@ -101,6 +101,21 @@ Flags:
 		fmt.Fprintln(os.Stderr, "eunox contracts: --ref and --attest-payload each print one value; pass only one")
 		return 2
 	}
+	// --role/--statement only mean anything for --attest-payload. flagWasSet, not *role/
+	// *statement != "": both have non-empty defaults ("vendor"/"attests"), so a plain
+	// emptiness check could never catch an operator explicitly passing the default value
+	// without --attest-payload. This is the one exemption CONTRIBUTING otherwise applies
+	// uniformly across the binary — an unpaired flag is rejected, not silently inert.
+	if *attestPayload == "" {
+		if flagWasSet(fs, "role") {
+			fmt.Fprintln(os.Stderr, "eunox contracts: --role only applies to --attest-payload; pass --attest-payload <contract-id> too")
+			return 2
+		}
+		if flagWasSet(fs, "statement") {
+			fmt.Fprintln(os.Stderr, "eunox contracts: --statement only applies to --attest-payload; pass --attest-payload <contract-id> too")
+			return 2
+		}
+	}
 
 	// ExpandHome for parity with every other operator-supplied path in the CLI.
 	resolved, err := config.ExpandHome(*dir)

@@ -572,6 +572,19 @@ func (p *HTTPProxy) runAfterListen(ctx context.Context, ln net.Listener) error {
 // Serve starts the HTTP server and blocks until ctx is canceled or a fatal
 // error occurs.
 func (p *HTTPProxy) Serve(ctx context.Context) error {
+	// Hand the registration back on EVERY Serve return, listen/bind failure and post-bind
+	// startup-hook failure included — not only the success path past srv.Serve. This
+	// registration happened at CONSTRUCTION (NewHTTPProxyGateway), not here, specifically
+	// so a kill delivered during startup is not lost; a Serve that never reaches its own
+	// mid-function teardown (an early `return err` from net.Listen or runAfterListen, or
+	// the ctx-already-canceled short-circuit below) must not leave the kill switch — which
+	// OUTLIVES this proxy and may be handed to a second one — calling into a proxy that
+	// will never serve anything. nil only for a struct-literal proxy, which registered
+	// nothing.
+	if p.unobserveRevocations != nil {
+		defer p.unobserveRevocations()
+	}
+
 	// Publish the serve-lifetime context under p.mu so the concurrent reads in serveCtx are
 	// synchronized. Happens before srv.Serve accepts any connection.
 	p.mu.Lock()
@@ -686,12 +699,6 @@ func (p *HTTPProxy) Serve(ctx context.Context) error {
 	// under sessionIdleTimeoutMs: 0, where a Redis-delivered kill would otherwise deny traffic
 	// but reclaim nothing until the process exited.
 	go p.reclaimOnRevocation(reaperCtx)
-	// Hand the registration back when this proxy is done, so the kill switch (which may
-	// outlive it) is not left calling into a proxy that serves nothing. nil only for a
-	// struct-literal proxy, which registered nothing.
-	if p.unobserveRevocations != nil {
-		defer p.unobserveRevocations()
-	}
 
 	// Teardown for EVERY Serve return path, as a single defer so no return arm can forget it.
 	// Order: srv.Shutdown drains in-flight handlers FIRST (so a handler cannot complete

@@ -43,7 +43,7 @@ import (
 // concatenated onto by the next write. This in-memory skip therefore matters for
 // read-only callers that never truncate (rotated-sibling resume) and as
 // defense-in-depth between the truncation and the tail read.
-func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, error) {
+func interpretAuditTail(buf []byte, n int, readErr error, size, start int64) (string, error) {
 	// Stat reported size>0 but ReadAt returned zero bytes: the file was truncated to
 	// empty (or shrank below the tail offset) between the two syscalls — a rotation
 	// daemon racing a restart, or a stale NFS size cache. Reporting this as ("", nil)
@@ -62,6 +62,18 @@ func interpretAuditTail(buf []byte, n int, readErr error, size int64) (string, e
 		return "", fmt.Errorf("audit tail read: file shrank from %d bytes (read %d of %d tail bytes) between stat and read: %w", size, n, len(buf), errAuditFileShrunk)
 	}
 	line, _ := lastCompleteLineFromTail(buf[:n])
+	if line == "" && start != 0 {
+		// The entire tail window trimmed away as whitespace (a run of blank lines/spaces
+		// filling the whole scan window) and the window did not begin at file offset 0: a
+		// real record may sit further back than this window reaches. Reporting ("", nil)
+		// here reads as "the file is empty," which for a rotated sibling means the caller
+		// (newestRotatedSiblingWithTail) silently skips to an older sibling and the chain
+		// resumes short of this file's actual seqs — a tamper-shaped duplicate-seq cascade
+		// with no chain_resume_failed marker, the one tail anomaly the package's own
+		// invariant says must never be silent. Fail closed exactly as the newline-less
+		// overflow case does: the boundary cannot be located within the window.
+		return "", fmt.Errorf("%w (%d bytes scanned from offset %d, entire window is whitespace)", errAuditTailUnbounded, n, start)
+	}
 	return line, nil
 }
 
@@ -387,7 +399,16 @@ func tailWindowStart(size, win int64) int64 {
 // exactly one record, in which case the window starts at 0 and is authoritative.
 func tailLineFromWindow(f *os.File, window []byte, start, size, winSize int64) (string, error) {
 	line, bounded := lastCompleteLineFromTail(window)
-	if bounded || start == 0 || line == "" {
+	if line == "" && start != 0 {
+		// The whole window trimmed away as whitespace and the window did not begin at
+		// file offset 0: re-reading with the same winSize would recompute the identical
+		// start (tailWindowStart is a pure function of size and winSize, and size has not
+		// shrunk in this call path), so it cannot resolve the ambiguity. A real record may
+		// exist before this window; reporting "" would read as an empty log and silently
+		// rewind the chain. Fail closed like the newline-less overflow case below.
+		return "", fmt.Errorf("%w (%d bytes scanned from offset %d, entire window is whitespace)", errAuditTailUnbounded, len(window), start)
+	}
+	if bounded || start == 0 {
 		return line, nil
 	}
 	reStart := tailWindowStart(size, winSize)

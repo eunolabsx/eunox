@@ -5,6 +5,7 @@ package capability_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -228,6 +229,24 @@ func TestValidateDelegationChain_ActorsAndGrantsMustAgree(t *testing.T) {
 	_, err = capability.ValidateDelegationChain([]string{"a", "b"}, []capability.DelegationGrant{{Subject: "a"}, {Subject: "z"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "chain names")
+}
+
+// TestValidateDelegationChain_ReassertsGrantsDepthCap pins the #219 Low-priority
+// defense-in-depth gap: ValidateDelegationChain re-asserts the actors cap independently of
+// ParseActorChain's own, but did not do the same for grants. ParseDelegationGrants already
+// caps a real token's claim before it reaches here, but ValidateDelegationChain is itself
+// an exported boundary a caller can reach directly with a pre-built []DelegationGrant (no
+// actors at all, so the hop-agreement check that would otherwise compare lengths never
+// runs) — the narrowing loop below must not walk an unbounded slice before either cap
+// fires.
+func TestValidateDelegationChain_ReassertsGrantsDepthCap(t *testing.T) {
+	grants := make([]capability.DelegationGrant, capability.MaxDelegationDepth+1)
+	for i := range grants {
+		grants[i] = capability.DelegationGrant{Subject: fmt.Sprintf("hop-%d", i)}
+	}
+	_, err := capability.ValidateDelegationChain(nil, grants)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "more than the maximum")
 }
 
 // TestValidateDelegationChain_PresentEmptyGrantsDisagreeWithActors is the mis-mint most likely

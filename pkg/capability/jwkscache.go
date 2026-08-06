@@ -625,13 +625,19 @@ func (c *JWKSCache) refuseCrossOriginResponse(resp *http.Response) error {
 		return fmt.Errorf("JWKS URI is not parseable: %w", err)
 	}
 	gotHost, wantHost := resp.Request.URL.Hostname(), want.Hostname()
-	if strings.EqualFold(gotHost, wantHost) {
-		return nil
+	sameHost := strings.EqualFold(gotHost, wantHost) || (IsLoopbackHost(gotHost) && IsLoopbackHost(wantHost))
+	if !sameHost {
+		return fmt.Errorf("JWKS response came from host %q, not the configured JWKS host %q; the key set is the root of trust for token verification and a redirect must not move it to another host", gotHost, wantHost)
 	}
-	if IsLoopbackHost(gotHost) && IsLoopbackHost(wantHost) {
-		return nil
+	// A same-host hop can still downgrade scheme (an https-configured IdP redirecting to
+	// http on the same name): the hostname check alone would pass it. The floor is
+	// documented as "a supplied client cannot weaken," so a plaintext-http response is
+	// refused whenever the configured URL demanded TLS, not just warned about at the
+	// configured URL (loopback is exempt: it never leaves the machine either way).
+	if want.Scheme == "https" && resp.Request.URL.Scheme != "https" && !(IsLoopbackHost(gotHost) && IsLoopbackHost(wantHost)) {
+		return fmt.Errorf("JWKS response for host %q was served over %q, not https; the configured JWKS URL demands TLS and a redirect must not downgrade it", gotHost, resp.Request.URL.Scheme)
 	}
-	return fmt.Errorf("JWKS response came from host %q, not the configured JWKS host %q; the key set is the root of trust for token verification and a redirect must not move it to another host", gotHost, wantHost)
+	return nil
 }
 
 func (c *JWKSCache) fetchKeys(ctx context.Context) (_ *jose.JSONWebKeySet, err error) {

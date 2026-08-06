@@ -307,6 +307,31 @@ func TestVerifyAttestations_UnsignedEntryIsBlank(t *testing.T) {
 	assert.Equal(t, 1, store.Len())
 }
 
+// TestVerifyAttestations_ProseFieldsAreOutsideTheSignature pins the M4/#220 documentation
+// fix's boundary: Summary, Notes, and Server are NOT part of AttestationPayload, so
+// rewriting them on an already-signed entry must not trip VerifyAttestations. This is the
+// negative control to TestVerifyAttestations_TamperedEntryIsAnError, which pins that
+// rewriting the EFFECT content does trip it — together they pin exactly where the signed
+// boundary sits, which is the property #219's M4 finding said no test pinned either way.
+func TestVerifyAttestations_ProseFieldsAreOutsideTheSignature(t *testing.T) {
+	c, pub, priv := signedEntry(t)
+	sign(t, &c, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+
+	// Rewrite every field AttestationPayload does not cover — content digest and
+	// signatures untouched.
+	c.Summary = "a completely rewritten summary"
+	c.Notes = "rewritten reviewer notes"
+	c.Server = registry.ServerRef{Name: "totally-different-server", Homepage: "https://attacker.example"}
+	c.Attestation = registry.Attestation{Author: "someone else", Source: registry.SourceImported, Review: registry.ReviewPending}
+	require.NoError(t, c.Validate(), "the effect content and digest are untouched — Validate must still pass")
+
+	store, err := registry.LoadTrustStore(writeTrustStore(t, trusted("acme-2026", "Acme Inc", pub)))
+	require.NoError(t, err)
+	status, err := c.VerifyAttestations(store)
+	require.NoError(t, err, "prose/provenance fields are outside the signed payload and must not trip verification")
+	assert.True(t, status.VendorAttested, "the effect content is unmodified, so the vendor attestation must still hold")
+}
+
 // TestNewSignaturePayload_ValidatesAndBindsContent pins that the printed payload is bound to
 // the entry's recomputed content, not to whatever digest the file declared.
 func TestNewSignaturePayload_ValidatesAndBindsContent(t *testing.T) {
