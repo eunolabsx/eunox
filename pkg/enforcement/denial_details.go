@@ -45,6 +45,13 @@ const (
 	// minDenialDetailKeyBudget floors the per-key share below, bounding how far the whole map
 	// can overshoot maxDenialDetailsBytes when a handler records an unusual number of keys.
 	minDenialDetailKeyBudget = 512
+
+	// maxDenialDetailTopLevelKeys bounds how many top-level keys BoundDenialDetails processes.
+	// The per-key share floors at minDenialDetailKeyBudget once len(in) passes this count, so
+	// "bounds the whole map" held only up to here — past it, output grows ~512 bytes per extra
+	// key with nothing capping how many keys there can be. Matches maxDenialDetailsBytes /
+	// minDenialDetailKeyBudget: the floor's own breakeven point.
+	maxDenialDetailTopLevelKeys = maxDenialDetailsBytes / minDenialDetailKeyBudget
 )
 
 // denialDetailContainerCost is what one map or slice charges before its contents. Without it
@@ -121,11 +128,29 @@ func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
 	if share < minDenialDetailKeyBudget {
 		share = minDenialDetailKeyBudget
 	}
-	out := make(map[string]interface{}, len(in))
-	for k, v := range in {
+
+	keys := make([]string, 0, len(in))
+	for k := range in {
+		keys = append(keys, k)
+	}
+	// Sorted so which keys survive a breadth cap (or an exhausted budget) is deterministic —
+	// Go's randomized map iteration would otherwise make two identical denied calls write
+	// different records.
+	sort.Strings(keys)
+	elided := 0
+	if len(keys) > maxDenialDetailTopLevelKeys {
+		elided = len(keys) - maxDenialDetailTopLevelKeys
+		keys = keys[:maxDenialDetailTopLevelKeys]
+	}
+
+	out := make(map[string]interface{}, len(keys)+1)
+	for _, k := range keys {
 		bk := escapeReservedDetailKey(boundDetailString(k))
 		budget := share - len(bk)
-		out[bk] = boundDetailValue(v, &budget, 0)
+		out[bk] = boundDetailValue(in[k], &budget, 0)
+	}
+	if elided > 0 {
+		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", elided, len(in))
 	}
 	return out
 }

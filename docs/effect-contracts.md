@@ -278,15 +278,18 @@ than the manifest's, which is the safe direction for a call that is refused eith
 
 `requireCompensation` applies only to an action already **above** `maxEffectClass`;
 demanding a compensating action for a reversible read would be noise. It therefore requires
-`maxEffectClass` to be set, and the loader rejects every shape where it is not. Two
+`maxEffectClass` to be set to a class **below `irreversible`**, the top of the vocabulary —
+`irreversible` bounds nothing an action could ever be classified above, so the compensation
+leg could never fire either, the identical inert shape wearing a valid-looking spelling. The
+loader rejects both: `maxEffectClass` unset, and `maxEffectClass: irreversible`. Two
 different things enforce that for the library seam that takes a ceiling directly, since
 that seam never passes through the loader: a ceiling carrying **only**
 `requireCompensation` does not count as set at all, so it cannot report itself active while
 being structurally incapable of refusing anything; and a ceiling carrying
-`requireCompensation` **alongside `maxBlastRadius` but no `maxEffectClass`** — which *is*
-set, and whose compensation leg still could never fire — exceeds outright, with the reason
-`ceiling_misconfigured`. A ceiling leg that cannot be evaluated must not read as "checked
-and fine".
+`requireCompensation` **alongside `maxBlastRadius` but no `maxEffectClass`** (or with
+`maxEffectClass: irreversible`) — which *is* set, and whose compensation leg still could
+never fire — exceeds outright, with the reason `ceiling_misconfigured`. A ceiling leg that
+cannot be evaluated must not read as "checked and fine".
 
 ## `escalate` is a refusal, not a pending state
 

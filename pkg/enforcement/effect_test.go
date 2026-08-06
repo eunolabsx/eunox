@@ -224,18 +224,40 @@ func TestEffectCeiling_OnExceedDeny(t *testing.T) {
 // consequence gate: the same irreversible action escalates without a compensating action
 // and passes with one, when the ceiling admits its class.
 func TestEffectCeiling_RequiresCompensationIsTheThirdGateInput(t *testing.T) {
-	eng := effectEngine(&capability.EffectCeiling{MaxEffectClass: capability.EffectIrreversible, RequireCompensation: true})
+	// A ceiling bound of "irreversible" itself — the top of the vocabulary — is the
+	// structurally inert shape M2 closes (see TestEffectCeiling_RequireCompensationWithMaxEffectClassIrreversibleEscalates):
+	// requireCompensation can never fire against it, so it is refused rather than
+	// evaluated. The "at (not above) the class bound" case below therefore uses a
+	// non-top bound instead, with an effect exactly AT it.
+	eng := effectEngine(&capability.EffectCeiling{MaxEffectClass: capability.EffectCompensable, RequireCompensation: true})
+
+	atBound := []capability.Constraint{{Target: "tool:wire", Actions: []string{"call"},
+		Effect: &capability.EffectContract{Class: capability.EffectCompensable, CompensatingAction: "tool:reverse"}}}
+	assert.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(context.Background(), effectReq("wire", nil), atBound).Decision,
+		"an action at (not above) the class bound is not subject to the compensation leg")
 
 	uncompensated := []capability.Constraint{{Target: "tool:wire", Actions: []string{"call"},
 		Effect: &capability.EffectContract{Class: capability.EffectIrreversible}}}
-	assert.Equal(t, capability.DecisionAllow,
-		eng.ValidateAction(context.Background(), effectReq("wire", nil), uncompensated).Decision,
-		"an action at (not above) the class bound is not subject to the compensation leg")
-
 	tighter := effectEngine(&capability.EffectCeiling{MaxEffectClass: capability.EffectCompensable, RequireCompensation: true})
 	resp := tighter.ValidateAction(context.Background(), effectReq("wire", nil), uncompensated)
 	require.Equal(t, capability.DecisionEscalate, resp.Decision)
 	assert.Contains(t, resp.Denial.Details["ceiling_exceeded"], "no_compensating_action")
+}
+
+// TestEffectCeiling_RequireCompensationWithMaxEffectClassIrreversibleEscalates pins the M2
+// fix at the engine level: a ceiling ostensibly bounding compensation at "irreversible" —
+// the top of the vocabulary, against which no action can ever be classified "above" — is
+// structurally inert, byte-for-byte the failure mode an unset maxEffectClass already
+// escalates for. It must not silently allow every action through unevaluated.
+func TestEffectCeiling_RequireCompensationWithMaxEffectClassIrreversibleEscalates(t *testing.T) {
+	eng := effectEngine(&capability.EffectCeiling{MaxEffectClass: capability.EffectIrreversible, RequireCompensation: true})
+
+	caps := []capability.Constraint{{Target: "tool:wire", Actions: []string{"call"},
+		Effect: &capability.EffectContract{Class: capability.EffectIrreversible}}}
+	resp := eng.ValidateAction(context.Background(), effectReq("wire", nil), caps)
+	require.Equal(t, capability.DecisionEscalate, resp.Decision)
+	assert.Contains(t, resp.Denial.Details["ceiling_exceeded"], "ceiling_misconfigured")
 }
 
 // TestEffectCeiling_RunsAfterConditionsAndBeforeTheStateCommit pins the ordering: an

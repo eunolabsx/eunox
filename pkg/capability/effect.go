@@ -364,13 +364,15 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 	if !c.IsSet() {
 		return false, nil
 	}
-	// requireCompensation with no class bound to hang it on. The manifest loader rejects
-	// this shape outright; the exported WithEffectCeiling seam takes a ceiling directly
-	// and never passes through it, and there the leg below could never fire — an operator
-	// would have authored a compensation requirement that silently bounded nothing. An
-	// unevaluable ceiling leg must not read as "checked and fine", so it exceeds, loudly,
-	// with a token that names the misconfiguration rather than a consequence.
-	if c.RequireCompensation && c.MaxEffectClass == "" {
+	// requireCompensation with no class bound to hang it on — OR a class bound of
+	// "irreversible", the top of the vocabulary, against which overClass below can never
+	// be true either. The manifest loader rejects both shapes outright; the exported
+	// WithEffectCeiling seam takes a ceiling directly and never passes through it, and
+	// there the leg below could never fire — an operator would have authored a
+	// compensation requirement that silently bounded nothing. An unevaluable ceiling leg
+	// must not read as "checked and fine", so it exceeds, loudly, with a token that names
+	// the misconfiguration rather than a consequence.
+	if c.RequireCompensation && (c.MaxEffectClass == "" || c.MaxEffectClass == EffectIrreversible) {
 		return true, []string{"ceiling_misconfigured"}
 	}
 	overClass := c.MaxEffectClass != "" && !EffectClassAtMost(eff.Class, c.MaxEffectClass)

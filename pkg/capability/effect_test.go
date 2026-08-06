@@ -273,9 +273,19 @@ func TestEffectCeiling_Exceeds(t *testing.T) {
 		},
 		{
 			name:        "requireCompensation does not fire for an action under the class bound",
-			ceiling:     &EffectCeiling{MaxEffectClass: EffectIrreversible, RequireCompensation: true},
+			ceiling:     &EffectCeiling{MaxEffectClass: EffectCompensable, RequireCompensation: true},
 			effect:      &ResolvedEffect{Class: EffectReversible, Annotated: true},
 			wantExceeds: false,
+		},
+		{
+			name: "requireCompensation with maxEffectClass irreversible is structurally inert and reports itself misconfigured",
+			// irreversible is the top of the vocabulary, so overClass can never be true and
+			// the compensation leg could never fire — the exact shape M2 closes for the
+			// exported WithEffectCeiling seam, mirroring the empty-MaxEffectClass case above.
+			ceiling:     &EffectCeiling{MaxEffectClass: EffectIrreversible, RequireCompensation: true},
+			effect:      &ResolvedEffect{Class: EffectReversible, Annotated: true},
+			wantExceeds: true,
+			wantReason:  "ceiling_misconfigured",
 		},
 	}
 
@@ -798,6 +808,27 @@ func TestCeilingRequireCompensationWithoutAClassBoundIsRefused(t *testing.T) {
 		Class: EffectCompensable, BlastRadius: v,
 		CompensatingAction: "tool:undo", Annotated: true,
 	})
+	if !over {
+		t.Fatal("a ceiling whose compensation leg can never fire must not admit silently")
+	}
+	if len(reasons) != 1 || reasons[0] != "ceiling_misconfigured" {
+		t.Fatalf("reasons = %v, want exactly [ceiling_misconfigured] — the token must name the\n"+
+			"misconfiguration, not a consequence the ceiling never actually assessed", reasons)
+	}
+}
+
+// TestCeilingRequireCompensationWithMaxEffectClassIrreversibleIsRefused covers the M2
+// shape: requireCompensation with maxEffectClass explicitly set to "irreversible", the top
+// of the vocabulary — a VALID-LOOKING spelling structurally identical to the no-class-bound
+// case above, since overClass can never be true against the top rank either. IsSet reports
+// true (a real class bound is stated), so — unlike TestCeilingWithOnlyRequireCompensationIsNotSet
+// — this ceiling reads as in force while its compensation leg could never fire.
+func TestCeilingRequireCompensationWithMaxEffectClassIrreversibleIsRefused(t *testing.T) {
+	c := &EffectCeiling{MaxEffectClass: EffectIrreversible, RequireCompensation: true}
+	if !c.IsSet() {
+		t.Fatal("a ceiling with a real class bound is in force")
+	}
+	over, reasons := c.Exceeds(&ResolvedEffect{Class: EffectIrreversible, Annotated: true})
 	if !over {
 		t.Fatal("a ceiling whose compensation leg can never fire must not admit silently")
 	}

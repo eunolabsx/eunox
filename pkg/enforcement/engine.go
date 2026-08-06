@@ -783,7 +783,17 @@ func (e *Engine) prepareAndAdmit(ctx context.Context, h CommittingConditionHandl
 			Message:       "committing condition handler supplied a nil Deny callback",
 		}
 	}
-	return commit.Deny(total, retryAfter)
+	if condErr := commit.Deny(total, retryAfter); condErr != nil {
+		return condErr
+	}
+	// A refused admission whose Deny callback returned nil would otherwise report the
+	// over-quota call as satisfied — a policy bypass. Fail closed instead of trusting the
+	// callback's result the way its non-nil-ness alone was already trusted above.
+	return &ConditionError{
+		Code:          capability.ErrCodeConditionFailed,
+		ConditionType: cond.ConditionType(),
+		Message:       "committing condition handler's Deny callback returned nil for a refused admission",
+	}
 }
 
 // isTypedNil reports whether v is a non-nil interface value wrapping a nil pointer, which
@@ -947,7 +957,18 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.E
 				Message:       fmt.Sprintf("committing condition handler for bucket index %d supplied a nil Deny callback", deniedIndex),
 			}, matched, requestID, now)
 		}
-		return denyFromConditionError(denies[deniedIndex](total, retryAfter), matched, requestID, now)
+		condErr := denies[deniedIndex](total, retryAfter)
+		if condErr == nil {
+			// A refused admission whose Deny callback returned nil would otherwise report the
+			// over-quota call as satisfied — a policy bypass — or, worse, panic
+			// denyFromConditionError's unconditional dereference of condErr.Code. Fail closed.
+			condErr = &ConditionError{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: bucketTypes[deniedIndex],
+				Message:       fmt.Sprintf("committing condition handler for bucket index %d's Deny callback returned nil for a refused admission", deniedIndex),
+			}
+		}
+		return denyFromConditionError(condErr, matched, requestID, now)
 	}
 	return nil
 }

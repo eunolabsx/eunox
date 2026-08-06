@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -349,6 +350,44 @@ func TestBoundDenialDetails_PolicyListCannotStarveTheEvidence(t *testing.T) {
 	}
 	if len(kept) >= len(allowed) {
 		t.Errorf("allowedValues kept %d of %d entries, want it bounded", len(kept), len(allowed))
+	}
+}
+
+// TestBoundDenialDetails_BoundsTopLevelKeyCount is the regression for the breadth gap
+// the per-key SHARE left open: share floors at minDenialDetailKeyBudget once len(in)
+// passes maxDenialDetailsBytes/minDenialDetailKeyBudget keys, so "bounds the WHOLE map"
+// held only up to that count — a handler (a custom ConditionHandler or PolicyEvaluator
+// echoing attacker-derived arguments) recording thousands of top-level keys grew output
+// ~512 bytes per extra key with nothing capping breadth.
+func TestBoundDenialDetails_BoundsTopLevelKeyCount(t *testing.T) {
+	t.Parallel()
+
+	in := make(map[string]interface{}, 5000)
+	for i := 0; i < 5000; i++ {
+		in[fmt.Sprintf("key-%05d", i)] = "v"
+	}
+	out := BoundDenialDetails(in)
+
+	if n := marshaledLen(t, out); n > 2*maxDenialDetailsBytes {
+		t.Errorf("marshaled details = %d bytes for %d top-level keys, want bounded near the %d-byte budget", n, len(in), maxDenialDetailsBytes)
+	}
+	if len(out) > maxDenialDetailTopLevelKeys+1 { // +1 for the elision marker
+		t.Errorf("output has %d top-level keys, want at most %d plus the elision marker", len(out), maxDenialDetailTopLevelKeys)
+	}
+	marker, ok := out[DenialDetailElidedKey].(string)
+	if !ok {
+		t.Fatalf("out[%q] = %#v, want an elision marker naming the dropped key count", DenialDetailElidedKey, out[DenialDetailElidedKey])
+	}
+	if !strings.Contains(marker, fmt.Sprintf("of %d entries elided", len(in))) {
+		t.Errorf("elision marker = %q, want it to name the total entry count %d", marker, len(in))
+	}
+	// The surviving keys are the lexicographically FIRST ones, deterministically — not an
+	// arbitrary subset Go's randomized map iteration would otherwise pick.
+	if _, ok := out["key-00000"]; !ok {
+		t.Error("want the lexicographically first key to survive the breadth cap")
+	}
+	if _, ok := out["key-04999"]; ok {
+		t.Error("want the lexicographically last key elided by the breadth cap")
 	}
 }
 
