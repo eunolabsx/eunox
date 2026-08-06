@@ -258,9 +258,9 @@ var numericPolicyScalarKeys = map[string]bool{
 // block they must appear in, since a bare-name match would also reject an opaque
 // `policy`/`custom` condition payload the engine does not itself enforce.
 var scopedNumericPolicyScalarKeys = map[string]map[string]bool{
-	"blastRadius":   {"value": true},          // effect contract's / a byArgument case's magnitude
-	"conditions":    {"max": true},            // the blastRadius condition's bound
-	"effectCeiling": {"maxBlastRadius": true}, // the top-level ceiling's magnitude bound
+	"blastRadius":   {"value": true},                 // effect contract's / a byArgument case's magnitude
+	"conditions":    {"max": true, "maxTotal": true}, // the blastRadius condition's per-call and cumulative bounds
+	"effectCeiling": {"maxBlastRadius": true},        // the top-level ceiling's magnitude bound
 }
 
 // numericPolicyScalarKeyApplies reports whether key names an enforced number at this point in

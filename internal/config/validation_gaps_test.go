@@ -31,6 +31,16 @@ func TestLoadManifest_RejectsCoercedEffectNumerics(t *testing.T) {
 `),
 		},
 		{
+			name: "blastRadius condition maxTotal",
+			body: effectManifest("", `  - target: tool:refund
+    actions: [call]
+    conditions:
+      - type: blastRadius
+        maxTotal: 0600
+        windowSeconds: 3600
+`),
+		},
+		{
 			name: "effect contract blastRadius value",
 			body: effectManifest("", `  - target: tool:refund
     actions: [call]
@@ -89,6 +99,8 @@ func TestLoadManifest_AcceptsCanonicalEffectNumerics(t *testing.T) {
     conditions:
       - type: blastRadius
         max: 500
+        maxTotal: 2000
+        windowSeconds: 3600
 `))
 	if err != nil {
 		t.Fatalf("canonical numeric bounds must load: %v", err)

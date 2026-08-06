@@ -262,6 +262,31 @@ func TestVerifyWithKeyRotationMultiKID(t *testing.T) {
 		require.Nil(t, got)
 		require.Error(t, err)
 	})
+
+	// D3 regression: a verifier's (nil, nil) contract violation on kid "A" is a
+	// key-INDEPENDENT engine-bug signal, not a per-key failure — every later kid would
+	// reach the identical verdict. Before Terminal wrapped it, this error was a plain
+	// error, so it fell into lastErr here and the loop pressed on to kid "B": a later
+	// kid's SUCCESS would silently mask the contract violation entirely (never surfacing
+	// it), and a later kid's ordinary key-miss failure would silently overwrite it. Both
+	// require the loop to keep going past "A" — so asserting B's verifier never runs is
+	// what actually pins the fix, not just the final error content.
+	t.Run("a contract-violation terminal error on an earlier kid is not masked by a later kid", func(t *testing.T) {
+		cache := serveKeys(t, sigKey(keyA.Public(), "A"), sigKey(keyB.Public(), "B"))
+		var sawB bool
+		got, err := VerifyWithKeyRotationMultiKID[string](context.Background(), cache, []string{"A", "B"}, func(key *jose.JSONWebKey, _ bool) (*string, error) {
+			if key.KeyID == "B" {
+				sawB = true
+				s := "ok"
+				return &s, nil // would succeed if reached
+			}
+			return nil, nil // "A": contract violation
+		})
+		require.Nil(t, got)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "neither a result nor an error")
+		assert.False(t, sawB, "a terminal contract violation on an earlier kid must short-circuit the fan-out, not let a later kid's success mask it")
+	})
 }
 
 // TestFindKeys_KidlessReturnsCopy pins that the kid-less branch of FindKeys returns

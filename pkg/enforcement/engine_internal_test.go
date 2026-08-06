@@ -367,6 +367,104 @@ func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 	}
 }
 
+// nilDenyResultHandler is a custom CommittingConditionHandler whose PrepareCommit
+// supplies a non-nil Deny callback that itself returns nil — the sibling handler bug
+// to nilDenyHandler's nil callback: prepareAndAdmit's guard validated that Deny was a
+// non-nil function but trusted its RESULT, so a refused admission reported nil (no
+// error) and read as satisfied. Pointer receiver so the copy held in the registry and
+// the test's reference share the same engine pointer.
+type nilDenyResultHandler struct{ e *Engine }
+
+func (h *nilDenyResultHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+	return h.e.prepareAndAdmit(ctx, h, cond, req)
+}
+
+func (h *nilDenyResultHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
+	if skip {
+		return DeferredCommit{}, true, nil
+	}
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
+	}
+	return DeferredCommit{
+		Bucket: capability.QuotaBucket{
+			Key:       key,
+			WindowSec: mc.WindowSeconds,
+			Counted:   true,
+			Limit:     float64(mc.Count),
+		},
+		// Deny is a real, non-nil callback that itself returns nil — the bug under test.
+		Deny: func(float64, time.Duration) *ConditionError { return nil },
+	}, false, nil
+}
+
+// alwaysDenyCounter is a minimal CallCounter fake whose AdmitAll always refuses
+// admission for a single-bucket batch, driving prepareAndAdmit straight to its
+// Deny-result handling without depending on real quota bookkeeping.
+type alwaysDenyCounter struct{}
+
+func (alwaysDenyCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
+	return 1, nil
+}
+func (alwaysDenyCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
+	return 0, nil
+}
+func (alwaysDenyCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	return false, 0, 5, 0, nil
+}
+
+// TestPrepareAndAdmit_NilDenyResultFailsClosed pins that prepareAndAdmit — reached
+// through a CommittingConditionHandler's own Handle, the documented WithConditionHandler
+// seam — denies with a structured CONDITION_FAILED error, not a silent allow, when a
+// refused admission's Deny callback itself returns nil.
+func TestPrepareAndAdmit_NilDenyResultFailsClosed(t *testing.T) {
+	handler := &nilDenyResultHandler{}
+	e := New(WithCallCounter(alwaysDenyCounter{}), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	handler.e = e
+
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
+	cond := &capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}
+
+	condErr := handler.Handle(context.Background(), cond, req)
+	if condErr == nil {
+		t.Fatal("Handle returned nil (allow) for a refused admission whose Deny callback returned nil — want a fail-closed CONDITION_FAILED error")
+	}
+	if condErr.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("condErr = %+v, want code %q", condErr, capability.ErrCodeConditionFailed)
+	}
+}
+
+// TestCommitDeferredAtomic_NilDenyResultFailsClosed pins the atomic multi-deferred
+// commit path's twin of the test above: a committing handler's DeferredCommit.Deny is
+// a real, non-nil callback, but the CALL to it returns nil for a refused admission.
+// denyFromConditionError dereferences its argument unconditionally, so the untested
+// gap here was a nil-pointer panic on the enforcement goroutine, not just a bypass.
+func TestCommitDeferredAtomic_NilDenyResultFailsClosed(t *testing.T) {
+	handler := &nilDenyResultHandler{}
+	e := New(WithCallCounter(forceDenyAtIndexZeroCounter{}), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	handler.e = e
+
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path.
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 3, WindowSeconds: 3600},
+		},
+	}}
+
+	resp := e.ValidateAction(context.Background(), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a Deny callback returning nil must fail closed, not allow or panic)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+}
+
 // nilCounterCommitHandler is a custom CommittingConditionHandler whose
 // PrepareCommit returns a complete DeferredCommit WITHOUT consulting the engine's
 // call counter — unlike the built-in maxCallsBucket, which fails closed on a nil

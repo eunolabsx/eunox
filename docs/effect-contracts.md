@@ -248,8 +248,8 @@ That placement is the whole point. A per-target condition guards only the target
 remembered to write one for, so the tool nobody thought about is the one with no gate. The
 ceiling inverts that: a new or unannotated tool has no contract, therefore resolves to
 irreversible, therefore exceeds the ceiling, therefore escalates. Approval is triggered by
-*irreversibility + blast radius + the absence of a compensating action* — never by tool
-identity.
+class or blast radius alone — never by tool identity; `requireCompensation` does not add a
+third trigger of its own (see below).
 
 The ceiling can only ever **narrow**: it runs after a constraint has already allowed the
 call, so it never admits anything the allowlist or the conditions denied. It runs **before**
@@ -278,15 +278,26 @@ than the manifest's, which is the safe direction for a call that is refused eith
 
 `requireCompensation` applies only to an action already **above** `maxEffectClass`;
 demanding a compensating action for a reversible read would be noise. It therefore requires
-`maxEffectClass` to be set, and the loader rejects every shape where it is not. Two
+`maxEffectClass` to be set to a class **below `irreversible`**, the top of the vocabulary —
+`irreversible` bounds nothing an action could ever be classified above, so the compensation
+leg could never fire either, the identical inert shape wearing a valid-looking spelling. The
+loader rejects both: `maxEffectClass` unset, and `maxEffectClass: irreversible`. Two
 different things enforce that for the library seam that takes a ceiling directly, since
 that seam never passes through the loader: a ceiling carrying **only**
 `requireCompensation` does not count as set at all, so it cannot report itself active while
 being structurally incapable of refusing anything; and a ceiling carrying
-`requireCompensation` **alongside `maxBlastRadius` but no `maxEffectClass`** — which *is*
-set, and whose compensation leg still could never fire — exceeds outright, with the reason
-`ceiling_misconfigured`. A ceiling leg that cannot be evaluated must not read as "checked
-and fine".
+`requireCompensation` **alongside `maxBlastRadius` but no `maxEffectClass`** (or with
+`maxEffectClass: irreversible`) — which *is* set, and whose compensation leg still could
+never fire — exceeds outright, with the reason `ceiling_misconfigured`. A ceiling leg that
+cannot be evaluated must not read as "checked and fine".
+
+**`requireCompensation` enriches the escalation record; it does not independently gate
+anything.** An action already exceeds the ceiling the moment it is over `maxEffectClass` —
+that alone makes the call escalate, with `requireCompensation` set or not. What the flag adds
+is a second reason, `no_compensating_action`, alongside `effect_class` on that *same*
+escalation, so an approver reading the record sees at a glance that this occurrence names no
+declared way to reverse it. There is no configuration under which setting `requireCompensation`
+turns an otherwise-allowed call into an escalation — only into a *more informative* one.
 
 ## `escalate` is a refusal, not a pending state
 

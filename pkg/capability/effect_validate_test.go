@@ -231,6 +231,11 @@ func TestValidateEffectCeiling(t *testing.T) {
 			wantErr: "needs 'maxEffectClass'",
 		},
 		{
+			name:    "requireCompensation with maxEffectClass irreversible never fires",
+			ceiling: &EffectCeiling{MaxEffectClass: EffectIrreversible, RequireCompensation: true},
+			wantErr: "never fires",
+		},
+		{
 			name:    "a ceiling that bounds nothing",
 			ceiling: &EffectCeiling{OnExceed: OnExceedDeny},
 			wantErr: "bounds nothing",

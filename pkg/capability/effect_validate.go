@@ -74,8 +74,14 @@ func ValidateEffectCeiling(c *EffectCeiling) error {
 	// bounds-nothing test below so the author gets the specific diagnosis ("this key needs
 	// that one") rather than the generic one, which would send them to add a key they
 	// already wrote.
-	if c.RequireCompensation && c.MaxEffectClass == "" {
-		return fmt.Errorf("effectCeiling 'requireCompensation' needs 'maxEffectClass': it demands a compensating action only for an action ABOVE the class bound, so without one it never fires")
+	//
+	// A MaxEffectClass of "irreversible" is the SAME inert shape wearing a valid-looking
+	// spelling: irreversible is the top of the vocabulary, so no resolvable class is ever
+	// "over" it (Exceeds' overClass can never be true) — the class leg AND the compensation
+	// leg both never fire, byte-for-byte the failure mode the empty-MaxEffectClass message
+	// above describes, yet this spelling loaded clean and read as an active control.
+	if c.RequireCompensation && (c.MaxEffectClass == "" || c.MaxEffectClass == EffectIrreversible) {
+		return fmt.Errorf("effectCeiling 'requireCompensation' needs 'maxEffectClass' set to a class below %q: it demands a compensating action only for an action ABOVE the class bound, so with %s it never fires", EffectIrreversible, classOrUnset(c.MaxEffectClass))
 	}
 	if !c.IsSet() {
 		return fmt.Errorf("effectCeiling bounds nothing: set 'maxEffectClass' or 'maxBlastRadius' (a ceiling with only 'onExceed' never fires, which reads as \"checked and fine\")")

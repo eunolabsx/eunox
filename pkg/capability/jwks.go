@@ -199,7 +199,12 @@ func VerifyWithKeyRotation[T any](
 			default:
 				// (nil, nil): a verifier must yield a result or an error. Fail closed with an
 				// intelligible message rather than the "verify signature: <nil>" terminus below.
-				return nil, fmt.Errorf("per-key verifier returned neither a result nor an error (fail closed)"), nil
+				// Wrapped with Terminal, not a plain error: this is a key-INDEPENDENT engine-bug
+				// signal (the verifier itself is broken, not this candidate key), so it must
+				// survive VerifyWithKeyRotationMultiKID's errors.As check across kids rather than
+				// being overwritten by a later kid's ordinary key-miss error or swallowed
+				// entirely if a later kid happens to verify.
+				return nil, Terminal(fmt.Errorf("per-key verifier returned neither a result nor an error (fail closed)")), nil
 			}
 		}
 		return nil, nil, lastSig
