@@ -266,9 +266,15 @@ func LoadCorpus(dir string) ([]Contract, error) {
 			return nil, err
 		}
 		data, err := config.ReadBoundedFile(config.BoundedRead{
-			Path:      p,
-			What:      "contract",
-			Max:       maxContractFileBytes,
+			Path: p,
+			What: "contract",
+			Max:  maxContractFileBytes,
+			// RefuseNonRegularPath alone leaves a Lstat->open TOCTOU: a symlink swapped
+			// in after the check and before this open would substitute an arbitrary
+			// file's content into the corpus, or reintroduce the FIFO hang the check
+			// above exists to close. O_NOFOLLOW closes it the same way readTrustStoreFile
+			// does for the trust store.
+			Flags:     config.OpenNoFollow,
 			OverLimit: "refusing to buffer it rather than decoding a corpus entry that cannot be one",
 		})
 		if err != nil {
