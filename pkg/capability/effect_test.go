@@ -323,6 +323,21 @@ func TestEffectCeiling_ExceedsIsFailClosedOnAnUnreadableBound(t *testing.T) {
 	}
 }
 
+// TestEffectCeiling_ExceedsFailsClosedOnNilResolvedEffect pins D4: a set ceiling given a
+// nil *ResolvedEffect must not panic dereferencing eff.Class — an embedder calling
+// Exceeds directly (every in-tree caller passes ResolveEffect's non-nil result) must get
+// a fail-closed refusal, not fail-open-via-crash, for an effect that cannot be described.
+func TestEffectCeiling_ExceedsFailsClosedOnNilResolvedEffect(t *testing.T) {
+	ceiling := &EffectCeiling{MaxEffectClass: EffectCompensable}
+	exceeds, reasons := ceiling.Exceeds(nil)
+	if !exceeds {
+		t.Fatal("a nil resolved effect against a set ceiling must fail closed, not pass")
+	}
+	if len(reasons) != 1 || reasons[0] != "effect_unresolved" {
+		t.Fatalf("reasons = %v, want exactly [effect_unresolved]", reasons)
+	}
+}
+
 // TestEffectCeiling_OutcomeDefaultsToEscalate pins the default: an action over the
 // ceiling routes to human approval, not to an outright refusal, unless the operator asked
 // for one.

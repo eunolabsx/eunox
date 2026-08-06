@@ -301,8 +301,9 @@ func (c BlastRadiusCondition) MarshalJSON() ([]byte, error) { return marshalCond
 // This is the purest form of consequence-gated escalation. A per-target condition has to
 // be written for each target, so the tool nobody thought about is the one with no gate;
 // the ceiling inverts that — a new or unannotated tool has no contract, therefore exceeds
-// the ceiling, therefore escalates. Approval is triggered by irreversibility plus blast
-// radius plus the absence of a compensating action, never by tool identity.
+// the ceiling, therefore escalates. Approval is triggered by class or blast radius alone,
+// never by tool identity; RequireCompensation enriches the record rather than adding a
+// third trigger (see its own doc).
 //
 // The ceiling can only ever narrow: it is applied after a constraint has already allowed
 // the call, so it never admits anything the manifest denied.
@@ -313,10 +314,16 @@ type EffectCeiling struct {
 	// MaxBlastRadius is the largest magnitude that passes. Nil leaves the magnitude
 	// dimension unbounded. An unquantified action exceeds any set bound.
 	MaxBlastRadius *json.Number `json:"maxBlastRadius,omitempty"`
-	// RequireCompensation, when set, additionally demands a compensating action for any
-	// action above MaxEffectClass — the third input of the consequence gate. It is what
-	// distinguishes "irreversible but undoable in business terms" from "irreversible full
-	// stop".
+	// RequireCompensation, when set, adds a "no_compensating_action" reason to the
+	// escalation record of any action already over MaxEffectClass, naming that this
+	// occurrence has no declared way to be undone — "irreversible but undoable in business
+	// terms" from "irreversible full stop". It enriches the record rather than gating
+	// anything independently: an action over MaxEffectClass already exceeds the ceiling on
+	// that bound alone (see Exceeds), with or without this flag. MaxEffectClass must
+	// therefore be set to a class below EffectIrreversible — see ValidateEffectCeiling —
+	// since with it unset, or at the top of the vocabulary, no action can ever be
+	// classified "above" it, so the reason this flag adds could never be reached, which
+	// would read as an active control that silently checks nothing.
 	RequireCompensation bool `json:"requireCompensation,omitempty"`
 	// OnExceed selects the outcome for an action over the ceiling: OnExceedEscalate (the
 	// default) marks it as needing human approval, OnExceedDeny refuses it outright.
@@ -364,6 +371,13 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 	if !c.IsSet() {
 		return false, nil
 	}
+	if eff == nil {
+		// Every in-tree caller passes ResolveEffect's non-nil result, but this package makes
+		// every other exported accessor nil-safe on principle — an embedder calling this
+		// directly must not get fail-open-via-crash on the one accessor that isn't. An effect
+		// that cannot even be described must not be treated as small or reversible.
+		return true, []string{"effect_unresolved"}
+	}
 	// requireCompensation with no class bound to hang it on — OR a class bound of
 	// "irreversible", the top of the vocabulary, against which overClass below can never
 	// be true either. The manifest loader rejects both shapes outright; the exported
@@ -389,9 +403,11 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 			reasons = append(reasons, "blast_radius")
 		}
 	}
-	// The compensation leg is the third input of the consequence gate and applies only to
-	// an action already over the class bound: demanding a compensating action for a
-	// reversible read would be noise, and the gate is about consequence, not paperwork.
+	// This leg is diagnostic, not gating: it only ever runs when overClass already made
+	// reasons non-empty (exceeds is already true from "effect_class" above), so it never by
+	// itself flips exceeds from false to true — it appends a reason an approver can act on,
+	// naming that this over-class action has no way to be undone. Gated on overClass so a
+	// reversible read below the bound is not flagged for lacking paperwork it does not need.
 	if c.RequireCompensation && overClass && eff.CompensatingAction == "" {
 		reasons = append(reasons, "no_compensating_action")
 	}
