@@ -491,3 +491,81 @@ func TestPreSessionKillRecords_AreRateLimited(t *testing.T) {
 		t.Errorf("recorded %d + suppressed %d = %d, want %d — a suppressed refusal must be counted, not lost", denies, rollup, got, attempts)
 	}
 }
+
+// TestPreSessionAudienceDenials_AreRateLimited is D1's regression: a caller who holds one
+// valid token for a SIBLING route's audience (accepted by the gateway's shared union JWT
+// validator) reaches initAudienceDenial on every session-creating initialize this route
+// refuses — no session or upstream ever exists. Before catAudience, that record was written
+// through unbounded, the same audit-queue-flooding primitive the pre-session kill records
+// are bounded against.
+func TestPreSessionAudienceDenials_AreRateLimited(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	sink, err := audit.Open(dir+"/audit.jsonl", dir+"/audit.key", 0, 0)
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+
+	denied := &capability.EnforceResponse{
+		Denial: &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed},
+	}
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  denyAudiencePDP{deny: denied},
+		sink: &routeSink{sink: sink},
+	}
+	proxy := newTestHTTPProxy()
+	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	now := base
+	proxy.preSessionDenies.setNow(func() time.Time { return now })
+
+	post := func(i int) {
+		body, _ := json.Marshal(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: mcp.MethodInitialize})
+		req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		proxy.handleMCPPost(w, req, route)
+
+		var resp mcp.RPCMsg
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("response %d is not JSON-RPC: %v (body=%s)", i, err, w.Body.String())
+		}
+		if resp.Error == nil {
+			t.Fatalf("initialize %d must be denied by the audience pin, got %s", i, w.Body.String())
+		}
+	}
+
+	const attempts = 200
+	for i := 0; i < attempts-1; i++ {
+		post(i)
+	}
+	now = base.Add(time.Second)
+	post(attempts - 1)
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("audit.Close: %v", err)
+	}
+	records := readAuditRecords(t, dir+"/audit.jsonl")
+	denies := 0
+	rollup := uint64(0)
+	for _, rec := range records {
+		if d, _ := rec["decision"].(string); d != "deny" {
+			continue
+		}
+		denies++
+		if details, _ := rec["details"].(map[string]interface{}); details != nil {
+			if n, ok := details[detailSuppressedRefusalCount].(float64); ok {
+				rollup += uint64(n)
+			}
+		}
+	}
+	if denies == 0 {
+		t.Fatal("the first refusals in a burst must be recorded in full — the bound caps the rate, it does not silence the evidence")
+	}
+	if denies >= attempts {
+		t.Fatalf("%d of %d pre-session audience records were written; a caller with a valid-elsewhere token must not set the audit write rate", denies, attempts)
+	}
+	if got := uint64(denies) + rollup; got != attempts {
+		t.Errorf("recorded %d + suppressed %d = %d, want %d — a suppressed refusal must be counted, not lost", denies, rollup, got, attempts)
+	}
+}

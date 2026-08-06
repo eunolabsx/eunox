@@ -8008,6 +8008,51 @@ func TestUnwiredDirective_DoesNotPreemptTheConditionVerdict(t *testing.T) {
 	assert.Empty(t, bug.Obligations, "a hard deny carries no obligations")
 }
 
+// TestUnwiredDirective_DoesNotDropASiblingsObligations is the fix pinned for #219's
+// "CollectObligations drops already-collected redactions when a later directive has an
+// unknown obligation type" finding. evaluateMatched calls CollectObligations UP FRONT and
+// stamps whatever it collected onto a LATER, unrelated condition-driven deny via a
+// deferred closure — the ordering TestUnwiredDirective_DoesNotPreemptTheConditionVerdict
+// pins. Before the fix, CollectObligations discarded every already-collected obligation
+// the moment it hit the sibling unwired directive, so the condition-driven deny (which
+// never even reaches the unwired directive's own hard-block path) was forwarded on an
+// audit-mode route with its redactFields silently dropped — the field the manifest marked
+// for redaction reached the host intact.
+func TestUnwiredDirective_DoesNotDropASiblingsObligations(t *testing.T) {
+	t.Parallel()
+	constraint := capability.Constraint{
+		Target:      "tool:read_file",
+		Actions:     []string{"call"},
+		Enforcement: "audit",
+		Conditions: []capability.Condition{
+			&capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/reports/*"}},
+		},
+		// redactFields collects successfully BEFORE the loop reaches the unwired
+		// directive; the condition below denies before CollectObligations's own error
+		// return is ever consulted, so this deny's obligations come only from the
+		// up-front partial collection.
+		Directives: []capability.Directive{
+			&capability.RedactFieldsDirective{Fields: []string{"$.user.ssn"}},
+			unwiredDirective{},
+		},
+	}
+	req := &capability.EnforceRequest{
+		SessionID:  "sess-1",
+		TargetName: "read_file",
+		Arguments:  map[string]interface{}{"path": "/internal/secrets.txt"},
+	}
+
+	resp := enforcement.New().ValidateAction(context.Background(), req, []capability.Constraint{constraint})
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, capability.ErrCodeValueNotPermitted, resp.Denial.Code, "the condition verdict must still win")
+	assert.False(t, resp.Denial.HardDeny, "an audit-mode route must not be made to block")
+	require.Len(t, resp.Obligations, 1,
+		"a sibling directive's unwired obligation type must not drop this forwarded deny's redactFields")
+	assert.Equal(t, capability.DirectiveTypeRedactFields, resp.Obligations[0].Type)
+	assert.Equal(t, []string{"$.user.ssn"}, resp.Obligations[0].Paths)
+}
+
 // TestNoMatchDeny_CarriesObligationsWhenForwarded covers the last downgradable deny the
 // engine produces: no constraint was selected for this caller, yet a route running
 // --audit forwards the call anyway. The obligations come from every capability NAMING the

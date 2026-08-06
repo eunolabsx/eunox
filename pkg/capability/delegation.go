@@ -640,6 +640,13 @@ func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*Delega
 	if len(actors) > MaxDelegationDepth {
 		return nil, fmt.Errorf("%s claim declares %d actors, more than the maximum of %d", ClaimActor, len(actors), MaxDelegationDepth)
 	}
+	// Re-asserted independently of the actors cap above: the hop-agreement check just below
+	// only compares the two lengths when actors is non-empty, so an actors-less token
+	// (grants alone, no mcp.act claim) would otherwise let the narrowing loop iterate an
+	// attacker-controlled, unbounded grants slice before either cap fires.
+	if len(grants) > MaxDelegationDepth {
+		return nil, fmt.Errorf("mcp.%s claim declares %d grant(s), more than the maximum of %d", ClaimDelegation, len(grants), MaxDelegationDepth)
+	}
 	if len(actors) > 0 && grants != nil {
 		if len(actors) != len(grants) {
 			return nil, fmt.Errorf("token declares %d actor(s) in %s but %d delegation grant(s) in mcp.%s; the two describe the same chain and must agree hop for hop", len(actors), ClaimActor, len(grants), ClaimDelegation)

@@ -936,6 +936,14 @@ There is no glob syntax for the query component itself, so a broad REST grant is
 written as the path-only wildcard. (This query rule applies only to http(s)
 resource URIs; for other schemes a `?` is parsed as a condition suffix.)
 
+The pin is an **exact, order-sensitive byte comparison** of the raw query
+string, not a normalized one: `resource:https://api/data?a=1&b=2` does **not**
+match a request for `https://api/data?b=2&a=1`, even though the two query
+strings are semantically identical. Neither side re-orders parameters or
+re-encodes percent-escapes before comparing. Write the claim's query
+component to match the exact string the client actually sends, or use the
+path-only wildcard if the parameter order is not guaranteed.
+
 Server-initiated `sampling/createMessage` is outside this rule: the upstream,
 not the token-bearing client, initiates it, so no token is attributable to the
 request and the manifest's `system:` opt-in alone governs (see § 2b and

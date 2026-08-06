@@ -1248,7 +1248,7 @@ func readLastAuditLine(path string) (string, error) {
 	if err != nil && err != io.EOF {
 		return "", err
 	}
-	return interpretAuditTail(buf, n, err, size)
+	return interpretAuditTail(buf, n, err, size, start)
 }
 
 // scanSeqContribution reads path once and separates the two distinct ways a file can inform

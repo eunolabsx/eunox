@@ -89,18 +89,23 @@ func isJSONMediaType(v string) bool {
 }
 
 // asciiEqualFold is strings.EqualFold restricted to ASCII case folding — no Unicode
-// special cases (see isJSONMediaType for why that distinction is load-bearing). want
-// must already be lower-case ASCII.
+// special cases (see isJSONMediaType for why that distinction is load-bearing). Both sides
+// are folded, so neither needs to already be lower-case: isJSONMediaType's want (CTJSON)
+// happens to be, but originAllowed compares two operator/caller-supplied strings where
+// neither side can be assumed pre-normalized.
 func asciiEqualFold(got, want string) bool {
 	if len(got) != len(want) {
 		return false
 	}
 	for i := 0; i < len(got); i++ {
-		c := got[i]
+		c, w := got[i], want[i]
 		if 'A' <= c && c <= 'Z' {
 			c += 'a' - 'A'
 		}
-		if c != want[i] {
+		if 'A' <= w && w <= 'Z' {
+			w += 'a' - 'A'
+		}
+		if c != w {
 			return false
 		}
 	}
@@ -430,6 +435,28 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
 }
 
+// preSessionAudienceRecorder returns the recorder the session-creating initialize's
+// per-route audience pin (initAudienceDenial) must write its record through, or nil when
+// the bucket suppressed this one (the request is still denied either way — only the
+// RECORD is elided). Mirrors preSessionKillRecorder: this fires for a caller who has
+// passed JWT validation (so is not a raw unauthenticated caller) but failed THIS route's
+// audience — reachable with one valid token for any sibling route, before any session or
+// upstream exists, so it is bounded the same way the pre-session kill records are.
+func (p *HTTPProxy) preSessionAudienceRecorder(route *UpstreamRoute) auditRecorder {
+	rec := asRecorder(route.sink)
+	if rec == nil {
+		return nil
+	}
+	admitted, suppressed := p.preSessionDenies.admit(catAudience)
+	if !admitted {
+		return nil
+	}
+	if suppressed == 0 {
+		return rec
+	}
+	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+}
+
 // rolledUpRecorder folds a suppressed-refusal rollup into the details of the one record it
 // passes through, so a bounded record still reports how much was elided. It wraps rather
 // than widening recordKillDenial/recordKillDrop with a details parameter: those two are the
@@ -533,9 +560,16 @@ func (p *HTTPProxy) addRefusalContext(details map[string]interface{}, r *http.Re
 // Deliberate port asymmetry: allowedOrigins entries match exactly (scheme + port), while
 // the host-set path accepts ANY port on a loopback or bind host — DNS rebinding is
 // host-based, not port-based, so any local port on a loopback host is equally local.
+//
+// asciiEqualFold, not strings.EqualFold: this file's own isJSONMediaType documents why
+// Unicode case folding (U+017F LATIN SMALL LETTER LONG S -> 's', among others) is the
+// wrong tool for an ASCII protocol value — the browser-sent Origin header and the
+// operator-configured allowlist entry are both meant to be compared as ASCII, and Unicode
+// folding could equate two byte-distinct strings a byte-exact downstream comparison (or a
+// second reviewer reading the config) would not.
 func (p *HTTPProxy) originAllowed(origin string) bool {
 	for _, a := range p.allowedOrigins {
-		if strings.EqualFold(origin, a) {
+		if asciiEqualFold(origin, a) {
 			return true
 		}
 	}

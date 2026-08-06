@@ -34,7 +34,7 @@ func TestInterpretAuditTail_WhitespaceOnlyFinalLine(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := []byte(tc.tail)
-			got, err := interpretAuditTail(buf, len(buf), nil, int64(len(buf)))
+			got, err := interpretAuditTail(buf, len(buf), nil, int64(len(buf)), 0)
 			if err != nil {
 				t.Fatalf("interpretAuditTail error: %v", err)
 			}

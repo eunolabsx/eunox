@@ -221,13 +221,19 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 // initialize, before any upstream is spawned/contacted: a token valid only for another
 // route's audience (accepted by the gateway's shared union validator) must not create a
 // session here. Mirrors initStrictAuditDenial; non-JWT routes never block.
+//
+// The record is rate-limited via preSessionAudienceRecorder (catAudience): a caller
+// holding one valid token for any sibling route's audience reaches this on every route
+// its own audience fails, with no session ever created — an unbounded write here would be
+// the same audit-queue-flooding primitive the pre-session kill records are bounded
+// against, degrading the sink and, under --require-audit=strict, denying every route.
 func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	deny := route.pdp.CheckAudience(ctx)
 	if deny == nil {
 		return mcp.RPCMsg{}, false
 	}
 	d := normalizeDenial(deny.Denial)
-	if rec := asRecorder(route.sink); rec != nil {
+	if rec := p.preSessionAudienceRecorder(route); rec != nil {
 		rec.RecordDeny(ctx, "", mcp.MethodInitialize, mcp.MethodInitialize, d.Code, d.ConditionType, d.Details, false)
 	}
 	return denialResult(msg.ID, d.Code, d.ConditionType, mcp.MethodInitialize, ""), true

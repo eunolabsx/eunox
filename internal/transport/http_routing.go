@@ -619,6 +619,14 @@ func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate
 // recordSessionGateDeny writes the fail-closed deny record for a failed session gate,
 // tagged transportTag. Shared by enforceSessionGates and handleMCPDelete so the record
 // shape lives once alongside the shared verdict.
+//
+// Deliberately NOT rate-limited like initAudienceDenial's pre-session twin: every call
+// site is reached only after p.getSession(sessionID) resolves a REAL, already-established
+// session (handleSessionPost returns 404 first otherwise), and session ids are unguessable
+// per-session UUIDs handed out only to that session's own creator. Driving this record
+// therefore needs a live victim session id, not merely a valid bearer token for some other
+// route's audience — a materially higher bar than the zero-session-required flood
+// catAudience closes, so it is not the same cheap-flood primitive.
 func (route *UpstreamRoute) recordSessionGateDeny(ctx context.Context, sessionID, method, transportTag string, gate sessionGate) {
 	details := map[string]interface{}{"transport": transportTag}
 	if gate.reason != "" {

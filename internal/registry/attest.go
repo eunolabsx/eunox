@@ -14,14 +14,17 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 )
 
-// A content digest proves an entry is what it says; a signature adds who is saying it
-// and whether anyone looked. Four rules keep that honest: verification is LOCAL only (no
-// key fetch, no network — same rule that keeps the registry off the decision path);
-// attestations are authoring-time input, never consulted on the decision path (a manifest
-// still pins by content digest); a signature claims AUTHORSHIP, not truth (a dispute is
-// advisory, like the drift layer's manifest/upstream mismatch signal, never a detection
-// result); and an untrusted signature is inert, but a signature by a TRUSTED key that
-// fails to verify is an error — the entry was edited after it was signed.
+// A content digest proves an entry's EFFECT CONTENT is what it says; a signature adds who
+// is saying so and whether anyone looked. Five rules keep that honest: verification is
+// LOCAL only (no key fetch, no network — same rule that keeps the registry off the
+// decision path); attestations are authoring-time input, never consulted on the decision
+// path (a manifest still pins by content digest); a signature claims AUTHORSHIP, not truth
+// (a dispute is advisory, like the drift layer's manifest/upstream mismatch signal, never
+// a detection result); an untrusted signature is inert, but a signature by a TRUSTED key
+// that fails to verify is an error — the entry's EFFECT CONTENT was edited after it was
+// signed (see AttestationPayload's SCOPE note: Summary/Notes/Server/Attestation are prose
+// and provenance, never covered by the signature, and can be edited on a signed entry
+// without invalidating it); and a signature is over CONTENT, never PROSE.
 //
 // This is deliberately a separate trust-key file from the per-upstream JWKS in
 // pkg/capability/receipt.go: one is a detached signature reviewed by a human at authoring
@@ -85,6 +88,14 @@ func (s *Signature) decoded() ([]byte, error) {
 // contract id, content digest, role, and statement, newline-separated. Exported so a
 // publisher can produce the same bytes to sign (`eunox contracts --attest-payload`
 // prints them).
+//
+// SCOPE: this is EVERYTHING a signature attests to. Summary, Notes, Server (name,
+// homepage, versionRange), and the Attestation provenance block are all OUTSIDE this
+// payload — a distributed entry can have those fields rewritten and still pass
+// VerifyAttestations against an unmodified signature. "Verified" therefore means "this
+// entry's effect content is what the signer saw," not "this entry, as a whole, is
+// unmodified." A reviewer who needs the prose/provenance itself authenticated must not
+// rely on the signature for that.
 //
 // A newline separator (not a length prefix) is safe here because reading from the END is
 // unambiguous — statement/role are closed vocabularies and digest is 64 hex chars, so
@@ -186,12 +197,12 @@ const maxTrustStoreBytes = 4 << 20
 // RefuseNonRegularPath alone cannot: a symlink swap there would substitute the operator's
 // whole trust root.
 func readTrustStoreFile(path string) ([]byte, error) {
-	return readBoundedFile(boundedRead{
-		path:      path,
-		what:      "attestation trust store",
-		max:       maxTrustStoreBytes,
-		flags:     config.OpenNoFollow,
-		overLimit: "refusing to load it rather than trusting a truncated key set",
+	return config.ReadBoundedFile(config.BoundedRead{
+		Path:      path,
+		What:      "attestation trust store",
+		Max:       maxTrustStoreBytes,
+		Flags:     config.OpenNoFollow,
+		OverLimit: "refusing to load it rather than trusting a truncated key set",
 	})
 }
 
@@ -288,7 +299,9 @@ func (s AttestationStatus) Summary() string {
 
 // VerifyAttestations checks every signature on c against the trust store. An untrusted
 // (or wrongly-roled) key counts as unverified; a TRUSTED key whose signature fails to
-// verify is an error — the only way to get one is editing the entry after it was signed.
+// verify is an error — the only way to get one is editing the entry's EFFECT CONTENT
+// after it was signed (see AttestationPayload's SCOPE note: Summary/Notes/Server/
+// Attestation are outside the signed payload and can change without tripping this).
 func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, error) {
 	var status AttestationStatus
 	if len(c.Signatures) == 0 {
@@ -320,7 +333,7 @@ func (c *Contract) VerifyAttestations(store *TrustStore) (AttestationStatus, err
 		// misreport a trusted key's tampered signature as merely "wrong role" instead
 		// of the tampering it is.
 		if !ed25519.Verify(key.pub, AttestationPayload(c.ID, digest, sig.Role, sig.Statement), raw) {
-			return AttestationStatus{}, fmt.Errorf("contract %q: signature by trusted key %q (%s) does not verify against this entry's content; the entry was edited after it was signed, or the signature was copied from another entry", c.ID, sig.KeyID, key.Owner)
+			return AttestationStatus{}, fmt.Errorf("contract %q: signature by trusted key %q (%s) does not verify against this entry's effect content; the effect content was edited after it was signed, or the signature was copied from another entry (summary/notes/server fields are not covered by this signature and would not trigger this error)", c.ID, sig.KeyID, key.Owner)
 		}
 		if !key.permits(sig.Role) {
 			// A genuine signature, in a role this operator doesn't accept from this

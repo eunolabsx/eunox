@@ -4492,3 +4492,22 @@ capabilities:
 		t.Errorf("error = %q, want it to mention a null condition", err)
 	}
 }
+
+// TestLoadManifest_BoundsFileRead pins #219's Low-priority fix: a fat-fingered --config/
+// manifest path pointed at a large data file or disk image must produce an error, not an
+// attempt to buffer it whole into memory.
+func TestLoadManifest_BoundsFileRead(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "huge-*.yaml")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	if err := f.Truncate(maxManifestFileBytes + 1); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	_ = f.Close()
+
+	_, err = LoadManifest(f.Name())
+	if err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("an oversized manifest must be refused rather than buffered, got %v", err)
+	}
+}

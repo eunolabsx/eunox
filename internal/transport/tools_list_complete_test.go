@@ -44,6 +44,12 @@ func TestCompleteToolsListing(t *testing.T) {
 		{"unparseable params fail closed", `[1,2]`, `{"tools":[]}`, false},
 		{"unparseable result fails closed", "", `{"tools":`, false},
 		{"non-object result fails closed", "", `[]`, false},
+		// A plain json.Unmarshal keeps the LAST of a duplicate key, so
+		// {"nextCursor":"p2","nextCursor":""} would decode to "" and mark a truncated
+		// page COMPLETE — this function's own doc says every ambiguous input reports
+		// false, and mcp.DecodeParams rejects the duplicate before it can decode either
+		// way.
+		{"duplicate nextCursor key fails closed", "", `{"tools":[],"nextCursor":"p2","nextCursor":""}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var params json.RawMessage

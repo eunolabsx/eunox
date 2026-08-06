@@ -4917,6 +4917,73 @@ func TestServe_AfterListenNotRunWhenBindFails(t *testing.T) {
 	}
 }
 
+// unregisterTrackingKS wraps a real killswitch.Manager and records whether the unregister
+// func ObserveRevocations returns was ever called, so a test can pin that a proxy which
+// never reaches Serve's own mid-function teardown still hands its registration back.
+type unregisterTrackingKS struct {
+	killswitch.Manager
+	unregistered atomic.Bool
+}
+
+func (k *unregisterTrackingKS) ObserveRevocations(fn func(killswitch.Revocation)) func() {
+	unreg := k.Manager.ObserveRevocations(fn)
+	return func() {
+		k.unregistered.Store(true)
+		unreg()
+	}
+}
+
+// TestServe_UnobservesRevocationsWhenBindFails is the #219 Low-priority fix: the kill
+// switch OUTLIVES this proxy and may be handed to a second one, so a proxy that loses the
+// bind race — and so never reaches the teardown defer inside Serve's own body — must still
+// hand its ObserveRevocations registration back rather than leaving the kill switch calling
+// into a proxy that will never serve anything.
+func TestServe_UnobservesRevocationsWhenBindFails(t *testing.T) {
+	t.Parallel()
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy port: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+	port := occupied.Addr().(*net.TCPAddr).Port
+
+	ks := &unregisterTrackingKS{Manager: killswitch.NewInMemory()}
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: map[string]*UpstreamRoute{},
+		Bind:   "127.0.0.1",
+		Port:   port,
+		KS:     ks,
+	})
+	if err := proxy.Serve(t.Context()); err == nil {
+		t.Fatal("Serve must fail when the address is already in use")
+	}
+	if !ks.unregistered.Load() {
+		t.Error("a Serve that fails before net.Listen succeeds must still unregister its ObserveRevocations callback")
+	}
+}
+
+// TestServe_UnobservesRevocationsWhenAfterListenFails is the post-bind counterpart: a
+// startup hook failing after the listener is held must ALSO hand the registration back —
+// this Serve call still never reaches the mid-function teardown defer.
+func TestServe_UnobservesRevocationsWhenAfterListenFails(t *testing.T) {
+	t.Parallel()
+	hookErr := errors.New("cannot persist control token")
+	ks := &unregisterTrackingKS{Manager: killswitch.NewInMemory()}
+	proxy := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes:      map[string]*UpstreamRoute{},
+		Bind:        "127.0.0.1",
+		Port:        freeTCPPort(t),
+		KS:          ks,
+		AfterListen: func(context.Context) error { return hookErr },
+	})
+	if err := proxy.Serve(t.Context()); !errors.Is(err, hookErr) {
+		t.Fatalf("Serve error = %v, want %v", err, hookErr)
+	}
+	if !ks.unregistered.Load() {
+		t.Error("a Serve that fails in AfterListen must still unregister its ObserveRevocations callback")
+	}
+}
+
 // TestServe_AfterListenErrorAbortsServe: a post-bind hook that cannot complete must fail
 // the proxy rather than leave it serving. The control token is what authenticates
 // /control/kill, so a proxy that came up without persisting it would answer requests while
