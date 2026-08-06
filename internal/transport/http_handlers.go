@@ -155,7 +155,7 @@ func upstreamErrInfo(w io.Writer, err error, upstreamTimeMs int) (code, reason s
 		if errors.As(err, &ne) && ne.Timeout() {
 			return codeUpstreamTimeout, upstreamTimeoutReason(upstreamTimeMs), jsonRPCCodeInternalError
 		}
-		fmt.Fprintf(resolvedErrOut(w), "[eunox] upstream error: %v\n", err)
+		_, _ = fmt.Fprintf(resolvedErrOut(w), "[eunox] upstream error: %v\n", err)
 		return codeUpstreamError, "upstream error", jsonRPCCodeInternalError
 	}
 }

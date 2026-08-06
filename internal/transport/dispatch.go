@@ -159,7 +159,7 @@ func denyUnmappedHostNotification(ctx context.Context, w io.Writer, rec auditRec
 	if rec != nil {
 		rec.RecordDeny(ctx, sessionID, msg.Method, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}
-	fmt.Fprintf(resolvedErrOut(w),
+	_, _ = fmt.Fprintf(resolvedErrOut(w),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
 		audit.SanitizeAuditField(msg.Method))
 	return true
@@ -414,7 +414,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: the server's own signed
 		// account contradicts the contract policy was written against.
-		fmt.Fprintf(d.errOutOrStderr(),
+		_, _ = fmt.Fprintf(d.errOutOrStderr(),
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
 	}
@@ -646,7 +646,7 @@ func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 	if d.rec != nil {
 		d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}
-	fmt.Fprintf(d.errOutOrStderr(),
+	_, _ = fmt.Fprintf(d.errOutOrStderr(),
 		"[eunox] SECURITY: unmapped MCP method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
 		sanitizedMethod,
 	)

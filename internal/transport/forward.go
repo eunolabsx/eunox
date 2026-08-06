@@ -304,7 +304,7 @@ func auditGateTripped(rec auditRecorder, strict bool) (tripped bool, reason stri
 // per process, on the first trip; later denials remain visible as AUDIT_UNAVAILABLE records.
 func warnStrictAuditOnce(w io.Writer, warned *atomic.Bool, reason string) {
 	if warned != nil && warned.CompareAndSwap(false, true) {
-		fmt.Fprintf(w,
+		_, _ = fmt.Fprintf(w,
 			"[eunox] SECURITY: --require-audit=strict is now denying forwards (AUDIT_UNAVAILABLE) until restart — %s. "+
 				"Each denied call is recorded as an AUDIT_UNAVAILABLE audit record.\n",
 			reason,
@@ -334,7 +334,7 @@ func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, 
 		return
 	}
 	if postDegraded, reason, _ := rec.AuditDegraded(); postDegraded {
-		fmt.Fprintf(w,
+		_, _ = fmt.Fprintf(w,
 			"[eunox] SECURITY: --require-audit=strict: the audit record for the %s %q request just forwarded to the upstream may itself have been lost (%s) — that call could be unaudited; every subsequent forward is now denied.\n",
 			kind, target, reason,
 		)
@@ -501,7 +501,7 @@ func commitDeclassify(ctx context.Context, w io.Writer, committer declassifyComm
 		// folding this into the fault arm below would tell an operator to reissue an
 		// approval for work that already landed — the unsafe direction for an alert to be
 		// wrong in. Nothing is cleared HERE, so the record carries only the spent grant.
-		fmt.Fprintf(w,
+		_, _ = fmt.Fprintf(w,
 			"[eunox] WARN declassify %s %q: the authorized clear was committed twice; the first commit applied it and this one changed nothing (proxy wiring fault, not a flow-store failure — the session is NOT over-tainted)\n",
 			kind, target)
 		return nil, spentGrantDetail(dec)
@@ -512,7 +512,7 @@ func commitDeclassify(ctx context.Context, w io.Writer, committer declassifyComm
 		// refusal's, since the operator action differs: reissue the approval to reach the
 		// state the policy describes.
 		detail[audit.DeclassifyCommitFailedKey] = authorized
-		fmt.Fprintf(w,
+		_, _ = fmt.Fprintf(w,
 			"[eunox] WARN declassify %s %q ran under an approved declassification, but the flow label(s) %v could not be cleared: %v — the session stays tainted, so a later sink will over-block until the action is retried under a new approval\n",
 			kind, target, authorized, err)
 		// cleared may still be non-empty beside the error (a Remove can delete and lose its
@@ -703,7 +703,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, observeDetail, true)
 			}
 		})
-		fmt.Fprintf(fp.errOutOrStderr(),
+		_, _ = fmt.Fprintf(fp.errOutOrStderr(),
 			"[eunox] AUDIT: %s %q would be denied (%s) — forwarding (audit mode)\n",
 			kind, denialTarget, denial.Code,
 		)
@@ -730,7 +730,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	if len(dec.Obligations) > 0 && upResp.Result != nil {
 		redacted, redactErr := pdp.ApplyRedactObligs(upResp.Result, dec.Obligations)
 		if redactErr != nil {
-			fmt.Fprintf(fp.errOutOrStderr(), "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
+			_, _ = fmt.Fprintf(fp.errOutOrStderr(), "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
 			// Record a deny so the call stays visible on the tape — otherwise an adversarial
 			// upstream could return a redaction-failing response to make every redactFields-
 			// guarded call vanish from the audit trail.
@@ -752,7 +752,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// upstream returning BOTH a result and an error (which JSON-RPC forbids) must not forward
 	// a redactable value through error.data, a free-form channel the redact paths can't verify.
 	if upResp.Error != nil && upResp.Error.Data != nil && hasRedactFieldsObligation(dec.Obligations) {
-		fmt.Fprintf(fp.errOutOrStderr(), "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
+		_, _ = fmt.Fprintf(fp.errOutOrStderr(), "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
 		upResp.Error.Data = nil
 	}
 
@@ -1174,7 +1174,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 			mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), true)
 	}
-	fmt.Fprintf(fp.errOutOrStderr(),
+	_, _ = fmt.Fprintf(fp.errOutOrStderr(),
 		"[eunox] AUDIT: sampling/createMessage would be denied (%s) — forwarding (audit mode)\n",
 		denial.Code,
 	)

@@ -358,7 +358,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 
 // printProxyUsage writes the `proxy` subcommand help text.
 func printProxyUsage(fs *flag.FlagSet, w io.Writer) {
-	fmt.Fprint(w, `Usage:
+	_, _ = fmt.Fprint(w, `Usage:
   eunox proxy --config <eunox.yaml>
   eunox proxy --audit -- <command> [args...]
   eunox proxy --audit --upstream-url <url> [--upstream-auth-header "Name: Value"]
@@ -384,6 +384,41 @@ Flags:
 `)
 	fs.SetOutput(w)
 	fs.PrintDefaults()
+}
+
+// resolveProxyConfig determines cmdProxy's GatewayConfig from the audit/config mode switch:
+// --audit builds a zero-config wiretap upstream, --config loads the gateway config, and
+// neither is a usage error. Extracted from cmdProxy to keep the latter's own branch count
+// under the complexity threshold; every returned error is plain (no "eunox proxy: " prefix
+// or trailing newline) so the one call site can wrap it identically regardless of which
+// branch produced it.
+func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConfig, error) {
+	switch {
+	case *f.audit:
+		cfg, err := buildAuditWiretapConfig(fs.Args(), *f.wiretapURL, *f.wiretapAuthHeader, *f.wiretapTLSSkipVerify)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
+		return cfg, nil
+	case *f.configPath != "":
+		// The upstream command comes from the config in this mode; a trailing
+		// "-- <command>" would be silently dropped, so reject stray positionals rather
+		// than let the operator believe they took effect.
+		if fs.NArg() > 0 {
+			return nil, fmt.Errorf("unexpected argument %q (--config takes the upstream from the config file; positional commands are only for --audit mode)", fs.Arg(0))
+		}
+		// The wiretap-only upstream flags describe the --audit upstream; under --config the
+		// upstream (and its auth/TLS posture) comes from the file, so these would be
+		// silently dropped. Reject them for the same reason as a stray positional.
+		if *f.wiretapURL != "" || *f.wiretapAuthHeader != "" || *f.wiretapTLSSkipVerify {
+			return nil, errors.New("--upstream-url/--upstream-auth-header/--upstream-tls-skip-verify apply only to --audit wiretap mode; under --config the upstream and its auth/TLS posture come from the config file")
+		}
+		return config.LoadGatewayConfig(*f.configPath)
+	default:
+		//nolint:staticcheck // ST1005: this is printed as a multi-line usage block, not a short sentence-case error
+		return nil, errors.New("one of --config <file> or --audit is required.\n\n  --config <eunox.yaml>           policy enforcement (or audit posture) declared in a file\n  --audit -- <command> [args...]  zero-config wiretap: forward everything, log everything\n\nRun 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.")
+	}
 }
 
 // cmdProxy runs the `proxy` subcommand, returning the exit code (rather than calling
@@ -421,40 +456,9 @@ func cmdProxy(args []string) (exitCode int) {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
-	var (
-		cfg *config.GatewayConfig
-		err error
-	)
-	switch {
-	case *f.audit:
-		cfg, err = buildAuditWiretapConfig(fs.Args(), *f.wiretapURL, *f.wiretapAuthHeader, *f.wiretapTLSSkipVerify)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
-			return 1
-		}
-		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
-	case *f.configPath != "":
-		// The upstream command comes from the config in this mode; a trailing
-		// "-- <command>" would be silently dropped, so reject stray positionals rather
-		// than let the operator believe they took effect.
-		if fs.NArg() > 0 {
-			fmt.Fprintf(os.Stderr, "eunox proxy: unexpected argument %q (--config takes the upstream from the config file; positional commands are only for --audit mode)\n", fs.Arg(0))
-			return 1
-		}
-		// The wiretap-only upstream flags describe the --audit upstream; under --config the
-		// upstream (and its auth/TLS posture) comes from the file, so these would be
-		// silently dropped. Reject them for the same reason as a stray positional.
-		if *f.wiretapURL != "" || *f.wiretapAuthHeader != "" || *f.wiretapTLSSkipVerify {
-			fmt.Fprintf(os.Stderr, "eunox proxy: --upstream-url/--upstream-auth-header/--upstream-tls-skip-verify apply only to --audit wiretap mode; under --config the upstream and its auth/TLS posture come from the config file\n")
-			return 1
-		}
-		cfg, err = config.LoadGatewayConfig(*f.configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
-			return 1
-		}
-	default:
-		fmt.Fprintf(os.Stderr, "eunox proxy: one of --config <file> or --audit is required.\n\n  --config <eunox.yaml>           policy enforcement (or audit posture) declared in a file\n  --audit -- <command> [args...]  zero-config wiretap: forward everything, log everything\n\nRun 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.\n")
+	cfg, err := resolveProxyConfig(fs, f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
 

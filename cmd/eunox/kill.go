@@ -39,7 +39,7 @@ func cmdKill(args []string) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.Usage = func() {
 		w := usageWriter(args)
-		fmt.Fprint(w, `Usage: eunox kill [flags] <session-id|all>
+		_, _ = fmt.Fprint(w, `Usage: eunox kill [flags] <session-id|all>
        eunox kill [flags] --session <session-id>
        eunox kill [flags] --agent <agent-id>
 

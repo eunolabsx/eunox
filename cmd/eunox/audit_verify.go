@@ -106,7 +106,7 @@ func cmdAuditVerify(args []string) int {
 	fs := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
 	fs.Usage = func() {
 		w := usageWriter(args)
-		fmt.Fprint(w, `Usage: eunox audit-verify [flags]
+		_, _ = fmt.Fprint(w, `Usage: eunox audit-verify [flags]
 
 Verify HMAC-SHA256 signatures in the local audit log.
 

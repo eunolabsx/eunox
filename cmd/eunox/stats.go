@@ -25,7 +25,7 @@ func cmdStats(args []string) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.Usage = func() {
 		w := usageWriter(args)
-		fmt.Fprint(w, `Usage: eunox stats [flags]
+		_, _ = fmt.Fprint(w, `Usage: eunox stats [flags]
 
 Print a denial count histogram from the local audit log. Denials are split
 into BLOCKED (enforce-mode — request was rejected) and OBSERVED (audit-mode

@@ -397,7 +397,7 @@ func cmdValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.Usage = func() {
 		w := usageWriter(args)
-		fmt.Fprint(w, `Usage:
+		_, _ = fmt.Fprint(w, `Usage:
   eunox validate <manifest.yaml> [...] --live --upstream-url <url>
   eunox validate <manifest.yaml> [...] --live --transport stdio -- <cmd> [args...]
   eunox validate --config <eunox.yaml> [--live]

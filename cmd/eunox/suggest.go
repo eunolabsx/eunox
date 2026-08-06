@@ -603,7 +603,7 @@ func cmdSuggest(args []string) int {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
 	fs.Usage = func() {
 		w := usageWriter(args)
-		fmt.Fprint(w, `Usage: eunox suggest [flags]
+		_, _ = fmt.Fprint(w, `Usage: eunox suggest [flags]
 
 Generate a draft capability manifest from the local audit log. Unlike 'init'
 (which scaffolds a deny-all from a live tool list), 'suggest' reads what the

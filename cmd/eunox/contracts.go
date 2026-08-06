@@ -35,13 +35,10 @@ func reportUnreadableCorpusDir(resolved, requested string, statErr error) {
 	}
 }
 
-// cmdContracts runs the `contracts` subcommand, returning the exit code (rather than
-// calling os.Exit) so tests can drive every branch including the failure paths.
-func cmdContracts(args []string) int {
-	fs := flag.NewFlagSet("contracts", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		fmt.Fprint(w, `Usage:
+// printContractsUsage writes the `contracts` subcommand help text. Its own top-level function,
+// mirroring printProxyUsage, so cmdContracts' body doesn't carry the usage text inline.
+func printContractsUsage(fs *flag.FlagSet, w io.Writer) {
+	_, _ = fmt.Fprint(w, `Usage:
   eunox contracts [--dir <corpus-dir>] [--trust-keys <file>]
   eunox contracts [--dir <corpus-dir>] --ref <contract-id>
   eunox contracts [--dir <corpus-dir>] --attest-payload <contract-id> [--role <role>] [--statement <statement>]
@@ -76,9 +73,15 @@ Exit codes:
 
 Flags:
 `)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
+	fs.SetOutput(w)
+	fs.PrintDefaults()
+}
+
+// cmdContracts runs the `contracts` subcommand, returning the exit code (rather than
+// calling os.Exit) so tests can drive every branch including the failure paths.
+func cmdContracts(args []string) int {
+	fs := flag.NewFlagSet("contracts", flag.ContinueOnError)
+	fs.Usage = func() { printContractsUsage(fs, usageWriter(args)) }
 
 	dir := fs.String("dir", defaultContractsDir, "Directory holding the corpus entries (*.json).")
 	ref := fs.String("ref", "", "Print the effect.ref pin for this contract id and exit.")
