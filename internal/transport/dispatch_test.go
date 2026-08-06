@@ -872,17 +872,22 @@ func TestUnmappedMethod_HTTP_NotForwarded(t *testing.T) {
 // TestUnmappedMethod_HTTP_LogsMethodName verifies that the method name
 // appears in the stderr log output when an unmapped method is received.
 func TestUnmappedMethod_HTTP_LogsMethodName(t *testing.T) {
+	// Swapped BEFORE the proxy is constructed: dispatch/forward diagnostics now go
+	// through the proxy's own configured errOut (resolved from os.Stderr once, at
+	// construction, per HTTPGatewayOptions.Stderr's doc), so a swap that happens
+	// AFTER construction is invisible to them — the exact race that doc comment
+	// warns a global os.Stderr reassignment risks.
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+
 	fu := newFakeUpstream()
 	fakeServer := httptest.NewServer(fu)
 	defer fakeServer.Close()
 
 	_, srv := newTestRemoteProxy(t, fakeServer.URL, httpProxyOptions{})
 	sessID := proxyInitSession(t, nil, srv)
-
-	old := os.Stderr
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	os.Stderr = w
 
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0",

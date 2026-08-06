@@ -3661,7 +3661,7 @@ func TestHandleSessionPost_OwnerMismatchNotification_Acks202(t *testing.T) {
 }
 
 // TestHandleSessionPost_KilledReapedSession_DeniesWithKillSwitch is the regression for
-// the interaction between the kill-triggered session teardown (reapKilledSession removes
+// the interaction between the kill-triggered session teardown (teardownSessionByID removes
 // the session from the registry) and the documented kill contract (a killed session's
 // requests are denied with KILL_SWITCH). Because the reap removes the session, a
 // subsequent POST to its id no longer resolves — but it must still return a JSON-RPC
@@ -3679,7 +3679,7 @@ func TestHandleSessionPost_KilledReapedSession_DeniesWithKillSwitch(t *testing.T
 	}
 	proxy := newTestHTTPProxy()
 	// The session has been killed AND reaped out of the registry (its subprocess/slot
-	// reclaimed) — exactly the post-kill state reapKilledSession leaves behind — but the
+	// reclaimed) — exactly the post-kill state teardownSessionByID leaves behind — but the
 	// kill store still records the id.
 	if err := ks.KillSession(context.Background(), "gone"); err != nil {
 		t.Fatalf("KillSession: %v", err)
@@ -3871,11 +3871,11 @@ func TestRegisterSession_FailsClosedAfterShutdown(t *testing.T) {
 
 // TestRegisterSession_FailsClosedAfterConcurrentGlobalReap is the regression for the
 // kill-triggered slot leak: a session-creating initialize that captured its reap
-// generation BEFORE a global kill's reapAllKilledSessions swept the registry must not
+// generation BEFORE a global kill's teardownAllSessionsForGlobalKill swept the registry must not
 // register into the fresh (post-sweep) map with a live upstream the sweep never saw.
 // Unlike TestRegisterSession_FailsClosedAfterShutdown, the registry must stay usable
 // AFTER the race is rejected — a fresh registerSession (with the current generation)
-// must still succeed, since reapAllKilledSessions (unlike closeAllSessions) does not
+// must still succeed, since teardownAllSessionsForGlobalKill (unlike closeAllSessions) does not
 // latch shuttingDown.
 func TestRegisterSession_FailsClosedAfterConcurrentGlobalReap(t *testing.T) {
 	t.Parallel()
@@ -3885,10 +3885,10 @@ func TestRegisterSession_FailsClosedAfterConcurrentGlobalReap(t *testing.T) {
 	// (possibly slow) upstream handshake.
 	staleGen := p.currentReapGen()
 
-	// A global kill fires and reapAllKilledSessions sweeps the registry while the
+	// A global kill fires and teardownAllSessionsForGlobalKill sweeps the registry while the
 	// simulated handshake above is still "in flight" (nothing registered yet, matching
 	// an empty registry mid-handshake).
-	p.reapAllKilledSessions()
+	p.teardownAllSessionsForGlobalKill()
 
 	// The handshake "finishes" and registers using the generation it captured before
 	// the sweep: must be rejected, and must not leak into the registry.
@@ -3900,7 +3900,7 @@ func TestRegisterSession_FailsClosedAfterConcurrentGlobalReap(t *testing.T) {
 		t.Fatal("a session racing a global reap must not leak into the registry")
 	}
 
-	// The registry must still be usable afterward (reapAllKilledSessions does not latch
+	// The registry must still be usable afterward (teardownAllSessionsForGlobalKill does not latch
 	// shuttingDown): a session that captures the CURRENT generation registers normally.
 	fresh := newTestSession(&httpSession{id: "fresh", done: make(chan struct{})})
 	if err := p.registerSession(fresh, p.currentReapGen()); err != nil {
@@ -6697,13 +6697,13 @@ func TestRevocationReclaim_KillDuringTheHandshakeIsStillReclaimed(t *testing.T) 
 	if err := ks.KillSession(context.Background(), sid); err != nil {
 		t.Fatalf("KillSession: %v", err)
 	}
-	proxy.reapKilledSessions() // deterministic stand-in for the worker's sweep
+	proxy.sweepKilledSessions() // deterministic stand-in for the worker's sweep
 	if proxy.sessionCount() != 1 {
 		t.Fatal("a sweep must spare an establishing session, not race its establishment teardown")
 	}
 
 	// A second sweep still spares it, so nothing but the establishment edge is left.
-	proxy.reapKilledSessions()
+	proxy.sweepKilledSessions()
 	if proxy.sessionCount() != 1 {
 		t.Fatal("still establishing: no sweep may reclaim it")
 	}

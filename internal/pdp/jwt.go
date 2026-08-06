@@ -323,8 +323,10 @@ func normalizeAudience(aud string) string {
 // sanitizeAudiences drops empty/whitespace-only entries from an accepted-audience
 // list. go-jose matches audiences by set intersection, so an AnyAudience carrying ""
 // would ACCEPT a token whose own aud is the literal empty string instead of rejecting
-// everything as intended. Returns a fresh slice; dropping every entry falls back to
-// validateStandardClaims' single-audience fail-closed path.
+// everything as intended. Returns a fresh slice, except for an already-empty input
+// (nothing to drop, so the original — itself empty — is handed back unmodified);
+// dropping every entry falls back to validateStandardClaims' single-audience
+// fail-closed path.
 func sanitizeAudiences(auds []string) []string {
 	if len(auds) == 0 {
 		return auds
@@ -1115,12 +1117,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 
 	// Exhaustive allowlist: an unlisted target is denied regardless of the
 	// manifest. Use the heads parsed at validation time when available.
-	var constraints []capability.Constraint
-	if claims.parsedCaps != nil {
-		constraints = buildConstraintsFromParsed(claims.parsedCaps, target)
-	} else {
-		constraints = buildConstraintsFromClaims(claims.Capabilities, target)
-	}
+	constraints := buildConstraintsFromParsed(parsedCapHeads(claims), target)
 	if len(constraints) == 0 {
 		// A claim that NAMES this target but whose condition suffix failed to parse
 		// also lands here (it grants nothing) — distinguish it so the operator isn't

@@ -272,16 +272,23 @@ func fetchSpecLive(ctx context.Context, spec initUpstreamSpec) (LiveUpstreamInfo
 }
 
 // fetchRouteLive introspects one route's declared upstream. A fresh liveUpstreamTimeout is
-// applied PER route so a slow early route cannot exhaust a shared budget.
+// applied PER route so a slow early route cannot exhaust a shared budget. Delegates the
+// actual transport dispatch to fetchSpecLive via an adapted initUpstreamSpec, so the two
+// don't hand-mirror the same stdio/http switch; the route name is added as an error prefix
+// here, since fetchSpecLive's caller-agnostic spec has none to give.
 func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstreamInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, liveUpstreamTimeout)
 	defer cancel()
-	switch u.Transport {
-	case config.HostTransportStdio:
-		return fetchLiveToolsStdio(ctx, u.Command, u.Args)
-	case config.HostTransportHTTP:
-		return fetchLiveTools(ctx, u.UpstreamURL, u.UpstreamAuthHeader, u.UpstreamTLSSkipVerify)
-	default:
-		return LiveUpstreamInfo{}, fmt.Errorf("upstream %q: unknown transport %q", u.Name, u.Transport)
+	info, err := fetchSpecLive(ctx, initUpstreamSpec{
+		Transport:     u.Transport,
+		URL:           u.UpstreamURL,
+		AuthHeader:    u.UpstreamAuthHeader,
+		TLSSkipVerify: u.UpstreamTLSSkipVerify,
+		Command:       u.Command,
+		Args:          u.Args,
+	})
+	if err != nil {
+		return LiveUpstreamInfo{}, fmt.Errorf("upstream %q: %w", u.Name, err)
 	}
+	return info, nil
 }

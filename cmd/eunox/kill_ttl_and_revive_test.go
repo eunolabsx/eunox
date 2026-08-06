@@ -579,7 +579,7 @@ func captureStdoutCode(t *testing.T, args []string) int {
 // TestKillUsage_DocumentsRevive keeps the flag discoverable: the startup banner points a
 // permanent-tombstone deployment at this command, so `eunox kill -h` has to list it.
 func TestKillUsage_DocumentsRevive(t *testing.T) {
-	out := captureStderr(t, func() { require.Zero(t, cmdKill([]string{"-h"})) })
+	out := captureStdout(t, func() { require.Zero(t, cmdKill([]string{"-h"})) })
 	require.Contains(t, out, "-revive")
 	require.Contains(t, out, "--revive")
 }

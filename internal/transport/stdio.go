@@ -1080,7 +1080,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 	}
 	// Any notification method outside the forwardable allowlist is a fail-closed reject,
 	// shared with the HTTP transport's equivalent guard.
-	if denyUnmappedHostNotification(ctx, p.rec(), p.sessionID, msg) {
+	if denyUnmappedHostNotification(ctx, p.errOut(), p.rec(), p.sessionID, msg) {
 		return false
 	}
 	if !p.waitHostForwardOrShutdown(ctx) {
@@ -1134,6 +1134,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     p.callUpstream,
 			strictAuditState: p.strictAudit(),
+			errOut:           p.errOut(),
 		},
 		pdp:              p.pdp,
 		sourceIP:         "", // stdio has no per-request client address
@@ -1213,6 +1214,7 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		decideLock:       p.samplingDecideLock(),
 		strictAuditState: p.strictAudit(),
 		pdp:              p.pdp,
+		errOut:           p.errOut(),
 	})
 }
 

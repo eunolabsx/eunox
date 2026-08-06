@@ -192,6 +192,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     sess.callUpstream,
 			strictAuditState: p.strictAudit(),
+			errOut:           p.errOut(),
 		},
 		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
@@ -210,6 +211,7 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 		rec:              asRecorder(route.sink),
 		sessionID:        "", // no session exists yet on the creating initialize
 		strictAuditState: p.strictAudit(),
+		errOut:           p.errOut(),
 	}
 	// initialize addresses no sub-target, so audit id/method/denial target all collapse to
 	// "initialize" (see dispatchList for the same pattern). Zero decision: nothing exists yet
@@ -279,5 +281,6 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		anchorSplit:      sess.spansAnchors,
 		strictAuditState: p.strictAudit(),
 		pdp:              rt.pdp,
+		errOut:           p.errOut(),
 	})
 }

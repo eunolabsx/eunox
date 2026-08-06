@@ -11,7 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -152,14 +152,14 @@ func isForwardableHostNotification(method string) bool {
 // denyUnmappedHostNotification denies (and records) a notification outside the forwardable
 // allowlist — the notification-framed analogue of dispatchUnmapped. Shared by both transports
 // so the check and record live once. Returns true when msg was denied.
-func denyUnmappedHostNotification(ctx context.Context, rec auditRecorder, sessionID string, msg mcp.RPCMsg) bool {
+func denyUnmappedHostNotification(ctx context.Context, w io.Writer, rec auditRecorder, sessionID string, msg mcp.RPCMsg) bool {
 	if isForwardableHostNotification(msg.Method) {
 		return false
 	}
 	if rec != nil {
 		rec.RecordDeny(ctx, sessionID, msg.Method, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(resolvedErrOut(w),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
 		audit.SanitizeAuditField(msg.Method))
 	return true
@@ -414,7 +414,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: the server's own signed
 		// account contradicts the contract policy was written against.
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(d.errOutOrStderr(),
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
 	}
@@ -523,7 +523,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// would bypass list filtering. callUpstream now rejects this before returning, so it's
 	// no longer reachable live — kept as a backstop against a future bypass.
 	if upResp.Error == nil && upResp.Result == nil {
-		warnIfStrictAuditJustDegraded(d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
+		warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
 			if d.rec != nil {
 				d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeEnforcementError, "", nil, false)
 			}
@@ -565,7 +565,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// AuditOnly never applies to list methods, so d.audit alone carries the observe posture.
 	// Details carry filter statistics so an auditor can tell filtering from a genuinely empty
 	// upstream apart.
-	warnIfStrictAuditJustDegraded(d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
+	warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
 		if d.rec != nil {
 			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
 		}
@@ -646,7 +646,7 @@ func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 	if d.rec != nil {
 		d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(d.errOutOrStderr(),
 		"[eunox] SECURITY: unmapped MCP method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
 		sanitizedMethod,
 	)

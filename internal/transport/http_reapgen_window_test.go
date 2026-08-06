@@ -57,7 +57,7 @@ func TestInitialize_ReapGenCapturedBeforeKillGate(t *testing.T) {
 			onCheckKill: func() {
 				if !swept {
 					swept = true
-					proxy.reapAllKilledSessions()
+					proxy.teardownAllSessionsForGlobalKill()
 				}
 			},
 		}

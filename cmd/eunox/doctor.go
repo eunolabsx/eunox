@@ -137,7 +137,8 @@ func parseDoctorReaderFlags(fs *flag.FlagSet, args []string, configPath, logPath
 func cmdDoctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage:
+		w := usageWriter(args)
+		fmt.Fprint(w, `Usage:
   eunox doctor [flags]
 
 Print a user-initiated support bundle: binary identity, redacted transport
@@ -154,6 +155,7 @@ before sharing.
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 

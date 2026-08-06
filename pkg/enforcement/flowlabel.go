@@ -65,16 +65,6 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	if condErr != nil {
 		return condErr
 	}
-	if fl == nil {
-		// Defense in depth against a typed-nil *FlowLabelCondition (runConditions already
-		// rejects this before dispatch): an unevaluable condition must fail closed, never
-		// panic.
-		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
-			ConditionType: capability.ConditionTypeFlowLabel,
-			Message:       "flowLabel condition is nil and cannot be evaluated",
-		}
-	}
 
 	// Compose the delegation chain's allow-set cap into the condition's own: intersection is
 	// the only safe composition, since the sink rule is "present and not allowed => deny", so

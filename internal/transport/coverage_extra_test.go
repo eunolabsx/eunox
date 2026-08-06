@@ -6,6 +6,7 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -806,13 +807,13 @@ func TestWarnStrictAuditOnce_FiresOnce(t *testing.T) {
 	t.Parallel()
 	var warned atomic.Bool
 	// First call swaps false->true.
-	warnStrictAuditOnce(&warned, "test reason")
+	warnStrictAuditOnce(io.Discard, &warned, "test reason")
 	if !warned.Load() {
 		t.Fatal("warnStrictAuditOnce must set the warned flag on first call")
 	}
 	// Second call is a no-op (CompareAndSwap fails); the flag stays set and nothing
 	// panics.
-	warnStrictAuditOnce(&warned, "test reason")
+	warnStrictAuditOnce(io.Discard, &warned, "test reason")
 	if !warned.Load() {
 		t.Fatal("warned flag must remain set after the second call")
 	}

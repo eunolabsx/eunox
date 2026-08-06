@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -225,6 +226,30 @@ type forwardParams struct {
 	// also defer the same release as a backstop for paths that return before deciding.
 	endDecision func()
 	strictAuditState
+	// errOut is where this forward's diagnostic (SECURITY/AUDIT) lines are written. Nil (the
+	// default, and what every construction that doesn't set it gets — including every test
+	// literal) means os.Stderr, mirroring StdioProxyOptions.Stderr/HTTPGatewayOptions.Stderr:
+	// a caller that wants to capture these lines (or avoid racing a concurrently-read
+	// os.Stderr) configures the proxy's writer, which flows down to here, instead of
+	// reassigning the process-global os.Stderr.
+	errOut io.Writer
+}
+
+// errOutOrStderr returns fp.errOut when set, else os.Stderr — the one place every
+// dispatch/forward diagnostic line resolves its destination, so a proxy's configured Stderr
+// writer actually reaches them instead of being bypassed by a direct os.Stderr write.
+func (fp forwardParams) errOutOrStderr() io.Writer {
+	return resolvedErrOut(fp.errOut)
+}
+
+// resolvedErrOut returns w when set, else os.Stderr — the fallback forwardParams.errOutOrStderr
+// and serverRequestParams.errOutOrStderr share, since the two params structs don't embed one
+// another but must resolve a nil errOut identically.
+func resolvedErrOut(w io.Writer) io.Writer {
+	if w == nil {
+		return os.Stderr
+	}
+	return w
 }
 
 // declassifyCommitter is the one method the forward core needs from the PDP: apply the flow
@@ -275,11 +300,11 @@ func auditGateTripped(rec auditRecorder, strict bool) (tripped bool, reason stri
 	return rec.AuditDegraded()
 }
 
-// warnStrictAuditOnce emits the "strict mode is now denying forwards" stderr line once per
-// process, on the first trip; later denials remain visible as AUDIT_UNAVAILABLE records.
-func warnStrictAuditOnce(warned *atomic.Bool, reason string) {
+// warnStrictAuditOnce emits the "strict mode is now denying forwards" diagnostic line once
+// per process, on the first trip; later denials remain visible as AUDIT_UNAVAILABLE records.
+func warnStrictAuditOnce(w io.Writer, warned *atomic.Bool, reason string) {
 	if warned != nil && warned.CompareAndSwap(false, true) {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(w,
 			"[eunox] SECURITY: --require-audit=strict is now denying forwards (AUDIT_UNAVAILABLE) until restart — %s. "+
 				"Each denied call is recorded as an AUDIT_UNAVAILABLE audit record.\n",
 			reason,
@@ -298,7 +323,7 @@ func warnStrictAuditOnce(warned *atomic.Bool, reason string) {
 //
 // Best-effort, not exact attribution: concurrent in-flight requests at the transition instant
 // may each warn, which is acceptable — each is a genuine boundary-call candidate.
-func warnIfStrictAuditJustDegraded(strict bool, rec auditRecorder, kind, target string, recordFn func()) {
+func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, kind, target string, recordFn func()) {
 	if !strict || rec == nil {
 		recordFn()
 		return
@@ -309,7 +334,7 @@ func warnIfStrictAuditJustDegraded(strict bool, rec auditRecorder, kind, target 
 		return
 	}
 	if postDegraded, reason, _ := rec.AuditDegraded(); postDegraded {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(w,
 			"[eunox] SECURITY: --require-audit=strict: the audit record for the %s %q request just forwarded to the upstream may itself have been lost (%s) — that call could be unaudited; every subsequent forward is now denied.\n",
 			kind, target, reason,
 		)
@@ -325,7 +350,7 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 	// This deny records a call already forwarded to (and answered, however badly, by)
 	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
 	// for, so it gets the same immediate diagnostic under strict mode.
-	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, method, auditID, func() {
+	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, auditID, func() {
 		if fp.rec != nil {
 			fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, code, "", detail, false)
 		}
@@ -451,7 +476,7 @@ func addSpentApproval(detail map[string]interface{}, dec capability.EnforceRespo
 //
 // committer and sessionID are passed rather than read off a params struct so the host path
 // and the server-initiated one share this body instead of mirroring it.
-func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessionID string, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
+func commitDeclassify(ctx context.Context, w io.Writer, committer declassifyCommitter, sessionID string, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
 	decl := dec.Declassification
 	if !decl.PendingClear() {
 		// Either no declassify directive at all, or an approved one whose labels the anchor
@@ -476,7 +501,7 @@ func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessio
 		// folding this into the fault arm below would tell an operator to reissue an
 		// approval for work that already landed — the unsafe direction for an alert to be
 		// wrong in. Nothing is cleared HERE, so the record carries only the spent grant.
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(w,
 			"[eunox] WARN declassify %s %q: the authorized clear was committed twice; the first commit applied it and this one changed nothing (proxy wiring fault, not a flow-store failure — the session is NOT over-tainted)\n",
 			kind, target)
 		return nil, spentGrantDetail(dec)
@@ -487,7 +512,7 @@ func commitDeclassify(ctx context.Context, committer declassifyCommitter, sessio
 		// refusal's, since the operator action differs: reissue the approval to reach the
 		// state the policy describes.
 		detail[audit.DeclassifyCommitFailedKey] = authorized
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(w,
 			"[eunox] WARN declassify %s %q ran under an approved declassification, but the flow label(s) %v could not be cleared: %v — the session stays tainted, so a later sink will over-block until the action is retried under a new approval\n",
 			kind, target, authorized, err)
 		// cleared may still be non-empty beside the error (a Remove can delete and lose its
@@ -592,7 +617,7 @@ func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, a
 	// reason is for the host-facing error and the stderr warning only, never the
 	// structured audit field.
 	fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeAuditUnavailable, "", detail, false)
-	warnStrictAuditOnce(fp.strictAuditWarned, reason)
+	warnStrictAuditOnce(fp.errOutOrStderr(), fp.strictAuditWarned, reason)
 	return denialResult(msg.ID, capability.ErrCodeAuditUnavailable, "", denialTarget, ""), true
 }
 
@@ -673,12 +698,12 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		// The same declassify merge the hard-deny arm makes: no exit below the decision may
 		// silently fail to report a spent grant.
 		observeDetail := mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec))
-		warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
+		warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 			if fp.rec != nil {
 				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, observeDetail, true)
 			}
 		})
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(fp.errOutOrStderr(),
 			"[eunox] AUDIT: %s %q would be denied (%s) — forwarding (audit mode)\n",
 			kind, denialTarget, denial.Code,
 		)
@@ -705,7 +730,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	if len(dec.Obligations) > 0 && upResp.Result != nil {
 		redacted, redactErr := pdp.ApplyRedactObligs(upResp.Result, dec.Obligations)
 		if redactErr != nil {
-			fmt.Fprintf(os.Stderr, "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
+			fmt.Fprintf(fp.errOutOrStderr(), "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
 			// Record a deny so the call stays visible on the tape — otherwise an adversarial
 			// upstream could return a redaction-failing response to make every redactFields-
 			// guarded call vanish from the audit trail.
@@ -714,7 +739,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 			// ANSWERED before it was taken. declassifyRedactionDetail decides what the record
 			// may CLAIM about that reply (see its doc).
 			redactDetail := declassifyRedactionDetail(dec, upResp)
-			warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
+			warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
 				}
@@ -727,7 +752,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// upstream returning BOTH a result and an error (which JSON-RPC forbids) must not forward
 	// a redactable value through error.data, a free-form channel the redact paths can't verify.
 	if upResp.Error != nil && upResp.Error.Data != nil && hasRedactFieldsObligation(dec.Obligations) {
-		fmt.Fprintf(os.Stderr, "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
+		fmt.Fprintf(fp.errOutOrStderr(), "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
 		upResp.Error.Data = nil
 	}
 
@@ -751,7 +776,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// was a DENY, and a downgraded deny must never untaint a session (defense in depth against
 	// a PDP that stamps a handle on a deny).
 	if dec.Decision == capability.DecisionAllow && declassifyCommitted(upResp) {
-		labelsCleared, declDetail = commitDeclassify(ctx, committer, fp.sessionID, dec, kind, denialTarget)
+		labelsCleared, declDetail = commitDeclassify(ctx, fp.errOutOrStderr(), committer, fp.sessionID, dec, kind, denialTarget)
 	} else {
 		declDetail = declassifyRefusalDetail(dec)
 	}
@@ -766,7 +791,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 
 	// Carry dec.AuditOnly so a per-entry audit-mode forward is not logged as a
 	// genuine allow. allowDetails supplies the structured details.
-	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
+	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 		if fp.rec == nil {
 			return
 		}
@@ -878,6 +903,17 @@ type serverRequestParams struct {
 	// strictAuditState (embedded) carries the --require-audit=strict gate, which also
 	// covers the enforced sampling/createMessage path below. See forwardParams.
 	strictAuditState
+	// errOut is this leg's diagnostic writer; see forwardParams.errOut for the fallback rule
+	// and rationale (nil means os.Stderr).
+	errOut io.Writer
+}
+
+// errOutOrStderr returns fp.errOut when set, else os.Stderr. See forwardParams.errOutOrStderr;
+// duplicated as a method (not shared via embedding) because serverRequestParams and
+// forwardParams are deliberately separate structs — the server-initiated leg carries none of
+// forwardParams' host-request-only fields (callUpstream, endDecision, upstreamTimeMs).
+func (fp serverRequestParams) errOutOrStderr() io.Writer {
+	return resolvedErrOut(fp.errOut)
 }
 
 // samplingTurnWait bounds how long the server-initiated leg waits for the decision turn. BOTH
@@ -1002,7 +1038,7 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 	fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeAuditUnavailable, "",
 		mergeAuditDetails(detail, declassifyRefusalDetail(dec)), false)
 	fp.writeUpstream(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, capability.ErrCodeAuditUnavailable))
-	warnStrictAuditOnce(fp.strictAuditWarned, reason)
+	warnStrictAuditOnce(fp.errOutOrStderr(), fp.strictAuditWarned, reason)
 	return true
 }
 
@@ -1018,7 +1054,7 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // declassification's signed triple. The non-sampling leg passes the zero decision (commits no
 // clear today). declDetail carries the annotations for a clear that did not land.
 func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method string, delivered, auditOnly bool, dec capability.EnforceResponse, cleared []string, declDetail map[string]interface{}) {
-	warnIfStrictAuditJustDegraded(fp.requireAuditStrict, fp.rec, method, method, func() {
+	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, method, func() {
 		if fp.rec == nil {
 			return
 		}
@@ -1138,7 +1174,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 			mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), true)
 	}
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(fp.errOutOrStderr(),
 		"[eunox] AUDIT: sampling/createMessage would be denied (%s) — forwarding (audit mode)\n",
 		denial.Code,
 	)

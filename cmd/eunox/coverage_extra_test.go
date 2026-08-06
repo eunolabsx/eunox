@@ -1628,7 +1628,7 @@ func TestPrintProxyUsage(t *testing.T) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	fs.String("config", "", "config path")
 
-	out := captureStderr(t, func() { printProxyUsage(fs) })
+	out := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
 	if !strings.Contains(out, "Usage:") {
 		t.Errorf("expected usage banner, got %q", out)
 	}
@@ -2621,8 +2621,8 @@ func TestCmdStats_ConfigLoadError(t *testing.T) {
 func TestCmdSuggest_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	code := cmdSuggest([]string{"--audit-log", logPath})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (no audit log), got %d", code)
+	if code != suggestUsageExit {
+		t.Errorf("expected exit code %d (no audit log), got %d", suggestUsageExit, code)
 	}
 }
 
@@ -2905,8 +2905,8 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 	badOutput := filepath.Join(blocker, "manifest.yaml")
 
 	code := cmdSuggest([]string{"--audit-log", logPath, "--output", badOutput})
-	if code != 2 {
-		t.Errorf("expected exit code 2 (WriteFile failed), got %d", code)
+	if code != 1 {
+		t.Errorf("expected exit code 1 (WriteFile failed), got %d", code)
 	}
 }
 
@@ -2915,12 +2915,15 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 // TestSubcommands_HelpReturnsZero covers the flag.ErrHelp branch added when
 // each subcommand's FlagSet moved from flag.ExitOnError to
 // flag.ContinueOnError: --help must print usage and return 0, not fall
-// through to the generic parse-error return 1.
+// through to the generic parse-error return 1. An explicit --help is a
+// successful query, so — matching the top-level printUsage convention —
+// its usage text goes to stdout, not stderr; stderr must stay silent.
 func TestSubcommands_HelpReturnsZero(t *testing.T) {
 	cases := []struct {
 		name string
 		run  func([]string) int
 	}{
+		{"proxy", cmdProxy},
 		{"validate", cmdValidate},
 		{"init", cmdInit},
 		{"suggest", cmdSuggest},
@@ -2928,18 +2931,25 @@ func TestSubcommands_HelpReturnsZero(t *testing.T) {
 		{"audit-verify", cmdAuditVerify},
 		{"stats", cmdStats},
 		{"doctor", cmdDoctor},
+		{"contracts", cmdContracts},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var code int
-			out := captureStderr(t, func() {
-				code = tc.run([]string{"--help"})
+			var out string
+			errOut := captureStderr(t, func() {
+				out = captureStdout(t, func() {
+					code = tc.run([]string{"--help"})
+				})
 			})
 			if code != 0 {
 				t.Errorf("%s --help: want exit code 0, got %d", tc.name, code)
 			}
 			if !strings.Contains(out, "Usage") {
-				t.Errorf("%s --help: expected usage text, got %q", tc.name, out)
+				t.Errorf("%s --help: expected usage text on stdout, got %q", tc.name, out)
+			}
+			if errOut != "" {
+				t.Errorf("%s --help: expected silent stderr, got %q", tc.name, errOut)
 			}
 		})
 	}

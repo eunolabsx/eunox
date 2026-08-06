@@ -708,7 +708,16 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 		// contiguous.
 		if rec.Seq != v.prevSeq+1 {
 			v.res.ChainBreaks++
-			_, _ = fmt.Fprintf(v.out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
+			if rec.Seq > v.prevSeq+1 {
+				_, _ = fmt.Fprintf(v.out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
+			} else {
+				// A seq that goes backward or repeats is not a missing record — this
+				// package's own documented tamper/restart signature (a duplicated,
+				// reordered, or reissued seq), the same shape a chain-resume already
+				// guards against elsewhere. Naming it distinctly keeps a reader from
+				// searching for a deleted line that was never there.
+				_, _ = fmt.Fprintf(v.out, "SEQ GAP: record seq %d does not follow %d (seq did not increase — a duplicate, reordered, or restarted chain, not a missing record)\n", rec.Seq, v.prevSeq)
+			}
 		}
 	}
 	v.havePrev = true

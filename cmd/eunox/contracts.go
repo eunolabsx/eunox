@@ -40,7 +40,8 @@ func reportUnreadableCorpusDir(resolved, requested string, statErr error) {
 func cmdContracts(args []string) int {
 	fs := flag.NewFlagSet("contracts", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage:
+		w := usageWriter(args)
+		fmt.Fprint(w, `Usage:
   eunox contracts [--dir <corpus-dir>] [--trust-keys <file>]
   eunox contracts [--dir <corpus-dir>] --ref <contract-id>
   eunox contracts [--dir <corpus-dir>] --attest-payload <contract-id> [--role <role>] [--statement <statement>]
@@ -75,6 +76,7 @@ Exit codes:
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 

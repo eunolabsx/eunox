@@ -166,10 +166,12 @@ type httpSession struct {
 	reqSemOnce sync.Once
 	reqSem     chan struct{}
 
-	// inFlight counts requests blocked on the upstream. lastActive isn't advanced while a call
-	// blocks, so reapOnce's normal arm spares a session with inFlight > 0 (the hard ceiling
-	// still reaps it). A separate atomic rather than len(reqSem): reqSem is lazily assigned, so
-	// a lock-free len() would race that one-time write.
+	// inFlight counts requests anywhere in handleSessionPost, not only ones blocked on the
+	// upstream — incremented right after the route-binding check, released when the handler
+	// returns. lastActive isn't advanced while a call blocks, so reapOnce's normal arm spares
+	// a session with inFlight > 0 (the hard ceiling still reaps it). A separate atomic rather
+	// than len(reqSem): reqSem is lazily assigned, so a lock-free len() would race that
+	// one-time write.
 	inFlight atomic.Int64
 
 	// notifySemOnce/notifySem bound in-flight notification forwards, deliberately its own pool
@@ -479,7 +481,7 @@ func (p *HTTPProxy) currentReapGen() uint64 {
 // cheap pre-spawn check in handleMCPPost.
 //
 // startGen is the reapGen the caller observed before establishing sess. If a global kill's
-// reapAllKilledSessions swept the registry during that (possibly long) window, p.reapGen will
+// teardownAllSessionsForGlobalKill swept the registry during that (possibly long) window, p.reapGen will
 // have advanced past startGen and the insert is rejected — otherwise the session would register
 // into the post-sweep map with a live upstream the sweep never saw, reopening the
 // kill-triggered session-exhaustion DoS the reap exists to close.
@@ -677,12 +679,7 @@ func (p *HTTPProxy) reapOnce(idle time.Duration) {
 	// Snapshot under p.mu, released before the idle/subscriber checks: hasSubscribers takes
 	// s.notifMu, and keeping the two locks disjoint here prevents a future p.mu->notifMu
 	// ordering from deadlocking against this loop.
-	p.mu.RLock()
-	snapshot := make([]*httpSession, 0, len(p.sessions))
-	for _, s := range p.sessions {
-		snapshot = append(snapshot, s)
-	}
-	p.mu.RUnlock()
+	snapshot := p.snapshotSessions()
 	var stale []staleSession
 	for _, s := range snapshot {
 		// A session still initializing has a stale lastActive that would misread as idle;
@@ -765,19 +762,14 @@ func (p *HTTPProxy) sessionKilled(s *httpSession) bool {
 	return deny != nil && deny.Denial != nil && deny.Denial.Code == capability.ErrCodeKillSwitch
 }
 
-// reapKilledSessions closes every registered session the kill switch NOW names, freeing its
+// sweepKilledSessions closes every registered session the kill switch NOW names, freeing its
 // upstream, maxSessions slot, and SSE stream. This is the on-DELIVERY reclaim
 // (reclaimOnRevocation); the idle reaper's killed arm is the same logic on a timer as the
 // backstop for a revocation notification that never arrived (and it's the ONLY reclaim on a
 // proxy with idle reaping off). Both go through reclaimKilledSession/p.sessionKilled so
 // "reclaiming a killed session" has one definition. Snapshotted and closed concurrently.
-func (p *HTTPProxy) reapKilledSessions() {
-	p.mu.RLock()
-	snapshot := make([]*httpSession, 0, len(p.sessions))
-	for _, s := range p.sessions {
-		snapshot = append(snapshot, s)
-	}
-	p.mu.RUnlock()
+func (p *HTTPProxy) sweepKilledSessions() {
+	snapshot := p.snapshotSessions()
 	var wg sync.WaitGroup
 	for _, s := range snapshot {
 		// Same spare as the idle sweep: a session mid-handshake would race its own
@@ -843,36 +835,60 @@ func (s *httpSession) hasSubscribers() bool {
 	return len(s.notifSubs) > 0
 }
 
-// closeAllSessions closes every active session (called during server shutdown).
-func (p *HTTPProxy) closeAllSessions() {
+// snapshotSessions returns a copy of every currently registered session, taken under a read
+// lock that is released before the caller iterates. Every sweep that acts on "the sessions
+// registered right now" (the idle reaper, sweepKilledSessions, evictAllSessionStreams) needs
+// this same shape, so it is written once rather than hand-rolled per call site.
+func (p *HTTPProxy) snapshotSessions() []*httpSession {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	sessions := make([]*httpSession, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		sessions = append(sessions, s)
+	}
+	return sessions
+}
+
+// drainAllSessions runs underLock (to latch whatever state, e.g. shuttingDown or reapGen,
+// must change atomically with the swap), replaces p.sessions with a fresh empty map, then
+// closes every previously-registered session concurrently and waits for them all. Shared by
+// closeAllSessions and teardownAllSessionsForGlobalKill, which differ only in underLock.
+func (p *HTTPProxy) drainAllSessions(underLock func()) {
 	p.mu.Lock()
-	// Latch shutdown before the snapshot/swap so a racing registerSession fails closed
-	// (errShuttingDown) instead of inserting into the fresh map after this reap.
-	p.shuttingDown = true
+	underLock()
 	sessions := make([]*httpSession, 0, len(p.sessions))
 	for _, s := range p.sessions {
 		sessions = append(sessions, s)
 	}
 	p.sessions = make(map[string]*httpSession)
 	p.mu.Unlock()
-	// Concurrent, so one slow upstream doesn't make shutdown O(N * shutdownMs).
+	// Concurrent, so one slow upstream doesn't make this O(N * shutdownMs).
 	var wg sync.WaitGroup
 	for _, s := range sessions {
 		wg.Add(1)
-		go func() {
+		go func(s *httpSession) {
 			defer wg.Done()
 			s.close(p.shutdownMs)
-		}()
+		}(s)
 	}
 	wg.Wait()
 }
 
-// reapKilledSession tears down a killed session's upstream and frees its maxSessions slot
+// closeAllSessions closes every active session (called during server shutdown).
+func (p *HTTPProxy) closeAllSessions() {
+	// Latch shutdown before the snapshot/swap so a racing registerSession fails closed
+	// (errShuttingDown) instead of inserting into the fresh map after this reap.
+	p.drainAllSessions(func() { p.shuttingDown = true })
+}
+
+// teardownSessionByID tears down a killed session's upstream and frees its maxSessions slot
 // immediately, instead of relying on the idle reaper — which doesn't run at all when
 // sessionIdleTimeoutMs is 0, and without this a killed session lingers until process exit and
 // eventually exhausts maxSessions, a DoS triggered by the kill switch itself. Mirrors
-// handleMCPDelete's teardown; a session already gone is a no-op.
-func (p *HTTPProxy) reapKilledSession(sessionID string) {
+// handleMCPDelete's teardown rather than reclaimKilledSession's re-check-then-evict-then-close:
+// the caller already knows this id was just killed, so there is nothing left to re-verify.
+// A session already gone is a no-op.
+func (p *HTTPProxy) teardownSessionByID(sessionID string) {
 	p.mu.Lock()
 	sess, ok := p.sessions[sessionID]
 	if ok {
@@ -884,29 +900,14 @@ func (p *HTTPProxy) reapKilledSession(sessionID string) {
 	}
 }
 
-// reapAllKilledSessions tears down every active session after a global (emergency-stop) kill.
-// Unlike closeAllSessions it does NOT latch shuttingDown: the proxy keeps serving. Bumps
-// reapGen under the snapshot/swap lock so a registration racing this sweep (a session already
-// past CheckKill but still mid-handshake) is rejected by registerSession's startGen check
-// rather than registering into the fresh map with a live, unreclaimed upstream.
-func (p *HTTPProxy) reapAllKilledSessions() {
-	p.mu.Lock()
-	p.reapGen++
-	sessions := make([]*httpSession, 0, len(p.sessions))
-	for _, s := range p.sessions {
-		sessions = append(sessions, s)
-	}
-	p.sessions = make(map[string]*httpSession)
-	p.mu.Unlock()
-	var wg sync.WaitGroup
-	for _, s := range sessions {
-		wg.Add(1)
-		go func(s *httpSession) {
-			defer wg.Done()
-			s.close(p.shutdownMs)
-		}(s)
-	}
-	wg.Wait()
+// teardownAllSessionsForGlobalKill tears down every active session after a global
+// (emergency-stop) kill. Unlike closeAllSessions it does NOT latch shuttingDown: the proxy
+// keeps serving. Bumps reapGen under the snapshot/swap lock so a registration racing this
+// sweep (a session already past CheckKill but still mid-handshake) is rejected by
+// registerSession's startGen check rather than registering into the fresh map with a live,
+// unreclaimed upstream.
+func (p *HTTPProxy) teardownAllSessionsForGlobalKill() {
+	p.drainAllSessions(func() { p.reapGen++ })
 }
 
 // evictStreams closes the evicted signal every handleMCPGet loop selects on, so a killed
@@ -932,12 +933,7 @@ func (p *HTTPProxy) evictSessionStreams(sessionID string) {
 // stop. Snapshotted under the lock and evicted outside it; adds no new lock ordering since
 // evictStreams only closes a channel.
 func (p *HTTPProxy) evictAllSessionStreams() {
-	p.mu.RLock()
-	sessions := make([]*httpSession, 0, len(p.sessions))
-	for _, s := range p.sessions {
-		sessions = append(sessions, s)
-	}
-	p.mu.RUnlock()
+	sessions := p.snapshotSessions()
 	for _, s := range sessions {
 		s.evictStreams()
 	}

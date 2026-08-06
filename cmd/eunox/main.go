@@ -16,6 +16,7 @@
 //	               directly via shared Redis state (--redis-addr) for stdio proxies.
 //	audit-verify   Verify HMAC signatures in the audit log.
 //	stats          Print a denial histogram from the audit log.
+//	contracts      Verify a local effect-contract corpus and print an entry's effect.ref pin.
 //	doctor         Print a user-initiated support bundle for bug reports.
 //	version        Print the binary version and exit.
 
@@ -111,6 +112,27 @@ func run(args []string) int {
 // cmdVersion prints the build version and exits.
 func cmdVersion() {
 	fmt.Printf("eunox version %s\n", version)
+}
+
+// usageWriter returns os.Stdout when args explicitly requests help (--help, -help, or -h —
+// the same tokens the flag package itself special-cases into ErrHelp), os.Stderr otherwise,
+// so every subcommand's fs.Usage follows printUsage's own stated convention: help and bare
+// invocations are a successful query (stdout, exit 0), a parse error prints usage to stderr
+// alongside the failure. A "--" terminator ends the scan, matching parseFlagsAndPositionals'
+// own handling — nothing after it is a flag. This is a heuristic, not a full re-parse: a
+// flag value that happens to be the literal string "-h" (e.g. --audit-log -h) would be
+// misread as a help request, but none of this binary's flags take a value where that is a
+// plausible mistake to make.
+func usageWriter(args []string) io.Writer {
+	for _, a := range args {
+		if a == "--" {
+			return os.Stderr
+		}
+		if a == "--help" || a == "-help" || a == "-h" {
+			return os.Stdout
+		}
+	}
+	return os.Stderr
 }
 
 // printUsage writes the top-level usage text to w. Help and bare invocations
@@ -335,8 +357,8 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 }
 
 // printProxyUsage writes the `proxy` subcommand help text.
-func printProxyUsage(fs *flag.FlagSet) {
-	fmt.Fprint(os.Stderr, `Usage:
+func printProxyUsage(fs *flag.FlagSet, w io.Writer) {
+	fmt.Fprint(w, `Usage:
   eunox proxy --config <eunox.yaml>
   eunox proxy --audit -- <command> [args...]
   eunox proxy --audit --upstream-url <url> [--upstream-auth-header "Name: Value"]
@@ -360,6 +382,7 @@ Run 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.
 
 Flags:
 `)
+	fs.SetOutput(w)
 	fs.PrintDefaults()
 }
 
@@ -372,7 +395,7 @@ func cmdProxy(args []string) (exitCode int) {
 	// ContinueOnError, like every sibling subcommand: ExitOnError would terminate the
 	// process inside Parse, reintroducing the untestable exit this function avoids.
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	fs.Usage = func() { printProxyUsage(fs) }
+	fs.Usage = func() { printProxyUsage(fs, usageWriter(args)) }
 
 	f := registerProxyFlags(fs)
 
@@ -635,21 +658,25 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 	// operator-facing decision.
 	stderrLog := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	var (
-		counter capability.CallCounter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
+		counter   capability.CallCounter
+		flowStore capability.FlowLabelStore
+		ks        killswitch.Manager
+		ksRedis   *killswitch.Redis // non-nil when --redis-addr is set
+		rdb       *goredis.Client
+	)
+	if redisAddr == "" {
+		counter = callcounter.NewInMemory(callcounter.WithMaxKeys(maxCallCounterKeys))
 		// WithMaxKeys is the flow store's fail-closed admission ceiling. The idle bound is
 		// enabled ONLY under task anchoring: a session-anchored key already reclaims via
 		// teardown, but a task-anchored key has no teardown owner (reclaiming on disconnect
 		// would let an agent launder a task's taint by reconnecting), so idle expiry is the
 		// only safe reclamation it can have.
-		flowStore capability.FlowLabelStore = flowlabelstore.NewInMemory(
+		flowStore = flowlabelstore.NewInMemory(
 			append(flowStoreOptions(taskAnchored),
 				flowlabelstore.WithMaxKeys(maxCallCounterKeys),
 				flowlabelstore.WithLogger(stderrLog))...)
-		ks      killswitch.Manager = killswitch.NewInMemory()
-		ksRedis *killswitch.Redis  // non-nil when --redis-addr is set
-	)
-	var rdb *goredis.Client
-	if redisAddr != "" {
+		ks = killswitch.NewInMemory()
+	} else {
 		var err error
 		rdb, err = buildRedisClient(redisAddr, redisPassword, redisTLS)
 		if err != nil {
