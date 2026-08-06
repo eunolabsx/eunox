@@ -489,6 +489,20 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			sess.inFlight.Add(-1)
 			sess.releaseRequestSlot()
 		}()
+		if p.getSession(sess.id) != sess {
+			// sess was resolved well above (getSession at the top of this function), and every
+			// teardown drain (awaitInFlightDrained, the inFlight.Load()==0 check before
+			// dropDecideGate, awaitAndDropDecideGate) counts only requests that already
+			// incremented inFlight. A request straggling in the window between that resolve and
+			// its own Add(1) above is invisible to the drain, so teardown can drop the session's
+			// pinned decision gate and release its PDP state while this request still holds
+			// neither, then take its turn on a gate the registry no longer owns (two gates for
+			// one anchor) and decide against flow state ReleaseSession already cleared. Every
+			// teardown path deletes from p.sessions before releaseSessionState, so a straggler
+			// whose Add(1) the drain missed observes the deletion here and fails closed instead.
+			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: session torn down; retry"))
+			return
+		}
 		d := p.dispatchParams(sess, p.sourceIP(r))
 		// Serialize the decision phase for a flow-/sequenceBlock-relevant route, so a
 		// source's state write isn't raced ahead of by a later sink's read on the same

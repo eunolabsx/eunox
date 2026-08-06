@@ -640,9 +640,16 @@ func (r *Redis) ActivateGlobal(ctx context.Context) error {
 	// fail-open window: a ShouldBlock between the write and the publish must already
 	// observe the kill.
 	r.mu.Lock()
+	gained := !r.globalActive
 	r.globalActive = true
 	r.cacheGen++
 	r.mu.Unlock()
+	// Notify outside the lock, mirroring InMemory, and only on a state CHANGE: this
+	// instance's own pub/sub echo dedups identically against the now-updated cache, so
+	// this is the only delivery a kill issued through THIS Manager ever gets.
+	if gained {
+		r.observers.notify(Revocation{Global: true})
+	}
 	return r.publish(ctx, "global:activate")
 }
 
@@ -699,6 +706,7 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	if session {
 		cache = r.killedSessions
 	}
+	gained := kill && !cache[id]
 	if kill {
 		cache[id] = true
 	} else {
@@ -706,6 +714,16 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	}
 	r.cacheGen++
 	r.mu.Unlock()
+	// Notify outside the lock, mirroring InMemory, and only on a kill that actually
+	// changed local state: this instance's own pub/sub echo dedups identically against
+	// the now-updated cache, so this is the only delivery a local kill ever gets.
+	if gained {
+		ev := Revocation{AgentID: id}
+		if session {
+			ev = Revocation{SessionID: id}
+		}
+		r.observers.notify(ev)
+	}
 	// Channel name mirrors the durable-key dimension: "<entity>:<action>:<id>".
 	action := "kill"
 	if !kill {

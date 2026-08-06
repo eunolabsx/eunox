@@ -121,7 +121,12 @@ func (o *revocationObservers) observe(fn func(Revocation)) func() {
 	return func() {
 		once.Do(func() {
 			o.mu.Lock()
-			o.fns = slices.DeleteFunc(o.fns, func(r registeredObserver) bool { return r.id == id })
+			// Clone before DeleteFunc: notify copies only the slice HEADER under RLock and
+			// iterates after releasing the lock, so an in-place DeleteFunc (which shifts
+			// surviving elements down and zeroes the tail of the backing array) would race
+			// a concurrent notify's iteration over that same array. Cloning first makes
+			// unregister copy-on-write, so any header a notify captured stays immutable.
+			o.fns = slices.DeleteFunc(slices.Clone(o.fns), func(r registeredObserver) bool { return r.id == id })
 			o.mu.Unlock()
 		})
 	}
