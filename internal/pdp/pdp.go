@@ -981,7 +981,11 @@ func collectSequenceAntecedents(caps []capability.Constraint) map[string]struct{
 	for i := range caps {
 		for _, cond := range caps[i].Conditions {
 			sb, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](cond)
-			if !ok {
+			if !ok || sb == nil {
+				// A typed-nil *SequenceBlockCondition is returned as-is by AsValueOrPointer
+				// (see its doc) rather than dereferenced — guard it here too, matching every
+				// other call site, so a programmatically built condition fails closed
+				// (skipped) instead of panicking on sb.AfterTools below.
 				continue
 			}
 			for _, prior := range sb.AfterTools {

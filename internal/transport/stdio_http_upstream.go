@@ -225,7 +225,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		if h.reportErr != nil && h.reportErr(mcp.MsgKey(msg.ID), err) {
 			return
 		}
-		_, reason, rpcCode := upstreamErrInfo(err, 0)
+		_, reason, rpcCode := upstreamErrInfo(os.Stderr, err, 0)
 		resp = mcp.ErrorResponse(msg.ID, rpcCode, reason)
 	case resp.JSONRPC == "" && resp.Result == nil && resp.Error == nil:
 		// An empty/zero RPCMsg here is a 200 OK whose body is {}, null, or any JSON

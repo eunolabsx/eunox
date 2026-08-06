@@ -346,7 +346,7 @@ func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, 
 // byte-identical records for the same physical outage. dispatchList passes the method as
 // both auditID and method (no sub-target); the forward core passes the per-target audit id.
 func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string, detail map[string]interface{}) mcp.RPCMsg {
-	code, reason, rpcCode := upstreamErrInfo(err, fp.upstreamTimeMs)
+	code, reason, rpcCode := upstreamErrInfo(fp.errOutOrStderr(), err, fp.upstreamTimeMs)
 	// This deny records a call already forwarded to (and answered, however badly, by)
 	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
 	// for, so it gets the same immediate diagnostic under strict mode.

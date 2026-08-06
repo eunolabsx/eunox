@@ -5538,7 +5538,7 @@ func TestUpstreamErrInfo(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			code, reason, rpcCode := upstreamErrInfo(tc.err, tc.timeMs)
+			code, reason, rpcCode := upstreamErrInfo(io.Discard, tc.err, tc.timeMs)
 			if code != tc.wantCode || reason != tc.wantReason || rpcCode != tc.wantRPCCode {
 				t.Errorf("upstreamErrInfo(%v, %d) = (%q, %q, %d), want (%q, %q, %d)",
 					tc.err, tc.timeMs, code, reason, rpcCode, tc.wantCode, tc.wantReason, tc.wantRPCCode)
