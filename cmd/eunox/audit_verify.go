@@ -105,7 +105,8 @@ const auditVerifySummaryFormat = "Checked %d record(s): %d valid, %d invalid, %d
 func cmdAuditVerify(args []string) int {
 	fs := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage: eunox audit-verify [flags]
+		w := usageWriter(args)
+		_, _ = fmt.Fprint(w, `Usage: eunox audit-verify [flags]
 
 Verify HMAC-SHA256 signatures in the local audit log.
 
@@ -118,6 +119,7 @@ Exit codes:
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log and\naudit.keyPath are used as defaults for --audit-log and --audit-key-path.")

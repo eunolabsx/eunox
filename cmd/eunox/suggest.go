@@ -590,12 +590,20 @@ func targetLess(a, b *observedTarget) bool {
 	return a.name < b.name
 }
 
+// suggestUsageExit is suggest's exit code for a usage, config, or audit-log-read error,
+// matching the binary's proxy/validate/audit-verify convention (2 = usage error, so it
+// reads as distinguishable from an operation-specific failure — here, --output write
+// failure, exit 1). Was the other way around; pre-1.0 permits the clean swap over a
+// compat shim.
+const suggestUsageExit = 2
+
 // cmdSuggest runs the `suggest` subcommand, returning the exit code (rather than calling
 // os.Exit) so tests can drive every branch.
 func cmdSuggest(args []string) int {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage: eunox suggest [flags]
+		w := usageWriter(args)
+		_, _ = fmt.Fprint(w, `Usage: eunox suggest [flags]
 
 Generate a draft capability manifest from the local audit log. Unlike 'init'
 (which scaffolds a deny-all from a live tool list), 'suggest' reads what the
@@ -613,11 +621,12 @@ tighten every entry, then 'eunox validate' it before enforcing.
 
 Exit codes:
   0  Draft manifest generated (to stdout or --output).
-  1  Usage, config, or audit-log-read error.
-  2  --output was set but writing the file failed.
+  1  --output was set but writing the file failed.
+  2  Usage, config, or audit-log-read error.
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
@@ -628,17 +637,22 @@ Flags:
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
 	if code, done := parseAuditReaderFlags("suggest", fs, args, configPath, auditLogPath, nil); done {
+		if code != 0 {
+			// Translate the shared preamble's 1 to this command's own usage exit code;
+			// see suggestUsageExit.
+			return suggestUsageExit
+		}
 		return code
 	}
 	logPath, ok := resolveAuditReaderLogPath("suggest", *auditLogPath)
 	if !ok {
-		return 1
+		return suggestUsageExit
 	}
 
 	r, closeChain, err := openAuditChain("suggest", logPath)
 	if err != nil {
 		fmt.Fprint(os.Stderr, err.Error())
-		return 1
+		return suggestUsageExit
 	}
 	defer closeChain()
 
@@ -646,7 +660,7 @@ Flags:
 	suggestions, err := computeSuggestions(r, resolvedMaxValues)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox suggest: reading log: %v\n", err)
-		return 1
+		return suggestUsageExit
 	}
 	manifest := renderSuggestedManifest(suggestions, *name, resolvedMaxValues)
 
@@ -656,7 +670,7 @@ Flags:
 	}
 	if err := writeGeneratedFile(*output, manifest, *force); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox suggest: %v\n", err)
-		return 2
+		return 1
 	}
 	fmt.Fprintf(os.Stderr, "Generated draft manifest %s from %d audit record(s) — review and tighten each entry, then run: eunox validate %s\n",
 		*output, suggestions.records, *output)

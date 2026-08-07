@@ -470,6 +470,44 @@ func gatewaySchemaVersionFromNode(root *yaml.Node) (version string, numeric bool
 	return val.Value, val.Tag == "!!int" || val.Tag == "!!float"
 }
 
+// gatewayConfigRawFields holds every env-ref-bearing field's PRE-expansion text, captured
+// before expandEnvInStrings overwrites cfg's string fields in place. LoadGatewayConfig's
+// unset-reference guards need the raw text (not the expanded value) to tell an operator-set
+// variable whose value happens to be empty from a reference that was never set at all.
+type gatewayConfigRawFields struct {
+	authToken      string
+	auditLog       string
+	auditKeyPath   string
+	allowedOrigins []string
+	// upstreamAuth/upstreamURL/command/args are per-upstream, indexed like cfg.Upstreams.
+	upstreamAuth []string
+	upstreamURL  []string
+	command      []string
+	args         [][]string
+}
+
+// captureGatewayConfigRawFields snapshots cfg's env-ref-bearing fields before expansion. See
+// gatewayConfigRawFields.
+func captureGatewayConfigRawFields(cfg *GatewayConfig) gatewayConfigRawFields {
+	f := gatewayConfigRawFields{
+		authToken:      cfg.Listen.AuthToken,
+		auditLog:       cfg.Audit.Log,
+		auditKeyPath:   cfg.Audit.KeyPath,
+		allowedOrigins: slices.Clone(cfg.Listen.AllowedOrigins),
+		upstreamAuth:   make([]string, len(cfg.Upstreams)),
+		upstreamURL:    make([]string, len(cfg.Upstreams)),
+		command:        make([]string, len(cfg.Upstreams)),
+		args:           make([][]string, len(cfg.Upstreams)),
+	}
+	for i := range cfg.Upstreams {
+		f.upstreamAuth[i] = cfg.Upstreams[i].UpstreamAuthHeader
+		f.upstreamURL[i] = cfg.Upstreams[i].UpstreamURL
+		f.command[i] = cfg.Upstreams[i].Command
+		f.args[i] = slices.Clone(cfg.Upstreams[i].Args)
+	}
+	return f
+}
+
 // LoadGatewayConfig reads, parses, env-expands, and validates a gateway config.
 // ${VAR}/$VAR references are expanded from the environment AFTER parsing — on the decoded
 // string values, not the raw text — so an env value can never be re-interpreted as YAML syntax.
@@ -543,30 +581,10 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 		}
 	}
 
-	// Capture the raw (pre-expansion) auth token so the post-expansion guard below can
-	// tell an empty token the operator INTENDED to be a secret from one legitimately omitted.
-	rawAuthToken := cfg.Listen.AuthToken
-
-	// Same for the audit log and key paths: an unset env ref survives expansion as literal
-	// "${VAR}" text, silently misdirecting the tamper-evident tape (fail-OPEN on the core
-	// integrity artifact) unless guarded like the credential/URL fields.
-	rawAuditLog := cfg.Audit.Log
-	rawAuditKeyPath := cfg.Audit.KeyPath
-	rawAllowedOrigins := slices.Clone(cfg.Listen.AllowedOrigins)
-
-	// Same unset/empty footgun for each upstream's auth header.
-	rawUpstreamAuth := make([]string, len(cfg.Upstreams))
-	rawUpstreamURL := make([]string, len(cfg.Upstreams))
-	// And for a stdio upstream's command/args: an unset `command: ${SERVER_BIN}` boots
-	// cleanly and fails per SESSION at exec time rather than at startup.
-	rawCommand := make([]string, len(cfg.Upstreams))
-	rawArgs := make([][]string, len(cfg.Upstreams))
-	for i := range cfg.Upstreams {
-		rawUpstreamAuth[i] = cfg.Upstreams[i].UpstreamAuthHeader
-		rawUpstreamURL[i] = cfg.Upstreams[i].UpstreamURL
-		rawCommand[i] = cfg.Upstreams[i].Command
-		rawArgs[i] = slices.Clone(cfg.Upstreams[i].Args)
-	}
+	// Capture every env-ref-bearing field's pre-expansion text, so the unset-reference guards
+	// below can tell an empty/unset variable from one legitimately omitted — expandEnvInStrings
+	// overwrites cfg's string fields in place next.
+	rawFields := captureGatewayConfigRawFields(&cfg)
 
 	// Expand on the PARSED string values, never the raw text: substituting into the text
 	// before parsing let a YAML metacharacter in a secret alter the parse (e.g. "#secret"
@@ -578,7 +596,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// otherwise silently start the listener with no bearer-token auth. Scoped to HTTP since
 	// only it has a listener. See validateCredentialEnvRefs.
 	if cfg.HostTransport() == HostTransportHTTP {
-		if err := validateCredentialEnvRefs(path, "listen.authToken", rawAuthToken, listenAuthTokenEnvGrammar); err != nil {
+		if err := validateCredentialEnvRefs(path, "listen.authToken", rawFields.authToken, listenAuthTokenEnvGrammar); err != nil {
 			return nil, err
 		}
 	}
@@ -587,7 +605,7 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// upstreamAuthHeader that listen.authToken gets above: an unset/blank ref yields an
 	// auth header the upstream rejects on every call. Fail closed.
 	for i := range cfg.Upstreams {
-		raw := rawUpstreamAuth[i]
+		raw := rawFields.upstreamAuth[i]
 		if raw == "" || cfg.Upstreams[i].Transport != "http" {
 			continue
 		}
@@ -604,13 +622,13 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// whose value itself contains "$" is not misdiagnosed as unset. The QUERY and FRAGMENT
 	// take the braced-only rule, since "?$filter=" is a perfectly good OData URL.
 	for i := range cfg.Upstreams {
-		if err := failOnUnsetEnvRefUnder(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawUpstreamURL[i], upstreamURLEnvGrammar); err != nil {
+		if err := failOnUnsetEnvRefUnder(path, fmt.Sprintf("upstream %q upstreamUrl", cfg.Upstreams[i].Name), rawFields.upstreamURL[i], upstreamURLEnvGrammar); err != nil {
 			return nil, err
 		}
 	}
 
 	// The argv and Origin legs of the same rule, kept together in one helper.
-	if err := failOnUnsetArgvAndOriginEnvRefs(path, &cfg, rawCommand, rawArgs, rawAllowedOrigins); err != nil {
+	if err := failOnUnsetArgvAndOriginEnvRefs(path, &cfg, rawFields.command, rawFields.args, rawFields.allowedOrigins); err != nil {
 		return nil, err
 	}
 
@@ -621,8 +639,8 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 		label, raw string
 		grammar    envGrammar
 	}{
-		{"audit.log", rawAuditLog, auditLogEnvGrammar},
-		{"audit.keyPath", rawAuditKeyPath, auditKeyPathEnvGrammar},
+		{"audit.log", rawFields.auditLog, auditLogEnvGrammar},
+		{"audit.keyPath", rawFields.auditKeyPath, auditKeyPathEnvGrammar},
 	} {
 		if err := failOnUnsetEnvRefUnder(path, f.label, f.raw, f.grammar); err != nil {
 			return nil, err

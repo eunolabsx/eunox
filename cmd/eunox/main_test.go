@@ -1150,7 +1150,7 @@ func TestFetchRouteLive_UnknownTransportErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error for unknown transport, got nil")
 	}
-	if !strings.Contains(err.Error(), "unknown transport") || !strings.Contains(err.Error(), "weird") {
+	if !strings.Contains(err.Error(), "grpc") || !strings.Contains(err.Error(), "weird") {
 		t.Errorf("error should name the bad transport and the route: %v", err)
 	}
 }

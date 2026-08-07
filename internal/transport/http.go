@@ -292,12 +292,12 @@ type HTTPProxy struct {
 	// initialize registering AFTER the registry is emptied fails closed instead of leaking
 	// its upstream subprocess. See registerSession.
 	shuttingDown bool
-	// reapGen is incremented under mu by reapAllKilledSessions each sweep. registerSession
+	// reapGen is incremented under mu by teardownAllSessionsForGlobalKill each sweep. registerSession
 	// rejects an insert if the generation has advanced since the session began establishing —
 	// closing the race where an initialize that started before a global kill would otherwise
 	// register into the fresh map after the sweep, leaking an undead upstream. Unlike
 	// shuttingDown this is not a permanent latch: a raced registration is simply rejected
-	// (the caller retries). See reapAllKilledSessions and registerSession.
+	// (the caller retries). See teardownAllSessionsForGlobalKill and registerSession.
 	reapGen uint64
 	// revoked wakes the reclaim worker (reclaimOnRevocation). One buffered slot, so a burst
 	// coalesces into one sweep and nothing raised before the worker starts is lost.
@@ -472,7 +472,7 @@ func (p *HTTPProxy) reclaimOnRevocation(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-p.revoked:
-			p.reapKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context, as every other reap site does.
+			p.sweepKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context, as every other reap site does.
 		}
 	}
 }

@@ -338,6 +338,18 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		http.Error(w, "session does not belong to this upstream route", http.StatusConflict)
 		return
 	}
+	// Count the request as in-flight for the WHOLE handler from here — right after the
+	// route-binding check confirms sess is a live registration this request may act on —
+	// not just the enforced-dispatch branch's upstream round trip. Mirrors stdio's own
+	// discipline (it counts in the reader, before dispatch): a request that's denied by a
+	// session gate, forwards a notification, or routes a host response back to the upstream
+	// is real in-flight work too, and previously none of it held inFlight, so the idle
+	// reaper could tear the session down (and teardown drop its decision gate + flow state)
+	// out from under any of those paths, not just a blocked enforced call. Release via defer
+	// so every return below — including a net/http-recovered panic — decrements it exactly
+	// once; the reaper's arms only get MORE conservative by counting more work as active.
+	sess.inFlight.Add(1)
+	defer sess.inFlight.Add(-1)
 	// Run the session-scoped security gates — the per-route audience pin AND the
 	// session-owner binding — on EVERY host-initiated action on this existing session, not
 	// just the enforced (Decide) methods: a same-audience SECOND identity that learned this
@@ -365,7 +377,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// session-gate verdict, one of whose callers runs under the session-registry lock.
 	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
 	// Check the kill switch BEFORE touchRequest so a killed session's denied POSTs can't
-	// keep deferring idle reaping (a request may race reapKilledSession's proactive
+	// keep deferring idle reaping (a request may race teardownSessionByID's proactive
 	// teardown). Gate ONLY touchRequest on it: enforced requests and re-initialize still
 	// flow through the dispatcher below, which re-checks the kill with the precise
 	// per-target audit identifier rather than this coarse method-only check.
@@ -398,7 +410,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// Any notification method outside the forwardable allowlist is a fail-closed
 			// reject too, so a notification-framed novel/unmapped method can't reach the
 			// upstream invisibly while its request-framed twin would be denied and logged.
-			if denyUnmappedHostNotification(r.Context(), asRecorder(route.sink), sessionID, msg) {
+			if denyUnmappedHostNotification(r.Context(), p.errOut(), asRecorder(route.sink), sessionID, msg) {
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -480,24 +492,22 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: too many concurrent requests in flight; retry"))
 			return
 		}
-		// Count the request as in-flight so the idle reaper doesn't tear the session down
-		// while this call blocks on the upstream. Release via defer so a net/http-recovered
-		// panic in dispatchRequest can't leave inFlight stuck (pinning against the reaper)
-		// or leak a slot. Mirrors stdio's deferred hostSem release.
-		sess.inFlight.Add(1)
-		defer func() {
-			sess.inFlight.Add(-1)
-			sess.releaseRequestSlot()
-		}()
+		// Release the request slot via defer so a net/http-recovered panic in dispatchRequest
+		// can't leak it. inFlight itself is now held for the whole handler (see the top of
+		// this function), not just this branch.
+		defer sess.releaseRequestSlot()
 		if p.getSession(sess.id) != sess {
-			// sess was resolved well above (getSession at the top of this function), and every
-			// teardown drain (awaitInFlightDrained, the inFlight.Load()==0 check before
-			// dropDecideGate, awaitAndDropDecideGate) counts only requests that already
-			// incremented inFlight. A request straggling in the window between that resolve and
-			// its own Add(1) above is invisible to the drain, so teardown can drop the session's
-			// pinned decision gate and release its PDP state while this request still holds
-			// neither, then take its turn on a gate the registry no longer owns (two gates for
-			// one anchor) and decide against flow state ReleaseSession already cleared. Every
+			// inFlight is now incremented immediately after the route-binding check at the
+			// top of this function — right after sess was resolved via getSession, with
+			// nothing blocking in between — so the window this re-validates is only that
+			// handful of non-blocking statements, not the session gates, kill checks, and
+			// notification handling this used to run through first. Kept anyway as a
+			// fail-closed backstop rather than removed: async goroutine preemption means even
+			// a gap with no blocking call is not provably zero-width, and every teardown drain
+			// (awaitInFlightDrained, the inFlight.Load()==0 check before dropDecideGate,
+			// awaitAndDropDecideGate) counts only requests that already incremented inFlight —
+			// a straggler the drain missed would otherwise take its turn on a gate the registry
+			// no longer owns, or decide against flow state ReleaseSession already cleared. Every
 			// teardown path deletes from p.sessions before releaseSessionState, so a straggler
 			// whose Add(1) the drain missed observes the deletion here and fails closed instead.
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: session torn down; retry"))
@@ -931,7 +941,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		// Proactively tear every session down rather than leaving reclamation to the idle
 		// reaper, which does not run when sessionIdleTimeoutMs is 0 — otherwise
 		// killed-but-undead sessions would pin capacity and 503 new initializes.
-		p.reapAllKilledSessions() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this response is written. Same rationale as the handleMCPDelete close() site.
+		p.teardownAllSessionsForGlobalKill() //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context — binding it to r.Context() would cancel the teardown the instant this response is written. Same rationale as the handleMCPDelete close() site.
 		p.writeKillResponse(w, killScopeAll, killDimensionGlobal)
 		return
 	}
@@ -949,8 +959,8 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	p.evictSessionStreams(body.SessionID)
 	// Proactively tear the killed session down instead of relying on the idle reaper,
-	// which does not run when sessionIdleTimeoutMs is 0 — see reapKilledSession.
-	p.reapKilledSession(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
+	// which does not run when sessionIdleTimeoutMs is 0 — see teardownSessionByID.
+	p.teardownSessionByID(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
 	p.writeKillResponse(w, body.SessionID, killDimensionSession)
 }
 

@@ -344,7 +344,8 @@ const initUsageExit = 2
 func cmdInit(args []string) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage:
+		w := usageWriter(args)
+		_, _ = fmt.Fprint(w, `Usage:
   eunox init [--transport http] --upstream-url <url> [flags]
   eunox init   --transport stdio [flags] -- <command> [args...]
 
@@ -364,6 +365,7 @@ Exit codes:
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 

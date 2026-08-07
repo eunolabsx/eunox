@@ -266,8 +266,9 @@ var jsonFieldNamesCache sync.Map // reflect.Type -> map[string]bool
 // DisallowUnknownFields: stripping means decoding to a map and re-marshaling, and that
 // round-trip is not identity (it sorts keys and collapses duplicates), so which of two
 // case-variant siblings won would change from JSON's last-wins to byte order — a parser
-// differential introduced by the very check meant to tighten things. Matching is
-// case-insensitive because that is how encoding/json binds, so this rejects exactly the
+// differential introduced by the very check meant to tighten things. Matching folds
+// through FoldJSONKey, the same fold encoding/json's own field binder uses (see its doc:
+// strings.ToLower/EqualFold under-fold runes like U+017F), so this rejects exactly the
 // keys the decode would have ignored, no more.
 func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra ...string) error {
 	var fields map[string]json.RawMessage
@@ -276,10 +277,10 @@ func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra
 	}
 	known := jsonFieldNames(target)
 	for k := range fields {
-		if known[strings.ToLower(k)] {
+		if known[FoldJSONKey(k)] {
 			continue
 		}
-		if slices.ContainsFunc(allowExtra, func(e string) bool { return strings.EqualFold(k, e) }) {
+		if slices.ContainsFunc(allowExtra, func(e string) bool { return FoldJSONKey(k) == FoldJSONKey(e) }) {
 			continue
 		}
 		return fmt.Errorf("%s: unknown field %q", context, k)
@@ -287,10 +288,11 @@ func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra
 	return nil
 }
 
-// jsonFieldNames returns the lowercased JSON field names encoding/json would bind on v,
-// for the unknown-field checks in unmarshalCondition and unmarshalDirective. Lowercased
-// because encoding/json matches field names case-insensitively; an unexported field
-// contributes nothing here, matching what the decoder itself would accept.
+// jsonFieldNames returns the fold-canonicalized JSON field names encoding/json would bind
+// on v, for the unknown-field checks in unmarshalCondition and unmarshalDirective. Folded
+// through FoldJSONKey because encoding/json matches field names case-insensitively via a
+// Unicode simple fold, not plain ASCII lower-casing; an unexported field contributes
+// nothing here, matching what the decoder itself would accept.
 func jsonFieldNames(v any) map[string]bool {
 	t := reflect.TypeOf(v)
 	for t.Kind() == reflect.Pointer {
@@ -317,7 +319,7 @@ func jsonFieldNames(v any) map[string]bool {
 				name = tag
 			}
 		}
-		names[strings.ToLower(name)] = true
+		names[FoldJSONKey(name)] = true
 	}
 	jsonFieldNamesCache.Store(t, names)
 	return names

@@ -53,12 +53,6 @@ func (e *Engine) handleEffectClass(ctx context.Context, cond capability.Conditio
 	if condErr != nil {
 		return condErr
 	}
-	// Defense in depth against a typed-nil *EffectClassCondition (castCondition returns it as
-	// non-error): runConditions already rejects this before dispatch, but an unevaluable
-	// condition must fail closed, never panic (mirrors handleFlowLabel).
-	if ec == nil {
-		return effectDenial(capability.ConditionTypeEffectClass, "effectClass condition is nil and cannot be evaluated", nil)
-	}
 	// The loader rejects an empty allow set and an unknown class, but a programmatically built
 	// condition can carry either — surface both rather than silently admit.
 	if len(ec.Allow) == 0 {
@@ -266,10 +260,6 @@ func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.C
 	br, condErr := castCondition[capability.BlastRadiusCondition](cond)
 	if condErr != nil {
 		return DeferredCommit{}, false, condErr
-	}
-	if br == nil {
-		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius,
-			"blastRadius condition is nil and cannot be evaluated", nil)
 	}
 	if br.Max == nil && !br.HasVelocity() {
 		// The loader requires at least one bound and rejects a half-written pair; a

@@ -396,7 +396,8 @@ func renderLiveReport(rep liveReport, out io.Writer) int {
 func cmdValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage:
+		w := usageWriter(args)
+		_, _ = fmt.Fprint(w, `Usage:
   eunox validate <manifest.yaml> [...] --live --upstream-url <url>
   eunox validate <manifest.yaml> [...] --live --transport stdio -- <cmd> [args...]
   eunox validate --config <eunox.yaml> [--live]
@@ -423,6 +424,7 @@ With --config the exit code is the maximum across all routes.
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 

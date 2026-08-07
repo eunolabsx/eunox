@@ -844,13 +844,22 @@ func (e *ResolvedEffect) AuditDetails() map[string]interface{} {
 }
 
 // SortedEffectClasses returns classes in vocabulary order, for deterministic messages
-// and audit details built from a manifest-authored set.
+// and audit details built from a manifest-authored set. Every vocabulary class sorts
+// before every non-vocabulary one — ranking by (in-vocabulary?, rank-or-name) rather than
+// falling back to a lexical compare only when BOTH sides lack a rank keeps the relation
+// transitive: a lexical fallback keyed on the unranked side alone let a ranked class whose
+// name sorts late (e.g. "reversible") compare arbitrarily against an unranked one, which
+// could form a cycle with a second unranked class and make sort.SliceStable's output
+// order-dependent instead of the deterministic one this function exists to provide.
 func SortedEffectClasses(classes []string) []string {
 	out := append([]string(nil), classes...)
 	sort.SliceStable(out, func(i, j int) bool {
 		ri, oki := effectClassRank[out[i]]
 		rj, okj := effectClassRank[out[j]]
-		if oki && okj {
+		if oki != okj {
+			return oki // ranked classes sort before every unranked one
+		}
+		if oki {
 			return ri < rj
 		}
 		return out[i] < out[j]

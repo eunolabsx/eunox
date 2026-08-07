@@ -6,6 +6,7 @@ package capability
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 )
 
@@ -43,49 +44,41 @@ func (w *DirectiveWrapper) UnmarshalJSON(data []byte) error {
 }
 
 func marshalDirective(directive Directive) ([]byte, error) {
+	// A typed-nil pointer slips past DirectiveWrapper.MarshalJSON's nil-interface
+	// guard; DirectiveType() has a value receiver and would dereference nil and
+	// panic. Guard it once here, mirroring conditions.go's marshalCondition.
+	if IsTypedNil(directive) {
+		return []byte("null"), nil
+	}
+	// Normalize a VALUE to its address and re-dispatch, so each directive type's
+	// marshaling is written once (in its pointer arm) instead of twice; see
+	// marshalCondition for why the pointer arm is the one that needs the `type
+	// alias` trick.
+	if rv := reflect.ValueOf(directive); rv.Kind() != reflect.Pointer {
+		pv := reflect.New(rv.Type())
+		pv.Elem().Set(rv)
+		ptr, ok := pv.Interface().(Directive)
+		if !ok {
+			// Unreachable for a value receiver (a *T method set contains T's methods),
+			// but fail closed rather than panic on a future receiver change.
+			return nil, fmt.Errorf("unsupported directive payload: %T", directive)
+		}
+		return marshalDirective(ptr)
+	}
 	switch typed := directive.(type) {
-	case RedactFieldsDirective:
-		type alias RedactFieldsDirective
-		return json.Marshal(struct {
-			directiveEnvelope
-			alias
-		}{directiveEnvelope{Type: typed.DirectiveType()}, alias(typed)})
 	case *RedactFieldsDirective:
-		// A typed-nil pointer slips past MarshalJSON's nil-interface guard;
-		// DirectiveType() has a value receiver and would dereference nil and panic.
-		if typed == nil {
-			return []byte("null"), nil
-		}
 		type alias RedactFieldsDirective
 		return json.Marshal(struct {
 			directiveEnvelope
 			*alias
 		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
-	case LabelOutputDirective:
-		type alias LabelOutputDirective
-		return json.Marshal(struct {
-			directiveEnvelope
-			alias
-		}{directiveEnvelope{Type: typed.DirectiveType()}, alias(typed)})
 	case *LabelOutputDirective:
-		if typed == nil {
-			return []byte("null"), nil
-		}
 		type alias LabelOutputDirective
 		return json.Marshal(struct {
 			directiveEnvelope
 			*alias
 		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
-	case DeclassifyDirective:
-		type alias DeclassifyDirective
-		return json.Marshal(struct {
-			directiveEnvelope
-			alias
-		}{directiveEnvelope{Type: typed.DirectiveType()}, alias(typed)})
 	case *DeclassifyDirective:
-		if typed == nil {
-			return []byte("null"), nil
-		}
 		type alias DeclassifyDirective
 		return json.Marshal(struct {
 			directiveEnvelope

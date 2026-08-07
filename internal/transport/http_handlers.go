@@ -10,8 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
-	"os"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -125,9 +125,9 @@ func IsInfraDenialCode(code string) bool {
 //
 // The reason never embeds the underlying error text (which can carry a remote upstream's
 // internal hostname/path), so the host only ever sees the failure class. Only the generic
-// UPSTREAM_ERROR branch logs the full error to stderr — the others are already on the tape,
-// so re-logging them would spam stderr under a sustained outage.
-func upstreamErrInfo(err error, upstreamTimeMs int) (code, reason string, rpcCode int) {
+// UPSTREAM_ERROR branch logs the full error to w — the others are already on the tape, so
+// re-logging them would spam it under a sustained outage.
+func upstreamErrInfo(w io.Writer, err error, upstreamTimeMs int) (code, reason string, rpcCode int) {
 	switch {
 	case errors.Is(err, errDuplicateID):
 		// A host pipelined a request reusing an in-flight JSON-RPC id: a client fault, not an
@@ -155,7 +155,7 @@ func upstreamErrInfo(err error, upstreamTimeMs int) (code, reason string, rpcCod
 		if errors.As(err, &ne) && ne.Timeout() {
 			return codeUpstreamTimeout, upstreamTimeoutReason(upstreamTimeMs), jsonRPCCodeInternalError
 		}
-		fmt.Fprintf(os.Stderr, "[eunox] upstream error: %v\n", err)
+		_, _ = fmt.Fprintf(resolvedErrOut(w), "[eunox] upstream error: %v\n", err)
 		return codeUpstreamError, "upstream error", jsonRPCCodeInternalError
 	}
 }
@@ -192,6 +192,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     sess.callUpstream,
 			strictAuditState: p.strictAudit(),
+			errOut:           p.errOut(),
 		},
 		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
@@ -210,6 +211,7 @@ func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRo
 		rec:              asRecorder(route.sink),
 		sessionID:        "", // no session exists yet on the creating initialize
 		strictAuditState: p.strictAudit(),
+		errOut:           p.errOut(),
 	}
 	// initialize addresses no sub-target, so audit id/method/denial target all collapse to
 	// "initialize" (see dispatchList for the same pattern). Zero decision: nothing exists yet
@@ -279,5 +281,6 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		anchorSplit:      sess.spansAnchors,
 		strictAuditState: p.strictAudit(),
 		pdp:              rt.pdp,
+		errOut:           p.errOut(),
 	})
 }

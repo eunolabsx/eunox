@@ -38,7 +38,8 @@ func killControlURL(host string, port int) string {
 func cmdKill(args []string) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage: eunox kill [flags] <session-id|all>
+		w := usageWriter(args)
+		_, _ = fmt.Fprint(w, `Usage: eunox kill [flags] <session-id|all>
        eunox kill [flags] --session <session-id>
        eunox kill [flags] --agent <agent-id>
 
@@ -75,6 +76,7 @@ revocation channel: it is a single process, so stop that process to halt it.
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 	port := fs.Int("port", 3000, "Port the HTTP proxy is listening on (HTTP transport).")

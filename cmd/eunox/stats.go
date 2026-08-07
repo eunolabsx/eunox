@@ -24,7 +24,8 @@ import (
 func cmdStats(args []string) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage: eunox stats [flags]
+		w := usageWriter(args)
+		_, _ = fmt.Fprint(w, `Usage: eunox stats [flags]
 
 Print a denial count histogram from the local audit log. Denials are split
 into BLOCKED (enforce-mode — request was rejected) and OBSERVED (audit-mode
@@ -34,6 +35,7 @@ exactly what would be blocked if enforcement were enabled.
 
 Flags:
 `)
+		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")

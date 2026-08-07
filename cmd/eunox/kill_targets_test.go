@@ -239,7 +239,7 @@ func TestCmdKill_AgentRejectedBeforeTheHTTPTransport(t *testing.T) {
 // TestKillUsage_DocumentsTargetingFlags keeps the new dimensions discoverable: the usage
 // block is the primary documentation for this command.
 func TestKillUsage_DocumentsTargetingFlags(t *testing.T) {
-	out := captureStderr(t, func() { require.Zero(t, cmdKill([]string{"-h"})) })
+	out := captureStdout(t, func() { require.Zero(t, cmdKill([]string{"-h"})) })
 	require.Contains(t, out, "-agent")
 	require.Contains(t, out, "-session")
 	require.Contains(t, out, "Agent kills never expire")

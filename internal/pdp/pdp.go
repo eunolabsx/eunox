@@ -554,11 +554,6 @@ func NewAlwaysAllowPDP(ks killswitch.Checker) AlwaysAllowPDP {
 	return AlwaysAllowPDP{ks: ks}
 }
 
-// wiretapAllow builds the allow response audit-only (wiretap) mode returns.
-func (p AlwaysAllowPDP) wiretapAllow() capability.EnforceResponse {
-	return newAllowResponse(p.clock)
-}
-
 // allowUnlessKilled is every Decide* method's whole body: audit/wiretap mode applies no
 // policy and forwards after logging, unless the kill switch is active — which hard-blocks
 // even a wiretap route.
@@ -571,7 +566,7 @@ func (p AlwaysAllowPDP) allowUnlessKilled(ctx context.Context, sessionID string)
 	if deny := p.CheckKill(ctx, sessionID); deny != nil {
 		return *deny
 	}
-	return p.wiretapAllow()
+	return newAllowResponse(p.clock)
 }
 
 // clockNow returns the current instant from c when non-nil, falling back to the
@@ -985,13 +980,13 @@ func collectSequenceAntecedents(caps []capability.Constraint) map[string]struct{
 	var names map[string]struct{}
 	for i := range caps {
 		for _, cond := range caps[i].Conditions {
-			sb, ok := cond.(capability.SequenceBlockCondition)
-			if !ok {
-				p, isPtr := cond.(*capability.SequenceBlockCondition)
-				if !isPtr || p == nil {
-					continue
-				}
-				sb = *p
+			sb, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](cond)
+			if !ok || sb == nil {
+				// A typed-nil *SequenceBlockCondition is returned as-is by AsValueOrPointer
+				// (see its doc) rather than dereferenced — guard it here too, matching every
+				// other call site, so a programmatically built condition fails closed
+				// (skipped) instead of panicking on sb.AfterTools below.
+				continue
 			}
 			for _, prior := range sb.AfterTools {
 				bare := strings.TrimSpace(enforcement.StripEnginePrefix(prior))

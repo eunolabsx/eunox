@@ -14,16 +14,18 @@ import (
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
-// TestHandleSessionPost_TeardownRaceAfterInFlightIncrement is the regression for H3: a
-// request whose session is torn down in the window between handleSessionPost's initial
-// getSession resolve and its own sess.inFlight.Add(1) must not take its decision turn on a
-// stale, no-longer-registered session — every teardown drain
-// (awaitInFlightDrained/dropDecideGate) only counts requests that already incremented, so
-// without a re-validation this straggler would decide against a pinned gate and PDP state
-// the teardown already released. It uses killGateHookPDP (defined alongside
-// TestInitialize_ReapGenCapturedBeforeKillGate) to tear the session out of the registry
-// exactly inside that window: handleSessionPost's existing-session CheckKill call sits
-// between the initial resolve and Add(1).
+// TestHandleSessionPost_TeardownRaceAfterInFlightIncrement is the regression for H3, in its
+// #234/C1 shape: inFlight is now incremented for the WHOLE handler (right after the
+// route-binding check, before the session gates and the existing-session CheckKill this test
+// hooks — see TestHandleSessionPost_InFlightCoversWholeHandler for that), so a session torn
+// out of the registry from inside CheckKill can no longer land in the narrow resolve-to-Add(1)
+// gap the original H3 fix re-validated against. This test now covers the WIDER window the
+// re-validation is kept as a fail-closed backstop for: a teardown landing anywhere between the
+// initial getSession resolve and the enforced-dispatch branch's own re-check must still deny
+// with a retryable error rather than take a decision turn on a gate/PDP state the teardown
+// already released. It uses killGateHookPDP (defined alongside
+// TestInitialize_ReapGenCapturedBeforeKillGate) to tear the session out of the registry from
+// inside CheckKill.
 func TestHandleSessionPost_TeardownRaceAfterInFlightIncrement(t *testing.T) {
 	t.Parallel()
 	ks := killswitch.NewInMemory()
@@ -65,5 +67,65 @@ func TestHandleSessionPost_TeardownRaceAfterInFlightIncrement(t *testing.T) {
 	}
 	if got := sess.inFlight.Load(); got != 0 {
 		t.Errorf("inFlight = %d, want 0: the deferred release must still run on the fail-closed path", got)
+	}
+}
+
+// TestHandleSessionPost_InFlightCoversWholeHandler pins #234/C1's adopted shape: inFlight is
+// incremented right after the route-binding check, before the session gates and the
+// existing-session CheckKill run — not only around the enforced-dispatch branch's upstream
+// call, as it was before. It hooks CheckKill (which this request reaches well before the old
+// Add(1) site) to observe inFlight mid-handler, proving the reaper would already spare this
+// session at that point; and it drives a notification (which never reaches the old Add(1) site
+// at all) to prove inFlight still returns to 0 on that path's own early return, so the wider
+// counting window can't leak.
+func TestHandleSessionPost_InFlightCoversWholeHandler(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+
+	var observedDuringCheckKill int64
+	route := &UpstreamRoute{name: "up1", sink: &routeSink{}}
+	sess := newTestSession(&httpSession{id: "sess-wide", route: route, done: make(chan struct{})})
+	route.pdp = killGateHookPDP{
+		// No constraints: tools/call denies immediately after the decision, so this test
+		// (which only cares about inFlight during CheckKill, run before that decision) never
+		// reaches callUpstream, which this hand-built session has no working upWriter for.
+		PolicyDecisionPoint: newTestManifestPDPWithKS(ks),
+		onCheckKill: func() {
+			observedDuringCheckKill = sess.inFlight.Load()
+		},
+	}
+	proxy := newTestHTTPProxy()
+	proxy.sessions["sess-wide"] = sess
+
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call", Params: json.RawMessage(`{"name":"x"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, "sess-wide")
+	w := httptest.NewRecorder()
+
+	proxy.handleSessionPost(w, req, route, "sess-wide", msg)
+
+	if observedDuringCheckKill != 1 {
+		t.Errorf("inFlight during CheckKill = %d, want 1: it must be counted before the session gates run, not only around the enforced dispatch below them", observedDuringCheckKill)
+	}
+	if got := sess.inFlight.Load(); got != 0 {
+		t.Errorf("inFlight = %d, want 0 after the handler returns", got)
+	}
+
+	// A notification never reaches the old Add(1) site (inside the enforced-dispatch else
+	// branch) at all, so it is the clearest proof the new site's defer still fires on a path
+	// that isn't an enforced request.
+	observedDuringCheckKill = -1
+	notif := mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/does-not-exist"}
+	req2 := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req2.Header.Set(SessionHeader, "sess-wide")
+	w2 := httptest.NewRecorder()
+
+	proxy.handleSessionPost(w2, req2, route, "sess-wide", notif)
+
+	if observedDuringCheckKill != 1 {
+		t.Errorf("inFlight during CheckKill (notification path) = %d, want 1", observedDuringCheckKill)
+	}
+	if got := sess.inFlight.Load(); got != 0 {
+		t.Errorf("inFlight = %d, want 0 after a notification-path return", got)
 	}
 }

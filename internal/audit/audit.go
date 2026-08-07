@@ -1063,9 +1063,9 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	// that it was. Run here, while this goroutine is still the only one touching the sink
 	// and before the drainer starts, so it needs no coordination with a concurrent
 	// rotation; pruneRotated publishes its own retention-stalled status either way.
-	if s.retain > 0 {
-		s.pruneRotated()
-	}
+	// Unconditional, like its other three call sites: pruneRotated's own prunePass is
+	// already a no-op when retain <= 0.
+	s.pruneRotated()
 
 	s.wg.Add(1)
 	go s.drain()
@@ -1581,11 +1581,14 @@ func (s *Sink) enqueue(rec auditRecord) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
-		// Shutting down; the drainer may already be gone. Count the loss (surfaced by
-		// Close's warning and DroppedRecords) without the queue-full message, which
-		// would misattribute the cause.
+		// Shutting down; the drainer may already be gone, and Close releases s.mu
+		// before waiting for it to exit — so this call can land either side of the
+		// drainer's terminal flushDropMarker, racily. A bucket recorded after that
+		// flush has already run is never read again, so per-method/target detail on
+		// this arm is best-effort; count only the aggregate (surfaced by Close's
+		// warning and DroppedRecords), which is not racy, without the queue-full
+		// message, which would misattribute the cause.
 		s.dropped.Add(1)
-		s.recordDropBucket(rec.Method, rec.Target)
 		return ""
 	}
 	// RESERVE before the send, and release on either drop arm. Adding the bytes after a

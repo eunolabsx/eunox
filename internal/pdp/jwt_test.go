@@ -738,6 +738,48 @@ func TestJWTPDP_ValidateToken_MissingIatRejected(t *testing.T) {
 	}
 }
 
+// TestJWTPDP_ValidateToken_IssuedInFutureRejected covers a token whose iat postdates
+// the validation instant: go-jose's jwtErrIssuedInFuture classification exists
+// (ClassifyJWTError maps jwt.ErrIssuedInTheFuture to it) but had no table case driving
+// it through the real ValidateToken path, so a go-jose leeway/clock-skew regression
+// here would go unnoticed.
+func TestJWTPDP_ValidateToken_IssuedInFutureRejected(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	pdp := makeJWTPDP(t, srv, "https://idp.example.com", "eunox", nil)
+
+	sig, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.ES256, Key: key.priv},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", key.kid),
+	)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	stdClaims := jwt.Claims{
+		Issuer:   "https://idp.example.com",
+		Subject:  "agent-1",
+		Audience: jwt.Audience{"eunox"},
+		Expiry:   jwt.NewNumericDate(time.Now().Add(2 * time.Hour)),
+		// Well past any leeway, so this cannot pass by clock-skew tolerance.
+		IssuedAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}
+	caps := []string{"tool:read_file"}
+	payload := idpJWTPayload{MCP: mcpClaimSet{Version: mcpClaimVersion, Capabilities: &caps, AgentID: "bot-9"}}
+	token, err := jwt.Signed(sig).Claims(stdClaims).Claims(payload).Serialize()
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	_, err = pdp.ValidateToken(context.Background(), "Bearer "+token)
+	if err == nil {
+		t.Fatal("expected an error for a token with iat in the future")
+	}
+	if got := ClassifyJWTError(err); got != jwtErrIssuedInFuture {
+		t.Errorf("ClassifyJWTError(err) = %q, want %q", got, jwtErrIssuedInFuture)
+	}
+}
+
 func TestJWTPDP_ValidateToken_ExtraClaimsReachRegoInput(t *testing.T) {
 
 	key := newTestKey(t, "k1")
