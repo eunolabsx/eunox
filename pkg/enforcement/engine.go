@@ -749,13 +749,30 @@ func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceR
 //
 // The engine's own deferred pass does NOT come through here: it prepares every condition
 // and admits the whole set atomically, the only way a multi-condition constraint gets a
-// TOCTOU-free commit.
+// TOCTOU-free commit. Since deferral is keyed by condition TYPE, that pass takes EVERY
+// committing condition, and this path is reached only by a direct Handle call — which is
+// why its skip assertion below is written out rather than assumed unreachable.
 func (e *Engine) prepareAndAdmit(ctx context.Context, h CommittingConditionHandler, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
 	commit, skip, condErr := h.PrepareCommit(ctx, cond, req)
 	if condErr != nil {
 		return condErr
 	}
-	if skip || !commit.Commits() {
+	if skip {
+		// The same contract commitDeferredConditions asserts, for the same reason it fails
+		// closed on: honoring a skip the context did not authorize lets a handler decline to
+		// spend its own budget on a call nothing refused. Asserted here too so the contract
+		// holds on BOTH paths a committing handler can be driven through, rather than being
+		// enforced only where the engine happens to route today.
+		if !SkipQuota(ctx) {
+			return &ConditionError{
+				Code:          capability.ErrCodeConditionFailed,
+				ConditionType: cond.ConditionType(),
+				Message:       fmt.Sprintf("committing condition %q reported a skip; skip must be derived solely from request context", cond.ConditionType()),
+			}
+		}
+		return nil
+	}
+	if !commit.Commits() {
 		return nil
 	}
 	if e.counter == nil {

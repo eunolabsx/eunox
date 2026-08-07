@@ -73,6 +73,12 @@ func (r *Redis) newMember(now time.Time) string {
 // NewRedis creates a Redis-backed call counter. Panics if crypto/rand cannot supply the
 // per-instance entropy for ZADD member uniqueness — a silent fallback would risk
 // reintroducing the cross-replica collision the entropy prevents.
+//
+// Redis Cluster is NOT supported: a multi-bucket AdmitAll is one multi-key EVAL whose keys
+// carry distinct window suffixes, so a cluster hashes them to different slots and refuses
+// the script with CROSSSLOT (a deny — fail closed, never an over-admission). Stated here
+// because the constructor takes any redis.Cmdable, a *redis.ClusterClient included, and the
+// posture is otherwise only discoverable from AdmitAll's own doc.
 func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {

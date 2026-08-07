@@ -348,7 +348,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		redisTLS:             fs.Bool("redis-tls", false, "Enable TLS for the Redis connection."),
 		killswitchFailOpen:   fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
 		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
-		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, "How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default 720h / 30 days). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr."),
+		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, fmt.Sprintf("How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default %s). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr.", describeDefaultSessionKillTTL())),
 		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct ANCHORS — one key per session, or under\ntaskAnchoredState one per TASK, which OUTLIVES the session that created it. Both\nstores reclaim an idle anchor on a periodic sweep, so the ceiling bounds LIVE\nanchors; a warning is logged as it is approached. 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
 
 		// Compliance flags.
@@ -765,6 +765,14 @@ func publishSessionKillTTL(parent context.Context, ksRedis *killswitch.Redis) {
 		fmt.Fprintf(os.Stderr, "[eunox] WARNING: this Redis already advertised a session-kill TTL of %s, now replaced by %s. If another proxy instance is running with the old value, the two disagree and `eunox kill` applies whichever was published last; align --killswitch-session-ttl across instances.\n",
 			killswitch.DescribeSessionKillTTL(prior), killswitch.DescribeSessionKillTTL(ksRedis.SessionKillTTL()))
 	}
+}
+
+// describeDefaultSessionKillTTL renders the DEFAULT session-kill tombstone lifetime for the
+// two --killswitch-session-ttl help strings. Both halves come from the constant, so neither
+// spelling can drift from the lifetime Redis actually applies the way the prose they replace
+// had to be kept in step by hand, in two commands.
+func describeDefaultSessionKillTTL() string {
+	return fmt.Sprintf("%s / %d days", killswitch.DefaultSessionKillTTL, int64(killswitch.DefaultSessionKillTTL/(24*time.Hour)))
 }
 
 // sessionKillTTLNotice renders the startup line describing how long a session-kill

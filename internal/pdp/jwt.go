@@ -1567,12 +1567,6 @@ func parseCapHeads(caps []string) []capHead {
 	return heads
 }
 
-// buildConstraintsFromClaims is the fallback for callers holding only raw claim
-// strings; the hot path uses buildConstraintsFromParsed against cached heads.
-func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capability.Constraint {
-	return buildConstraintsFromParsed(parseCapHeads(caps), target)
-}
-
 // claimNamesTargetButFailedToParse reports whether some claim MATCHES target but
 // contributed no constraint because its condition suffix would not parse — so the
 // deny message can distinguish "not in your token" from "malformed in your token",
@@ -1592,9 +1586,8 @@ func claimNamesTargetButFailedToParse(claims *JWTClaims, target EnforceTarget) b
 	return false
 }
 
-// buildConstraintsFromParsed is the matching/condition phase shared by the hot path
-// and buildConstraintsFromClaims; the expensive parseCondSuffix runs only for claims
-// that actually match target.
+// buildConstraintsFromParsed is the matching/condition phase of claim evaluation; the
+// expensive parseCondSuffix runs only for claims that actually match target.
 func buildConstraintsFromParsed(heads []capHead, target EnforceTarget) []capability.Constraint {
 	var out []capability.Constraint
 	for _, h := range heads {

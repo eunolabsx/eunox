@@ -306,6 +306,20 @@ Section conventions:
 
 ### Changed
 
+- **`killswitch.Redis.Status` fails closed before `Start`.** An instance that never
+  seeded its cache holds no kill state and no refresh error, so the snapshot it built —
+  returned with a **nil** error — was byte-identical to a confirmed "nothing is killed".
+  `ShouldBlock` already refused exactly that shape with `ErrNotStarted`; `Status` now
+  does too, and returns no snapshot rather than one an unchecked caller could report as
+  an all-clear. A *degraded* (stale) cache is still reported, unchanged —
+  `HealthStatus()` remains the freshness signal. Library-facing only: nothing in the
+  binary queries an unstarted switch. **Migration:** `Start` before `Status`, or handle
+  `ErrNotStarted`. See `docs/adr/0003-redis-killswitch-fail-open.md`.
+- Both `--killswitch-session-ttl` help strings (`proxy` and `kill`) now render the
+  default tombstone lifetime **from** `killswitch.DefaultSessionKillTTL` instead of
+  restating it as prose in two commands, so raising the default cannot leave either one
+  telling operators the old value. The rendered text changes from `720h / 30 days` to
+  `720h0m0s / 30 days`.
 - **BREAKING (pre-1.0): a session on a task-anchored route may span tasks; its
   server-initiated leg is what pays.** Such a session used to be pinned to one anchor, and a
   request resolving another was refused (`session_anchor_mismatch`) — fail-closed, and with no
@@ -982,6 +996,16 @@ Section conventions:
 
 ### Fixed
 
+- **A committing condition's own `Handle` asserts the skip contract the atomic commit
+  already did.** `CommittingConditionHandler` requires `skip` to be derived solely from the
+  request context (`SkipQuota`), because the atomic multi-bucket commit treats one bucket's
+  skip as skipping the whole deferred set — and that path hard-denies a handler reporting it
+  for any other reason. The single-condition path (`prepareAndAdmit`, reached through a
+  handler's own `Handle` — the documented `WithConditionHandler` seam) honored `skip`
+  unconditionally, failing **open** exactly where its sibling fails closed: a handler could
+  decline to spend its own budget on a call nothing had refused. Both now refuse an
+  unauthorized skip with `CONDITION_FAILED`. An authorized skip — observe mode, where the
+  context does carry `SkipQuota` — passes as before.
 - **The harden path applies a delegation chain to its verdict, not only to its obligations.**
   `HardenRefusal` composes this PDP's verdicts onto a refusal the JWT layer produced. Its
   obligation fill read the chain off the context and applied the chain's composed

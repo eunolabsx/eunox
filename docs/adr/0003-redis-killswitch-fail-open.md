@@ -108,6 +108,11 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   reports the same cause, checked in the same order as `ShouldBlock`'s gates:
   reporting healthy there would publish `status: "ok"` on `/healthz` through a
   *total* data-plane outage — the state in which a green probe misleads most.
+  `Status()` refuses with the same sentinel and returns no snapshot: the empty one
+  an unstarted cache can build is byte-identical to a confirmed all-clear, so
+  reporting it with a nil error would answer a question the switch has no state to
+  answer. A *degraded* (stale) cache is still reported rather than refused —
+  `HealthStatus()` remains the authoritative freshness signal.
 
 - **Stopped is distinct from unreachable.** Once the kill switch's `Start` context
   is canceled (`Stop()`, or the caller's own context), the reconcile and pub/sub

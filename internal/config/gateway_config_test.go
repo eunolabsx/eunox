@@ -686,9 +686,9 @@ upstreams:
 	}
 }
 
-// expandEnvRefs substitutes a set variable and leaves an unset reference intact
-// (fail closed: an unset secret reference becomes an unguessable literal, never an
-// empty/disabled value). Both $VAR and ${VAR} forms are handled.
+// Under the default (full) grammar, expansion substitutes a set variable and leaves an
+// unset reference intact (fail closed: an unset secret reference becomes an unguessable
+// literal, never an empty/disabled value). Both $VAR and ${VAR} forms are handled.
 func TestExpandEnvRefs(t *testing.T) {
 	t.Setenv("EUNOX_TEST_TOKEN", "s3cret")
 
@@ -700,8 +700,8 @@ func TestExpandEnvRefs(t *testing.T) {
 		"no refs here":                "no refs here",
 	}
 	for in, want := range cases {
-		if got := expandEnvRefs(in); got != want {
-			t.Errorf("expandEnvRefs(%q) = %q, want %q", in, got, want)
+		if got := expandEnvRefsUnder(in, envGrammarFull); got != want {
+			t.Errorf("expandEnvRefsUnder(%q, envGrammarFull) = %q, want %q", in, got, want)
 		}
 	}
 }

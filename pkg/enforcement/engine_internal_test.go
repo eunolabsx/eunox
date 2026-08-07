@@ -290,6 +290,36 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	}
 }
 
+// TestPrepareAndAdmit_NonUniformSkipFailsClosed pins the single-condition twin of the
+// test above, driven through a committing handler's own Handle — the documented
+// WithConditionHandler seam, and the only way this path is reached, since the engine's
+// own flow always defers a committing condition to the atomic commit. A skip the request
+// context did not authorize must deny here exactly as it does there; honoring it let a
+// handler decline to spend its own budget on a call nothing had refused.
+func TestPrepareAndAdmit_NonUniformSkipFailsClosed(t *testing.T) {
+	handler := nonUniformSkipHandler{}
+	e := New(WithCallCounter(callcounter.NewInMemory()), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	handler.e = e
+
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
+	cond := &capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}
+
+	// No WithSkipQuota on the context: the handler's unconditional skip is unauthorized.
+	condErr := handler.Handle(context.Background(), cond, req)
+	if condErr == nil {
+		t.Fatal("Handle returned nil (allow) for a skip the request context did not authorize — want a fail-closed CONDITION_FAILED error")
+	}
+	if condErr.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("condErr = %+v, want code %q", condErr, capability.ErrCodeConditionFailed)
+	}
+
+	// The assertion refuses an UNAUTHORIZED skip, not skipping: the same handler under
+	// observe mode, where the context does authorize it, still passes.
+	if condErr := handler.Handle(WithSkipQuota(context.Background()), cond, req); condErr != nil {
+		t.Fatalf("observe mode: Handle = %+v, want nil (SkipQuota authorizes the skip)", condErr)
+	}
+}
+
 // nilDenyHandler is a custom CommittingConditionHandler whose PrepareCommit
 // derives a real bucket (Key/WindowSecs/Limit) via the built-in maxCallsBucket
 // but deliberately leaves Deny nil — a handler bug the atomic commit must not
@@ -929,24 +959,27 @@ func TestSchemaTypeCompatible(t *testing.T) {
 	}
 }
 
+// A manifest condition may decode as either a value or a pointer, so the cast every
+// handler runs must accept both and still refuse a different condition type. Exercised
+// through capability.AsValueOrPointer, the shared helper castCondition casts with.
 func TestAsSequenceBlock_PointerValueAndMismatch(t *testing.T) {
 	t.Parallel()
 
 	// Pointer form.
 	ptr := &capability.SequenceBlockCondition{}
-	if got, ok := asCondition[capability.SequenceBlockCondition](ptr); !ok || got != ptr {
+	if got, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](ptr); !ok || got != ptr {
 		t.Errorf("pointer form: got (%v,%v), want (%v,true)", got, ok, ptr)
 	}
 
 	// Value form: must be normalised to a non-nil pointer.
 	val := capability.SequenceBlockCondition{}
-	if got, ok := asCondition[capability.SequenceBlockCondition](val); !ok || got == nil {
+	if got, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](val); !ok || got == nil {
 		t.Errorf("value form: got (%v,%v), want (non-nil,true)", got, ok)
 	}
 
 	// A different condition type must not match.
 	other := &capability.MaxCallsCondition{}
-	if got, ok := asCondition[capability.SequenceBlockCondition](other); ok || got != nil {
+	if got, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](other); ok || got != nil {
 		t.Errorf("mismatch: got (%v,%v), want (nil,false)", got, ok)
 	}
 }

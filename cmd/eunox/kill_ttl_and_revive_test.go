@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -582,6 +583,25 @@ func TestKillUsage_DocumentsRevive(t *testing.T) {
 	out := captureStdout(t, func() { require.Zero(t, cmdKill([]string{"-h"})) })
 	require.Contains(t, out, "-revive")
 	require.Contains(t, out, "--revive")
+}
+
+// TestSessionKillTTLHelp_DerivesTheDefaultFromTheConstant: both --killswitch-session-ttl
+// help strings used to spell the default lifetime as prose ("720h / 30 days"), in two
+// commands, while the value they describe lives in pkg/killswitch — so changing it there
+// would have left both stating the old one to operators. Pin that each renders the
+// constant instead.
+func TestSessionKillTTLHelp_DerivesTheDefaultFromTheConstant(t *testing.T) {
+	rendered := describeDefaultSessionKillTTL()
+	require.Contains(t, rendered, killswitch.DefaultSessionKillTTL.String(),
+		"the rendered default must come from the constant, not a restatement of it")
+
+	killHelp := captureStdout(t, func() { require.Zero(t, cmdKill([]string{"-h"})) })
+	require.Contains(t, killHelp, rendered)
+
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	registerProxyFlags(fs)
+	proxyHelp := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
+	require.Contains(t, proxyHelp, rendered)
 }
 
 // TestSessionKillTTLNotice_PointsAtARealCommand: with expiry disabled the banner used to
