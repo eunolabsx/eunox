@@ -1414,25 +1414,23 @@ func asInterfaceSlice(v interface{}) ([]interface{}, bool) {
 	return nil, false
 }
 
-// asCondition returns cond as *T, accepting either a *T or a value T, since a manifest
-// condition may decode into either form. Delegates to capability.AsValueOrPointer, shared
-// with the directive-side predicates, so the type-switch pattern lives in one place.
-func asCondition[T any](cond capability.Condition) (*T, bool) {
-	return capability.AsValueOrPointer[T](cond)
-}
-
 // castCondition casts cond to *T and, on a type mismatch, builds the ConditionError every
 // handler returns for it. T is constrained to capability.Condition so condType is DERIVED
 // from a zero T's own ConditionType() rather than passed separately — a prior version's
 // string parameter let a call site pair the wrong ConditionType constant with T and
 // compile silently, corrupting the audit tape.
 //
-// A TYPED-NIL pointer handed to an exported predicate matches asCondition's `case *T` arm
-// as (nil, nil), which every handler would then dereference and panic on
-// (fail-open-via-crash); refused here once rather than at each handler, mirroring
+// The cast goes through capability.AsValueOrPointer — shared with the directive-side
+// predicates, so the value-or-pointer type switch lives in one place — since a manifest
+// condition may decode into either form.
+//
+// A TYPED-NIL pointer handed to an exported predicate is returned AS-IS by
+// AsValueOrPointer's `case *T` arm — (nil, true), so ok alone does not refuse it — and every
+// handler would then dereference it and panic (fail-open-via-crash). The `t == nil` half of
+// the guard below is what catches that, once here rather than at each handler, mirroring
 // CollectObligations' typed-nil guard for directives.
 func castCondition[T capability.Condition](cond capability.Condition) (*T, *ConditionError) {
-	t, ok := asCondition[T](cond)
+	t, ok := capability.AsValueOrPointer[T](cond)
 	if !ok || t == nil {
 		var zero T
 		condType := zero.ConditionType()

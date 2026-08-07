@@ -28,6 +28,14 @@ import (
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
+// buildConstraintsFromClaims runs both claim-parsing phases over RAW claim strings, the
+// form a test states a case in. Production never holds raw claims at this point — the hot
+// path decides against heads parsed once and cached on the token — so this composition
+// lives here rather than in jwt.go.
+func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capability.Constraint {
+	return buildConstraintsFromParsed(parseCapHeads(caps), target)
+}
+
 // testKey holds an ECDSA key pair for signing test JWTs.
 type testKey struct {
 	priv *ecdsa.PrivateKey
@@ -3008,12 +3016,10 @@ func TestJWTPDP_DecideSampling_KilledAgent_Denied(t *testing.T) {
 	}
 }
 
-// makeJWTCtx is a convenience wrapper that validates a token and returns the
-// enriched context.  It calls t.Fatal on any error.
 // TestJWTPDP_Decide_MatchingClaimConditionEnforcedAmongNoise guards the lazy
-// reorder: buildConstraintsFromClaims now performs the cheap namespace/bare-name
-// match before parsing a claim's condition suffix, so non-matching claims never pay
-// for condition parsing. This test proves the optimization is behavior-preserving —
+// reorder: claim evaluation performs the cheap namespace/bare-name match
+// (parseCapHeads) before parsing a claim's condition suffix, so non-matching claims
+// never pay for condition parsing. This test proves the optimization is behavior-preserving —
 // the matching claim's condition is still parsed and enforced, and non-matching
 // conditioned claims are ignored — by surrounding one conditioned matching claim
 // with several non-matching conditioned claims.
@@ -3040,6 +3046,7 @@ func TestJWTPDP_Decide_MatchingClaimConditionEnforcedAmongNoise(t *testing.T) {
 	}
 }
 
+// makeJWTCtx validates a token and returns the enriched context, calling t.Fatal on any error.
 func makeJWTCtx(t *testing.T, pdp *JWTPDP, token string) context.Context {
 	t.Helper()
 	ctx, err := pdp.ValidateToken(context.Background(), "Bearer "+token)

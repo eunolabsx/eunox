@@ -73,6 +73,10 @@ func (r *Redis) newMember(now time.Time) string {
 // NewRedis creates a Redis-backed call counter. Panics if crypto/rand cannot supply the
 // per-instance entropy for ZADD member uniqueness — a silent fallback would risk
 // reintroducing the cross-replica collision the entropy prevents.
+//
+// Redis Cluster is NOT supported — see AdmitAll for the mechanism (a multi-key EVAL a
+// cluster can refuse with CROSSSLOT). Stated at the constructor because that is where a
+// *redis.ClusterClient is wired in, and redis.Cmdable accepts one.
 func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {

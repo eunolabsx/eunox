@@ -353,6 +353,7 @@ func TestRedis_Status(t *testing.T) {
 		killedAgents:   map[string]bool{"agent-1": true, "agent-2": true},
 		killedSessions: map[string]bool{"sess-1": true},
 	}
+	markStarted(t, r)
 
 	status, err := r.Status(context.Background())
 	require.NoError(t, err)
@@ -360,6 +361,65 @@ func TestRedis_Status(t *testing.T) {
 	assert.True(t, status.GlobalActive)
 	assert.ElementsMatch(t, []string{"agent-1", "agent-2"}, status.KilledAgents)
 	assert.Equal(t, []string{"sess-1"}, status.KilledSessions)
+}
+
+// TestRedis_Status_MirrorsShouldBlocksGateChain: a snapshot asserts "this is the whole kill
+// set", the same claim ShouldBlock makes on a non-match, so it must refuse on the same
+// causes. Guarding only the unstarted case left the two states an operator actually reaches
+// — a boot into a Redis partition, and a stopped switch — reporting a confident all-clear
+// with a nil error while ShouldBlock denied every request on the same instance.
+func TestRedis_Status_MirrorsShouldBlocksGateChain(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("unstarted", func(t *testing.T) {
+		t.Parallel()
+		r, _ := newTestRedis(t)
+		status, err := r.Status(ctx)
+		require.ErrorIs(t, err, ErrNotStarted)
+		require.Nil(t, status, "a refused Status must yield no snapshot to misread as an all-clear")
+	})
+
+	// Started, but the initial refresh failed: started is set once the load has been
+	// ATTEMPTED, so the flag alone cannot tell this from a seeded cache.
+	t.Run("started into an unreachable backend", func(t *testing.T) {
+		t.Parallel()
+		r, mr := newTestRedis(t)
+		mr.Close()
+		r.Start(ctx)
+		defer r.Stop()
+
+		status, err := r.Status(ctx)
+		require.ErrorIs(t, err, ErrBackendUnreachable)
+		require.Nil(t, status)
+		_, blockErr := r.ShouldBlock(ctx, "agent-x", "sess-x")
+		require.ErrorIs(t, blockErr, ErrBackendUnreachable, "report and data plane must agree")
+	})
+
+	// Fail-open opts into serving the last-known cache; a report is served on exactly the
+	// same terms, so the flag does not mean one thing to ShouldBlock and another here.
+	t.Run("degraded under fail-open", func(t *testing.T) {
+		t.Parallel()
+		r, mr := newTestRedis(t, WithFailOpen(true))
+		mr.Close()
+		r.Start(ctx)
+		defer r.Stop()
+
+		status, err := r.Status(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, status)
+	})
+
+	t.Run("stopped", func(t *testing.T) {
+		t.Parallel()
+		r, _ := newTestRedis(t)
+		r.Start(ctx)
+		r.Stop()
+
+		status, err := r.Status(ctx)
+		require.ErrorIs(t, err, ErrStopped, "a frozen switch can never converge; it is not a transient outage")
+		require.Nil(t, status)
+	})
 }
 
 func TestRedis_WithLogger_LogsRefreshFailure(t *testing.T) {
@@ -469,6 +529,15 @@ func newTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.Minired
 	t.Cleanup(func() { _ = client.Close() })
 
 	return NewRedis(client, opts...), mr
+}
+
+// markStarted stands in for the initial state load Start performs, for a test that drives
+// the cache directly (refreshState, a struct literal) and would otherwise be refused by the
+// unstarted guard ShouldBlock and Status share. Setting the flag rather than calling Start
+// keeps those tests free of the listener and reconcile goroutines they are not exercising.
+func markStarted(t *testing.T, r *Redis) {
+	t.Helper()
+	r.started.Store(true)
 }
 
 func TestRedis_KillAndReviveAgent(t *testing.T) {
@@ -761,6 +830,7 @@ func TestRedis_Reset_ClearsAllState(t *testing.T) {
 
 	// A fresh refresh from Redis must agree that everything was deleted.
 	require.NoError(t, r.refreshState(ctx))
+	markStarted(t, r)
 	status, err := r.Status(ctx)
 	require.NoError(t, err)
 	assert.False(t, status.GlobalActive)
@@ -1259,7 +1329,11 @@ func TestRedis_RefreshState_Success(t *testing.T) {
 	if err := r.refreshState(context.Background()); err != nil {
 		t.Fatalf("expected clean refresh, got %v", err)
 	}
-	st, _ := r.Status(context.Background())
+	markStarted(t, r)
+	st, err := r.Status(context.Background())
+	if err != nil {
+		t.Fatalf("expected a snapshot from a seeded cache, got %v", err)
+	}
 	if !st.GlobalActive {
 		t.Error("expected global kill switch to be active after refresh")
 	}
@@ -1309,7 +1383,11 @@ func TestRedis_Reset_Success(t *testing.T) {
 	if err := r.Reset(context.Background()); err != nil {
 		t.Fatalf("expected clean reset, got %v", err)
 	}
-	st, _ := r.Status(context.Background())
+	markStarted(t, r)
+	st, err := r.Status(context.Background())
+	if err != nil {
+		t.Fatalf("expected a snapshot from a seeded cache, got %v", err)
+	}
 	if st.GlobalActive || len(st.KilledAgents) != 0 || len(st.KilledSessions) != 0 {
 		t.Errorf("Reset must clear in-memory state, got %+v", st)
 	}

@@ -75,7 +75,7 @@ const envRefEscape = "$$"
 func isEnvRefEscape(match string) bool { return match == envRefEscape }
 
 // envRefName extracts the variable name from a single envRefRe match ("$VAR" or "${VAR}").
-// Shared by expandEnvRefs and validateCredentialEnvRefs so the two decode a reference
+// Shared by expandRecognizedRefs and validateCredentialEnvRefs so the two decode a reference
 // identically instead of drifting.
 func envRefName(match string) string {
 	name := match[1:]
@@ -120,15 +120,12 @@ func splitURLEnvScope(raw string) (head, tail string) {
 	return raw, ""
 }
 
-// expandEnvRefs replaces ${VAR} / $VAR with the environment value when VAR is
-// set, leaving the reference text intact when unset (unlike os.ExpandEnv, which
-// blanks it). See envRefRe for the matching rules.
-func expandEnvRefs(s string) string { return expandEnvRefsUnder(s, envGrammarFull) }
-
-// expandEnvRefsUnder is expandEnvRefs under a field's declared grammar: a spelling the grammar
-// does not recognize is left exactly as written rather than substituted. The "$$" escape
+// expandEnvRefsUnder replaces a reference with the environment value when the variable is
+// set, leaving the reference text intact when unset (unlike os.ExpandEnv, which blanks it).
+// Which spellings ARE references is g, the field's declared grammar: one the grammar does
+// not recognize is left exactly as written rather than substituted. The "$$" escape
 // collapses to a literal "$" under EVERY grammar deliberately — it is how a literal "${" is
-// written at all, not part of what the grammar narrows.
+// written at all, not part of what the grammar narrows. See envRefRe for the matching rules.
 func expandEnvRefsUnder(s string, g envGrammar) string {
 	if g == envGrammarURL {
 		head, tail := splitURLEnvScope(s)
@@ -518,7 +515,7 @@ func captureGatewayConfigRawFields(cfg *GatewayConfig) gatewayConfigRawFields {
 // LoadGatewayConfig reads, parses, env-expands, and validates a gateway config.
 // ${VAR}/$VAR references are expanded from the environment AFTER parsing — on the decoded
 // string values, not the raw text — so an env value can never be re-interpreted as YAML syntax.
-// An unset reference is left untouched rather than blanked. See expandEnvRefs/envRefRe.
+// An unset reference is left untouched rather than blanked. See expandEnvRefsUnder/envRefRe.
 func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	raw, err := ReadBoundedFile(BoundedRead{
 		Path:      path,

@@ -347,8 +347,8 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		redisPassword:        fs.String("redis-password", "", "Redis password (AUTH). Leave empty for unauthenticated connections. Prefer\nthe EUNOX_REDIS_PASSWORD env var: a password on the command line is visible\nin /proc/<pid>/cmdline. A non-empty flag value takes precedence over the env\nvar; leaving the flag empty does NOT override a set EUNOX_REDIS_PASSWORD."),
 		redisTLS:             fs.Bool("redis-tls", false, "Enable TLS for the Redis connection."),
 		killswitchFailOpen:   fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
-		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, "How often the Redis kill switch reconciles its local cache against Redis\n(default 30s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr."),
-		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, "How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default 720h / 30 days). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr."),
+		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, fmt.Sprintf("How often the Redis kill switch reconciles its local cache against Redis\n(default %s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr.", killswitch.DefaultReconcileInterval)),
+		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, fmt.Sprintf("How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default %s). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr.", describeDefaultSessionKillTTL())),
 		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct ANCHORS — one key per session, or under\ntaskAnchoredState one per TASK, which OUTLIVES the session that created it. Both\nstores reclaim an idle anchor on a periodic sweep, so the ceiling bounds LIVE\nanchors; a warning is logged as it is approached. 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
 
 		// Compliance flags.
@@ -767,6 +767,21 @@ func publishSessionKillTTL(parent context.Context, ksRedis *killswitch.Redis) {
 	}
 }
 
+// describeDefaultSessionKillTTL renders the DEFAULT session-kill tombstone lifetime for the
+// two --killswitch-session-ttl help strings, through the same renderer every other TTL
+// message in this binary uses, so the prose they replace cannot come back as a second
+// spelling to keep in step by hand. The "/ N days" gloss is added only when the default IS
+// a whole number of days: a truncating count would render 36h as "1 days" and 12h as
+// "0 days", relocating the drift rather than removing it.
+func describeDefaultSessionKillTTL() string {
+	d := killswitch.DefaultSessionKillTTL
+	rendered := killswitch.DescribeSessionKillTTL(d)
+	if d > 0 && d%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%s / %d days", rendered, d/(24*time.Hour))
+	}
+	return rendered
+}
+
 // sessionKillTTLNotice renders the startup line describing how long a session-kill
 // tombstone survives, resolved through the same normalizer the option applies so the
 // banner cannot claim one lifetime while Redis enforces another.
@@ -781,7 +796,8 @@ func sessionKillTTLNotice(ttl time.Duration) string {
 	if ttl == 0 {
 		suffix = " (default)"
 	}
-	return fmt.Sprintf("session kills expire after %s%s; a session held open longer than that is re-admitted", effective, suffix)
+	return fmt.Sprintf("session kills expire after %s%s; a session held open longer than that is re-admitted",
+		killswitch.DescribeSessionKillTTL(effective), suffix)
 }
 
 // warnAuditFlagOverridden prints the shared "config wins over an explicit --audit-* flag"

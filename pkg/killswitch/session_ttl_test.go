@@ -348,6 +348,7 @@ func TestSessionKillTTLKey_SurvivesResetAndIsNotAKill(t *testing.T) {
 	require.NoError(t, r.KillSession(ctx, "sess-1"))
 	require.NoError(t, r.Reset(ctx))
 
+	markStarted(t, r)
 	status, err := r.Status(ctx)
 	require.NoError(t, err)
 	require.Empty(t, status.KilledSessions, "the config key must never be scanned as a session kill")
