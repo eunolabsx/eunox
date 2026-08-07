@@ -199,14 +199,15 @@ pattern in `internal/transport/stdio.go` — add a handler, register it in the
 shared dispatch switch (`internal/transport/dispatch.go`), write a test in
 `internal/transport/enforcement_gaps_test.go`, and update this table.
 
-## Forthcoming: the 2026-07-28 stateless release candidate
+## Forthcoming: the 2026-07-28 stateless revision
 
-The 2026-07-28 MCP revision (release candidate, locked 2026-05-21) is **not yet
-the targeted spec** — eunox still targets 2025-11-25 — but two of its changes
+The 2026-07-28 MCP revision is the published stable specification, but it is **not
+yet the spec eunox targets** — eunox still targets 2025-11-25. Two of its changes
 place obligations on a filtering proxy that are worth recording ahead of the
 broader conformance work, part of which is decided in
 [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (see below for exactly
-which part).
+which part). The full migration is planned in
+[mcp-2026-07-28-plan.md](mcp-2026-07-28-plan.md).
 
 | Feature | 2026-07-28 method / field | eunox disposition | Notes |
 |---|---|---|---|
@@ -234,10 +235,16 @@ over-cite:
   probe/drift path's own dual-revision handling (`validate --live`, `init`,
   `drift.MakeDriftCheck` all open with `initialize` today).
 
-Until each row lands, an unmapped 2026-07-28-only method hits the fail-closed
-dispatch default (`internal/transport/dispatch.go`, `dispatchUnmapped`) — a
-2026-07-28 host gets denials, never bypass, but is not yet functional against
-eunox.
+Until each row lands, a 2026-07-28-only method (`server/discover`,
+`subscriptions/listen`, `tasks/*`) hits the fail-closed dispatch default
+(`internal/transport/dispatch.go`, `dispatchUnmapped`) — denials, never bypass,
+but not functional. Methods that exist in **both** revisions (`tools/call`,
+`resources/read`, `prompts/get`) are a distinct case: a 2026-07-28 request for one
+of them is dispatched and enforced today. eunox's decision stays correct, since it
+has always decided on the request body, but the new `Mcp-Method` / `Mcp-Name`
+headers are neither required nor checked against that body, so a disagreeing pair
+is forwarded rather than rejected with `HEADER_MISMATCH` (-32020). Verifying that
+pair is tracked in the plan as a hardening item, not a compatibility gap.
 
 ---
 
