@@ -17,6 +17,12 @@ import (
 type Checker interface {
 	// ShouldBlock returns true if the given agent/session combination is killed.
 	// An empty agentID or sessionID means the field is not evaluated for that dimension.
+	//
+	// A non-nil error means the backend could not CONFIRM its kill set, not that the answer
+	// is "no": (false, err) must be treated as a denial, since an unconfirmable non-match is
+	// indistinguishable from a confirmed all-clear. See the rule on [Manager], which binds
+	// this method too — a backend reaches the hot path through this interface, so a consumer
+	// that only ever sees a Checker still has to fail closed on the error.
 	ShouldBlock(ctx context.Context, agentID, sessionID string) (bool, error)
 }
 
