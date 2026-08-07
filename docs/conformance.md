@@ -228,12 +228,17 @@ over-cite:
   pending exact field names and encodings from the published revision; and dual
   protocol-version negotiation at the seam level (the existing `MCPProtocolVersion`
   constant in `internal/transport/stdio.go` becomes a negotiated set).
-- **Not yet designed, no ADR:** the `server/discover` opening-method responder
-  (today both transports answer `initialize` locally), the `Mcp-Method`/`Mcp-Name`
-  routing headers, `subscriptions/listen`, header/body protocol-version
-  consistency verification, the moved missing-resource error codes, and the CLI
-  probe/drift path's own dual-revision handling (`validate --live`, `init`,
-  `drift.MakeDriftCheck` all open with `initialize` today).
+- **Designed in Draft ADRs, not yet implemented:** per-peer revision
+  negotiation, the mismatched-pair translation boundary, the `server/discover`
+  responder and its list-filter parity, the `Mcp-Method`/`Mcp-Name` headers,
+  revision-consistency verification, and the CLI probe/drift dual-revision
+  handling in [ADR-0006](adr/0006-dual-revision-translation-boundary.md); the
+  MRTR signed continuation and its commit-once metering in
+  [ADR-0007](adr/0007-mrtr-signed-continuation.md); `subscriptions/listen` and
+  the tasks extension in
+  [ADR-0008](adr/0008-stream-and-task-enforcement.md). The moved
+  missing-resource error code is mechanical and tracked in the
+  [execution plan](mcp-2026-07-28-execution.md) alone.
 
 Until each row lands, a 2026-07-28-only method (`server/discover`,
 `subscriptions/listen`, `tasks/*`) hits the fail-closed dispatch default

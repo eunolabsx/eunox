@@ -150,3 +150,35 @@ and the JWT can still only narrow the manifest, never expand it
   and the seams; the precise wire details (header names, negotiation tokens,
   permitted GET-stream uses) are finalized against the published revision, and any
   divergence is reconciled there rather than guessed here.
+
+## Addendum (2026-08-07): session creation without `initialize`
+
+The revision is now published, and two commitments this ADR deferred have their
+own records: negotiation and the mismatched-pair translation boundary in
+[ADR-0006](./0006-dual-revision-translation-boundary.md), and the
+`requestState` integrity mechanism in
+[ADR-0007](./0007-mrtr-signed-continuation.md). What remained undecided here is
+*creation*: everything the HTTP transport builds per client — the internal
+session, the upstream subprocess, the decision-turn pin, the identity capture,
+the `--require-audit=strict` gate — hangs off the session-creating
+`initialize`, and the new revision has no such request. Decisions:
+
+- **The first enforced request mints the worker.** On the 2026-07-28 path, the
+  internal session is created on the first enforced request — same
+  registration, pinning, and reaping as today (`registerSession`,
+  `internal/transport/http_session.go`) — with the old-revision `initialize`
+  path left untouched.
+- **The worker is keyed by the resolved state anchor**
+  (`enforcement.ResolveStateAnchor`) — the same subject stateful policy keys
+  on, so the worker map and accumulated policy state cannot disagree about a
+  request. `jti` stays revocation-only, consistent with the scope-key /
+  revocation-key split above.
+- **Unauthenticated 2026-07-28 requests are refused by default when the
+  upstream is a subprocess.** With no handshake and no credential, each
+  request would otherwise fork its own upstream process — a resource-
+  exhaustion vector, not a session model. A dev-mode flag opts in; remote
+  HTTP upstreams, which cost nothing per request, serve unauthenticated
+  traffic per-request as a matter of course.
+- **`--require-audit=strict` relocates to the first-request path** with
+  unchanged semantics: identity is established before any enforced action, or
+  the request is refused.
