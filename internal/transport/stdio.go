@@ -993,20 +993,19 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 		}
 		msg := r.msg
 
-		// Negotiate the message's revision before anything routes on its method: every
-		// table below (swallow/forward for a notification, enforced/local for a request) is
-		// revision-scoped, so resolving after the lookup would route by one revision's table
-		// and record under another's.
-		rev, ok := p.negotiateHostRevision(ctx, msg)
+		// Negotiate first — the head of the shared gate order (dispatch.go) — and route the
+		// rest of this iteration on the context it returns: every table below (notification
+		// disposition, enforced/local for a request) is revision-scoped, so resolving after
+		// the lookup would route by one revision's table and record under another's.
+		ctx, ok := p.negotiateHostRevision(ctx, msg)
 		if !ok {
 			continue
 		}
-		ctx := capability.WithProtocolRevision(ctx, rev)
 
 		if msg.IsNotification() {
 			// forwardHostNotification returns true only when a shutdown woke the
 			// wire-ordering barrier, matching the ctx.Done/upstreamDone cases above.
-			if p.forwardHostNotification(ctx, rev, msg) {
+			if p.forwardHostNotification(ctx, msg) {
 				return
 			}
 			continue
@@ -1032,7 +1031,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// in that order regardless of scheduling. Only enforced methods take one, and
 			// only after the hostSem acquire above, so a server-busy rejection never strands
 			// an un-begun ticket that would stall every later one.
-			serialized := p.decideGate != nil && isEnforcedMethod(rev, msg.Method)
+			serialized := p.decideGate != nil && isEnforcedMethod(ctx, msg.Method)
 			var ticket decisionTicket
 			if serialized {
 				ticket = p.takeDecisionTicket()
@@ -1049,7 +1048,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				p.fwdHostWrites.Done()
 			})
 			wg.Add(1)
-			go func(m mcp.RPCMsg, rev capability.Revision, serialized bool, ticket decisionTicket) {
+			go func(m mcp.RPCMsg, serialized bool, ticket decisionTicket) {
 				defer wg.Done()
 				defer func() { <-p.hostSem }()
 				defer release()
@@ -1063,8 +1062,8 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 					defer end()
 					hctx = withDecisionEnd(hctx, end)
 				}
-				p.handleHostRequest(hctx, rev, m)
-			}(msg, rev, serialized, ticket)
+				p.handleHostRequest(hctx, m)
+			}(msg, serialized, ticket)
 			continue
 		}
 		if msg.IsResponse() {
@@ -1094,13 +1093,14 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 	wg.Wait()
 }
 
-// forwardHostNotification forwards one host->upstream notification, enforcing (in order) the
-// swallow of notifications/initialized, the session kill switch, the host wire-ordering
-// barrier, and the notifications/cancelled id translation. Returns stop=true ONLY when a
-// shutdown woke the ordering barrier, signalling serveHost to return immediately.
+// forwardHostNotification forwards one host->upstream notification: the shared
+// hostNotificationGate first (swallowed set, revocation, fail-closed routing — see the gate
+// order in dispatch.go), then this transport's own wire-ordering barrier and the
+// notifications/cancelled id translation. Returns stop=true ONLY when a shutdown woke the
+// ordering barrier, signalling serveHost to return immediately.
 //
-// An id-less "initialize" is swallowed too: IsNotification()'s classification is purely
-// structural, so a client can send "initialize" with no id and have it classified as a
+// An id-less "initialize" is swallowed by the gate: IsNotification()'s classification is
+// purely structural, so a client can send "initialize" with no id and have it classified as a
 // notification — forwarding that verbatim would re-trigger the upstream's handshake outside
 // dispatchRequest's kill gate and audit trail.
 //
@@ -1111,22 +1111,15 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 // cancelling a slow in-flight call does not block it. On a shutdown wake it returns stop=true
 // rather than looping: a leaked waiter is still registered on fwdHostWrites, so reading
 // further requests would be Add-concurrent-with-Wait, a WaitGroup misuse that panics.
-func (p *StdioProxy) forwardHostNotification(ctx context.Context, rev capability.Revision, msg mcp.RPCMsg) (stop bool) {
-	if isSwallowedHostNotification(rev, msg.Method) {
-		return false
+func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg) (stop bool) {
+	gate := hostNotificationGate{
+		rec:       p.rec(),
+		sessionID: p.sessionID,
+		errOut:    p.errOut(),
+		checkKill: func() *capability.EnforceResponse { return p.pdp.CheckKill(ctx, p.sessionID) },
+		leg:       legStdioNotification,
 	}
-	if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-		recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioNotification)
-		return false
-	}
-	// An enforced method framed as a notification (no id) is a fail-closed reject; shared
-	// with the HTTP transport's equivalent guard so the two cannot drift.
-	if denyEnforcedMethodNotification(ctx, p.rec(), p.sessionID, rev, msg) {
-		return false
-	}
-	// Any notification method outside the forwardable allowlist is a fail-closed reject,
-	// shared with the HTTP transport's equivalent guard.
-	if denyUnmappedHostNotification(ctx, p.errOut(), p.rec(), p.sessionID, rev, msg) {
+	if !gate.admit(ctx, msg) {
 		return false
 	}
 	if !p.waitHostForwardOrShutdown(ctx) {
@@ -1150,8 +1143,8 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, rev capability
 // dispatchRequest so the method->handler mapping, the fail-closed default, and the
 // cross-cutting kill gate cannot drift from the HTTP transport. initialize's local
 // response is supplied by p.buildInitResponse (wired into dispatchParams).
-func (p *StdioProxy) handleHostRequest(ctx context.Context, rev capability.Revision, msg mcp.RPCMsg) {
-	d := p.dispatchParams(rev)
+func (p *StdioProxy) handleHostRequest(ctx context.Context, msg mcp.RPCMsg) {
+	d := p.dispatchParams()
 	// nil unless the serve loop threaded a decision-lock release for a serialized enforced
 	// request; the Decide* handlers call it right after the decision so the upstream forward
 	// runs outside the lock.
@@ -1170,8 +1163,9 @@ func (p *StdioProxy) strictAudit() strictAuditState {
 }
 
 // dispatchParams bundles the proxy's policy/audit/upstream wiring for the shared request
-// dispatcher. stdio carries no per-request client address, so sourceIP is empty.
-func (p *StdioProxy) dispatchParams(rev capability.Revision) dispatchParams {
+// dispatcher. stdio carries no per-request client address, so sourceIP is empty. The
+// request's revision is NOT among them — it rides the context; see requestRevision.
+func (p *StdioProxy) dispatchParams() dispatchParams {
 	return dispatchParams{
 		forwardParams: forwardParams{
 			rec:              p.rec(),
@@ -1187,7 +1181,6 @@ func (p *StdioProxy) dispatchParams(rev capability.Revision) dispatchParams {
 		buildInit:        p.buildInitResponse,
 		receipts:         p.receipts,
 		honorAttribution: p.honorAttribution,
-		revision:         rev,
 	}
 }
 
@@ -1195,20 +1188,25 @@ func (p *StdioProxy) dispatchParams(rev capability.Revision) dispatchParams {
 // FIRST resolved message, so every later message is checked against it — which is what makes
 // the mid-context-flip refusal reachable for a peer that never sends initialize.
 //
+// It returns the STAMPED context rather than the bare revision: that context is the one
+// carrier of the decided revision (the tables route by it, the tape records it), so a caller
+// cannot route a message without also giving its records the revision they were routed by.
+// This is the first gate every host message passes; see the gate order in dispatch.go.
+//
 // ok=false means the message was refused: the record is written either way, and a REQUEST
 // also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
 // serveHost, the single goroutine that owns the pin.
-func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (capability.Revision, bool) {
+func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (context.Context, bool) {
 	rev, err := resolveHostRevision(p.hostRevision(), msg)
 	if err != nil {
 		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, msg, err)
 		if msg.IsRequest() {
 			_ = p.hostWriter.Write(resp)
 		}
-		return "", false
+		return ctx, false
 	}
 	p.hostRev.Store(rev)
-	return rev, true
+	return capability.WithProtocolRevision(ctx, rev), true
 }
 
 // hostRevision returns the revision this connection's context resolved, or "" before its
@@ -1228,7 +1226,7 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	// this method at all means the request resolved to the revision that defines initialize.
 	_, _ = fmt.Fprintf(p.errOut(),
 		"[eunox] Session %s: host initialized (protocol %s).\n",
-		p.sessionID, capability.Revision20251125,
+		p.sessionID, handshakeRevision,
 	)
 	return resp
 }
@@ -1281,13 +1279,14 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 	// fire-and-forget, so a poisoned stdout discards the request while the audit record still
 	// says delivered=true. The writer's poison hook (armed in Start) bounds the window: the
 	// FIRST desync tears the upstream down, so at most frames already in flight are misrecorded.
-	// The context's revision is known here, so this leg's records must name it too — an
-	// absent field is reserved for a record written before any revision was resolved.
-	ctx = capability.WithProtocolRevision(ctx, p.hostRevision())
 	forwardServerRequest(ctx, msg, serverRequestParams{
-		rec:              p.rec(),
-		audit:            p.audit,
-		sessionID:        p.sessionID,
+		rec:       p.rec(),
+		audit:     p.audit,
+		sessionID: p.sessionID,
+		// The host context's revision is known here, so this leg's records must name it too —
+		// an absent field is reserved for a record written before any revision was resolved.
+		// forwardServerRequest does the stamping; this supplies the fact.
+		revision:         p.hostRevision(),
 		forward:          func(m mcp.RPCMsg) bool { p.forwardServerRequestToHost(m); return true },
 		writeUpstream:    func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
 		decideLock:       p.samplingDecideLock(),

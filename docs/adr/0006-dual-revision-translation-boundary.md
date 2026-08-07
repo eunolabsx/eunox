@@ -1,6 +1,6 @@
 # ADR-0006: Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest
 
-- **Status:** Draft
+- **Status:** In Review
 - **Date:** 2026-08-07
 - **Deciders:** eunox maintainers
 
@@ -41,11 +41,19 @@ and refuse the rest fail-closed.** Concretely:
 - **Host-side revision is established per context, checked per request.** A
   context opened by `initialize` is a 2025-11-25 context. A handshake-less
   request declaring `io.modelcontextprotocol/protocolVersion` in `_meta` is a
-  2026-07-28 request. A request carrying neither, or declaring a revision that
-  disagrees with the context it arrives in, is denied with
-  `UNSUPPORTED_PROTOCOL_VERSION` (-32022) and audited — a revision flip inside
-  one context is an enforcement-confusion vector of the same family as
-  header/body disagreement, not a negotiation.
+  2026-07-28 request. A request declaring a revision that disagrees with the
+  context it arrives in is denied with `UNSUPPORTED_PROTOCOL_VERSION` (-32022)
+  and audited — a revision flip inside one context is an enforcement-confusion
+  vector of the same family as header/body disagreement, not a negotiation. A
+  request carrying **neither** a context nor a declaration resolves to
+  2025-11-25 rather than being denied: turning "no context, no declaration"
+  into a refusal is the session-creation-on-first-request decision, which is
+  [ADR-0004](./0004-bearer-identity-session-anchor.md)'s session-creation half
+  and not this boundary's to make. Until that lands, the conservative direction
+  is the surface eunox already shipped — omission can never reach a newer
+  method set, and the newer table stays reachable only by explicit declaration.
+  If handshake-less session creation later makes refusal the correct answer,
+  it is ADR-0004's half that changes it, not a silent divergence here.
 - **Upstream-side revision is probed once and pinned** per route (gateway) or
   per proxy (stdio): the session-start probe opens with `server/discover` and
   falls back to `initialize`; a `protocolVersion: auto | "2025-11-25" |

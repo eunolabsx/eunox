@@ -7,11 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/mcp"
-	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -168,93 +166,5 @@ func TestResolveUpstreamRevision(t *testing.T) {
 		if got := resolveUpstreamRevision(tc.configured, tc.reported); got != tc.want {
 			t.Errorf("resolveUpstreamRevision(%q, %q) = %q, want %q", tc.configured, tc.reported, got, tc.want)
 		}
-	}
-}
-
-// TestDispatchRequest_PerRevisionUnmappedDenials is the fail-closed sweep across the seam:
-// a method outside the requesting peer's table hits dispatchUnmapped exactly as an unknown
-// method does, with the AUTHORIZATION_FAILED record that path already writes. Removal is
-// expressed by absence — there is no second mechanism to assert.
-func TestDispatchRequest_PerRevisionUnmappedDenials(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name     string
-		rev      capability.Revision
-		method   string
-		wantDeny bool
-	}{
-		{name: "ping is answered for an old-revision peer", rev: capability.Revision20251125, method: methodPing},
-		{name: "ping is denied for a new-revision peer", rev: capability.Revision20260728, method: methodPing, wantDeny: true},
-		{name: "initialize is answered for an old-revision peer", rev: capability.Revision20251125, method: mcp.MethodInitialize},
-		{name: "initialize is denied for a new-revision peer", rev: capability.Revision20260728, method: mcp.MethodInitialize, wantDeny: true},
-		{name: "server/discover is denied for an old-revision peer", rev: capability.Revision20251125, method: "server/discover", wantDeny: true},
-		{name: "server/discover is denied until its responder is implemented", rev: capability.Revision20260728, method: "server/discover", wantDeny: true},
-		{name: "resources/subscribe is denied for a new-revision peer", rev: capability.Revision20260728, method: capability.MethodResourcesSubscribe, wantDeny: true},
-		{name: "resources/unsubscribe is denied for a new-revision peer", rev: capability.Revision20260728, method: capability.MethodResourcesUnsubscribe, wantDeny: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			rec := &fwdRecorder{}
-			d := dispatchParams{
-				forwardParams: forwardParams{rec: rec, errOut: io.Discard},
-				pdp:           pdp.AlwaysAllowPDP{},
-				revision:      tc.rev,
-				buildInit: func(msg mcp.RPCMsg) mcp.RPCMsg {
-					return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}
-				},
-			}
-			out := dispatchRequest(context.Background(), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method})
-			if !tc.wantDeny {
-				if out.Error != nil {
-					t.Fatalf("%s under %s must be answered, got error %+v", tc.method, tc.rev, out.Error)
-				}
-				return
-			}
-			if out.Error == nil {
-				t.Fatalf("%s under %s must be denied, got result %s", tc.method, tc.rev, out.Result)
-			}
-			if len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeAuthorizationFailed {
-				t.Fatalf("records = %+v, want one AUTHORIZATION_FAILED deny", rec.records)
-			}
-		})
-	}
-}
-
-// TestNotificationTables_PerRevision: roots/list_changed is forwardable to an old-revision
-// upstream and dropped-plus-recorded for a new-revision peer (the capability is deprecated
-// there), while notifications/initialized stops being a swallowed construct and becomes an
-// ordinary unmapped notification — the revision has no handshake to close.
-func TestNotificationTables_PerRevision(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		rev        capability.Revision
-		method     string
-		wantDenied bool
-	}{
-		{rev: capability.Revision20251125, method: methodNotificationsRootsListChanged, wantDenied: false},
-		{rev: capability.Revision20260728, method: methodNotificationsRootsListChanged, wantDenied: true},
-		{rev: capability.Revision20251125, method: methodNotificationsCancelled, wantDenied: false},
-		{rev: capability.Revision20260728, method: methodNotificationsCancelled, wantDenied: false},
-		{rev: capability.Revision20260728, method: mcp.MethodNotificationsInitialized, wantDenied: true},
-	}
-	for _, tc := range cases {
-		rec := &fwdRecorder{}
-		msg := mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}
-		denied := denyUnmappedHostNotification(context.Background(), io.Discard, rec, "sess", tc.rev, msg)
-		if denied != tc.wantDenied {
-			t.Errorf("%s under %s: denied = %v, want %v", tc.method, tc.rev, denied, tc.wantDenied)
-		}
-		if tc.wantDenied && (len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeAuthorizationFailed) {
-			t.Errorf("%s under %s: records = %+v, want the drop recorded", tc.method, tc.rev, rec.records)
-		}
-	}
-	// The swallowed set is the one disposition that writes NO record, so it is asserted
-	// separately: silently dropping a method the revision does not have would hide it.
-	if !isSwallowedHostNotification(capability.Revision20251125, mcp.MethodNotificationsInitialized) {
-		t.Error("notifications/initialized must stay swallowed for an old-revision peer")
-	}
-	if isSwallowedHostNotification(capability.Revision20260728, mcp.MethodNotificationsInitialized) {
-		t.Error("notifications/initialized must not be silently swallowed for a new-revision peer: the revision has no handshake, so it is an unmapped notification and must be recorded")
 	}
 }

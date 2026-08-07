@@ -466,7 +466,7 @@ Adds and removes are **advisory**, not breaks: MCP supports a changing tool list
 
 **Attack:** JSON-RPC distinguishes a *request* (carries an `id`, expects a response) from a *notification* (no `id`, fire-and-forget) purely structurally — `IsNotification()` is `id == nil && method != ""`, with no allowlist restricting which methods may legitimately take notification form. `tools/call`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, and `prompts/get` are always requests in a well-formed MCP session, but nothing rejected one of these framed as a notification instead: a host omitting the `id` field on an otherwise-normal `tools/call` body caused the message to be routed to each transport's fire-and-forget notification-forwarding path (stdio's `forwardHostNotification`, the HTTP transport's notification branch in `handleSessionPost`), which forwarded it to the upstream verbatim after only a kill-switch check — never reaching `dispatchRequest`, so the PDP decision was skipped and no audit record (allow or deny) was written. A lenient upstream MCP server that processes notification-framed method calls would execute the tool the manifest would otherwise have denied, invisibly to the audit trail and to `--require-audit=strict`.
 
-**Mitigation:** Both transports check the notification's method against the same enforced-method set `dispatchRequest` routes on for that peer's protocol revision (`methodRegistry` / `isEnforcedMethod`, `internal/transport/dispatch.go`) before forwarding. A match is denied and recorded (`INVALID_REQUEST`) instead of forwarded — the request never reaches the upstream, and the denial is a signed audit record like any other enforced-path deny. The check and its record are a single shared function (`denyEnforcedMethodNotification`) both transports call, so the two cannot independently drift out of sync.
+**Mitigation:** Both transports check the notification's method against the same enforced-method set `dispatchRequest` routes on for that peer's protocol revision (`methodRegistry` / `isEnforcedMethod`, `internal/transport/dispatch.go`) before forwarding. A match is denied and recorded (`INVALID_REQUEST`) instead of forwarded — the request never reaches the upstream, and the denial is a signed audit record like any other enforced-path deny. The check and its record live in a single shared gate (`hostNotificationGate.admit`) both transports call for every host notification, so the two cannot independently drift out of sync — nor can they drift in the ORDER they apply it, since that gate also carries the swallowed set, the kill check and the unmapped default in their one canonical sequence.
 
 **Residual risk:** The denial record uses the raw method name as both the audit identifier and the target (mirroring `malformedDeny`'s pre-existing convention for params rejected before the PDP is consulted, since a notification-framed call's real target argument is not parsed) — for `prompts/get` this yields a `target` of `"get"` rather than a real prompt name. A consumer that keys off `denial_code` (as `suggest` already does via `IsInfraDenialCode`) is unaffected; a hand-rolled consumer that does not filter infrastructure-fault codes could misread this as a denied call to a tool/resource/prompt literally named after the bare method suffix.
 
@@ -644,15 +644,28 @@ opened at another (a mid-context flip).
   set is refused; internally, a revision with no tables resolves to empty tables rather
   than borrowing another revision's, so even a wiring fault denies rather than widens.
 - **Removal is expressed by absence.** Each method declares the revisions it exists in,
-  once, and the four routing tables are derived from those declarations. A method outside
+  once, and the routing tables are derived from those declarations — including the
+  notification dispositions, which are one map per revision whose ZERO VALUE is the
+  fail-closed "unmapped": a method with no entry cannot be reached by any other path. A method outside
   the requesting peer's tables falls to the same fail-closed default (`dispatchUnmapped`,
   `AUTHORIZATION_FAILED`, recorded) that already covers unknown methods — there is no
   second removal mechanism that could disagree with the first. A declaration naming no
   revision fails the build.
-- **The decision is on the tape.** Every record stamps `protocol_revision` (§6.1) in the
-  signed body, so an auditor can separate "policy refused this" from "this method does
-  not exist in the revision that peer negotiated". The refusal itself is recorded under
-  the `UNSUPPORTED_PROTOCOL_VERSION` code.
+- **The decision is on the tape, from the same value that routed it.** Every record stamps
+  `protocol_revision` (§6.1) in the signed body, so an auditor can separate "policy refused
+  this" from "this method does not exist in the revision that peer negotiated". The routing
+  tables are selected by READING THAT SAME CARRIER (the request context, via
+  `requestRevision`) rather than by a second copy threaded beside it, so a record cannot
+  name a revision the dispatcher did not route by, or stay silent about one it did. The
+  refusal itself is recorded under the `UNSUPPORTED_PROTOCOL_VERSION` code.
+- **The gate order is fixed and asserted.** Revision negotiation runs ahead of the
+  revocation check on both transports, because a message whose revision is unresolved has
+  no method table to be looked up in. The consequence is bounded and deliberate: a revoked
+  session's bad-version probe is recorded as `UNSUPPORTED_PROTOCOL_VERSION` rather than
+  `KILL_SWITCH` — a labelling difference on a message refused either way, which contacts no
+  upstream, mutates no state, and is rate-limited like every other caller-driven refusal.
+  Because that difference is SIEM-facing during an emergency stop, the ordering and its
+  exception are pinned by tests on both transports rather than left to prose.
 
 **Residual risk.** The revision a peer declares is still the peer's own claim; eunox
 constrains which table that claim can select and records the choice, but does not
@@ -662,11 +675,17 @@ not permit.
 
 **Test coverage.** `internal/transport/dispatch_revision_test.go` (per-revision exact
 table sets; the undeclared-membership build gate; an unspoken revision dispatching
-nothing), `internal/transport/revision_test.go` (the negotiation table, including both
-flip directions and the malformed-params case that must NOT be relabeled as a version
-failure), `internal/transport/integration_test.go` (end-to-end through a real proxy and
-upstream), `internal/audit/protocol_revision_test.go` (sign-and-verify round-trip plus
-the tamper leg).
+nothing; the registry-derived handshake revision), `internal/transport/revision_test.go`
+(the negotiation table, including both flip directions and the malformed-params case that
+must NOT be relabeled as a version failure),
+`internal/transport/enforcement_gaps_test.go` (the per-revision method cells: which peer's
+revision dispatches a method and which denies it fail-closed, in both framings),
+`internal/transport/gate_order_test.go` (the gate order and its labelling exception, on
+both transports; the single-carrier property),
+`internal/transport/revision_wire_test.go` (byte-stable old-revision responses),
+`internal/transport/integration_test.go` (end-to-end through a real proxy and upstream),
+`internal/audit/protocol_revision_test.go` (sign-and-verify round-trip plus the tamper
+leg).
 
 ---
 

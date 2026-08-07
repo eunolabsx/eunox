@@ -874,7 +874,7 @@ func BenchmarkStdioProxy(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			proxy.handleHostRequest(ctx, capability.DefaultRevision, allowMsg)
+			proxy.handleHostRequest(ctx, allowMsg)
 		}
 	})
 
@@ -887,7 +887,7 @@ func BenchmarkStdioProxy(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			proxy.handleHostRequest(ctx, capability.DefaultRevision, denyMsg)
+			proxy.handleHostRequest(ctx, denyMsg)
 		}
 	})
 }

@@ -42,12 +42,30 @@ func TestMethodRegistry_EveryMethodDeclaresRevisionMembership(t *testing.T) {
 		if len(slices.Compact(sorted)) != len(spec.In) {
 			t.Errorf("method %q declares a duplicate revision in %v", method, spec.In)
 		}
-		if spec.Enforced && spec.Handler == nil {
-			t.Errorf("method %q is marked Enforced but declares no handler", method)
+		if spec.Decide != nil && spec.Local != nil {
+			t.Errorf("method %q declares both a Decide and a Local handler; the field it sits in IS its classification, so exactly one may be set", method)
 		}
-		if spec.Handler == nil && spec.Notification == notifyUnmapped {
+		if handler, _ := spec.handler(); handler == nil && spec.Notification == notifyUnmapped {
 			t.Errorf("method %q declares neither a handler nor a notification disposition, so it dispatches nowhere — delete the entry rather than leaving a no-op", method)
 		}
+	}
+}
+
+// TestHandshakeRevision_DerivedFromTheRegistry pins the derivation behind handshakeRevision:
+// every site that opens, answers, or version-stamps a handshake reads it, so a registry
+// change that leaves it unresolvable must fail here rather than silently falling back to the
+// shipped default at eleven call sites.
+func TestHandshakeRevision_DerivedFromTheRegistry(t *testing.T) {
+	t.Parallel()
+	spec, ok := methodRegistry[mcp.MethodInitialize]
+	if !ok {
+		t.Fatalf("%q has no registry entry, so the handshake revision cannot be derived", mcp.MethodInitialize)
+	}
+	if len(spec.In) != 1 {
+		t.Fatalf("%q declares %v; the handshake revision is derivable only while exactly one revision has it — give the sites that read handshakeRevision a per-peer answer before widening this", mcp.MethodInitialize, spec.In)
+	}
+	if handshakeRevision != spec.In[0] || HandshakeRevision() != spec.In[0] {
+		t.Errorf("handshakeRevision = %q / %q, want %q from the registry", handshakeRevision, HandshakeRevision(), spec.In[0])
 	}
 }
 
@@ -133,8 +151,8 @@ func TestRevisionDispatch_ExactSetPerRevision(t *testing.T) {
 			tables := tablesFor(tc.rev)
 			assertKeySet(t, "decide", handlerKeys(tables.decide), tc.decide)
 			assertKeySet(t, "local", handlerKeys(tables.local), tc.local)
-			assertKeySet(t, "forwardNotifications", markerKeys(tables.forwardNotifications), tc.forward)
-			assertKeySet(t, "swallowNotifications", markerKeys(tables.swallowNotifications), tc.swallow)
+			assertKeySet(t, "forwardNotifications", dispositionKeys(tables, notifyForward), tc.forward)
+			assertKeySet(t, "swallowNotifications", dispositionKeys(tables, notifySwallow), tc.swallow)
 			for _, m := range tc.absentOK {
 				if _, ok := tables.decide[m]; ok {
 					t.Errorf("%q must not be an enforced method under %s", m, tc.rev)
@@ -142,11 +160,8 @@ func TestRevisionDispatch_ExactSetPerRevision(t *testing.T) {
 				if _, ok := tables.local[m]; ok {
 					t.Errorf("%q must not be locally answered under %s", m, tc.rev)
 				}
-				if isForwardableHostNotification(tc.rev, m) {
-					t.Errorf("%q must not be a forwardable notification under %s", m, tc.rev)
-				}
-				if isSwallowedHostNotification(tc.rev, m) {
-					t.Errorf("%q must not be a swallowed notification under %s", m, tc.rev)
+				if got := tables.notifications[m]; got != notifyUnmapped {
+					t.Errorf("%q must have no notification disposition under %s, got %v", m, tc.rev, got)
 				}
 			}
 		})
@@ -164,11 +179,11 @@ func TestTablesFor_UnknownRevisionDispatchesNothing(t *testing.T) {
 		t.Errorf("an unset revision must resolve to the default revision's tables")
 	}
 	unknown := tablesFor(capability.Revision("1999-01-01"))
-	if len(unknown.decide)+len(unknown.local)+len(unknown.forwardNotifications)+len(unknown.swallowNotifications) != 0 {
-		t.Errorf("an unspoken revision must dispatch nothing, got decide=%d local=%d forward=%d swallow=%d",
-			len(unknown.decide), len(unknown.local), len(unknown.forwardNotifications), len(unknown.swallowNotifications))
+	if len(unknown.decide)+len(unknown.local)+len(unknown.notifications) != 0 {
+		t.Errorf("an unspoken revision must dispatch nothing, got decide=%d local=%d notifications=%d",
+			len(unknown.decide), len(unknown.local), len(unknown.notifications))
 	}
-	if isEnforcedMethod(capability.Revision("1999-01-01"), capability.MethodToolsCall) {
+	if isEnforcedMethod(revisionContext(capability.Revision("1999-01-01")), capability.MethodToolsCall) {
 		t.Error("tools/call must not be enforced under a revision this build does not speak")
 	}
 }
@@ -181,9 +196,9 @@ func TestBuildRevisionDispatch_SkipsUndeclaredEntries(t *testing.T) {
 	t.Parallel()
 	handler := func(_ context.Context, _ dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg { return msg }
 	built := buildRevisionDispatch(map[string]methodSpec{
-		"no/revisions":      {Handler: handler},
-		"unknown/revision":  {In: []capability.Revision{"1999-01-01"}, Handler: handler},
-		"declared/properly": {In: []capability.Revision{capability.Revision20260728}, Handler: handler},
+		"no/revisions":      {Local: handler},
+		"unknown/revision":  {In: []capability.Revision{"1999-01-01"}, Local: handler},
+		"declared/properly": {In: []capability.Revision{capability.Revision20260728}, Local: handler},
 	})
 	for _, rev := range capability.PublishedRevisions() {
 		for _, m := range []string{"no/revisions", "unknown/revision"} {
@@ -223,13 +238,25 @@ func handlerKeys(m map[string]methodHandler) []string {
 	return out
 }
 
-func markerKeys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
+// dispositionKeys reads the method names a revision's notification table maps to want.
+func dispositionKeys(t revisionTables, want notificationDisposition) []string {
+	out := make([]string, 0, len(t.notifications))
+	for k, d := range t.notifications {
+		if d == want {
+			out = append(out, k)
+		}
 	}
 	return out
 }
+
+// revisionContext returns a context negotiated at rev — the single carrier the dispatcher and
+// the audit tape both read, so a test naming a revision names it the way a transport does.
+func revisionContext(rev capability.Revision) context.Context {
+	return capability.WithProtocolRevision(context.Background(), rev)
+}
+
+// noKill is the hostNotificationGate kill thunk for a live (unrevoked) session.
+func noKill() *capability.EnforceResponse { return nil }
 
 // assertKeySet compares a derived table's method set against the expected one exactly.
 func assertKeySet(t *testing.T, label string, got, want []string) {

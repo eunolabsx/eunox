@@ -204,7 +204,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		clientIP:     clientIP,
 		// See newSession: a session is minted by `initialize`, which is the older revision's
 		// method, so opening one negotiates that revision for the context's life.
-		hostRev:        capability.Revision20251125,
+		hostRev:        handshakeRevision,
 		upstreamRevPin: route.upstreamProtocolVersion,
 	}
 	// Marks initializing until this returns (after the drift check) so the idle reaper
@@ -538,5 +538,5 @@ func (s *httpSession) doRemoteHTTP(ctx context.Context, msg mcp.RPCMsg, sessID s
 // all, which a conformant upstream answers with 400 (including the terminating DELETE, whose
 // failure leaks the upstream session).
 func setNegotiatedVersionHeader(req *http.Request, _ capability.Revision) {
-	req.Header.Set("MCP-Protocol-Version", capability.Revision20251125.String())
+	req.Header.Set("MCP-Protocol-Version", handshakeRevision.String())
 }

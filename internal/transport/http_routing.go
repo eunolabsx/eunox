@@ -392,7 +392,11 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		return
 	}
 	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
-	// On ctx from here down, so every record stamps the revision its table was chosen by.
+	// The stamped context is the ONE carrier of the decided revision from here down: the
+	// tables route by it and the tape records it, so neither can name a revision the other
+	// did not. Stamped inline rather than returned already-stamped because contextcheck
+	// requires the derivation from r.Context() to be visible at the site; that the pairing
+	// holds is pinned by TestGateOrder_RevisionRidesOneCarrier and its HTTP sibling.
 	ctx := capability.WithProtocolRevision(r.Context(), rev)
 	// Check the kill switch BEFORE touchRequest so a killed session's denied POSTs can't
 	// keep deferring idle reaping (a request may race teardownSessionByID's proactive
@@ -405,33 +409,20 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// an SSE GET open): it defers both the idle reaper and the hard idle ceiling.
 		sess.touchRequest()
 	}
-	// Host notifications are forwarded verbatim only when allowlisted, after the swallowed
-	// set (notifications/initialized, and a mid-session id-less "initialize" — forwarding it
-	// verbatim would let a client re-trigger the upstream's handshake outside the
-	// dispatcher's kill gate) and the enforced-method fail-closed reject. These don't flow
-	// through the dispatcher, so the kill is enforced here.
+	// Host notifications don't flow through the dispatcher, so they take the swallowed set,
+	// the kill, and the two fail-closed rejects from the shared gate instead — one call, in
+	// the one canonical order (see dispatch.go). Everything it admits is allowlisted for
+	// verbatim forwarding on a live session. The gate runs before the notify-slot acquisition
+	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
-		if !isSwallowedHostNotification(rev, msg.Method) {
-			if kill != nil {
-				recordKillDrop(ctx, asRecorder(route.sink), kill, verifiedSession(sess.id), msg.Method, msg.Method, legHTTPNotification)
-				w.WriteHeader(http.StatusAccepted)
-				return
-			}
-			// An enforced method framed as a notification (no id) is a fail-closed reject —
-			// shared with the stdio transport's equivalent guard so the check and its audit
-			// record can't drift between transports. Checked before the notify-slot
-			// acquisition below: no point reserving a slot for a notification about to be denied.
-			if denyEnforcedMethodNotification(ctx, asRecorder(route.sink), sessionID, rev, msg) {
-				w.WriteHeader(http.StatusAccepted)
-				return
-			}
-			// Any notification method outside the forwardable allowlist is a fail-closed
-			// reject too, so a notification-framed novel/unmapped method can't reach the
-			// upstream invisibly while its request-framed twin would be denied and logged.
-			if denyUnmappedHostNotification(ctx, p.errOut(), asRecorder(route.sink), sessionID, rev, msg) {
-				w.WriteHeader(http.StatusAccepted)
-				return
-			}
+		gate := hostNotificationGate{
+			rec:       asRecorder(route.sink),
+			sessionID: sessionID,
+			errOut:    p.errOut(),
+			checkKill: func() *capability.EnforceResponse { return kill },
+			leg:       legHTTPNotification,
+		}
+		if gate.admit(ctx, msg) {
 			// Bound concurrent in-flight notification forwards on this session — its own
 			// pool, deliberately separate from the enforced-request slot below, so a burst of
 			// tool calls blocked on the upstream can never exhaust it and start dropping
@@ -477,7 +468,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// here, and is not subject to the in-flight cap below since it contacts no upstream.
 		// dispatchInitialize skips strictAuditDenial intentionally: this is a pure local
 		// echo of already-captured state, not a fresh decision against upstream state.
-		resp = dispatchRequest(ctx, p.dispatchParams(sess, p.sourceIP(r), rev), msg)
+		resp = dispatchRequest(ctx, p.dispatchParams(sess, p.sourceIP(r)), msg)
 	} else {
 		// Bound concurrent in-flight enforced requests on this session (the HTTP analogue
 		// of stdio's hostSem). Non-blocking acquire: on saturation reject with a retryable
@@ -512,7 +503,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: session torn down; retry"))
 			return
 		}
-		d := p.dispatchParams(sess, p.sourceIP(r), rev)
+		d := p.dispatchParams(sess, p.sourceIP(r))
 		// Serialize the decision phase for a flow-/sequenceBlock-relevant route, so a
 		// source's state write isn't raced ahead of by a later sink's read on the same
 		// ANCHOR. Only enforced methods take the turn; the Decide* handler releases it via
@@ -523,7 +514,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// sessions share one key, and a per-session lock would leave them unserialized
 		// against state they share. sess.route is dereferenced unconditionally by
 		// dispatchParams above, so a nil-route session can't reach here.
-		if sess.route.serializes() && isEnforcedMethod(rev, msg.Method) {
+		if sess.route.serializes() && isEnforcedMethod(ctx, msg.Method) {
 			// The release is idempotent, so finishDecision and this deferred backstop
 			// advance the turn exactly once between them.
 			end := sess.beginDecisionTurn(ctx)
@@ -1017,16 +1008,14 @@ const (
 )
 
 // negotiateHostRevision resolves the MCP protocol revision one host message is dispatched
-// under, checked against the revision the session's context was opened at. ok=false means
-// the refusal has already been written: -32022 plus its record for a request, and for a
-// notification a recorded drop with a bodyless 202, since JSON-RPC forbids replying to one.
+// under, checked against the revision the session's context was opened at. Its caller stamps
+// the result onto the request context immediately, and that context is the ONE carrier from
+// there down — nothing else threads the revision. ok=false means the refusal has already been
+// written: -32022 plus its record for a request, and for a notification a recorded drop with a
+// bodyless 202, since JSON-RPC forbids replying to one.
 //
-// It runs AHEAD of the kill check, deliberately: every table the routing below consults is
-// revision-scoped, so a message whose revision cannot be established has no table to be
-// looked up in. The cost is that a revoked session's bad-version probe is recorded as
-// UNSUPPORTED_PROTOCOL_VERSION rather than KILL_SWITCH — a labelling difference on a message
-// that is refused either way, since this path contacts no upstream and mutates no state. The
-// containment property is unchanged; only that one record's code differs.
+// This is the FIRST gate every host message passes — ahead of the kill check, deliberately;
+// see the gate order in dispatch.go for why, and for the one labelling exception it costs.
 //
 // Split out of handleSessionPost so that function stays within its complexity bound, and so
 // the refusal shape lives in one place rather than inline among the routing branches.
@@ -1085,7 +1074,7 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 //
 // ok=false means the refusal has already been written.
 func (p *HTTPProxy) negotiateCreatingInitialize(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) bool {
-	if _, err := resolveHostRevision(capability.Revision20251125, msg); err != nil {
+	if _, err := resolveHostRevision(handshakeRevision, msg); err != nil {
 		// No session exists yet, so the record carries no session id — the same posture as
 		// the other pre-session refusals on this path.
 		writeJSONMsg(w, refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), "", msg, err))

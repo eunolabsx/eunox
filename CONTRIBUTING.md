@@ -255,7 +255,15 @@ rules:
   what the REPLACEMENT reads — an override is otherwise unclassified, and so
   keeps every facility wired.
 - For new MCP method coverage, add an enforcement-gap-style test in
-  `internal/transport/enforcement_gaps_test.go`.
+  `internal/transport/enforcement_gaps_test.go`. That includes **per-revision**
+  coverage: which methods a given peer's revision dispatches, and which it
+  denies fail-closed, is method coverage — a new method declares its revision
+  membership in `methodRegistry`, so its cells belong beside the others rather
+  than in a revision-specific sibling. The machinery that derives the tables
+  from those declarations (the exact-set-per-revision and build-gate cells) is
+  the exception and stays in `internal/transport/dispatch_revision_test.go`;
+  the negotiation rule itself is `revision_test.go`, and the cross-cutting
+  per-message gate order is `gate_order_test.go`.
 - For new audit-record fields, add a sign-and-verify round-trip test.
 - The duplicate-key scan (`internal/pdp`, the fail-closed gate behind the
   `*/list` entry filter and the `redactFields` response path) is checked against

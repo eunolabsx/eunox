@@ -53,7 +53,7 @@ criterion is the ADR reaching **Final** under the ADR lifecycle
 
 | Gate | Decision | Recorded in | Blocks |
 |---|---|---|---|
-| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (Draft) | W3, W4, W13's mismatch cells. **No longer blocks W1**, which landed its negotiation spine without activating any translation — see the note below the table. |
+| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (In Review) | W3, W4, W13's mismatch cells. **No longer blocks W1**, which landed its negotiation spine without activating any translation — see the note below the table. |
 | D2 | MRTR metering: the signed continuation — key sourcing, anchor binding, lifetime, replay bound, what re-evaluates per retry, and the commit-once quota rule. | [ADR-0007](adr/0007-mrtr-signed-continuation.md) (Draft) | W6 |
 | D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (updated: session-creation addendum) | W2, and through it W6/W7 |
 | D4 | Stream and deferred-effect enforcement: `subscriptions/listen` open/deny semantics, notification filtering, cancel rehoming; tasks anchor binding and the kill×tasks interaction. | [ADR-0008](adr/0008-stream-and-task-enforcement.md) (Draft) | W7, W8 |
@@ -84,9 +84,12 @@ criteria below for what each turns on. Follow-up work the negotiation spine
 deliberately left open is tracked in the repository's issue tracker rather than
 here: the revision-selected upstream opener (the `protocolVersion` pin does not yet
 change how a leg is opened or framed), the forwarded `_meta` declaration that can
-disagree with the header on the same upstream request, observe mode's posture
-toward a method absent from the peer's revision table, and the structural cleanups
-the review named.
+disagree with the header on the same upstream request, and observe mode's posture
+toward a method absent from the peer's revision table. The structural cleanups the
+review named have since landed: the decided revision travels on ONE carrier (the
+context both the routing tables and the tape read), the per-message gate order is
+stated once and asserted rather than described, and the per-revision method cells
+moved into the gap file the conventions designate.
 
 Scope:
 
@@ -138,6 +141,12 @@ Exit criteria:
       criterion names as its arbiter is W13's and does not exist. The suite is a weaker
       guarantee than a byte-stable interop cell, and this doc's own rule is that "mostly
       done" has no checkbox. Ticks when W13 stands the cell up.
+      **Partially narrowed since:** `internal/transport/revision_wire_test.go` pins the exact
+      host-facing BYTES for every old-revision response the proxy generates itself
+      (`initialize`, `ping`, a filtered `tools/list`, the fail-closed default, and the -32022
+      refusal), against a context that negotiated nothing — the old-revision peer's own shape.
+      That covers the responses this workstream's refactor actually rewrote; what it does not
+      cover, and what still needs W13, is a live old upstream on the other side of the proxy.
 - [x] -32022 on unsupported or missing protocol version, with audit record.
       (`mcp.UnsupportedProtocolVersionResponse`, `refuseHostRevision`;
       `TestRefuseHostRevision_EmitsSpecCodeAndRecords` plus the stdio e2e cell.)
@@ -148,10 +157,16 @@ Exit criteria:
 - [x] Revision field on audit records with threat-model update and sign/verify roundtrip.
       (`protocol_revision`; threat model §3.16 + §6.1;
       `TestRecord_ProtocolRevisionSignAndVerify`, including the tamper leg.)
-- [ ] ADR-0006 Final before any translation behavior activates. **Still Draft** — and
-      nothing landed here activates translation: each revision's table is deny-by-default
-      over the same manifest, so selecting one can only remove methods, never grant one.
-      The mismatched-pair behavior D1 governs (W3, W4, W13's mismatch cells) is untouched.
+- [ ] ADR-0006 Final before any translation behavior activates. **Now In Review, so still
+      unticked** — `Final` is ratification by maintainer consensus, never a lone merge (see
+      [adr/README.md](adr/README.md)), so it is not a criterion an implementing PR can close.
+      What blocked readiness is closed: the one place the ADR's text and the shipped code
+      disagreed — a request "carrying neither" a context nor a declaration — now reads as the
+      code behaves, with the reason it belongs to ADR-0004's session-creation half rather than
+      to this boundary. Nothing landed here activates translation either: each revision's table
+      is deny-by-default over the same manifest, so selecting one can only remove methods,
+      never grant one. The mismatched-pair behavior D1 governs (W3, W4, W13's mismatch cells)
+      is untouched.
 
 As landed, differing from the scope above in three places:
 
@@ -162,11 +177,13 @@ As landed, differing from the scope above in three places:
   pin from a handler goroutine the message loop read for the next request. Both were
   caught in review before merge, not in production.
 - The **host-side rule for a context that negotiated nothing** resolves to 2025-11-25
-  rather than refusing. ADR-0006 reads "a request carrying neither … is denied" — but
+  rather than refusing. ADR-0006 read "a request carrying neither … is denied" — but
   turning "no context, no declaration" into a refusal is the session-creation-on-first-
   request decision, which is D3's and W2's. Until then the conservative direction is to
   land on the surface eunox already shipped: omission can never reach a newer method set,
-  and the newer table is only ever reached by an explicit declaration.
+  and the newer table is only ever reached by an explicit declaration. **No longer a
+  divergence:** ADR-0006 now states this resolution and why it belongs to ADR-0004's half,
+  so the ADR and the code agree ahead of ratification.
 - The **2026-07-28 methods this revision ADDS** (`server/discover`,
   `subscriptions/listen`, `tasks/*`) are deliberately absent from the registry, so they
   deny fail-closed rather than routing to a handler that does not exist. W4/W7/W8 add
