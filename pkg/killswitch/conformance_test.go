@@ -21,11 +21,21 @@ type managerBackend struct {
 	name string
 	// ready builds a backend whose kill set is confirmable, the state every consumer runs it in.
 	ready func(t *testing.T) Manager
-	// unconfirmed builds one that CANNOT confirm its kill set, or is nil for a backend with no
-	// such state: InMemory holds the set in-process, so there is nothing it could fail to
-	// confirm. Distinguishing the two is the point of the field — "has no unconfirmed state" is
-	// a property of the backend, not a row to skip silently.
-	unconfirmed func(t *testing.T) Manager
+	// unconfirmed builds EVERY state in which this backend cannot confirm its kill set, or is
+	// empty for a backend with no such state: InMemory holds the set in-process, so there is
+	// nothing it could fail to confirm. Distinguishing the two is the point of the field —
+	// "has no unconfirmed state" is a property of the backend, not a row to skip silently.
+	//
+	// A list rather than one builder because Redis has several and they are gated differently:
+	// the not-started guard sits AHEAD of the fail-open check, so a table sampling only that
+	// state would exercise the one arm no configuration can weaken.
+	unconfirmed []unconfirmedState
+}
+
+// unconfirmedState is one named way a backend loses confidence in its kill set.
+type unconfirmedState struct {
+	name  string
+	build func(t *testing.T) Manager
 }
 
 func managerBackends() []managerBackend {
@@ -50,12 +60,36 @@ func managerBackends() []managerBackend {
 				t.Cleanup(r.Stop)
 				return r
 			},
-			unconfirmed: func(t *testing.T) Manager {
-				t.Helper()
-				// Never started: the cache was never loaded, so an empty kill set is a state this
-				// backend cannot vouch for.
-				r, _ := newTestRedis(t)
-				return r
+			unconfirmed: []unconfirmedState{
+				{
+					// The cache was never loaded, so an empty kill set is a state this backend
+					// cannot vouch for.
+					name: "never started",
+					build: func(t *testing.T) Manager {
+						t.Helper()
+						r, _ := newTestRedis(t)
+						return r
+					},
+				},
+				{
+					// A refresh ran and failed. This is the state an operator actually hits — a
+					// partition — and the one --killswitch-fail-open deliberately weakens, so the
+					// default (fail-closed) posture is what the rule binds here.
+					name:  "refresh failed",
+					build: func(t *testing.T) Manager { return newDegradedRedis(t, false) },
+				},
+				{
+					// Started, then stopped: the convergence loops have exited, so the cache can
+					// never be confirmed again — a permanent cause, not a transient one.
+					name: "convergence stopped",
+					build: func(t *testing.T) Manager {
+						t.Helper()
+						r, _ := newTestRedis(t)
+						r.Start(context.Background())
+						r.Stop()
+						return r
+					},
+				},
 			},
 		},
 	}
@@ -188,22 +222,27 @@ func TestManagerConformance_UnconfirmedBackendNeverAllClears(t *testing.T) {
 	for _, b := range managerBackends() {
 		t.Run(b.name, func(t *testing.T) {
 			t.Parallel()
-			if b.unconfirmed == nil {
+			if len(b.unconfirmed) == 0 {
 				// Recorded as an exemption rather than dropped from the loop: a row that
 				// vanishes reads the same as a row nobody wired, and the next backend whose
 				// state stops being in-process would inherit that silence.
 				t.Skip("in-process kill set: there is no state this backend could fail to confirm")
 			}
-			m := b.unconfirmed(t)
+			for _, state := range b.unconfirmed {
+				t.Run(state.name, func(t *testing.T) {
+					t.Parallel()
+					m := state.build(t)
 
-			require.Error(t, m.HealthStatus(), "an unconfirmable backend must report the cause to a probe")
+					require.Error(t, m.HealthStatus(), "an unconfirmable backend must report the cause to a probe")
 
-			blocked, err := m.ShouldBlock(context.Background(), "agent-1", "sess-1")
-			require.Error(t, err, "a non-match must carry the cause rather than read as a confirmed all-clear")
-			require.False(t, blocked, "the refusal is the error; a synthetic match would deny for the wrong stated reason")
+					blocked, err := m.ShouldBlock(context.Background(), "agent-1", "sess-1")
+					require.Error(t, err, "a non-match must carry the cause rather than read as a confirmed all-clear")
+					require.False(t, blocked, "the refusal is the error; a synthetic match would deny for the wrong stated reason")
 
-			_, err = m.Status(context.Background())
-			require.Error(t, err, "an unconfirmable snapshot must not be handed out as the whole kill set")
+					_, err = m.Status(context.Background())
+					require.Error(t, err, "an unconfirmable snapshot must not be handed out as the whole kill set")
+				})
+			}
 		})
 	}
 }

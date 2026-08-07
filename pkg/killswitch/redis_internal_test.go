@@ -238,14 +238,8 @@ func TestRedis_Reset_StatePreservedOnError(t *testing.T) {
 
 func TestRedis_DeactivateGlobal(t *testing.T) {
 	t.Parallel()
-	mr := miniredis.NewMiniRedis()
-	require.NoError(t, mr.Start())
-	t.Cleanup(mr.Close)
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
-
-	r := NewRedis(client)
-	markStarted(t, r) // write-op cache semantics on a started switch
+	// write-op cache semantics on a started switch
+	r, _ := newStartedTestRedis(t)
 	ctx := context.Background()
 
 	// Activate then deactivate — ShouldBlock must go false.
@@ -266,14 +260,8 @@ func TestRedis_DeactivateGlobal(t *testing.T) {
 
 func TestRedis_ReviveSession(t *testing.T) {
 	t.Parallel()
-	mr := miniredis.NewMiniRedis()
-	require.NoError(t, mr.Start())
-	t.Cleanup(mr.Close)
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
-
-	r := NewRedis(client)
-	markStarted(t, r) // write-op cache semantics on a started switch
+	// write-op cache semantics on a started switch
+	r, _ := newStartedTestRedis(t)
 	ctx := context.Background()
 
 	require.NoError(t, r.KillSession(ctx, "sess-abc"))
@@ -299,14 +287,8 @@ func TestRedis_ReviveSession(t *testing.T) {
 // and ShouldBlock must block immediately after each call returns.
 func TestRedis_KillUpdatesLocalCacheBeforePublish(t *testing.T) {
 	t.Parallel()
-	mr := miniredis.NewMiniRedis()
-	require.NoError(t, mr.Start())
-	t.Cleanup(mr.Close)
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
-
-	r := NewRedis(client)
-	markStarted(t, r) // write-op cache semantics on a started switch
+	// write-op cache semantics on a started switch
+	r, _ := newStartedTestRedis(t)
 	ctx := context.Background()
 
 	// KillAgent: cache must reflect the kill the moment the call returns.
