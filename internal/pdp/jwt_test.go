@@ -3016,8 +3016,6 @@ func TestJWTPDP_DecideSampling_KilledAgent_Denied(t *testing.T) {
 	}
 }
 
-// makeJWTCtx is a convenience wrapper that validates a token and returns the
-// enriched context.  It calls t.Fatal on any error.
 // TestJWTPDP_Decide_MatchingClaimConditionEnforcedAmongNoise guards the lazy
 // reorder: claim evaluation performs the cheap namespace/bare-name match
 // (parseCapHeads) before parsing a claim's condition suffix, so non-matching claims
@@ -3048,6 +3046,7 @@ func TestJWTPDP_Decide_MatchingClaimConditionEnforcedAmongNoise(t *testing.T) {
 	}
 }
 
+// makeJWTCtx validates a token and returns the enriched context, calling t.Fatal on any error.
 func makeJWTCtx(t *testing.T, pdp *JWTPDP, token string) context.Context {
 	t.Helper()
 	ctx, err := pdp.ValidateToken(context.Background(), "Bearer "+token)

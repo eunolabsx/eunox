@@ -111,8 +111,10 @@ func (d DeferredCommit) Commits() bool { return d.Bucket.Key != "" }
 // skip MUST be derived solely from the request context (as the built-in maxCalls does via
 // SkipQuota(ctx)), never from the condition's own config: the atomic multi-condition commit
 // treats one bucket's skip as skipping the WHOLE deferred set, so a per-condition skip would
-// fail-open the buckets it never checked. commitDeferredConditions asserts skip ==
-// SkipQuota(ctx) and fails closed on a violation.
+// fail-open the buckets it never checked. EVERY site that consumes a PrepareCommit result
+// asserts skip => SkipQuota(ctx) and hard-denies a violation (unauthorizedSkipError). The
+// converse is not asserted: a handler that ignores SkipQuota and commits anyway spends real
+// quota on an observe route, which the engine cannot distinguish from a legitimate commit.
 //
 // A condition type is "deferred" precisely when its registered handler implements this
 // interface, so a custom WithConditionHandler that commits state participates automatically.
@@ -122,10 +124,16 @@ type CommittingConditionHandler interface {
 }
 
 // ConditionError describes a condition evaluation failure.
+//
+// HardDeny marks a failure that must block even under an audit-mode constraint, for the
+// engine/plugin BUGS a policy verdict cannot be downgraded from — without it the shared
+// error type could not express what the deferred path's own refusals already needed, so a
+// refusal moved onto this type silently became forwardable.
 type ConditionError struct {
 	Code          string
 	ConditionType string
 	Message       string
+	HardDeny      bool
 	Details       map[string]interface{}
 }
 
@@ -750,25 +758,21 @@ func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceR
 // The engine's own deferred pass does NOT come through here: it prepares every condition
 // and admits the whole set atomically, the only way a multi-condition constraint gets a
 // TOCTOU-free commit. Since deferral is keyed by condition TYPE, that pass takes EVERY
-// committing condition, and this path is reached only by a direct Handle call — which is
-// why its skip assertion below is written out rather than assumed unreachable.
+// committing condition, so NO engine path reaches this one today — it survives because
+// CommittingConditionHandler embeds ConditionHandler, which obliges each committing handler
+// to carry a Handle at all. That is why its guards are written out rather than assumed
+// unreachable: they are what a future single-condition fast path would inherit.
 func (e *Engine) prepareAndAdmit(ctx context.Context, h CommittingConditionHandler, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
 	commit, skip, condErr := h.PrepareCommit(ctx, cond, req)
 	if condErr != nil {
 		return condErr
 	}
 	if skip {
-		// The same contract commitDeferredConditions asserts, for the same reason it fails
-		// closed on: honoring a skip the context did not authorize lets a handler decline to
-		// spend its own budget on a call nothing refused. Asserted here too so the contract
-		// holds on BOTH paths a committing handler can be driven through, rather than being
-		// enforced only where the engine happens to route today.
+		// Asserted wherever a PrepareCommit result is consumed, not only where the engine
+		// routes today: honoring a skip the context did not authorize lets a handler decline
+		// to spend its own budget on a call nothing refused.
 		if !SkipQuota(ctx) {
-			return &ConditionError{
-				Code:          capability.ErrCodeConditionFailed,
-				ConditionType: cond.ConditionType(),
-				Message:       fmt.Sprintf("committing condition %q reported a skip; skip must be derived solely from request context", cond.ConditionType()),
-			}
+			return unauthorizedSkipError(cond.ConditionType())
 		}
 		return nil
 	}
@@ -878,16 +882,7 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.E
 			// conditions unchecked: a fail-open. Assert the contract and fail closed on a
 			// per-bucket violation.
 			if !SkipQuota(ctx) {
-				resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
-					Code:          capability.ErrCodeConditionFailed,
-					ConditionType: condType,
-					// HardDeny: a handler violating the skip contract is an engine/plugin bug,
-					// not a downgradable policy verdict, so it must block even under an
-					// audit-mode constraint rather than being forwarded with quota unconsumed.
-					HardDeny: true,
-					Message:  fmt.Sprintf("committing condition %q reported a non-uniform skip; deferred commit requires skip to be derived solely from request context", condType),
-				})
-				return &resp
+				return denyFromConditionError(unauthorizedSkipError(condType), matched, requestID, now)
 			}
 			skipped++
 			committing++
@@ -1014,9 +1009,27 @@ func denyFromConditionError(condErr *ConditionError, matched *capability.Constra
 		Code:          condErr.Code,
 		ConditionType: condErr.ConditionType,
 		Message:       condErr.Message,
+		HardDeny:      condErr.HardDeny,
 		Details:       condErr.Details,
 	})
 	return &resp
+}
+
+// unauthorizedSkipError refuses a committing handler's skip that the request context did
+// not authorize. ONE constructor for every site that consumes a PrepareCommit result: the
+// two hand-written copies of this refusal had already drifted on HardDeny, the field that
+// decides whether an audit-mode constraint forwards the call anyway.
+//
+// HardDeny because a handler violating the skip contract is an engine/plugin bug, not a
+// downgradable policy verdict: an audit route must not forward a call whose declared budget
+// was neither checked nor spent.
+func unauthorizedSkipError(condType string) *ConditionError {
+	return &ConditionError{
+		Code:          capability.ErrCodeConditionFailed,
+		ConditionType: condType,
+		HardDeny:      true,
+		Message:       fmt.Sprintf("committing condition %q reported a skip the request context did not authorize; skip must be derived solely from request context", condType),
+	}
 }
 
 // committingHandler returns the registered handler for condType when it commits

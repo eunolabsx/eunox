@@ -51,9 +51,11 @@ type Manager interface {
 	// Reset clears all kill-switch state.
 	Reset(ctx context.Context) error
 
-	// Status returns the current kill-switch state. A backend that loads its state
-	// asynchronously reports an error rather than a snapshot until it has one (the Redis
-	// backend's ErrNotStarted), since an empty snapshot cannot be told from an all-clear.
+	// Status returns the current kill-switch state. A snapshot asserts "this is the whole
+	// kill set", the same claim ShouldBlock makes when nothing matches, so a backend whose
+	// cache cannot be confirmed must report the same cause here instead (the Redis
+	// backend's ErrNotStarted / ErrStopped / ErrBackendUnreachable) — an unconfirmable
+	// snapshot cannot be told from a confirmed all-clear.
 	Status(ctx context.Context) (*Status, error)
 
 	// ObserveRevocations registers fn to be called whenever this backend's LOCAL view

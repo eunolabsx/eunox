@@ -247,13 +247,17 @@ func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
 // be uniform across the constraint. On the multi-deferred path this would fail OPEN —
 // one bucket's skip shortcuts the whole set to allow without limit-checking the rest —
 // so the atomic commit must instead fail closed.
+//
+// Pointer receiver so the copy held in the registry and the test's reference share the
+// same engine pointer (as its two sibling fakes do): registered by value, the copy keeps
+// the nil *Engine it was boxed with, and any future use of h.e would nil-deref there.
 type nonUniformSkipHandler struct{ e *Engine }
 
-func (h nonUniformSkipHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
+func (h *nonUniformSkipHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
 	return h.e.prepareAndAdmit(ctx, h, cond, req)
 }
 
-func (h nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+func (h *nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	// skip unconditionally, regardless of ctx — the contract violation under test.
 	return DeferredCommit{}, true, nil
 }
@@ -264,7 +268,7 @@ func (h nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Con
 // would allow the whole deferred set without limit-checking the remaining conditions.
 func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	counter := callcounter.NewInMemory()
-	handler := nonUniformSkipHandler{}
+	handler := &nonUniformSkipHandler{}
 	e := New(WithCallCounter(counter), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
@@ -272,6 +276,9 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
+		// An AUDIT-mode constraint: a handler violating the skip contract is an engine
+		// bug, not a downgradable policy verdict, so the refusal must still block here.
+		Enforcement: capability.EnforcementAudit,
 		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path.
 		Conditions: []capability.Condition{
 			&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60},
@@ -288,16 +295,20 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
+	if !resp.Denial.HardDeny {
+		t.Fatal("denial must be a HardDeny: an audit route forwards anything downgradable, so a skip-contract violation would ship with the budget unchecked")
+	}
 }
 
-// TestPrepareAndAdmit_NonUniformSkipFailsClosed pins the single-condition twin of the
-// test above, driven through a committing handler's own Handle — the documented
-// WithConditionHandler seam, and the only way this path is reached, since the engine's
-// own flow always defers a committing condition to the atomic commit. A skip the request
-// context did not authorize must deny here exactly as it does there; honoring it let a
-// handler decline to spend its own budget on a call nothing had refused.
+// TestPrepareAndAdmit_NonUniformSkipFailsClosed pins the single-condition twin of the test
+// above. It drives a committing handler's own Handle directly, which is the ONLY way this
+// path runs: the engine defers every committing condition to the atomic commit, and
+// prepareAndAdmit is unexported, so no registered handler reaches it. The guard exists for
+// what a future single-condition fast path would inherit, and it must refuse identically —
+// same code, and the same HardDeny, since honoring an unauthorized skip lets a handler
+// decline to spend its own budget on a call nothing refused.
 func TestPrepareAndAdmit_NonUniformSkipFailsClosed(t *testing.T) {
-	handler := nonUniformSkipHandler{}
+	handler := &nonUniformSkipHandler{}
 	e := New(WithCallCounter(callcounter.NewInMemory()), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
@@ -311,6 +322,9 @@ func TestPrepareAndAdmit_NonUniformSkipFailsClosed(t *testing.T) {
 	}
 	if condErr.Code != capability.ErrCodeConditionFailed {
 		t.Fatalf("condErr = %+v, want code %q", condErr, capability.ErrCodeConditionFailed)
+	}
+	if !condErr.HardDeny {
+		t.Fatal("condErr must carry HardDeny, as the deferred path's twin does — the two refusals are one contract and drifted on exactly this field")
 	}
 
 	// The assertion refuses an UNAUTHORIZED skip, not skipping: the same handler under
@@ -959,28 +973,41 @@ func TestSchemaTypeCompatible(t *testing.T) {
 	}
 }
 
-// A manifest condition may decode as either a value or a pointer, so the cast every
-// handler runs must accept both and still refuse a different condition type. Exercised
-// through capability.AsValueOrPointer, the shared helper castCondition casts with.
-func TestAsSequenceBlock_PointerValueAndMismatch(t *testing.T) {
+// TestCastCondition_PointerValueMismatchAndTypedNil covers the cast every handler runs: a
+// manifest condition may decode as either a value or a pointer, so both must pass, while a
+// different type and a TYPED NIL must be refused. The typed nil is the load-bearing case —
+// the shared helper returns it as (nil, true), so the ok result alone does not catch it and
+// each handler would dereference it and panic.
+func TestCastCondition_PointerValueMismatchAndTypedNil(t *testing.T) {
 	t.Parallel()
 
 	// Pointer form.
 	ptr := &capability.SequenceBlockCondition{}
-	if got, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](ptr); !ok || got != ptr {
-		t.Errorf("pointer form: got (%v,%v), want (%v,true)", got, ok, ptr)
+	if got, condErr := castCondition[capability.SequenceBlockCondition](ptr); condErr != nil || got != ptr {
+		t.Errorf("pointer form: got (%v,%v), want (%v,nil)", got, condErr, ptr)
 	}
 
 	// Value form: must be normalised to a non-nil pointer.
 	val := capability.SequenceBlockCondition{}
-	if got, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](val); !ok || got == nil {
-		t.Errorf("value form: got (%v,%v), want (non-nil,true)", got, ok)
+	if got, condErr := castCondition[capability.SequenceBlockCondition](val); condErr != nil || got == nil {
+		t.Errorf("value form: got (%v,%v), want (non-nil,nil)", got, condErr)
 	}
 
-	// A different condition type must not match.
+	// A different condition type must not match, and the error names the EXPECTED type,
+	// derived from T rather than passed in beside it.
 	other := &capability.MaxCallsCondition{}
-	if got, ok := capability.AsValueOrPointer[capability.SequenceBlockCondition](other); ok || got != nil {
-		t.Errorf("mismatch: got (%v,%v), want (nil,false)", got, ok)
+	got, condErr := castCondition[capability.SequenceBlockCondition](other)
+	if got != nil || condErr == nil {
+		t.Fatalf("mismatch: got (%v,%v), want (nil,non-nil)", got, condErr)
+	}
+	if condErr.ConditionType != capability.ConditionTypeSequenceBlock {
+		t.Errorf("mismatch: ConditionType = %q, want %q", condErr.ConditionType, capability.ConditionTypeSequenceBlock)
+	}
+
+	// A typed nil survives `cond == nil` as a non-nil interface; refused here, not panicked on.
+	var typedNil *capability.SequenceBlockCondition
+	if got, condErr := castCondition[capability.SequenceBlockCondition](typedNil); got != nil || condErr == nil {
+		t.Errorf("typed nil: got (%v,%v), want (nil,non-nil)", got, condErr)
 	}
 }
 

@@ -74,11 +74,9 @@ func (r *Redis) newMember(now time.Time) string {
 // per-instance entropy for ZADD member uniqueness — a silent fallback would risk
 // reintroducing the cross-replica collision the entropy prevents.
 //
-// Redis Cluster is NOT supported: a multi-bucket AdmitAll is one multi-key EVAL whose keys
-// carry distinct window suffixes, so a cluster hashes them to different slots and refuses
-// the script with CROSSSLOT (a deny — fail closed, never an over-admission). Stated here
-// because the constructor takes any redis.Cmdable, a *redis.ClusterClient included, and the
-// posture is otherwise only discoverable from AdmitAll's own doc.
+// Redis Cluster is NOT supported — see AdmitAll for the mechanism (a multi-key EVAL a
+// cluster can refuse with CROSSSLOT). Stated at the constructor because that is where a
+// *redis.ClusterClient is wired in, and redis.Cmdable accepts one.
 func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {

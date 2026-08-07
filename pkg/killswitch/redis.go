@@ -70,9 +70,9 @@ type pubSubClient interface {
 // underlying error is NOT wrapped so connection details don't leak; see HealthStatus().
 var ErrBackendUnreachable = errors.New("killswitch: redis backend unreachable; failing closed (kill-switch state cannot be confirmed)")
 
-// ErrNotStarted is returned by ShouldBlock and Status before Start has loaded initial
-// state: the cache cannot tell "nothing is killed" from "never loaded", so both fail
-// closed regardless of WithFailOpen — a WIRING error, not a transient outage.
+// ErrNotStarted is returned by every reader of the cache before Start has loaded initial
+// state: the cache cannot tell "nothing is killed" from "never loaded", so it fails closed
+// regardless of WithFailOpen — a WIRING error, not a transient outage.
 var ErrNotStarted = errors.New("killswitch: redis kill switch queried before Start(); failing closed (state never loaded)")
 
 // ErrStopped is returned by ShouldBlock on a non-match once the Start context is
@@ -807,19 +807,31 @@ func (r *Redis) Reset(ctx context.Context) error {
 	return pubErr
 }
 
-// Status returns the current kill-switch state from the LOCAL cache. A DEGRADED (stale)
-// cache is reported rather than refused — HealthStatus is the authoritative freshness
-// signal — but a cache that was never seeded is refused with ErrNotStarted, the same shape
-// ShouldBlock fails closed on: the zero snapshot an unstarted instance holds is
-// indistinguishable from "confirmed: nothing is killed", so reporting it as one would let
-// the write-only, never-Started idiom this package's callers use answer a question it has
-// no state to answer.
+// Status returns the current kill-switch state from the LOCAL cache. It answers the same
+// question ShouldBlock's NON-MATCH arm does — "this is the whole kill set" — so it refuses
+// on the same causes, in the same order, with the same sentinels, and honors failOpen
+// identically: a snapshot from a cache that cannot be confirmed is byte-identical to a
+// confirmed all-clear, which is the one answer an unconfirmable cache must not give.
+// Reading the gate chain through livenessLocked rather than restating it is what keeps the
+// three readers from disagreeing about the same instance.
 func (r *Redis) Status(_ context.Context) (*Status, error) {
+	// Before mu, as the siblings do: a never-Started switch has no cache to lock over.
 	if !r.started.Load() {
 		return nil, ErrNotStarted
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	switch r.livenessLocked() {
+	case killStopped:
+		return nil, ErrStopped
+	case killRefreshFailed, killStale:
+		// The sanitized sentinel, not HealthStatus's raw error: a snapshot may be rendered
+		// to a caller that is not the operator, so connection detail stays in HealthStatus.
+		if !r.failOpen {
+			return nil, ErrBackendUnreachable
+		}
+	case killLive:
+	}
 	return buildStatus(r.globalActive, r.killedAgents, r.killedSessions), nil
 }
 

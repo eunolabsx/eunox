@@ -306,15 +306,22 @@ Section conventions:
 
 ### Changed
 
-- **`killswitch.Redis.Status` fails closed before `Start`.** An instance that never
-  seeded its cache holds no kill state and no refresh error, so the snapshot it built —
-  returned with a **nil** error — was byte-identical to a confirmed "nothing is killed".
-  `ShouldBlock` already refused exactly that shape with `ErrNotStarted`; `Status` now
-  does too, and returns no snapshot rather than one an unchecked caller could report as
-  an all-clear. A *degraded* (stale) cache is still reported, unchanged —
-  `HealthStatus()` remains the freshness signal. Library-facing only: nothing in the
-  binary queries an unstarted switch. **Migration:** `Start` before `Status`, or handle
-  `ErrNotStarted`. See `docs/adr/0003-redis-killswitch-fail-open.md`.
+- **`killswitch.Redis.Status` fails closed on a cache it cannot confirm.** A snapshot
+  asserts "this is the whole kill set" — `ShouldBlock`'s "nothing matches" written out —
+  but `Status` answered it from any cache at all, returning a **nil** error beside a
+  snapshot byte-identical to a confirmed all-clear. It now runs the same gate chain as
+  `ShouldBlock`, through the same classifier, with the same sentinels: `ErrNotStarted`
+  before `Start`, `ErrStopped` once the convergence loops have exited, and
+  `ErrBackendUnreachable` for a degraded or stale cache — the last honoring
+  `--killswitch-fail-open` exactly as `ShouldBlock` does, since serving the last-known
+  cache is what that flag opts into. The states this closes are ordinary ones: a proxy
+  booting into a Redis partition (`Start` marks the switch started once the initial load
+  has been *attempted*) and a stopped switch both used to report "nothing is killed"
+  while the data plane denied every request. `HealthStatus()` is unchanged and remains
+  the operator channel that carries the raw error. Library-facing only: nothing in the
+  binary calls `Status`. **Migration:** handle the error, or read `HealthStatus()` when
+  you want the last-known cache regardless of confidence. See
+  `docs/adr/0003-redis-killswitch-fail-open.md`.
 - Both `--killswitch-session-ttl` help strings (`proxy` and `kill`) now render the
   default tombstone lifetime **from** `killswitch.DefaultSessionKillTTL` instead of
   restating it as prose in two commands, so raising the default cannot leave either one
@@ -996,16 +1003,23 @@ Section conventions:
 
 ### Fixed
 
-- **A committing condition's own `Handle` asserts the skip contract the atomic commit
-  already did.** `CommittingConditionHandler` requires `skip` to be derived solely from the
-  request context (`SkipQuota`), because the atomic multi-bucket commit treats one bucket's
-  skip as skipping the whole deferred set — and that path hard-denies a handler reporting it
-  for any other reason. The single-condition path (`prepareAndAdmit`, reached through a
-  handler's own `Handle` — the documented `WithConditionHandler` seam) honored `skip`
-  unconditionally, failing **open** exactly where its sibling fails closed: a handler could
-  decline to spend its own budget on a call nothing had refused. Both now refuse an
-  unauthorized skip with `CONDITION_FAILED`. An authorized skip — observe mode, where the
-  context does carry `SkipQuota` — passes as before.
+- **The `CommittingConditionHandler` skip contract is refused from one constructor, at
+  every site that consumes a `PrepareCommit` result.** The contract requires `skip` to be
+  derived solely from the request context (`SkipQuota`), because the atomic multi-bucket
+  commit treats one bucket's skip as skipping the whole deferred set. Only that commit
+  asserted it; the single-condition path (`prepareAndAdmit`) honored `skip` unconditionally.
+  No shipped build could reach that path — the engine defers *every* committing condition,
+  and `prepareAndAdmit` is unexported, so it survives only because
+  `CommittingConditionHandler` embeds `ConditionHandler` and each committing handler must
+  therefore carry a `Handle` — so this is what a future single-condition fast path would
+  have inherited, not a live fail-open. Both sites now build the refusal with one
+  `unauthorizedSkipError`, which is how the divergence surfaced: written out twice, the
+  copy had silently dropped `HardDeny`, the field deciding whether an audit-mode constraint
+  forwards the call anyway. `enforcement.ConditionError` gains an exported `HardDeny bool`
+  so the shared error type can carry it; `denyFromConditionError` propagates it. An
+  authorized skip — observe mode, where the context does carry `SkipQuota` — passes as
+  before, and the converse (a handler that ignores `SkipQuota` and commits real quota on an
+  observe route) is still not asserted, which the interface doc now says explicitly.
 - **The harden path applies a delegation chain to its verdict, not only to its obligations.**
   `HardenRefusal` composes this PDP's verdicts onto a refusal the JWT layer produced. Its
   obligation fill read the chain off the context and applied the chain's composed

@@ -768,11 +768,18 @@ func publishSessionKillTTL(parent context.Context, ksRedis *killswitch.Redis) {
 }
 
 // describeDefaultSessionKillTTL renders the DEFAULT session-kill tombstone lifetime for the
-// two --killswitch-session-ttl help strings. Both halves come from the constant, so neither
-// spelling can drift from the lifetime Redis actually applies the way the prose they replace
-// had to be kept in step by hand, in two commands.
+// two --killswitch-session-ttl help strings, through the same renderer every other TTL
+// message in this binary uses, so the prose they replace cannot come back as a second
+// spelling to keep in step by hand. The "/ N days" gloss is added only when the default IS
+// a whole number of days: a truncating count would render 36h as "1 days" and 12h as
+// "0 days", relocating the drift rather than removing it.
 func describeDefaultSessionKillTTL() string {
-	return fmt.Sprintf("%s / %d days", killswitch.DefaultSessionKillTTL, int64(killswitch.DefaultSessionKillTTL/(24*time.Hour)))
+	d := killswitch.DefaultSessionKillTTL
+	rendered := killswitch.DescribeSessionKillTTL(d)
+	if d > 0 && d%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%s / %d days", rendered, d/(24*time.Hour))
+	}
+	return rendered
 }
 
 // sessionKillTTLNotice renders the startup line describing how long a session-kill

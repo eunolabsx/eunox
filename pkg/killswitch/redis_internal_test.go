@@ -363,17 +363,63 @@ func TestRedis_Status(t *testing.T) {
 	assert.Equal(t, []string{"sess-1"}, status.KilledSessions)
 }
 
-// TestRedis_Status_FailsClosedBeforeStart: an unstarted instance holds an empty cache and
-// no refresh error, so the snapshot it can build is byte-identical to a confirmed all-clear.
-// ShouldBlock already refuses that shape; Status returning it with a nil error let a caller
-// report "nothing is killed" from a switch that had never read Redis at all.
-func TestRedis_Status_FailsClosedBeforeStart(t *testing.T) {
+// TestRedis_Status_MirrorsShouldBlocksGateChain: a snapshot asserts "this is the whole kill
+// set", the same claim ShouldBlock makes on a non-match, so it must refuse on the same
+// causes. Guarding only the unstarted case left the two states an operator actually reaches
+// — a boot into a Redis partition, and a stopped switch — reporting a confident all-clear
+// with a nil error while ShouldBlock denied every request on the same instance.
+func TestRedis_Status_MirrorsShouldBlocksGateChain(t *testing.T) {
 	t.Parallel()
-	r, _ := newTestRedis(t)
+	ctx := context.Background()
 
-	status, err := r.Status(context.Background())
-	require.ErrorIs(t, err, ErrNotStarted)
-	require.Nil(t, status, "a refused Status must yield no snapshot to misread as an all-clear")
+	t.Run("unstarted", func(t *testing.T) {
+		t.Parallel()
+		r, _ := newTestRedis(t)
+		status, err := r.Status(ctx)
+		require.ErrorIs(t, err, ErrNotStarted)
+		require.Nil(t, status, "a refused Status must yield no snapshot to misread as an all-clear")
+	})
+
+	// Started, but the initial refresh failed: started is set once the load has been
+	// ATTEMPTED, so the flag alone cannot tell this from a seeded cache.
+	t.Run("started into an unreachable backend", func(t *testing.T) {
+		t.Parallel()
+		r, mr := newTestRedis(t)
+		mr.Close()
+		r.Start(ctx)
+		defer r.Stop()
+
+		status, err := r.Status(ctx)
+		require.ErrorIs(t, err, ErrBackendUnreachable)
+		require.Nil(t, status)
+		_, blockErr := r.ShouldBlock(ctx, "agent-x", "sess-x")
+		require.ErrorIs(t, blockErr, ErrBackendUnreachable, "report and data plane must agree")
+	})
+
+	// Fail-open opts into serving the last-known cache; a report is served on exactly the
+	// same terms, so the flag does not mean one thing to ShouldBlock and another here.
+	t.Run("degraded under fail-open", func(t *testing.T) {
+		t.Parallel()
+		r, mr := newTestRedis(t, WithFailOpen(true))
+		mr.Close()
+		r.Start(ctx)
+		defer r.Stop()
+
+		status, err := r.Status(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, status)
+	})
+
+	t.Run("stopped", func(t *testing.T) {
+		t.Parallel()
+		r, _ := newTestRedis(t)
+		r.Start(ctx)
+		r.Stop()
+
+		status, err := r.Status(ctx)
+		require.ErrorIs(t, err, ErrStopped, "a frozen switch can never converge; it is not a transient outage")
+		require.Nil(t, status)
+	})
 }
 
 func TestRedis_WithLogger_LogsRefreshFailure(t *testing.T) {

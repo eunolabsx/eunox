@@ -111,8 +111,19 @@ refine what "cannot confirm" means, so a health probe and the data plane agree o
   `Status()` refuses with the same sentinel and returns no snapshot: the empty one
   an unstarted cache can build is byte-identical to a confirmed all-clear, so
   reporting it with a nil error would answer a question the switch has no state to
-  answer. A *degraded* (stale) cache is still reported rather than refused —
-  `HealthStatus()` remains the authoritative freshness signal.
+  answer.
+
+- **A snapshot is the same claim as a non-match.** `Status()` reports "this is the
+  whole kill set", which is `ShouldBlock`'s "nothing matches" written out, so it runs
+  the *same* gate chain in the same order and maps it to the same sentinels —
+  `ErrNotStarted`, then `ErrStopped`, then `ErrBackendUnreachable` for a degraded or
+  stale cache — and honors `--killswitch-fail-open` identically, since serving the
+  last-known cache is exactly what that flag opts into. Reading the chain through the
+  one classifier rather than restating it is what keeps the three readers from
+  disagreeing about the same instance: guarding only "never `Start`ed" left a boot
+  into a Redis partition, and a stopped switch, reporting a confident all-clear while
+  `ShouldBlock` denied every request. `HealthStatus()` remains the operator channel,
+  and is the one that carries the raw error.
 
 - **Stopped is distinct from unreachable.** Once the kill switch's `Start` context
   is canceled (`Stop()`, or the caller's own context), the reconcile and pub/sub

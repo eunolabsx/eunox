@@ -1424,9 +1424,10 @@ func asInterfaceSlice(v interface{}) ([]interface{}, bool) {
 // predicates, so the value-or-pointer type switch lives in one place — since a manifest
 // condition may decode into either form.
 //
-// A TYPED-NIL pointer handed to an exported predicate matches AsValueOrPointer's `case *T`
-// arm as (nil, nil), which every handler would then dereference and panic on
-// (fail-open-via-crash); refused here once rather than at each handler, mirroring
+// A TYPED-NIL pointer handed to an exported predicate is returned AS-IS by
+// AsValueOrPointer's `case *T` arm — (nil, true), so ok alone does not refuse it — and every
+// handler would then dereference it and panic (fail-open-via-crash). The `t == nil` half of
+// the guard below is what catches that, once here rather than at each handler, mirroring
 // CollectObligations' typed-nil guard for directives.
 func castCondition[T capability.Condition](cond capability.Condition) (*T, *ConditionError) {
 	t, ok := capability.AsValueOrPointer[T](cond)

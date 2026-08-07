@@ -592,8 +592,8 @@ func TestKillUsage_DocumentsRevive(t *testing.T) {
 // constant instead.
 func TestSessionKillTTLHelp_DerivesTheDefaultFromTheConstant(t *testing.T) {
 	rendered := describeDefaultSessionKillTTL()
-	require.Contains(t, rendered, killswitch.DefaultSessionKillTTL.String(),
-		"the rendered default must come from the constant, not a restatement of it")
+	require.Contains(t, rendered, killswitch.DescribeSessionKillTTL(killswitch.DefaultSessionKillTTL),
+		"the rendered default must come through the package's renderer, not a second spelling of it")
 
 	killHelp := captureStdout(t, func() { require.Zero(t, cmdKill([]string{"-h"})) })
 	require.Contains(t, killHelp, rendered)
@@ -602,6 +602,14 @@ func TestSessionKillTTLHelp_DerivesTheDefaultFromTheConstant(t *testing.T) {
 	registerProxyFlags(fs)
 	proxyHelp := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
 	require.Contains(t, proxyHelp, rendered)
+
+	// The day gloss is a claim about the constant, not decoration: it appears only when the
+	// default divides evenly into days, so it can never state a truncated count.
+	if killswitch.DefaultSessionKillTTL%(24*time.Hour) == 0 {
+		require.Contains(t, rendered, "days")
+	} else {
+		require.NotContains(t, rendered, "days", "a non-whole-day default must not be glossed with a truncated day count")
+	}
 }
 
 // TestSessionKillTTLNotice_PointsAtARealCommand: with expiry disabled the banner used to
