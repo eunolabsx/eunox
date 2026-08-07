@@ -872,6 +872,12 @@ func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string
 		if authHeader != "" || tlsSkipVerify {
 			return nil, fmt.Errorf("--audit: --upstream-auth-header/--upstream-tls-skip-verify apply only to a remote --upstream-url upstream, not a positional `-- <command>` subprocess")
 		}
+		// The protocol pin only reaches the wire on a remote HTTP leg (it selects that leg's
+		// version header); a subprocess upstream speaks the handshake it is given. Refuse it
+		// here rather than accept a flag that would silently do nothing.
+		if protocolVersion != "" {
+			return nil, fmt.Errorf("--audit: --upstream-protocol-version applies only to a remote --upstream-url upstream, not a positional `-- <command>` subprocess")
+		}
 		u.Transport = config.HostTransportStdio
 		u.Command = positional[0]
 		u.Args = positional[1:]
@@ -1650,7 +1656,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		UpstreamTLSSkipVerify: u.UpstreamTLSSkipVerify,
 		// Empty when the operator wrote `auto` or omitted the key: the handshake's own
 		// reported revision wins. LoadGatewayConfig has already refused anything else.
-		UpstreamProtocolVersion: capability.Revision(u.ResolvedProtocolVersion()),
+		UpstreamProtocolVersion: u.ResolvedProtocolVersion(),
 		PDP:                     dp,
 		Sink:                    sink,
 		PolicyVersion:           policyVersion,

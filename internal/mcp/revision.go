@@ -23,24 +23,43 @@ import (
 // request arrived in.
 var ErrUnknownRevision = errors.New("mcp: unsupported protocol revision")
 
+// maxReflectedRevisionLen bounds how much of a rejected version string is echoed back to the
+// peer. The value reaches the error precisely BECAUSE it failed the closed-set match, so it
+// is arbitrary caller text up to the transport's whole frame — reflecting it unbounded would
+// make the refusal an amplifier. Long enough that a real revision date is never truncated.
+const maxReflectedRevisionLen = 32
+
 // DeclaredRevision reads the protocol revision a request declares in its `_meta`
 // (capability.MetaKeyProtocolVersion), as 2026-07-28 requires on every request.
 //
-// Three outcomes, and the caller must keep them apart: a revision this build speaks;
-// nothing declared (declared=false, err=nil); or a declaration this build cannot honor
-// (ErrUnknownRevision). Malformed params report nothing declared rather than an error — the
-// method handler decodes the same bytes moments later and denies them as INVALID_REQUEST
-// with the target-bearing record that path already writes, and reporting a version failure
-// here would relabel every malformed request as a version problem.
+// Three outcomes, and the caller must keep them apart: a revision this build speaks; nothing
+// declared (declared=false, err=nil); or a declaration this build cannot honor
+// (ErrUnknownRevision).
+//
+// The params are DECODED rather than scanned for the key as raw bytes. A byte-substring probe
+// was the obvious fast path and was wrong: JSON permits escaping any character of an object
+// key (`io.modelcontextprotocol\/protocolVersion`, `\u005fmeta`), so a peer could spell the
+// key in a way the probe missed while every conforming decoder — including the upstream's,
+// reading the same bytes eunox forwards verbatim — still saw it. That is the enforcement
+// versus upstream parser differential the DecodeParams choice below exists to close, so the
+// probe cannot be the thing that reintroduces it. Cost: one JSON walk per host message.
+//
+// A params body that does not decode reports nothing declared rather than an error. It is a
+// malformed REQUEST, and relabelling every one of those as a version failure would replace
+// the target-bearing INVALID_REQUEST record the enforced-method handlers write. What keeps
+// that safe is the caller's own pin: a context resolves its revision from its FIRST message
+// and every later one is checked against it, so falling through yields the context's revision
+// rather than a caller-chosen table.
 func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared bool, err error) {
-	// Substring probe before the decode: the key is absent from every 2025-11-25 request,
-	// and this runs once per host message on the hot path, so the common case pays one scan
-	// instead of a full JSON walk. A false positive costs only the decode below.
-	if len(params) == 0 || !bytes.Contains(params, []byte(capability.MetaKeyProtocolVersion)) {
+	if len(params) == 0 {
 		return "", false, nil
 	}
+	// Only the one key is modelled, so an unrelated `_meta` entry (an attribution block, a
+	// progress token) costs no allocation of its own.
 	var probe struct {
-		Meta map[string]json.RawMessage `json:"_meta"`
+		Meta struct {
+			Version json.RawMessage `json:"io.modelcontextprotocol/protocolVersion"`
+		} `json:"_meta"`
 	}
 	// DecodeParams, not json.Unmarshal: it rejects a duplicate object key at any depth, so a
 	// params body carrying the version key twice cannot resolve to one revision here and a
@@ -48,8 +67,12 @@ func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared
 	if decErr := DecodeParams(params, &probe); decErr != nil {
 		return "", false, nil
 	}
-	raw, ok := probe.Meta[capability.MetaKeyProtocolVersion]
-	if !ok {
+	raw := bytes.TrimSpace(probe.Meta.Version)
+	// Absent, or present as an explicit null: both are the JSON spellings of "no value", and
+	// a client SDK that always emits the `_meta` slot with an unset optional field sends the
+	// second. Refusing it would lock out a conforming host over a serialization detail, and it
+	// grants nothing — an undeclared request inherits its context's revision.
+	if len(raw) == 0 || string(raw) == "null" {
 		return "", false, nil
 	}
 	var version string
@@ -61,17 +84,34 @@ func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared
 	}
 	parsed, ok := capability.ParseRevision(version)
 	if !ok {
-		return "", true, fmt.Errorf("%w: %q", ErrUnknownRevision, version)
+		return "", true, fmt.Errorf("%w: %q", ErrUnknownRevision, boundReflected(version))
 	}
 	return parsed, true, nil
 }
 
-// UnsupportedProtocolVersionResponse builds the spec's UNSUPPORTED_PROTOCOL_VERSION
-// (-32022) refusal, carrying the revisions this build speaks so a peer can retry against
-// one rather than guess. message names what was wrong with the request's own declaration;
-// it never echoes a caller-supplied value beyond the version string itself, which the peer
-// sent and which is bounded by being compared against a closed set.
-func UnsupportedProtocolVersionResponse(id *json.RawMessage, message string) RPCMsg {
+// boundReflected truncates a rejected version string to what is safe to echo back to the peer
+// that sent it, and strips anything that is not printable ASCII so a terminal reading the
+// error cannot be driven by the value. See maxReflectedRevisionLen.
+func boundReflected(version string) string {
+	if len(version) > maxReflectedRevisionLen {
+		version = version[:maxReflectedRevisionLen] + "..."
+	}
+	out := []rune(version)
+	for i, r := range out {
+		if r < 0x20 || r > 0x7e {
+			out[i] = '?'
+		}
+	}
+	return string(out)
+}
+
+// unsupportedRevisionData is the constant `data` payload every -32022 refusal carries: the
+// symbolic code plus every revision this build speaks, so a refused peer can retry against
+// one rather than guess. Built once — none of it depends on the request, and the refusal path
+// is reachable pre-authentication.
+var unsupportedRevisionData = buildUnsupportedRevisionData()
+
+func buildUnsupportedRevisionData() json.RawMessage {
 	supported := capability.PublishedRevisions()
 	versions := make([]string, 0, len(supported))
 	for _, rev := range supported {
@@ -81,13 +121,20 @@ func UnsupportedProtocolVersionResponse(id *json.RawMessage, message string) RPC
 		Code      string   `json:"code"`
 		Supported []string `json:"supported"`
 	}{Code: capability.ErrCodeUnsupportedProtocolVersion, Supported: versions})
+	return data
+}
+
+// UnsupportedProtocolVersionResponse builds the spec's UNSUPPORTED_PROTOCOL_VERSION
+// (-32022) refusal. message names what was wrong with the request's own declaration; any
+// caller-supplied text it embeds has already been bounded and stripped by boundReflected.
+func UnsupportedProtocolVersionResponse(id *json.RawMessage, message string) RPCMsg {
 	return RPCMsg{
 		JSONRPC: "2.0",
 		ID:      id,
 		Error: &RPCError{
 			Code:    capability.JSONRPCCodeUnsupportedProtocolVersion,
 			Message: capability.ErrCodeUnsupportedProtocolVersion + ": " + message,
-			Data:    data,
+			Data:    unsupportedRevisionData,
 		},
 	}
 }

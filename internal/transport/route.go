@@ -319,7 +319,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			// Empty when the operator wrote `auto` (or omitted the key): the handshake's own
 			// reported version wins. LoadGatewayConfig has already refused anything that is
 			// neither, so nothing this build cannot speak reaches the pin.
-			upstreamProtocolVersion: capability.Revision(u.ResolvedProtocolVersion()),
+			upstreamProtocolVersion: u.ResolvedProtocolVersion(),
 			audit:                   cfg.AuditModeFor(u),
 			// Placeholder only, always overwritten below. DenyAllPDP matches the
 			// package's no-policy-default posture; an AlwaysAllowPDP placeholder would

@@ -304,8 +304,18 @@ upstreams:
     protocolVersion: auto        # auto (default) | "2025-11-25" | "2026-07-28"
 ```
 
-The `proxy --audit` wiretap equivalent is `--upstream-protocol-version`. A value
-this build does not speak is refused at load, not at the first request.
+The `proxy --audit` wiretap equivalent is `--upstream-protocol-version` (remote
+`--upstream-url` upstreams only — a subprocess upstream speaks the handshake it is
+given). A value this build does not speak is refused at load, not at the first
+request.
+
+The pin names the revision eunox speaks to that upstream; it does not yet change the
+opener. Every upstream leg is opened with `initialize`, so the `MCP-Protocol-Version`
+header its post-handshake requests carry names the handshake revision regardless of
+the pin. A host request's own `_meta` declaration is likewise forwarded verbatim, so
+a host on one revision in front of an upstream on another can produce a header and
+body naming different revisions — rewriting that pair is translation, which the
+mismatched-pair boundary governs and this release does not implement.
 
 ---
 

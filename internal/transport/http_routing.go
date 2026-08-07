@@ -200,6 +200,14 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			writeJSONMsg(w, resp)
 			return
 		}
+		// Negotiate BEFORE anything privileged happens: creating a session spawns or contacts
+		// an upstream, and a declaration this build cannot honor (or one naming a revision that
+		// has no `initialize` at all) must be refused without that side effect — which is what
+		// stdio does for the same bytes. Answering initialize is itself the negotiation, so the
+		// only admissible declaration here is the revision that defines the method.
+		if !p.negotiateCreatingInitialize(w, r, route, msg) {
+			return
+		}
 		// Per-route audience pin BEFORE spawning: a token valid only for ANOTHER route's
 		// audience (accepted by the gateway's shared union validator) must not create a
 		// session on this route. Initialize doesn't flow through the Decide*/list/sampling
@@ -375,13 +383,15 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// session records the span here and that leg refuses for the rest of its life. See
 	// httpSession.noteRequestAnchor. Placed here (a write) rather than in the check-only
 	// session-gate verdict, one of whose callers runs under the session-registry lock.
-	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
-	// Negotiate before anything routes on the method: every table below is revision-scoped,
-	// so resolving after the lookup would route by one table and record under another.
+	// Negotiate FIRST: every table below is revision-scoped, so resolving after the lookup
+	// would route by one table and record under another — and a refused message must not have
+	// written session state on its way to being refused (noteRequestAnchor latches a span for
+	// the session's life, which would outlive a request that was never dispatched).
 	rev, ok := p.negotiateHostRevision(w, r, route, sess, msg)
 	if !ok {
 		return
 	}
+	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
 	// On ctx from here down, so every record stamps the revision its table was chosen by.
 	ctx := capability.WithProtocolRevision(r.Context(), rev)
 	// Check the kill switch BEFORE touchRequest so a killed session's denied POSTs can't
@@ -1025,7 +1035,10 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	if err == nil {
 		return rev, true
 	}
-	resp := refuseHostRevision(r.Context(), asRecorder(route.sink), sess.id, msg, err)
+	// Rate-limited like every other caller-driven refusal: a suppressed record still gets its
+	// -32022 on the wire, so the peer is refused either way — what the bucket bounds is the
+	// tape write, which is the part a flood turns into an availability problem.
+	resp := refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), sess.id, msg, err)
 	if msg.IsRequest() {
 		writeJSONMsg(w, resp)
 	} else {
@@ -1058,4 +1071,43 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] WARNING: dropped host response to a server-initiated request: no upstream writer in remote-upstream mode\n")
 	}
+}
+
+// negotiateCreatingInitialize applies revision negotiation to the session-CREATING
+// `initialize`, the one host message that has no session to resolve a context from.
+//
+// `initialize` exists only in the handshake-bearing revision, so a declaration naming any
+// other revision — or one this build cannot speak — is refused -32022 and recorded, before a
+// subprocess is spawned or a remote upstream is contacted. Without this the declaration was
+// discarded, the session was pinned to the handshake revision anyway, and the peer's next
+// request was refused as a "mid-context flip" it had in fact declared consistently from its
+// first message.
+//
+// ok=false means the refusal has already been written.
+func (p *HTTPProxy) negotiateCreatingInitialize(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) bool {
+	if _, err := resolveHostRevision(capability.Revision20251125, msg); err != nil {
+		// No session exists yet, so the record carries no session id — the same posture as
+		// the other pre-session refusals on this path.
+		writeJSONMsg(w, refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), "", msg, err))
+		return false
+	}
+	return true
+}
+
+// revisionRefusalRecorder returns the route's sink when the revision-refusal bucket admits a
+// record now, and nil when it does not — refuseHostRevision writes nothing for a nil
+// recorder, so the wire refusal is unaffected and only the tape write is bounded.
+//
+// Nil-limiter tolerance mirrors recordRefusal's: a proxy built without one (tests) records
+// unbounded rather than not at all.
+func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder {
+	if p.preSessionDenies != nil {
+		if ok, _ := p.preSessionDenies.admit(catRevision); !ok {
+			return nil
+		}
+	}
+	if route != nil {
+		return asRecorder(route.sink)
+	}
+	return asRecorder(p.sink)
 }

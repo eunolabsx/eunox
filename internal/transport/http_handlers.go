@@ -112,6 +112,11 @@ func IsInfraDenialCode(code string) bool {
 		// gate tripping. Mining these would fabricate a deny-only suggestion for a target
 		// policy never actually denied.
 		return true
+	case capability.ErrCodeUnsupportedProtocolVersion:
+		// A refusal taken before any policy match: no target was ever parsed, so the record's
+		// identifier is the bare method name. Mining it would fabricate a phantom target from
+		// caller-controlled text, and a peer can drive these at will.
+		return true
 	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType:
 		// Non-policy refusals recorded before/independent of a PDP decision. None names a
 		// policy target, so mining them would fabricate a phantom-target suggestion.
@@ -267,6 +272,10 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	}
 	// sess.broadcastServerRequest reports whether an SSE subscriber received the request;
 	// sess.claims is attached so per-agent kills are honored and records carry agent_id.
+	// The session's revision is known here, so the leg's records must name it. Without this
+	// stamp a sampling decision on a fully negotiated session was indistinguishable on the tape
+	// from a pre-session refusal, which is the one case an absent field is supposed to mean.
+	ctx = capability.WithProtocolRevision(ctx, sess.hostRev)
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:           asRecorder(rt.sink),
 		audit:         rt.audit,

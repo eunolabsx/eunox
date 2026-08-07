@@ -24,7 +24,8 @@ func TestResolveHostRevision(t *testing.T) {
 	cases := []struct {
 		name       string
 		contextRev capability.Revision
-		declared   any // nil = no `_meta` block at all
+		declared   any    // nil = no `_meta` block at all
+		rawParams  string // a params body written out verbatim, for shapes `declared` cannot express
 		want       capability.Revision
 		wantErr    error
 	}{
@@ -38,13 +39,19 @@ func TestResolveHostRevision(t *testing.T) {
 		{name: "unknown revision", declared: "1999-01-01", wantErr: mcp.ErrUnknownRevision},
 		{name: "unknown revision inside a context", contextRev: capability.Revision20251125, declared: "2030-01-01", wantErr: mcp.ErrUnknownRevision},
 		{name: "non-string revision", declared: 20260728, wantErr: mcp.ErrUnknownRevision},
-		{name: "null revision", declared: nil, want: capability.Revision20251125},
+		// declared is `any`, and nil means "no _meta block at all" in this table — an explicit
+		// JSON null needs its own case, since it takes a different path through the decoder.
+		{name: "explicit null revision inherits the context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, contextRev: capability.Revision20260728, want: capability.Revision20260728},
+		{name: "explicit null revision with no context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, want: capability.Revision20251125},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall}
-			if tc.declared != nil {
+			switch {
+			case tc.rawParams != "":
+				msg.Params = json.RawMessage(tc.rawParams)
+			case tc.declared != nil:
 				msg.Params = metaParams(t, tc.declared, map[string]any{"name": "read_file"})
 			}
 			got, err := resolveHostRevision(tc.contextRev, msg)
@@ -181,7 +188,7 @@ func TestDispatchRequest_PerRevisionUnmappedDenials(t *testing.T) {
 		{name: "initialize is answered for an old-revision peer", rev: capability.Revision20251125, method: mcp.MethodInitialize},
 		{name: "initialize is denied for a new-revision peer", rev: capability.Revision20260728, method: mcp.MethodInitialize, wantDeny: true},
 		{name: "server/discover is denied for an old-revision peer", rev: capability.Revision20251125, method: "server/discover", wantDeny: true},
-		{name: "server/discover is denied until its own workstream lands", rev: capability.Revision20260728, method: "server/discover", wantDeny: true},
+		{name: "server/discover is denied until its responder is implemented", rev: capability.Revision20260728, method: "server/discover", wantDeny: true},
 		{name: "resources/subscribe is denied for a new-revision peer", rev: capability.Revision20260728, method: capability.MethodResourcesSubscribe, wantDeny: true},
 		{name: "resources/unsubscribe is denied for a new-revision peer", rev: capability.Revision20260728, method: capability.MethodResourcesUnsubscribe, wantDeny: true},
 	}

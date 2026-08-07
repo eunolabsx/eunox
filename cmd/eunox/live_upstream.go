@@ -41,7 +41,7 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 
 	// The probe opens with `initialize`, which exists only in the handshake-bearing
 	// revision — so that is the revision this leg speaks, and what its post-handshake
-	// requests declare. A discover-first opener is the CLI-probe workstream's.
+	// requests declare. A discover-first opener is not implemented yet.
 	initResp, respHdr, err := transport.DoMCPHTTP(ctx, client, endpoint,
 		transport.BuildInitializeRequestWithID(mcp.RawJSON(`1`)), "", authHeader, capability.Revision20251125)
 	// Capture the session id and arm the terminating DELETE BEFORE the err gate: a lenient

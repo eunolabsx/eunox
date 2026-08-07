@@ -58,12 +58,12 @@ func TestDeclaredRevision(t *testing.T) {
 			wantErr:      ErrUnknownRevision,
 		},
 		{
+			// An explicit null is the JSON spelling of "no value", and a client SDK that always
+			// emits the `_meta` slot with an unset optional field sends exactly this. Refusing
+			// it would lock out a conforming host over a serialization detail; reading it as
+			// absent grants nothing, since an undeclared request inherits its context.
 			name:   "null revision reads as absent",
 			params: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`,
-			// json.Unmarshal of `null` into a string succeeds, leaving "", which is not a
-			// published revision — so this is a declaration that cannot be honored.
-			wantDeclared: true,
-			wantErr:      ErrUnknownRevision,
 		},
 		{
 			// Duplicate keys are rejected by DecodeParams, and a rejected probe reads as

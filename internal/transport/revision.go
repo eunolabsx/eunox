@@ -56,14 +56,14 @@ func resolveHostRevision(contextRev capability.Revision, msg mcp.RPCMsg) (capabi
 // the peer sent and which is bounded by having been matched against a closed set), never any
 // other caller-supplied value.
 func revisionRefusalReason(err error) string {
-	switch {
-	case errors.Is(err, errRevisionMismatch):
+	// One condition, not an arm per sentinel: what this function protects is the ALLOWLIST of
+	// errors whose text is safe to echo, and both of these are (each names only the failure
+	// class and a version string boundReflected has already truncated and stripped). Anything
+	// else collapses to a fixed string rather than leaking an unreviewed message.
+	if errors.Is(err, errRevisionMismatch) || errors.Is(err, mcp.ErrUnknownRevision) {
 		return err.Error()
-	case errors.Is(err, mcp.ErrUnknownRevision):
-		return err.Error()
-	default:
-		return "protocol revision could not be established"
 	}
+	return "protocol revision could not be established"
 }
 
 // refuseHostRevision records the refusal and builds the -32022 response for a request whose

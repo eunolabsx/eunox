@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -146,8 +147,8 @@ const (
 //
 // The 2026-07-28 entries describe that revision's method set as the spec defines it; the
 // methods it ADDS (server/discover, subscriptions/listen, tasks/*) are deliberately absent
-// until the workstreams that implement them land, so they deny fail-closed meanwhile rather
-// than routing to a handler that does not exist.
+// until each one's responder is implemented, so they deny fail-closed meanwhile rather than
+// routing to a handler that does not exist.
 var methodRegistry = map[string]methodSpec{
 	// Enforced (Decide*) methods. The resources/subscribe pair is 2025-11-25 only:
 	// 2026-07-28 replaces it with subscriptions/listen, which is not implemented yet.
@@ -287,6 +288,27 @@ func buildRevisionDispatch(registry map[string]methodSpec) map[capability.Revisi
 	return out
 }
 
+// removedInRevision reports whether method is one this build dispatches under SOME revision
+// but not under rev — i.e. denied because the peer's revision removed it, rather than because
+// nobody has ever heard of it. The two are routed identically on purpose (removal is
+// expressed by absence); they differ only in what an audit record can honestly claim.
+func removedInRevision(rev capability.Revision, method string) bool {
+	spec, known := methodRegistry[method]
+	if !known {
+		return false
+	}
+	return !slices.Contains(spec.In, rev)
+}
+
+// effectiveRevision returns the revision this request was negotiated under, resolving the
+// zero value the same way tablesFor does so the record and the routing cannot disagree.
+func (d dispatchParams) effectiveRevision() capability.Revision {
+	if d.revision == "" {
+		return capability.DefaultRevision
+	}
+	return d.revision
+}
+
 // tablesFor returns the routing tables for rev.
 //
 // The zero Revision resolves to capability.DefaultRevision: a dispatchParams built without
@@ -331,8 +353,15 @@ func denyUnmappedHostNotification(ctx context.Context, w io.Writer, rec auditRec
 	if isForwardableHostNotification(rev, msg.Method) {
 		return false
 	}
+	// Identifier dropped for a method the peer's revision removed — see dispatchUnmapped for
+	// why: resources/subscribe resolves a target type, so recording it as the identifier would
+	// stamp a resource literally named after the method onto the signed tape.
+	identifier := msg.Method
+	if removedInRevision(rev, msg.Method) {
+		identifier = ""
+	}
 	if rec != nil {
-		rec.RecordDeny(ctx, sessionID, msg.Method, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
+		rec.RecordDeny(ctx, sessionID, identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}
 	_, _ = fmt.Fprintf(resolvedErrOut(w),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
@@ -388,32 +417,26 @@ const methodPing = "ping"
 //
 // Derived across ALL revisions, not one: the banner prints once at startup, before any peer
 // has negotiated, so the honest claim is every method this build may enforce.
-var enforcedMethodSummary = sortedMethods(func() map[string]methodHandler {
-	all := map[string]methodHandler{}
-	for _, tables := range revisionDispatch {
-		for method, handler := range tables.decide {
-			all[method] = handler
+var enforcedMethodSummary = enforcedMethodNames()
+
+// enforcedMethodNames joins every method this build may enforce under ANY revision, sorted so
+// a map's iteration order cannot make the banner text unstable. Read straight off the
+// declarations — the derived tables would give the same answer through an extra map.
+func enforcedMethodNames() string {
+	methods := make([]string, 0, len(methodRegistry))
+	for method, spec := range methodRegistry {
+		if spec.Enforced {
+			methods = append(methods, method)
 		}
 	}
-	return all
-}())
+	sort.Strings(methods)
+	return strings.Join(methods, ", ")
+}
 
 // unmappedMethodExamples names MCP methods this build does NOT dispatch, so the banner's
 // caveat is concrete rather than abstract. They are examples, not an exhaustive list:
 // anything outside the two routing tables is denied the same way.
 const unmappedMethodExamples = "e.g. completion/complete, logging/setLevel, resources/templates/list"
-
-// sortedMethods joins a routing table's keys in sorted order, so a banner derived from a
-// table cannot drift from what the dispatcher does, and a map's iteration order cannot make
-// the text unstable.
-func sortedMethods(table map[string]methodHandler) string {
-	methods := make([]string, 0, len(table))
-	for m := range table {
-		methods = append(methods, m)
-	}
-	sort.Strings(methods)
-	return strings.Join(methods, ", ")
-}
 
 // dispatchInitialize answers a host initialize by delegating to the per-transport buildInit
 // responder. The shared kill gate runs at the dispatchRequest boundary (buildInit echoes
@@ -811,8 +834,19 @@ func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
 	// Record-before-act: write the audit record before the stderr notice, so a crash between
 	// the two never leaves a SIEM alert with no corresponding audit trail entry.
+	//
+	// The IDENTIFIER is dropped for a method this build knows but the requesting peer's
+	// revision does not have. Until routing became revision-scoped, only methods with no
+	// target type could reach here, so deriveTargetFields left the target empty; now
+	// resources/subscribe can, and it DOES resolve a target type — which would stamp a
+	// resource literally named "resources/subscribe" onto the signed tape and let `eunox
+	// suggest` mine a capability for it. The method field still names what was denied.
+	identifier := msg.Method
+	if removedInRevision(d.effectiveRevision(), msg.Method) {
+		identifier = ""
+	}
 	if d.rec != nil {
-		d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
+		d.rec.RecordDeny(ctx, d.sessionID, identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}
 	_, _ = fmt.Fprintf(d.errOutOrStderr(),
 		"[eunox] SECURITY: unmapped MCP method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",

@@ -19,12 +19,12 @@ func TestLoadGatewayConfig_ProtocolVersionRoundTrip(t *testing.T) {
 	cases := []struct {
 		name     string
 		yamlLine string
-		want     string
+		want     capability.Revision
 	}{
 		{name: "omitted", yamlLine: "", want: ""},
 		{name: "explicit auto", yamlLine: `    protocolVersion: auto`, want: ""},
-		{name: "pinned to the old revision", yamlLine: `    protocolVersion: "2025-11-25"`, want: "2025-11-25"},
-		{name: "pinned to the new revision", yamlLine: `    protocolVersion: "2026-07-28"`, want: "2026-07-28"},
+		{name: "pinned to the old revision", yamlLine: `    protocolVersion: "2025-11-25"`, want: capability.Revision20251125},
+		{name: "pinned to the new revision", yamlLine: `    protocolVersion: "2026-07-28"`, want: capability.Revision20260728},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,10 +47,8 @@ upstreams:
 			}
 			// A resolved pin must be a revision the transport can act on, never a bare
 			// string the loader admitted and nothing downstream recognizes.
-			if got := cfg.Upstreams[0].ResolvedProtocolVersion(); got != "" {
-				if _, ok := capability.ParseRevision(got); !ok {
-					t.Errorf("ResolvedProtocolVersion() = %q, which is not a revision this build speaks", got)
-				}
+			if got := cfg.Upstreams[0].ResolvedProtocolVersion(); got != "" && !got.Supported() {
+				t.Errorf("ResolvedProtocolVersion() = %q, which is not a revision this build speaks", got)
 			}
 		})
 	}

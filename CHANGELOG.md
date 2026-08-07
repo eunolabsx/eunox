@@ -69,7 +69,14 @@ Section conventions:
   method does not exist in the revision the peer negotiated. Drawn from the closed
   published set, never caller-supplied text, so no length bound is needed; omitted
   on a record written before a revision was resolved, which is honest — none was
-  decided. See `docs/threat-model-mcp.md` §3.16 and §6.1.
+  decided. It rides the server-initiated leg too, so a sampling decision on a
+  negotiated session is not indistinguishable from a pre-session refusal. Two
+  record-shape rules travel with it: a method the peer's revision REMOVED names no
+  policy target (`resources/subscribe` resolves a target type, so recording the
+  method as the identifier would stamp a resource named after it onto the tape and
+  let `eunox suggest` mine a capability for it), and the -32022 refusal is classed as
+  infrastructure and rate-limited per category like every other caller-driven
+  refusal. See `docs/threat-model-mcp.md` §3.16 and §6.1.
 
 - **Two audit fields attribute a DELEGATED call: `delegate` and `delegation_depth`.** A
   delegation *refusal* already named the hop that blocked it, in the denial details, while an

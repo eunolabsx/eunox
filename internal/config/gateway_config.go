@@ -1071,46 +1071,56 @@ const ProtocolVersionAuto = "auto"
 // sentinel nor a revision this build speaks. The error names the accepted set, since the
 // value is a date this build either knows or does not and guessing is unhelpful.
 func validateProtocolVersion(name, value string) error {
+	if protocolVersionAccepted(value) {
+		return nil
+	}
+	return fmt.Errorf("upstream %q: invalid protocolVersion %q — valid values are %s", name, value, acceptedProtocolVersions())
+}
+
+// protocolVersionAccepted reports whether value is a usable pin: the auto sentinel (or an
+// omitted key) or a revision this build speaks.
+func protocolVersionAccepted(value string) bool {
 	if value == "" || value == ProtocolVersionAuto {
-		return nil
+		return true
 	}
-	if _, ok := capability.ParseRevision(value); ok {
-		return nil
-	}
+	_, ok := capability.ParseRevision(value)
+	return ok
+}
+
+// acceptedProtocolVersions renders the accepted set for an error message. One renderer, so
+// the config key's error and the flag's cannot list different sets while both claiming to
+// accept exactly the same one.
+func acceptedProtocolVersions() string {
 	supported := capability.PublishedRevisions()
 	names := make([]string, 0, len(supported)+1)
 	names = append(names, ProtocolVersionAuto)
 	for _, rev := range supported {
 		names = append(names, rev.String())
 	}
-	return fmt.Errorf("upstream %q: invalid protocolVersion %q — valid values are %s", name, value, strings.Join(names, ", "))
+	return strings.Join(names, ", ")
 }
 
 // ValidateProtocolVersionFlag applies the same rule to the CLI's --upstream-protocol-version
 // as Validate applies to an upstream's protocolVersion key, so the flag and the config key
 // accept exactly the same set. The error names the flag rather than an upstream.
 func ValidateProtocolVersionFlag(value string) error {
-	if err := validateProtocolVersion("", value); err != nil {
-		supported := capability.PublishedRevisions()
-		names := make([]string, 0, len(supported)+1)
-		names = append(names, ProtocolVersionAuto)
-		for _, rev := range supported {
-			names = append(names, rev.String())
-		}
-		return fmt.Errorf("--upstream-protocol-version %q is not a revision this build speaks — valid values are %s", value, strings.Join(names, ", "))
+	if protocolVersionAccepted(value) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("--upstream-protocol-version %q is not a revision this build speaks — valid values are %s", value, acceptedProtocolVersions())
 }
 
 // ResolvedProtocolVersion returns the operator's explicit protocol-revision pin for this
 // upstream, or "" when the revision is to be probed from the handshake. Validate has already
-// refused anything else, so the returned string is either empty or a revision this build
-// speaks.
-func (u *UpstreamConfig) ResolvedProtocolVersion() string {
+// refused anything else, so the result is either empty or a revision this build speaks.
+// Typed rather than a bare string: both call sites converted it, and an untyped string can be
+// assigned to any other string field without a compile error — the transposition hazard
+// UpstreamHandshake became a struct to avoid.
+func (u *UpstreamConfig) ResolvedProtocolVersion() capability.Revision {
 	if u.ProtocolVersion == ProtocolVersionAuto {
 		return ""
 	}
-	return u.ProtocolVersion
+	return capability.Revision(u.ProtocolVersion)
 }
 
 // Host-facing transport values for GatewayConfig.Transport.

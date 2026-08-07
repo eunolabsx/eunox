@@ -35,7 +35,11 @@ func TestMethodRegistry_EveryMethodDeclaresRevisionMembership(t *testing.T) {
 				t.Errorf("method %q declares revision %q, which this build does not speak (%v)", method, rev, published)
 			}
 		}
-		if len(slices.Compact(slices.Clone(spec.In))) != len(spec.In) {
+		// Sorted before Compact: it collapses only ADJACENT equal elements, so an unsorted
+		// check would miss the duplicate shape a copy-paste actually produces (A, B, A).
+		sorted := slices.Clone(spec.In)
+		slices.Sort(sorted)
+		if len(slices.Compact(sorted)) != len(spec.In) {
 			t.Errorf("method %q declares a duplicate revision in %v", method, spec.In)
 		}
 		if spec.Enforced && spec.Handler == nil {
@@ -51,10 +55,10 @@ func TestMethodRegistry_EveryMethodDeclaresRevisionMembership(t *testing.T) {
 // from the declarations rather than restated by hand at the call sites.
 //
 // Exact, not "contains": a method silently gaining membership in a revision that removed it
-// is the failure this workstream exists to prevent, and only an exact set catches an
+// is the failure revision-scoped routing exists to prevent, and only an exact set catches an
 // addition. The 2026-07-28 sets are deliberately smaller than the spec's full method list —
-// server/discover, subscriptions/listen and tasks/* land with the workstreams that implement
-// them, and until then they fall to the fail-closed default like any unknown method.
+// server/discover, subscriptions/listen and tasks/* land with their own responders, and until
+// then they fall to the fail-closed default like any unknown method.
 func TestRevisionDispatch_ExactSetPerRevision(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
