@@ -610,6 +610,10 @@ func TestSessionKillTTLHelp_DerivesTheDefaultFromTheConstant(t *testing.T) {
 	} else {
 		require.NotContains(t, rendered, "days", "a non-whole-day default must not be glossed with a truncated day count")
 	}
+
+	// The sibling default one line up in the same flag block had the same prose problem.
+	require.Contains(t, proxyHelp, killswitch.DefaultReconcileInterval.String(),
+		"--killswitch-reconcile-interval must name its default from the constant too")
 }
 
 // TestSessionKillTTLNotice_PointsAtARealCommand: with expiry disabled the banner used to

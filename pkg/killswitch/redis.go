@@ -44,6 +44,12 @@ const (
 // the flag is unset.
 const DefaultSessionKillTTL = defaultSessionKillTTL
 
+// DefaultReconcileInterval is the exported form of the default reconcile cadence, for the
+// same reason as DefaultSessionKillTTL: --killswitch-reconcile-interval's help has to name
+// the default an unset flag selects, and the prose spelling of it had already drifted out
+// of reach of the constant.
+const DefaultReconcileInterval = defaultReconcileInterval
+
 // subscribeConfirmTimeout bounds the initial pub/sub subscription-confirmation read in
 // Start: pubsub.Receive's deadline-less socket read would otherwise block a blackholed
 // connection forever, and Start holds lifeMu across it, deadlocking a concurrent Stop. A

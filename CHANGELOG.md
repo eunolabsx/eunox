@@ -326,7 +326,10 @@ Section conventions:
   default tombstone lifetime **from** `killswitch.DefaultSessionKillTTL` instead of
   restating it as prose in two commands, so raising the default cannot leave either one
   telling operators the old value. The rendered text changes from `720h / 30 days` to
-  `720h0m0s / 30 days`.
+  `720h0m0s / 30 days`. `--killswitch-reconcile-interval`'s help had the same prose
+  problem one line up in the same flag block and is fixed the same way, which is what
+  `killswitch.DefaultReconcileInterval` is newly exported for; its rendered text is
+  unchanged (`30s`).
 - **BREAKING (pre-1.0): a session on a task-anchored route may span tasks; its
   server-initiated leg is what pays.** Such a session used to be pinned to one anchor, and a
   request resolving another was refused (`session_anchor_mismatch`) — fail-closed, and with no
