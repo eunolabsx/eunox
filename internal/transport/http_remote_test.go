@@ -87,7 +87,7 @@ func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		caps, _ := json.Marshal(map[string]interface{}{"tools": map[string]interface{}{}})
 		result := mcp.InitResult{
-			ProtocolVersion: MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "fake-upstream", "version": "0.0.1"},
 		}
@@ -363,7 +363,7 @@ func TestRemoteUpstream_MethodBearingReplyFailsClosed(t *testing.T) {
 		case "initialize":
 			w.Header().Set(SessionHeader, "upstream-sess-1")
 			resp, _ := mcp.SuccessResponse(in.ID, mcp.InitResult{
-				ProtocolVersion: MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "fake", "version": "0"},
 			})
@@ -889,7 +889,7 @@ func TestDoMCPHTTP_SSEResponseDecoded(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "tools/call", Params: json.RawMessage(`{}`)}
-	out, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, req, "", "")
+	out, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, req, "", "", capability.Revision20251125)
 	if err != nil {
 		t.Fatalf("DoMCPHTTP over SSE: %v", err)
 	}
@@ -958,13 +958,13 @@ func TestDoMCPHTTP_202ToRequestFailsClosed(t *testing.T) {
 
 	// Request (has an id): a 202 must surface as an error.
 	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "tools/call", Params: json.RawMessage(`{}`)}
-	if _, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, req, "", ""); err == nil {
+	if _, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, req, "", "", capability.Revision20251125); err == nil {
 		t.Fatal("DoMCPHTTP: 202 to a request must return an error (fail closed), got nil")
 	}
 
 	// Notification (no id): a 202 is a valid ack, no error.
 	notif := mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/initialized"}
-	out, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, notif, "", "")
+	out, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, notif, "", "", capability.Revision20251125)
 	if err != nil {
 		t.Fatalf("DoMCPHTTP: 202 to a notification must be a clean ack, got %v", err)
 	}
@@ -993,7 +993,7 @@ func TestDoMCPHTTP_SSEResponseSkipsInterleavedNotification(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "tools/call", Params: json.RawMessage(`{}`)}
-	out, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, req, "", "")
+	out, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, req, "", "", capability.Revision20251125)
 	if err != nil {
 		t.Fatalf("DoMCPHTTP over SSE: %v", err)
 	}
@@ -1072,7 +1072,7 @@ func TestDoMCPHTTP_SetsSpecHeaders(t *testing.T) {
 
 	// Non-initialize request: Accept set, protocol version present.
 	call := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"}
-	if _, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, call, "", ""); err != nil {
+	if _, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, call, "", "", capability.Revision20251125); err != nil {
 		t.Fatalf("DoMCPHTTP tools/list: %v", err)
 	}
 	mu.Lock()
@@ -1081,13 +1081,13 @@ func TestDoMCPHTTP_SetsSpecHeaders(t *testing.T) {
 	if !strings.Contains(gotAccept, CTJSON) || !strings.Contains(gotAccept, ctSSE) {
 		t.Errorf("Accept header = %q, want both %q and %q", gotAccept, CTJSON, ctSSE)
 	}
-	if gotProto != MCPProtocolVersion {
-		t.Errorf("MCP-Protocol-Version = %q, want %q", gotProto, MCPProtocolVersion)
+	if gotProto != capability.Revision20251125.String() {
+		t.Errorf("MCP-Protocol-Version = %q, want %q", gotProto, capability.Revision20251125.String())
 	}
 
 	// initialize request: Accept still set, protocol version omitted.
 	initMsg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "initialize", Params: json.RawMessage(`{}`)}
-	if _, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, initMsg, "", ""); err != nil {
+	if _, _, err := DoMCPHTTP(context.Background(), &http.Client{}, srv.URL, initMsg, "", "", capability.Revision20251125); err != nil {
 		t.Fatalf("DoMCPHTTP initialize: %v", err)
 	}
 	mu.Lock()
@@ -1252,7 +1252,7 @@ func stuckUpstream() http.Handler {
 			w.Header().Set(SessionHeader, "upstream-sess-stuck")
 			w.Header().Set("Content-Type", CTJSON)
 			resp, _ := mcp.SuccessResponse(msg.ID, mcp.InitResult{
-				ProtocolVersion: MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "stuck-upstream", "version": "0.0.1"},
 			})
@@ -1387,7 +1387,7 @@ func slowToolsListUpstream(toolName, toolDesc string, delay time.Duration) http.
 			w.Header().Set(SessionHeader, "upstream-sess-slow")
 			w.Header().Set("Content-Type", CTJSON)
 			resp, _ := mcp.SuccessResponse(msg.ID, mcp.InitResult{
-				ProtocolVersion: MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "slow-upstream", "version": "0.0.1"},
 			})

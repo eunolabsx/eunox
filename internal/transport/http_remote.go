@@ -59,7 +59,7 @@ const upstreamSessionDeleteTimeout = 5 * time.Second
 // no-op. Uses a fresh background context since it runs from teardown paths whose own
 // context is typically being canceled; failures are logged, not returned, so teardown never
 // blocks.
-func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine string) {
+func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine string, rev capability.Revision) {
 	if sessID == "" || client == nil {
 		return
 	}
@@ -72,7 +72,7 @@ func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine 
 	req.Header.Set(SessionHeader, sessID)
 	// A post-handshake request must carry the negotiated protocol version; without it a
 	// spec-conformant upstream rejects the DELETE with 400 and leaks the session.
-	req.Header.Set("MCP-Protocol-Version", MCPProtocolVersion)
+	setNegotiatedVersionHeader(req, rev)
 	if name, value, ok := splitHeaderLine(authHeaderLine); ok {
 		req.Header.Set(name, value)
 	}
@@ -202,6 +202,10 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		upHTTPClient: client,
 		claims:       pdp.JWTClaimsPtr(ctx),
 		clientIP:     clientIP,
+		// See newSession: a session is minted by `initialize`, which is the older revision's
+		// method, so opening one negotiates that revision for the context's life.
+		hostRev:        capability.Revision20251125,
+		upstreamRevPin: route.upstreamProtocolVersion,
 	}
 	// Marks initializing until this returns (after the drift check) so the idle reaper
 	// doesn't tear it down mid-establishment — same guard as local-subprocess newSession.
@@ -275,11 +279,14 @@ func (s *httpSession) initRemoteUpstream(ctx context.Context) error {
 		return fmt.Errorf("upstream initialize: %w", err)
 	}
 
-	caps, sv, instructions, err := applyInitializeResult(respMsg)
+	hs, err := applyInitializeResult(respMsg)
 	if err != nil {
 		return err
 	}
-	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = caps, sv, instructions
+	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
+	// Pin the upstream-side revision once, at the handshake: every later leg reads this one
+	// answer rather than re-deriving it from a result no longer in scope.
+	s.upstreamRev = resolveUpstreamRevision(s.upstreamRevPin, hs.ProtocolVersion)
 
 	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
 	_, _, err = s.doRemoteHTTP(ctx, notif, s.upstreamSessID)
@@ -318,7 +325,7 @@ func (s *httpSession) callRemoteUpstream(ctx context.Context, msg mcp.RPCMsg) (m
 // spec-violating empty answer and returns an error (fail closed). The single HTTP-upstream
 // implementation, shared by the gateway's per-session path, the validation live-check, and
 // the stdio host's HTTP bridge.
-func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mcp.RPCMsg, sessID, authHeaderLine string) (mcp.RPCMsg, http.Header, error) {
+func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mcp.RPCMsg, sessID, authHeaderLine string, rev capability.Revision) (mcp.RPCMsg, http.Header, error) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return mcp.RPCMsg{}, nil, fmt.Errorf("marshalling request: %w", err)
@@ -337,7 +344,7 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	// Every post-handshake request must carry the negotiated protocol version; the
 	// initialize request precedes negotiation and must not.
 	if msg.Method != mcp.MethodInitialize {
-		req.Header.Set("MCP-Protocol-Version", MCPProtocolVersion)
+		setNegotiatedVersionHeader(req, rev)
 	}
 	if sessID != "" {
 		req.Header.Set(SessionHeader, sessID)
@@ -517,5 +524,19 @@ func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error
 // setting the given session ID header (empty string omits the header).
 // It returns the decoded JSON-RPC response and the response headers.
 func (s *httpSession) doRemoteHTTP(ctx context.Context, msg mcp.RPCMsg, sessID string) (mcp.RPCMsg, http.Header, error) {
-	return DoMCPHTTP(ctx, s.upHTTPClient, s.mcpEndpointURL(), msg, sessID, s.route.upstreamAuthHeader)
+	return DoMCPHTTP(ctx, s.upHTTPClient, s.mcpEndpointURL(), msg, sessID, s.route.upstreamAuthHeader, s.upstreamRev)
+}
+
+// setNegotiatedVersionHeader stamps MCP-Protocol-Version on an upstream request when the leg
+// speaks the revision that defines it.
+//
+// The header is a 2025-11-25 construct: it carries the version negotiated by a handshake that
+// revision has and 2026-07-28 does not, which instead declares the version per request in
+// `_meta`. Sending it to a peer on the newer revision would assert a negotiation that never
+// happened; the newer leg's own required headers land with the header-verification work.
+func setNegotiatedVersionHeader(req *http.Request, rev capability.Revision) {
+	if rev != "" && rev != capability.Revision20251125 {
+		return
+	}
+	req.Header.Set("MCP-Protocol-Version", capability.Revision20251125.String())
 }

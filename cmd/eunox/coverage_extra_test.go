@@ -797,7 +797,7 @@ func initOKHandler(t *testing.T, toolsList func(w http.ResponseWriter, msg mcp.R
 			w.Header().Set(transport.SessionHeader, "sess-1")
 			w.Header().Set("Content-Type", transport.CTJSON)
 			result := mcp.InitResult{
-				ProtocolVersion: transport.MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "x", "version": "1.0.0"},
 			}
@@ -893,7 +893,7 @@ func TestFetchLiveTools_NotificationPostFails(t *testing.T) {
 			w.Header().Set(transport.SessionHeader, "sess-1")
 			w.Header().Set("Content-Type", transport.CTJSON)
 			result := mcp.InitResult{
-				ProtocolVersion: transport.MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "x", "version": "1.0.0"},
 			}
@@ -967,7 +967,7 @@ func TestRunStdioHandshake_ToolsListWriteError(t *testing.T) {
 			return
 		}
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{},
 			ServerInfo:      map[string]interface{}{"version": "0.0.1"},
 		})
@@ -1138,7 +1138,7 @@ func pagingToolsHandler(t *testing.T) http.Handler {
 		case "initialize":
 			w.Header().Set(transport.SessionHeader, "sess-1")
 			result := mcp.InitResult{
-				ProtocolVersion: transport.MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "x", "version": "1.0.0"},
 			}
@@ -1191,7 +1191,7 @@ func TestRunStdioHandshake_PaginatesToExhaustion(t *testing.T) {
 			return
 		}
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{},
 			ServerInfo:      map[string]interface{}{"version": "1.0.0"},
 		})
@@ -1247,7 +1247,7 @@ func TestValidateConfigRoutes_LiveEmptyServerVersion(t *testing.T) {
 		case "initialize":
 			w.Header().Set(transport.SessionHeader, "sess-1")
 			result := mcp.InitResult{
-				ProtocolVersion: transport.MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "noversion"},
 			}
@@ -1481,7 +1481,7 @@ func TestRunStdioHandshake_ToolsListServerErrorAfterRead(t *testing.T) {
 			return
 		}
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{},
 			ServerInfo:      map[string]interface{}{"version": "1.0.0"},
 		})
@@ -1522,7 +1522,7 @@ func TestRunStdioHandshake_MalformedToolsResult(t *testing.T) {
 			return
 		}
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{},
 			ServerInfo:      map[string]interface{}{"version": "1.0.0"},
 		})
@@ -1606,7 +1606,7 @@ func TestRunStdioHandshake_NotificationWriteError(t *testing.T) {
 			return
 		}
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{},
 			ServerInfo:      map[string]interface{}{"version": "1.0.0"},
 		})
@@ -1850,21 +1850,21 @@ func TestOpenConfiguredAuditSink_FatalFailureReturnsError(t *testing.T) {
 // ───────────────────────── buildAuditWiretapConfig ──────────────────────────
 
 func TestBuildAuditWiretapConfig_BothSourcesError(t *testing.T) {
-	_, err := buildAuditWiretapConfig([]string{"echo"}, "http://example.com", "", false)
+	_, err := buildAuditWiretapConfig([]string{"echo"}, "http://example.com", "", false, "")
 	if err == nil {
 		t.Fatal("expected an error when both positional and --upstream-url are set")
 	}
 }
 
 func TestBuildAuditWiretapConfig_NeitherSourceError(t *testing.T) {
-	_, err := buildAuditWiretapConfig(nil, "", "", false)
+	_, err := buildAuditWiretapConfig(nil, "", "", false, "")
 	if err == nil {
 		t.Fatal("expected an error when neither positional nor --upstream-url is set")
 	}
 }
 
 func TestBuildAuditWiretapConfig_Positional(t *testing.T) {
-	cfg, err := buildAuditWiretapConfig([]string{"echo", "hi"}, "", "", false)
+	cfg, err := buildAuditWiretapConfig([]string{"echo", "hi"}, "", "", false, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1874,7 +1874,7 @@ func TestBuildAuditWiretapConfig_Positional(t *testing.T) {
 }
 
 func TestBuildAuditWiretapConfig_UpstreamURL(t *testing.T) {
-	cfg, err := buildAuditWiretapConfig(nil, "http://example.com/mcp", "Authorization: Bearer x", true)
+	cfg, err := buildAuditWiretapConfig(nil, "http://example.com/mcp", "Authorization: Bearer x", true, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

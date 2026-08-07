@@ -59,7 +59,7 @@ func (f *injectionUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "initialize":
 		w.Header().Set(SessionHeader, "up-sess")
 		result := mcp.InitResult{
-			ProtocolVersion: MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "injection-fake", "version": "0.0.1"},
 		}
@@ -535,7 +535,7 @@ func TestAdv5_NewMethod_Stdio_AuditRecordWritten(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	proxy, hostW, _ := newTestStdioProxy(t, pdp.AlwaysAllowPDP{}, sink)
 
-	proxy.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`503`), Method: "tools/execute"})
+	proxy.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`503`), Method: "tools/execute"})
 	_ = hostW.Close()
 	_ = sink.Close()
 
@@ -735,7 +735,7 @@ func TestAdv7_NotificationFramedEnforcedMethod_Stdio_AuditRecordWritten(t *testi
 	proxy, _, _ := newTestStdioProxy(t, pdp.AlwaysAllowPDP{}, sink)
 
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "tools/call", Params: json.RawMessage(`{"name":"read_file","arguments":{}}`)}
-	_ = proxy.forwardHostNotification(context.Background(), msg)
+	_ = proxy.forwardHostNotification(context.Background(), capability.DefaultRevision, msg)
 	_ = sink.Close()
 
 	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), "tools/call", "deny")
@@ -972,7 +972,7 @@ func TestUnmappedMethod_Stdio_Denied(t *testing.T) {
 		ID:      mcp.RawJSON(`42`),
 		Method:  "agents/delegate",
 	}
-	proxy.handleHostRequest(context.Background(), msg)
+	proxy.handleHostRequest(context.Background(), capability.DefaultRevision, msg)
 	_ = hostW.Close()
 
 	result := <-responses
@@ -1000,7 +1000,7 @@ func TestUnmappedMethod_Stdio_LogsMethodName(t *testing.T) {
 		ID:      mcp.RawJSON(`1`),
 		Method:  "future/extension",
 	}
-	proxy.handleHostRequest(context.Background(), msg)
+	proxy.handleHostRequest(context.Background(), capability.DefaultRevision, msg)
 
 	_ = w.Close()
 	os.Stderr = old

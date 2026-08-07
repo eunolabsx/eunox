@@ -4,7 +4,7 @@
 which states what changes and why. This document states the work as workstreams —
 concrete deliverables, the tests each one owes, and the exit criteria that say when
 it is done. Workstream sections are keyed to the plan's numbered items.
-**Verified against:** eunox @ `5dba99c`.
+**Verified against:** eunox @ `5dba99c`; W1 landed since (see its exit criteria).
 
 References name a **file and a symbol, never a line number**.
 
@@ -105,12 +105,41 @@ Tests:
 
 Exit criteria:
 
-- [ ] One declaration per method carries revision membership; absence fails the build.
-- [ ] Old-revision wire behavior unchanged through the refactor (full suite + old×old e2e cell green).
-- [ ] -32022 on unsupported or missing protocol version, with audit record.
-- [ ] Config key + flag + schema + roundtrip test landed.
-- [ ] Revision field on audit records with threat-model update and sign/verify roundtrip.
-- [ ] ADR-0006 Final before any translation behavior activates.
+- [x] One declaration per method carries revision membership; absence fails the build.
+      (`internal/transport/dispatch.go` `methodRegistry` + `buildRevisionDispatch`;
+      `TestMethodRegistry_EveryMethodDeclaresRevisionMembership`,
+      `TestRevisionDispatch_ExactSetPerRevision`.)
+- [x] Old-revision wire behavior unchanged through the refactor (full suite green).
+      The old×old e2e cell is W13's and does not exist yet; the pre-existing suite is
+      the regression net meanwhile, and it passes unmodified except where a test
+      called a signature this workstream widened.
+- [x] -32022 on unsupported or missing protocol version, with audit record.
+      (`mcp.UnsupportedProtocolVersionResponse`, `refuseHostRevision`;
+      `TestRefuseHostRevision_EmitsSpecCodeAndRecords` plus the stdio e2e cell.)
+- [x] Config key + flag + schema + roundtrip test landed.
+      (`protocolVersion` on `config.UpstreamConfig`, `--upstream-protocol-version`,
+      the gateway schema branch cross-checked against `capability.PublishedRevisions`,
+      `TestLoadGatewayConfig_ProtocolVersionRoundTrip`.)
+- [x] Revision field on audit records with threat-model update and sign/verify roundtrip.
+      (`protocol_revision`; threat model §3.16 + §6.1;
+      `TestRecord_ProtocolRevisionSignAndVerify`, including the tamper leg.)
+- [ ] ADR-0006 Final before any translation behavior activates. **Still Draft** — and
+      nothing landed here activates translation: each revision's table is deny-by-default
+      over the same manifest, so selecting one can only remove methods, never grant one.
+      The mismatched-pair behavior D1 governs (W3, W4, W13's mismatch cells) is untouched.
+
+Landed, with two deliberate scope notes:
+
+- The **host-side rule for a context that negotiated nothing** resolves to 2025-11-25
+  rather than refusing. ADR-0006 reads "a request carrying neither … is denied" — but
+  turning "no context, no declaration" into a refusal is the session-creation-on-first-
+  request decision, which is D3's and W2's. Until then the conservative direction is to
+  land on the surface eunox already shipped: omission can never reach a newer method set,
+  and the newer table is only ever reached by an explicit declaration.
+- The **2026-07-28 methods this revision ADDS** (`server/discover`,
+  `subscriptions/listen`, `tasks/*`) are deliberately absent from the registry, so they
+  deny fail-closed rather than routing to a handler that does not exist. W4/W7/W8 add
+  each declaration when its responder lands.
 
 ### W2 — Bearer identity, session creation, revocation (plan §2) — XL
 
@@ -199,7 +228,8 @@ Exit criteria:
 
 **Depends on:** W1, D1 (filter-reuse ruling).
 
-Scope: a responder registered in the 2026-07-28 `locallyAnsweredHandlers` table —
+Scope: a responder declared in `methodRegistry` for 2026-07-28 (W1 made the four tables
+derived, so this is one `methodSpec` entry) —
 routed through `dispatchRequest`, so it inherits the shared kill gate by
 construction, unlike HTTP's session-creating `initialize` today. Output built
 from the upstream probe (`server/discover`, or synthesized from `initialize` for

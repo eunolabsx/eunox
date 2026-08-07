@@ -2557,6 +2557,17 @@ func TestGatewaySchema_EnumsRequiredAndPatterns(t *testing.T) {
 		schemaStringList(t, schemaObjectAt(t, upstream, "properties", "enforcement"), "enum"),
 		wantEnforce)
 
+	// protocolVersion enum DERIVED from the published revision list, so publishing a
+	// revision cannot leave the schema refusing one the binary speaks (or the reverse). ""
+	// and "auto" both mean "probe it".
+	wantProtocol := []string{"", config.ProtocolVersionAuto}
+	for _, rev := range capability.PublishedRevisions() {
+		wantProtocol = append(wantProtocol, rev.String())
+	}
+	assertSchemaStringSet(t, "upstream.protocolVersion.enum",
+		schemaStringList(t, schemaObjectAt(t, upstream, "properties", "protocolVersion"), "enum"),
+		wantProtocol)
+
 	// Patterns: the route-name grammar and the upstream version pin, enforced by
 	// the loader (routeNameRe / expectVersion validation).
 	assertSchemaPattern(t, "upstream.name.pattern",

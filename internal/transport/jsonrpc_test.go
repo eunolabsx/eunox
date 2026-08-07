@@ -699,7 +699,8 @@ func TestApplyInitializeResult_RejectsErrorResponse(t *testing.T) {
 		ID:      mcp.RawJSON("1"),
 		Error:   &mcp.RPCError{Code: -32600, Message: "unsupported protocol version"},
 	}
-	caps, ver, instructions, err := applyInitializeResult(resp)
+	hs, err := applyInitializeResult(resp)
+	caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 	if err == nil {
 		t.Fatal("applyInitializeResult must fail on an error response")
 	}
@@ -754,7 +755,8 @@ func TestApplyInitializeResult_FailsClosedOnMalformedShapes(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			caps, ver, instructions, err := applyInitializeResult(tc.resp)
+			hs, err := applyInitializeResult(tc.resp)
+			caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 			if err == nil {
 				t.Fatalf("applyInitializeResult must fail closed on a %s", tc.name)
 			}
@@ -773,7 +775,7 @@ func TestApplyInitializeResult_FailsClosedOnMalformedShapes(t *testing.T) {
 func TestApplyInitializeResult_AcceptsValidResult(t *testing.T) {
 	t.Parallel()
 	result := mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 		ServerInfo:      map[string]interface{}{"name": "up", "version": "9.9.9"},
 	}
@@ -782,7 +784,8 @@ func TestApplyInitializeResult_AcceptsValidResult(t *testing.T) {
 		t.Fatalf("marshal result: %v", err)
 	}
 	resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)}
-	caps, ver, _, err := applyInitializeResult(resp)
+	hs, err := applyInitializeResult(resp)
+	caps, ver := hs.Capabilities, hs.ServerVersion
 	if err != nil {
 		t.Fatalf("applyInitializeResult rejected a valid result: %v", err)
 	}
@@ -799,7 +802,7 @@ func TestApplyInitializeResult_AcceptsValidResult(t *testing.T) {
 func TestApplyInitializeResult_PreservesInstructions(t *testing.T) {
 	t.Parallel()
 	result := mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 		ServerInfo:      map[string]interface{}{"name": "up", "version": "1.0.0"},
 		Instructions:    "use this tool carefully",
@@ -809,7 +812,8 @@ func TestApplyInitializeResult_PreservesInstructions(t *testing.T) {
 		t.Fatalf("marshal result: %v", err)
 	}
 	resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)}
-	caps, ver, instructions, err := applyInitializeResult(resp)
+	hs, err := applyInitializeResult(resp)
+	caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 	if err != nil {
 		t.Fatalf("applyInitializeResult rejected a valid result: %v", err)
 	}

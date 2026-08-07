@@ -33,7 +33,6 @@ import (
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
-	"github.com/eunolabs/eunox/internal/transport"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -102,7 +101,7 @@ func stdioUpstreamServe() {
 		switch msg.Method {
 		case "initialize":
 			result = mcp.InitResult{
-				ProtocolVersion: transport.MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "stdio-integ", "version": "1.0.0"},
 			}
@@ -143,7 +142,7 @@ func stdioUpstreamServeNoisy() {
 		switch msg.Method {
 		case "initialize":
 			result = mcp.InitResult{
-				ProtocolVersion: transport.MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "stdio-noisy", "version": "1.0.0"},
 			}

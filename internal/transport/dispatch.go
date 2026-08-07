@@ -43,6 +43,12 @@ type dispatchParams struct {
 	// configured key domain. nil (the default) skips the whole surface entirely.
 	receipts *capability.EffectReceiptVerifier
 
+	// revision is the MCP protocol revision this request was negotiated under; it selects
+	// the dispatch tables. The zero value means the caller never negotiated one and resolves
+	// to capability.DefaultRevision (see tablesFor) — the surface eunox already shipped, so
+	// omission can never reach a different method set.
+	revision capability.Revision
+
 	// honorAttribution admits the client-supplied attribution interface (_meta's
 	// io.eunolabs.context-manifest block), gated on the route's schemaVersion since the
 	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
@@ -86,74 +92,243 @@ func (d dispatchParams) decideCtx(ctx context.Context) context.Context {
 	return ctx
 }
 
-// decideMethodHandlers maps each Decide*-method to its dispatch handler, and is the single
-// source of truth for "is this an enforced method": isEnforcedMethod derives from the same
-// map so the two questions cannot silently diverge.
-var decideMethodHandlers = map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg{
-	capability.MethodToolsCall:            dispatchToolsCall,
-	capability.MethodResourcesRead:        dispatchResourcesRead,
-	capability.MethodResourcesSubscribe:   dispatchResourcesSubscribe,
-	capability.MethodResourcesUnsubscribe: dispatchResourcesUnsubscribe,
-	capability.MethodPromptsGet:           dispatchPromptsGet,
-}
+// methodHandler is the shape every dispatched request handler shares.
+type methodHandler func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg
 
-// isEnforcedMethod reports whether method is one of the Decide* methods, derived from
-// decideMethodHandlers so it cannot drift from dispatchRequest's routing table.
-func isEnforcedMethod(method string) bool {
-	_, ok := decideMethodHandlers[method]
-	return ok
-}
+// notificationDisposition is what a transport does with the NOTIFICATION framing of a
+// method. The zero value is the fail-closed one: dropped and recorded.
+type notificationDisposition int
 
-// swallowedHostNotifications is the set of host->upstream notifications both transports drop:
-//   - "notifications/initialized": the proxy already sent its own during its handshake.
-//   - "initialize": can arrive with no id (a notification by IsNotification's structural
-//     classification); forwarding it would re-trigger the handshake outside the kill gate.
+const (
+	// notifyUnmapped drops and records the notification (denyUnmappedHostNotification), the
+	// notification-framed analogue of dispatchUnmapped's default.
+	notifyUnmapped notificationDisposition = iota
+	// notifyForward forwards the notification to the upstream verbatim.
+	notifyForward
+	// notifySwallow drops the notification silently, with no record: the proxy already
+	// handled the thing it announces, so it is neither an error nor an event.
+	notifySwallow
+)
+
+// methodSpec is ONE method's whole declaration: the revisions it exists in, how its request
+// framing is dispatched, and what happens to its notification framing. The four routing
+// tables are DERIVED from these (buildRevisionDispatch), so a method's revision membership
+// is stated once rather than mirrored into four maps that can silently disagree — the
+// pattern pkg/capability's tokenSpec already uses for grammar revisions.
 //
-// Single source of truth so stdio and HTTP provably agree rather than hand-mirroring it.
-var swallowedHostNotifications = map[string]struct{}{
-	mcp.MethodNotificationsInitialized: {},
-	mcp.MethodInitialize:               {},
+// Removal across revisions is expressed by ABSENCE from In: a method outside the requesting
+// peer's tables falls to dispatchUnmapped exactly as an unknown method does, so there is no
+// second removal mechanism to keep in step with the first.
+type methodSpec struct {
+	// In lists the revisions this method exists in. An entry declaring none is refused by
+	// buildRevisionDispatch (dispatched under no revision) and fails
+	// TestMethodRegistry_EveryMethodDeclaresRevisionMembership.
+	In []capability.Revision
+	// Handler answers the request framing; nil for a notification-only method.
+	Handler methodHandler
+	// Enforced marks Handler as a Decide* handler — the one that carries its own kill
+	// record and takes the decision turn. It is what isEnforcedMethod derives from, so
+	// "is this enforced" and "which handler runs" cannot diverge.
+	Enforced bool
+	// Notification is the disposition of this method's notification framing.
+	Notification notificationDisposition
 }
 
-// isSwallowedHostNotification reports whether a host->upstream notification of this
-// method must be dropped rather than forwarded (see swallowedHostNotifications).
-func isSwallowedHostNotification(method string) bool {
-	_, ok := swallowedHostNotifications[method]
-	return ok
-}
-
-// methodNotificationsProgress and methodNotificationsRootsListChanged are notifications the
-// proxy forwards verbatim (see forwardableHostNotifications); defined here since nothing else
-// in the package references them.
+// methodNotificationsProgress and methodNotificationsRootsListChanged are notification
+// methods with no request framing; defined here since nothing else in the package
+// references them.
 const (
 	methodNotificationsProgress         = "notifications/progress"
 	methodNotificationsRootsListChanged = "notifications/roots/list_changed"
 )
 
-// forwardableHostNotifications is the allowlist of notifications forwarded verbatim once the
-// swallowed and enforced-method checks have passed. Anything not in this set is dropped and
-// recorded by denyUnmappedHostNotification, mirroring dispatchUnmapped's fail-closed default
-// for the request-framed case — before this existed, an unrecognized notification-framed
-// method reached the upstream invisibly while its request-framed twin was denied and logged.
-var forwardableHostNotifications = map[string]struct{}{
-	methodNotificationsCancelled:        {},
-	methodNotificationsProgress:         {},
-	methodNotificationsRootsListChanged: {},
+// methodRegistry is the single source of truth for what eunox dispatches, per revision.
+//
+// The 2026-07-28 entries describe that revision's method set as the spec defines it; the
+// methods it ADDS (server/discover, subscriptions/listen, tasks/*) are deliberately absent
+// until the workstreams that implement them land, so they deny fail-closed meanwhile rather
+// than routing to a handler that does not exist.
+var methodRegistry = map[string]methodSpec{
+	// Enforced (Decide*) methods. The resources/subscribe pair is 2025-11-25 only:
+	// 2026-07-28 replaces it with subscriptions/listen, which is not implemented yet.
+	capability.MethodToolsCall: {
+		In:       []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Handler:  dispatchToolsCall,
+		Enforced: true,
+	},
+	capability.MethodResourcesRead: {
+		In:       []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Handler:  dispatchResourcesRead,
+		Enforced: true,
+	},
+	capability.MethodResourcesSubscribe: {
+		In:       []capability.Revision{capability.Revision20251125},
+		Handler:  dispatchResourcesSubscribe,
+		Enforced: true,
+	},
+	capability.MethodResourcesUnsubscribe: {
+		In:       []capability.Revision{capability.Revision20251125},
+		Handler:  dispatchResourcesUnsubscribe,
+		Enforced: true,
+	},
+	capability.MethodPromptsGet: {
+		In:       []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Handler:  dispatchPromptsGet,
+		Enforced: true,
+	},
+
+	// Locally answered methods. initialize and ping are handshake/utility methods
+	// 2026-07-28 removes; the three */list methods exist in both revisions.
+	mcp.MethodInitialize: {
+		In:      []capability.Revision{capability.Revision20251125},
+		Handler: dispatchInitialize,
+		// "initialize" can arrive with no id (a notification by IsNotification's structural
+		// classification); forwarding it verbatim would re-trigger the upstream handshake
+		// outside the kill gate, so the notification framing is swallowed.
+		Notification: notifySwallow,
+	},
+	methodPing: {
+		In: []capability.Revision{capability.Revision20251125},
+		Handler: func(_ context.Context, _ dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+			return dispatchPing(msg)
+		},
+	},
+	capability.MethodResourcesList: {
+		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Handler: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
+		},
+	},
+	capability.MethodToolsList: {
+		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Handler: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterToolsList)
+		},
+	},
+	capability.MethodPromptsList: {
+		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Handler: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterPromptsList)
+		},
+	},
+
+	// Notification-only methods. notifications/initialized closes a handshake 2026-07-28
+	// does not have; roots/list_changed announces a capability it deprecates.
+	mcp.MethodNotificationsInitialized: {
+		In: []capability.Revision{capability.Revision20251125},
+		// The proxy already sent its own during its upstream handshake.
+		Notification: notifySwallow,
+	},
+	methodNotificationsCancelled: {
+		In:           []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Notification: notifyForward,
+	},
+	methodNotificationsProgress: {
+		In:           []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Notification: notifyForward,
+	},
+	methodNotificationsRootsListChanged: {
+		In:           []capability.Revision{capability.Revision20251125},
+		Notification: notifyForward,
+	},
 }
 
-// isForwardableHostNotification reports whether a host->upstream notification of
-// this method is allowlisted for verbatim forwarding (see
-// forwardableHostNotifications).
-func isForwardableHostNotification(method string) bool {
-	_, ok := forwardableHostNotifications[method]
+// revisionTables is one revision's four derived routing tables — the shape the dispatcher
+// and the two transports actually consult.
+type revisionTables struct {
+	decide               map[string]methodHandler
+	local                map[string]methodHandler
+	forwardNotifications map[string]struct{}
+	swallowNotifications map[string]struct{}
+}
+
+// revisionDispatch holds the per-revision tables derived from methodRegistry at init.
+var revisionDispatch = buildRevisionDispatch(methodRegistry)
+
+// buildRevisionDispatch derives each published revision's four routing tables from the
+// declarations. An entry that declares no revision, or names one this build does not speak,
+// contributes to no table at all — it is dispatched nowhere and falls to the fail-closed
+// default, the same outcome as never having been declared. That silence is intentional
+// (production must not panic on a data slip) and is what the derivation test converts into a
+// build failure.
+func buildRevisionDispatch(registry map[string]methodSpec) map[capability.Revision]revisionTables {
+	out := make(map[capability.Revision]revisionTables, len(capability.PublishedRevisions()))
+	for _, rev := range capability.PublishedRevisions() {
+		out[rev] = revisionTables{
+			decide:               map[string]methodHandler{},
+			local:                map[string]methodHandler{},
+			forwardNotifications: map[string]struct{}{},
+			swallowNotifications: map[string]struct{}{},
+		}
+	}
+	for method, spec := range registry {
+		for _, rev := range spec.In {
+			tables, ok := out[rev]
+			if !ok {
+				continue // a revision this build does not speak: contribute nothing
+			}
+			if spec.Handler != nil {
+				if spec.Enforced {
+					tables.decide[method] = spec.Handler
+				} else {
+					tables.local[method] = spec.Handler
+				}
+			}
+			switch spec.Notification {
+			case notifyForward:
+				tables.forwardNotifications[method] = struct{}{}
+			case notifySwallow:
+				tables.swallowNotifications[method] = struct{}{}
+			case notifyUnmapped:
+				// The fail-closed default: recorded and dropped, no table entry.
+			}
+		}
+	}
+	return out
+}
+
+// tablesFor returns the routing tables for rev.
+//
+// The zero Revision resolves to capability.DefaultRevision: a dispatchParams built without
+// an explicit revision is a caller that never negotiated one, and the old revision is the
+// surface eunox already shipped. An unknown non-empty revision resolves to EMPTY tables
+// instead — it was declared and cannot be honored, so every method falls to the fail-closed
+// default rather than borrowing another revision's set.
+func tablesFor(rev capability.Revision) revisionTables {
+	if rev == "" {
+		rev = capability.DefaultRevision
+	}
+	return revisionDispatch[rev]
+}
+
+// isEnforcedMethod reports whether method is one of rev's Decide* methods, derived from the
+// same declarations dispatchRequest routes by so the two cannot drift.
+func isEnforcedMethod(rev capability.Revision, method string) bool {
+	_, ok := tablesFor(rev).decide[method]
 	return ok
 }
 
-// denyUnmappedHostNotification denies (and records) a notification outside the forwardable
-// allowlist — the notification-framed analogue of dispatchUnmapped. Shared by both transports
-// so the check and record live once. Returns true when msg was denied.
-func denyUnmappedHostNotification(ctx context.Context, w io.Writer, rec auditRecorder, sessionID string, msg mcp.RPCMsg) bool {
-	if isForwardableHostNotification(msg.Method) {
+// isSwallowedHostNotification reports whether a host->upstream notification of this method
+// must be dropped silently under rev rather than forwarded or recorded.
+func isSwallowedHostNotification(rev capability.Revision, method string) bool {
+	_, ok := tablesFor(rev).swallowNotifications[method]
+	return ok
+}
+
+// isForwardableHostNotification reports whether a host->upstream notification of this
+// method is allowlisted for verbatim forwarding under rev.
+func isForwardableHostNotification(rev capability.Revision, method string) bool {
+	_, ok := tablesFor(rev).forwardNotifications[method]
+	return ok
+}
+
+// denyUnmappedHostNotification denies (and records) a notification outside the requesting
+// peer's forwardable allowlist — the notification-framed analogue of dispatchUnmapped.
+// Shared by both transports so the check and record live once. Returns true when msg was
+// denied. Before this existed, an unrecognized notification-framed method reached the
+// upstream invisibly while its request-framed twin was denied and logged.
+func denyUnmappedHostNotification(ctx context.Context, w io.Writer, rec auditRecorder, sessionID string, rev capability.Revision, msg mcp.RPCMsg) bool {
+	if isForwardableHostNotification(rev, msg.Method) {
 		return false
 	}
 	if rec != nil {
@@ -169,8 +344,8 @@ func denyUnmappedHostNotification(ctx context.Context, w io.Writer, rec auditRec
 // via notification framing (no id) rather than request framing — forwarding it verbatim would
 // bypass both the PDP decision and the audit record. Shared by both transports; returns true
 // when msg was denied.
-func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sessionID string, msg mcp.RPCMsg) bool {
-	if !isEnforcedMethod(msg.Method) {
+func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sessionID string, rev capability.Revision, msg mcp.RPCMsg) bool {
+	if !isEnforcedMethod(rev, msg.Method) {
 		return false
 	}
 	if rec != nil {
@@ -188,7 +363,8 @@ func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sess
 // shares one simple gate applied here, so a new locally-answered method inherits revocation by
 // construction rather than needing killDenied re-placed inside its handler.
 func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	if handler, ok := decideMethodHandlers[msg.Method]; ok {
+	tables := tablesFor(d.revision)
+	if handler, ok := tables.decide[msg.Method]; ok {
 		return handler(ctx, d, msg)
 	}
 
@@ -197,7 +373,7 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.
 	if resp, killed := d.killDenied(ctx, msg); killed {
 		return resp
 	}
-	if handler, ok := locallyAnsweredHandlers[msg.Method]; ok {
+	if handler, ok := tables.local[msg.Method]; ok {
 		return handler(ctx, d, msg)
 	}
 	return dispatchUnmapped(ctx, d, msg)
@@ -206,29 +382,21 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.
 // methodPing is the MCP liveness probe, answered locally without contacting the upstream.
 const methodPing = "ping"
 
-// locallyAnsweredHandlers maps each method dispatchRequest answers WITHOUT a PDP Decide* call
-// to its handler. A table, like decideMethodHandlers, so routing and "is this dispatched"
-// stay one fact. Anything in neither table falls to dispatchUnmapped's fail-closed deny.
-var locallyAnsweredHandlers = map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg{
-	mcp.MethodInitialize: dispatchInitialize,
-	methodPing: func(_ context.Context, _ dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-		return dispatchPing(msg)
-	},
-	capability.MethodResourcesList: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
-	},
-	capability.MethodToolsList: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterToolsList)
-	},
-	capability.MethodPromptsList: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-		return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterPromptsList)
-	},
-}
-
 // enforcedMethodSummary is the subset the audit-mode banner may claim as "forwarded and
 // logged": only Decide* methods reach the upstream AND leave a decision record — initialize,
 // ping, and */list do not (no record, or an enumeration event rather than a decision).
-var enforcedMethodSummary = sortedMethods(decideMethodHandlers)
+//
+// Derived across ALL revisions, not one: the banner prints once at startup, before any peer
+// has negotiated, so the honest claim is every method this build may enforce.
+var enforcedMethodSummary = sortedMethods(func() map[string]methodHandler {
+	all := map[string]methodHandler{}
+	for _, tables := range revisionDispatch {
+		for method, handler := range tables.decide {
+			all[method] = handler
+		}
+	}
+	return all
+}())
 
 // unmappedMethodExamples names MCP methods this build does NOT dispatch, so the banner's
 // caveat is concrete rather than abstract. They are examples, not an exhaustive list:
@@ -238,7 +406,7 @@ const unmappedMethodExamples = "e.g. completion/complete, logging/setLevel, reso
 // sortedMethods joins a routing table's keys in sorted order, so a banner derived from a
 // table cannot drift from what the dispatcher does, and a map's iteration order cannot make
 // the text unstable.
-func sortedMethods(table map[string]func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg) string {
+func sortedMethods(table map[string]methodHandler) string {
 	methods := make([]string, 0, len(table))
 	for m := range table {
 		methods = append(methods, m)

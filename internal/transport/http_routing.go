@@ -376,12 +376,20 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// httpSession.noteRequestAnchor. Placed here (a write) rather than in the check-only
 	// session-gate verdict, one of whose callers runs under the session-registry lock.
 	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
+	// Negotiate before anything routes on the method: every table below is revision-scoped,
+	// so resolving after the lookup would route by one table and record under another.
+	rev, ok := p.negotiateHostRevision(w, r, route, sess, msg)
+	if !ok {
+		return
+	}
+	// On ctx from here down, so every record stamps the revision its table was chosen by.
+	ctx := capability.WithProtocolRevision(r.Context(), rev)
 	// Check the kill switch BEFORE touchRequest so a killed session's denied POSTs can't
 	// keep deferring idle reaping (a request may race teardownSessionByID's proactive
 	// teardown). Gate ONLY touchRequest on it: enforced requests and re-initialize still
 	// flow through the dispatcher below, which re-checks the kill with the precise
 	// per-target audit identifier rather than this coarse method-only check.
-	kill := route.pdp.CheckKill(r.Context(), sessionID)
+	kill := route.pdp.CheckKill(ctx, sessionID)
 	if kill == nil {
 		// A live POST is active host-initiated traffic (distinct from passively holding
 		// an SSE GET open): it defers both the idle reaper and the hard idle ceiling.
@@ -393,9 +401,9 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// dispatcher's kill gate) and the enforced-method fail-closed reject. These don't flow
 	// through the dispatcher, so the kill is enforced here.
 	if msg.IsNotification() {
-		if !isSwallowedHostNotification(msg.Method) {
+		if !isSwallowedHostNotification(rev, msg.Method) {
 			if kill != nil {
-				recordKillDrop(r.Context(), asRecorder(route.sink), kill, verifiedSession(sess.id), msg.Method, msg.Method, legHTTPNotification)
+				recordKillDrop(ctx, asRecorder(route.sink), kill, verifiedSession(sess.id), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -403,14 +411,14 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// shared with the stdio transport's equivalent guard so the check and its audit
 			// record can't drift between transports. Checked before the notify-slot
 			// acquisition below: no point reserving a slot for a notification about to be denied.
-			if denyEnforcedMethodNotification(r.Context(), asRecorder(route.sink), sessionID, msg) {
+			if denyEnforcedMethodNotification(ctx, asRecorder(route.sink), sessionID, rev, msg) {
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
 			// Any notification method outside the forwardable allowlist is a fail-closed
 			// reject too, so a notification-framed novel/unmapped method can't reach the
 			// upstream invisibly while its request-framed twin would be denied and logged.
-			if denyUnmappedHostNotification(r.Context(), p.errOut(), asRecorder(route.sink), sessionID, msg) {
+			if denyUnmappedHostNotification(ctx, p.errOut(), asRecorder(route.sink), sessionID, rev, msg) {
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -427,7 +435,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// ungated this was the cheapest audit-write flooding primitive available (no
 				// upstream round trip, a 202 identical to success) and enough records latch
 				// AuditDegraded(), which under --require-audit=strict denies every route.
-				recordResourceExhausted(r.Context(), asRecorder(route.sink), &sess.notifySaturation, sessionID, msg.Method)
+				recordResourceExhausted(ctx, asRecorder(route.sink), &sess.notifySaturation, sessionID, msg.Method)
 				_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
 				w.WriteHeader(http.StatusAccepted)
 				return
@@ -439,37 +447,18 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// upstream can leave it past by 202-write time and drop a connection for a
 			// notification that was in fact delivered.
 			rearmWriteDeadline(w, p.upstreamTimeMs)
-			sess.forwardNotification(r.Context(), msg)
+			sess.forwardNotification(ctx, msg)
 		}
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
 	if !msg.IsRequest() {
-		// A host response to a server-initiated request the proxy broadcast must be routed
-		// back to the blocked upstream. Only responses whose ID we forwarded are routed
-		// (take consumes the tracked ID); any other non-request POST is acked and ignored.
-		if msg.IsResponse() && sess.serverReqs.take(mcp.MsgKey(msg.ID)) {
-			switch {
-			case kill != nil:
-				// A kill doesn't tear the upstream down; its blocked server-initiated
-				// request is intentionally left unanswered and reclaimed later by the idle
-				// reaper's hard ceiling. Record the dropped reply so it's visible on the tape.
-				recordKillDrop(r.Context(), asRecorder(route.sink), kill, verifiedSession(sess.id), "server-response", "server-response", legHTTPServerResponse)
-			case sess.upWriter != nil:
-				_ = sess.upWriter.Write(msg)
-			default:
-				// Remote-upstream mode has no upWriter to route the response back. Unreachable
-				// today (remote sessions issue no server-initiated requests), pending a fix.
-				_, _ = fmt.Fprintf(p.errOut(),
-					"[eunox] WARNING: dropped host response to a server-initiated request: no upstream writer in remote-upstream mode\n")
-			}
-		}
+		p.routeHostServerResponse(ctx, route, sess, kill, msg)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
-	ctx := r.Context()
 	var resp mcp.RPCMsg
 	if msg.Method == mcp.MethodInitialize {
 		// Re-initialize is answered locally from capabilities captured at session start
@@ -478,7 +467,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// here, and is not subject to the in-flight cap below since it contacts no upstream.
 		// dispatchInitialize skips strictAuditDenial intentionally: this is a pure local
 		// echo of already-captured state, not a fresh decision against upstream state.
-		resp = dispatchRequest(ctx, p.dispatchParams(sess, p.sourceIP(r)), msg)
+		resp = dispatchRequest(ctx, p.dispatchParams(sess, p.sourceIP(r), rev), msg)
 	} else {
 		// Bound concurrent in-flight enforced requests on this session (the HTTP analogue
 		// of stdio's hostSem). Non-blocking acquire: on saturation reject with a retryable
@@ -513,7 +502,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: session torn down; retry"))
 			return
 		}
-		d := p.dispatchParams(sess, p.sourceIP(r))
+		d := p.dispatchParams(sess, p.sourceIP(r), rev)
 		// Serialize the decision phase for a flow-/sequenceBlock-relevant route, so a
 		// source's state write isn't raced ahead of by a later sink's read on the same
 		// ANCHOR. Only enforced methods take the turn; the Decide* handler releases it via
@@ -524,7 +513,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// sessions share one key, and a per-session lock would leave them unserialized
 		// against state they share. sess.route is dereferenced unconditionally by
 		// dispatchParams above, so a nil-route session can't reach here.
-		if sess.route.serializes() && isEnforcedMethod(msg.Method) {
+		if sess.route.serializes() && isEnforcedMethod(rev, msg.Method) {
 			// The release is idempotent, so finishDecision and this deferred backstop
 			// advance the turn exactly once between them.
 			end := sess.beginDecisionTurn(ctx)
@@ -1016,3 +1005,57 @@ const (
 	killDimensionGlobal  = "global"
 	killDimensionSession = "session"
 )
+
+// negotiateHostRevision resolves the MCP protocol revision one host message is dispatched
+// under, checked against the revision the session's context was opened at. ok=false means
+// the refusal has already been written: -32022 plus its record for a request, and for a
+// notification a recorded drop with a bodyless 202, since JSON-RPC forbids replying to one.
+//
+// It runs AHEAD of the kill check, deliberately: every table the routing below consults is
+// revision-scoped, so a message whose revision cannot be established has no table to be
+// looked up in. The cost is that a revoked session's bad-version probe is recorded as
+// UNSUPPORTED_PROTOCOL_VERSION rather than KILL_SWITCH — a labelling difference on a message
+// that is refused either way, since this path contacts no upstream and mutates no state. The
+// containment property is unchanged; only that one record's code differs.
+//
+// Split out of handleSessionPost so that function stays within its complexity bound, and so
+// the refusal shape lives in one place rather than inline among the routing branches.
+func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg) (capability.Revision, bool) {
+	rev, err := resolveHostRevision(sess.hostRev, msg)
+	if err == nil {
+		return rev, true
+	}
+	resp := refuseHostRevision(r.Context(), asRecorder(route.sink), sess.id, msg, err)
+	if msg.IsRequest() {
+		writeJSONMsg(w, resp)
+	} else {
+		w.WriteHeader(http.StatusAccepted)
+	}
+	return "", false
+}
+
+// routeHostServerResponse routes a host POST that is neither request nor notification: a
+// response to a server-initiated request the proxy broadcast, which must reach the blocked
+// upstream. Only responses whose ID the proxy forwarded are routed (take consumes the
+// tracked ID); anything else is ignored, and the caller acks either way.
+//
+// Split out of handleSessionPost to keep that function within its complexity bound.
+func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *UpstreamRoute, sess *httpSession, kill *capability.EnforceResponse, msg mcp.RPCMsg) {
+	if !msg.IsResponse() || !sess.serverReqs.take(mcp.MsgKey(msg.ID)) {
+		return
+	}
+	switch {
+	case kill != nil:
+		// A kill doesn't tear the upstream down; its blocked server-initiated request is
+		// intentionally left unanswered and reclaimed later by the idle reaper's hard
+		// ceiling. Record the dropped reply so it's visible on the tape.
+		recordKillDrop(ctx, asRecorder(route.sink), kill, verifiedSession(sess.id), "server-response", "server-response", legHTTPServerResponse)
+	case sess.upWriter != nil:
+		_ = sess.upWriter.Write(msg)
+	default:
+		// Remote-upstream mode has no upWriter to route the response back. Unreachable
+		// today (remote sessions issue no server-initiated requests), pending a fix.
+		_, _ = fmt.Fprintf(p.errOut(),
+			"[eunox] WARNING: dropped host response to a server-initiated request: no upstream writer in remote-upstream mode\n")
+	}
+}

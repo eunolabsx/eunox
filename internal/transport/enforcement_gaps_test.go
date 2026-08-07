@@ -214,7 +214,7 @@ func (f *fullFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(SessionHeader, "upstream-sess-1")
 		w.Header().Set("Content-Type", "application/json")
 		result := mcp.InitResult{
-			ProtocolVersion: MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "fake-full", "version": "0.0.1"},
 		}
@@ -759,7 +759,7 @@ func TestStdioProxy_RecStampsPolicyProvenance(t *testing.T) {
 
 	const method = "tools/uninstall" // any unmapped notification triggers a deny record
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: method, Params: json.RawMessage(`{}`)}
-	if stop := p.forwardHostNotification(context.Background(), msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown here")
 	}
 
@@ -844,7 +844,7 @@ func TestStdioForwardHostNotification_EnforcedMethodDenied(t *testing.T) {
 				t.Fatal("test message must be notification-shaped (no id) to exercise the bypass path")
 			}
 
-			stop := p.forwardHostNotification(context.Background(), msg)
+			stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg)
 			if stop {
 				t.Fatal("forwardHostNotification must not signal shutdown for a denied notification")
 			}
@@ -874,7 +874,7 @@ func TestStdioForwardHostNotification_OrdinaryNotificationStillForwarded(t *test
 	p, _, uw := newStdioProxyForSamplingTest(t, pdp.AlwaysAllowPDP{})
 
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/progress", Params: json.RawMessage(`{"p":1}`)}
-	if stop := p.forwardHostNotification(context.Background(), msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown here")
 	}
 	if len(uw.messages) != 1 || uw.messages[0].Method != "notifications/progress" {
@@ -901,7 +901,7 @@ func TestStdioForwardHostNotification_UnmappedNotificationDeniedAndRecorded(t *t
 		t.Fatal("test message must be notification-shaped (no id)")
 	}
 
-	if stop := p.forwardHostNotification(context.Background(), msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown here")
 	}
 	if len(uw.messages) != 0 {
@@ -935,7 +935,7 @@ func TestStdioForwardHostNotification_MidSessionInitializeSwallowed(t *testing.T
 		t.Fatal("test message must be notification-shaped (no id) to exercise the swallow path")
 	}
 
-	if stop := p.forwardHostNotification(context.Background(), msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown for a swallowed initialize notification")
 	}
 	if len(uw.messages) != 0 {
@@ -1490,7 +1490,7 @@ func TestGap3_HTTPProxy_ResourcesUnsubscribe_AllowedAfterQuotaExhausted(t *testi
 // notification-framed unsubscribe must be rejected like every other enforced method
 // rather than forwarded verbatim.
 func TestGap3_ResourcesUnsubscribe_IsEnforcedMethod(t *testing.T) {
-	if !isEnforcedMethod(capability.MethodResourcesUnsubscribe) {
+	if !isEnforcedMethod(capability.Revision20251125, capability.MethodResourcesUnsubscribe) {
 		t.Error("resources/unsubscribe must be in the enforced (Decide*) set")
 	}
 	if tt, ok := capability.MethodTargetType(capability.MethodResourcesUnsubscribe); !ok || tt != capability.TargetTypeResource {
@@ -1499,7 +1499,7 @@ func TestGap3_ResourcesUnsubscribe_IsEnforcedMethod(t *testing.T) {
 }
 
 // The audit-mode banner must name exactly the ENFORCED set — the methods that reach the
-// upstream AND leave a decision record — and its list is derived from decideMethodHandlers,
+// upstream AND leave a decision record — and its list is derived from the method registry,
 // so a newly enforced method shows up automatically. The locally-answered half must NOT be
 // advertised as "forwarded and logged": initialize and ping never touch the upstream and
 // write no record, and the …/list flavors are recorded as enumeration events, not decisions.
@@ -1525,7 +1525,7 @@ func TestEnforcedMethodSummary_DerivedFromTheDecideTable(t *testing.T) {
 		if strings.Contains(enforcedMethodSummary, m) {
 			t.Errorf("locally-answered method %q must not be advertised as forwarded and logged: %q", m, enforcedMethodSummary)
 		}
-		if _, ok := locallyAnsweredHandlers[m]; !ok {
+		if _, ok := tablesFor(capability.Revision20251125).local[m]; !ok {
 			t.Errorf("%q is expected to be locally answered, but is not in the table", m)
 		}
 	}
@@ -1534,10 +1534,10 @@ func TestEnforcedMethodSummary_DerivedFromTheDecideTable(t *testing.T) {
 		if strings.Contains(enforcedMethodSummary, m) {
 			t.Errorf("method %q is NOT dispatched (it hits the fail-closed default) but the banner advertises it", m)
 		}
-		if _, ok := decideMethodHandlers[m]; ok {
+		if _, ok := tablesFor(capability.Revision20251125).decide[m]; ok {
 			t.Errorf("%q unexpectedly became an enforced method; the banner caveat names it as unmapped", m)
 		}
-		if _, ok := locallyAnsweredHandlers[m]; ok {
+		if _, ok := tablesFor(capability.Revision20251125).local[m]; ok {
 			t.Errorf("%q unexpectedly became locally answered; the banner caveat names it as unmapped", m)
 		}
 	}
@@ -2705,7 +2705,7 @@ func TestStdioHandleToolsCall_EmptyName_InvalidParams(t *testing.T) {
 	p, hw := closedUpstream(t)
 	p.pdp = newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}})
 
-	p.handleHostRequest(context.Background(), mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"","arguments":{}}`),
 	})

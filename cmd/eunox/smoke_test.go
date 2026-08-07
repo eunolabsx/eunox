@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/eunolabs/eunox/pkg/capability"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -136,10 +137,10 @@ upstreams:
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		resp, hdr, err := transport.DoMCPHTTP(reqCtx, client, endpoint, mcpRequest(1, "initialize", map[string]interface{}{
-			"protocolVersion": transport.MCPProtocolVersion,
+			"protocolVersion": capability.Revision20251125.String(),
 			"capabilities":    map[string]interface{}{},
 			"clientInfo":      map[string]interface{}{"name": "smoke", "version": "1.0.0"},
-		}), "", "")
+		}), "", "", capability.Revision20251125)
 		if err == nil && resp.Error == nil {
 			sessID = hdr.Get(transport.SessionHeader)
 			break
@@ -158,7 +159,7 @@ upstreams:
 	allowResp, _, err := transport.DoMCPHTTP(reqCtx, client, endpoint, mcpRequest(2, "tools/call", map[string]interface{}{
 		"name":      "read_file",
 		"arguments": map[string]interface{}{},
-	}), sessID, "")
+	}), sessID, "", capability.Revision20251125)
 	if err != nil {
 		t.Fatalf("allowed tools/call: transport error: %v", err)
 	}
@@ -174,7 +175,7 @@ upstreams:
 	denyResp, _, err := transport.DoMCPHTTP(reqCtx, client, endpoint, mcpRequest(3, "tools/call", map[string]interface{}{
 		"name":      "write_file",
 		"arguments": map[string]interface{}{},
-	}), sessID, "")
+	}), sessID, "", capability.Revision20251125)
 	if err != nil {
 		t.Fatalf("denied tools/call: transport error: %v", err)
 	}

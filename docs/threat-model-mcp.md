@@ -466,7 +466,7 @@ Adds and removes are **advisory**, not breaks: MCP supports a changing tool list
 
 **Attack:** JSON-RPC distinguishes a *request* (carries an `id`, expects a response) from a *notification* (no `id`, fire-and-forget) purely structurally — `IsNotification()` is `id == nil && method != ""`, with no allowlist restricting which methods may legitimately take notification form. `tools/call`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, and `prompts/get` are always requests in a well-formed MCP session, but nothing rejected one of these framed as a notification instead: a host omitting the `id` field on an otherwise-normal `tools/call` body caused the message to be routed to each transport's fire-and-forget notification-forwarding path (stdio's `forwardHostNotification`, the HTTP transport's notification branch in `handleSessionPost`), which forwarded it to the upstream verbatim after only a kill-switch check — never reaching `dispatchRequest`, so the PDP decision was skipped and no audit record (allow or deny) was written. A lenient upstream MCP server that processes notification-framed method calls would execute the tool the manifest would otherwise have denied, invisibly to the audit trail and to `--require-audit=strict`.
 
-**Mitigation:** Both transports check the notification's method against the same enforced-method set `dispatchRequest` routes on (`decideMethodHandlers` / `isEnforcedMethod`, `internal/transport/dispatch.go`) before forwarding. A match is denied and recorded (`INVALID_REQUEST`) instead of forwarded — the request never reaches the upstream, and the denial is a signed audit record like any other enforced-path deny. The check and its record are a single shared function (`denyEnforcedMethodNotification`) both transports call, so the two cannot independently drift out of sync.
+**Mitigation:** Both transports check the notification's method against the same enforced-method set `dispatchRequest` routes on for that peer's protocol revision (`methodRegistry` / `isEnforcedMethod`, `internal/transport/dispatch.go`) before forwarding. A match is denied and recorded (`INVALID_REQUEST`) instead of forwarded — the request never reaches the upstream, and the denial is a signed audit record like any other enforced-path deny. The check and its record are a single shared function (`denyEnforcedMethodNotification`) both transports call, so the two cannot independently drift out of sync.
 
 **Residual risk:** The denial record uses the raw method name as both the audit identifier and the target (mirroring `malformedDeny`'s pre-existing convention for params rejected before the PDP is consulted, since a notification-framed call's real target argument is not parsed) — for `prompts/get` this yields a `target` of `"get"` rather than a real prompt name. A consumer that keys off `denial_code` (as `suggest` already does via `IsInfraDenialCode`) is unaffected; a hand-rolled consumer that does not filter infrastructure-fault codes could misread this as a denied call to a tool/resource/prompt literally named after the bare method suffix.
 
@@ -611,6 +611,57 @@ The delegated `maxEffectClass` composes onto a wrapping layer's short-circuited 
 **Residual.** A delegation refusal is downgradable by `--audit`, deliberately: it is an authorization verdict like the manifest's own no-match deny, and an observe route exists to show what enforcement would do on a chain being rolled out. The chain is also only as good as the minting side — eunox consumes tokens and never mints them, so a control plane that issues a delegate the same grant as its delegator has expressed no attenuation, and the proxy has nothing to enforce. What the proxy guarantees is that a chain claiming to narrow actually does.
 
 ---
+
+### 3.16 Protocol-Revision Confusion (Reaching Another Revision's Method Table)
+
+**Threat.** eunox speaks two MCP revisions, and they do not have the same method set:
+2025-11-25 has `initialize`, `ping`, and the `resources/subscribe` pair; 2026-07-28
+removes all of them and declares its protocol version in each request's `_meta`
+(`io.modelcontextprotocol/protocolVersion`). Once routing is revision-scoped, the
+revision a request is decided under selects which methods exist for it — so a caller
+that can influence that value can choose the table its request is matched against.
+Two shapes matter: declaring a revision this build does not speak (does the request
+fall back to a permissive default?), and declaring one revision inside a context
+opened at another (a mid-context flip).
+
+**Mitigation.**
+
+- **Omission never widens.** A request declaring no revision inherits the revision its
+  context negotiated, and a context that negotiated none resolves to `2025-11-25` — the
+  surface eunox already shipped. There is no path by which leaving a declaration out
+  reaches a method set the peer did not negotiate.
+- **A mid-context flip is refused, not honored.** Answering `initialize` negotiates
+  2025-11-25 for that context's life; a later request declaring a different revision is
+  denied `UNSUPPORTED_PROTOCOL_VERSION` (-32022) and recorded. A peer that changes its
+  declared revision mid-context is indistinguishable from one probing for the more
+  permissive table, so this fails closed rather than re-negotiating (ADR-0006).
+- **An unspoken revision dispatches nothing.** A declared revision outside the published
+  set is refused; internally, a revision with no tables resolves to empty tables rather
+  than borrowing another revision's, so even a wiring fault denies rather than widens.
+- **Removal is expressed by absence.** Each method declares the revisions it exists in,
+  once, and the four routing tables are derived from those declarations. A method outside
+  the requesting peer's tables falls to the same fail-closed default (`dispatchUnmapped`,
+  `AUTHORIZATION_FAILED`, recorded) that already covers unknown methods — there is no
+  second removal mechanism that could disagree with the first. A declaration naming no
+  revision fails the build.
+- **The decision is on the tape.** Every record stamps `protocol_revision` (§6.1) in the
+  signed body, so an auditor can separate "policy refused this" from "this method does
+  not exist in the revision that peer negotiated". The refusal itself is recorded under
+  the `UNSUPPORTED_PROTOCOL_VERSION` code.
+
+**Residual risk.** The revision a peer declares is still the peer's own claim; eunox
+constrains which table that claim can select and records the choice, but does not
+authenticate it. Since every revision's table is deny-by-default over the same manifest,
+selecting a different table can only ever *remove* methods, never grant one policy did
+not permit.
+
+**Test coverage.** `internal/transport/dispatch_revision_test.go` (per-revision exact
+table sets; the undeclared-membership build gate; an unspoken revision dispatching
+nothing), `internal/transport/revision_test.go` (the negotiation table, including both
+flip directions and the malformed-params case that must NOT be relabeled as a version
+failure), `internal/transport/integration_test.go` (end-to-end through a real proxy and
+upstream), `internal/audit/protocol_revision_test.go` (sign-and-verify round-trip plus
+the tamper leg).
 
 ## 4. Explicit Out-of-Scope Threats
 
@@ -860,6 +911,7 @@ The proxy writes one OCSF-based audit record per enforced MCP decision (`tools/c
 | `labels_cleared` | array  | `["pii"]`                    | Declassification (§3.13): the native flow labels an APPROVED `declassify` directive actually removed from the anchor on this call — what the COMMIT changed, i.e. the intersection with what was being carried, not what the approval authorized, so the tape never records a declassification that did not happen. Same closed vocabulary as `labels_out`, so no length bound is needed. Appears only with `approver`, and only on an allow whose clear was applied; omitted otherwise |
 | `approver`       | string | `"alice@example.com"`        | Declassification (§3.13): the human the approval named, taken from the `mcp.declassify` claim of an already-verified token. IdP-supplied and structure-validated but not length-bounded at the source, so bounded here like `agent_id`/`task_id`/`user_id`. Appears only with `labels_cleared` — the proxy performs no declassification without an accountable human — and never on a refusal |
 | `approval_id`    | string | `"apr-2026-08-01-014"`       | Declassification (§3.13): the control plane's own record identifier for the approval, echoed so a tape entry joins back to the workflow that produced it. Opaque to the proxy — nothing interprets it — but a SIGNED field rather than a details annotation, so the three declassification facts are one record shape the transport cannot reach into. Bounded like `approver`; appears only with it |
+| `protocol_revision` | string | `"2025-11-25"`            | Protocol negotiation (§3.16): the MCP revision this decision was taken under. Drawn from the closed published set (`2025-11-25`, `2026-07-28`) — never caller-supplied text — so no length bound is needed. It is what makes a per-revision method table auditable: without it, a `tools/call` denied `AUTHORIZATION_FAILED` reads identically whether policy refused the call or the method does not exist in the revision the peer negotiated. Omitted on a record written before a revision was resolved (a pre-session refusal), which is honest: none was decided |
 | `key_id`         | string | `"3a7b9c1d2e0f4a5b"`         | Identifier of the HMAC key that signed this record; selects the verifying key after rotation (§ 3.4) |
 | `prev_hmac`      | string | `"sha256:3a7b..."`           | `_hmac` of the preceding record (the `sha256:genesis` sentinel for the first); chains records together for tamper evidence (§ 3.4) |
 | `_hmac`          | string | `"sha256:3a7b..."`           | HMAC-SHA256 over all other fields                       |

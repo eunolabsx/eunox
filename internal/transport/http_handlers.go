@@ -182,7 +182,7 @@ func (p *HTTPProxy) strictAudit() strictAuditState {
 // dispatchParams bundles this session's policy/audit/upstream wiring for the shared request
 // dispatcher. The route sink is routed through asRecorder so a nil sink becomes a true nil
 // interface.
-func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchParams {
+func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string, rev capability.Revision) dispatchParams {
 	rt := sess.route
 	return dispatchParams{
 		forwardParams: forwardParams{
@@ -199,6 +199,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 		buildInit:        sess.buildInitResponse,
 		receipts:         rt.receipts,
 		honorAttribution: rt.honorAttribution,
+		revision:         rev,
 	}
 }
 

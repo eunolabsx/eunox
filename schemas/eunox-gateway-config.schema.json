@@ -261,6 +261,17 @@
             "audit"
           ]
         },
+        "protocolVersion": {
+          "type": "string",
+          "description": "MCP protocol revision eunox speaks to THIS upstream. \"auto\" (the default, and what an omitted key means) probes it from the upstream's own handshake; naming a revision pins it and overrides the probe. Per upstream, not per gateway, because upstreams migrate on independent schedules.",
+          "enum": [
+            "",
+            "auto",
+            "2025-11-25",
+            "2026-07-28"
+          ],
+          "default": "auto"
+        },
         "effectReceiptKeys": {
           "type": "string",
           "description": "Path to a local JWKS document holding THIS upstream's receipt-signing public keys, enabling verification of the signed effect receipts it publishes in a tool result's `_meta` (`io.eunolabs.effect-receipt`). A distinct key domain from the caller-authenticating JWKS on purpose: a receipt is a server's statement about its own behavior, so tying it to the token issuer that authenticates callers would let anyone who can mint a caller token also mint attestations about a server. Read once from disk at startup \u2014 never fetched \u2014 and omitting it disables receipt handling entirely for the route."

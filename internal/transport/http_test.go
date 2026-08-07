@@ -553,7 +553,7 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	// runInitHandshake increments idCounter to 1 for the first request, so the
 	// matching response must carry id 1.
 	resp, err := mcp.SuccessResponse(mcp.RawJSON("1"), mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 		ServerInfo:      map[string]interface{}{"name": "upstream", "version": "9.9.9"},
 	})
@@ -578,6 +578,9 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	}
 	if sess.upstreamCaps == nil {
 		t.Error("upstreamCaps should also be captured")
+	}
+	if sess.upstreamRev != capability.Revision20251125 {
+		t.Errorf("upstreamRev = %q, want %q (probed from the handshake's own protocolVersion)", sess.upstreamRev, capability.Revision20251125)
 	}
 }
 
@@ -1274,7 +1277,7 @@ func initHTTPSession(t *testing.T, proxySrv *httptest.Server) string {
 	body := map[string]interface{}{
 		"jsonrpc": "2.0", "id": 1, "method": "initialize",
 		"params": map[string]interface{}{
-			"protocolVersion": MCPProtocolVersion,
+			"protocolVersion": capability.Revision20251125.String(),
 			"capabilities":    map[string]interface{}{},
 			"clientInfo":      map[string]interface{}{"name": "test", "version": "0.1"},
 		},
@@ -1666,7 +1669,7 @@ func mcpHelperServe() {
 		var result interface{}
 		if msg.Method == "initialize" {
 			result = mcp.InitResult{
-				ProtocolVersion: MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{},
 				ServerInfo:      map[string]interface{}{"name": "leak-helper", "version": "1.0"},
 			}
@@ -1745,7 +1748,7 @@ func mcpHangAfterInitServe() {
 		return
 	}
 	result := mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    map[string]interface{}{},
 		ServerInfo:      map[string]interface{}{"name": "hang-after-init-helper", "version": "1.0"},
 	}
@@ -3015,7 +3018,7 @@ func TestHandleHostRequest_Initialize(t *testing.T) {
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		pdp:        pdp.AlwaysAllowPDP{}, // non-nil PDP invariant; CheckKill clears the way for initialize
 	}
-	p.handleHostRequest(context.Background(), mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "initialize",
 	})
 	if len(hw.messages) == 0 {
@@ -3026,7 +3029,7 @@ func TestHandleHostRequest_Initialize(t *testing.T) {
 func TestHandleHostRequest_Default_UnmappedMethod(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "unknown/method",
 	})
 	if len(hw.messages) != 1 {
@@ -3056,7 +3059,7 @@ func TestHandleHostRequest_AllMethods(t *testing.T) {
 		t.Run(tc.method, func(t *testing.T) {
 			t.Parallel()
 			p, hw := closedUpstream(t)
-			p.handleHostRequest(context.Background(), mcp.RPCMsg{
+			p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
 				JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method, Params: tc.params,
 			})
 			if len(hw.messages) == 0 {
@@ -4810,7 +4813,7 @@ func TestHTTPSession_initUpstream_Success(t *testing.T) {
 			switch msg.Method {
 			case "initialize":
 				result := mcp.InitResult{
-					ProtocolVersion: MCPProtocolVersion,
+					ProtocolVersion: capability.Revision20251125.String(),
 					Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 					ServerInfo:      map[string]interface{}{"name": "fake", "version": "0.1"},
 				}

@@ -202,6 +202,7 @@ type proxyCLIFlags struct {
 	wiretapURL           *string
 	wiretapAuthHeader    *string
 	wiretapTLSSkipVerify *bool
+	wiretapProtocolVer   *string
 	unsafeBindAll        *bool
 	trustFwdFor          *bool
 	auditLog             *string
@@ -311,6 +312,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		wiretapURL:           fs.String("upstream-url", "", "HTTP upstream URL for --audit mode (alternative to a `--` subprocess)."),
 		wiretapAuthHeader:    fs.String("upstream-auth-header", "", `HTTP upstream auth header for --audit mode, "Name: Value".`),
 		wiretapTLSSkipVerify: fs.Bool("upstream-tls-skip-verify", false, "Skip TLS verification for --audit --upstream-url (development only)."),
+		wiretapProtocolVer:   fs.String("upstream-protocol-version", "", "Pin the MCP protocol revision eunox speaks to the --audit upstream, overriding\nwhat its handshake reports: \"auto\" (the default) probes it, or name a revision.\nThe config-file equivalent is an upstream's `protocolVersion` key; under --config\nthe pin comes from there, so this flag applies only to --audit wiretap mode."),
 
 		// Operational flags layered over the config.
 		unsafeBindAll:      fs.Bool("unsafe-bind-all", false, "Allow binding to all interfaces (transport: http only)."),
@@ -395,7 +397,7 @@ Flags:
 func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConfig, error) {
 	switch {
 	case *f.audit:
-		cfg, err := buildAuditWiretapConfig(fs.Args(), *f.wiretapURL, *f.wiretapAuthHeader, *f.wiretapTLSSkipVerify)
+		cfg, err := buildAuditWiretapConfig(fs.Args(), *f.wiretapURL, *f.wiretapAuthHeader, *f.wiretapTLSSkipVerify, *f.wiretapProtocolVer)
 		if err != nil {
 			return nil, err
 		}
@@ -411,8 +413,8 @@ func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConf
 		// The wiretap-only upstream flags describe the --audit upstream; under --config the
 		// upstream (and its auth/TLS posture) comes from the file, so these would be
 		// silently dropped. Reject them for the same reason as a stray positional.
-		if *f.wiretapURL != "" || *f.wiretapAuthHeader != "" || *f.wiretapTLSSkipVerify {
-			return nil, errors.New("--upstream-url/--upstream-auth-header/--upstream-tls-skip-verify apply only to --audit wiretap mode; under --config the upstream and its auth/TLS posture come from the config file")
+		if *f.wiretapURL != "" || *f.wiretapAuthHeader != "" || *f.wiretapTLSSkipVerify || *f.wiretapProtocolVer != "" {
+			return nil, errors.New("--upstream-url/--upstream-auth-header/--upstream-tls-skip-verify/--upstream-protocol-version apply only to --audit wiretap mode; under --config the upstream, its auth/TLS posture, and its protocolVersion pin come from the config file")
 		}
 		return config.LoadGatewayConfig(*f.configPath)
 	default:
@@ -842,7 +844,7 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 // buildAuditWiretapConfig synthesizes a zero-config `transport: stdio` gateway in audit
 // (observe) mode from the operator's --audit arguments. Exactly one upstream is configured
 // (subprocess or --upstream-url); no manifest is referenced. Used by `proxy --audit`.
-func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string, tlsSkipVerify bool) (*config.GatewayConfig, error) {
+func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string, tlsSkipVerify bool, protocolVersion string) (*config.GatewayConfig, error) {
 	if len(positional) > 0 && upstreamURL != "" {
 		return nil, fmt.Errorf("--audit: pick exactly one upstream — positional `-- <command>` OR --upstream-url, not both")
 	}
@@ -857,7 +859,12 @@ func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string
 		Transport:     config.HostTransportStdio,
 	}
 	cfg.Defaults.Enforcement = capability.EnforcementAudit
-	u := config.UpstreamConfig{Name: "wiretap"}
+	// Validate rejects a revision this build cannot speak, so an unusable pin fails here as
+	// an operator flag error rather than being reported as "the binary built something invalid".
+	if err := config.ValidateProtocolVersionFlag(protocolVersion); err != nil {
+		return nil, err
+	}
+	u := config.UpstreamConfig{Name: "wiretap", ProtocolVersion: protocolVersion}
 	switch {
 	case len(positional) > 0:
 		// A positional subprocess upstream has neither auth header nor TLS posture, so
@@ -1641,15 +1648,18 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		UpstreamURL:           u.UpstreamURL,
 		UpstreamAuthHeader:    u.UpstreamAuthHeader,
 		UpstreamTLSSkipVerify: u.UpstreamTLSSkipVerify,
-		PDP:                   dp,
-		Sink:                  sink,
-		PolicyVersion:         policyVersion,
-		PolicySHA256:          policySHA256,
-		SessionID:             pf.sessionID,
-		ShutdownMs:            pf.shutdownMs,
-		UpstreamTimeMs:        upstreamTimeMs,
-		Audit:                 auditMode,
-		RequireAuditStrict:    pf.requireAuditStrict,
+		// Empty when the operator wrote `auto` or omitted the key: the handshake's own
+		// reported revision wins. LoadGatewayConfig has already refused anything else.
+		UpstreamProtocolVersion: capability.Revision(u.ResolvedProtocolVersion()),
+		PDP:                     dp,
+		Sink:                    sink,
+		PolicyVersion:           policyVersion,
+		PolicySHA256:            policySHA256,
+		SessionID:               pf.sessionID,
+		ShutdownMs:              pf.shutdownMs,
+		UpstreamTimeMs:          upstreamTimeMs,
+		Audit:                   auditMode,
+		RequireAuditStrict:      pf.requireAuditStrict,
 		// Serialize the decision phase only when the policy accumulates state a source
 		// commits and a later call reads, so a pipelining host cannot race a sink ahead of
 		// its source; a policy that accumulates nothing keeps full parallelism.

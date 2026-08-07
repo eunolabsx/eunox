@@ -105,9 +105,17 @@ type auditRecord struct {
 	LabelsCleared []string `json:"labels_cleared,omitempty"`
 	Approver      string   `json:"approver,omitempty"`
 	ApprovalID    string   `json:"approval_id,omitempty"`
-	KeyID         string   `json:"key_id,omitempty"` // id of the HMAC key that signed this record; lets audit-verify select the right key after rotation (§ 3.4)
-	PrevHMAC      string   `json:"prev_hmac"`        // _hmac of the preceding record (genesis sentinel for the first); chains records together
-	HMAC          string   `json:"_hmac,omitempty"`
+	// ProtocolRevision is the MCP protocol revision this decision was taken under, drawn
+	// from the closed published set (capability.PublishedRevisions) and never from
+	// caller-supplied text, so it needs no length bound. It is what makes a per-revision
+	// method table auditable: without it, "tools/call denied AUTHORIZATION_FAILED" reads the
+	// same whether policy refused the call or the method does not exist in the revision the
+	// peer negotiated. Omitted on records written before a revision was resolved (a
+	// pre-session refusal), which is honest — no revision was decided.
+	ProtocolRevision string `json:"protocol_revision,omitempty"`
+	KeyID            string `json:"key_id,omitempty"` // id of the HMAC key that signed this record; lets audit-verify select the right key after rotation (§ 3.4)
+	PrevHMAC         string `json:"prev_hmac"`        // _hmac of the preceding record (genesis sentinel for the first); chains records together
+	HMAC             string `json:"_hmac,omitempty"`
 
 	// queuedSize is the byte reservation this record holds against
 	// auditQueueByteBudget: queueSize() evaluated ONCE at enqueue, carried on the
@@ -1522,6 +1530,13 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// both) they would be heap the queue budget cannot see.
 		DenialCode:    boundFieldTo(p.DenialCode, auditEnvelopeFieldCap),
 		ConditionType: boundFieldTo(p.ConditionType, auditEnvelopeFieldCap),
+		// Read from the context rather than taken as a RecordParams field: the transports
+		// stamp it once, right after negotiation, so every record a request produces
+		// necessarily names the same revision its dispatch table was chosen by. A parameter
+		// would let one call site along that path pass a different one. Unbounded on purpose
+		// — the value is drawn from a closed set this package can enumerate, so it is not the
+		// caller-supplied text the envelope caps exist for.
+		ProtocolRevision: protocolRevision(ctx),
 		// Bound (and, in the same pass, deep-clone) details before enqueue, then
 		// marshal the bounded copy ONCE — here, on the caller's goroutine. The queued
 		// record therefore carries immutable bytes, not the live params.Arguments map
@@ -1787,7 +1802,7 @@ func (rec *auditRecord) queueSize() int64 {
 	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.Delegate))
 	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
 	n += int64(len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
-	n += int64(len(rec.DenialCode) + len(rec.ConditionType))
+	n += int64(len(rec.DenialCode) + len(rec.ConditionType) + len(rec.ProtocolRevision))
 	for _, l := range rec.LabelsOut {
 		n += int64(len(l))
 	}
@@ -3001,4 +3016,15 @@ func (s *Sink) Close() error {
 		}
 	})
 	return s.closeErr
+}
+
+// protocolRevision returns the MCP revision this request was decided under, as recorded on
+// the context by the transport's negotiation. It refuses anything outside the published set,
+// so a record can only ever name a revision this build actually speaks.
+func protocolRevision(ctx context.Context) string {
+	rev := capability.ProtocolRevisionFromContext(ctx)
+	if !rev.Supported() {
+		return ""
+	}
+	return rev.String()
 }

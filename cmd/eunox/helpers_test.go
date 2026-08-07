@@ -272,7 +272,7 @@ func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		caps, _ := json.Marshal(map[string]interface{}{"tools": map[string]interface{}{}})
 		result := mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "fake-upstream", "version": "0.0.1"},
 		}
@@ -443,7 +443,7 @@ func (f *fakeUpstreamWithTools) ServeHTTP(w http.ResponseWriter, r *http.Request
 		w.Header().Set(transport.SessionHeader, "upstream-sess-1")
 		w.Header().Set("Content-Type", "application/json")
 		result := mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "fake", "version": "0.0.1"},
 		}

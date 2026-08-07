@@ -225,14 +225,21 @@ over-cite:
   `InputRequiredResult`/`inputRequests`/`requestState` exchange that replaces the
   standalone GET SSE push, including where the enforcement work lands
   (`internal/transport/dispatch.go`, `forward.go`'s `enforcedForwardCore`) —
-  pending exact field names and encodings from the published revision; and dual
-  protocol-version negotiation at the seam level (the existing `MCPProtocolVersion`
-  constant in `internal/transport/stdio.go` becomes a negotiated set).
-- **Designed in Draft ADRs, not yet implemented:** per-peer revision
-  negotiation, the mismatched-pair translation boundary, the `server/discover`
-  responder and its list-filter parity, the `Mcp-Method`/`Mcp-Name` headers,
-  revision-consistency verification, and the CLI probe/drift dual-revision
-  handling in [ADR-0006](adr/0006-dual-revision-translation-boundary.md); the
+  pending exact field names and encodings from the published revision. Its third
+  decided item, dual protocol-version negotiation at the seam level, has since
+  landed (see below).
+- **Landed:** the negotiation spine of
+  [ADR-0006](adr/0006-dual-revision-translation-boundary.md) — per-peer revision
+  negotiation (host side per request, upstream side pinned per route), the
+  revision-scoped dispatch tables derived from one declaration per method, the
+  `UNSUPPORTED_PROTOCOL_VERSION` (-32022) refusal, the per-upstream
+  `protocolVersion` config pin, and the `protocol_revision` audit field. See the
+  per-revision method table below.
+- **Designed in Draft ADRs, not yet implemented:** the mismatched-pair
+  translation boundary, the `server/discover` responder and its list-filter
+  parity, the `Mcp-Method`/`Mcp-Name` headers, and the CLI probe/drift
+  dual-revision handling in
+  [ADR-0006](adr/0006-dual-revision-translation-boundary.md); the
   MRTR signed continuation and its commit-once metering in
   [ADR-0007](adr/0007-mrtr-signed-continuation.md); `subscriptions/listen` and
   the tasks extension in
@@ -240,16 +247,65 @@ over-cite:
   missing-resource error code is mechanical and tracked in the
   [execution plan](mcp-2026-07-28-execution.md) alone.
 
-Until each row lands, a 2026-07-28-only method (`server/discover`,
-`subscriptions/listen`, `tasks/*`) hits the fail-closed dispatch default
-(`internal/transport/dispatch.go`, `dispatchUnmapped`) — denials, never bypass,
-but not functional. Methods that exist in **both** revisions (`tools/call`,
-`resources/read`, `prompts/get`) are a distinct case: a 2026-07-28 request for one
-of them is dispatched and enforced today. eunox's decision stays correct, since it
-has always decided on the request body, but the new `Mcp-Method` / `Mcp-Name`
-headers are neither required nor checked against that body, so a disagreeing pair
+### Per-revision method disposition
+
+A peer's revision is established per context and checked per request. Answering
+`initialize` negotiates 2025-11-25 for that context's life; a request declaring
+`io.modelcontextprotocol/protocolVersion` in its `_meta` is a request of the
+revision it names. A request declaring nothing inherits its context's revision,
+and a context that negotiated none resolves to 2025-11-25 — omission never
+reaches a method set the peer did not negotiate. A declaration that disagrees
+with its context, or names a revision this build does not speak, is refused
+`UNSUPPORTED_PROTOCOL_VERSION` (-32022) and recorded.
+
+Each method declares the revisions it exists in once
+(`internal/transport/dispatch.go`, `methodRegistry`); the routing tables are
+derived from those declarations, and a method outside the requesting peer's
+tables falls to the same fail-closed default (`dispatchUnmapped`,
+`AUTHORIZATION_FAILED`, recorded) that already covers unknown methods.
+
+| Method | 2025-11-25 | 2026-07-28 |
+|---|---|---|
+| `tools/call` | enforced | enforced |
+| `resources/read` | enforced | enforced |
+| `prompts/get` | enforced | enforced |
+| `resources/subscribe` | enforced | denied (replaced by `subscriptions/listen`) |
+| `resources/unsubscribe` | enforced | denied (replaced by `subscriptions/listen`) |
+| `tools/list` / `resources/list` / `prompts/list` | answered, filtered | answered, filtered |
+| `initialize` | answered locally | denied (no handshake in this revision) |
+| `ping` | answered locally | denied (removed) |
+| `notifications/initialized` | swallowed | denied and recorded (no handshake to close) |
+| `notifications/cancelled` | forwarded | forwarded |
+| `notifications/progress` | forwarded | forwarded |
+| `notifications/roots/list_changed` | forwarded | denied and recorded (roots deprecated) |
+| `server/discover` | denied | denied — responder not yet implemented |
+| `subscriptions/listen` | denied | denied — not yet implemented |
+| `tasks/*` | denied | denied — not yet implemented |
+
+The methods listed as "not yet implemented" are absent from both tables, so they
+hit the fail-closed default — denials, never bypass, but not functional. For
+methods that exist in **both** revisions, eunox's decision has always been made
+on the request body, so it stays correct; the new `Mcp-Method` / `Mcp-Name`
+headers are not yet required or checked against that body, so a disagreeing pair
 is forwarded rather than rejected with `HEADER_MISMATCH` (-32020). Verifying that
 pair is tracked in the plan as a hardening item, not a compatibility gap.
+
+### Upstream-side revision
+
+The revision eunox speaks to an upstream is tracked separately from the host
+side, because the two peers migrate on independent schedules. It is probed from
+the upstream's own handshake, or pinned by a per-upstream config key:
+
+```yaml
+upstreams:
+  - name: filesystem
+    transport: stdio
+    command: npx
+    protocolVersion: auto        # auto (default) | "2025-11-25" | "2026-07-28"
+```
+
+The `proxy --audit` wiretap equivalent is `--upstream-protocol-version`. A value
+this build does not speak is refused at load, not at the first request.
 
 ---
 

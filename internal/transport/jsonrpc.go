@@ -185,7 +185,10 @@ func correlateUpstreamReply(req, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 // the handshake stays identical without a second exported spelling.
 func buildInitializeParams() json.RawMessage {
 	params, _ := json.Marshal(map[string]interface{}{
-		"protocolVersion": MCPProtocolVersion,
+		// The handshake exists only in the older revision, so the version it offers is that
+		// revision by construction — a newer-revision upstream is reached through its own
+		// opener, not by offering it a version it removed.
+		"protocolVersion": capability.Revision20251125.String(),
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
 			"name":    proxyName,
@@ -221,7 +224,9 @@ func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, i
 		caps = map[string]interface{}{"tools": map[string]interface{}{}}
 	}
 	result := mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		// Answering `initialize` at all means the host opened a 2025-11-25 context: the
+		// method does not exist in the newer revision, so the response cannot name one.
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    caps,
 		ServerInfo: map[string]interface{}{
 			"name":    proxyName,
@@ -277,32 +282,53 @@ func awaitStartupReply(
 	}
 }
 
+// UpstreamHandshake is what a validated upstream `initialize` response yields.
+//
+// A struct rather than a positional tuple for the reason audit.RecordParams gives: three of
+// its fields are strings, so any two transposed at a call site compiles cleanly and silently
+// misconfigures a session — and adding the protocol revision made it three of four.
+type UpstreamHandshake struct {
+	// Capabilities is the upstream's advertised capability object, echoed to the host.
+	Capabilities map[string]interface{}
+	// ServerVersion is serverInfo.version, captured for the FM-4 drift check.
+	ServerVersion string
+	// Instructions is the upstream's optional instructions string.
+	Instructions string
+	// ProtocolVersion is the revision the upstream reported, VERBATIM rather than parsed: a
+	// version this build does not speak is still a fact worth carrying, and
+	// resolveUpstreamRevision is the one place that decides what to do with an unknown one.
+	ProtocolVersion string
+}
+
 // applyInitializeResult validates an upstream's `initialize` response and extracts the
-// server capabilities, version, and instructions. Fails closed on any non-success shape
-// rather than handing the client a session backed by an unconfirmed upstream.
-// serverInfo.version is captured for the FM-4 drift check.
-func applyInitializeResult(resp mcp.RPCMsg) (caps map[string]interface{}, serverVersion, instructions string, err error) {
+// handshake facts. Fails closed on any non-success shape rather than handing the client a
+// session backed by an unconfirmed upstream.
+func applyInitializeResult(resp mcp.RPCMsg) (UpstreamHandshake, error) {
 	if resp.Error != nil {
-		return nil, "", "", fmt.Errorf("upstream initialize rejected: %s (code %d)", resp.Error.Message, resp.Error.Code)
+		return UpstreamHandshake{}, fmt.Errorf("upstream initialize rejected: %s (code %d)", resp.Error.Message, resp.Error.Code)
 	}
 	if resp.Result == nil {
-		return nil, "", "", fmt.Errorf("upstream initialize response carried neither result nor error")
+		return UpstreamHandshake{}, fmt.Errorf("upstream initialize response carried neither result nor error")
 	}
 	var result mcp.InitResult
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, "", "", fmt.Errorf("upstream initialize result malformed: %w", err)
+		return UpstreamHandshake{}, fmt.Errorf("upstream initialize result malformed: %w", err)
 	}
 	// Unmarshalling JSON `null` into a struct succeeds with all fields zero, which
 	// would be accepted as a successful handshake with empty capabilities. Require
 	// the mandatory MCP fields before accepting the handshake (fail closed).
 	if err := validateInitializeResultFields(result); err != nil {
-		return nil, "", "", err
+		return UpstreamHandshake{}, err
 	}
-	caps = result.Capabilities
+	hs := UpstreamHandshake{
+		Capabilities:    result.Capabilities,
+		Instructions:    result.Instructions,
+		ProtocolVersion: result.ProtocolVersion,
+	}
 	if sv, ok := result.ServerInfo["version"].(string); ok {
-		serverVersion = sv
+		hs.ServerVersion = sv
 	}
-	return caps, serverVersion, result.Instructions, nil
+	return hs, nil
 }
 
 // validateInitializeResultFields rejects a structurally invalid MCP InitializeResult —
@@ -324,7 +350,7 @@ func validateInitializeResultFields(result mcp.InitResult) error {
 // ApplyInitializeResult is the exported form of applyInitializeResult, shared
 // with the CLI's live-upstream probe so the proxy and CLI cannot diverge on what
 // counts as a valid handshake.
-func ApplyInitializeResult(resp mcp.RPCMsg) (caps map[string]interface{}, serverVersion, instructions string, err error) {
+func ApplyInitializeResult(resp mcp.RPCMsg) (UpstreamHandshake, error) {
 	return applyInitializeResult(resp)
 }
 

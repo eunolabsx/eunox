@@ -72,6 +72,18 @@ type httpSession struct {
 	upstreamInstructions  string // instructions from the upstream initialize response
 	idCounter             int64
 
+	// upstreamRev is the protocol revision this session speaks to its upstream, pinned at
+	// the handshake and read-only after. hostRev is the revision the HOST context was
+	// opened at. The two are separate because host and upstream migrate independently, and
+	// bridging that gap is what a proxy is for.
+	upstreamRev capability.Revision
+	hostRev     capability.Revision
+	// upstreamRevPin is the route's operator pin, copied at construction so the handshake
+	// resolves the revision from a session field rather than reaching back through the
+	// route — the handshake has no other route dependency, and giving it one would make a
+	// bare upstream handshake impossible to exercise on its own. Empty means probe it.
+	upstreamRevPin capability.Revision
+
 	// claims holds the JWT claims validated at initialize, or nil if none. Server-initiated
 	// decisions (e.g. sampling/createMessage) have no host request in scope, so they're
 	// attributed to these claims instead.
@@ -317,6 +329,12 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		sessCancel:   sessCancel,
 		claims:       pdp.JWTClaimsPtr(ctx),
 		clientIP:     clientIP,
+		// Every session is minted by a host `initialize` today, and that method exists only
+		// in the older revision — so opening one IS negotiating it. Each request is checked
+		// against this pin, so one declaring a different revision is refused rather than
+		// switching method tables mid-context.
+		hostRev:        capability.Revision20251125,
+		upstreamRevPin: route.upstreamProtocolVersion,
 	}
 	// Cleared only when newSession returns, so the idle reaper spares the drift-check window.
 	sess.initInProgress.Store(true)
@@ -979,11 +997,14 @@ func (s *httpSession) runInitHandshake() error {
 	if err != nil {
 		return fmt.Errorf("reading initialize response: %w", err)
 	}
-	caps, sv, instructions, err := applyInitializeResult(resp)
+	hs, err := applyInitializeResult(resp)
 	if err != nil {
 		return err
 	}
-	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = caps, sv, instructions
+	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
+	// Pin the upstream-side revision once, at the handshake: every later leg reads this one
+	// answer rather than re-deriving it from a result no longer in scope.
+	s.upstreamRev = resolveUpstreamRevision(s.upstreamRevPin, hs.ProtocolVersion)
 
 	notif, err := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
 	if err != nil {
@@ -1260,7 +1281,7 @@ func (s *httpSession) close(shutdownMs int) {
 			// so it is deliberately NOT closed here — released wholesale at proxy shutdown
 			// instead (UpstreamRoute.closeIdleUpstreamConns).
 			if s.upstreamSessID != "" && s.route != nil {
-				DeleteMCPHTTPSession(s.upHTTPClient, s.mcpEndpointURL(), s.upstreamSessID, s.route.upstreamAuthHeader)
+				DeleteMCPHTTPSession(s.upHTTPClient, s.mcpEndpointURL(), s.upstreamSessID, s.route.upstreamAuthHeader, s.upstreamRev)
 			}
 			close(s.done)
 			return
