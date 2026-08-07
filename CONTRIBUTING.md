@@ -102,7 +102,11 @@ behavior change end-to-end.
    lower coverage will likely block.
 3. **Run the gates locally** — `make test && make lint && make check-license`
    — before pushing. CI runs the same gates, plus the `pkg/`/`cmd/` coverage
-   check and the demo integration suite.
+   check and the demo integration suite. If `make lint` can't run in your
+   environment (see [`docs/repo-guide.md`](./docs/repo-guide.md) for a
+   workaround before assuming it's unavailable), that's a reason to check
+   the PR's actual CI `Lint` conclusion *more* closely before merging, not
+   a reason to skip the check and merge on `go build`/`go test` alone.
 4. **Open a PR** against `main` and fill in the
    [PR template](./.github/pull_request_template.md). The "Security
    considerations" section is not boilerplate — please answer it.
