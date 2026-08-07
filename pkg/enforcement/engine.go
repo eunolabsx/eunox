@@ -75,20 +75,16 @@ type registeredHandler struct {
 	builtin bool
 }
 
-// impl returns whichever shape this entry carries, for the checks that treat both alike.
-func (r registeredHandler) impl() interface{} {
-	if r.committing != nil {
-		return r.committing
-	}
-	return r.pure
-}
-
 // dependsOn reports whether this entry's handler depends on subsystem s. A handler that
 // declares for itself wins over the recorded declaration unconditionally, even for a
 // built-in — the two extension points use it to ask their evaluator rather than answer
 // conservatively.
 func (r registeredHandler) dependsOn(s capability.EngineSubsystem) bool {
-	if d, ok := r.impl().(SubsystemDependent); ok {
+	var handler interface{} = r.pure
+	if r.committing != nil {
+		handler = r.committing
+	}
+	if d, ok := handler.(SubsystemDependent); ok {
 		return capability.DeclarationUsesSubsystem(d.UsesEngineSubsystems(), s)
 	}
 	return capability.DeclarationUsesSubsystem(r.uses, s)
@@ -676,22 +672,22 @@ func escalateResponse(requestID, now string, denial capability.DenialInfo) capab
 // the built-ins (see New), it overwrites one of the same type whichever shape that one had.
 // The map is frozen by the time New returns, so the engine reads it lock-free on the hot path.
 //
-// A handler that COMMITS state on admit belongs in [WithCommittingConditionHandler]: deferral
-// is keyed off how the type was registered, and a committing handler registered here is
-// treated as a pure predicate — it would burn its slot on a call a later condition then
-// denies. A handler passed here that ALSO implements CommittingConditionHandler is registered
-// as committing rather than silently losing its deferral, since the two method sets no longer
-// exclude each other.
+// A handler that COMMITS state on admit belongs in [WithCommittingConditionHandler]. One that
+// carries PrepareCommit is registered as committing wherever it is passed, including here, so
+// an embedder cannot lose deferral by reaching for the wrong option — and cannot force the
+// pure shape on a type that has both. What no registration can detect is a handler that
+// consumes quota inside Handle without a PrepareCommit: that one is treated as a pure
+// predicate and burns its slot on a call a later condition then denies.
 //
 // An override is UNCLASSIFIED for the optional-subsystem gates unless it implements
 // [SubsystemDependent]: the built-in's declaration is not evidence about a replacement.
 func WithConditionHandler(name string, handler ConditionHandler) Option {
 	return func(e *Engine) {
 		if ch, commits := handler.(CommittingConditionHandler); commits {
-			e.register(name, registeredHandler{committing: ch})
+			e.registerCommitting(name, ch, nil, false)
 			return
 		}
-		e.register(name, registeredHandler{pure: handler})
+		e.registerPure(name, handler, nil, false)
 	}
 }
 
@@ -704,14 +700,20 @@ func WithConditionHandler(name string, handler ConditionHandler) Option {
 // reader to mistake for the path that runs.
 func WithCommittingConditionHandler(name string, handler CommittingConditionHandler) Option {
 	return func(e *Engine) {
-		e.register(name, registeredHandler{committing: handler})
+		e.registerCommitting(name, handler, nil, false)
 	}
 }
 
-// register installs entry for name. The ONLY write to the registry, so a new handler can never
-// leave the previous handler's subsystem declaration — or its opposite shape — in place.
-func (e *Engine) register(name string, entry registeredHandler) {
-	e.handlers[name] = entry
+// registerPure and registerCommitting are the ONLY writes to the registry. Two funnels rather
+// than one taking a whole entry: each sets exactly one handler field, so "an entry holds one
+// shape, never both, never neither" is a property of the writes rather than an invariant three
+// readers have to defend.
+func (e *Engine) registerPure(name string, handler ConditionHandler, uses []capability.EngineSubsystem, builtin bool) {
+	e.handlers[name] = registeredHandler{pure: handler, uses: uses, builtin: builtin}
+}
+
+func (e *Engine) registerCommitting(name string, handler CommittingConditionHandler, uses []capability.EngineSubsystem, builtin bool) {
+	e.handlers[name] = registeredHandler{committing: handler, uses: uses, builtin: builtin}
 }
 
 // ConditionHandlerOverridden reports whether the handler this engine dispatches for condType
@@ -738,23 +740,20 @@ func (e *Engine) ConditionHandlerOverridden(condType string) bool {
 // directive discriminator must declare (see capability/subsystem.go), and which describes
 // exactly the handler being registered here.
 func (e *Engine) registerBuiltin(name string, handler ConditionHandler) {
-	e.register(name, registeredHandler{pure: handler, uses: builtinUses(name), builtin: true})
+	e.registerPure(name, handler, builtinUses(name), true)
 }
 
 // registerBuiltinCommitting is registerBuiltin for one of this build's own quota-consuming
 // handlers.
 func (e *Engine) registerBuiltinCommitting(name string, handler CommittingConditionHandler) {
-	e.register(name, registeredHandler{committing: handler, uses: builtinUses(name), builtin: true})
+	e.registerCommitting(name, handler, builtinUses(name), true)
 }
 
 // builtinUses reads a built-in's subsystem declaration off the token's prototype-registry
 // entry. A missing or malformed one resolves to nil, which dependsOn reads as "depends on
 // everything" — the conservative direction.
 func builtinUses(name string) []capability.EngineSubsystem {
-	uses, ok := capability.TokenEngineSubsystems(name)
-	if !ok {
-		return nil
-	}
+	uses, _ := capability.TokenEngineSubsystems(name)
 	return uses
 }
 
@@ -833,9 +832,14 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.E
 		// condition type (see attributableType).
 		bucketTypes []string
 	)
-	// The loop prepares EVERY condition so a later one's condErr surfaces even when an
-	// earlier one skipped — returning on the first skip could mask a later committing
-	// condition's error as an allow where enforce mode would deny.
+	// skipQuota is loop-invariant: read once rather than per condition, on a path every
+	// quota-carrying policy takes.
+	skipQuota := SkipQuota(ctx)
+	// unauthorizedCommit names the first condition that derived a bucket under observe. Recorded
+	// rather than returned, because the loop must still prepare EVERY condition so a later one's
+	// condErr surfaces — returning early could mask a real verdict as a contract complaint, and
+	// report an allow where enforce mode denies.
+	unauthorizedCommit := ""
 	for _, cond := range deferred {
 		condType := cond.ConditionType()
 		ch, ok := e.committingHandler(condType)
@@ -857,39 +861,47 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.E
 			return denyFromConditionError(condErr, matched, requestID, now)
 		}
 		// The skip/commit contract, asserted in both directions HERE because this is the only
-		// place a PrepareCommit result is consumed. Both violations are handler bugs, and both
-		// are hard denies: the only posture that reaches the second one is a route running
-		// --audit, where the transport forwards any verdict it can downgrade.
-		if skip && !SkipQuota(ctx) {
-			// A handler skipping for its OWN reason (config, arguments) leaves the remaining
-			// committing conditions unchecked while the whole set reads as skipped: a fail-open.
-			return denyFromConditionError(unauthorizedSkipError(condType), matched, requestID, now)
-		}
-		if !commit.Commits() {
-			// This particular condition consumes nothing — either it skipped, or its
-			// configuration has no cumulative bound. Its pure checks ran inside PrepareCommit
-			// and passed, so there is simply no bucket to admit.
+		// place a PrepareCommit result is consumed.
+		if skip {
+			if !skipQuota {
+				// A handler skipping for its OWN reason (config, arguments) leaves the remaining
+				// committing conditions unchecked while the whole set reads as skipped: a
+				// fail-open.
+				return denyFromConditionError(unauthorizedSkipError(condType), matched, requestID, now)
+			}
+			// An authorized skip consumes nothing whatever the handler also prepared, so honor it
+			// before inspecting the commit: a handler reporting both is stating the outcome this
+			// posture requires, not violating the contract's other half.
 			continue
 		}
-		if SkipQuota(ctx) {
-			// A bucket produced under observe: the handler ignored SkipQuota and would spend
-			// real quota on a route whose contract is that none is consumed, draining the
-			// budget an operator ran observe mode only to PREDICT. Refuse rather than charge
-			// it — the engine cannot tell this from a commit the handler thinks is legitimate,
-			// so the contract decides, not the guess.
-			return denyFromConditionError(unauthorizedCommitError(condType), matched, requestID, now)
+		if !commit.Commits() {
+			// This particular condition consumes nothing — its configuration has no cumulative
+			// bound. Its pure checks ran inside PrepareCommit and passed, so there is no bucket.
+			continue
+		}
+		if skipQuota {
+			// A bucket derived under observe with no skip reported: the handler ignored
+			// SkipQuota and would spend real quota on a route whose contract is that none is
+			// consumed, draining the budget an operator ran observe mode only to PREDICT.
+			if unauthorizedCommit == "" {
+				unauthorizedCommit = condType
+			}
+			continue
 		}
 		buckets = append(buckets, commit.Bucket)
 		denies = append(denies, commit.Deny)
 		bucketTypes = append(bucketTypes, condType)
 	}
 
-	// Nothing to admit. Under observe that is guaranteed: both refusals above leave a
-	// condition only the skip and the commits-nothing outcomes. Outside observe nothing
-	// skipped, so an empty batch means no condition on this constraint consumes anything in
-	// its configuration (a per-call-only blastRadius). One check where there were three — the
-	// counters existed to detect a MIXED set after the loop, which the per-condition
-	// assertions now make unrepresentable rather than caught late.
+	// Refuse a contract violation only once every condition has been prepared, so a genuine
+	// verdict from a later one wins. It is a hard deny: the only posture that reaches it is a
+	// route running --audit, where the transport forwards any verdict it can downgrade, and
+	// forwarding is exactly what must not happen to a call whose budget was silently spent.
+	if unauthorizedCommit != "" {
+		return denyFromConditionError(unauthorizedCommitError(unauthorizedCommit), matched, requestID, now)
+	}
+	// No bucket to admit: under observe nothing may produce one, and outside it a condition
+	// whose configuration has no cumulative bound produces none.
 	if len(buckets) == 0 {
 		return nil
 	}
@@ -1021,7 +1033,10 @@ func unauthorizedCommitError(condType string) *ConditionError {
 // types to keep in sync.
 func (e *Engine) committingHandler(condType string) (CommittingConditionHandler, bool) {
 	h, ok := e.handlers[condType]
-	if !ok || h.committing == nil {
+	// isTypedNil: a nil POINTER boxed in the interface survives == nil and would panic the
+	// enforcement goroutine on PrepareCommit. Reporting it as "not committing" routes it to
+	// evalCondition's guard, which denies fail-closed.
+	if !ok || h.committing == nil || isTypedNil(h.committing) {
 		return nil, false
 	}
 	return h.committing, true
@@ -1052,15 +1067,18 @@ func (e *Engine) evalCondition(ctx context.Context, cond capability.Condition, r
 		})
 		return &resp
 	}
-	if handler.pure == nil {
-		// A committing type has no pure entry point at all. runPureConditions diverts these
-		// by type before reaching here, so this means the registry changed under us — fail
-		// closed rather than allow a condition nothing evaluated.
+	if handler.pure == nil || isTypedNil(handler.pure) {
+		// Reachable for a nil registration, not for a committing one (runPureConditions diverts
+		// those by type first), so the message says what is true of both rather than naming a
+		// commit path a nil handler does not have: a structured denial must not fabricate a
+		// cause. isTypedNil because a nil POINTER in the interface passes == nil and then panics
+		// the enforcement goroutine on Handle, the guard this file already applies to conditions
+		// and directives.
 		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
 			Code:          capability.ErrCodeConditionFailed,
 			ConditionType: condType,
 			HardDeny:      true,
-			Message:       fmt.Sprintf("condition type %q commits state and cannot be evaluated as a pure predicate", condType),
+			Message:       fmt.Sprintf("condition type %q has no usable handler to evaluate it", condType),
 		})
 		return &resp
 	}

@@ -42,6 +42,13 @@ type Checker interface {
 //
 // A backend whose state lives in-process is always confirmable and simply never reports a
 // cause; the rule binds the ones that mirror remote state.
+//
+// The ONE exception is an explicit operator choice to prefer availability: the Redis backend's
+// WithFailOpen (--killswitch-fail-open, ADR-0003) serves the last-known cache from ShouldBlock
+// and Status during an outage rather than denying, and HealthStatus alone reports the cause.
+// That is a configured trade, not a backend answering as it likes — a consumer that must not
+// be surprised by it either declines to wire fail-open, or polls HealthStatus, which reports
+// the cause under both postures.
 type Manager interface {
 	Checker
 
@@ -52,8 +59,9 @@ type Manager interface {
 	// down" from an error it must fail closed on either way.
 	//
 	// It reports the CURRENT cause, not a latched one: a backend that recovers reports nil
-	// again. Implementations answer through the same gate chain their readers use, so a probe
-	// and the data plane cannot disagree.
+	// again. Implementations answer through the same gate chain their readers use — and it is
+	// the one reader that reports a cause even under fail-open, where the others deliberately
+	// serve the cache, so it is what an operator alerts on.
 	HealthStatus() error
 
 	// ActivateGlobal activates the global kill switch (blocks all requests).

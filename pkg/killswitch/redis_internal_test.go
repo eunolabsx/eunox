@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -531,28 +532,31 @@ func newTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.Minired
 	return NewRedis(client, opts...), mr
 }
 
-// markStarted stands in for the initial state load Start performs, for a test that drives
-// the cache directly (refreshState, a struct literal) and would otherwise be refused by the
-// unstarted guard ShouldBlock and Status share. It leaves out the listener and reconcile
-// goroutines those tests are not exercising.
-//
-// It seeds in Start's ORDER — run context and refresh trigger under mu, THEN the flag —
-// because setting the flag alone fabricates a state Start never produces: started, with
-// runCtx still nil. livenessLocked reads runCtx, so a test seeded that way asserts against a
-// switch production cannot reach, and any further meaning attached to the lifecycle would
-// leave it passing anyway. startedOnce is deliberately NOT set: nothing but Start reads it,
-// so leaving it clear keeps a later real Start available to a test that wants the goroutines.
-//
-// The ONE test-side definition of "started" for this package; seed through it rather than
-// touching r.started, or the definition drifts per insertion point.
+// markStarted is the ONE test-side definition of "started": seed through it rather than
+// touching r.started, which fabricates a state Start never produces (started, runCtx nil) that
+// livenessLocked then reads. It stands in for Start's initial load without the listener and
+// reconcile goroutines, and leaves startedOnce clear so a test that does want them can still
+// call Start.
 func markStarted(t *testing.T, r *Redis) {
 	t.Helper()
 	runCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	// lifeMu as well as mu: Stop reads r.cancel under lifeMu ALONE, so seeding it under mu
+	// only would leave the write unpaired with the read that consumes it.
+	r.lifeMu.Lock()
+	defer r.lifeMu.Unlock()
 	r.mu.Lock()
 	r.cancel = cancel
 	r.runCtx = runCtx
 	r.refreshTrigger = make(chan struct{}, 1)
+	// Start sets the flag only AFTER refreshState has run, so a started switch always carries
+	// the outcome of at least one refresh. Seeding neither stamp leaves the cache
+	// never-confirmed, which staleLocked reads as fresh only because of a special case for the
+	// zero value — tighten that and every test seeded here would flip to a denial against a
+	// healthy backend. A test wanting the failed outcome overwrites lastRefreshErr.
+	if r.lastRefreshOK.IsZero() {
+		r.lastRefreshOK = r.clock()
+	}
 	r.mu.Unlock()
 	r.started.Store(true)
 }
@@ -564,6 +568,35 @@ func newStartedTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.
 	r, mr := newTestRedis(t, opts...)
 	markStarted(t, r)
 	return r, mr
+}
+
+// TestShardFanOut_CoversEveryShardingClient pins that the keyless-SCAN fan-out enumerates the
+// same client shapes callcounter.IsShardingClient refuses. The two used to be hand-written
+// type switches that had already drifted: a *redis.Ring took the single-node path, so a refresh
+// loaded whichever shard go-redis happened to pick and reported healthy — a partial kill set is
+// a fail-open on the emergency stop.
+func TestShardFanOut_CoversEveryShardingClient(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		client  redis.Cmdable
+		wantFan bool
+	}{
+		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}}), true},
+		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000"}}), true},
+		{"single node", redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"}), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := shardFanOut(tc.client)
+			if ok != tc.wantFan {
+				t.Fatalf("shardFanOut(%T) fan-out = %v, want %v", tc.client, ok, tc.wantFan)
+			}
+			if got := callcounter.IsShardingClient(tc.client); got != tc.wantFan {
+				t.Fatalf("callcounter.IsShardingClient(%T) = %v, but this package's fan-out says %v; the two enumerate one set", tc.client, got, tc.wantFan)
+			}
+		})
+	}
 }
 
 func TestRedis_KillAndReviveAgent(t *testing.T) {

@@ -694,13 +694,6 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 			_ = rdb.Close()
 			return upstreamBackends{}, err
 		}
-		// After the ping, since it needs a live connection: a clustered server answers every
-		// command eunox issues until a policy carries two quota bounds, so the topology is
-		// checked here rather than found at that request.
-		if err := checkRedisNotClustered(context.Background(), rdb); err != nil {
-			_ = rdb.Close()
-			return upstreamBackends{}, err
-		}
 		fmt.Fprintf(os.Stderr, "[eunox] Redis backend enabled (%s). State persists across restarts.\n", redisAddr)
 		// Refuses a keyspace-sharding client (see callcounter.ErrClusterUnsupported). Close
 		// the pool first, as the ping failure above does: this returns before anything else

@@ -37,8 +37,13 @@ import (
 // rather than calling parseCapHeads directly: composing the two ends by hand drives a
 // join nothing ships, so anything added to that seam — normalization, dedup, a
 // fail-closed gate on an unparsed cache — would be invisible to every case stated here.
+//
+// The cache is populated as newValidatedClaims does, so the seam takes the branch every
+// production decision takes. Leaving it nil would exercise only the fallback, which is the
+// arm production never reaches — a different join from the one it claims to drive.
 func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capability.Constraint {
-	return buildConstraintsFromParsed(parsedCapHeads(&JWTClaims{Capabilities: caps}), target)
+	claims := &JWTClaims{Capabilities: caps, parsedCaps: parseCapHeads(caps)}
+	return buildConstraintsFromParsed(parsedCapHeads(claims), target)
 }
 
 // testKey holds an ECDSA key pair for signing test JWTs.

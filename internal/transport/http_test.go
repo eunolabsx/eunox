@@ -297,6 +297,11 @@ type killWriteErrSwitch struct{}
 func (killWriteErrSwitch) ShouldBlock(_ context.Context, _, _ string) (bool, error) {
 	return false, nil
 }
+
+// HealthStatus keeps this double satisfying killswitch.Manager. The proxy holds the narrower
+// killActivator, so a missing method compiles and only fails at killStatusForTest's runtime
+// assertion — nil because the WRITES are what this double breaks, not the cache behind them.
+func (killWriteErrSwitch) HealthStatus() error                      { return nil }
 func (killWriteErrSwitch) ActivateGlobal(_ context.Context) error   { return errKillSwitchFailed }
 func (killWriteErrSwitch) DeactivateGlobal(_ context.Context) error { return nil }
 func (killWriteErrSwitch) KillAgent(_ context.Context, _ string) error {

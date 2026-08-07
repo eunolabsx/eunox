@@ -467,7 +467,7 @@ Use a single node, or Sentinel for failover.
 > last-known state and allow traffic not already known to be killed instead.
 > Either way, because the degraded window is exactly the window in which Redis is
 > degraded, **alert on `killSwitchHealthy` / `eunox_kill_switch_healthy`
-> (`0` = degraded) and run Redis with HA (Sentinel/cluster)**. Full rationale and
+> (`0` = degraded) and run Redis with HA (Sentinel — see the Cluster note above)**. Full rationale and
 > alternatives: [ADR-0003](./docs/adr/0003-redis-killswitch-fail-open.md).
 
 ---

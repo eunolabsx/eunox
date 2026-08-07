@@ -5,6 +5,7 @@ package callcounter_test
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -21,9 +22,9 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// TestNewRedis_RefusesKeyspaceShardingClients pins the wiring guard: a client that spreads
-// one keyspace across servers cannot run AdmitAll's multi-key EVAL, and the failure is a
-// CROSSSLOT that fails closed — so without this it is invisible until the first policy
+// TestNewRedis_RefusesKeyspaceShardingClients pins the client-side wiring guard: a client that
+// spreads one keyspace across servers cannot run AdmitAll's multi-key EVAL, and the failure is
+// a CROSSSLOT that fails closed — so without this it is invisible until the first policy
 // carrying two quota buckets denies in production, and nondeterministically even then, since
 // unrelated window suffixes may collide into one slot by chance.
 //
@@ -31,20 +32,22 @@ import (
 // the client TYPE.
 func TestNewRedis_RefusesKeyspaceShardingClients(t *testing.T) {
 	cases := []struct {
-		name   string
-		client redis.Cmdable
+		name     string
+		client   redis.Cmdable
+		wantType string
 	}{
-		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000", "127.0.0.1:7001"}})},
-		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"}})},
+		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000", "127.0.0.1:7001"}}), "*redis.ClusterClient"},
+		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"}}), "*redis.Ring"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			counter, err := callcounter.NewRedis(tc.client)
 			require.ErrorIs(t, err, callcounter.ErrClusterUnsupported)
 			require.Nil(t, counter, "a refused construction must hand back nothing to admit against")
-			// The concrete type is named, so the operator reading the startup failure knows
-			// which wiring decision produced it.
-			require.Contains(t, err.Error(), "redis.")
+			// Asserted on the CONCRETE type, not on a substring the sentinel's own text already
+			// contains: the operator reading a startup failure needs to know which wiring
+			// decision produced it, and only this names it.
+			require.Contains(t, err.Error(), "got "+tc.wantType)
 		})
 	}
 }
@@ -59,6 +62,54 @@ func TestNewRedis_AcceptsSingleNodeClient(t *testing.T) {
 	counter, err := callcounter.NewRedis(client)
 	require.NoError(t, err)
 	require.NotNil(t, counter)
+}
+
+// fakeServerInfo answers INFO with a canned reply, so the clustered branch is reachable
+// without standing up a cluster.
+type fakeServerInfo struct {
+	reply    string
+	err      error
+	sections []string
+}
+
+func (f *fakeServerInfo) Info(_ context.Context, section ...string) *redis.StringCmd {
+	f.sections = section
+	return redis.NewStringResult(f.reply, f.err)
+}
+
+// TestCheckServerNotClustered pins the SERVER-side half. The binary builds a single-node
+// client, so its spelling of the unsupported wiring is an ordinary client aimed at a clustered
+// server: every command eunox issues works there until a policy carries two quota bounds.
+//
+// The reply bodies are verbatim `INFO cluster` output from redis-server, and the error row is
+// the real answer from a server that does not implement it. An earlier version of this check
+// read `CLUSTER INFO` and matched cluster_enabled:1 in its reply — a field that command never
+// returns — so it was dead in both directions while a hand-written fake said otherwise. Assert
+// against what the wire actually carries.
+func TestCheckServerNotClustered(t *testing.T) {
+	cases := []struct {
+		name       string
+		info       *fakeServerInfo
+		wantRefuse bool
+	}{
+		{"clustered", &fakeServerInfo{reply: "# Cluster\r\ncluster_enabled:1\r\n"}, true},
+		{"standalone", &fakeServerInfo{reply: "# Cluster\r\ncluster_enabled:0\r\n"}, false},
+		// Inconclusive, not safe: an emulator or a denying ACL must not stop the proxy starting
+		// against a server that answers every command eunox actually issues. AdmitAll's
+		// CROSSSLOT mapping is what covers this arm at request time.
+		{"info unsupported", &fakeServerInfo{err: errors.New("ERR unknown command 'info'")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := callcounter.CheckServerNotClustered(context.Background(), tc.info)
+			require.Equal(t, []string{"cluster"}, tc.info.sections, "the probe must read INFO's Cluster section; cluster_enabled exists nowhere else")
+			if tc.wantRefuse {
+				require.ErrorIs(t, err, callcounter.ErrClusterUnsupported)
+				return
+			}
+			require.NoError(t, err, "startup must not fail against a non-cluster server")
+		})
+	}
 }
 
 func TestRedis_IncrementAndGet_Basic(t *testing.T) {

@@ -65,14 +65,26 @@ func managerBackends() []managerBackend {
 // backend and one that also consumes its own pub/sub echo (an in-flight kill echo applied
 // after a revive transiently re-adds the id — fail-closed and self-correcting, but not
 // instantaneous). An error is never the answer here: these cases run on a confirmable backend.
+//
+// It polls by hand rather than through require.Eventuallyf because the diagnostic is the whole
+// point: passing lastErr as a format ARG evaluates it at the call, before the first poll, so
+// the message would report the zero error forever and send a reader after a wrong boolean when
+// the backend was erroring.
 func awaitBlock(t *testing.T, m Manager, agentID, sessionID string, want bool, msg string) {
 	t.Helper()
 	var lastErr error
-	require.Eventuallyf(t, func() bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
 		blocked, err := m.ShouldBlock(context.Background(), agentID, sessionID)
 		lastErr = err
-		return err == nil && blocked == want
-	}, 2*time.Second, 5*time.Millisecond, "%s (last error: %v)", msg, lastErr)
+		if err == nil && blocked == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: ShouldBlock(%q, %q) = (%v, %v), want (%v, nil)", msg, agentID, sessionID, blocked, lastErr, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // TestManagerConformance_ReadyBackendsAnswerAlike runs the whole Manager contract against
@@ -174,11 +186,14 @@ func TestManagerConformance_RevocationsAreObservable(t *testing.T) {
 func TestManagerConformance_UnconfirmedBackendNeverAllClears(t *testing.T) {
 	t.Parallel()
 	for _, b := range managerBackends() {
-		if b.unconfirmed == nil {
-			continue
-		}
 		t.Run(b.name, func(t *testing.T) {
 			t.Parallel()
+			if b.unconfirmed == nil {
+				// Recorded as an exemption rather than dropped from the loop: a row that
+				// vanishes reads the same as a row nobody wired, and the next backend whose
+				// state stops being in-process would inherit that silence.
+				t.Skip("in-process kill set: there is no state this backend could fail to confirm")
+			}
 			m := b.unconfirmed(t)
 
 			require.Error(t, m.HealthStatus(), "an unconfirmable backend must report the cause to a probe")
@@ -191,6 +206,26 @@ func TestManagerConformance_UnconfirmedBackendNeverAllClears(t *testing.T) {
 			require.Error(t, err, "an unconfirmable snapshot must not be handed out as the whole kill set")
 		})
 	}
+}
+
+// TestManagerConformance_FailOpenIsTheStatedException pins the one carve-out in the
+// confirmability rule, so "every reader reports the cause" cannot quietly become false for the
+// configuration an operator actually runs during a partition. Under --killswitch-fail-open the
+// operator has chosen availability: ShouldBlock serves the cache and Status hands out a
+// snapshot, and HealthStatus is the only reader that still reports the cause — which is why it
+// is the signal the README tells them to alert on.
+func TestManagerConformance_FailOpenIsTheStatedException(t *testing.T) {
+	t.Parallel()
+	var m Manager = newDegradedRedis(t, true)
+
+	blocked, err := m.ShouldBlock(context.Background(), "agent-1", "sess-1")
+	require.NoError(t, err, "fail-open serves the last-known cache rather than denying")
+	require.False(t, blocked)
+
+	_, err = m.Status(context.Background())
+	require.NoError(t, err, "fail-open hands out the cached snapshot for the same reason")
+
+	require.Error(t, m.HealthStatus(), "the reader an operator alerts on must still report the cause")
 }
 
 // TestInMemory_ZeroValueRecordsKillsRatherThanPanicking pins the specific misuse the table's

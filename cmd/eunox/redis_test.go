@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -95,50 +94,6 @@ func TestPingRedis_Failure(t *testing.T) {
 	ctx := context.Background()
 	if err := pingRedis(ctx, client); err == nil {
 		t.Fatal("expected error for unreachable server, got nil")
-	}
-}
-
-// fakeClusterInfo answers CLUSTER INFO with a canned reply, so the clustered branch is
-// reachable without a cluster.
-type fakeClusterInfo struct {
-	reply string
-	err   error
-}
-
-func (f fakeClusterInfo) ClusterInfo(context.Context) *goredis.StringCmd {
-	return goredis.NewStringResult(f.reply, f.err)
-}
-
-// TestCheckRedisNotClustered pins the startup topology check. The binary builds a single-node
-// client, so its spelling of the unsupported wiring is an ordinary client aimed at a clustered
-// server: every command eunox issues works there until a policy carries two quota bounds, and
-// the multi-key admission is then refused with CROSSSLOT in production.
-func TestCheckRedisNotClustered(t *testing.T) {
-	cases := []struct {
-		name       string
-		lookup     clusterInfoLookup
-		wantRefuse bool
-	}{
-		{"clustered", fakeClusterInfo{reply: "cluster_enabled:1\r\ncluster_state:ok\r\n"}, true},
-		{"standalone", fakeClusterInfo{reply: "cluster_enabled:0\r\n"}, false},
-		// A server without CLUSTER INFO (or one refusing it) is treated as unclustered: only a
-		// definitive cluster_enabled:1 is grounds to refuse, or startup would fail against
-		// every Redis-protocol server that answers the commands eunox actually issues.
-		{"command unsupported", fakeClusterInfo{err: errors.New("ERR unknown command 'cluster'")}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := checkRedisNotClustered(context.Background(), tc.lookup)
-			if tc.wantRefuse {
-				if !errors.Is(err, callcounter.ErrClusterUnsupported) {
-					t.Fatalf("err = %v, want %v", err, callcounter.ErrClusterUnsupported)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("err = %v, want nil (startup must not fail against a non-cluster server)", err)
-			}
-		})
 	}
 }
 

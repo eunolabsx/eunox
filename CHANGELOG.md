@@ -1006,23 +1006,62 @@ Section conventions:
 
 ### Fixed
 
-- **The `CommittingConditionHandler` skip contract is refused from one constructor, at
-  every site that consumes a `PrepareCommit` result.** The contract requires `skip` to be
-  derived solely from the request context (`SkipQuota`), because the atomic multi-bucket
-  commit treats one bucket's skip as skipping the whole deferred set. Only that commit
-  asserted it; the single-condition path (`prepareAndAdmit`) honored `skip` unconditionally.
-  No shipped build could reach that path — the engine defers *every* committing condition,
-  and `prepareAndAdmit` is unexported, so it survives only because
-  `CommittingConditionHandler` embeds `ConditionHandler` and each committing handler must
-  therefore carry a `Handle` — so this is what a future single-condition fast path would
-  have inherited, not a live fail-open. Both sites now build the refusal with one
-  `unauthorizedSkipError`, which is how the divergence surfaced: written out twice, the
-  copy had silently dropped `HardDeny`, the field deciding whether an audit-mode constraint
-  forwards the call anyway. `enforcement.ConditionError` gains an exported `HardDeny bool`
-  so the shared error type can carry it; `denyFromConditionError` propagates it. An
-  authorized skip — observe mode, where the context does carry `SkipQuota` — passes as
-  before, and the converse (a handler that ignores `SkipQuota` and commits real quota on an
-  observe route) is still not asserted, which the interface doc now says explicitly.
+- **Redis Cluster is refused at the seam instead of denying on the first two-bucket policy.**
+  `AdmitAll` is one multi-key `EVAL` whose keys carry distinct window suffixes, so on a sharded
+  keyspace they can hash to different slots and the script is refused `CROSSSLOT`. That fails
+  closed — never an over-admission — which is what made it hard to find: the wiring error stayed
+  invisible until the first capability carrying two quota bounds denied in production, and
+  nondeterministically even then, since unrelated suffixes may collide into one slot by chance.
+  `callcounter.NewRedis` now refuses a `*redis.ClusterClient`/`*redis.Ring`
+  (`ErrClusterUnsupported`), the binary's startup handshake refuses a `--redis-addr` pointed at
+  a cluster node (`INFO cluster`), and a `CROSSSLOT` that reaches `AdmitAll` anyway is reported
+  as that same refusal rather than an opaque backend fault. `pkg/killswitch`'s per-server SCAN
+  fan-out now covers `*redis.Ring` as well as `*redis.ClusterClient`: it had covered only the
+  latter, so a Ring loaded its kill set from one randomly-chosen shard and reported healthy — a
+  fail-open on the emergency stop for a library consumer wiring that backend alone.
+
+  **BREAKING (pre-1.0):** `callcounter.NewRedis` returns `(*Redis, error)`. Existing call
+  sites take the error; the crypto/rand failure it used to panic on is now that error too.
+
+- **Kill-switch readiness is on the `Manager` seam, and `InMemory`'s zero value is usable.**
+  The lifecycle rule said a backend that cannot confirm its kill set must report the cause
+  rather than serve a silent all-clear, but it was stated on whichever method last needed it,
+  no `Manager`-typed consumer could ask, and nothing checked a backend against it.
+  `HealthStatus() error` joins `Manager`; the confirmability rule moves to the interface doc,
+  where it binds every reader and states its one exception (`--killswitch-fail-open`, where the
+  operator has chosen availability and `HealthStatus` alone reports the cause). `InMemory`
+  recorded kills by assigning into nil maps and panicked on a `&InMemory{}`; the sets are now
+  created on first write. A table-driven conformance suite runs the contract across backends —
+  `contracts.go` proves the methods exist, this proves they agree.
+
+  **BREAKING (pre-1.0):** `killswitch.Manager` gained `HealthStatus() error`. An in-process
+  backend returns nil; one that mirrors remote state must report the cause it cannot confirm,
+  or it reintroduces the silent all-clear the rule exists to prevent.
+
+- **A committing condition has one entry point, and both halves of its skip contract are
+  enforced there.** `CommittingConditionHandler` embedded `ConditionHandler`, so every
+  committing handler carried a `Handle` the engine never calls — the engine defers every
+  committing TYPE, and `NonCommittingConditionVerdict` refuses them outright — yet that
+  `Handle` still had to be correct, because it carried the quota commit. Two paths that must
+  agree where only one runs is how the `HardDeny` divergence in the previous batch got in.
+  The interface is now `PrepareCommit` alone (register with
+  `enforcement.WithCommittingConditionHandler`), and `prepareAndAdmit` plus the two
+  delegating `Handle`s are deleted.
+
+  With one consumption site, the contract gets its missing half. Only `skip => SkipQuota(ctx)`
+  was asserted; a handler that IGNORED `SkipQuota` and returned a bucket anyway was admitted
+  normally and spent a real quota slot on an `--audit` route, whose contract is that none is
+  consumed — nothing logged, and an operator's observe run silently drained the budget it was
+  meant only to predict. A bucket derived under `SkipQuota` is now refused with the same
+  `HardDeny` as its mirror, decided after every condition has been prepared so a later
+  condition's real verdict still wins. An authorized skip is honored whatever else the handler
+  returned, and the two assertions together make a mixed set unrepresentable, retiring the
+  post-loop partial-skip guard.
+
+  **Migration:** drop `Handle` from a committing handler and register it with
+  `WithCommittingConditionHandler`. A handler that keeps a `Handle` and goes through
+  `WithConditionHandler` still registers as committing and behaves as before. A handler that
+  commits under `WithSkipQuota` is now refused rather than charged.
 - **The harden path applies a delegation chain to its verdict, not only to its obligations.**
   `HardenRefusal` composes this PDP's verdicts onto a refusal the JWT layer produced. Its
   obligation fill read the chain off the context and applied the chain's composed

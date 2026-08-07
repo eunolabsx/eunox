@@ -15,8 +15,10 @@ import (
 
 // healthReporter is the readiness question asked of a kill-switch backend with no request in
 // hand. Every killswitch.Manager answers it (in-memory always nil: an in-process kill set is
-// always confirmable), but the transport deliberately holds the narrower Checker, so the
-// assertion stays — a backend supplying only ShouldBlock is treated as always healthy.
+// always confirmable), but the proxy holds killActivator — narrow to keep the kill's UNDO path
+// shut — which carries no reader at all, so the assertion stays. A value satisfying that
+// interface without HealthStatus is reported healthy, which is why the one the binary wires is
+// a full Manager.
 type healthReporter interface {
 	HealthStatus() error
 }

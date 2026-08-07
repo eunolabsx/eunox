@@ -11,7 +11,10 @@ import (
 
 // InMemory is an in-memory implementation of Manager for single-replica or dev use.
 type InMemory struct {
-	mu             sync.RWMutex
+	mu sync.RWMutex
+	// globalActive, killedAgents and killedSessions are nil-safe to READ (the zero value is a
+	// usable manager), but any method that ASSIGNS into either map must call ensureSetsLocked
+	// first — assignment to a nil map panics, which is what it did before that helper existed.
 	globalActive   bool
 	killedAgents   map[string]bool
 	killedSessions map[string]bool

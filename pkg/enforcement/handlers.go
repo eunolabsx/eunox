@@ -301,9 +301,7 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 }
 
 // maxCallsBucket derives the counter bucket for a maxCalls condition: casts the condition,
-// applies the skip-quota bypass, and validates the counter, session, and target. Both the
-// direct handler path and the engine's atomic multi-condition commit reach it through
-// PrepareCommit, so they build the SAME key under the SAME fail-closed guards. skip is true
+// applies the skip-quota bypass, and validates the counter, session, and target. skip is true
 // under --audit observe mode (treat as satisfied); condErr is non-nil on any deny.
 func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (mc *capability.MaxCallsCondition, key string, skip bool, condErr *ConditionError) {
 	mc, condErr = castCondition[capability.MaxCallsCondition](cond)

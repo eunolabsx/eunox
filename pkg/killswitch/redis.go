@@ -968,6 +968,25 @@ func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]boo
 	return gained
 }
 
+// shardFanOut returns the per-server iterator for a client that shards the keyspace, or ok
+// false for one that keeps it on a single server.
+//
+// ONE resolver for both keyless-command sites (the refresh SCAN and the reset sweep), covering
+// the same shapes callcounter.IsShardingClient names: the two hand-written type switches it
+// replaces had drifted — both named ClusterClient, neither named Ring — so a Ring took the
+// single-node path over a keyspace it holds only part of.
+func shardFanOut(client redis.Cmdable) (func(context.Context, func(context.Context, *redis.Client) error) error, bool) {
+	switch c := client.(type) {
+	case *redis.ClusterClient:
+		// Masters only: a replica holds the same keys, so scanning them would double the work
+		// and, mid-failover, disagree with its master about what is there.
+		return c.ForEachMaster, true
+	case *redis.Ring:
+		return c.ForEachShard, true
+	}
+	return nil, false
+}
+
 // scanner is the subset of a Redis node needed to enumerate keys by prefix. A PARAMETER
 // type for the per-node helpers (called with both r.client and an individual
 // ForEachMaster master), not a capability test.
@@ -976,18 +995,18 @@ type scanner interface {
 }
 
 func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string]bool) error {
-	// A keyless SCAN on a *redis.ClusterClient hits one random master, so a cluster-wide
-	// enumeration must visit every master and merge the scans, or refreshState loads a
-	// partial snapshot and reports healthy — a fail-open on the emergency stop.
-	// Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped
-	// binary is single-node, and callcounter.NewRedis REFUSES a sharding client
-	// (ErrClusterUnsupported), so a proxy sharing one connection pool across the two never
-	// presents a cluster here. Kept because deleting it would leave the standalone cluster
-	// case unhandled rather than absent — a keyless SCAN would silently load a partial kill
-	// set, which is a fail-open on the emergency stop.
-	if cc, ok := r.client.(*redis.ClusterClient); ok {
+	// A keyless SCAN on a client that shards the keyspace reaches ONE server of several, so a
+	// full enumeration must visit each and merge the scans — otherwise refreshState loads a
+	// partial kill set and reports healthy, a fail-open on the emergency stop.
+	//
+	// Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary
+	// is single-node, and callcounter.NewRedis refuses a sharding client outright. Kept, and
+	// kept covering BOTH shapes callcounter.IsShardingClient names, because the half-handled
+	// version was the dangerous one — a Ring fell through to the single-node path and loaded
+	// whichever shard go-redis picked at random for that refresh.
+	if fanOut, ok := shardFanOut(r.client); ok {
 		var mu sync.Mutex
-		return cc.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
 			return scanNode(ctx, node, prefix, target, &mu)
 		})
 	}
@@ -1028,11 +1047,10 @@ type scanDeleter interface {
 }
 
 func (r *Redis) deleteByPrefix(ctx context.Context, prefix string) error {
-	// As with scanPrefix, a cluster client SCANs only one master, so a reset must
-	// visit every master; otherwise Reset() reports success while leaving kills on
-	// the others.
-	if cc, ok := r.client.(*redis.ClusterClient); ok {
-		return cc.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+	// As with scanPrefix, a sharding client SCANs only one server, so a reset must visit each;
+	// otherwise Reset() reports success while leaving kills on the others.
+	if fanOut, ok := shardFanOut(r.client); ok {
+		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
 			return deleteNodeKeys(ctx, node, prefix)
 		})
 	}

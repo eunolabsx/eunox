@@ -203,7 +203,7 @@ func (h *recordingCommittingHandler) PrepareCommit(ctx context.Context, cond cap
 
 // TestCommitDeferredAtomic_DispatchesThroughRegistry pins the contract that a constraint
 // carrying more than one deferred condition commits through the registered
-// CommittingConditionHandler, so a custom WithConditionHandler for maxCalls is honored
+// CommittingConditionHandler, so a custom committing handler for maxCalls is honored
 // on the multi-deferred path exactly as on the single-condition path — not bypassed by
 // a hardcoded maxCalls type switch. Before the fix the atomic commit called the
 // built-in maxCallsBucket directly and this custom handler's PrepareCommit was never
@@ -533,6 +533,8 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 //	             condition whose validity is independent of the quota skip)
 //	Count == 7 → always commits, IGNORING SkipQuota (violates the contract's second
 //	             half: under an observe request a handler must skip or commit nothing)
+//	Count == 8 → reports skip AND hands back the bucket it prepared (belt-and-braces:
+//	             states the outcome observe requires, so the skip decides)
 //	otherwise  → skips under SkipQuota, commits otherwise (the well-behaved case)
 type sentinelCommitHandler struct{}
 
@@ -561,6 +563,8 @@ func (sentinelCommitHandler) PrepareCommit(ctx context.Context, cond capability.
 		return DeferredCommit{}, true, &ConditionError{Code: capability.ErrCodeConditionFailed, ConditionType: capability.ConditionTypeMaxCalls, Message: "invalid bucket config"}
 	case mc.Count == 7:
 		return commit, false, nil // commit even under SkipQuota
+	case mc.Count == 8:
+		return commit, true, nil // skip, but hand back the prepared bucket too
 	case SkipQuota(ctx):
 		return DeferredCommit{}, true, nil
 	default:
@@ -717,6 +721,62 @@ func TestCommitDeferredAtomic_AllSkipUnderObserveAllows(t *testing.T) {
 	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
 	if resp.Decision != capability.DecisionAllow {
 		t.Fatalf("decision = %q, want allow (all buckets skip under observe); denial %+v", resp.Decision, resp.Denial)
+	}
+}
+
+// TestCommitDeferredAtomic_SkipWithPreparedBucketIsHonored pins that an authorized skip wins
+// over whatever the handler ALSO returned. A committing handler that reports skip and hands
+// back its prepared bucket is stating the outcome observe requires; reading its bucket first
+// and refusing turns a belt-and-braces handler into a hard deny on an --audit route, whose
+// whole promise is that it never blocks — with a message telling it to report the skip it
+// reported.
+func TestCommitDeferredAtomic_SkipWithPreparedBucketIsHonored(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, sentinelCommitHandler{}))
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
+	caps := []capability.Constraint{{
+		Target:     "tool",
+		Actions:    []string{"*"},
+		Conditions: []capability.Condition{&capability.MaxCallsCondition{Count: 8, WindowSeconds: 60}},
+	}}
+
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("decision = %q, want allow (an authorized skip consumes nothing, whatever else the handler prepared); denial %+v", resp.Decision, resp.Denial)
+	}
+	spent, err := counter.Peek(context.Background(), "sentinel-bucket", 60)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	if spent != 0 {
+		t.Errorf("observe run spent %d slots; the skip must still mean no consumption", spent)
+	}
+}
+
+// TestCommitDeferredAtomic_ObserveCommitDoesNotMaskLaterCondErr pins that the contract refusal
+// is decided AFTER every condition is prepared. Returning on the first over-committing bucket
+// would replace a later condition's real validation verdict with a handler complaint — the
+// observe run would stop predicting what enforce mode reports, which is the divergence the
+// two-pass commit exists to prevent — and would flip the denial's HardDeny, changing whether
+// an audit route forwards.
+func TestCommitDeferredAtomic_ObserveCommitDoesNotMaskLaterCondErr(t *testing.T) {
+	e := sentinelEngine()
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 7, WindowSeconds: 60},    // commits, ignoring SkipQuota
+			&capability.MaxCallsCondition{Count: -1, WindowSeconds: 3600}, // invalid: a real verdict
+		},
+	}}
+
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Message != "invalid bucket" {
+		t.Fatalf("denial = %+v, want the later condition's own verdict (\"invalid bucket\"), not the earlier handler's contract complaint", resp.Denial)
 	}
 }
 
