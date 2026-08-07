@@ -259,6 +259,10 @@ changelog:
       - "^test:"
       - "^ci:"
       - "^chore:"
+      # refactor: is defined as carrying no behavior change (see CONTRIBUTING.md),
+      # so it is hidden for the same reason chore: is. Work that IS observable to
+      # an operator is a fix:/feat:/sec: and appears under that prefix instead.
+      - "^refactor:"
   groups:
     - title: "Features"
       regexp: '^.*?feat(\([[:word:]]+\))?!?:.+$'
@@ -266,6 +270,8 @@ changelog:
       regexp: '^.*?fix(\([[:word:]]+\))?!?:.+$'
     - title: "Security"
       regexp: '^.*?sec(\([[:word:]]+\))?!?:.+$'
+    - title: "Performance"
+      regexp: '^.*?perf(\([[:word:]]+\))?!?:.+$'
     - title: "Others"
       order: 999
 
