@@ -393,7 +393,7 @@ func TestSessionCapDeny_CarriesRouteStamp(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody)
 
-	proxy.recordSessionCapDeny(req, route)
+	proxy.recordSessionCapDeny(context.Background(), req, route)
 
 	_ = sink.Close()
 	rec := findAuditRecordByCode(readAuditRecords(t, logPath), "RESOURCE_EXHAUSTED")

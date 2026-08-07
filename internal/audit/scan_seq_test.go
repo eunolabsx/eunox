@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/eunolabs/eunox/internal/config"
 )
 
 // TestOpen_ChainResumeFailedReasonIsStructuredSentinel guards the structured
@@ -558,5 +560,33 @@ func TestOpen_UnlistableLogDirMarksSeedUnbounded(t *testing.T) {
 	}
 	if marker["seed_unbounded"] != true {
 		t.Fatalf("marker details = %v, want seed_unbounded=true when the log directory cannot be listed", marker)
+	}
+}
+
+// TestScanSeqContribution_RefusesSymlinkedLog pins the resume-path symlink posture: the seq
+// scan reads the same attacker-choosable bytes readLastAuditLine refuses through a planted
+// symlink, so it must refuse them the same way — the fold then sees only the stat size,
+// which can inflate the counter but never feed it parsed content.
+func TestScanSeqContribution_RefusesSymlinkedLog(t *testing.T) {
+	if config.OpenNoFollow == 0 {
+		t.Skip("platform has no O_NOFOLLOW equivalent; the portable Lstat guards are the only symlink check")
+	}
+	t.Parallel()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "planted.jsonl")
+	if err := os.WriteFile(target, []byte(`{"seq":9000000}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write planted target: %v", err)
+	}
+	link := filepath.Join(dir, "audit.jsonl")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	parsedMax, parsed, unread := scanSeqContribution(link, auditScanBufferBytes)
+	if parsed || parsedMax != 0 {
+		t.Fatalf("scanSeqContribution parsed content through a symlink: max=%d parsed=%v", parsedMax, parsed)
+	}
+	if unread == 0 {
+		t.Error("a refused non-empty log must still report its stat size, so the counter seeds past it rather than at genesis")
 	}
 }

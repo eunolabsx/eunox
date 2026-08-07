@@ -333,3 +333,152 @@ func TestGateOrder_RevisionRidesOneCarrier(t *testing.T) {
 		t.Error("requestRevision must resolve the empty carrier to the default revision, in one place")
 	}
 }
+
+// TestGateOrder_CreatingInitializeAppliesTheCanonicalOrder pins the canonical order on the
+// one request prologue that lives outside dispatchRequest: the HTTP session-creating
+// initialize. The same bytes must record the same code stdio records for its initialize —
+// negotiation ahead of the kill gate — or an emergency stop relabels a bad-version probe's
+// evidence on one transport only. The second POST bounds the exception: a resolvable
+// initialize on the same killed proxy is refused by the kill gate as always, and its record
+// names the revision negotiation had already resolved and stamped.
+func TestGateOrder_CreatingInitializeAppliesTheCanonicalOrder(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+	if err := ks.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
+	}
+	sink, logPath := newTempAuditSink(t)
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink, upstream: "up1"},
+	}
+	proxy := newTestHTTPProxy()
+
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+		req.Header.Set("Content-Type", CTJSON)
+		w := httptest.NewRecorder()
+		proxy.handleMCPPost(w, req, route)
+		return w
+	}
+
+	w := post(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}`)
+	if !strings.Contains(w.Body.String(), "-32022") {
+		t.Errorf("bad-revision creating initialize: body = %q, want the -32022 revision refusal", w.Body.String())
+	}
+	post(`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}`)
+
+	_ = sink.Close()
+	var badRevision, killed map[string]interface{}
+	for _, rec := range readAuditRecords(t, logPath) {
+		if m, _ := rec["method"].(string); m != mcp.MethodInitialize {
+			continue
+		}
+		switch code, _ := rec["denial_code"].(string); code {
+		case capability.ErrCodeUnsupportedProtocolVersion:
+			badRevision = rec
+		case capability.ErrCodeKillSwitch:
+			killed = rec
+		}
+	}
+	if badRevision == nil {
+		t.Fatal("the bad-revision probe must record UNSUPPORTED_PROTOCOL_VERSION — kill active or not, negotiation refuses first on both transports")
+	}
+	if killed == nil {
+		t.Fatal("the resolvable initialize must still be refused by the kill gate")
+	}
+	if rev, _ := killed["protocol_revision"].(string); rev != string(handshakeRevision) {
+		t.Errorf("kill record protocol_revision = %q, want %q — the resolved revision is stamped before the later pre-session gates record", rev, string(handshakeRevision))
+	}
+}
+
+// TestGateOrder_InitializeNotificationAppliesTheCanonicalOrder covers the third sessionless
+// entry point: an id-less `initialize`. It reaches neither hostNotificationGate.admit nor
+// dispatchRequest, so the canonical order is hand-placed there and nothing but this test
+// holds it. Before it, an unhonorable declaration on this arm recorded KILL_SWITCH under a
+// kill and NOTHING at all without one, while stdio recorded UNSUPPORTED_PROTOCOL_VERSION
+// for the identical bytes.
+func TestGateOrder_InitializeNotificationAppliesTheCanonicalOrder(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		kill bool
+	}{
+		{"no kill active", false},
+		{"global kill active", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ks := killswitch.NewInMemory()
+			if tc.kill {
+				if err := ks.ActivateGlobal(context.Background()); err != nil {
+					t.Fatalf("ActivateGlobal: %v", err)
+				}
+			}
+			sink, logPath := newTempAuditSink(t)
+			route := &UpstreamRoute{
+				name: "up1",
+				pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+				sink: &routeSink{sink: sink, upstream: "up1"},
+			}
+			proxy := newTestHTTPProxy()
+
+			body := `{"jsonrpc":"2.0","method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}`
+			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+			req.Header.Set("Content-Type", CTJSON)
+			w := httptest.NewRecorder()
+			proxy.handleMCPPost(w, req, route)
+			_ = sink.Close()
+
+			// A notification never receives a JSON-RPC body, kill or no kill.
+			if w.Body.Len() != 0 {
+				t.Errorf("an initialize notification must be acked bodyless, got %q", w.Body.String())
+			}
+			rec := findAuditRecordByMethod(readAuditRecords(t, logPath), mcp.MethodInitialize, "deny")
+			if rec == nil {
+				t.Fatal("a notification declaring an unhonorable revision must leave a record, not be dropped silently")
+			}
+			if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnsupportedProtocolVersion {
+				t.Errorf("denial_code = %q, want %q — negotiation refuses ahead of the kill gate on every entry point, as it does on stdio", code, capability.ErrCodeUnsupportedProtocolVersion)
+			}
+		})
+	}
+}
+
+// TestGateOrder_SessionCapDenialNamesItsRevision closes the stamp's last gap on the
+// creating path. The cap refusal sits between gates that record protocol_revision, so
+// leaving it on the unstamped request context made a post-negotiation refusal read, under
+// this package's own "absent means pre-negotiation" convention, as though nothing had been
+// negotiated at all.
+func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink, upstream: "up1"},
+	}
+	proxy := newTestHTTPProxy()
+	// Every slot already taken, so the pre-spawn reservation refuses without an upstream.
+	proxy.maxSessions = 1
+	proxy.establishing = 1
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	req.Header.Set("Content-Type", CTJSON)
+	w := httptest.NewRecorder()
+	proxy.handleMCPPost(w, req, route)
+	_ = sink.Close()
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 from the session cap", w.Code)
+	}
+	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), "", "deny")
+	if rec == nil {
+		t.Fatal("the session-cap refusal must leave a record")
+	}
+	if got, _ := rec["protocol_revision"].(string); got != string(handshakeRevision) {
+		t.Errorf("protocol_revision = %q, want %q — a refusal after negotiation must name the revision it decided under", got, string(handshakeRevision))
+	}
+}

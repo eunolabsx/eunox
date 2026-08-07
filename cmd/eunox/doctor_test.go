@@ -1063,3 +1063,32 @@ func TestWriteDoctorBundle_NilConfigWithoutErrorDoesNotPanic(t *testing.T) {
 		t.Errorf("bundle must still complete:\n%s", buf.String())
 	}
 }
+
+// TestDoctorConfig_OversizeFileIsRefusedNotBuffered pins the bundle's own read bound:
+// doctor deliberately keeps going when the typed loader refuses a config, so without a cap
+// of its own this re-read would buffer whole the misdirected multi-GB path the loader just
+// refused — an OOM in the one command meant to survive a broken config.
+func TestDoctorConfig_OversizeFileIsRefusedNotBuffered(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Sparse: over the cap without writing the bytes.
+	if err := f.Truncate(config.MaxGatewayConfigFileBytes + 1); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var out bytes.Buffer
+	writeDoctorConfig(&out, path)
+	if !strings.Contains(out.String(), "could not read") {
+		t.Errorf("an over-size config must surface as a section error, got:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "larger than") {
+		t.Errorf("the section error must name the size refusal, got:\n%s", out.String())
+	}
+}

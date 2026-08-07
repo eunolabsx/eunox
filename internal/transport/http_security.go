@@ -49,7 +49,7 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	if len(vals) == 1 && isJSONMediaType(vals[0]) {
 		return true
 	}
-	admitted := p.recordRefusal(r, route, codeUnsupportedMediaType, catContentType, map[string]interface{}{
+	admitted := p.recordRefusal(r.Context(), r, route, codeUnsupportedMediaType, catContentType, map[string]interface{}{
 		"header_count": len(vals),
 	})
 	// Bounded AND gated on the same admission verdict as the record, mirroring checkOrigin:
@@ -403,7 +403,7 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // Returns the rate limiter's verdict so a caller can gate its own stderr diagnostic on the
 // same decision.
 func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) bool {
-	return p.recordRefusal(r, nil, code, category, extra)
+	return p.recordRefusal(r.Context(), r, nil, code, category, extra)
 }
 
 // preSessionKillRecorder returns the recorder a PRE-SESSION kill-switch site must write
@@ -492,8 +492,8 @@ func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier,
 // bucket whose tally spans every route. The rollup names its own scope
 // (suppressedScopeProxyCategory) so `upstream: github` with a count of 5000 is read as
 // 5000 saturation refusals across every route, not 5000 against github specifically.
-func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) {
-	p.recordRefusal(r, route, codeResourceExhausted, catSaturation, map[string]interface{}{
+func (p *HTTPProxy) recordSessionCapDeny(ctx context.Context, r *http.Request, route *UpstreamRoute) {
+	p.recordRefusal(ctx, r, route, codeResourceExhausted, catSaturation, map[string]interface{}{
 		"reason": "session_limit_reached",
 	})
 }
@@ -503,7 +503,7 @@ func (p *HTTPProxy) recordSessionCapDeny(r *http.Request, route *UpstreamRoute) 
 // sink when known (nil ⟹ the proxy-wide sink). Returns whether the refusal was ADMITTED by
 // the rate limiter, so a caller whose own stderr diagnostic is part of the same flood
 // (checkOrigin's SECURITY line) can gate it on the same verdict.
-func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code string, category refusalCategory, extra map[string]interface{}) bool {
+func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *UpstreamRoute, code string, category refusalCategory, extra map[string]interface{}) bool {
 	rec := asRecorder(p.sink)
 	if route != nil {
 		rec = asRecorder(route.sink)
@@ -535,7 +535,7 @@ func (p *HTTPProxy) recordRefusal(r *http.Request, route *UpstreamRoute, code st
 		extra[detailSuppressedRefusalCount] = suppressed
 		extra[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
 	}
-	rec.RecordDeny(r.Context(), "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
+	rec.RecordDeny(ctx, "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
 	return true
 }
 

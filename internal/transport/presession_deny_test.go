@@ -91,11 +91,11 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	// Saturate a DIFFERENT route. None of this is attributable to github.
 	const attempts = 5000
 	for i := 0; i < attempts; i++ {
-		proxy.recordSessionCapDeny(req, other)
+		proxy.recordSessionCapDeny(context.Background(), req, other)
 	}
 	// Refill one second of tokens, then let github's session cap be the next admitted.
 	now = base.Add(time.Second)
-	proxy.recordSessionCapDeny(httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody), route)
+	proxy.recordSessionCapDeny(context.Background(), httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody), route)
 
 	_ = sink.Close()
 	recs := readAuditRecords(t, logPath)
@@ -565,6 +565,71 @@ func TestPreSessionAudienceDenials_AreRateLimited(t *testing.T) {
 	if denies >= attempts {
 		t.Fatalf("%d of %d pre-session audience records were written; a caller with a valid-elsewhere token must not set the audit write rate", denies, attempts)
 	}
+	if got := uint64(denies) + rollup; got != attempts {
+		t.Errorf("recorded %d + suppressed %d = %d, want %d — a suppressed refusal must be counted, not lost", denies, rollup, got, attempts)
+	}
+}
+
+// TestRevisionRefusals_RollUpSuppressedCounts pins catRevision to the limiter's fold
+// contract the two pre-session siblings already honor: a suppressed revision refusal must
+// surface as suppressed_refusal_count on the next admitted -32022 record, not vanish.
+// catRevision is the cheapest refusal an unauthenticated caller can force, so a dropped
+// tally here is exactly the flood volume an incident responder would under-count.
+func TestRevisionRefusals_RollUpSuppressedCounts(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	base := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	now := base
+	lim := newPreSessionDenyLimiter()
+	lim.setNow(func() time.Time { return now })
+	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
+	route := &UpstreamRoute{name: "github", sink: &routeSink{sink: sink, upstream: "github"}}
+
+	refuse := func() {
+		msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call"}
+		resp := refuseHostRevision(context.Background(), proxy.revisionRefusalRecorder(route), "", msg,
+			errRevisionMismatch)
+		// Every one is REFUSED on the wire — the bound elides records, never enforcement.
+		if resp.Error == nil {
+			t.Fatal("refuseHostRevision must refuse the request whether or not its record was admitted")
+		}
+	}
+
+	const attempts = 200
+	for i := 0; i < attempts-1; i++ {
+		refuse()
+	}
+	// One more after a refill second, so a record IS admitted to carry the rollup the
+	// suppressed ones folded into.
+	now = base.Add(time.Second)
+	refuse()
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("audit.Close: %v", err)
+	}
+	denies := 0
+	rollup := uint64(0)
+	for _, rec := range readAuditRecords(t, logPath) {
+		if d, _ := rec["decision"].(string); d != "deny" {
+			continue
+		}
+		denies++
+		if details, _ := rec["details"].(map[string]interface{}); details != nil {
+			if n, ok := details[detailSuppressedRefusalCount].(float64); ok {
+				rollup += uint64(n)
+				if scope, _ := details[detailSuppressedRefusalScope].(string); scope != suppressedScopeProxyCategory {
+					t.Errorf("rollup scope = %q, want %q", scope, suppressedScopeProxyCategory)
+				}
+			}
+		}
+	}
+	if denies == 0 {
+		t.Fatal("the first refusals in a burst must be recorded in full — the bound caps the rate, it does not silence the evidence")
+	}
+	if denies >= attempts {
+		t.Fatalf("%d of %d revision-refusal records were written; an unauthenticated caller must not set the audit write rate", denies, attempts)
+	}
+	// Nothing vanishes: every suppressed record is folded into a later one's rollup.
 	if got := uint64(denies) + rollup; got != attempts {
 		t.Errorf("recorded %d + suppressed %d = %d, want %d — a suppressed refusal must be counted, not lost", denies, rollup, got, attempts)
 	}

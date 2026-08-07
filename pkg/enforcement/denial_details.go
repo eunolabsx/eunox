@@ -171,16 +171,7 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 	if *budget < 0 {
 		return map[string]interface{}{DenialDetailElidedKey: fmt.Sprintf("%d entries elided", len(in))}
 	}
-	keys := make([]string, 0, boundedPrealloc(len(in), *budget))
-	for k := range in {
-		keys = append(keys, k)
-		if len(keys) == cap(keys) {
-			// Stop once the remaining budget provably can't admit another entry — sizing from
-			// len(in) meant a 4 MiB argument allocated tens of MiB to sort a few hundred
-			// thousand keys for a few KiB of output, on a path an attacker triggers at will.
-			break
-		}
-	}
+	keys := selectSmallestKeys(in, boundedPrealloc(len(in), *budget))
 	// Sorted so which entries survive an exhausted budget is deterministic — Go's randomized
 	// map iteration would otherwise make two identical denied calls write different records.
 	sort.Strings(keys)
@@ -201,6 +192,54 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-len(keys), len(in))
 	}
 	return out
+}
+
+// selectSmallestKeys returns the limit lexicographically-smallest keys of in (all of them
+// when the map is no larger), unsorted. A bounded max-heap over a full iteration, for two
+// properties a capped collect loop cannot give together: the truncated selection must be
+// deterministic (any early-stopped subset is a random sample of Go's map iteration — two
+// identical denied calls wrote different signed records), and sizing the collection from
+// len(in) meant a 4 MiB argument allocated tens of MiB to sort a few hundred thousand keys
+// for a few KiB of output, on a path an attacker triggers at will. O(n log limit) time,
+// O(limit) memory.
+func selectSmallestKeys(in map[string]interface{}, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	sel := make([]string, 0, limit)
+	for k := range in {
+		if len(sel) < limit {
+			sel = append(sel, k)
+			for i := len(sel) - 1; i > 0; {
+				parent := (i - 1) / 2
+				if sel[parent] >= sel[i] {
+					break
+				}
+				sel[parent], sel[i] = sel[i], sel[parent]
+				i = parent
+			}
+			continue
+		}
+		if k >= sel[0] {
+			continue
+		}
+		sel[0] = k
+		for i := 0; ; {
+			largest := i
+			if l := 2*i + 1; l < len(sel) && sel[l] > sel[largest] {
+				largest = l
+			}
+			if r := 2*i + 2; r < len(sel) && sel[r] > sel[largest] {
+				largest = r
+			}
+			if largest == i {
+				break
+			}
+			sel[i], sel[largest] = sel[largest], sel[i]
+			i = largest
+		}
+	}
+	return sel
 }
 
 // boundedPrealloc caps a make() hint (and the fill loop) from untrusted input at what the

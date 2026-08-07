@@ -31,7 +31,7 @@ func TestLoadGatewayConfig_BoundsFileRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := f.Truncate(maxGatewayConfigFileBytes + 1); err != nil {
+	if err := f.Truncate(MaxGatewayConfigFileBytes + 1); err != nil {
 		t.Fatalf("Truncate: %v", err)
 	}
 	_ = f.Close()
