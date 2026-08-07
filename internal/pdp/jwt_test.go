@@ -32,8 +32,13 @@ import (
 // form a test states a case in. Production never holds raw claims at this point — the hot
 // path decides against heads parsed once and cached on the token — so this composition
 // lives here rather than in jwt.go.
+//
+// It joins the phases through parsedCapHeads, the cache-or-parse seam production uses,
+// rather than calling parseCapHeads directly: composing the two ends by hand drives a
+// join nothing ships, so anything added to that seam — normalization, dedup, a
+// fail-closed gate on an unparsed cache — would be invisible to every case stated here.
 func buildConstraintsFromClaims(caps []string, target EnforceTarget) []capability.Constraint {
-	return buildConstraintsFromParsed(parseCapHeads(caps), target)
+	return buildConstraintsFromParsed(parsedCapHeads(&JWTClaims{Capabilities: caps}), target)
 }
 
 // testKey holds an ECDSA key pair for signing test JWTs.

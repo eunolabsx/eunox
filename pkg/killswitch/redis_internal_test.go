@@ -244,7 +244,7 @@ func TestRedis_DeactivateGlobal(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	r := NewRedis(client)
-	r.started.Store(true) // exercising write-op cache semantics on a started switch
+	markStarted(t, r) // write-op cache semantics on a started switch
 	ctx := context.Background()
 
 	// Activate then deactivate — ShouldBlock must go false.
@@ -272,7 +272,7 @@ func TestRedis_ReviveSession(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	r := NewRedis(client)
-	r.started.Store(true) // exercising write-op cache semantics on a started switch
+	markStarted(t, r) // write-op cache semantics on a started switch
 	ctx := context.Background()
 
 	require.NoError(t, r.KillSession(ctx, "sess-abc"))
@@ -305,7 +305,7 @@ func TestRedis_KillUpdatesLocalCacheBeforePublish(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	r := NewRedis(client)
-	r.started.Store(true) // exercising write-op cache semantics on a started switch
+	markStarted(t, r) // write-op cache semantics on a started switch
 	ctx := context.Background()
 
 	// KillAgent: cache must reflect the kill the moment the call returns.
@@ -533,11 +533,37 @@ func newTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.Minired
 
 // markStarted stands in for the initial state load Start performs, for a test that drives
 // the cache directly (refreshState, a struct literal) and would otherwise be refused by the
-// unstarted guard ShouldBlock and Status share. Setting the flag rather than calling Start
-// keeps those tests free of the listener and reconcile goroutines they are not exercising.
+// unstarted guard ShouldBlock and Status share. It leaves out the listener and reconcile
+// goroutines those tests are not exercising.
+//
+// It seeds in Start's ORDER — run context and refresh trigger under mu, THEN the flag —
+// because setting the flag alone fabricates a state Start never produces: started, with
+// runCtx still nil. livenessLocked reads runCtx, so a test seeded that way asserts against a
+// switch production cannot reach, and any further meaning attached to the lifecycle would
+// leave it passing anyway. startedOnce is deliberately NOT set: nothing but Start reads it,
+// so leaving it clear keeps a later real Start available to a test that wants the goroutines.
+//
+// The ONE test-side definition of "started" for this package; seed through it rather than
+// touching r.started, or the definition drifts per insertion point.
 func markStarted(t *testing.T, r *Redis) {
 	t.Helper()
+	runCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r.mu.Lock()
+	r.cancel = cancel
+	r.runCtx = runCtx
+	r.refreshTrigger = make(chan struct{}, 1)
+	r.mu.Unlock()
 	r.started.Store(true)
+}
+
+// newStartedTestRedis is newTestRedis followed by markStarted, for the common case: a
+// miniredis-backed switch driven directly, without Start's background loops.
+func newStartedTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.Miniredis) {
+	t.Helper()
+	r, mr := newTestRedis(t, opts...)
+	markStarted(t, r)
+	return r, mr
 }
 
 func TestRedis_KillAndReviveAgent(t *testing.T) {
@@ -1455,7 +1481,7 @@ func TestRedis_ShouldBlock_ServesCachedStateWhenRedisDown(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	r := NewRedis(client)
-	r.started.Store(true) // a started switch that subsequently loses its backend
+	markStarted(t, r) // a started switch that subsequently loses its backend
 	ctx := context.Background()
 
 	// Kill an agent while Redis is healthy: populates both Redis and local cache.
@@ -1546,7 +1572,7 @@ func (f *resetRaceFake) Publish(_ context.Context, _ string, _ interface{}) *red
 func TestRedis_Reset_ReseedsRacedKill(t *testing.T) {
 	t.Parallel()
 	r := NewRedis(&resetRaceFake{agentID: "victim"})
-	r.started.Store(true) // Reset is an admin op on an already-started switch
+	markStarted(t, r) // Reset is an admin op on an already-started switch
 
 	if err := r.Reset(context.Background()); err != nil {
 		t.Fatalf("Reset returned error: %v", err)
@@ -1692,23 +1718,24 @@ func TestRedis_HandlePubSubMessage_Reset_RefreshesFromRedis(t *testing.T) {
 
 // newDegradedRedis returns a *Redis whose lastRefreshErr is set, simulating a
 // backend whose most recent refresh failed, without standing up a server.
-func newDegradedRedis(failOpen bool) *Redis {
+func newDegradedRedis(t *testing.T, failOpen bool) *Redis {
+	t.Helper()
 	r := &Redis{
 		killedAgents:   map[string]bool{},
 		killedSessions: map[string]bool{},
 		lastRefreshErr: errors.New("dial tcp 10.0.0.5:6379: connect: connection refused"),
 		failOpen:       failOpen,
 	}
-	// Mark started so ShouldBlock exercises the degraded-mode decision logic rather
-	// than the pre-Start fail-closed guard: these tests simulate a switch that HAS been
-	// started and then degraded, not one that was never started.
-	r.started.Store(true)
+	// Started, so ShouldBlock exercises the degraded-mode decision logic rather than the
+	// pre-Start fail-closed guard: these tests simulate a switch that HAS been started and
+	// then degraded, not one that was never started.
+	markStarted(t, r)
 	return r
 }
 
 func TestRedis_ShouldBlock_FailClosedByDefault_WhenDegraded(t *testing.T) {
 	t.Parallel()
-	r := newDegradedRedis(false)
+	r := newDegradedRedis(t, false)
 
 	blocked, err := r.ShouldBlock(context.Background(), "agent-1", "sess-1")
 	require.Error(t, err, "default fail-closed: a degraded backend must surface an error so the caller denies")
@@ -1718,7 +1745,7 @@ func TestRedis_ShouldBlock_FailClosedByDefault_WhenDegraded(t *testing.T) {
 
 func TestRedis_ShouldBlock_FailClosed_DoesNotLeakBackendError(t *testing.T) {
 	t.Parallel()
-	r := newDegradedRedis(false)
+	r := newDegradedRedis(t, false)
 
 	_, err := r.ShouldBlock(context.Background(), "", "sess-1")
 	require.Error(t, err)
@@ -1731,7 +1758,7 @@ func TestRedis_ShouldBlock_FailClosed_DoesNotLeakBackendError(t *testing.T) {
 
 func TestRedis_ShouldBlock_FailOpen_OptIn_WhenDegraded(t *testing.T) {
 	t.Parallel()
-	r := newDegradedRedis(true)
+	r := newDegradedRedis(t, true)
 
 	blocked, err := r.ShouldBlock(context.Background(), "agent-1", "sess-1")
 	require.NoError(t, err, "fail-open opt-in must not error on a degraded backend")
@@ -1740,7 +1767,7 @@ func TestRedis_ShouldBlock_FailOpen_OptIn_WhenDegraded(t *testing.T) {
 
 func TestRedis_ShouldBlock_FailOpen_StillHonoursCachedKill_WhenDegraded(t *testing.T) {
 	t.Parallel()
-	r := newDegradedRedis(true)
+	r := newDegradedRedis(t, true)
 	r.killedSessions["sess-1"] = true
 
 	blocked, err := r.ShouldBlock(context.Background(), "", "sess-1")
@@ -1753,7 +1780,7 @@ func TestRedis_ShouldBlock_FailClosed_CachedKillIsKnownState_NoError(t *testing.
 	// Even degraded and fail-closed, a kill already present in the local cache is
 	// known state: it blocks as an ordinary kill (no error), so the audit record
 	// carries KILL_SWITCH rather than KILL_SWITCH_ERROR.
-	r := newDegradedRedis(false)
+	r := newDegradedRedis(t, false)
 	r.globalActive = true
 
 	blocked, err := r.ShouldBlock(context.Background(), "", "")
@@ -1769,7 +1796,7 @@ func TestRedis_ShouldBlock_Healthy_Unaffected(t *testing.T) {
 		killedAgents:   map[string]bool{},
 		killedSessions: map[string]bool{"sess-1": true},
 	}
-	r.started.Store(true) // simulate a started (healthy) switch
+	markStarted(t, r) // a started, healthy switch
 	blocked, err := r.ShouldBlock(context.Background(), "", "sess-1")
 	require.NoError(t, err)
 	assert.True(t, blocked)
@@ -1800,7 +1827,7 @@ func TestRedis_ShouldBlock_FailClosed_AfterRealRefreshFailure(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	r := NewRedis(client)
-	r.started.Store(true) // simulate a started switch whose refresh then fails
+	markStarted(t, r) // a started switch whose refresh then fails
 	require.Error(t, r.refreshState(context.Background()), "refresh against a closed backend must fail")
 
 	_, err := r.ShouldBlock(context.Background(), "", "sess-1")
@@ -1850,7 +1877,7 @@ func TestRedis_RefreshState_DoesNotEraseConcurrentKill(t *testing.T) {
 
 	hc := &genRaceClient{Cmdable: base}
 	r := NewRedis(hc)
-	r.started.Store(true) // exercising refreshState's gen-race logic on a started switch
+	markStarted(t, r) // refreshState's gen-race logic on a started switch
 
 	hc.hook = func() {
 		require.NoError(t, base.Set(context.Background(), redisAgentPrefix+"victim", "1", 0).Err())
@@ -1909,7 +1936,7 @@ func TestRedis_RefreshState_Serialized(t *testing.T) {
 
 	sc := &serialScanClient{Cmdable: base}
 	r := NewRedis(sc)
-	r.started.Store(true)
+	markStarted(t, r)
 
 	const n = 6
 	var wg sync.WaitGroup
@@ -2102,8 +2129,7 @@ func TestRedis_Start_KillDuringSnapshotWindowIsObserved(t *testing.T) {
 // fresher error mid-scan.
 func TestRedis_RefreshState_ClearsErrorWhenNoFresherFailure(t *testing.T) {
 	t.Parallel()
-	r, _ := newTestRedis(t)
-	r.started.Store(true)
+	r, _ := newStartedTestRedis(t)
 
 	// Seed a stale error as if a prior refresh had failed.
 	r.recordRefreshErr(errors.New("previous outage"))
