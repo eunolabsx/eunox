@@ -431,6 +431,13 @@ type UpstreamConfig struct {
 	// handling entirely for the route.
 	EffectReceiptKeys string `yaml:"effectReceiptKeys"`
 
+	// ProtocolVersion pins the MCP protocol revision eunox speaks to THIS upstream:
+	// "auto" (the default, and what an omitted key means) probes it from the upstream's own
+	// handshake, or name a revision to override the probe. Per upstream, not per gateway,
+	// because a gateway's upstreams migrate on independent schedules — serving a pair that
+	// disagrees is the deployment a proxy exists for.
+	ProtocolVersion string `yaml:"protocolVersion"`
+
 	// Per-route overrides. Pointer ⟹ "unset, inherit from defaults".
 	StrictDrift *bool `yaml:"strictDrift"`
 	// TaskAnchoredState overrides RouteDefaults.TaskAnchoredState for this route: the anchor
@@ -989,6 +996,13 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 		return fmt.Errorf("upstream %q: invalid enforcement %q — valid values are %q or %q", u.Name, u.Enforcement, capability.EnforcementEnforce, capability.EnforcementAudit)
 	}
 
+	// The protocol pin is refused at LOAD, not at the first request: a revision this build
+	// cannot speak would otherwise fall back to the probe and silently serve the upstream
+	// under a revision the operator did not name.
+	if err := validateProtocolVersion(u.Name, u.ProtocolVersion); err != nil {
+		return err
+	}
+
 	switch u.Transport {
 	case "stdio":
 		if u.Command == "" {
@@ -1045,6 +1059,68 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 			"use a single merged policy file, or remove 'expectVersion'", u.Name, len(u.Policy))
 	}
 	return nil
+}
+
+// ProtocolVersionAuto is the upstream `protocolVersion` value — and the meaning of an
+// omitted key — that probes the revision from the upstream's own handshake instead of
+// pinning one. Spelled out rather than left as "" so an operator can write the default
+// explicitly and a reader can tell "probe" from "not yet configured".
+const ProtocolVersionAuto = "auto"
+
+// validateProtocolVersion refuses an upstream `protocolVersion` that is neither the auto
+// sentinel nor a revision this build speaks. The error names the accepted set, since the
+// value is a date this build either knows or does not and guessing is unhelpful.
+func validateProtocolVersion(name, value string) error {
+	if protocolVersionAccepted(value) {
+		return nil
+	}
+	return fmt.Errorf("upstream %q: invalid protocolVersion %q — valid values are %s", name, value, acceptedProtocolVersions())
+}
+
+// protocolVersionAccepted reports whether value is a usable pin: the auto sentinel (or an
+// omitted key) or a revision this build speaks.
+func protocolVersionAccepted(value string) bool {
+	if value == "" || value == ProtocolVersionAuto {
+		return true
+	}
+	_, ok := capability.ParseRevision(value)
+	return ok
+}
+
+// acceptedProtocolVersions renders the accepted set for an error message. One renderer, so
+// the config key's error and the flag's cannot list different sets while both claiming to
+// accept exactly the same one.
+func acceptedProtocolVersions() string {
+	supported := capability.PublishedRevisions()
+	names := make([]string, 0, len(supported)+1)
+	names = append(names, ProtocolVersionAuto)
+	for _, rev := range supported {
+		names = append(names, rev.String())
+	}
+	return strings.Join(names, ", ")
+}
+
+// ValidateProtocolVersionFlag applies the same rule to the CLI's --upstream-protocol-version
+// as Validate applies to an upstream's protocolVersion key, so the flag and the config key
+// accept exactly the same set. The error names the flag rather than an upstream.
+func ValidateProtocolVersionFlag(value string) error {
+	if protocolVersionAccepted(value) {
+		return nil
+	}
+	return fmt.Errorf("--upstream-protocol-version %q is not a revision this build speaks — valid values are %s", value, acceptedProtocolVersions())
+}
+
+// ResolvedProtocolVersion returns the operator's explicit protocol-revision pin for this
+// upstream, or "" when the revision is to be probed from the handshake. Validate has already
+// refused anything else, so the result is either empty or a revision this build speaks.
+// Typed rather than a bare string: both call sites converted it, and an untyped string can be
+// assigned to any other string field without a compile error — the transposition hazard
+// UpstreamHandshake became a struct to avoid.
+func (u *UpstreamConfig) ResolvedProtocolVersion() capability.Revision {
+	if u.ProtocolVersion == ProtocolVersionAuto {
+		return ""
+	}
+	return capability.Revision(u.ProtocolVersion)
 }
 
 // Host-facing transport values for GatewayConfig.Transport.

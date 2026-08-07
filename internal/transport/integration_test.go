@@ -85,7 +85,7 @@ func stdioUpstreamServe() {
 		switch msg.Method {
 		case "initialize":
 			result = mcp.InitResult{
-				ProtocolVersion: MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "stdio-integ", "version": "1.0.0"},
 			}
@@ -765,5 +765,159 @@ func TestStdioProxy_OnReadyRunsOnceSessionIsLive(t *testing.T) {
 	}
 	if err := h.shutdown(t); err != nil {
 		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+// TestStdioProxy_RevisionNegotiationEndToEnd drives the whole seam through a real proxy and
+// a real upstream subprocess: an ordinary 2025-11-25 session is byte-unchanged, a request
+// declaring the newer revision inside that context is refused -32022, and a method the
+// newer revision removed is refused for a peer that declares it.
+//
+// End-to-end rather than at the resolver, because the property that matters is that the
+// serve loop resolves the revision BEFORE anything routes on the method — a unit test on
+// resolveHostRevision cannot see a call site that looked the method up first.
+func TestStdioProxy_RevisionNegotiationEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
+	}
+
+	h := newStdioHostHarness(t, StdioProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		SessionID:  "integ-revision",
+		ShutdownMs: 2000,
+	})
+
+	initResp := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "initialize",
+		Params: json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}`),
+	})
+	if initResp.Error != nil {
+		t.Fatalf("initialize errored: %+v", initResp.Error)
+	}
+	if got := h.proxy.hostRevision(); got != capability.Revision20251125 {
+		t.Fatalf("host context revision = %q, want %q — answering initialize IS the negotiation", got, capability.Revision20251125)
+	}
+
+	// The regression guard: an ordinary request of the negotiated revision carries no
+	// declaration and must behave exactly as before the seam existed.
+	if resp := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call",
+		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/etc/hosts"}}`),
+	}); resp.Error != nil {
+		t.Fatalf("an undeclared request in a negotiated context must serve unchanged, got %+v", resp.Error)
+	}
+
+	// A declaration disagreeing with the context is enforcement confusion, not negotiation.
+	flip := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "tools/call",
+		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/etc/hosts"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if flip.Error == nil || flip.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Fatalf("a mid-context revision flip must be refused -32022, got %+v (result %s)", flip.Error, flip.Result)
+	}
+
+	// An unknown revision is refused the same way, whatever the context.
+	unknown := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "tools/list",
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01"}}`),
+	})
+	if unknown.Error == nil || unknown.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Fatalf("an unknown declared revision must be refused -32022, got %+v", unknown.Error)
+	}
+
+	if err := h.shutdown(t); err != nil {
+		t.Errorf("Start returned error: %v", err)
+	}
+}
+
+// TestStdioProxy_NewRevisionPeerLosesRemovedMethods: a peer that declares 2026-07-28 before
+// any handshake gets that revision's tables — so ping, a method the revision removed, is
+// denied by the same fail-closed default an unknown method hits, while tools/call (which
+// both revisions have) still serves.
+func TestStdioProxy_NewRevisionPeerLosesRemovedMethods(t *testing.T) {
+	if testing.Short() {
+		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
+	}
+
+	h := newStdioHostHarness(t, StdioProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		SessionID:  "integ-revision-new",
+		ShutdownMs: 2000,
+	})
+
+	ping := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "ping",
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if ping.Error == nil {
+		t.Fatalf("ping must be denied for a peer on a revision that removed it, got result %s", ping.Result)
+	}
+	if ping.Error.Code != capability.JSONRPCCodeAuthorizationFailed {
+		t.Errorf("ping denial code = %d, want %d — removal is expressed by absence from the table, so it hits the ordinary unmapped default",
+			ping.Error.Code, capability.JSONRPCCodeAuthorizationFailed)
+	}
+
+	call := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call",
+		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/etc/hosts"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if call.Error != nil {
+		t.Fatalf("tools/call exists in both revisions and must serve, got %+v", call.Error)
+	}
+
+	if err := h.shutdown(t); err != nil {
+		t.Errorf("Start returned error: %v", err)
+	}
+}
+
+// TestStdioProxy_ContextPinsFromItsFirstMessage is the regression for a pin that only landed
+// when `initialize` was answered.
+//
+// Two defects shared that placement. A peer on a revision with no `initialize` never pinned at
+// all, so `resolveHostRevision` accepted whatever each request declared and the peer could
+// alternate method tables per message for the connection's life — the mid-context-flip refusal
+// was inert for exactly the revision that mandates per-request declarations. And the pin was
+// written from a handler goroutine while the serve loop read it for the next message, so a
+// pipelined follow-up resolved against an unpinned context depending on scheduling.
+func TestStdioProxy_ContextPinsFromItsFirstMessage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
+	}
+
+	h := newStdioHostHarness(t, StdioProxyOptions{
+		PDP:        pdp.AlwaysAllowPDP{},
+		SessionID:  "integ-revision-pin",
+		ShutdownMs: 2000,
+	})
+
+	// First message declares the newer revision and never handshakes: that IS the negotiation.
+	if resp := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
+		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/etc/hosts"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	}); resp.Error != nil {
+		t.Fatalf("a first message declaring a revision must be served under it, got %+v", resp.Error)
+	}
+	if got := h.proxy.hostRevision(); got != capability.Revision20260728 {
+		t.Fatalf("context revision = %q, want %q — the pin must land on the FIRST resolved message, not only on initialize", got, capability.Revision20260728)
+	}
+
+	// Flipping back to the older (larger) table on the same connection must now be refused.
+	flip := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "ping",
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}`),
+	})
+	if flip.Error == nil || flip.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Fatalf("a flip back to the older revision must be refused -32022, got %+v (result %s)", flip.Error, flip.Result)
+	}
+
+	// And an undeclared request inherits the pinned revision rather than the default, so it
+	// cannot regain a removed method by simply omitting the declaration.
+	bare := h.roundTrip(t, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "ping"})
+	if bare.Error == nil {
+		t.Fatalf("ping must stay denied on a context pinned to the revision that removed it, got result %s", bare.Result)
+	}
+
+	if err := h.shutdown(t); err != nil {
+		t.Errorf("Start returned error: %v", err)
 	}
 }

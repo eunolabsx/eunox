@@ -68,7 +68,7 @@ func TestInitialize_ReapGenCapturedBeforeKillGate(t *testing.T) {
 		JSONRPC: "2.0",
 		ID:      mcp.RawJSON(`1`),
 		Method:  mcp.MethodInitialize,
-		Params:  json.RawMessage(`{"protocolVersion":"` + MCPProtocolVersion + `","capabilities":{},"clientInfo":{"name":"t","version":"0"}}`),
+		Params:  json.RawMessage(`{"protocolVersion":"` + capability.Revision20251125.String() + `","capabilities":{},"clientInfo":{"name":"t","version":"0"}}`),
 	}
 	resp := postMCP(t, proxySrv, msg, "")
 	defer func() { _ = resp.Body.Close() }()

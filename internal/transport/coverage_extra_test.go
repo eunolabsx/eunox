@@ -119,8 +119,8 @@ func TestBuildInitResponse_DefaultsWhenNoUpstreamCaps(t *testing.T) {
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if result.ProtocolVersion != MCPProtocolVersion {
-		t.Errorf("protocolVersion = %q, want %q", result.ProtocolVersion, MCPProtocolVersion)
+	if result.ProtocolVersion != capability.Revision20251125.String() {
+		t.Errorf("protocolVersion = %q, want %q", result.ProtocolVersion, capability.Revision20251125.String())
 	}
 	// Default capabilities synthesize a tools object when the upstream supplied none.
 	if _, ok := result.Capabilities["tools"]; !ok {
@@ -157,7 +157,7 @@ func TestApplyInitializeResult_ExportedWrapper(t *testing.T) {
 	t.Parallel()
 
 	result := mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 		ServerInfo:      map[string]interface{}{"name": "up", "version": "4.5.6"},
 		Instructions:    "exported path",
@@ -166,7 +166,8 @@ func TestApplyInitializeResult_ExportedWrapper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	caps, ver, instructions, err := ApplyInitializeResult(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)})
+	hs, err := ApplyInitializeResult(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)})
+	caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 	if err != nil {
 		t.Fatalf("ApplyInitializeResult rejected a valid result: %v", err)
 	}
@@ -175,7 +176,7 @@ func TestApplyInitializeResult_ExportedWrapper(t *testing.T) {
 	}
 
 	// Fail-closed: an error response surfaces as an error from the exported form too.
-	_, _, _, err = ApplyInitializeResult(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Error: &mcp.RPCError{Code: -32600, Message: "nope"}})
+	_, err = ApplyInitializeResult(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Error: &mcp.RPCError{Code: -32600, Message: "nope"}})
 	if err == nil {
 		t.Fatal("ApplyInitializeResult must fail closed on an error response")
 	}
@@ -187,7 +188,7 @@ func TestApplyInitializeResult_ExportedWrapper(t *testing.T) {
 		ID:      mcp.RawJSON("1"),
 		Result:  json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{}}`),
 	}
-	if _, _, _, err := ApplyInitializeResult(noServerInfo); err == nil {
+	if _, err := ApplyInitializeResult(noServerInfo); err == nil {
 		t.Fatal("a result missing serverInfo must fail closed")
 	} else if !strings.Contains(err.Error(), "serverInfo") {
 		t.Errorf("error = %q, want it to mention serverInfo", err.Error())
@@ -950,7 +951,7 @@ func TestDoMCPHTTP_NonOKReturnsError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Method: "tools/list"}
-	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "")
+	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "", capability.Revision20251125)
 	if err == nil {
 		t.Fatal("a non-2xx upstream response must return an error")
 	}
@@ -968,7 +969,7 @@ func TestDoMCPHTTP_AcceptedReturnsEmpty(t *testing.T) {
 
 	// A notification (no id) answered with 202 returns an empty message and no error.
 	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
-	out, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, notif, "sess", "Authorization: Bearer x")
+	out, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, notif, "sess", "Authorization: Bearer x", capability.Revision20251125)
 	if err != nil {
 		t.Fatalf("202 Accepted must not error: %v", err)
 	}
@@ -989,7 +990,7 @@ func TestDoMCPHTTP_SSEBodyDecoded(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("5"), Method: "tools/call"}
-	out, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "")
+	out, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "", capability.Revision20251125)
 	if err != nil {
 		t.Fatalf("SSE 200 response must decode: %v", err)
 	}
@@ -1008,7 +1009,7 @@ func TestDoMCPHTTP_MalformedJSONBodyErrors(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Method: "tools/list"}
-	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "")
+	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "", capability.Revision20251125)
 	if err == nil {
 		t.Fatal("a malformed JSON body must surface a decode error")
 	}
@@ -1028,7 +1029,7 @@ func TestDoMCPHTTP_SSENoMatchErrors(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("99"), Method: "tools/call"}
-	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "")
+	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "", capability.Revision20251125)
 	if err == nil {
 		t.Fatal("an SSE stream with no matching id must surface a decode error")
 	}
@@ -1046,8 +1047,8 @@ func TestDeleteMCPHTTPSession_NoOpGuards(t *testing.T) {
 	t.Parallel()
 	// A blank session ID is a no-op: nothing was initialized to terminate. A nil
 	// client is likewise a no-op. Neither must panic or make a request.
-	DeleteMCPHTTPSession(http.DefaultClient, "http://127.0.0.1:0/mcp", "", "")
-	DeleteMCPHTTPSession(nil, "http://127.0.0.1:0/mcp", "sess", "")
+	DeleteMCPHTTPSession(http.DefaultClient, "http://127.0.0.1:0/mcp", "", "", capability.Revision20251125)
+	DeleteMCPHTTPSession(nil, "http://127.0.0.1:0/mcp", "sess", "", capability.Revision20251125)
 }
 
 func TestDeleteMCPHTTPSession_SendsDeleteWithAuthHeader(t *testing.T) {
@@ -1062,7 +1063,7 @@ func TestDeleteMCPHTTPSession_SendsDeleteWithAuthHeader(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	DeleteMCPHTTPSession(srv.Client(), srv.URL+"/mcp", "up-sess-1", "Authorization: Bearer tok")
+	DeleteMCPHTTPSession(srv.Client(), srv.URL+"/mcp", "up-sess-1", "Authorization: Bearer tok", capability.Revision20251125)
 	select {
 	case s := <-got:
 		if s.method != http.MethodDelete {

@@ -325,3 +325,17 @@ func TestPreSessionLimiterAndSaturationGate_DoNotShareABucket(t *testing.T) {
 		t.Fatal("a saturation flood must not spend the pre-session refusal budget")
 	}
 }
+
+// TestNumRefusalCategories_MatchesTheList keeps the aggregate budget sized to the set it
+// divides. numRefusalCategories must be a const (the budget constants are), so a category
+// added to refusalCategories without updating it would quietly shrink every category's share.
+func TestNumRefusalCategories_MatchesTheList(t *testing.T) {
+	t.Parallel()
+	if numRefusalCategories != len(refusalCategories) {
+		t.Fatalf("numRefusalCategories = %d, want %d — update it when adding a refusal category, or every existing category's rate share shrinks", numRefusalCategories, len(refusalCategories))
+	}
+	// The per-category share must divide evenly, or the floor silently rounds a category down.
+	if int(perCategoryDenyRate) != perCategoryDenyRatePerSec || int(perCategoryDenyBurst) != perCategoryDenyBurstSize {
+		t.Errorf("per-category share = %v/%v, want %d/%d", perCategoryDenyRate, perCategoryDenyBurst, perCategoryDenyRatePerSec, perCategoryDenyBurstSize)
+	}
+}

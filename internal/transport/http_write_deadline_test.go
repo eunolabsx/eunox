@@ -5,6 +5,7 @@ package transport
 
 import (
 	"encoding/json"
+	"github.com/eunolabs/eunox/pkg/capability"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -178,7 +179,7 @@ func TestHandleMCPPost_SessionStartDeadlineFloorsAtHTTPWriteTimeout(t *testing.T
 		JSONRPC: "2.0",
 		ID:      mcp.RawJSON(`1`),
 		Method:  mcp.MethodInitialize,
-		Params:  json.RawMessage(`{"protocolVersion":"` + MCPProtocolVersion + `","capabilities":{},"clientInfo":{"name":"t","version":"0"}}`),
+		Params:  json.RawMessage(`{"protocolVersion":"` + capability.Revision20251125.String() + `","capabilities":{},"clientInfo":{"name":"t","version":"0"}}`),
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {

@@ -68,6 +68,16 @@ const (
 	// them. Shares -32003 with the other condition-failure codes on the wire; the
 	// symbolic code and decision=escalate are what distinguish it.
 	ErrCodeEscalationRequired = "ESCALATION_REQUIRED"
+	// ErrCodeUnsupportedProtocolVersion refuses a request whose MCP protocol revision
+	// cannot be established: none declared on a context that never negotiated one, a
+	// declared revision this build does not speak, or a declaration disagreeing with the
+	// context it arrived in. The last is the reason this is a REFUSAL rather than a
+	// fallback — a revision flip inside one context is indistinguishable from a probe for
+	// the more permissive method table, and each revision has its own.
+	//
+	// It names no policy target (the request was never matched), so IsInfraDenialCode
+	// treats it as infrastructure and `eunox suggest` skips it.
+	ErrCodeUnsupportedProtocolVersion = "UNSUPPORTED_PROTOCOL_VERSION"
 )
 
 // Fixed JSON-RPC integer error codes for denial responses.
@@ -85,6 +95,11 @@ const (
 	// standard JSON-RPC internal-error code, because an enforcement-engine failure
 	// is a server-side internal error, not a policy denial.
 	JSONRPCCodeEnforcementError = -32603 // ENFORCEMENT_ERROR
+	// JSONRPCCodeUnsupportedProtocolVersion is the wire code for
+	// ErrCodeUnsupportedProtocolVersion. Unlike every other code here it is not eunox's to
+	// choose: -32022 is assigned by the MCP specification, which is also why it sits in the
+	// -32020..-32099 band eunox otherwise never mints into.
+	JSONRPCCodeUnsupportedProtocolVersion = -32022 // UNSUPPORTED_PROTOCOL_VERSION (spec-assigned)
 )
 
 // AllDenialCodes lists every symbolic denial code (ErrCode*). It exists so
@@ -108,6 +123,7 @@ var AllDenialCodes = []string{
 	ErrCodeAuditUnavailable,
 	ErrCodeSamplingDenied,
 	ErrCodeEscalationRequired,
+	ErrCodeUnsupportedProtocolVersion,
 }
 
 // DenialWireCode maps a symbolic denial code (ErrCode*) to the JSON-RPC integer
@@ -149,6 +165,10 @@ func DenialWireCode(code string) (wire int, ok bool) {
 	// JSON-RPC internal-error code, distinct from -32001/-32002/-32003.
 	case ErrCodeEnforcementError, ErrCodeAuditUnavailable:
 		return JSONRPCCodeEnforcementError, true
+	// The one spec-assigned code eunox emits: a peer whose protocol revision cannot be
+	// established gets -32022, not a policy code, because nothing about policy was reached.
+	case ErrCodeUnsupportedProtocolVersion:
+		return JSONRPCCodeUnsupportedProtocolVersion, true
 	case ErrCodeCapabilityDenied:
 		return JSONRPCCodeCapabilityDenied, true
 	default:

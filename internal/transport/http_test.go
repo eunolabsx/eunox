@@ -553,7 +553,7 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	// runInitHandshake increments idCounter to 1 for the first request, so the
 	// matching response must carry id 1.
 	resp, err := mcp.SuccessResponse(mcp.RawJSON("1"), mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 		ServerInfo:      map[string]interface{}{"name": "upstream", "version": "9.9.9"},
 	})
@@ -578,6 +578,9 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	}
 	if sess.upstreamCaps == nil {
 		t.Error("upstreamCaps should also be captured")
+	}
+	if sess.upstreamRev != capability.Revision20251125 {
+		t.Errorf("upstreamRev = %q, want %q (probed from the handshake's own protocolVersion)", sess.upstreamRev, capability.Revision20251125)
 	}
 }
 
@@ -1274,7 +1277,7 @@ func initHTTPSession(t *testing.T, proxySrv *httptest.Server) string {
 	body := map[string]interface{}{
 		"jsonrpc": "2.0", "id": 1, "method": "initialize",
 		"params": map[string]interface{}{
-			"protocolVersion": MCPProtocolVersion,
+			"protocolVersion": capability.Revision20251125.String(),
 			"capabilities":    map[string]interface{}{},
 			"clientInfo":      map[string]interface{}{"name": "test", "version": "0.1"},
 		},
@@ -1666,7 +1669,7 @@ func mcpHelperServe() {
 		var result interface{}
 		if msg.Method == "initialize" {
 			result = mcp.InitResult{
-				ProtocolVersion: MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{},
 				ServerInfo:      map[string]interface{}{"name": "leak-helper", "version": "1.0"},
 			}
@@ -1745,7 +1748,7 @@ func mcpHangAfterInitServe() {
 		return
 	}
 	result := mcp.InitResult{
-		ProtocolVersion: MCPProtocolVersion,
+		ProtocolVersion: capability.Revision20251125.String(),
 		Capabilities:    map[string]interface{}{},
 		ServerInfo:      map[string]interface{}{"name": "hang-after-init-helper", "version": "1.0"},
 	}
@@ -3015,7 +3018,7 @@ func TestHandleHostRequest_Initialize(t *testing.T) {
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		pdp:        pdp.AlwaysAllowPDP{}, // non-nil PDP invariant; CheckKill clears the way for initialize
 	}
-	p.handleHostRequest(context.Background(), mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "initialize",
 	})
 	if len(hw.messages) == 0 {
@@ -3026,7 +3029,7 @@ func TestHandleHostRequest_Initialize(t *testing.T) {
 func TestHandleHostRequest_Default_UnmappedMethod(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "unknown/method",
 	})
 	if len(hw.messages) != 1 {
@@ -3056,7 +3059,7 @@ func TestHandleHostRequest_AllMethods(t *testing.T) {
 		t.Run(tc.method, func(t *testing.T) {
 			t.Parallel()
 			p, hw := closedUpstream(t)
-			p.handleHostRequest(context.Background(), mcp.RPCMsg{
+			p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
 				JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method, Params: tc.params,
 			})
 			if len(hw.messages) == 0 {
@@ -4810,7 +4813,7 @@ func TestHTTPSession_initUpstream_Success(t *testing.T) {
 			switch msg.Method {
 			case "initialize":
 				result := mcp.InitResult{
-					ProtocolVersion: MCPProtocolVersion,
+					ProtocolVersion: capability.Revision20251125.String(),
 					Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 					ServerInfo:      map[string]interface{}{"name": "fake", "version": "0.1"},
 				}
@@ -6772,5 +6775,65 @@ func TestRevocationReclaim_ServeReleasesTheObserverRegistration(t *testing.T) {
 	}
 	if len(proxy.revoked) != 0 {
 		t.Fatal("a proxy whose Serve has returned must not still be receiving revocations")
+	}
+}
+
+// TestHTTPInitialize_RefusesAnUnhonorableRevisionBeforeSpawning is the regression for the one
+// host message that never ran negotiation.
+//
+// The session-creating `initialize` is answered outside handleSessionPost, so a declaration on
+// it was neither honored nor refused: the session was pinned to the handshake revision anyway
+// and the peer's next request — declaring the SAME revision it had asked for from message one
+// — was then refused as a "mid-context flip". Worse, the refusal came only after an upstream
+// had been spawned, a privileged side effect stdio performs for none of these bytes.
+func TestHTTPInitialize_RefusesAnUnhonorableRevisionBeforeSpawning(t *testing.T) {
+	t.Parallel()
+	for _, declared := range []string{"2026-07-28", "2099-01-01"} {
+		t.Run(declared, func(t *testing.T) {
+			t.Parallel()
+			route := &UpstreamRoute{
+				name:      "up1",
+				transport: "stdio",
+				// A command that would fail loudly if it were ever spawned.
+				command: "/nonexistent/eunox-must-not-spawn-this",
+				pdp:     newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+				sink:    &routeSink{},
+			}
+			proxy := newTestHTTPProxy()
+
+			body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"` + declared + `"}}}`
+			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+			req.Header.Set("Content-Type", CTJSON)
+			w := httptest.NewRecorder()
+			proxy.handleMCPPost(w, req, route)
+
+			var resp mcp.RPCMsg
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v (body=%s)", err, w.Body.String())
+			}
+			if resp.Error == nil || resp.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+				t.Fatalf("error = %+v, want -32022: initialize exists only in the handshake revision, so any other declaration on it cannot be honored", resp.Error)
+			}
+			if n := proxy.sessionCount(); n != 0 {
+				t.Errorf("no session may be created for a refused declaration; sessionCount=%d", n)
+			}
+			if sid := w.Header().Get(SessionHeader); sid != "" {
+				t.Errorf("no session id should be issued, got %q", sid)
+			}
+		})
+	}
+}
+
+// TestHTTPInitialize_AdmitsTheHandshakeRevisionDeclaration: a client that declares the
+// revision `initialize` belongs to is stating the truth, not flipping — it must be admitted,
+// so the refusal above cannot be read as "never declare anything on initialize".
+func TestHTTPInitialize_AdmitsTheHandshakeRevisionDeclaration(t *testing.T) {
+	t.Parallel()
+	msg := mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize,
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}`),
+	}
+	if _, err := resolveHostRevision(capability.Revision20251125, msg); err != nil {
+		t.Errorf("declaring the handshake revision on initialize must be admitted, got %v", err)
 	}
 }

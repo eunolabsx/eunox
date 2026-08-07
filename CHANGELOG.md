@@ -27,6 +27,57 @@ Section conventions:
 
 ### Added
 
+- **eunox speaks two MCP protocol revisions, negotiated per peer.** The single
+  `MCPProtocolVersion` constant is replaced by a supported-revision set
+  (`2025-11-25`, `2026-07-28`), with the host-side and upstream-side results tracked
+  independently — a proxy exists to stand between peers that migrate on different
+  schedules, and the common migration deployment is a current host in front of a
+  lagging upstream or the reverse. A peer's revision is established per context and
+  checked per request: answering `initialize` negotiates 2025-11-25 for that
+  context's life, and a request declaring
+  `io.modelcontextprotocol/protocolVersion` in its `_meta` is a request of the
+  revision it names. Omission never widens — a request declaring nothing inherits
+  its context's revision, and a context that negotiated none resolves to
+  2025-11-25, the surface eunox already shipped. A declaration disagreeing with its
+  context, or naming a revision this build does not speak, is refused
+  `UNSUPPORTED_PROTOCOL_VERSION` (-32022) and recorded: a mid-context revision flip
+  is indistinguishable from a probe for the more permissive method table, so it
+  fails closed rather than re-negotiating.
+- **Routing is revision-scoped, declared once per method.** The four dispatch
+  tables (`decideMethodHandlers`, `locallyAnsweredHandlers`,
+  `forwardableHostNotifications`, `swallowedHostNotifications`) are now *derived*
+  from one declaration per method carrying its revision membership, following the
+  prototype-registry pattern `pkg/capability`'s `TokenSince` established. Removal
+  across revisions is expressed by **absence**: a method outside the requesting
+  peer's table falls to the same fail-closed default (`dispatchUnmapped`,
+  `AUTHORIZATION_FAILED`, recorded) that already covers unknown methods, so there
+  is no second removal mechanism to keep in step with the first. A method declared
+  without revision membership fails the build. Concretely, for a peer on
+  2026-07-28: `initialize`, `ping`, `resources/subscribe`, `resources/unsubscribe`
+  and `notifications/roots/list_changed` are denied and recorded, while
+  `tools/call`, `resources/read`, `prompts/get` and the three `*/list` methods are
+  enforced exactly as before. Nothing changes for a 2025-11-25 peer.
+- **`protocolVersion` pins the revision eunox speaks to an upstream.** A new
+  per-upstream config key — `auto` (the default; probe it from the upstream's own
+  handshake), `"2025-11-25"`, or `"2026-07-28"` — with `--upstream-protocol-version`
+  as the `proxy --audit` wiretap equivalent. Per upstream rather than per gateway,
+  since a gateway's upstreams migrate independently. A value this build does not
+  speak is refused at load, not at the first request.
+- **`protocol_revision` on every audit record** (signed, `omitempty`): the MCP
+  revision the decision was taken under. Without it, a `tools/call` denied
+  `AUTHORIZATION_FAILED` reads identically whether policy refused the call or the
+  method does not exist in the revision the peer negotiated. Drawn from the closed
+  published set, never caller-supplied text, so no length bound is needed; omitted
+  on a record written before a revision was resolved, which is honest — none was
+  decided. It rides the server-initiated leg too, so a sampling decision on a
+  negotiated session is not indistinguishable from a pre-session refusal. Two
+  record-shape rules travel with it: a method the peer's revision REMOVED names no
+  policy target (`resources/subscribe` resolves a target type, so recording the
+  method as the identifier would stamp a resource named after it onto the tape and
+  let `eunox suggest` mine a capability for it), and the -32022 refusal is classed as
+  infrastructure and rate-limited per category like every other caller-driven
+  refusal. See `docs/threat-model-mcp.md` §3.16 and §6.1.
+
 - **Two audit fields attribute a DELEGATED call: `delegate` and `delegation_depth`.** A
   delegation *refusal* already named the hop that blocked it, in the denial details, while an
   **allow** carried nothing — so a call made by `agent-b`, delegated from `agent-a`, acting for

@@ -35,10 +35,6 @@ const (
 	// proxyName is the clientInfo.name the proxy presents to upstreams. The CLI's
 	// live-upstream probe reuses it via BuildInitializeRequestWithID rather than a second spelling.
 	proxyName = "eunox-proxy"
-
-	// MCPProtocolVersion is the MCP protocol version the proxy advertises;
-	// exported for the CLI's live-upstream probe.
-	MCPProtocolVersion = "2025-11-25"
 )
 
 // proxyVersion is the version reported in MCP initialize responses; set via SetProxyVersion.
@@ -130,6 +126,32 @@ type StdioProxy struct {
 	upstreamCaps          map[string]interface{}
 	upstreamServerVersion string
 	upstreamInstructions  string
+
+	// upstreamRev is the protocol revision this proxy speaks to its upstream, pinned once
+	// at the handshake (configuredUpstreamRev overriding the probe) and read-only after. It
+	// is tracked apart from the host side because the two peers migrate independently —
+	// standing between a pair that disagrees is the whole reason a proxy exists.
+	upstreamRev capability.Revision
+	// configuredUpstreamRev is the operator's explicit pin, empty for "probe it".
+	configuredUpstreamRev capability.Revision
+
+	// hostRev is the revision this host connection's context resolved, pinned from its FIRST
+	// message and checked against every later one (resolveHostRevision), so a mid-context flip
+	// is refused rather than silently switching method tables.
+	//
+	// WRITTEN only by serveHost, inline on the loop that reads host messages, before the
+	// per-request handler is spawned. Pinning it from the initialize RESPONSE instead was the
+	// obvious placement and was wrong twice over: that runs on a handler goroutine, so the loop
+	// could read it stale for a pipelined follow-up request — a check-then-act window -race
+	// cannot see, since the value itself is atomic — and a context that never sends initialize,
+	// which is every peer on a revision that removed it, would never pin at all, leaving the
+	// flip refusal permanently inert for exactly the revision that mandates per-request
+	// declarations.
+	//
+	// Atomic because the SERVER-initiated leg reads it from its own goroutine to stamp the
+	// revision on records that leg writes; the single writer is what makes the pin correct,
+	// the atomic only makes that read safe.
+	hostRev atomic.Value // capability.Revision
 
 	// idCounter is used for the proxy→upstream initialize request ID.
 	idCounter int64
@@ -265,6 +287,12 @@ type StdioProxyOptions struct {
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
 
+	// UpstreamProtocolVersion pins the protocol revision this proxy speaks to its upstream,
+	// overriding what the handshake reports. Empty (the default) probes: the upstream's own
+	// reported version wins, falling back to capability.DefaultRevision when it names one
+	// this build does not speak.
+	UpstreamProtocolVersion capability.Revision
+
 	// OnReady, when non-nil, runs inside Start once the session is live and before the host
 	// serve loop begins — the stdio analogue of HTTPGatewayOptions.AfterListen. It runs
 	// after every fallible startup step so a process that never comes up cannot clobber
@@ -310,6 +338,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		requireAuditStrict:    opts.RequireAuditStrict,
 		taskAnchored:          opts.TaskAnchoredState,
 		driftCheck:            opts.DriftCheck,
+		configuredUpstreamRev: opts.UpstreamProtocolVersion,
 		honorAttribution:      opts.HonorAttribution,
 		receipts:              opts.EffectReceipts,
 		onReady:               opts.OnReady,
@@ -786,11 +815,18 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("reading initialize response: %w", err)
 	}
-	caps, sv, instructions, err := applyInitializeResult(resp)
+	hs, err := applyInitializeResult(resp)
 	if err != nil {
 		return err
 	}
-	p.upstreamCaps, p.upstreamServerVersion, p.upstreamInstructions = caps, sv, instructions
+	p.upstreamCaps, p.upstreamServerVersion, p.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
+	// Pin the upstream-side revision once, here: every later leg (the MCP-Protocol-Version
+	// header, drift, the dispatch decisions taken against this upstream) must read one
+	// answer, not re-derive it from a handshake result that is no longer in scope.
+	p.upstreamRev = resolveUpstreamRevision(p.configuredUpstreamRev, hs.ProtocolVersion)
+	if p.upHTTP != nil {
+		p.upHTTP.setRevision(p.upstreamRev)
+	}
 
 	// Send `initialized` notification to upstream.
 	notif, err := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
@@ -957,10 +993,20 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 		}
 		msg := r.msg
 
+		// Negotiate the message's revision before anything routes on its method: every
+		// table below (swallow/forward for a notification, enforced/local for a request) is
+		// revision-scoped, so resolving after the lookup would route by one revision's table
+		// and record under another's.
+		rev, ok := p.negotiateHostRevision(ctx, msg)
+		if !ok {
+			continue
+		}
+		ctx := capability.WithProtocolRevision(ctx, rev)
+
 		if msg.IsNotification() {
 			// forwardHostNotification returns true only when a shutdown woke the
 			// wire-ordering barrier, matching the ctx.Done/upstreamDone cases above.
-			if p.forwardHostNotification(ctx, msg) {
+			if p.forwardHostNotification(ctx, rev, msg) {
 				return
 			}
 			continue
@@ -986,7 +1032,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// in that order regardless of scheduling. Only enforced methods take one, and
 			// only after the hostSem acquire above, so a server-busy rejection never strands
 			// an un-begun ticket that would stall every later one.
-			serialized := p.decideGate != nil && isEnforcedMethod(msg.Method)
+			serialized := p.decideGate != nil && isEnforcedMethod(rev, msg.Method)
 			var ticket decisionTicket
 			if serialized {
 				ticket = p.takeDecisionTicket()
@@ -1003,7 +1049,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				p.fwdHostWrites.Done()
 			})
 			wg.Add(1)
-			go func(m mcp.RPCMsg, serialized bool, ticket decisionTicket) {
+			go func(m mcp.RPCMsg, rev capability.Revision, serialized bool, ticket decisionTicket) {
 				defer wg.Done()
 				defer func() { <-p.hostSem }()
 				defer release()
@@ -1017,8 +1063,8 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 					defer end()
 					hctx = withDecisionEnd(hctx, end)
 				}
-				p.handleHostRequest(hctx, m)
-			}(msg, serialized, ticket)
+				p.handleHostRequest(hctx, rev, m)
+			}(msg, rev, serialized, ticket)
 			continue
 		}
 		if msg.IsResponse() {
@@ -1065,8 +1111,8 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 // cancelling a slow in-flight call does not block it. On a shutdown wake it returns stop=true
 // rather than looping: a leaked waiter is still registered on fwdHostWrites, so reading
 // further requests would be Add-concurrent-with-Wait, a WaitGroup misuse that panics.
-func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg) (stop bool) {
-	if isSwallowedHostNotification(msg.Method) {
+func (p *StdioProxy) forwardHostNotification(ctx context.Context, rev capability.Revision, msg mcp.RPCMsg) (stop bool) {
+	if isSwallowedHostNotification(rev, msg.Method) {
 		return false
 	}
 	if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
@@ -1075,12 +1121,12 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 	}
 	// An enforced method framed as a notification (no id) is a fail-closed reject; shared
 	// with the HTTP transport's equivalent guard so the two cannot drift.
-	if denyEnforcedMethodNotification(ctx, p.rec(), p.sessionID, msg) {
+	if denyEnforcedMethodNotification(ctx, p.rec(), p.sessionID, rev, msg) {
 		return false
 	}
 	// Any notification method outside the forwardable allowlist is a fail-closed reject,
 	// shared with the HTTP transport's equivalent guard.
-	if denyUnmappedHostNotification(ctx, p.errOut(), p.rec(), p.sessionID, msg) {
+	if denyUnmappedHostNotification(ctx, p.errOut(), p.rec(), p.sessionID, rev, msg) {
 		return false
 	}
 	if !p.waitHostForwardOrShutdown(ctx) {
@@ -1104,8 +1150,8 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 // dispatchRequest so the method->handler mapping, the fail-closed default, and the
 // cross-cutting kill gate cannot drift from the HTTP transport. initialize's local
 // response is supplied by p.buildInitResponse (wired into dispatchParams).
-func (p *StdioProxy) handleHostRequest(ctx context.Context, msg mcp.RPCMsg) {
-	d := p.dispatchParams()
+func (p *StdioProxy) handleHostRequest(ctx context.Context, rev capability.Revision, msg mcp.RPCMsg) {
+	d := p.dispatchParams(rev)
 	// nil unless the serve loop threaded a decision-lock release for a serialized enforced
 	// request; the Decide* handlers call it right after the decision so the upstream forward
 	// runs outside the lock.
@@ -1125,7 +1171,7 @@ func (p *StdioProxy) strictAudit() strictAuditState {
 
 // dispatchParams bundles the proxy's policy/audit/upstream wiring for the shared request
 // dispatcher. stdio carries no per-request client address, so sourceIP is empty.
-func (p *StdioProxy) dispatchParams() dispatchParams {
+func (p *StdioProxy) dispatchParams(rev capability.Revision) dispatchParams {
 	return dispatchParams{
 		forwardParams: forwardParams{
 			rec:              p.rec(),
@@ -1141,7 +1187,35 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 		buildInit:        p.buildInitResponse,
 		receipts:         p.receipts,
 		honorAttribution: p.honorAttribution,
+		revision:         rev,
 	}
+}
+
+// negotiateHostRevision resolves one host message's revision and pins the context from its
+// FIRST resolved message, so every later message is checked against it — which is what makes
+// the mid-context-flip refusal reachable for a peer that never sends initialize.
+//
+// ok=false means the message was refused: the record is written either way, and a REQUEST
+// also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
+// serveHost, the single goroutine that owns the pin.
+func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (capability.Revision, bool) {
+	rev, err := resolveHostRevision(p.hostRevision(), msg)
+	if err != nil {
+		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, msg, err)
+		if msg.IsRequest() {
+			_ = p.hostWriter.Write(resp)
+		}
+		return "", false
+	}
+	p.hostRev.Store(rev)
+	return rev, true
+}
+
+// hostRevision returns the revision this connection's context resolved, or "" before its
+// first message has been negotiated. See StdioProxy.hostRev for the single-writer rule.
+func (p *StdioProxy) hostRevision() capability.Revision {
+	rev, _ := p.hostRev.Load().(capability.Revision)
+	return rev
 }
 
 // buildInitResponse builds the host-facing initialize response from the upstream
@@ -1150,9 +1224,11 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // returned message to the host.
 func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	resp := buildInitializeResponse(msg.ID, p.upstreamCaps, p.upstreamInstructions)
+	// The context pin is serveHost's, not this handler's — see StdioProxy.hostRev. Reaching
+	// this method at all means the request resolved to the revision that defines initialize.
 	_, _ = fmt.Fprintf(p.errOut(),
 		"[eunox] Session %s: host initialized (protocol %s).\n",
-		p.sessionID, MCPProtocolVersion,
+		p.sessionID, capability.Revision20251125,
 	)
 	return resp
 }
@@ -1205,6 +1281,9 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 	// fire-and-forget, so a poisoned stdout discards the request while the audit record still
 	// says delivered=true. The writer's poison hook (armed in Start) bounds the window: the
 	// FIRST desync tears the upstream down, so at most frames already in flight are misrecorded.
+	// The context's revision is known here, so this leg's records must name it too — an
+	// absent field is reserved for a record written before any revision was resolved.
+	ctx = capability.WithProtocolRevision(ctx, p.hostRevision())
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:              p.rec(),
 		audit:            p.audit,

@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"github.com/eunolabs/eunox/pkg/capability"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -377,7 +378,7 @@ func (f *fakeUpstreamWithTools) serveMsg(w http.ResponseWriter, _ *http.Request,
 		w.Header().Set(transport.SessionHeader, "upstream-sess-1")
 		w.Header().Set("Content-Type", transport.CTJSON)
 		result := mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "fake", "version": "0.0.1"},
 		}
@@ -452,7 +453,7 @@ func happyPathHandler(t *testing.T, serverVersion string, tools []map[string]int
 			return
 		}
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "mock", "version": serverVersion},
 		})
@@ -499,7 +500,7 @@ func TestRunStdioHandshake_RejectsServerInitiatedRequest(t *testing.T) {
 			return
 		}
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 			ServerInfo:      map[string]interface{}{"name": "mock", "version": "1"},
 		})
@@ -591,7 +592,7 @@ func TestRunStdioHandshake_ToolsListErrorPropagates(t *testing.T) {
 		// initialize ok
 		msg, _ := r.Read()
 		initResult, _ := json.Marshal(mcp.InitResult{
-			ProtocolVersion: transport.MCPProtocolVersion,
+			ProtocolVersion: capability.Revision20251125.String(),
 			Capabilities:    map[string]interface{}{},
 			ServerInfo:      map[string]interface{}{"version": "0.0.1"},
 		})

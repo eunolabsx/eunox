@@ -20,9 +20,17 @@ import (
 // one cheap flood cannot silence another category's records, and per-category shares
 // divide (not replicate) the aggregate so the reachable rate an attacker can drive stays
 // bounded regardless of category count.
+// Sized as a per-category share times the category count, so ADDING a category costs one
+// category's worth of aggregate rather than silently halving every existing category's share
+// — which is what plain division does at the integer boundary (20/10 = 2/s, 20/11 = 1/s).
+// The aggregate is still what bounds the reachable rate; it just grows with the set it
+// divides rather than being a fixed number the set erodes.
 const (
-	preSessionDenyRatePerSec = 20
-	preSessionDenyBurst      = 50
+	perCategoryDenyRatePerSec = 2
+	perCategoryDenyBurstSize  = 5
+
+	preSessionDenyRatePerSec = perCategoryDenyRatePerSec * numRefusalCategories
+	preSessionDenyBurst      = perCategoryDenyBurstSize * numRefusalCategories
 )
 
 // refusalCategory is a distinct type (not a bare string) because its values double as both
@@ -52,14 +60,25 @@ const (
 	// session or upstream ever spawned — the same cheap-flood shape catKill exists to
 	// bound, one credential away rather than zero.
 	catAudience refusalCategory = "audience"
+	// catRevision bounds the protocol-revision refusal (-32022). It is the cheapest
+	// refusal the proxy can be made to write: a small body carrying a bogus `_meta`
+	// protocol version, refused before the kill check, holding no slot and contacting no
+	// upstream. Ungated, that is enough records to latch AuditDegraded(), which under
+	// --require-audit=strict denies every route — the same shape catKill and catAudience
+	// exist to bound, minus even the need for a credential.
+	catRevision refusalCategory = "revision"
 )
 
 // refusalCategories is authoritative: a category added above but omitted here falls to the
 // shared unknown bucket instead of getting its own (see
 // TestRefusalCategories_AllHaveTheirOwnBucket).
 var refusalCategories = []refusalCategory{
-	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation, catKill, catAudience,
+	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation, catKill, catAudience, catRevision,
 }
+
+// numRefusalCategories sizes the aggregate budget above. It is a const because the budget
+// constants are, and TestRefusalCategories_AllHaveTheirOwnBucket holds it to len().
+const numRefusalCategories = 11
 
 // perCategoryFloor keeps every category's bucket alive even where plain division would
 // floor its share to 0 (possible past ~20 categories at today's rate) — a 0-rate bucket

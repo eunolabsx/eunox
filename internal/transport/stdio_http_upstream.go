@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // initializedNotifyTimeout bounds the synchronous notifications/initialized POST
@@ -76,6 +77,10 @@ type httpUpstream struct {
 
 	mu     sync.Mutex
 	sessID string // upstream Mcp-Session-Id, captured from the initialize response
+	// rev is the protocol revision this leg speaks, captured from the initialize response
+	// alongside sessID (and overridden by an operator pin). Guarded by mu for the same
+	// reason: it is written once at the handshake and read by every later POST.
+	rev capability.Revision
 
 	// errOut is where this bridge writes its diagnostic lines. Read through
 	// errOutOrStderr(), never directly, so a nil value (the zero value, and every
@@ -280,9 +285,16 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 // response and headers. Delegates to DoMCPHTTP, the shared implementation.
 func (h *httpUpstream) do(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, http.Header, error) {
 	h.mu.Lock()
-	sid := h.sessID
+	sid, rev := h.sessID, h.rev
 	h.mu.Unlock()
-	return DoMCPHTTP(ctx, h.client, h.endpoint, msg, sid, h.authHeader)
+	return DoMCPHTTP(ctx, h.client, h.endpoint, msg, sid, h.authHeader, rev)
+}
+
+// setRevision pins the protocol revision this leg speaks, once the handshake has settled it.
+func (h *httpUpstream) setRevision(rev capability.Revision) {
+	h.mu.Lock()
+	h.rev = rev
+	h.mu.Unlock()
 }
 
 // Read returns the next queued upstream message, blocking until one arrives or
@@ -322,9 +334,9 @@ func (h *httpUpstream) close() {
 		// until its own (often absent) expiry. DeleteMCPHTTPSession uses its own
 		// background context, so h.cancel() below does not abort it.
 		h.mu.Lock()
-		sid := h.sessID
+		sid, rev := h.sessID, h.rev
 		h.mu.Unlock()
-		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader)
+		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader, rev)
 		close(h.done)
 		h.cancel()
 	})

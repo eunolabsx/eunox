@@ -21,6 +21,7 @@ import (
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/transport"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // LiveUpstreamInfo holds the tool list and server metadata fetched from a live MCP HTTP
@@ -38,8 +39,11 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 	client := transport.BuildUpstreamClient(tlsSkipVerify, 0)
 	endpoint := transport.UpstreamMCPEndpoint(baseURL)
 
+	// The probe opens with `initialize`, which exists only in the handshake-bearing
+	// revision — so that is the revision this leg speaks, and what its post-handshake
+	// requests declare. A discover-first opener is not implemented yet.
 	initResp, respHdr, err := transport.DoMCPHTTP(ctx, client, endpoint,
-		transport.BuildInitializeRequestWithID(mcp.RawJSON(`1`)), "", authHeader)
+		transport.BuildInitializeRequestWithID(mcp.RawJSON(`1`)), "", authHeader, capability.Revision20251125)
 	// Capture the session id and arm the terminating DELETE BEFORE the err gate: a lenient
 	// upstream may have already allocated a server-side session even on a failed initialize,
 	// so it must be closed on every error path, not only success.
@@ -47,7 +51,7 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 	if respHdr != nil {
 		if sessID = respHdr.Get(transport.SessionHeader); sessID != "" {
 			//nolint:contextcheck // teardown deliberately uses the helper's own bounded background context: it runs from the defer as the probe's request context is being canceled.
-			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader)
+			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, capability.Revision20251125)
 		}
 	}
 	if err != nil {
@@ -56,20 +60,21 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 
 	// Same checker the proxy uses, so the CLI and proxy can't diverge on what counts as a
 	// valid initialize result (e.g. a `null` result must be rejected).
-	_, serverVersion, _, err := transport.ApplyInitializeResult(initResp)
+	hs, err := transport.ApplyInitializeResult(initResp)
 	if err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("initialize: %w", err)
 	}
+	serverVersion := hs.ServerVersion
 
 	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
-	if _, _, err := transport.DoMCPHTTP(ctx, client, endpoint, notif, sessID, authHeader); err != nil {
+	if _, _, err := transport.DoMCPHTTP(ctx, client, endpoint, notif, sessID, authHeader, capability.Revision20251125); err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("notifications/initialized: %w", err)
 	}
 
 	// Page tools/list to exhaustion so the full tool catalog is observed.
 	merged, err := drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
 		req := drift.ToolsListRequest(mcp.RawJSON(`2`), cursor)
-		listResp, _, err := transport.DoMCPHTTP(ctx, client, endpoint, req, sessID, authHeader)
+		listResp, _, err := transport.DoMCPHTTP(ctx, client, endpoint, req, sessID, authHeader, capability.Revision20251125)
 		if err != nil {
 			return nil, fmt.Errorf("tools/list: %w", err)
 		}
@@ -179,10 +184,11 @@ func runStdioHandshake(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader) 
 	}
 	// Same checker as the HTTP probe, so the stdio path fails closed on a
 	// null/missing-field result. ApplyInitializeResult also surfaces an upstream error.
-	_, serverVersion, _, err := transport.ApplyInitializeResult(initResp)
+	hs, err := transport.ApplyInitializeResult(initResp)
 	if err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("initialize: %w", err)
 	}
+	serverVersion := hs.ServerVersion
 
 	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
 	if err := w.Write(notif); err != nil {

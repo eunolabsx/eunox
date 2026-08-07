@@ -90,7 +90,7 @@ func newBenchUpstream(b *testing.B) *httptest.Server {
 		switch msg.Method {
 		case "initialize":
 			initResult, _ := json.Marshal(mcp.InitResult{
-				ProtocolVersion: MCPProtocolVersion,
+				ProtocolVersion: capability.Revision20251125.String(),
 				Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 				ServerInfo:      map[string]interface{}{"name": "bench-upstream", "version": "0.1"},
 			})
@@ -572,7 +572,7 @@ func BenchmarkHTTPProxy(b *testing.B) {
 			switch msg.Method {
 			case "initialize":
 				initResult, _ := json.Marshal(mcp.InitResult{
-					ProtocolVersion: MCPProtocolVersion,
+					ProtocolVersion: capability.Revision20251125.String(),
 					Capabilities:    map[string]interface{}{"tools": map[string]interface{}{}},
 					ServerInfo:      map[string]interface{}{"name": "bench-redact-upstream", "version": "0.1"},
 				})
@@ -874,7 +874,7 @@ func BenchmarkStdioProxy(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			proxy.handleHostRequest(ctx, allowMsg)
+			proxy.handleHostRequest(ctx, capability.DefaultRevision, allowMsg)
 		}
 	})
 
@@ -887,7 +887,7 @@ func BenchmarkStdioProxy(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			proxy.handleHostRequest(ctx, denyMsg)
+			proxy.handleHostRequest(ctx, capability.DefaultRevision, denyMsg)
 		}
 	})
 }

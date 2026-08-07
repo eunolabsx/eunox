@@ -133,6 +133,7 @@ upstreams:
     upstreamUrl: https://mcp.stripe.com
     upstreamAuthHeader: "Authorization: Bearer ${STRIPE_KEY}"
     policy: ["./policies/stripe.yaml"]
+    protocolVersion: auto             # auto (default) | "2025-11-25" | "2026-07-28"
 ```
 
 ```bash
@@ -145,6 +146,14 @@ eunox proxy --config gateway.yaml
 > route to a reviewed version of a **single** manifest file; the gateway refuses
 > to start on a version mismatch — or if `expectVersion` is set on a route that
 > merges several policy files, since the pin would silently track only the first.
+
+> **Protocol revision per upstream.** `protocolVersion` pins the MCP revision
+> eunox speaks to that upstream, overriding what its handshake reports. It is per
+> upstream, not per gateway, because upstreams migrate on independent schedules —
+> and it is only the *upstream* leg: the revision each host request is decided
+> under is negotiated from that request's own context (see
+> [conformance.md](conformance.md#per-revision-method-disposition)). A value this
+> build does not speak is refused at startup, not at the first request.
 
 > **Editor support.** A JSON Schema for this config lives at
 > [`schemas/eunox-gateway-config.schema.json`](../schemas/eunox-gateway-config.schema.json).
