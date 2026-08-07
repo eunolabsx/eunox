@@ -13,9 +13,10 @@ import (
 	"net/http"
 )
 
-// healthReporter is the subset of a kill-switch backend that can report its own
-// health. The Redis kill switch implements it (it tracks the last pub/sub refresh
-// error); the in-memory backend does not and is treated as always healthy.
+// healthReporter is the readiness question asked of a kill-switch backend with no request in
+// hand. Every killswitch.Manager answers it (in-memory always nil: an in-process kill set is
+// always confirmable), but the transport deliberately holds the narrower Checker, so the
+// assertion stays — a backend supplying only ShouldBlock is treated as always healthy.
 type healthReporter interface {
 	HealthStatus() error
 }

@@ -23,13 +23,33 @@ type InMemory struct {
 	observers revocationObservers
 }
 
-// NewInMemory creates an in-memory kill-switch manager.
+// NewInMemory creates an in-memory kill-switch manager. The zero value &InMemory{} is
+// equally usable — the kill sets are created on the first write — so this is the
+// intent-declaring spelling rather than a required initialization step, and the two cannot
+// diverge into a usable shape and a trap.
 func NewInMemory() *InMemory {
-	return &InMemory{
-		killedAgents:   make(map[string]bool),
-		killedSessions: make(map[string]bool),
+	return &InMemory{}
+}
+
+// ensureSetsLocked creates the kill sets if this InMemory was written as a zero value rather
+// than built by NewInMemory. Caller must hold m.mu for writing.
+//
+// Reads already tolerate nil maps, so only the two Kill* assignments were affected — and they
+// PANICKED, taking down an admin handler mid-request instead of recording the kill. A
+// library-facing zero value must fail no worse than an unusable one.
+func (m *InMemory) ensureSetsLocked() {
+	if m.killedAgents == nil {
+		m.killedAgents = make(map[string]bool)
+	}
+	if m.killedSessions == nil {
+		m.killedSessions = make(map[string]bool)
 	}
 }
+
+// HealthStatus implements [Manager]: an in-process kill set is always confirmable, so there
+// is never a cause to report. Present so a Manager-typed consumer can ask the readiness
+// question without a type switch on which backend it holds.
+func (m *InMemory) HealthStatus() error { return nil }
 
 // ShouldBlock checks if the global, agent, or session kill switch is active.
 func (m *InMemory) ShouldBlock(_ context.Context, agentID, sessionID string) (bool, error) {
@@ -78,6 +98,7 @@ func (m *InMemory) KillAgent(_ context.Context, agentID string) error {
 		return fmt.Errorf("killswitch: KillAgent: agentID must not be empty")
 	}
 	m.mu.Lock()
+	m.ensureSetsLocked()
 	gained := !m.killedAgents[agentID]
 	m.killedAgents[agentID] = true
 	m.mu.Unlock()
@@ -107,6 +128,7 @@ func (m *InMemory) KillSession(_ context.Context, sessionID string) error {
 		return fmt.Errorf("killswitch: KillSession: sessionID must not be empty")
 	}
 	m.mu.Lock()
+	m.ensureSetsLocked()
 	gained := !m.killedSessions[sessionID]
 	m.killedSessions[sessionID] = true
 	m.mu.Unlock()
