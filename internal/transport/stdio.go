@@ -518,7 +518,7 @@ func awaitDrained(counter *atomic.Int64, timeout time.Duration) {
 // a remote HTTP bridge when upstreamURL is set, otherwise a local subprocess.
 func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 	if p.upstreamURL != "" {
-		up := newHTTPUpstream(ctx, p.upstreamURL, p.upstreamAuthHeader, p.upstreamTLSSkipVerify, p.upstreamTimeMs)
+		up := newHTTPUpstream(ctx, p.upstreamURL, p.upstreamAuthHeader, p.upstreamTLSSkipVerify, p.upstreamTimeMs, p.errOut())
 		// A transport-level POST failure is reported back through upErr so the waiting
 		// caller records a deny/UPSTREAM_ERROR (matching the gateway) rather than an allow.
 		up.reportErr = p.reportUpstreamErr

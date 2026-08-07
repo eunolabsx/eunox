@@ -21,6 +21,18 @@ version already installed is ignored rather than used — one built with an olde
 toolchain than `go.mod` targets refuses to lint at all, which looks like "the linter is
 unavailable here" while CI fails on findings no local run could surface.
 
+A sandbox whose local Go toolchain is older than `go.mod` targets is not actually stuck: the
+`golangci-lint.sh` wrapper's own `go install` there may resolve to a `golangci-lint` build
+still too old to lint this repo, since `go install` follows the *installed package's* own
+toolchain requirement, not this repo's. Fetch the pinned release binary directly instead —
+`https://github.com/golangci/golangci-lint/releases/download/v<GOLANGCI_LINT_VERSION>/golangci-lint-<version>-linux-amd64.tar.gz`
+(match `GOLANGCI_LINT_VERSION` in the Makefile) — and run it with a new-enough `go` on
+`PATH`. `go build`/`go test` in this repo already trigger `GOTOOLCHAIN`'s auto-download of
+the `go.mod`-pinned toolchain into `$(go env GOMODCACHE)/golang.org/toolchain@v0.0.1-go<N>.*/bin/go`;
+put that directory ahead of the system `go` on `PATH` and the downloaded `golangci-lint`
+binary will lint against it. Either way, treat "lint couldn't run locally" as a prompt to
+check the PR's actual CI `Lint` conclusion before merging, not as license to skip the check.
+
 ## Build & Test
 
 ```bash
