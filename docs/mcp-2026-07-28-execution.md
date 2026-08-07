@@ -227,6 +227,13 @@ Scope:
 - Emit `resultType` on every result eunox synthesizes or rewrites for 2026-07-28
   peers: the `internal/mcp` response builders, `dispatchList` output, the
   discover response.
+- **Treat `resultType` as an open union.** The schema is `"complete" |
+  "input_required" | string`, so an unrecognized value is an ambiguity rather
+  than a parse detail. An *absent* field means `"complete"` — the spec's rule for
+  earlier-protocol servers, and the only permissive reading. An unrecognized
+  *present* value is refused fail-closed and recorded: treating it as complete
+  would let an upstream carry a result variant past the response-path enforcement
+  W6 introduces, and eunox cannot enforce a result shape it does not understand.
 - Clamp `cacheScope` to `private` on any response eunox filtered — never preserve
   an upstream `public`; set it when a translated old-upstream response lacks it;
   preserve `ttlMs` as a freshness hint. Lands in `internal/pdp`'s
@@ -237,6 +244,7 @@ Scope:
 Exit criteria:
 
 - [ ] Sweep test: no builder emits a 2026-07-28 result without `resultType`; old-revision output byte-stable.
+- [ ] Unknown-`resultType` result refused fail-closed and recorded; absent-means-complete asserted as a separate case.
 - [ ] Property test across all filter paths: a filtered response never carries `cacheScope: public`.
 - [ ] Ordering-preservation test green.
 - [ ] L-6 marked mitigated in `docs/threat-model-mcp.md`.
@@ -259,8 +267,18 @@ Scope:
   lever keeps its manifest surface (`system:sampling/createMessage`); what moves is
   where it is evaluated. An entry the manifest does not permit fails the **whole
   result** fail-closed, recorded — no partial stripping, which would desynchronize
-  the client/upstream exchange. `redactFields` applies to inputRequest content as
-  to any result.
+  the client/upstream exchange. An entry of an unrecognized kind fails the same
+  way, for the same reason W5 refuses an unknown `resultType`. `redactFields`
+  applies to inputRequest content as to any result.
+- **Elicitation gets its own lever, and it is the one that outlives the clock.**
+  `sampling/createMessage` and `roots/list` are deprecated as of 2026-07-28;
+  `elicitation/create` is not, so it becomes the durable MRTR payload after the
+  2027-07-28 removal window. eunox forwards elicitation un-enforced today (a
+  documented gap in `docs/conformance.md`), and it is a user-prompting surface —
+  the input it solicits flows back through the retry as arguments. Add a
+  `system:elicitation/create` manifest surface enforced on the same response path,
+  deny-by-default like sampling. This is new enforcement rather than a relocation,
+  so it carries the manifest-vocabulary conventions in full.
 - **Retry path:** verify the continuation (anchor binding, lifetime, per D2),
   re-run kill check and match, re-evaluate conditions against the retry's
   arguments (including effect conditions and the ceiling — `inputResponses` can
@@ -292,6 +310,7 @@ Exit criteria:
 - [ ] All continuation negatives green; fuzz target landed and in CI.
 - [ ] Cross-instance verify test green.
 - [ ] Sampling deny lever demonstrably relocated (old request-path test retired to the 2025-11-25 scope, response-path test green).
+- [ ] `system:elicitation/create` enforced deny-by-default on the response path, with the manifest-vocabulary conventions satisfied.
 - [ ] Threat model: continuation, replay analysis, and the interim posture below.
 
 **Interim fail-closed posture** (if D2 slips): deny any

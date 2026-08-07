@@ -199,7 +199,7 @@ pattern in `internal/transport/stdio.go` — add a handler, register it in the
 shared dispatch switch (`internal/transport/dispatch.go`), write a test in
 `internal/transport/enforcement_gaps_test.go`, and update this table.
 
-## Forthcoming: the 2026-07-28 stateless revision
+## The 2026-07-28 stateless revision: published, not yet supported
 
 The 2026-07-28 MCP revision is the published stable specification, but it is **not
 yet the spec eunox targets** — eunox still targets 2025-11-25. Two of its changes
