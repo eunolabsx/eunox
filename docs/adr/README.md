@@ -72,6 +72,6 @@ silent edits.
 | [0003](./0003-redis-killswitch-fail-open.md) | Redis kill switch fails closed by default on a Redis outage (opt-in fail-open) | Draft |
 | [0004](./0004-bearer-identity-session-anchor.md) | Anchor client correlation and revocation on bearer identity, not the protocol session | Draft |
 | [0005](./0005-upstream-credential-delegation.md) | Resolve upstream credentials per request via a provider seam, prefer delegation over a shared static token | Draft |
-| [0006](./0006-dual-revision-translation-boundary.md) | Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest | Draft |
+| [0006](./0006-dual-revision-translation-boundary.md) | Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest | In Review |
 | [0007](./0007-mrtr-signed-continuation.md) | Meter multi round-trip requests once per logical call, via a signed continuation | Draft |
 | [0008](./0008-stream-and-task-enforcement.md) | Enforce subscription streams and task methods at the opener's anchor | Draft |
