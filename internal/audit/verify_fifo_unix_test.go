@@ -100,3 +100,34 @@ func TestScanSeqContribution_RefusesFIFO(t *testing.T) {
 		t.Fatal("scanSeqContribution blocked on a FIFO planted at the log path")
 	}
 }
+
+// TestReadLastAuditLine_RefusesFIFO covers the third whole-file reader. Its callers walk
+// rotated siblings discovered by a directory scan and treat an unreadable one as fail-closed
+// (seed past the on-disk max), so the refusal must arrive as an error — not as a hang, and
+// not as the ("", nil) that means "absent, resume from genesis".
+func TestReadLastAuditLine_RefusesFIFO(t *testing.T) {
+	t.Parallel()
+	fifo := filepath.Join(t.TempDir(), "audit.jsonl.20260601T000000.000000000Z")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	type result struct {
+		line string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		line, err := readLastAuditLine(fifo)
+		done <- result{line, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err == nil {
+			t.Fatalf("a FIFO must be refused as unreadable, got line %q with no error — the caller would read that as an absent sibling and resume from genesis", got.line)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("readLastAuditLine blocked on a FIFO planted at a rotated-sibling path")
+	}
+}

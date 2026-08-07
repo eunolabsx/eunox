@@ -1225,16 +1225,19 @@ func NewLineScanner(r io.Reader) *bufio.Scanner {
 //     is the normal brand-new-install case.
 //   - (line, nil): the extracted last record line.
 func readLastAuditLine(path string) (string, error) {
-	// config.OpenNoFollow here too, not just on the append opens: this read is Open's
-	// chain-resume path, so a symlink planted at the log path would otherwise seed the
-	// resumed chain from an attacker-chosen file.
-	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: path is the user-configured audit log
+	// Guarded like the other whole-file reads, and for a sharper reason than theirs: this
+	// is Open's chain-resume path AND its callers walk rotated siblings found by a
+	// directory scan, so a substituted path would otherwise seed the resumed chain from
+	// attacker-chosen bytes — or, for a planted FIFO, block forever inside open(2).
+	f, err := openDiscoveredAuditFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent file: the normal brand-new-install / freshly-rotated case, not an
 			// I/O error. Report empty so the caller resumes from genesis or a sibling.
 			return "", nil
 		}
+		// Every other refusal (including a non-regular substitution) is an unreadable
+		// file, which the callers fail closed on rather than treating as empty.
 		return "", err
 	}
 	defer func() { _ = f.Close() }()
