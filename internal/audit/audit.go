@@ -4,9 +4,10 @@
 // Package audit implements the tamper-evident, HMAC-signed OCSF JSONL audit log:
 // the asynchronous record sink (writer plus bounded background drainer),
 // size-triggered rotation with retention pruning, and per-record HMAC plus
-// tamper-evident chain verification. It depends only on internal/config (the
-// shared ExpandHome helper), pkg/capability, and the standard library, never
-// back on the binary.
+// tamper-evident chain verification. It depends only on internal/config
+// (ExpandHome plus the file-substitution guards RefuseNonRegularPath,
+// OpenNoFollow and OpenNonBlock), pkg/capability, and the standard library,
+// never back on the binary.
 package audit
 
 import (
@@ -1259,6 +1260,31 @@ func readLastAuditLine(path string) (string, error) {
 	return interpretAuditTail(buf, n, err, size, start)
 }
 
+// openDiscoveredAuditFile opens an audit-log path for a whole-file READ, refusing every
+// substitution a path DISCOVERED by a directory scan is open to — the readdir that found it
+// saw a regular file, but nothing holds that true until the open.
+//
+// All three guards are load-bearing and none subsumes another: OpenNoFollow refuses a
+// planted symlink, OpenNonBlock keeps a planted FIFO from blocking INSIDE open(2) (a
+// read-only FIFO open waits for a writer, so a post-open check would never run and the
+// caller would hang with no error), and the fstat — through the HANDLE, not the path, so no
+// second TOCTOU window opens — refuses whatever non-regular file was substituted.
+func openDiscoveredAuditFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow|config.OpenNonBlock, 0) //nolint:gosec // G304: path is the user-configured audit log or a sibling of it
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := f.Stat()
+	if statErr != nil || !info.Mode().IsRegular() {
+		_ = f.Close()
+		if statErr == nil {
+			statErr = fmt.Errorf("not a regular file (mode %v)", info.Mode())
+		}
+		return nil, statErr
+	}
+	return f, nil
+}
+
 // scanSeqContribution reads path once and separates the two distinct ways a file can inform
 // the resumed seq counter, which callers combine differently:
 //
@@ -1279,11 +1305,11 @@ func readLastAuditLine(path string) (string, error) {
 // monotonic seq counter, so an unsigned or forged on-disk record can at worst inflate the
 // counter (harmless), never inject a trusted chain link.
 func scanSeqContribution(path string, bufCap int) (parsedMax uint64, parsed bool, unreadBytes uint64) {
-	// config.OpenNoFollow for the same reason readLastAuditLine carries it: this scan runs
-	// on the resume path, and a symlink planted at the log path would otherwise feed the
-	// counter from an attacker-chosen file. The stat fallback below then reports the link
-	// target's size — inflation only, which the seq fold already tolerates.
-	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: path is the user-configured audit log
+	// Refused for the same reason readLastAuditLine carries O_NOFOLLOW: this scan runs on
+	// the resume path, so a substituted path would otherwise feed the counter from an
+	// attacker-chosen file. A refusal takes the stat fallback below, which reports a size —
+	// inflation only, which the seq fold already tolerates.
+	f, err := openDiscoveredAuditFile(path)
 	if err != nil {
 		if info, statErr := os.Stat(path); statErr == nil {
 			if sz := uint64(info.Size()); sz > 0 { //nolint:gosec // G115: file size is non-negative

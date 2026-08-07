@@ -91,11 +91,11 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	// Saturate a DIFFERENT route. None of this is attributable to github.
 	const attempts = 5000
 	for i := 0; i < attempts; i++ {
-		proxy.recordSessionCapDeny(req, other)
+		proxy.recordSessionCapDeny(context.Background(), req, other)
 	}
 	// Refill one second of tokens, then let github's session cap be the next admitted.
 	now = base.Add(time.Second)
-	proxy.recordSessionCapDeny(httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody), route)
+	proxy.recordSessionCapDeny(context.Background(), httptest.NewRequest(http.MethodPost, "/mcp/github", http.NoBody), route)
 
 	_ = sink.Close()
 	recs := readAuditRecords(t, logPath)

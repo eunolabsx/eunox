@@ -106,7 +106,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 		}
 		// The raw decode error and body are NOT recorded — either can carry
 		// attacker-controlled free text; only the fixed reason string is kept.
-		p.recordRefusal(r, route, codeInvalidRequest, catBody, map[string]interface{}{
+		p.recordRefusal(r.Context(), r, route, codeInvalidRequest, catBody, map[string]interface{}{
 			"reason": "malformed_json",
 		})
 		http.Error(w, invalidBodyMsg, http.StatusBadRequest)
@@ -118,7 +118,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return false
 		}
-		p.recordRefusal(r, route, codeInvalidRequest, catBody, map[string]interface{}{
+		p.recordRefusal(r.Context(), r, route, codeInvalidRequest, catBody, map[string]interface{}{
 			"reason": "trailing_data",
 		})
 		http.Error(w, invalidBodyMsg+": trailing data after JSON message", http.StatusBadRequest)
@@ -139,10 +139,10 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 // shapes — it's reachable WITHOUT an established session, so it's the cheaper flood and was
 // the one leaving no trace. The other two legs are benign lifecycle races, not attack
 // signal, so they stay status-only.
-func (p *HTTPProxy) writeSessionCreateError(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
+func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
 	switch {
 	case errors.Is(err, errSessionLimit):
-		p.recordSessionCapDeny(r, route)
+		p.recordSessionCapDeny(ctx, r, route)
 		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 	case errors.Is(err, errRacedReap):
 		http.Error(w, "session raced a kill-switch reap; retry", http.StatusServiceUnavailable)
@@ -239,7 +239,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// Recorded for the same reason as writeSessionCreateError's errSessionLimit leg:
 			// this is its cheap pre-spawn twin, and both go through the one route-stamped
 			// helper so the two ways to hit the same cap can't produce two record shapes.
-			p.recordSessionCapDeny(r, route)
+			p.recordSessionCapDeny(ctx, r, route)
 			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
 			return
 		}
@@ -272,7 +272,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			sess, err = p.newSession(initCtx, route, clientIP, startGen)
 		}
 		if err != nil {
-			p.writeSessionCreateError(w, r, route, err)
+			p.writeSessionCreateError(ctx, w, r, route, err)
 			return
 		}
 		w.Header().Set(SessionHeader, sess.id)
@@ -288,15 +288,30 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// An initialize notification (excluded from the session-creation branch above)
 		// expects no response: accept and drop it without allocating session state.
 		if msg.Method == mcp.MethodInitialize && msg.IsNotification() {
+			// Negotiate FIRST, as the session-creating arm and stdio's serve loop both do
+			// for these same bytes: this arm reaches neither hostNotificationGate.admit nor
+			// dispatchRequest, so dispatch.go's canonical order has to be applied by hand
+			// here or the identical notification records UNSUPPORTED_PROTOCOL_VERSION on
+			// stdio and either KILL_SWITCH or nothing at all here.
+			rev, rerr := resolveHostRevision(handshakeRevision, msg)
+			if rerr != nil {
+				// A notification MUST NOT receive a JSON-RPC response, so the refusal is
+				// recorded and acked bodyless — the same framing the kill arm below uses,
+				// and why refuseHostRevision's response is discarded rather than written.
+				_ = refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), "", msg, rerr)
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			ctx := capability.WithProtocolRevision(r.Context(), rev)
 			// Consult the kill switch BEFORE the 202 ack: a 202 to an initialize
 			// notification is a readiness acknowledgement, so returning it during a global
 			// emergency stop would tell the client the server is ready, unaudited.
-			if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
+			if deny := route.pdp.CheckKill(ctx, ""); deny != nil {
 				// A notification MUST NOT receive a JSON-RPC response: msg.ID is nil, so
 				// recordKillDenial's response would carry "id":null and, with no prior
 				// WriteHeader, send an implicit 200 indistinguishable from a successful
 				// readiness ack. Record the deny directly and ack the drop with a bodyless 202.
-				recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), msg.Method, msg.Method, legHTTPNotification)
+				recordKillDrop(ctx, p.preSessionKillRecorder(route), deny, claimedSession(r), msg.Method, msg.Method, legHTTPNotification)
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
