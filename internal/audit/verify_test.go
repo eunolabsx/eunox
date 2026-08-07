@@ -20,6 +20,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/eunolabs/eunox/internal/config"
 )
 
 // signTestRecord signs rec with key, stamping rec.KeyID verbatim, and returns the
@@ -2491,5 +2493,55 @@ func TestVerifyAuditLog_KeylessVerifierReportsUnverifiableNotTampered(t *testing
 	}
 	if !res.OK() || res.Valid != 3 {
 		t.Fatalf("matching key: got %+v, want OK with Valid=3", res)
+	}
+}
+
+// TestVerifyLogFiles_RefusesSymlinkedChainFile pins the O_NOFOLLOW half of the chain read:
+// the paths come from a ReadDir snapshot that saw regular files, and a symlink swapped into
+// that window would otherwise redirect verification to an arbitrary file — a symlink to a
+// FIFO wedges the verifier forever (the open succeeds, the read blocks).
+func TestVerifyLogFiles_RefusesSymlinkedChainFile(t *testing.T) {
+	if config.OpenNoFollow == 0 {
+		t.Skip("platform has no O_NOFOLLOW equivalent; the portable Lstat guards are the only symlink check")
+	}
+	t.Parallel()
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	target := filepath.Join(dir, "target.jsonl")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(dir, "audit.jsonl")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := VerifyLogFiles([]string{link}, verifierFor(t, keyPath), "", time.Time{}, io.Discard); err == nil {
+		t.Fatal("VerifyLogFiles must refuse a symlinked chain file rather than follow it")
+	}
+}
+
+// TestVerifyLog_SuppressedUnsignedSummarySurvivesScanAbort pins the accounting line's one
+// gap: an aborted scan (an over-cap line mid-archive — the corrupted-log case an incident
+// responder is most likely in) must still print the elided-unsigned summary before the
+// error returns, or the elided diagnostics are silently dropped exactly when they matter.
+func TestVerifyLog_SuppressedUnsignedSummarySurvivesScanAbort(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+
+	var log bytes.Buffer
+	for i := 0; i < maxUnsignedDiagnostics+5; i++ {
+		fmt.Fprintf(&log, `{"seq":%d,"decision":"allow"}`+"\n", i+1)
+	}
+	// An over-cap line aborts the scan (bufio.ErrTooLong) after the unsigned prefix.
+	log.WriteString(strings.Repeat("x", auditScanBufferBytes+1) + "\n")
+
+	var out strings.Builder
+	_, err := VerifyLog(&log, verifierFor(t, keyPath), "", time.Time{}, &out)
+	if err == nil {
+		t.Fatal("an over-cap line must abort the scan with an error")
+	}
+	if !strings.Contains(out.String(), "diagnostics elided") {
+		t.Errorf("the elided-unsigned summary must be printed even when the scan aborts; output:\n%s", out.String())
 	}
 }

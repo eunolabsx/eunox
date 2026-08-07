@@ -182,6 +182,50 @@ func TestBoundDenialDetails_IsDeterministic(t *testing.T) {
 	}
 }
 
+// TestBoundDenialDetails_NestedTruncationIsDeterministic pins the same property one level
+// down, where it actually broke: BoundDenialDetails collects every top-level key before
+// sorting, but boundDetailMap bounds a NESTED object against a per-key share that can admit
+// only a subset of its keys, and an early-stopped collection was a random sample of Go's
+// map iteration — two identical denied calls wrote different signed records.
+func TestBoundDenialDetails_NestedTruncationIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	nested := map[string]interface{}{}
+	for i := 0; i < 3000; i++ {
+		nested[fmt.Sprintf("k%04d", i)] = i
+	}
+	// Enough top-level keys to floor the per-key share at minDenialDetailKeyBudget, so the
+	// nested object's key count far exceeds what its budget can admit.
+	in := map[string]interface{}{"value": nested}
+	for i := 0; i < 15; i++ {
+		in[fmt.Sprintf("pad%02d", i)] = "x"
+	}
+
+	out := BoundDenialDetails(in)
+	outNested, _ := out["value"].(map[string]interface{})
+	if _, ok := outNested[DenialDetailElidedKey]; !ok {
+		t.Fatal("test shape did not force nested truncation; the determinism loop below would pass vacuously")
+	}
+	// The deterministic rule is smallest-first, so the lexicographic minimum always survives.
+	if _, ok := outNested["k0000"]; !ok {
+		t.Error("smallest nested key did not survive truncation")
+	}
+
+	first, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		next, err := json.Marshal(BoundDenialDetails(in))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !bytes.Equal(next, first) {
+			t.Fatal("bounding the same details twice produced different records")
+		}
+	}
+}
+
 // TestBoundDenialDetails_NormalizesInvalidUTF8 pins the UTF-8 treatment. encoding/json
 // is not idempotent across a decode-then-re-encode round trip for invalid UTF-8, and
 // both the audit chain's HMAC recompute and its canonical-bytes check depend on that

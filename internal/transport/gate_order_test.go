@@ -333,3 +333,62 @@ func TestGateOrder_RevisionRidesOneCarrier(t *testing.T) {
 		t.Error("requestRevision must resolve the empty carrier to the default revision, in one place")
 	}
 }
+
+// TestGateOrder_CreatingInitializeAppliesTheCanonicalOrder pins the canonical order on the
+// one request prologue that lives outside dispatchRequest: the HTTP session-creating
+// initialize. The same bytes must record the same code stdio records for its initialize —
+// negotiation ahead of the kill gate — or an emergency stop relabels a bad-version probe's
+// evidence on one transport only. The second POST bounds the exception: a resolvable
+// initialize on the same killed proxy is refused by the kill gate as always, and its record
+// names the revision negotiation had already resolved and stamped.
+func TestGateOrder_CreatingInitializeAppliesTheCanonicalOrder(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+	if err := ks.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
+	}
+	sink, logPath := newTempAuditSink(t)
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink, upstream: "up1"},
+	}
+	proxy := newTestHTTPProxy()
+
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+		req.Header.Set("Content-Type", CTJSON)
+		w := httptest.NewRecorder()
+		proxy.handleMCPPost(w, req, route)
+		return w
+	}
+
+	w := post(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}`)
+	if !strings.Contains(w.Body.String(), "-32022") {
+		t.Errorf("bad-revision creating initialize: body = %q, want the -32022 revision refusal", w.Body.String())
+	}
+	post(`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}`)
+
+	_ = sink.Close()
+	var badRevision, killed map[string]interface{}
+	for _, rec := range readAuditRecords(t, logPath) {
+		if m, _ := rec["method"].(string); m != mcp.MethodInitialize {
+			continue
+		}
+		switch code, _ := rec["denial_code"].(string); code {
+		case capability.ErrCodeUnsupportedProtocolVersion:
+			badRevision = rec
+		case capability.ErrCodeKillSwitch:
+			killed = rec
+		}
+	}
+	if badRevision == nil {
+		t.Fatal("the bad-revision probe must record UNSUPPORTED_PROTOCOL_VERSION — kill active or not, negotiation refuses first on both transports")
+	}
+	if killed == nil {
+		t.Fatal("the resolvable initialize must still be refused by the kill gate")
+	}
+	if rev, _ := killed["protocol_revision"].(string); rev != string(handshakeRevision) {
+		t.Errorf("kill record protocol_revision = %q, want %q — the resolved revision is stamped before the later pre-session gates record", rev, string(handshakeRevision))
+	}
+}

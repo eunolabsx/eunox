@@ -188,24 +188,32 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// a kill-denied session that then pins a subprocess/slot until process exit (with no
 		// idle reaper configured, that leak never self-heals).
 		startGen := p.currentReapGen()
+		// Negotiate FIRST, ahead of the kill gate — dispatch.go's canonical order, which
+		// stdio applies to these same bytes: a probe declaring an unhonorable revision must
+		// record the same code on both transports, kill active or not. Also before anything
+		// privileged: creating a session spawns or contacts an upstream, and a declaration
+		// this build cannot honor (or one naming a revision that has no `initialize` at all)
+		// must be refused without that side effect. Answering initialize is itself the
+		// negotiation, so the only admissible declaration here is the revision that defines
+		// the method.
+		rev, ok := p.negotiateCreatingInitialize(w, r, route, msg)
+		if !ok {
+			return
+		}
+		// The refusals below and the establishment itself all decide under the revision just
+		// resolved; stamping it is what puts protocol_revision on their records, the same
+		// "absent means pre-negotiation" convention every dispatched record follows.
+		ctx := capability.WithProtocolRevision(r.Context(), rev)
 		// Kill-switch check BEFORE spawning anything. This is the one initialize answered
 		// outside dispatchRequest (no session/dispatchParams yet), so it repeats the kill
 		// gate dispatchRequest applies to every other locally-answered method.
-		if deny := route.pdp.CheckKill(r.Context(), ""); deny != nil {
+		if deny := route.pdp.CheckKill(ctx, ""); deny != nil {
 			// No session exists yet, so claimedSession is the honest subject rather than fact.
 			// Rate-limited: an unauthenticated caller reaches this record, so an unbounded
 			// write here is an audit-queue flooding primitive; a suppressed record elides
 			// only the RECORD, the request is denied either way.
-			resp := recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), mcp.MethodInitialize)
+			resp := recordKillDenial(ctx, p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), mcp.MethodInitialize)
 			writeJSONMsg(w, resp)
-			return
-		}
-		// Negotiate BEFORE anything privileged happens: creating a session spawns or contacts
-		// an upstream, and a declaration this build cannot honor (or one naming a revision that
-		// has no `initialize` at all) must be refused without that side effect — which is what
-		// stdio does for the same bytes. Answering initialize is itself the negotiation, so the
-		// only admissible declaration here is the revision that defines the method.
-		if !p.negotiateCreatingInitialize(w, r, route, msg) {
 			return
 		}
 		// Per-route audience pin BEFORE spawning: a token valid only for ANOTHER route's
@@ -213,14 +221,14 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// session on this route. Initialize doesn't flow through the Decide*/list/sampling
 		// paths that embed the same pin, so without this gate a cross-audience token could
 		// spin up this route's upstream and read its serverInfo.
-		if denied, blocked := p.initAudienceDenial(r.Context(), route, msg); blocked {
+		if denied, blocked := p.initAudienceDenial(ctx, route, msg); blocked {
 			writeJSONMsg(w, denied)
 			return
 		}
 		// --require-audit=strict: creating a session spawns/contacts an upstream — a
 		// privileged side effect — so once the audit trail has degraded, refuse new sessions
 		// fail-closed rather than run traffic that can't be fully recorded.
-		if denied, blocked := p.initStrictAuditDenial(r.Context(), route, msg); blocked {
+		if denied, blocked := p.initStrictAuditDenial(ctx, route, msg); blocked {
 			writeJSONMsg(w, denied)
 			return
 		}
@@ -247,7 +255,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			startBudget = b
 		}
 		rearmWriteDeadlineFor(w, startBudget)
-		initCtx, initCancel := context.WithTimeout(r.Context(), sessionStartTimeout)
+		initCtx, initCancel := context.WithTimeout(ctx, sessionStartTimeout)
 		defer initCancel()
 
 		var (
@@ -1072,31 +1080,47 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 // request was refused as a "mid-context flip" it had in fact declared consistently from its
 // first message.
 //
-// ok=false means the refusal has already been written.
-func (p *HTTPProxy) negotiateCreatingInitialize(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) bool {
-	if _, err := resolveHostRevision(handshakeRevision, msg); err != nil {
+// ok=false means the refusal has already been written; on ok the caller stamps the
+// resolved revision onto the request context, as the dispatched paths do.
+func (p *HTTPProxy) negotiateCreatingInitialize(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) (capability.Revision, bool) {
+	rev, err := resolveHostRevision(handshakeRevision, msg)
+	if err != nil {
 		// No session exists yet, so the record carries no session id — the same posture as
 		// the other pre-session refusals on this path.
 		writeJSONMsg(w, refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), "", msg, err))
-		return false
+		return "", false
 	}
-	return true
+	return rev, true
 }
 
 // revisionRefusalRecorder returns the route's sink when the revision-refusal bucket admits a
 // record now, and nil when it does not — refuseHostRevision writes nothing for a nil
-// recorder, so the wire refusal is unaffected and only the tape write is bounded.
+// recorder, so the wire refusal is unaffected and only the tape write is bounded. Suppressed
+// refusals fold into the next admitted record via rolledUpRecorder, mirroring the two
+// pre-session siblings: catRevision is the cheapest refusal an attacker can force, so a
+// dropped tally here is exactly the flood volume an incident responder would under-count.
 //
 // Nil-limiter tolerance mirrors recordRefusal's: a proxy built without one (tests) records
 // unbounded rather than not at all.
 func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder {
-	if p.preSessionDenies != nil {
-		if ok, _ := p.preSessionDenies.admit(catRevision); !ok {
-			return nil
-		}
-	}
+	rec := asRecorder(p.sink)
 	if route != nil {
-		return asRecorder(route.sink)
+		rec = asRecorder(route.sink)
 	}
-	return asRecorder(p.sink)
+	if rec == nil {
+		// Nothing to write, so nothing to bound: leave the bucket's tokens for a site
+		// that has a tape.
+		return nil
+	}
+	if p.preSessionDenies == nil {
+		return rec
+	}
+	admitted, suppressed := p.preSessionDenies.admit(catRevision)
+	if !admitted {
+		return nil
+	}
+	if suppressed == 0 {
+		return rec
+	}
+	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
 }

@@ -253,8 +253,14 @@ func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.Enfor
 	now := e.clock.Now().UTC().Format(time.RFC3339Nano)
 
 	var carriedLabels []string
-	if labels, err := e.peekSessionLabels(ctx, req); err == nil {
-		carriedLabels = labels
+	// Skip the peek for an unanchorable request, mirroring evaluateMatched's ordering: with
+	// no task id the anchor falls back to the SESSION key, and the snapshot would come from
+	// the very bucket the full path's refusal exists to reject — wrong-bucket evidence on
+	// the hardened record.
+	if !e.anchorUnresolved(req) {
+		if labels, err := e.peekSessionLabels(ctx, req); err == nil {
+			carriedLabels = labels
+		}
 	}
 	// Outcome discarded: it describes what a COMMIT would apply, and this commits nothing.
 	_, refusal := e.checkDeclassify(ctx, req, matched, carriedLabels, requestID, now)

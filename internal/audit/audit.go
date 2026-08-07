@@ -1265,9 +1265,10 @@ func readLastAuditLine(path string) (string, error) {
 //   - parsedMax/parsed: the largest seq actually decoded from a record (exact and
 //     authoritative). parsed is false when the file opened and read cleanly but held no
 //     parseable record (empty/blank/all-unparseable).
-//   - unreadBytes: the file's byte size when it could NOT be fully read — os.Open was
-//     refused (a write-only 0200 log fails EACCES on every restart) or the scan aborted on
-//     an over-cap line (bufio.ErrTooLong) or a mid-file read fault — so the true max is
+//   - unreadBytes: the file's byte size when it could NOT be fully read — the open was
+//     refused (a write-only 0200 log fails EACCES on every restart; a symlinked path fails
+//     under config.OpenNoFollow, same as every other audit-file open) or the scan aborted
+//     on an over-cap line (bufio.ErrTooLong) or a mid-file read fault — so the true max is
 //     unknown and bounded only by the byte count (>= 1 byte per record). Zero when the file
 //     read cleanly to EOF.
 //
@@ -1278,7 +1279,11 @@ func readLastAuditLine(path string) (string, error) {
 // monotonic seq counter, so an unsigned or forged on-disk record can at worst inflate the
 // counter (harmless), never inject a trusted chain link.
 func scanSeqContribution(path string, bufCap int) (parsedMax uint64, parsed bool, unreadBytes uint64) {
-	f, err := os.Open(path) //nolint:gosec // G304: path is the user-configured audit log
+	// config.OpenNoFollow for the same reason readLastAuditLine carries it: this scan runs
+	// on the resume path, and a symlink planted at the log path would otherwise feed the
+	// counter from an attacker-chosen file. The stat fallback below then reports the link
+	// target's size — inflation only, which the seq fold already tolerates.
+	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: path is the user-configured audit log
 	if err != nil {
 		if info, statErr := os.Stat(path); statErr == nil {
 			if sz := uint64(info.Size()); sz > 0 { //nolint:gosec // G115: file size is non-negative

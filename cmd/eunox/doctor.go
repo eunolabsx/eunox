@@ -337,7 +337,16 @@ func writeDoctorBinary(w io.Writer) {
 func writeDoctorConfig(w io.Writer, path string) {
 	wf(w, "  path: %s\n\n", path)
 
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator-supplied --config path
+	// Bounded like the typed loader's read: doctor deliberately keeps going when
+	// LoadGatewayConfig fails, so without its own cap this re-read would buffer whole the
+	// misdirected multi-GB path the loader just refused — an OOM in the one command meant
+	// to survive a broken config.
+	raw, err := config.ReadBoundedFile(config.BoundedRead{
+		Path:      path,
+		What:      "gateway config",
+		Max:       config.MaxGatewayConfigFileBytes,
+		OverLimit: "refusing to buffer it into the doctor bundle",
+	})
 	if err != nil {
 		wf(w, "  could not read: %v\n", err)
 		return

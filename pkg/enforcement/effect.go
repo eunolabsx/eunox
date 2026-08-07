@@ -409,7 +409,11 @@ func (e *Engine) CeilingVerdictFor(ctx context.Context, req *capability.EnforceR
 	effect := capability.ResolveEffect(matched.Effect, req.Arguments)
 
 	var carriedLabels []string
-	if !e.skipFlow && constraintHasFlow(matched) {
+	// Skip the peek for an unanchorable request, mirroring evaluateMatched's ordering: with
+	// no task id the anchor falls back to the SESSION key, and the snapshot would come from
+	// the very bucket the full path's refusal exists to reject — wrong-bucket evidence on
+	// the hardened record.
+	if !e.skipFlow && constraintHasFlow(matched) && !e.anchorUnresolved(req) {
 		// A pure read: "which provenance produced this" is one of the consequence inputs the
 		// short-circuit was dropping.
 		if labels, err := e.peekSessionLabels(ctx, req); err == nil {

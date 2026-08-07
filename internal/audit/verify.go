@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/eunolabs/eunox/internal/config"
 )
 
 // errKeyIDNotInRing is returned by keysToTry (and propagated by the signature check) when
@@ -290,10 +292,13 @@ func VerifyLog(r io.Reader, verifier *Sink, requestID string, since time.Time, o
 		}
 		v.processLine(line)
 	}
+	// Before the scan-abort return, not after: an aborted scan (over-cap line, mid-archive
+	// read fault) is exactly the corrupted-log case where dropping the elided-unsigned
+	// accounting line would silently under-report.
+	v.reportSuppressedUnsigned()
 	if err := scanner.Err(); err != nil {
 		return v.res, err
 	}
-	v.reportSuppressedUnsigned()
 	return v.res, nil
 }
 
@@ -365,10 +370,23 @@ func (l *lazyFileReader) Read(p []byte) (int, error) {
 			}
 			return 0, io.EOF
 		}
-		f, err := os.Open(l.path) //nolint:gosec // G304: path is a discovered audit-log file
+		// config.OpenNoFollow plus a through-the-handle regularity check: the path came
+		// from a ReadDir snapshot that saw a regular file, but a swap in that window
+		// would otherwise redirect verification to an arbitrary file — a symlink to a
+		// FIFO wedges the verifier forever (the open succeeds, the read blocks).
+		f, err := os.OpenFile(l.path, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: path is a discovered audit-log file
 		if err != nil {
 			l.done = true
 			l.err = fmt.Errorf("opening audit log %q: %w", l.path, err)
+			return 0, l.err
+		}
+		if info, statErr := f.Stat(); statErr != nil || !info.Mode().IsRegular() {
+			_ = f.Close()
+			l.done = true
+			if statErr == nil {
+				statErr = fmt.Errorf("not a regular file (mode %v)", info.Mode())
+			}
+			l.err = fmt.Errorf("opening audit log %q: %w", l.path, statErr)
 			return 0, l.err
 		}
 		l.f = f

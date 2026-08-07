@@ -232,6 +232,48 @@ func TestTaskAnchor_UnresolvedRefusalCarriesNoSessionEvidence(t *testing.T) {
 		"the refusal must not report labels read from the very bucket it refuses to account against")
 }
 
+// TestTaskAnchor_HardeningVerdictsCarryNoSessionEvidence extends the no-session-evidence
+// property to the two composed-hardening verdicts a wrapping PDP calls on an already-refused
+// request: both peek the flow bucket for record evidence, and for a caller the engine refuses
+// as unanchorable that peek's session fallback reads the very bucket the refusal rejects.
+// The refusals themselves must still fire — only the wrong-bucket snapshot is withheld.
+func TestTaskAnchor_HardeningVerdictsCarryNoSessionEvidence(t *testing.T) {
+	eng := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+		enforcement.WithTaskAnchoredState(),
+		enforcement.WithEffectCeiling(&capability.EffectCeiling{MaxEffectClass: capability.EffectReversible}),
+	)
+	ctx := context.Background()
+
+	// An unauthenticated call falls back to the session and taints THAT bucket. Annotated
+	// reversible: unannotated resolves to irreversible, which the ceiling would escalate.
+	source := sourceCaps("read_customer", capability.FlowLabelPII)
+	source[0].Effect = &capability.EffectContract{Class: capability.EffectReversible}
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_customer"), source).Decision)
+
+	authed := req("s", "publish")
+	authed.Claims = map[string]interface{}{"sub": "svc@example.com"}
+
+	overCeiling := sinkCaps("publish", capability.FlowLabelPublic)[0]
+	overCeiling.Effect = &capability.EffectContract{Class: capability.EffectIrreversible}
+	verdict := eng.CeilingVerdictFor(ctx, authed, &overCeiling)
+	require.NotNil(t, verdict, "the ceiling escalation itself must not stand down")
+	assert.Nil(t, verdict.CarriedLabels,
+		"the escalation must not report labels read from the very bucket the full path refuses to account against")
+	assert.NotContains(t, verdict.Denial.Details, "carried_labels")
+
+	unapproved := sinkCaps("publish", capability.FlowLabelPublic)[0]
+	unapproved.Directives = append(unapproved.Directives,
+		capability.DeclassifyDirective{Labels: []string{capability.FlowLabelPII}})
+	verdict = eng.DeclassifyVerdictFor(ctx, authed, &unapproved)
+	require.NotNil(t, verdict, "the declassify escalation itself must not stand down")
+	assert.Nil(t, verdict.CarriedLabels,
+		"the escalation must not report labels read from the very bucket the full path refuses to account against")
+	assert.NotContains(t, verdict.Denial.Details, "carried_labels")
+}
+
 // TestTaskAnchor_NoRollbackAcrossASharedTaskKey pins why the label rollback stands down under
 // task anchoring: the snapshot it computes its delta from is taken under ONE session's decision
 // lock, and that lock does not span a task key two sessions share. Removing a label a
