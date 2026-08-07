@@ -333,7 +333,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		// in the older revision — so opening one IS negotiating it. Each request is checked
 		// against this pin, so one declaring a different revision is refused rather than
 		// switching method tables mid-context.
-		hostRev:        capability.Revision20251125,
+		hostRev:        handshakeRevision,
 		upstreamRevPin: route.upstreamProtocolVersion,
 	}
 	// Cleared only when newSession returns, so the idle reaper spares the drift-check window.

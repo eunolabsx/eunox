@@ -1803,7 +1803,7 @@ func TestAuditOnly_StdioProxy_DeniedToolForwarded(t *testing.T) {
 		response: mcp.RPCMsg{JSONRPC: "2.0", Result: fakeResult},
 	})
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0",
 		ID:      mcp.RawJSON(`42`),
 		Method:  "tools/call",

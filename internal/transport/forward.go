@@ -881,7 +881,14 @@ type serverRequestParams struct {
 	claims    *pdp.JWTClaims
 	// pdp is the decision point this leg decides with. Nothing here is DERIVED from it — a
 	// declassification is refused here rather than committed — so a plain field is enough.
-	pdp           pdp.PolicyDecisionPoint
+	pdp pdp.PolicyDecisionPoint
+	// revision is the revision this session's HOST context negotiated. This leg has no host
+	// request to read one from, so each transport supplies the fact and forwardServerRequest
+	// stamps it — a new server-initiated entry point inherits the stamp rather than needing it
+	// re-placed, which is how this leg came to record every sampling decision on a negotiated
+	// session as though no revision had been resolved. Empty means the host has not negotiated
+	// yet, and stays absent on the record: that IS the honest reading.
+	revision      capability.Revision
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
 	// decideLock serializes the sampling decision against host-path decisions on the same
@@ -1089,6 +1096,12 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// roots/list, elicitation/create, etc. Inert for stdio (claims always nil).
 	if fp.claims != nil {
 		ctx = pdp.WithJWTClaims(ctx, fp.claims)
+	}
+	// Stamped here for the same reason the claims are: both branches record, and a stamp
+	// placed in one transport's caller is a stamp the other transport (or the next entry
+	// point) can be written without.
+	if fp.revision != "" {
+		ctx = capability.WithProtocolRevision(ctx, fp.revision)
 	}
 	if msg.Method != samplingMethod {
 		if deny := fp.pdp.CheckKill(ctx, fp.sessionID); deny != nil {

@@ -21,7 +21,6 @@ import (
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/transport"
-	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // LiveUpstreamInfo holds the tool list and server metadata fetched from a live MCP HTTP
@@ -41,9 +40,12 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 
 	// The probe opens with `initialize`, which exists only in the handshake-bearing
 	// revision — so that is the revision this leg speaks, and what its post-handshake
-	// requests declare. A discover-first opener is not implemented yet.
+	// requests declare. Read off the proxy's own method registry (transport.HandshakeRevision)
+	// rather than restated here, so the probe and the running proxy cannot open at different
+	// revisions. A discover-first opener is not implemented yet.
+	handshakeRev := transport.HandshakeRevision()
 	initResp, respHdr, err := transport.DoMCPHTTP(ctx, client, endpoint,
-		transport.BuildInitializeRequestWithID(mcp.RawJSON(`1`)), "", authHeader, capability.Revision20251125)
+		transport.BuildInitializeRequestWithID(mcp.RawJSON(`1`)), "", authHeader, handshakeRev)
 	// Capture the session id and arm the terminating DELETE BEFORE the err gate: a lenient
 	// upstream may have already allocated a server-side session even on a failed initialize,
 	// so it must be closed on every error path, not only success.
@@ -51,7 +53,7 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 	if respHdr != nil {
 		if sessID = respHdr.Get(transport.SessionHeader); sessID != "" {
 			//nolint:contextcheck // teardown deliberately uses the helper's own bounded background context: it runs from the defer as the probe's request context is being canceled.
-			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, capability.Revision20251125)
+			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, handshakeRev)
 		}
 	}
 	if err != nil {
@@ -67,14 +69,14 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 	serverVersion := hs.ServerVersion
 
 	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
-	if _, _, err := transport.DoMCPHTTP(ctx, client, endpoint, notif, sessID, authHeader, capability.Revision20251125); err != nil {
+	if _, _, err := transport.DoMCPHTTP(ctx, client, endpoint, notif, sessID, authHeader, handshakeRev); err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("notifications/initialized: %w", err)
 	}
 
 	// Page tools/list to exhaustion so the full tool catalog is observed.
 	merged, err := drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
 		req := drift.ToolsListRequest(mcp.RawJSON(`2`), cursor)
-		listResp, _, err := transport.DoMCPHTTP(ctx, client, endpoint, req, sessID, authHeader, capability.Revision20251125)
+		listResp, _, err := transport.DoMCPHTTP(ctx, client, endpoint, req, sessID, authHeader, handshakeRev)
 		if err != nil {
 			return nil, fmt.Errorf("tools/list: %w", err)
 		}

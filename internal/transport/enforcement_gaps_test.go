@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -759,7 +760,7 @@ func TestStdioProxy_RecStampsPolicyProvenance(t *testing.T) {
 
 	const method = "tools/uninstall" // any unmapped notification triggers a deny record
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: method, Params: json.RawMessage(`{}`)}
-	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown here")
 	}
 
@@ -844,7 +845,7 @@ func TestStdioForwardHostNotification_EnforcedMethodDenied(t *testing.T) {
 				t.Fatal("test message must be notification-shaped (no id) to exercise the bypass path")
 			}
 
-			stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg)
+			stop := p.forwardHostNotification(context.Background(), msg)
 			if stop {
 				t.Fatal("forwardHostNotification must not signal shutdown for a denied notification")
 			}
@@ -874,7 +875,7 @@ func TestStdioForwardHostNotification_OrdinaryNotificationStillForwarded(t *test
 	p, _, uw := newStdioProxyForSamplingTest(t, pdp.AlwaysAllowPDP{})
 
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/progress", Params: json.RawMessage(`{"p":1}`)}
-	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown here")
 	}
 	if len(uw.messages) != 1 || uw.messages[0].Method != "notifications/progress" {
@@ -901,7 +902,7 @@ func TestStdioForwardHostNotification_UnmappedNotificationDeniedAndRecorded(t *t
 		t.Fatal("test message must be notification-shaped (no id)")
 	}
 
-	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown here")
 	}
 	if len(uw.messages) != 0 {
@@ -935,7 +936,7 @@ func TestStdioForwardHostNotification_MidSessionInitializeSwallowed(t *testing.T
 		t.Fatal("test message must be notification-shaped (no id) to exercise the swallow path")
 	}
 
-	if stop := p.forwardHostNotification(context.Background(), capability.DefaultRevision, msg); stop {
+	if stop := p.forwardHostNotification(context.Background(), msg); stop {
 		t.Fatal("forwardHostNotification must not signal shutdown for a swallowed initialize notification")
 	}
 	if len(uw.messages) != 0 {
@@ -1490,7 +1491,7 @@ func TestGap3_HTTPProxy_ResourcesUnsubscribe_AllowedAfterQuotaExhausted(t *testi
 // notification-framed unsubscribe must be rejected like every other enforced method
 // rather than forwarded verbatim.
 func TestGap3_ResourcesUnsubscribe_IsEnforcedMethod(t *testing.T) {
-	if !isEnforcedMethod(capability.Revision20251125, capability.MethodResourcesUnsubscribe) {
+	if !isEnforcedMethod(revisionContext(capability.Revision20251125), capability.MethodResourcesUnsubscribe) {
 		t.Error("resources/unsubscribe must be in the enforced (Decide*) set")
 	}
 	if tt, ok := capability.MethodTargetType(capability.MethodResourcesUnsubscribe); !ok || tt != capability.TargetTypeResource {
@@ -2705,7 +2706,7 @@ func TestStdioHandleToolsCall_EmptyName_InvalidParams(t *testing.T) {
 	p, hw := closedUpstream(t)
 	p.pdp = newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}})
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"","arguments":{}}`),
 	})
@@ -2809,5 +2810,98 @@ func TestPing_KilledSessionGetsKillSwitchNotPong(t *testing.T) {
 	}
 	if len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeKillSwitch {
 		t.Fatalf("want a single KILL_SWITCH record for the refused ping, got %+v", rec.records)
+	}
+}
+
+// The per-revision cells below live here, not beside the negotiation unit tests, because
+// revision scoping changes WHICH METHODS ARE DISPATCHED FOR WHICH PEER — which is exactly the
+// coverage this file is the designated home for. The machinery that derives the tables from
+// the declarations is pinned separately in dispatch_revision_test.go.
+
+// TestGapRevision_DispatchRequestPerRevisionUnmappedDenials is the fail-closed sweep across
+// the seam: a method outside the requesting peer's table hits dispatchUnmapped exactly as an
+// unknown method does, with the AUTHORIZATION_FAILED record that path already writes. Removal
+// is expressed by absence — there is no second mechanism to assert.
+func TestGapRevision_DispatchRequestPerRevisionUnmappedDenials(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		rev      capability.Revision
+		method   string
+		wantDeny bool
+	}{
+		{name: "ping is answered for an old-revision peer", rev: capability.Revision20251125, method: methodPing},
+		{name: "ping is denied for a new-revision peer", rev: capability.Revision20260728, method: methodPing, wantDeny: true},
+		{name: "initialize is answered for an old-revision peer", rev: capability.Revision20251125, method: mcp.MethodInitialize},
+		{name: "initialize is denied for a new-revision peer", rev: capability.Revision20260728, method: mcp.MethodInitialize, wantDeny: true},
+		{name: "server/discover is denied for an old-revision peer", rev: capability.Revision20251125, method: "server/discover", wantDeny: true},
+		{name: "server/discover is denied until its responder is implemented", rev: capability.Revision20260728, method: "server/discover", wantDeny: true},
+		{name: "resources/subscribe is denied for a new-revision peer", rev: capability.Revision20260728, method: capability.MethodResourcesSubscribe, wantDeny: true},
+		{name: "resources/unsubscribe is denied for a new-revision peer", rev: capability.Revision20260728, method: capability.MethodResourcesUnsubscribe, wantDeny: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rec := &fwdRecorder{}
+			d := dispatchParams{
+				forwardParams: forwardParams{rec: rec, errOut: io.Discard},
+				pdp:           pdp.AlwaysAllowPDP{},
+				buildInit: func(msg mcp.RPCMsg) mcp.RPCMsg {
+					return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}
+				},
+			}
+			out := dispatchRequest(revisionContext(tc.rev), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method})
+			if !tc.wantDeny {
+				if out.Error != nil {
+					t.Fatalf("%s under %s must be answered, got error %+v", tc.method, tc.rev, out.Error)
+				}
+				return
+			}
+			if out.Error == nil {
+				t.Fatalf("%s under %s must be denied, got result %s", tc.method, tc.rev, out.Result)
+			}
+			if len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeAuthorizationFailed {
+				t.Fatalf("records = %+v, want one AUTHORIZATION_FAILED deny", rec.records)
+			}
+		})
+	}
+}
+
+// TestGapRevision_NotificationTablesPerRevision: roots/list_changed is forwardable to an
+// old-revision upstream and dropped-plus-recorded for a new-revision peer (the capability is
+// deprecated there), while notifications/initialized stops being a swallowed construct and
+// becomes an ordinary unmapped notification — the revision has no handshake to close.
+func TestGapRevision_NotificationTablesPerRevision(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		rev        capability.Revision
+		method     string
+		wantDenied bool
+	}{
+		{rev: capability.Revision20251125, method: methodNotificationsRootsListChanged, wantDenied: false},
+		{rev: capability.Revision20260728, method: methodNotificationsRootsListChanged, wantDenied: true},
+		{rev: capability.Revision20251125, method: methodNotificationsCancelled, wantDenied: false},
+		{rev: capability.Revision20260728, method: methodNotificationsCancelled, wantDenied: false},
+		{rev: capability.Revision20260728, method: mcp.MethodNotificationsInitialized, wantDenied: true},
+	}
+	for _, tc := range cases {
+		rec := &fwdRecorder{}
+		msg := mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}
+		gate := hostNotificationGate{rec: rec, sessionID: "sess", errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+		denied := !gate.admit(revisionContext(tc.rev), msg)
+		if denied != tc.wantDenied {
+			t.Errorf("%s under %s: denied = %v, want %v", tc.method, tc.rev, denied, tc.wantDenied)
+		}
+		if tc.wantDenied && (len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeAuthorizationFailed) {
+			t.Errorf("%s under %s: records = %+v, want the drop recorded", tc.method, tc.rev, rec.records)
+		}
+	}
+	// The swallowed set is the one disposition that writes NO record, so it is asserted
+	// separately: silently dropping a method the revision does not have would hide it.
+	rec := &fwdRecorder{}
+	gate := hostNotificationGate{rec: rec, sessionID: "sess", errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+	initialized := mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized}
+	if gate.admit(revisionContext(capability.Revision20251125), initialized) || len(rec.records) != 0 {
+		t.Errorf("notifications/initialized must stay swallowed (dropped, unrecorded) for an old-revision peer; records = %+v", rec.records)
 	}
 }

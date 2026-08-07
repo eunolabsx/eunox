@@ -186,8 +186,9 @@ func (p *HTTPProxy) strictAudit() strictAuditState {
 
 // dispatchParams bundles this session's policy/audit/upstream wiring for the shared request
 // dispatcher. The route sink is routed through asRecorder so a nil sink becomes a true nil
-// interface.
-func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string, rev capability.Revision) dispatchParams {
+// interface. The request's revision is NOT among them — it rides the context; see
+// requestRevision.
+func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchParams {
 	rt := sess.route
 	return dispatchParams{
 		forwardParams: forwardParams{
@@ -204,7 +205,6 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string, rev capab
 		buildInit:        sess.buildInitResponse,
 		receipts:         rt.receipts,
 		honorAttribution: rt.honorAttribution,
-		revision:         rev,
 	}
 }
 
@@ -272,16 +272,17 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	}
 	// sess.broadcastServerRequest reports whether an SSE subscriber received the request;
 	// sess.claims is attached so per-agent kills are honored and records carry agent_id.
-	// The session's revision is known here, so the leg's records must name it. Without this
-	// stamp a sampling decision on a fully negotiated session was indistinguishable on the tape
-	// from a pre-session refusal, which is the one case an absent field is supposed to mean.
-	ctx = capability.WithProtocolRevision(ctx, sess.hostRev)
 	forwardServerRequest(ctx, msg, serverRequestParams{
-		rec:           asRecorder(rt.sink),
-		audit:         rt.audit,
-		sessionID:     sess.id,
-		sourceIP:      sess.clientIP,
-		claims:        sess.claims,
+		rec:       asRecorder(rt.sink),
+		audit:     rt.audit,
+		sessionID: sess.id,
+		sourceIP:  sess.clientIP,
+		claims:    sess.claims,
+		// The session's revision is known here, so the leg's records must name it — without
+		// it a sampling decision on a fully negotiated session was indistinguishable on the
+		// tape from a pre-session refusal, the one case an absent field is supposed to mean.
+		// forwardServerRequest does the stamping; this supplies the fact.
+		revision:      sess.hostRev,
 		forward:       sess.broadcastServerRequest,
 		writeUpstream: func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
 		decideLock:    decideLock,

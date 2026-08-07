@@ -48,9 +48,8 @@ func TestUnmappedDenial_NamesNoPolicyTargetForARemovedMethod(t *testing.T) {
 			d := dispatchParams{
 				forwardParams: forwardParams{rec: rec, errOut: io.Discard},
 				pdp:           pdp.AlwaysAllowPDP{},
-				revision:      tc.rev,
 			}
-			dispatchUnmapped(context.Background(), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method})
+			dispatchUnmapped(revisionContext(tc.rev), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method})
 			if len(rec.records) != 1 {
 				t.Fatalf("records = %+v, want exactly one", rec.records)
 			}
@@ -68,7 +67,8 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetForARemovedMethod(t *test
 	t.Parallel()
 	rec := &fwdRecorder{}
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodResourcesSubscribe}
-	if !denyUnmappedHostNotification(context.Background(), io.Discard, rec, "sess", capability.Revision20260728, msg) {
+	gate := hostNotificationGate{rec: rec, sessionID: "sess", errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+	if gate.admit(revisionContext(capability.Revision20260728), msg) {
 		t.Fatal("a method the revision removed must be denied in notification framing too")
 	}
 	if len(rec.records) != 1 || rec.records[0].identifier != "" {
@@ -98,8 +98,8 @@ func TestSetNegotiatedVersionHeader_AlwaysSignalsAVersion(t *testing.T) {
 	for _, rev := range []capability.Revision{"", capability.Revision20251125, capability.Revision20260728, "1999-01-01"} {
 		req := newTestRequestForHeader(t)
 		setNegotiatedVersionHeader(req, rev)
-		if got := req.Header.Get("MCP-Protocol-Version"); got != capability.Revision20251125.String() {
-			t.Errorf("rev %q: MCP-Protocol-Version = %q, want %q — a post-handshake request must always carry the version the handshake negotiated", rev, got, capability.Revision20251125)
+		if got := req.Header.Get("MCP-Protocol-Version"); got != handshakeRevision.String() {
+			t.Errorf("rev %q: MCP-Protocol-Version = %q, want %q — a post-handshake request must always carry the version the handshake negotiated", rev, got, handshakeRevision)
 		}
 	}
 }

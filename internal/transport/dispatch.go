@@ -3,6 +3,31 @@
 
 // Shared request dispatch: the single method→handler mapping and fail-closed
 // default both transports route enforced MCP requests through.
+//
+// # Gate order
+//
+// The cross-cutting gates every host message passes are ordered ONCE, here, rather than
+// re-derived at each transport's prologue. Both transports inherit it: the notification
+// framing by calling hostNotificationGate.admit, the request framing by dispatchRequest.
+//
+//  1. REVISION negotiation (resolveHostRevision / refuseHostRevision). First, because every
+//     table below is revision-scoped: a message whose revision cannot be established has no
+//     table to be looked up in. Its one cost is a labelling exception — a revoked session's
+//     bad-version probe is recorded as UNSUPPORTED_PROTOCOL_VERSION rather than KILL_SWITCH,
+//     on a message refused either way that contacts no upstream and mutates no state.
+//     Negotiation is also what stamps the revision onto the context every later gate records
+//     under, so a gate placed ahead of it would write a record naming no revision at all.
+//  2. The SWALLOWED set (notification framing only): a method the proxy has already handled
+//     is neither an error nor an event, so it is dropped before anything that would record it.
+//  3. REVOCATION (kill switch). Locally-answered requests share dispatchRequest's boundary
+//     gate; Decide* requests carry their own richer record inside enforcedForwardCore;
+//     notifications take it from hostNotificationGate.
+//  4. FAIL-CLOSED routing: enforced-method-as-notification smuggling, then the unmapped
+//     default (dispatchUnmapped / notifyUnmapped).
+//
+// The order and its exception are pinned by TestGateOrder_* in gate_order_test.go, so a
+// reordered prologue fails a test rather than silently changing which code a revoked
+// session's probes are recorded under.
 
 package transport
 
@@ -43,12 +68,6 @@ type dispatchParams struct {
 	// receipts verifies a tool result's signed effect receipt against this upstream's
 	// configured key domain. nil (the default) skips the whole surface entirely.
 	receipts *capability.EffectReceiptVerifier
-
-	// revision is the MCP protocol revision this request was negotiated under; it selects
-	// the dispatch tables. The zero value means the caller never negotiated one and resolves
-	// to capability.DefaultRevision (see tablesFor) — the surface eunox already shipped, so
-	// omission can never reach a different method set.
-	revision capability.Revision
 
 	// honorAttribution admits the client-supplied attribution interface (_meta's
 	// io.eunolabs.context-manifest block), gated on the route's schemaVersion since the
@@ -120,19 +139,33 @@ const (
 // Removal across revisions is expressed by ABSENCE from In: a method outside the requesting
 // peer's tables falls to dispatchUnmapped exactly as an unknown method does, so there is no
 // second removal mechanism to keep in step with the first.
+// The request handler is declared as one of TWO typed fields rather than a handler paired
+// with an "is it enforced" flag: the flag made `enforced, no handler` representable, an
+// invalid state a registry test had to reject by hand. Which field carries the handler IS
+// the classification, so isEnforcedMethod and "which handler runs" cannot diverge.
 type methodSpec struct {
 	// In lists the revisions this method exists in. An entry declaring none is refused by
 	// buildRevisionDispatch (dispatched under no revision) and fails
 	// TestMethodRegistry_EveryMethodDeclaresRevisionMembership.
 	In []capability.Revision
-	// Handler answers the request framing; nil for a notification-only method.
-	Handler methodHandler
-	// Enforced marks Handler as a Decide* handler — the one that carries its own kill
-	// record and takes the decision turn. It is what isEnforcedMethod derives from, so
-	// "is this enforced" and "which handler runs" cannot diverge.
-	Enforced bool
+	// Decide answers the request framing through the PDP: it carries its own richer kill
+	// record inside enforcedForwardCore and takes the decision turn.
+	Decide methodHandler
+	// Local answers the request framing inside the proxy, under dispatchRequest's boundary
+	// kill gate. Setting it alongside Decide is refused by
+	// TestMethodRegistry_EveryMethodDeclaresRevisionMembership.
+	Local methodHandler
 	// Notification is the disposition of this method's notification framing.
 	Notification notificationDisposition
+}
+
+// handler returns the method's request handler and whether it is the enforced (Decide*) one.
+// Nil for a notification-only method.
+func (s methodSpec) handler() (methodHandler, bool) {
+	if s.Decide != nil {
+		return s.Decide, true
+	}
+	return s.Local, false
 }
 
 // methodNotificationsProgress and methodNotificationsRootsListChanged are notification
@@ -153,36 +186,31 @@ var methodRegistry = map[string]methodSpec{
 	// Enforced (Decide*) methods. The resources/subscribe pair is 2025-11-25 only:
 	// 2026-07-28 replaces it with subscriptions/listen, which is not implemented yet.
 	capability.MethodToolsCall: {
-		In:       []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Handler:  dispatchToolsCall,
-		Enforced: true,
+		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide: dispatchToolsCall,
 	},
 	capability.MethodResourcesRead: {
-		In:       []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Handler:  dispatchResourcesRead,
-		Enforced: true,
+		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide: dispatchResourcesRead,
 	},
 	capability.MethodResourcesSubscribe: {
-		In:       []capability.Revision{capability.Revision20251125},
-		Handler:  dispatchResourcesSubscribe,
-		Enforced: true,
+		In:     []capability.Revision{capability.Revision20251125},
+		Decide: dispatchResourcesSubscribe,
 	},
 	capability.MethodResourcesUnsubscribe: {
-		In:       []capability.Revision{capability.Revision20251125},
-		Handler:  dispatchResourcesUnsubscribe,
-		Enforced: true,
+		In:     []capability.Revision{capability.Revision20251125},
+		Decide: dispatchResourcesUnsubscribe,
 	},
 	capability.MethodPromptsGet: {
-		In:       []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Handler:  dispatchPromptsGet,
-		Enforced: true,
+		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide: dispatchPromptsGet,
 	},
 
 	// Locally answered methods. initialize and ping are handshake/utility methods
 	// 2026-07-28 removes; the three */list methods exist in both revisions.
 	mcp.MethodInitialize: {
-		In:      []capability.Revision{capability.Revision20251125},
-		Handler: dispatchInitialize,
+		In:    []capability.Revision{capability.Revision20251125},
+		Local: dispatchInitialize,
 		// "initialize" can arrive with no id (a notification by IsNotification's structural
 		// classification); forwarding it verbatim would re-trigger the upstream handshake
 		// outside the kill gate, so the notification framing is swallowed.
@@ -190,25 +218,25 @@ var methodRegistry = map[string]methodSpec{
 	},
 	methodPing: {
 		In: []capability.Revision{capability.Revision20251125},
-		Handler: func(_ context.Context, _ dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		Local: func(_ context.Context, _ dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchPing(msg)
 		},
 	},
 	capability.MethodResourcesList: {
 		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Handler: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
 		},
 	},
 	capability.MethodToolsList: {
 		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Handler: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterToolsList)
 		},
 	},
 	capability.MethodPromptsList: {
 		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Handler: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterPromptsList)
 		},
 	},
@@ -234,13 +262,17 @@ var methodRegistry = map[string]methodSpec{
 	},
 }
 
-// revisionTables is one revision's four derived routing tables — the shape the dispatcher
-// and the two transports actually consult.
+// revisionTables is one revision's derived routing tables — the shape the dispatcher and the
+// two transports actually consult.
+//
+// The notification dispositions are ONE map rather than a set-map per disposition: two
+// mutually-exclusive sets could both claim a method, and the fail-closed notifyUnmapped came
+// from neither of them. As a single map it is the zero value, so a method with no entry
+// falls to it by construction.
 type revisionTables struct {
-	decide               map[string]methodHandler
-	local                map[string]methodHandler
-	forwardNotifications map[string]struct{}
-	swallowNotifications map[string]struct{}
+	decide        map[string]methodHandler
+	local         map[string]methodHandler
+	notifications map[string]notificationDisposition
 }
 
 // revisionDispatch holds the per-revision tables derived from methodRegistry at init.
@@ -256,10 +288,9 @@ func buildRevisionDispatch(registry map[string]methodSpec) map[capability.Revisi
 	out := make(map[capability.Revision]revisionTables, len(capability.PublishedRevisions()))
 	for _, rev := range capability.PublishedRevisions() {
 		out[rev] = revisionTables{
-			decide:               map[string]methodHandler{},
-			local:                map[string]methodHandler{},
-			forwardNotifications: map[string]struct{}{},
-			swallowNotifications: map[string]struct{}{},
+			decide:        map[string]methodHandler{},
+			local:         map[string]methodHandler{},
+			notifications: map[string]notificationDisposition{},
 		}
 	}
 	for method, spec := range registry {
@@ -268,24 +299,40 @@ func buildRevisionDispatch(registry map[string]methodSpec) map[capability.Revisi
 			if !ok {
 				continue // a revision this build does not speak: contribute nothing
 			}
-			if spec.Handler != nil {
-				if spec.Enforced {
-					tables.decide[method] = spec.Handler
+			if handler, enforced := spec.handler(); handler != nil {
+				if enforced {
+					tables.decide[method] = handler
 				} else {
-					tables.local[method] = spec.Handler
+					tables.local[method] = handler
 				}
 			}
-			switch spec.Notification {
-			case notifyForward:
-				tables.forwardNotifications[method] = struct{}{}
-			case notifySwallow:
-				tables.swallowNotifications[method] = struct{}{}
-			case notifyUnmapped:
-				// The fail-closed default: recorded and dropped, no table entry.
+			// notifyUnmapped is left absent deliberately: it is the map's zero value, so the
+			// fail-closed default needs no entry to be reached.
+			if spec.Notification != notifyUnmapped {
+				tables.notifications[method] = spec.Notification
 			}
 		}
 	}
 	return out
+}
+
+// handshakeRevision is the revision whose method set contains `initialize` — the one place
+// "the handshake exists only in the older revision" is written down, DERIVED from
+// methodRegistry rather than restated at each site that opens, answers, or version-stamps a
+// handshake. A registry that stops declaring exactly one revision for `initialize` falls back
+// to the shipped default here (production must not panic on a data slip) and fails
+// TestHandshakeRevision_DerivedFromTheRegistry.
+var handshakeRevision = deriveHandshakeRevision(methodRegistry)
+
+// HandshakeRevision returns the MCP revision that defines the `initialize` handshake, so the
+// CLI's live-upstream probes open a leg at the same revision the running proxy does.
+func HandshakeRevision() capability.Revision { return handshakeRevision }
+
+func deriveHandshakeRevision(registry map[string]methodSpec) capability.Revision {
+	if spec, ok := registry[mcp.MethodInitialize]; ok && len(spec.In) == 1 {
+		return spec.In[0]
+	}
+	return capability.DefaultRevision
 }
 
 // removedInRevision reports whether method is one this build dispatches under SOME revision
@@ -300,13 +347,38 @@ func removedInRevision(rev capability.Revision, method string) bool {
 	return !slices.Contains(spec.In, rev)
 }
 
-// effectiveRevision returns the revision this request was negotiated under, resolving the
-// zero value the same way tablesFor does so the record and the routing cannot disagree.
-func (d dispatchParams) effectiveRevision() capability.Revision {
-	if d.revision == "" {
-		return capability.DefaultRevision
+// requestRevision returns the revision this request is dispatched under, read from the ONE
+// carrier: the context the transports stamp at negotiation, which is also where the audit
+// sink reads protocol_revision from.
+//
+// It is deliberately not ALSO a field on dispatchParams. Two carriers threaded by hand from
+// the same local variable had opposite zero-value semantics — the field resolved to
+// DefaultRevision, the context omitted the field entirely — so any entry point that threaded
+// one and forgot the other wrote a record claiming no revision was decided for a request the
+// dispatcher decided under 2025-11-25. That is the same argument
+// enforcement.ResolveStateAnchor makes for the state anchor: a second reading of the same
+// question is where the two silently diverge.
+//
+// A context that carries no revision resolves to capability.DefaultRevision — the surface
+// eunox already shipped, so omission can never reach a different method set. Every dispatch
+// decision reads that fallback HERE, so no two of them can resolve the empty carrier
+// differently. The audit sink's omission is not a third reading of the same question: it
+// records what was negotiated, and "nothing was" is a fact a pre-negotiation refusal needs to
+// be able to state.
+func requestRevision(ctx context.Context) capability.Revision {
+	if rev := capability.ProtocolRevisionFromContext(ctx); rev != "" {
+		return rev
 	}
-	return d.revision
+	return capability.DefaultRevision
+}
+
+// tablesFromContext returns the routing tables for the revision the request was negotiated
+// under. Re-derived from the single carrier at each lookup rather than resolved once and
+// passed alongside it: a carried copy is exactly the second carrier this seam exists to
+// remove. The cost is one map lookup per dispatch decision — two per enforced request, since
+// the transports ask isEnforcedMethod before dispatching one.
+func tablesFromContext(ctx context.Context) revisionTables {
+	return tablesFor(requestRevision(ctx))
 }
 
 // tablesFor returns the routing tables for rev.
@@ -323,64 +395,76 @@ func tablesFor(rev capability.Revision) revisionTables {
 	return revisionDispatch[rev]
 }
 
-// isEnforcedMethod reports whether method is one of rev's Decide* methods, derived from the
-// same declarations dispatchRequest routes by so the two cannot drift.
-func isEnforcedMethod(rev capability.Revision, method string) bool {
-	_, ok := tablesFor(rev).decide[method]
+// isEnforcedMethod reports whether method is one of the request's revision's Decide* methods,
+// derived from the same declarations dispatchRequest routes by so the two cannot drift.
+func isEnforcedMethod(ctx context.Context, method string) bool {
+	_, ok := tablesFromContext(ctx).decide[method]
 	return ok
 }
 
-// isSwallowedHostNotification reports whether a host->upstream notification of this method
-// must be dropped silently under rev rather than forwarded or recorded.
-func isSwallowedHostNotification(rev capability.Revision, method string) bool {
-	_, ok := tablesFor(rev).swallowNotifications[method]
-	return ok
+// hostNotificationGate is the per-transport wiring the shared notification gate needs. The
+// gate itself — which checks run, and in what order — is not per-transport; see the package
+// gate order at the top of this file.
+type hostNotificationGate struct {
+	rec       auditRecorder
+	sessionID string
+	errOut    io.Writer
+	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
+	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
+	// notification is dropped before revocation is even a question.
+	checkKill func() *capability.EnforceResponse
+	// leg names this transport's notification leg in a kill-drop record.
+	leg killDropLeg
 }
 
-// isForwardableHostNotification reports whether a host->upstream notification of this
-// method is allowlisted for verbatim forwarding under rev.
-func isForwardableHostNotification(rev capability.Revision, method string) bool {
-	_, ok := tablesFor(rev).forwardNotifications[method]
-	return ok
-}
-
-// denyUnmappedHostNotification denies (and records) a notification outside the requesting
-// peer's forwardable allowlist — the notification-framed analogue of dispatchUnmapped.
-// Shared by both transports so the check and record live once. Returns true when msg was
-// denied. Before this existed, an unrecognized notification-framed method reached the
-// upstream invisibly while its request-framed twin was denied and logged.
-func denyUnmappedHostNotification(ctx context.Context, w io.Writer, rec auditRecorder, sessionID string, rev capability.Revision, msg mcp.RPCMsg) bool {
-	if isForwardableHostNotification(rev, msg.Method) {
+// admit applies every cross-cutting gate a host->upstream notification passes, in the one
+// canonical order, and reports whether it may be forwarded verbatim. A false return means the
+// gate already disposed of the notification — swallowed silently, or dropped WITH its record —
+// and the caller need only ack.
+//
+// Shared by both transports so the checks, their order, and their audit records cannot drift
+// between them; before it existed each transport hand-placed the same four steps. It also
+// resolves the revision's tables ONCE, where the three separate predicates it replaces each
+// resolved their own.
+func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
+	tables := tablesFromContext(ctx)
+	disposition := tables.notifications[msg.Method]
+	if disposition == notifySwallow {
 		return false
 	}
+	if kill := g.checkKill(); kill != nil {
+		recordKillDrop(ctx, g.rec, kill, verifiedSession(g.sessionID), msg.Method, msg.Method, g.leg)
+		return false
+	}
+	// An enforced method framed as a notification (no id) is a fail-closed reject: forwarding
+	// it verbatim would bypass both the PDP decision and the audit record.
+	if _, enforced := tables.decide[msg.Method]; enforced {
+		if g.rec != nil {
+			g.rec.RecordDeny(ctx, g.sessionID, msg.Method, msg.Method, codeInvalidRequest, "", nil, false)
+		}
+		return false
+	}
+	if disposition == notifyForward {
+		return true
+	}
+	// notifyUnmapped, the notification-framed analogue of dispatchUnmapped. Before this
+	// existed, an unrecognized notification-framed method reached the upstream invisibly while
+	// its request-framed twin was denied and logged.
+	//
 	// Identifier dropped for a method the peer's revision removed — see dispatchUnmapped for
 	// why: resources/subscribe resolves a target type, so recording it as the identifier would
 	// stamp a resource literally named after the method onto the signed tape.
 	identifier := msg.Method
-	if removedInRevision(rev, msg.Method) {
+	if removedInRevision(requestRevision(ctx), msg.Method) {
 		identifier = ""
 	}
-	if rec != nil {
-		rec.RecordDeny(ctx, sessionID, identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
+	if g.rec != nil {
+		g.rec.RecordDeny(ctx, g.sessionID, identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
 	}
-	_, _ = fmt.Fprintf(resolvedErrOut(w),
+	_, _ = fmt.Fprintf(resolvedErrOut(g.errOut),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
 		audit.SanitizeAuditField(msg.Method))
-	return true
-}
-
-// denyEnforcedMethodNotification denies (and records) an enforced Decide* method smuggled in
-// via notification framing (no id) rather than request framing — forwarding it verbatim would
-// bypass both the PDP decision and the audit record. Shared by both transports; returns true
-// when msg was denied.
-func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sessionID string, rev capability.Revision, msg mcp.RPCMsg) bool {
-	if !isEnforcedMethod(rev, msg.Method) {
-		return false
-	}
-	if rec != nil {
-		rec.RecordDeny(ctx, sessionID, msg.Method, msg.Method, codeInvalidRequest, "", nil, false)
-	}
-	return true
+	return false
 }
 
 // dispatchRequest routes an enforced MCP request to its handler and returns the JSON-RPC
@@ -390,9 +474,10 @@ func denyEnforcedMethodNotification(ctx context.Context, rec auditRecorder, sess
 // The kill gate is applied STRUCTURALLY: Decide* methods embed their own richer kill record
 // inside enforcedForwardCore and skip the boundary gate; every other (locally-answered) method
 // shares one simple gate applied here, so a new locally-answered method inherits revocation by
-// construction rather than needing killDenied re-placed inside its handler.
+// construction rather than needing killDenied re-placed inside its handler. Its position
+// relative to revision negotiation is the package gate order at the top of this file.
 func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	tables := tablesFor(d.revision)
+	tables := tablesFromContext(ctx)
 	if handler, ok := tables.decide[msg.Method]; ok {
 		return handler(ctx, d, msg)
 	}
@@ -425,7 +510,7 @@ var enforcedMethodSummary = enforcedMethodNames()
 func enforcedMethodNames() string {
 	methods := make([]string, 0, len(methodRegistry))
 	for method, spec := range methodRegistry {
-		if spec.Enforced {
+		if spec.Decide != nil {
 			methods = append(methods, method)
 		}
 	}
@@ -842,7 +927,7 @@ func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 	// resource literally named "resources/subscribe" onto the signed tape and let `eunox
 	// suggest` mine a capability for it. The method field still names what was denied.
 	identifier := msg.Method
-	if removedInRevision(d.effectiveRevision(), msg.Method) {
+	if removedInRevision(requestRevision(ctx), msg.Method) {
 		identifier = ""
 	}
 	if d.rec != nil {

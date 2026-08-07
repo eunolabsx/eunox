@@ -3018,7 +3018,7 @@ func TestHandleHostRequest_Initialize(t *testing.T) {
 		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
 		pdp:        pdp.AlwaysAllowPDP{}, // non-nil PDP invariant; CheckKill clears the way for initialize
 	}
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "initialize",
 	})
 	if len(hw.messages) == 0 {
@@ -3029,7 +3029,7 @@ func TestHandleHostRequest_Initialize(t *testing.T) {
 func TestHandleHostRequest_Default_UnmappedMethod(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "unknown/method",
 	})
 	if len(hw.messages) != 1 {
@@ -3059,7 +3059,7 @@ func TestHandleHostRequest_AllMethods(t *testing.T) {
 		t.Run(tc.method, func(t *testing.T) {
 			t.Parallel()
 			p, hw := closedUpstream(t)
-			p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+			p.handleHostRequest(context.Background(), mcp.RPCMsg{
 				JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method, Params: tc.params,
 			})
 			if len(hw.messages) == 0 {

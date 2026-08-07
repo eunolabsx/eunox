@@ -187,8 +187,9 @@ func buildInitializeParams() json.RawMessage {
 	params, _ := json.Marshal(map[string]interface{}{
 		// The handshake exists only in the older revision, so the version it offers is that
 		// revision by construction — a newer-revision upstream is reached through its own
-		// opener, not by offering it a version it removed.
-		"protocolVersion": capability.Revision20251125.String(),
+		// opener, not by offering it a version it removed. Read off the registry that
+		// declares which revision has `initialize` rather than restated here.
+		"protocolVersion": handshakeRevision.String(),
 		"capabilities":    map[string]interface{}{},
 		"clientInfo": map[string]interface{}{
 			"name":    proxyName,
@@ -224,9 +225,9 @@ func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, i
 		caps = map[string]interface{}{"tools": map[string]interface{}{}}
 	}
 	result := mcp.InitResult{
-		// Answering `initialize` at all means the host opened a 2025-11-25 context: the
-		// method does not exist in the newer revision, so the response cannot name one.
-		ProtocolVersion: capability.Revision20251125.String(),
+		// Answering `initialize` at all means the host opened a handshake-revision context:
+		// the method does not exist in the newer revision, so the response cannot name one.
+		ProtocolVersion: handshakeRevision.String(),
 		Capabilities:    caps,
 		ServerInfo: map[string]interface{}{
 			"name":    proxyName,

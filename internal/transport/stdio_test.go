@@ -127,7 +127,7 @@ func fakePromptsResult(names ...string) json.RawMessage {
 func TestStdioHandleToolsList_Success_NoFilter(t *testing.T) {
 	t.Parallel()
 	p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: fakeToolsResult("read_file")})
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
 	if len(hw.messages) != 1 || hw.messages[0].Error != nil {
 		t.Fatalf("expected success, got: %+v", hw.messages)
 	}
@@ -139,7 +139,7 @@ func TestStdioHandleToolsList_Success_NoFilter(t *testing.T) {
 func TestStdioHandleResourcesList_Success(t *testing.T) {
 	t.Parallel()
 	p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: fakeResourcesResult("file:///a")})
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/list"})
 	if len(hw.messages) != 1 || hw.messages[0].Error != nil {
 		t.Fatalf("expected success, got: %+v", hw.messages)
 	}
@@ -148,7 +148,7 @@ func TestStdioHandleResourcesList_Success(t *testing.T) {
 func TestStdioHandlePromptsList_Success(t *testing.T) {
 	t.Parallel()
 	p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: fakePromptsResult("my-prompt")})
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "prompts/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "prompts/list"})
 	if len(hw.messages) != 1 || hw.messages[0].Error != nil {
 		t.Fatalf("expected success, got: %+v", hw.messages)
 	}
@@ -160,7 +160,7 @@ func TestStdioHandleResourcesRead_Success(t *testing.T) {
 	t.Parallel()
 	raw, _ := json.Marshal(map[string]interface{}{"contents": []interface{}{}})
 	p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: raw})
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/read",
 		Params: json.RawMessage(`{"uri":"file:///allowed.txt"}`),
 	})
@@ -175,7 +175,7 @@ func TestStdioHandleResourcesSubscribe_Success(t *testing.T) {
 	t.Parallel()
 	raw, _ := json.Marshal(map[string]interface{}{"ok": true})
 	p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: raw})
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/subscribe",
 		Params: json.RawMessage(`{"uri":"file:///allowed.txt"}`),
 	})
@@ -203,7 +203,7 @@ func TestStdioHandlePromptsGet_ManifestPDP_Allow(t *testing.T) {
 	p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: raw})
 	p.pdp = newTestManifestPDPWithPrompt(t, "my-prompt")
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "prompts/get",
 		Params: json.RawMessage(`{"name":"my-prompt"}`),
 	})
@@ -217,7 +217,7 @@ func TestStdioHandlePromptsGet_ManifestPDP_InvalidParams(t *testing.T) {
 	p, hw := closedUpstream(t)
 	p.pdp = newTestManifestPDPWithPrompt(t, "my-prompt")
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "prompts/get",
 		Params: json.RawMessage(`"bad"`),
 	})
@@ -231,7 +231,7 @@ func TestStdioHandlePromptsGet_ManifestPDP_EmptyName(t *testing.T) {
 	p, hw := closedUpstream(t)
 	p.pdp = newTestManifestPDPWithPrompt(t, "my-prompt")
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "prompts/get",
 		Params: json.RawMessage(`{"name":""}`),
 	})
@@ -248,7 +248,7 @@ func TestStdioHandlePromptsGet_ManifestPDP_Deny(t *testing.T) {
 	p, hw := closedUpstream(t)
 	p.pdp = newTestManifestPDPWithPrompt(t, "allowed-only")
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "prompts/get",
 		Params: json.RawMessage(`{"name":"blocked-prompt"}`),
 	})
@@ -264,7 +264,7 @@ func TestStdioHandlePromptsGet_ManifestPDP_DenyDryRun(t *testing.T) {
 	p.pdp = newTestManifestPDPWithPrompt(t, "allowed-only")
 	p.audit = true
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "prompts/get",
 		Params: json.RawMessage(`{"name":"blocked-prompt"}`),
 	})
@@ -279,7 +279,7 @@ func TestStdioHandlePromptsGet_ManifestPDP_UpstreamError(t *testing.T) {
 	p, hw := closedUpstream(t)
 	p.pdp = newTestManifestPDPWithPrompt(t, "my-prompt")
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`6`), Method: "prompts/get",
 		Params: json.RawMessage(`{"name":"my-prompt"}`),
 	})
@@ -301,7 +301,7 @@ func TestStdioHandleToolsCall_AllowWithSink(t *testing.T) {
 	sink, _ := newTempAuditSink(t)
 	p.sink = sink
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/ok"}}`),
 	})
@@ -351,7 +351,7 @@ func TestStdioHandleResourcesRead_DenyDryRun(t *testing.T) {
 	}()
 	defer upW.Close()
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/read",
 		Params: json.RawMessage(`{"uri":"file:///secret.txt"}`),
 	})
@@ -400,7 +400,7 @@ func TestStdioHandleResourcesSubscribe_DenyDryRun(t *testing.T) {
 	}()
 	defer upW.Close()
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/subscribe",
 		Params: json.RawMessage(`{"uri":"file:///secret.txt"}`),
 	})
@@ -449,7 +449,7 @@ func TestStdioHandleResourcesSubscribe_AuditOnlyDeny(t *testing.T) {
 	}()
 	defer upW.Close()
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/subscribe",
 		Params: json.RawMessage(`{"uri":"file:///secret.txt"}`),
 	})
@@ -469,7 +469,7 @@ func TestStdioHandleToolsCall_WithTimeout(t *testing.T) {
 	p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: fakeResult})
 	p.upstreamTimeMs = 5000 // generous timeout → call succeeds
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/ok"}}`),
 	})
@@ -488,7 +488,7 @@ func TestStdioHandleToolsCall_AuditOnlyAllow(t *testing.T) {
 	sink, _ := newTempAuditSink(t)
 	p.sink = sink
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/ok"}}`),
 	})
@@ -711,7 +711,7 @@ func TestStdioHandleToolsCall_PerEntryAudit_AllowRecordMarkedAuditOnly(t *testin
 
 	// path "/blocked" fails the allowedValues condition → deny, but audit-only, so
 	// the call is forwarded and an allow record is written.
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`8`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/blocked"}}`),
 	})
@@ -773,7 +773,7 @@ func TestStdioHandleToolsCall_PerEntryAudit_DenyForwarded(t *testing.T) {
 	p.pdp = newTestManifestPDP(auditToolEntry())
 
 	// path "/blocked" fails the allowedValues condition → would deny.
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/blocked"}}`),
 	})
@@ -1160,7 +1160,7 @@ func TestNewStdioProxy_WithExplicitPDP(t *testing.T) {
 func TestStdioHandleToolsCall_InvalidParams(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
 		Params: json.RawMessage(`"not-an-object"`),
 	})
@@ -1175,7 +1175,7 @@ func TestStdioHandleToolsCall_InvalidParams(t *testing.T) {
 func TestStdioHandleToolsCall_UpstreamError(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/x"}}`),
 	})
@@ -1196,7 +1196,7 @@ func TestStdioHandleToolsCall_DenyNotDryRun(t *testing.T) {
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: done,
 	}
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"blocked_tool","arguments":{}}`),
 	})
@@ -1217,7 +1217,7 @@ func TestStdioHandleToolsCall_DenyDryRun(t *testing.T) {
 	p.pdp = denyAllPDP{}
 	p.audit = true
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"blocked_tool","arguments":{}}`),
 	})
@@ -1250,7 +1250,7 @@ func TestStdioHandleToolsCall_KillSwitchHardBlocksInAuditMode(t *testing.T) {
 	)
 	p.audit = true // audit mode: policy denials would normally be forwarded
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/x"}}`),
 	})
@@ -1291,7 +1291,7 @@ func TestStdioHandleToolsCall_AllowedValuesLargeIntPrecision(t *testing.T) {
 		fakeResult, _ := json.Marshal(mcptest.ToolCallResult{Content: []mcptest.Content{{Type: "text", Text: "ok"}}})
 		p, hw := respondingProxy(t, mcp.RPCMsg{JSONRPC: "2.0", Result: fakeResult})
 		p.pdp = manifestPDP
-		p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+		p.handleHostRequest(context.Background(), mcp.RPCMsg{
 			JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
 			Params: json.RawMessage(`{"name":"transfer","arguments":{"amount":` + amount + `}}`),
 		})
@@ -1316,7 +1316,7 @@ func TestStdioHandleToolsCall_AllowedValuesLargeIntPrecision(t *testing.T) {
 func TestStdioHandleResourcesRead_InvalidParams(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/read",
 		Params: json.RawMessage(`"bad"`),
 	})
@@ -1328,7 +1328,7 @@ func TestStdioHandleResourcesRead_InvalidParams(t *testing.T) {
 func TestStdioHandleResourcesRead_EmptyURI(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "resources/read",
 		Params: json.RawMessage(`{"uri":""}`),
 	})
@@ -1340,7 +1340,7 @@ func TestStdioHandleResourcesRead_EmptyURI(t *testing.T) {
 func TestStdioHandleResourcesRead_UpstreamError(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "resources/read",
 		Params: json.RawMessage(`{"uri":"file:///test.txt"}`),
 	})
@@ -1361,7 +1361,7 @@ func TestStdioHandleResourcesRead_Deny(t *testing.T) {
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: done,
 	}
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "resources/read",
 		Params: json.RawMessage(`{"uri":"file:///secret.txt"}`),
 	})
@@ -1375,7 +1375,7 @@ func TestStdioHandleResourcesRead_Deny(t *testing.T) {
 func TestStdioHandleResourcesSubscribe_InvalidParams(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/subscribe",
 		Params: json.RawMessage(`"bad"`),
 	})
@@ -1387,7 +1387,7 @@ func TestStdioHandleResourcesSubscribe_InvalidParams(t *testing.T) {
 func TestStdioHandleResourcesSubscribe_EmptyURI(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "resources/subscribe",
 		Params: json.RawMessage(`{"uri":""}`),
 	})
@@ -1399,7 +1399,7 @@ func TestStdioHandleResourcesSubscribe_EmptyURI(t *testing.T) {
 func TestStdioHandleResourcesSubscribe_UpstreamError(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "resources/subscribe",
 		Params: json.RawMessage(`{"uri":"file:///watch.txt"}`),
 	})
@@ -1420,7 +1420,7 @@ func TestStdioHandleResourcesSubscribe_Deny(t *testing.T) {
 		upWriter:     mcp.NewMsgWriter(io.Discard),
 		upstreamDone: done,
 	}
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "resources/subscribe",
 		Params: json.RawMessage(`{"uri":"file:///secret.txt"}`),
 	})
@@ -1434,7 +1434,7 @@ func TestStdioHandleResourcesSubscribe_Deny(t *testing.T) {
 func TestStdioHandleToolsList_UpstreamError(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
 	if len(hw.messages) == 0 {
 		t.Fatal("expected error response")
 	}
@@ -1443,7 +1443,7 @@ func TestStdioHandleToolsList_UpstreamError(t *testing.T) {
 func TestStdioHandleResourcesList_UpstreamError(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "resources/list"})
 	if len(hw.messages) == 0 {
 		t.Fatal("expected error response")
 	}
@@ -1452,7 +1452,7 @@ func TestStdioHandleResourcesList_UpstreamError(t *testing.T) {
 func TestStdioHandlePromptsList_UpstreamError(t *testing.T) {
 	t.Parallel()
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "prompts/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "prompts/list"})
 	if len(hw.messages) == 0 {
 		t.Fatal("expected error response")
 	}
@@ -1470,7 +1470,7 @@ func TestStdioHandleToolsList_SuccessWritesAllowRecord(t *testing.T) {
 	p.sink = sink
 	p.sessionID = "stdio-list-allow"
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
 	if len(hw.messages) != 1 || hw.messages[0].Error != nil {
 		t.Fatalf("expected a successful list response, got %+v", hw.messages)
 	}
@@ -1490,7 +1490,7 @@ func TestStdioHandlePromptsGet_NotManifestPDP(t *testing.T) {
 	// enforcedForwardCore; with a closed upstream the forward fails and the host
 	// gets an upstream-error response.
 	p, hw := closedUpstream(t)
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "prompts/get",
 		Params: json.RawMessage(`{"name":"my-prompt"}`),
 	})
@@ -1606,7 +1606,7 @@ func TestStdioHandleList_UpstreamErrorWritesAuditRecord(t *testing.T) {
 	p.sessionID = "stdio-list-audit"
 	p.audit = true // even in audit mode, an upstream failure is enforced (host gets the error)
 
-	p.handleHostRequest(context.Background(), capability.DefaultRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
+	p.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/list"})
 	if len(hw.messages) != 1 || hw.messages[0].Error == nil {
 		t.Fatal("expected an error response from the closed upstream")
 	}
