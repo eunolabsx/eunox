@@ -58,15 +58,16 @@ on the protocol session.** Concretely:
   which carries the usual obligations (threat-model update, sign-and-verify
   roundtrip test).
 - Server-initiated requests (sampling, elicitation, roots) stop being a separate
-  push and fold into the originating client request. Three spec changes drive this
-  and must not be conflated: server-to-client requests **must** associate with an
-  in-flight client request (the SHOULD-to-MUST promotion); the standalone GET SSE
-  stream is **removed** and all traffic is POST-only; and the in-flight round trip
+  push and fold into the originating client request. Two spec changes drive this
+  and must not be conflated: the standalone GET SSE stream is **removed** and all
+  traffic is POST-only; and the round trip itself
   is replaced by a payload exchange — the original `tools/call` /
   `resources/read` / `prompts/get` terminates with an `InputRequiredResult`
   carrying the server's `inputRequests` plus an opaque `requestState`, and the
   client re-issues a *new* request (with a different JSON-RPC id) carrying
-  `inputResponses` and the echoed `requestState`. eunox must treat `requestState`
+  `inputResponses` and the echoed `requestState`. The request *types* survive as
+  `inputRequests` payload shapes — so what the revision removes is the delivery
+  mechanism, not the vocabulary. eunox must treat `requestState`
   as attacker-controlled and integrity-protect it wherever it influences a
   decision. Because the interaction now rides the originating call, the rework
   lands in the enforced client-request path (`internal/transport/dispatch.go`,
@@ -147,9 +148,9 @@ and the JWT can still only narrow the manifest, never expand it
   dead code under a stateless upstream and should be removed when that path is
   retired.
 - **Conformance tracks the published spec.** This ADR commits to the *direction*
-  and the seams; the precise wire details (header names, negotiation tokens,
-  permitted GET-stream uses) are finalized against the published revision, and any
-  divergence is reconciled there rather than guessed here.
+  and the seams; the precise wire details are finalized against the published
+  revision, and any divergence is reconciled there rather than guessed here. See
+  the addendum below for where each deferred detail was settled.
 
 ## Addendum (2026-08-07): session creation without `initialize`
 
@@ -157,7 +158,20 @@ The revision is now published, and two commitments this ADR deferred have their
 own records: negotiation and the mismatched-pair translation boundary in
 [ADR-0006](./0006-dual-revision-translation-boundary.md), and the
 `requestState` integrity mechanism in
-[ADR-0007](./0007-mrtr-signed-continuation.md). What remained undecided here is
+[ADR-0007](./0007-mrtr-signed-continuation.md).
+
+Two release-candidate-era statements in the Decision above were corrected against
+the published text at the same time, since implementing either as written would
+have been wrong. The first described server-to-client requests as promoted from
+SHOULD to MUST associate with an in-flight client request; the published revision
+does not tighten that obligation, it removes server-initiated requests as a
+delivery mechanism outright. The second deferred "permitted GET-stream uses" to
+the published revision; there are none — the standalone GET endpoint is removed.
+What survives is the request *vocabulary* as `inputRequests` payload shapes, with
+`sampling/createMessage` and `roots/list` deprecated as of 2026-07-28 but
+`elicitation/create` not deprecated at all.
+
+What remained undecided here is
 *creation*: everything the HTTP transport builds per client — the internal
 session, the upstream subprocess, the decision-turn pin, the identity capture,
 the `--require-audit=strict` gate — hangs off the session-creating
