@@ -179,10 +179,6 @@ type recordingCommittingHandler struct {
 	prepareCalls int
 }
 
-func (h *recordingCommittingHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.prepareAndAdmit(ctx, h, cond, req)
-}
-
 func (h *recordingCommittingHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	h.prepareCalls++
 	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
@@ -218,7 +214,7 @@ func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
 	// The handler is only invoked during ValidateAction, after e is assigned below, so
 	// wiring e post-construction is safe (WithConditionHandler only registers the
 	// pointer; the deferred call reads h.e once set).
-	e := New(WithCallCounter(counter), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
 	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
@@ -253,10 +249,6 @@ func TestCommitDeferredAtomic_DispatchesThroughRegistry(t *testing.T) {
 // the nil *Engine it was boxed with, and any future use of h.e would nil-deref there.
 type nonUniformSkipHandler struct{ e *Engine }
 
-func (h *nonUniformSkipHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.prepareAndAdmit(ctx, h, cond, req)
-}
-
 func (h *nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	// skip unconditionally, regardless of ctx — the contract violation under test.
 	return DeferredCommit{}, true, nil
@@ -269,7 +261,7 @@ func (h *nonUniformSkipHandler) PrepareCommit(_ context.Context, _ capability.Co
 func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	handler := &nonUniformSkipHandler{}
-	e := New(WithCallCounter(counter), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
 	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
@@ -300,37 +292,42 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	}
 }
 
-// TestPrepareAndAdmit_NonUniformSkipFailsClosed pins the single-condition twin of the test
-// above. It drives a committing handler's own Handle directly, which is the ONLY way this
-// path runs: the engine defers every committing condition to the atomic commit, and
-// prepareAndAdmit is unexported, so no registered handler reaches it. The guard exists for
-// what a future single-condition fast path would inherit, and it must refuse identically —
-// same code, and the same HardDeny, since honoring an unauthorized skip lets a handler
-// decline to spend its own budget on a call nothing refused.
-func TestPrepareAndAdmit_NonUniformSkipFailsClosed(t *testing.T) {
+// TestCommitDeferredAtomic_UnauthorizedSkipIsRefusedOnASingleCondition pins that the skip
+// assertion is per CONDITION, not a property of a multi-bucket batch: a constraint carrying
+// ONE committing condition whose handler skips unasked is refused exactly as the two-bucket
+// case is. There is one consumption site now, so there is one refusal to test — the retired
+// single-condition path had its own copy of this guard, and the two had already drifted on
+// HardDeny, the field that decides whether an audit route forwards the call anyway.
+func TestCommitDeferredAtomic_UnauthorizedSkipIsRefusedOnASingleCondition(t *testing.T) {
 	handler := &nonUniformSkipHandler{}
-	e := New(WithCallCounter(callcounter.NewInMemory()), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	e := New(WithCallCounter(callcounter.NewInMemory()), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
 	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
-	cond := &capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}
+	caps := []capability.Constraint{{
+		Target:      "tool",
+		Actions:     []string{"*"},
+		Enforcement: capability.EnforcementAudit,
+		Conditions:  []capability.Condition{&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}},
+	}}
 
 	// No WithSkipQuota on the context: the handler's unconditional skip is unauthorized.
-	condErr := handler.Handle(context.Background(), cond, req)
-	if condErr == nil {
-		t.Fatal("Handle returned nil (allow) for a skip the request context did not authorize — want a fail-closed CONDITION_FAILED error")
+	resp := e.ValidateAction(context.Background(), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny for a skip the request context did not authorize", resp.Decision)
 	}
-	if condErr.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("condErr = %+v, want code %q", condErr, capability.ErrCodeConditionFailed)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
-	if !condErr.HardDeny {
-		t.Fatal("condErr must carry HardDeny, as the deferred path's twin does — the two refusals are one contract and drifted on exactly this field")
+	if !resp.Denial.HardDeny {
+		t.Fatal("denial must carry HardDeny: an audit-mode constraint forwards anything downgradable, so the budget would ship unchecked")
 	}
 
-	// The assertion refuses an UNAUTHORIZED skip, not skipping: the same handler under
-	// observe mode, where the context does authorize it, still passes.
-	if condErr := handler.Handle(WithSkipQuota(context.Background()), cond, req); condErr != nil {
-		t.Fatalf("observe mode: Handle = %+v, want nil (SkipQuota authorizes the skip)", condErr)
+	// The assertion refuses an UNAUTHORIZED skip, not skipping: the same handler under observe
+	// mode, where the context does authorize it, allows.
+	resp = e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("observe mode: decision = %q, want allow (SkipQuota authorizes the skip); denial %+v", resp.Decision, resp.Denial)
 	}
 }
 
@@ -342,10 +339,6 @@ func TestPrepareAndAdmit_NonUniformSkipFailsClosed(t *testing.T) {
 // test's reference share the same engine pointer (mirrors
 // recordingCommittingHandler).
 type nilDenyHandler struct{ e *Engine }
-
-func (h *nilDenyHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.prepareAndAdmit(ctx, h, cond, req)
-}
 
 func (h *nilDenyHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
@@ -388,7 +381,7 @@ func (forceDenyAtIndexZeroCounter) AdmitAll(_ context.Context, _ []capability.Qu
 // counter denies that handler's bucket on the multi-deferred atomic-commit path.
 func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 	handler := &nilDenyHandler{}
-	e := New(WithCallCounter(forceDenyAtIndexZeroCounter{}), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	e := New(WithCallCounter(forceDenyAtIndexZeroCounter{}), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
 	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
@@ -419,10 +412,6 @@ func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 // the test's reference share the same engine pointer.
 type nilDenyResultHandler struct{ e *Engine }
 
-func (h *nilDenyResultHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.prepareAndAdmit(ctx, h, cond, req)
-}
-
 func (h *nilDenyResultHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
 	if skip {
@@ -443,42 +432,6 @@ func (h *nilDenyResultHandler) PrepareCommit(ctx context.Context, cond capabilit
 	}, false, nil
 }
 
-// alwaysDenyCounter is a minimal CallCounter fake whose AdmitAll always refuses
-// admission for a single-bucket batch, driving prepareAndAdmit straight to its
-// Deny-result handling without depending on real quota bookkeeping.
-type alwaysDenyCounter struct{}
-
-func (alwaysDenyCounter) IncrementAndGet(_ context.Context, _ string, _, _ int) (int64, error) {
-	return 1, nil
-}
-func (alwaysDenyCounter) Peek(_ context.Context, _ string, _ int) (int64, error) {
-	return 0, nil
-}
-func (alwaysDenyCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
-	return false, 0, 5, 0, nil
-}
-
-// TestPrepareAndAdmit_NilDenyResultFailsClosed pins that prepareAndAdmit — reached
-// through a CommittingConditionHandler's own Handle, the documented WithConditionHandler
-// seam — denies with a structured CONDITION_FAILED error, not a silent allow, when a
-// refused admission's Deny callback itself returns nil.
-func TestPrepareAndAdmit_NilDenyResultFailsClosed(t *testing.T) {
-	handler := &nilDenyResultHandler{}
-	e := New(WithCallCounter(alwaysDenyCounter{}), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
-	handler.e = e
-
-	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
-	cond := &capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}
-
-	condErr := handler.Handle(context.Background(), cond, req)
-	if condErr == nil {
-		t.Fatal("Handle returned nil (allow) for a refused admission whose Deny callback returned nil — want a fail-closed CONDITION_FAILED error")
-	}
-	if condErr.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("condErr = %+v, want code %q", condErr, capability.ErrCodeConditionFailed)
-	}
-}
-
 // TestCommitDeferredAtomic_NilDenyResultFailsClosed pins the atomic multi-deferred
 // commit path's twin of the test above: a committing handler's DeferredCommit.Deny is
 // a real, non-nil callback, but the CALL to it returns nil for a refused admission.
@@ -486,7 +439,7 @@ func TestPrepareAndAdmit_NilDenyResultFailsClosed(t *testing.T) {
 // gap here was a nil-pointer panic on the enforcement goroutine, not just a bypass.
 func TestCommitDeferredAtomic_NilDenyResultFailsClosed(t *testing.T) {
 	handler := &nilDenyResultHandler{}
-	e := New(WithCallCounter(forceDenyAtIndexZeroCounter{}), WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	e := New(WithCallCounter(forceDenyAtIndexZeroCounter{}), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
 	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
@@ -518,10 +471,6 @@ func TestCommitDeferredAtomic_NilDenyResultFailsClosed(t *testing.T) {
 // with e.counter still nil.
 type nilCounterCommitHandler struct{ e *Engine }
 
-func (h *nilCounterCommitHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.prepareAndAdmit(ctx, h, cond, req)
-}
-
 func (h *nilCounterCommitHandler) PrepareCommit(_ context.Context, cond capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	mc, condErr := castCondition[capability.MaxCallsCondition](cond)
 	if condErr != nil {
@@ -550,7 +499,7 @@ func (h *nilCounterCommitHandler) PrepareCommit(_ context.Context, cond capabili
 func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 	handler := &nilCounterCommitHandler{}
 	// NB: no WithCallCounter — e.counter stays nil.
-	e := New(WithConditionHandler(capability.ConditionTypeMaxCalls, handler))
+	e := New(WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, handler))
 	handler.e = e
 
 	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
@@ -582,14 +531,10 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 //
 //	Count < 0  → always a validation condErr, even under SkipQuota (a committing
 //	             condition whose validity is independent of the quota skip)
-//	Count == 7 → always commits, IGNORING SkipQuota (violates the ctx-uniform skip
-//	             contract, producing a non-uniform skip across buckets)
+//	Count == 7 → always commits, IGNORING SkipQuota (violates the contract's second
+//	             half: under an observe request a handler must skip or commit nothing)
 //	otherwise  → skips under SkipQuota, commits otherwise (the well-behaved case)
 type sentinelCommitHandler struct{}
-
-func (sentinelCommitHandler) Handle(context.Context, capability.Condition, *capability.EnforceRequest) *ConditionError {
-	return nil
-}
 
 func (sentinelCommitHandler) PrepareCommit(ctx context.Context, cond capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	mc, condErr := castCondition[capability.MaxCallsCondition](cond)
@@ -624,7 +569,7 @@ func (sentinelCommitHandler) PrepareCommit(ctx context.Context, cond capability.
 }
 
 func sentinelEngine() *Engine {
-	return New(WithCallCounter(callcounter.NewInMemory()), WithConditionHandler(capability.ConditionTypeMaxCalls, sentinelCommitHandler{}))
+	return New(WithCallCounter(callcounter.NewInMemory()), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, sentinelCommitHandler{}))
 }
 
 // TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr pins that under the
@@ -651,12 +596,12 @@ func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
 	}
 }
 
-// TestCommitDeferredAtomic_PartialSkipFailsClosed pins that a non-uniform skip — some
-// buckets skip under SkipQuota while another commits — fails closed after the loop. The
-// per-bucket assertion cannot catch it (each skipping bucket individually satisfies
-// SkipQuota); admitting the committing buckets while dropping the skipped ones would be a
-// fail-open.
-func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
+// TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveFailsClosed pins the case that used
+// to need a whole post-loop guard: under observe, one bucket skips while another commits.
+// Admitting the committing bucket while dropping the skipped one is a fail-open, and the
+// answer is now the same per-condition assertion that refuses the lone committing bucket —
+// which is why "uniform across the constraint" no longer has to be re-derived after the loop.
+func TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveFailsClosed(t *testing.T) {
 	e := sentinelEngine()
 	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	caps := []capability.Constraint{{
@@ -669,17 +614,62 @@ func TestCommitDeferredAtomic_PartialSkipFailsClosed(t *testing.T) {
 	}}
 	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
 	if resp.Decision != capability.DecisionDeny {
-		t.Fatalf("decision = %q, want deny (a partial/non-uniform skip across buckets must fail closed)", resp.Decision)
+		t.Fatalf("decision = %q, want deny (a bucket committing beside a skipping one must fail closed)", resp.Decision)
 	}
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
-	// HardDeny, or the guard cannot actually block. A partial skip is only reachable when
-	// SkipQuota is set, which the binary sets only on a route running --audit — and there
-	// the transport downgrades and FORWARDS any non-HardDeny verdict, letting the call
-	// proceed with zero quota consumed on any bucket.
+	// HardDeny, or the refusal cannot actually block: this is only reachable when SkipQuota is
+	// set, which the binary sets only on a route running --audit — and there the transport
+	// downgrades and FORWARDS any non-HardDeny verdict, letting the call proceed with the
+	// skipped bucket never checked.
 	if !resp.Denial.HardDeny {
-		t.Error("the partial-skip deny must be HardDeny; a downgradable verdict is forwarded on the only posture that reaches this branch, so the guard would never block")
+		t.Error("the deny must be HardDeny; a downgradable verdict is forwarded on the only posture that reaches this branch, so the guard would never block")
+	}
+}
+
+// TestCommitDeferredAtomic_CommitUnderObserveSpendsNoQuota pins the reachable half of the
+// skip contract, and the one an operator pays for: a handler that ignores SkipQuota and
+// commits anyway used to be admitted normally and charged a REAL quota slot on a route whose
+// contract — stated in WithSkipQuota's own doc — is that none is consumed. Nothing logged, and
+// an observe run silently drained the budget it was meant only to predict.
+//
+// Every deferred condition commits here, so no partial skip is involved: this is the plain
+// case, and the assertion is that the engine refuses rather than charges.
+func TestCommitDeferredAtomic_CommitUnderObserveSpendsNoQuota(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, sentinelCommitHandler{}))
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		// Both commit, ignoring SkipQuota. Distinct windows so a two-bucket batch is legal.
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 7, WindowSeconds: 60},
+			&capability.MaxCallsCondition{Count: 7, WindowSeconds: 3600},
+		},
+	}}
+
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a handler committing under observe must be refused, not charged)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+	if !resp.Denial.HardDeny {
+		t.Error("the deny must be HardDeny: --audit is the only posture that reaches it, and there a downgradable verdict is forwarded")
+	}
+	// The substance: the observe run left the budget untouched. A refusal that still committed
+	// would satisfy every assertion above and drain the quota anyway.
+	for _, windowSec := range []int{60, 3600} {
+		spent, err := counter.Peek(context.Background(), "sentinel-bucket", windowSec)
+		if err != nil {
+			t.Fatalf("Peek(%d): %v", windowSec, err)
+		}
+		if spent != 0 {
+			t.Errorf("observe run spent %d slots in the %ds window; an observe route must consume none", spent, windowSec)
+		}
 	}
 }
 

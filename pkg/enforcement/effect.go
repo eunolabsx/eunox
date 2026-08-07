@@ -238,21 +238,15 @@ func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceR
 }
 
 // blastRadiusHandler is the built-in blastRadius condition handler. A condition declaring a
-// CUMULATIVE bound commits a weighted slice of a sliding-window budget on admit, so beyond
-// Handle it implements CommittingConditionHandler, running after every pure predicate and
-// after the effect ceiling so a magnitude is never charged to a call a later check then
-// refuses.
+// CUMULATIVE bound commits a weighted slice of a sliding-window budget on admit, so it is a
+// CommittingConditionHandler, running after every pure predicate and after the effect ceiling
+// so a magnitude is never charged to a call a later check then refuses.
 //
-// PrepareCommit carries the per-call bound too: leaving it in Handle alone meant observe mode
-// (which skips the commit) also skipped the per-call check for a constraint carrying both
-// bounds.
+// PrepareCommit carries the per-call bound too, so observe mode (which skips the commit)
+// still checks it for a constraint carrying both bounds. A configuration with ONLY a per-call
+// bound consumes nothing and reports no bucket, which is the shape the skip/commit contract
+// admits beside a skip.
 type blastRadiusHandler struct{ e *Engine }
-
-// Handle implements ConditionHandler by routing through PrepareCommit and admitting the
-// single bucket, so the condition has ONE implementation of its own semantics.
-func (h blastRadiusHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.prepareAndAdmit(ctx, h, cond, req)
-}
 
 // PrepareCommit runs the condition's pure checks (the bounds' well-formedness and the
 // per-call `max`) and derives the weighted bucket for a cumulative bound.
