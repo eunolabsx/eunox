@@ -1,10 +1,15 @@
 # MCP 2026-07-28 execution plan
 
-**Status:** planning. Companion to [mcp-2026-07-28-plan.md](mcp-2026-07-28-plan.md),
-which states what changes and why. This document states the work as workstreams —
-concrete deliverables, the tests each one owes, and the exit criteria that say when
-it is done. Workstream sections are keyed to the plan's numbered items.
-**Verified against:** eunox @ `5dba99c`; W1 landed since (see its exit criteria).
+**Status:** in progress — W1 has landed; every other workstream is still planning.
+Companion to [mcp-2026-07-28-plan.md](mcp-2026-07-28-plan.md), which states what
+changes and why. This document states the work as workstreams — concrete
+deliverables, the tests each one owes, and the exit criteria that say when it is
+done. Workstream sections are keyed to the plan's numbered items.
+**Verified against:** eunox @ `d5d9a85`.
+
+A landed workstream says so in its heading; an unmarked heading is still planning.
+A workstream is **landed** only when every exit criterion below it is ticked or
+explicitly accounted for — W1 is landed with two criteria open, and says which.
 
 References name a **file and a symbol, never a line number**.
 
@@ -48,7 +53,7 @@ criterion is the ADR reaching **Final** under the ADR lifecycle
 
 | Gate | Decision | Recorded in | Blocks |
 |---|---|---|---|
-| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (Draft) | W1 activation, W3, W4, W13's mismatch cells |
+| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (Draft) | W3, W4, W13's mismatch cells. **No longer blocks W1**, which landed its negotiation spine without activating any translation — see the note below the table. |
 | D2 | MRTR metering: the signed continuation — key sourcing, anchor binding, lifetime, replay bound, what re-evaluates per retry, and the commit-once quota rule. | [ADR-0007](adr/0007-mrtr-signed-continuation.md) (Draft) | W6 |
 | D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (updated: session-creation addendum) | W2, and through it W6/W7 |
 | D4 | Stream and deferred-effect enforcement: `subscriptions/listen` open/deny semantics, notification filtering, cancel rehoming; tasks anchor binding and the kill×tasks interaction. | [ADR-0008](adr/0008-stream-and-task-enforcement.md) (Draft) | W7, W8 |
@@ -57,13 +62,31 @@ W1's table refactor and W2's subject-struct reshape are behavior-neutral and may
 land while their ADRs are still Draft; anything that changes wire behavior waits
 for Final.
 
+W1 has since landed on that basis, negotiation included. What made it admissible
+under a Draft D1 is that each revision's table is deny-by-default over the same
+manifest, so selecting one can only REMOVE methods, never grant one policy did not
+permit — no translation is activated, and the mismatched-pair behavior D1 governs
+is untouched. D1 still gates W3, W4, and W13's mismatch cells.
+
 ---
 
 ## Workstreams
 
-### W1 — Negotiation spine (plan §1) — L
+### W1 — Negotiation spine (plan §1) — L — **LANDED** (two criteria open)
 
-**Depends on:** nothing (seam half); D1 (activation half). **Blocks:** everything else.
+**Depends on:** nothing. (Originally scoped as depending on D1 for its activation half;
+in the event the negotiation activated no translation, so D1 did not gate it — see the
+note under the decision-gate table.) **Blocks:** everything else.
+
+Landed in eunox @ `d5d9a85`. The two open criteria are ADR-0006 reaching Final and
+the old×old interop cell, neither of which is W1's to satisfy — see the exit
+criteria below for what each turns on. Follow-up work the negotiation spine
+deliberately left open is tracked in the repository's issue tracker rather than
+here: the revision-selected upstream opener (the `protocolVersion` pin does not yet
+change how a leg is opened or framed), the forwarded `_meta` declaration that can
+disagree with the header on the same upstream request, observe mode's posture
+toward a method absent from the peer's revision table, and the structural cleanups
+the review named.
 
 Scope:
 
@@ -109,10 +132,12 @@ Exit criteria:
       (`internal/transport/dispatch.go` `methodRegistry` + `buildRevisionDispatch`;
       `TestMethodRegistry_EveryMethodDeclaresRevisionMembership`,
       `TestRevisionDispatch_ExactSetPerRevision`.)
-- [x] Old-revision wire behavior unchanged through the refactor (full suite green).
-      The old×old e2e cell is W13's and does not exist yet; the pre-existing suite is
-      the regression net meanwhile, and it passes unmodified except where a test
-      called a signature this workstream widened.
+- [ ] Old-revision wire behavior unchanged through the refactor (full suite + old×old
+      e2e cell green). **Half met, so unticked:** the full suite passes unmodified except
+      where a test called a signature this workstream widened, but the old×old cell this
+      criterion names as its arbiter is W13's and does not exist. The suite is a weaker
+      guarantee than a byte-stable interop cell, and this doc's own rule is that "mostly
+      done" has no checkbox. Ticks when W13 stands the cell up.
 - [x] -32022 on unsupported or missing protocol version, with audit record.
       (`mcp.UnsupportedProtocolVersionResponse`, `refuseHostRevision`;
       `TestRefuseHostRevision_EmitsSpecCodeAndRecords` plus the stdio e2e cell.)
@@ -128,8 +153,14 @@ Exit criteria:
       over the same manifest, so selecting one can only remove methods, never grant one.
       The mismatched-pair behavior D1 governs (W3, W4, W13's mismatch cells) is untouched.
 
-Landed, with two deliberate scope notes:
+As landed, differing from the scope above in three places:
 
+- The **context pin is taken from a context's FIRST resolved message**, not from the
+  `initialize` params as the scope reads. Pinning at the handshake left the flip refusal
+  inert for any peer on a revision that removed `initialize` — which is every 2026-07-28
+  peer, i.e. exactly the revision that mandates per-request declarations — and wrote the
+  pin from a handler goroutine the message loop read for the next request. Both were
+  caught in review before merge, not in production.
 - The **host-side rule for a context that negotiated nothing** resolves to 2025-11-25
   rather than refusing. ADR-0006 reads "a request carrying neither … is denied" — but
   turning "no context, no declaration" into a refusal is the session-creation-on-first-
@@ -512,8 +543,10 @@ Dependency order, not calendar. Parallel where independent.
 1. **Seams — land before the first tagged release:** W1's declaration/table
    refactor and revision-set type (behavior-neutral), and W2's subject-struct
    reshape plus the jti claims-carry. These are the forward-compatible hedge and
-   are cheap now, breaking later.
-2. **D1 + D3 resolved; W13 mocks stood up.** W1 activation; W2 in full.
+   are cheap now, breaking later. *W1's half is done — it landed with the
+   negotiation as well, which needed no translation and so needed no D1.* W2's
+   half is outstanding.
+2. **D1 + D3 resolved; W13 mocks stood up.** W2 in full.
 3. **W3, W4, W5, W9 in parallel** (all hang off W1; none touch each other).
 4. **D2 → W6. D4 → W7, W8.** W6 and W7 are independent of each other; W8 follows
    W6's anchor semantics.

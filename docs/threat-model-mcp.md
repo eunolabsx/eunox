@@ -630,11 +630,16 @@ opened at another (a mid-context flip).
   context negotiated, and a context that negotiated none resolves to `2025-11-25` — the
   surface eunox already shipped. There is no path by which leaving a declaration out
   reaches a method set the peer did not negotiate.
-- **A mid-context flip is refused, not honored.** Answering `initialize` negotiates
-  2025-11-25 for that context's life; a later request declaring a different revision is
-  denied `UNSUPPORTED_PROTOCOL_VERSION` (-32022) and recorded. A peer that changes its
-  declared revision mid-context is indistinguishable from one probing for the more
-  permissive table, so this fails closed rather than re-negotiating (ADR-0006).
+- **A mid-context flip is refused, not honored.** A context pins its revision from its
+  FIRST resolved message, and a later request declaring a different one is denied
+  `UNSUPPORTED_PROTOCOL_VERSION` (-32022) and recorded. A peer that changes its declared
+  revision mid-context is indistinguishable from one probing for the more permissive
+  table, so this fails closed rather than re-negotiating (ADR-0006). The pin is
+  deliberately NOT taken from the `initialize` response: a peer on a revision that removed
+  the handshake would never pin at all — leaving this refusal inert for exactly the
+  revision that mandates per-request declarations — and that placement also wrote the pin
+  from a handler goroutine the message loop read for the next request, a check-then-act
+  window the value being atomic concealed.
 - **An unspoken revision dispatches nothing.** A declared revision outside the published
   set is refused; internally, a revision with no tables resolves to empty tables rather
   than borrowing another revision's, so even a wiring fault denies rather than widens.
