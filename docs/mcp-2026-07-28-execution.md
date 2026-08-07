@@ -43,7 +43,8 @@ References name a **file and a symbol, never a line number**.
 ## Decision gates
 
 Four decisions block code. Each lands as an ADR in `docs/adr/`; the gate's exit
-criterion is the ADR reaching **Accepted**.
+criterion is the ADR reaching **Final** under the ADR lifecycle
+([docs/adr/README.md](adr/README.md)).
 
 | Gate | Decision | Recorded in | Blocks |
 |---|---|---|---|
@@ -54,7 +55,7 @@ criterion is the ADR reaching **Accepted**.
 
 W1's table refactor and W2's subject-struct reshape are behavior-neutral and may
 land while their ADRs are still Draft; anything that changes wire behavior waits
-for Accepted.
+for Final.
 
 ---
 
@@ -109,7 +110,7 @@ Exit criteria:
 - [ ] -32022 on unsupported or missing protocol version, with audit record.
 - [ ] Config key + flag + schema + roundtrip test landed.
 - [ ] Revision field on audit records with threat-model update and sign/verify roundtrip.
-- [ ] ADR-0006 Accepted before any translation behavior activates.
+- [ ] ADR-0006 Final before any translation behavior activates.
 
 ### W2 — Bearer identity, session creation, revocation (plan §2) — XL
 
@@ -158,7 +159,7 @@ Tests:
 
 Exit criteria:
 
-- [ ] ADR-0004 updated with the session-creation half and promoted to Accepted.
+- [ ] ADR-0004 updated with the session-creation half and graduated to Final.
 - [ ] jti revocation end-to-end in e2e: CLI flag → control endpoint → next request denied `KILL_SWITCH` → audit record carries the token id.
 - [ ] Subject struct landed; adding JTI required no signature change beyond the struct field (demonstrated by the diff itself).
 - [ ] A 2026-07-28 host's first HTTP request serves with no `initialize`, on both auth postures D3 admits.
@@ -286,7 +287,7 @@ Tests:
 
 Exit criteria:
 
-- [ ] ADR-0007 Accepted.
+- [ ] ADR-0007 Final.
 - [ ] Metering invariants green: no double commit, no unmetered retries beyond D2's bound.
 - [ ] All continuation negatives green; fuzz target landed and in CI.
 - [ ] Cross-instance verify test green.
@@ -328,7 +329,7 @@ filtering parity with list filtering.
 
 Exit criteria:
 
-- [ ] ADR-0008 Accepted (stream half).
+- [ ] ADR-0008 Final (stream half).
 - [ ] Open/deny, filtering-parity, kill-during-stream, and spent-budget-close tests green.
 - [ ] GET endpoint verified absent for new-revision peers (test).
 - [ ] Threat-model stream section written; conformance rows updated.
@@ -361,7 +362,7 @@ no manifest entry; extension-stripping (manifest without tasks → discover stri
 
 Exit criteria:
 
-- [ ] ADR-0008 Accepted (tasks half).
+- [ ] ADR-0008 Final (tasks half).
 - [ ] All three methods enforced, tested, deny-by-default.
 - [ ] Extension gate test green.
 - [ ] Kill×tasks semantics decided, implemented, e2e-tested.
@@ -420,14 +421,14 @@ Exit criteria:
 Scope: `docs/conformance.md` grows a per-revision method matrix and flips its
 targeted-spec line when the global criteria hold; threat model gains the header
 confusion, continuation, and stream sections and closes L-6 (L-7 re-checked);
-ADR-0002 promoted to Accepted (shipped long since); ADR-0004 promoted in W2;
-ADR-0006/0007/0008 authored at their gates; `CHANGELOG.md` entries accrue per
-workstream.
+ADR-0002 graduated to Final (its code shipped long since); ADR-0004 graduated
+in W2; ADR-0006/0007/0008 authored at their gates and graduated as their
+workstreams land; `CHANGELOG.md` entries accrue per workstream.
 
 Exit criteria:
 
 - [ ] conformance.md states both targeted revisions with a complete per-method, per-revision matrix.
-- [ ] No ADR in `docs/adr/` remains Draft.
+- [ ] No ADR this plan touches remains Draft — each is Final, or In Review awaiting consensus.
 - [ ] Threat model current; CHANGELOG complete for the release.
 
 ### W13 — Test and demo infrastructure — L
@@ -500,7 +501,7 @@ makes that eventual deletion a subtraction.
    where a test itself asserted a now-revision-scoped detail, and the old×old
    cell is byte-stable.
 7. **Docs and ADRs:** conformance matrix flipped; threat model current with L-6
-   closed; ADR-0002 and ADR-0004 Accepted; ADR-0006–0008 Accepted; CHANGELOG
+   closed; ADR-0002 and ADR-0004 Final; ADR-0006–0008 Final; CHANGELOG
    complete.
 8. **Blanket criteria** hold repo-wide: race-clean tests, lint, fmt, license,
    NOTICE, and the 80% coverage gates.
