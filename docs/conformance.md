@@ -204,18 +204,40 @@ shared dispatch switch (`internal/transport/dispatch.go`), write a test in
 The 2026-07-28 MCP revision (release candidate, locked 2026-05-21) is **not yet
 the targeted spec** — eunox still targets 2025-11-25 — but two of its changes
 place obligations on a filtering proxy that are worth recording ahead of the
-broader conformance work tracked in
-[ADR-0004](adr/0004-bearer-identity-session-anchor.md).
+broader conformance work, part of which is decided in
+[ADR-0004](adr/0004-bearer-identity-session-anchor.md) (see below for exactly
+which part).
 
 | Feature | 2026-07-28 method / field | eunox disposition | Notes |
 |---|---|---|---|
 | **List-result caching** (SEP-2549) | `cacheScope` (`public`/`private`) + `ttlMs` on `*/list`, `resources/read`, and the discovery result | **Open obligation.** eunox filters `*/list` per identity, so every list it emits is authorization-context-specific. `filterListResult` preserves sibling fields verbatim, so an upstream `cacheScope: public` would pass through unchanged on a personalized response. The fix is to **override `cacheScope` to `private`** on any response eunox has filtered (never preserve an upstream `public`); `ttlMs` may be preserved as a freshness hint. See threat model L-6. | A shared downstream cache honoring `public` on a filtered list could serve one identity's narrowed view to another — the spec's "caches MUST NOT be shared across authorization contexts" invariant |
 | **MCP Apps** (SEP-1865) | `ui://` template resources; `ui/*` host↔iframe bridge | **Covered by existing mediation; documentation watch item.** App UI templates are fetched via `resources/read` / `resources/list` (already gated and filtered) and UI-initiated execution is an ordinary `tools/call` (already enforced and audited). The `ui/*` methods run on the host↔iframe postMessage bridge, which never traverses eunox. No new server-transport method exists today. | A *future* Apps revision adding a server-transport `app/*` method would hit the fail-closed unmapped-method path and need classification |
 
-Broader 2026-07-28 conformance — stateless transport (`server/discover`, per-request
-`_meta` + the `MCP-Protocol-Version` header), the multi-round-trip replacement for
-server-initiated requests, and the `Mcp-Method`/`Mcp-Name` routing headers — is
-tracked in [ADR-0004](adr/0004-bearer-identity-session-anchor.md).
+Broader 2026-07-28 conformance splits into what
+[ADR-0004](adr/0004-bearer-identity-session-anchor.md) actually decides and what
+it does not — stated precisely here because the ADR is Draft and easy to
+over-cite:
+
+- **Decided in ADR-0004** (design depth, not yet implemented): the
+  bearer-identity/revocation re-anchor (`jti`/`agent_id`, `RevokeJTI`/`ReviveJTI`);
+  the multi-round-trip replacement for server-initiated requests — the
+  `InputRequiredResult`/`inputRequests`/`requestState` exchange that replaces the
+  standalone GET SSE push, including where the enforcement work lands
+  (`internal/transport/dispatch.go`, `forward.go`'s `enforcedForwardCore`) —
+  pending exact field names and encodings from the published revision; and dual
+  protocol-version negotiation at the seam level (the existing `MCPProtocolVersion`
+  constant in `internal/transport/stdio.go` becomes a negotiated set).
+- **Not yet designed, no ADR:** the `server/discover` opening-method responder
+  (today both transports answer `initialize` locally), the `Mcp-Method`/`Mcp-Name`
+  routing headers, `subscriptions/listen`, header/body protocol-version
+  consistency verification, the moved missing-resource error codes, and the CLI
+  probe/drift path's own dual-revision handling (`validate --live`, `init`,
+  `drift.MakeDriftCheck` all open with `initialize` today).
+
+Until each row lands, an unmapped 2026-07-28-only method hits the fail-closed
+dispatch default (`internal/transport/dispatch.go`, `dispatchUnmapped`) — a
+2026-07-28 host gets denials, never bypass, but is not yet functional against
+eunox.
 
 ---
 
