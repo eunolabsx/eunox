@@ -5,9 +5,12 @@ package callcounter
 
 import (
 	"context"
+	"testing"
 	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // WithRedisTimeFunc exposes the unexported clock-injection option to the
@@ -15,6 +18,19 @@ import (
 // surface. This file is compiled only under `go test`.
 func WithRedisTimeFunc(fn func() time.Time) redisOption {
 	return withTimeFunc(fn)
+}
+
+// NewRedisForTest is NewRedis with its construction error asserted away, for the cases that
+// wire a single-node miniredis client — where neither refusal (a sharding client, crypto/rand)
+// is reachable — and would otherwise carry two lines of error plumbing each. The refusals
+// themselves are pinned by their own tests. Compiled only under `go test`.
+func NewRedisForTest(tb testing.TB, client redis.Cmdable, opts ...redisOption) *Redis {
+	tb.Helper()
+	r, err := NewRedis(client, opts...)
+	if err != nil {
+		tb.Fatalf("NewRedis: %v", err)
+	}
+	return r
 }
 
 // ParseAdmitAllReply exposes the unexported AdmitAll reply decoder to the external test

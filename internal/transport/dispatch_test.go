@@ -606,6 +606,17 @@ func TestAdv6_RateLimit_InMemory_SessionBypass(t *testing.T) {
 // Note: this test covers the same-session-ID cross-instance case.  Session-ID
 // rotation is an independent residual risk that Redis does not address (counter
 // keys include the session ID for both backends).
+// newRedisCounter builds a Redis-backed counter over a single-node test client, where
+// NewRedis's construction refusals (a keyspace-sharding client, crypto/rand) are unreachable.
+func newRedisCounter(t *testing.T, client goredis.Cmdable) *callcounter.Redis {
+	t.Helper()
+	counter, err := callcounter.NewRedis(client)
+	if err != nil {
+		t.Fatalf("callcounter.NewRedis: %v", err)
+	}
+	return counter
+}
+
 func TestAdv6_RateLimit_Redis_SharedAcrossInstances(t *testing.T) {
 	mr := miniredis.RunT(t)
 
@@ -624,8 +635,8 @@ func TestAdv6_RateLimit_Redis_SharedAcrossInstances(t *testing.T) {
 		},
 	}
 
-	pdpA := newManifestPDPWithCounter(caps, callcounter.NewRedis(clientA))
-	pdpB := newManifestPDPWithCounter(caps, callcounter.NewRedis(clientB))
+	pdpA := newManifestPDPWithCounter(caps, newRedisCounter(t, clientA))
+	pdpB := newManifestPDPWithCounter(caps, newRedisCounter(t, clientB))
 
 	ctx := context.Background()
 	target := pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"}

@@ -979,9 +979,12 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	// A keyless SCAN on a *redis.ClusterClient hits one random master, so a cluster-wide
 	// enumeration must visit every master and merge the scans, or refreshState loads a
 	// partial snapshot and reports healthy — a fail-open on the emergency stop.
-	// Reachable only by a LIBRARY consumer (the shipped binary is single-node); kept
-	// because deleting it would leave the cluster case unhandled rather than absent.
-	// Note pkg/callcounter has NO cluster handling — Redis Cluster is unsupported.
+	// Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped
+	// binary is single-node, and callcounter.NewRedis REFUSES a sharding client
+	// (ErrClusterUnsupported), so a proxy sharing one connection pool across the two never
+	// presents a cluster here. Kept because deleting it would leave the standalone cluster
+	// case unhandled rather than absent — a keyless SCAN would silently load a partial kill
+	// set, which is a fail-open on the emergency stop.
 	if cc, ok := r.client.(*redis.ClusterClient); ok {
 		var mu sync.Mutex
 		return cc.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {

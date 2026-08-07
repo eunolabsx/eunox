@@ -32,7 +32,7 @@ func weightedBackends(t *testing.T, now func() time.Time) map[string]capability.
 	t.Cleanup(func() { _ = client.Close() })
 	return map[string]capability.CallCounter{
 		"memory": callcounter.NewInMemory(callcounter.WithTimeFunc(now)),
-		"redis":  callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(now)),
+		"redis":  callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(now)),
 	}
 }
 

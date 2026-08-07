@@ -88,7 +88,7 @@ func TestRedisAdmitAll_WeightedEntryCeilingRefusesRatherThanGrowing(t *testing.T
 	ctx := context.Background()
 
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRedis(client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(3))
+	r := NewRedisForTest(t, client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(3))
 	b := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 1e-9, Limit: 1000}
 	redisKey := redisWindowKey(b.Key, b.WindowSec)
 
@@ -130,7 +130,7 @@ func TestRedisAdmitAll_WeightedCeilingIsAllOrNothingAcrossTheBatch(t *testing.T)
 	ctx := context.Background()
 
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRedis(client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(2))
+	r := NewRedisForTest(t, client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(2))
 	full := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 60, Weight: 1e-9, Limit: 1000}
 	sibling := capability.QuotaBucket{Key: "sess|tool:charge", WindowSec: 3600, Counted: true, Limit: 100}
 
