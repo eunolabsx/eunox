@@ -142,8 +142,8 @@ func TestDecideTarget_PinFiresWhenNoConstraintSelected(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny", resp.Decision)
 	}
-	if resp.Denial == nil || !resp.Denial.HardDeny {
-		t.Fatalf("the pin deny must be HardDeny (non-downgradable); got %+v — a plain no-match deny (HardDeny=false) means the pin did not fire", resp.Denial)
+	if resp.Denial == nil || !resp.Denial.BlockOverride {
+		t.Fatalf("the pin deny must be BlockOverride (non-downgradable); got %+v — a plain no-match deny (BlockOverride=false) means the pin did not fire", resp.Denial)
 	}
 	if resp.Denial == nil || !strings.Contains(resp.Denial.Message, "pinned descriptionHash") {
 		t.Fatalf("deny must be the descriptionHash pin, not the no-match deny; got message %q", resp.Denial.Message)
@@ -176,7 +176,7 @@ func TestRecordObservedToolHashes_UndecodablePinnedEntryPoisons(t *testing.T) {
 	resp := mdp.Decide(context.Background(), "sess",
 		EnforceTarget{Type: capability.TargetTypeTool, Name: "pinned_tool"},
 		map[string]interface{}{}, "")
-	if resp.Decision != capability.DecisionDeny || resp.Denial == nil || !resp.Denial.HardDeny {
+	if resp.Decision != capability.DecisionDeny || resp.Denial == nil || !resp.Denial.BlockOverride {
 		t.Fatalf("call leg must hard-deny the poisoned pin; got decision=%q denial=%+v", resp.Decision, resp.Denial)
 	}
 }
@@ -274,8 +274,8 @@ func TestDecideSampling_AuditOnlyConstraintHardDenies(t *testing.T) {
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
 		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR", resp.Denial)
 	}
-	if resp.Denial == nil || !resp.Denial.HardDeny {
-		t.Error("an audit-only sampling deny must be HardDeny (non-downgradable)")
+	if resp.Denial == nil || !resp.Denial.BlockOverride {
+		t.Error("an audit-only sampling deny must be BlockOverride (non-downgradable)")
 	}
 }
 
@@ -310,12 +310,12 @@ func TestRecordAuditModeAntecedent_RouteAuditRecordsEnforcedConstraint(t *testin
 		t.Fatalf("writes = %d, want 1 (route --audit must record the antecedent)", counter.writes)
 	}
 
-	// A HardDeny is never downgraded — the tool never ran — so it records nothing even
+	// A BlockOverride is never downgraded — the tool never ran — so it records nothing even
 	// under route audit.
 	recordAuditModeAntecedent(ctxAudit, engine, nil, req, enforced,
-		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{HardDeny: true}})
+		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{BlockOverride: true}})
 	if counter.writes != 1 {
-		t.Fatalf("writes = %d, want 1 (a HardDeny must not record even under route audit)", counter.writes)
+		t.Fatalf("writes = %d, want 1 (a BlockOverride must not record even under route audit)", counter.writes)
 	}
 }
 
@@ -399,7 +399,7 @@ func TestDecide_ManifestAbsentToolUnderAudit_RecordsSequenceAntecedent(t *testin
 	// run and its antecedent must land in session history.
 	auditCtx := enforcement.WithSkipQuota(context.Background())
 	resp := callTool(mdp, auditCtx, "absent", nil)
-	if resp.Decision != capability.DecisionDeny || resp.Denial == nil || resp.Denial.HardDeny {
+	if resp.Decision != capability.DecisionDeny || resp.Denial == nil || resp.Denial.BlockOverride {
 		t.Fatalf("want a downgradable AUTHORIZATION_FAILED deny under --audit, got %+v", resp)
 	}
 	if counter.writes != 1 {
@@ -434,7 +434,7 @@ func TestDecide_ManifestAbsentToolUnderAudit_UnqueryableNameRecordsNothing(t *te
 	// antecedent, so none should consume a key.
 	for i := 0; i < 50; i++ {
 		resp := callTool(mdp, auditCtx, fmt.Sprintf("made-up-%d", i), nil)
-		if resp.Denial != nil && resp.Denial.HardDeny {
+		if resp.Denial != nil && resp.Denial.BlockOverride {
 			t.Fatalf("call %d hard-denied on an observe route: %+v", i, resp.Denial)
 		}
 	}
@@ -444,7 +444,7 @@ func TestDecide_ManifestAbsentToolUnderAudit_UnqueryableNameRecordsNothing(t *te
 		t.Fatalf("an observe route must still allow a listed tool after the flood, got %+v", resp)
 	}
 	// And the declared antecedent still records, so the guarantee the gate protects holds.
-	if resp := callTool(mdp, auditCtx, "watched", nil); resp.Denial != nil && resp.Denial.HardDeny {
+	if resp := callTool(mdp, auditCtx, "watched", nil); resp.Denial != nil && resp.Denial.BlockOverride {
 		t.Fatalf("the declared antecedent must still record, got %+v", resp.Denial)
 	}
 }

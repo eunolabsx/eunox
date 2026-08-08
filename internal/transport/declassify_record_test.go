@@ -898,7 +898,7 @@ func TestEnforcedForwardCore_SpentGrantIsNamedWithoutPendingLabels(t *testing.T)
 		Declassification: capability.NewDeclassification(nil, "", "apr-9", true),
 		Denial: &capability.DenialInfo{
 			Code: capability.ErrCodeConditionFailed, ConditionType: capability.DirectiveTypeDeclassify,
-			HardDeny: true, Details: map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
+			BlockOverride: true, Details: map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 		},
 	}
 	fp := forwardParams{rec: rec, sessionID: "s", callUpstream: cleanUpstream()}

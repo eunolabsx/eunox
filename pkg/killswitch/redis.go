@@ -981,20 +981,29 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	// full enumeration must visit each and merge the scans — otherwise refreshState loads a
 	// partial kill set and reports healthy, a fail-open on the emergency stop.
 	//
-	// Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary
-	// is single-node, and callcounter.NewRedis refuses a sharding client outright. Kept because
-	// the half-handled version was the dangerous one — a Ring fell through to the single-node
-	// path and loaded whichever shard go-redis picked at random for that refresh — and the
-	// iterator comes FROM callcounter.ShardIterator, which is also what defines "does this
-	// shard", so this cannot be handed a topology it has no iterator for.
+	// The mutex is taken unconditionally: on the single-node path it is uncontended, and
+	// making it conditional is what would put a second copy of the topology decision here.
+	var mu sync.Mutex
+	return r.forEachNode(ctx, func(ctx context.Context, node redis.Cmdable) error {
+		return scanNode(ctx, node, prefix, target, &mu)
+	})
+}
+
+// forEachNode runs fn against every server holding part of this keyspace: each shard of a
+// sharding client, or the one node otherwise. The ONE place that decision is made, so the two
+// keyless-command sites cannot drift — the shape they were in before, when one of them fell
+// through to a single-node SCAN for a *redis.Ring and loaded whichever shard go-redis picked.
+//
+// The topology comes from callcounter.ShardIterator, which is also what DEFINES "does this
+// client shard", so this cannot be handed a shape it has no iterator for.
+//
+// Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary is
+// single-node, and callcounter.NewRedis refuses a sharding client outright.
+func (r *Redis) forEachNode(ctx context.Context, fn func(context.Context, redis.Cmdable) error) error {
 	if fanOut := callcounter.ShardIterator(r.client); fanOut != nil {
-		var mu sync.Mutex
-		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
-			return scanNode(ctx, node, prefix, target, &mu)
-		})
+		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error { return fn(ctx, node) })
 	}
-	// r.client satisfies scanner by construction: Scan is part of redis.Cmdable.
-	return scanNode(ctx, r.client, prefix, target, nil)
+	return fn(ctx, r.client)
 }
 
 // scanNode SCANs a single node for keys matching prefix and records the stripped IDs in
@@ -1030,16 +1039,11 @@ type scanDeleter interface {
 }
 
 func (r *Redis) deleteByPrefix(ctx context.Context, prefix string) error {
-	// As with scanPrefix, a sharding client SCANs only one server, so a reset must visit each;
-	// otherwise Reset() reports success while leaving kills on the others.
-	if fanOut := callcounter.ShardIterator(r.client); fanOut != nil {
-		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
-			return deleteNodeKeys(ctx, node, prefix)
-		})
-	}
-	// r.client satisfies scanDeleter by construction: Scan and Del are both part of
-	// redis.Cmdable.
-	return deleteNodeKeys(ctx, r.client, prefix)
+	// Through the same resolver as scanPrefix: a sharding client SCANs only one server, so a
+	// reset must visit each or Reset() reports success while leaving kills on the others.
+	return r.forEachNode(ctx, func(ctx context.Context, node redis.Cmdable) error {
+		return deleteNodeKeys(ctx, node, prefix)
+	})
 }
 
 // deleteNodeKeys SCANs a single node and deletes keys one at a time: a multi-key DEL can

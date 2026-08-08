@@ -1128,16 +1128,18 @@ Section conventions:
   is a property of the legs rather than a drift — the pre-session arms exist only to answer
   `initialize`, so their context IS the handshake revision — and that is now written down where
   the two legs differ.
-- **The HTTP session leg makes at most one kill-switch lookup per POST.** The notification
-  gate's revocation check is a thunk so a swallowed notification costs no lookup — on a
-  Redis-backed kill switch that is a network round trip. The session leg computed the answer
-  eagerly before building the gate, so the thunk returned an already-paid value and the saving
-  was never taken; an enforced or locally-answered request then paid a SECOND lookup inside the
-  dispatcher's gate. The leg now shares one lazily-resolved, memoized answer with every gate on
-  the message, which also means the gates of a single POST cannot disagree about whether it is
-  revoked. Consequence: a notification the gates DROP (swallowed, revoked, unmapped) no longer
-  defers that session's idle reaping — the conservative direction, since a revoked session must
-  not keep itself alive.
+- **The HTTP session leg's kill-switch lookup is lazy, and idle reaping follows what the proxy
+  acts on.** The notification gate's revocation check is a thunk so a swallowed notification
+  costs no lookup — on a Redis-backed kill switch that is a network round trip — but the session
+  leg computed the answer eagerly before building the gate, so the thunk returned an
+  already-paid value and the saving was never taken. The leg now resolves it on first use and
+  shares that one answer among its own gates. The dispatcher's gate is deliberately NOT given
+  it: that gate can be reached after an unbounded wait for the decision turn, and a kill landing
+  during the wait must be recorded as `KILL_SWITCH` rather than as the method's own refusal.
+  Consequence: a session's idle timer is deferred by traffic the proxy ACTS on — forwards,
+  answers, and refusals it records — and not by messages it discards, so a swallowed
+  notification, or a reply to a request this proxy never issued, can no longer hold a session
+  and its upstream subprocess open past the idle timeout.
 - **An unknown condition type is no longer forwarded on an observing route.** Three refusals
   mean "this condition could not be evaluated" and two of them blocked; the third — an unknown
   condition type — was built without the non-downgradable flag, so on a route running
@@ -1171,6 +1173,15 @@ Section conventions:
   changes is that a fault- or revocation-coded denial minted with the bool unset (a
   transport-layer literal, an out-of-tree PDP) can no longer have the PDP commit session state
   for a call the transport then hard-blocks.
+
+  **Migration (breaking, pre-1.0):** `capability.DenialInfo.HardDeny` and
+  `enforcement.ConditionError.HardDeny` are renamed to **`BlockOverride`**. The field's meaning
+  narrowed — it is now ONLY a producer's override of the denial class, never the general "this
+  must block" signal — and a rename is what turns that into a compile error rather than a silent
+  flip. An embedder that read `HardDeny` to decide whether to forward a refusal must switch to
+  `DenialInfo.Downgradable()`, which folds the class and the override; reading the bool alone was
+  already wrong for a kill switch (a revocation never set it) and is now wrong for engine faults
+  too. Producers that SET it to block a policy verdict keep their behavior under the new name.
 - **The sessionless HTTP arms inherit the gate order instead of restating it.** An id-less
   `initialize` with no session reached neither the shared notification gate nor the dispatcher,
   so the canonical per-message order was hand-placed there — a fifth copy of an order the

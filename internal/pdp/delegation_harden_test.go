@@ -147,7 +147,7 @@ func TestHardenRefusal_DelegationCapDoesNotPreemptTheEscalation(t *testing.T) {
 	if hardened.Decision != capability.DecisionEscalate {
 		t.Fatalf("decision = %v, want escalate: the ceiling's HARD verdict must win over the delegation cap's downgradable one", hardened.Decision)
 	}
-	if hardened.Denial == nil || !hardened.Denial.HardDeny {
+	if hardened.Denial == nil || !hardened.Denial.BlockOverride {
 		t.Fatalf("the composed refusal must stay hard: %+v", hardened.Denial)
 	}
 }

@@ -1022,12 +1022,12 @@ func (p *JWTPDP) routeAudienceSatisfied(claims *JWTClaims) bool {
 	return false
 }
 
-// audienceDeny carries the producer's HardDeny override so a route running under --audit does
+// audienceDeny carries the producer's BlockOverride override so a route running under --audit does
 // NOT downgrade it to a logged forward: audience is an authentication/tenancy boundary (like
 // the kill switch), not the per-call policy decision its AUTHORIZATION_FAILED code names.
 func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 	resp := denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtAudience", message)
-	resp.Denial.HardDeny = true
+	resp.Denial.BlockOverride = true
 	return resp
 }
 

@@ -157,7 +157,7 @@ func TestEnforcedForwardCore_AllowCleanSuccessHasNoDetail(t *testing.T) {
 	assert.Nil(t, rec.records[0].details, "a clean success must record no extra detail")
 }
 
-func TestEnforcedForwardCore_HardDenyDoesNotCallUpstream(t *testing.T) {
+func TestEnforcedForwardCore_BlockOverrideDoesNotCallUpstream(t *testing.T) {
 	rec := &fwdRecorder{}
 	called := false
 	fp := forwardParams{
@@ -398,8 +398,8 @@ func TestEnforcedForwardCore_NilDenialDoesNotPanic(t *testing.T) {
 // audit mode, a hard denial is never downgraded, and only a soft denial in
 // audit or audit-only mode is downgraded to observe.
 func TestIsObserveDeny_Matrix(t *testing.T) {
-	soft := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, HardDeny: false}
-	hard := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, HardDeny: true}
+	soft := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, BlockOverride: false}
+	hard := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, BlockOverride: true}
 	killSwitch := &capability.DenialInfo{Code: capability.ErrCodeKillSwitch}
 
 	cases := []struct {
@@ -528,13 +528,13 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 	t.Run("a kill-switch denial is never downgraded", func(t *testing.T) {
 		// The second exemption isObserveDeny applies, and the one WillForwardDeny cannot
 		// express: a kill is recognized by its CODE and sets no override, so a reader who took
-		// "the HardDeny flag is the only thing that never downgrades" literally would forward
+		// "the BlockOverride flag is the only thing that never downgrades" literally would forward
 		// an operator's emergency stop.
 		dec := capability.EnforceResponse{
 			Decision: capability.DecisionDeny,
 			Denial:   &capability.DenialInfo{Code: capability.ErrCodeKillSwitch},
 		}
-		require.False(t, dec.Denial.HardDeny, "the premise: a kill is blocked by its code, not by the flag")
+		require.False(t, dec.Denial.BlockOverride, "the premise: a kill is blocked by its code, not by the flag")
 
 		rec, called := forward(t, dec, true)
 		assert.False(t, called, "an emergency stop must block even on a route running --audit")
@@ -547,7 +547,7 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 		dec := decide(context.Background(), capability.EnforcementAudit, modeSoftDeny)
 		require.Equal(t, capability.DecisionDeny, dec.Decision)
 		require.NotNil(t, dec.Denial)
-		require.False(t, dec.Denial.HardDeny, "an ordinary condition failure is a policy verdict, not an engine bug")
+		require.False(t, dec.Denial.BlockOverride, "an ordinary condition failure is a policy verdict, not an engine bug")
 
 		rec, called := forward(t, dec, false)
 		assert.True(t, called, "the union's forwarding half: an audit-mode constraint delivers the call")
@@ -581,7 +581,7 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 		// descriptionHash pin). Same code as the forwarded arm above; only the override differs.
 		dec := capability.EnforceResponse{
 			Decision: capability.DecisionDeny,
-			Denial:   &capability.DenialInfo{Code: capability.ErrCodeConditionFailed, HardDeny: true},
+			Denial:   &capability.DenialInfo{Code: capability.ErrCodeConditionFailed, BlockOverride: true},
 		}
 		require.Equal(t, capability.DenialClassPolicy, capability.ClassifyDenialCode(dec.Denial.Code),
 			"the premise: the class alone would forward this")

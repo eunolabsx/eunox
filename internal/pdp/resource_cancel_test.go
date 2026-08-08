@@ -273,7 +273,7 @@ func TestJWTPDP_DecideResourceCancel_NoClaims_HardDenied(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeNoJWTClaims, resp.Denial.Code)
-	assert.True(t, resp.Denial.HardDeny,
+	assert.True(t, resp.Denial.BlockOverride,
 		"an unvalidated token must not be downgradable to a logged forward by an audit-mode route")
 }
 

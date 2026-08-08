@@ -4,6 +4,8 @@
 package transport
 
 import (
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -152,11 +155,21 @@ type packageSource struct {
 // provenance struct directly, drive the negotiation primitives — to pin the rule itself, and
 // holding them to it would say nothing about production while making every new table-driven
 // test edit an allowlist.
+// Parsed ONCE per test binary: five guards walk the same ~13k lines, and the result is
+// read-only in every one of them.
 func packageSources(t *testing.T) []packageSource {
 	t.Helper()
+	sources, err := parsePackageSources()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sources
+}
+
+var parsePackageSources = sync.OnceValues(func() ([]packageSource, error) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("listing package sources: %v", err)
+		return nil, fmt.Errorf("listing package sources: %w", err)
 	}
 	fset := token.NewFileSet()
 	var sources []packageSource
@@ -167,17 +180,17 @@ func packageSources(t *testing.T) []packageSource {
 		}
 		file, perr := parser.ParseFile(fset, name, nil, 0)
 		if perr != nil {
-			t.Fatalf("parsing %s: %v", name, perr)
+			return nil, fmt.Errorf("parsing %s: %w", name, perr)
 		}
 		sources = append(sources, packageSource{name: filepath.Base(name), file: file, fset: fset})
 	}
 	// Every caller's guard passes vacuously on an empty walk, so the emptiness is refused here
 	// rather than re-checked (or forgotten) at each one.
 	if len(sources) == 0 {
-		t.Fatal("no package sources found; every source guard would pass vacuously")
+		return nil, errors.New("no package sources found; every source guard would pass vacuously")
 	}
-	return sources
-}
+	return sources, nil
+})
 
 // walkLiterals visits every composite literal under n, reporting the named type of each and
 // the literal itself (so a caller can also inspect its elements). elem is the type name an
@@ -243,6 +256,20 @@ func elementTypeName(t ast.Expr) string {
 	}
 	if ident, ok := elt.(*ast.Ident); ok {
 		return ident.Name
+	}
+	return ""
+}
+
+// callName returns the identifier a call names — `f(...)` or `x.f(...)` — or "" for any other
+// callee shape. Shared by every source guard here that matches calls by name: each used to
+// handle one spelling, and a guard that misses the other is a guard that passes on the code it
+// was written to catch.
+func callName(call *ast.CallExpr) string {
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		return fun.Name
+	case *ast.SelectorExpr:
+		return fun.Sel.Name
 	}
 	return ""
 }

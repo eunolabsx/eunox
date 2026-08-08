@@ -45,7 +45,7 @@ func TestPin_CaseVariantSiblingKeyPoisons(t *testing.T) {
 	resp := observe.Decide(context.Background(), "sess",
 		EnforceTarget{Type: capability.TargetTypeTool, Name: "pinned_tool"},
 		map[string]interface{}{}, "")
-	if resp.Decision != capability.DecisionDeny || resp.Denial == nil || !resp.Denial.HardDeny {
+	if resp.Decision != capability.DecisionDeny || resp.Denial == nil || !resp.Denial.BlockOverride {
 		t.Fatalf("call leg must hard-deny the poisoned pin; got decision=%q denial=%+v", resp.Decision, resp.Denial)
 	}
 
@@ -378,8 +378,8 @@ func TestJWTDecide_RouteAuditDowngradedDenyCarriesObligations(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny", resp.Decision)
 	}
-	if resp.Denial != nil && resp.Denial.HardDeny {
-		t.Fatal("a JWT capability deny is downgradable, so it must not be a HardDeny")
+	if resp.Denial != nil && resp.Denial.BlockOverride {
+		t.Fatal("a JWT capability deny is downgradable, so it must not be a BlockOverride")
 	}
 	if len(resp.Obligations) != 1 || resp.Obligations[0].Type != capability.DirectiveTypeRedactFields {
 		t.Fatalf("a JWT deny the --audit route forwards must carry the manifest's redactFields obligation; got %+v", resp.Obligations)
@@ -759,7 +759,7 @@ func TestAuditModeAntecedent_UnanchorableRequestWritesNothing(t *testing.T) {
 	if resp.Decision == capability.DecisionAllow {
 		t.Fatalf("an unlisted tool must still be denied: %+v", resp)
 	}
-	if resp.Denial == nil || !resp.Denial.HardDeny {
+	if resp.Denial == nil || !resp.Denial.BlockOverride {
 		t.Fatalf("the refusal must be HARD: a downgradable one is FORWARDED by --audit, which is "+
 			"how the un-anchored antecedent would be written in the first place; got %+v", resp.Denial)
 	}

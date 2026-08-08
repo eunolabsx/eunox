@@ -69,7 +69,7 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetForARemovedMethod(t *test
 	rec := &fwdRecorder{}
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodResourcesSubscribe}
 	gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
-	if gate.admit(revisionContext(capability.Revision20260728), msg) {
+	if gate.admit(revisionContext(capability.Revision20260728), msg) == notificationForward {
 		t.Fatal("a method the revision removed must be denied in notification framing too")
 	}
 	if len(rec.records) != 1 || rec.records[0].identifier != "" {
@@ -95,8 +95,13 @@ func TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDefines(t *testing.T) {
 	hw := &mockHostWriter{}
 	pr, pw := io.Pipe()
 	p := &StdioProxy{
-		pdp:          newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
-		sessionID:    "sess",
+		pdp:       newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sessionID: "sess",
+		// The leg Start always leaves a proxy on: eunox opens every upstream with `initialize`,
+		// so the handshake revision is what it addresses one as. Set here because it changes
+		// what resolveHostRevision will honor, and a fixture that omits it tests a state
+		// production never reaches.
+		upstreamRev:  handshakeRevision,
 		hostReader:   mcp.NewMsgReader(pr),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
@@ -131,15 +136,21 @@ func TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDefines(t *testing.T) {
 // cost the property the pin exists for. A peer that never sends `initialize` still latches its
 // revision from its first ordinary message, so a later declaration disagreeing with it is
 // refused as the mid-context flip it is.
+//
+// The peer declares the HANDSHAKE revision, which is the only one a live upstream leg can
+// dispatch: eunox addresses every leg it opens as that revision, and every method 2026-07-28
+// defines forwards its params, so a declaration of the newer one is refused by
+// checkUpstreamHonorable one gate before the pin is even consulted. A fixture that pinned
+// 2026-07-28 would only reach the pin by leaving the leg revision unset — a state Start never
+// produces.
 func TestStdioNegotiation_StillPinsFromADefinedMethod(t *testing.T) {
 	t.Parallel()
 	hw := &mockHostWriter{}
 	pr, pw := io.Pipe()
 	p := &StdioProxy{
-		// No capabilities: the calls below are denied by policy, so neither reaches an upstream
-		// this proxy does not have.
 		pdp:          newTestManifestPDP(),
 		sessionID:    "sess",
+		upstreamRev:  handshakeRevision,
 		hostReader:   mcp.NewMsgReader(pr),
 		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
 		upWriter:     mcp.NewMsgWriter(io.Discard),
@@ -149,10 +160,10 @@ func TestStdioNegotiation_StillPinsFromADefinedMethod(t *testing.T) {
 	done := make(chan struct{})
 	go func() { p.serveHost(context.Background()); close(done) }()
 
-	// tools/call exists in BOTH revisions, so declaring the newer one here is evidence about
-	// the conversation — unlike the `initialize` above, which the declared revision removed.
-	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`+"\n")
-	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"probe","_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`+"\n")
+	// ping is answered locally and exists in the declared revision, so it both pins and is
+	// dispatched — unlike the `initialize` above, which the revision IT declared had removed.
+	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`+"\n")
+	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":2,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`+"\n")
 	_ = pw.Close()
 	select {
 	case <-done:
@@ -160,14 +171,14 @@ func TestStdioNegotiation_StillPinsFromADefinedMethod(t *testing.T) {
 		t.Fatal("serveHost did not return after the host closed stdin")
 	}
 
-	if got := p.hostRevision(); got != capability.Revision20260728 {
-		t.Fatalf("pinned revision = %q, want %q from the first message the revision defines", got, capability.Revision20260728)
+	if got := p.hostRevision(); got != handshakeRevision {
+		t.Fatalf("pinned revision = %q, want %q from the first message the revision defines", got, handshakeRevision)
 	}
 	if len(hw.messages) != 2 {
 		t.Fatalf("host received %d message(s), want two: %+v", len(hw.messages), hw.messages)
 	}
-	// Order-independent: the flip is refused inline by the read loop while the first call's
-	// policy denial is written by its own handler goroutine, so either may land first.
+	// Order-independent: the flip is refused inline by the read loop while the first message's
+	// own reply is written by its handler goroutine, so either may land first.
 	flipped := false
 	for _, m := range hw.messages {
 		if m.Error != nil && m.Error.Code == capability.JSONRPCCodeUnsupportedProtocolVersion {

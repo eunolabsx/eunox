@@ -47,9 +47,9 @@ const maxReflectedRevisionLen = 32
 // A params body that does not decode reports nothing declared rather than an error. It is a
 // malformed REQUEST, and relabelling every one of those as a version failure would replace
 // the target-bearing INVALID_REQUEST record the enforced-method handlers write. What keeps
-// that safe is the caller's own pin: a context resolves its revision from its FIRST message
-// and every later one is checked against it, so falling through yields the context's revision
-// rather than a caller-chosen table.
+// that safe is where a caller-chosen table can come from at all: this reports "nothing
+// declared", so the caller resolves the context's pinned revision — or, on a context with no
+// pin yet, capability.DefaultRevision. Neither is a table the malformed body chose.
 func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared bool, err error) {
 	if len(params) == 0 {
 		return "", false, nil

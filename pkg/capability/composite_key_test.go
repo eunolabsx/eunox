@@ -8,11 +8,65 @@ import (
 	"testing"
 )
 
+// TestCompositeKey_EncodesTheseExactBytes is the GOLDEN half, and the one that matters: the
+// key addresses a live counter/flow bucket in both the in-memory and Redis backends, so a
+// change to the encoding does not fail — it quietly accounts a call against a different bucket
+// than the one the same policy used yesterday, resetting every budget and orphaning every
+// sequenceBlock antecedent in a running deployment.
+//
+// Literal expected strings, deliberately. The equivalence table below cannot stand in for this:
+// CompositeKey delegates to CompositeKeyJoin, so both sides of that comparison move together.
+func TestCompositeKey_EncodesTheseExactBytes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		got    string
+		want   string
+		reason string
+	}{
+		{
+			name:   "a counter key",
+			got:    CompositeKey("maxcalls", "route", "sess-1", "tool", "export"),
+			want:   "maxcalls:5:route:6:sess-1:4:tool:6:export",
+			reason: "prefix verbatim, then each part as :<byte length>:<bytes>",
+		},
+		{
+			name: "the same key through the two-group form",
+			got:  CompositeKeyJoin("maxcalls", []string{"route", "sess-1"}, []string{"tool", "export"}),
+			want: "maxcalls:5:route:6:sess-1:4:tool:6:export",
+		},
+		{
+			name:   "an empty part still carries its tag",
+			got:    CompositeKey("seq", "", "x"),
+			want:   "seq:0::1:x",
+			reason: "dropping the tag for an empty part would make (\"\",\"x\") and (\"x\") one key",
+		},
+		{
+			name:   "a part carrying the separator",
+			got:    CompositeKey("flow", "a:1:b"),
+			want:   "flow:5:a:1:b",
+			reason: "the length prefix is what makes a caller-supplied \":\" unable to forge another tuple",
+		},
+		{
+			name: "a NUL-bearing part",
+			got:  CompositeKey("seq", "a\x00b"),
+			want: "seq:3:a\x00b",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.got != tc.want {
+				t.Errorf("key = %q, want %q — %s\n  Changing this encoding re-keys every deployed counter and flow bucket; if that is genuinely intended it needs a migration, not a test update.", tc.got, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
 // TestCompositeKeyJoin_MatchesTheFlattenedSpelling is what makes the two-group form safe to
 // reach for: it must produce the SAME bytes as flattening the groups into one variadic list.
-// The key addresses a live counter/flow bucket in both the in-memory and Redis backends, so a
-// divergence would not fail — it would quietly account a call against a different bucket than
-// the one the same policy used yesterday.
+// It is a RELATIVE check — both sides share one encoder — so it says the grouping is invisible,
+// not what the bytes are; the golden table above says that.
 func TestCompositeKeyJoin_MatchesTheFlattenedSpelling(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

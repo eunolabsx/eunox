@@ -461,7 +461,7 @@ func denyResponse(clock enforcement.Clock, code, condType, message string) capab
 // denyResponseWithDetails is denyResponse for a deny that carries structured details, and it
 // is the ONE place in this package that may set Denial.Details.
 //
-// It sets no Denial.HardDeny for a non-policy code: whether an observing route may forward a
+// It sets no Denial.BlockOverride for a non-policy code: whether an observing route may forward a
 // refusal is read off the CODE, by capability.DenialInfo.Downgradable, at every site that
 // asks. Deriving it onto the bool here too made the field mean "override OR one of the two
 // non-policy classes" — two meanings, both of which a third denial constructor could get
@@ -509,8 +509,15 @@ func denyResponseWithDetails(clock enforcement.Clock, code, condType, message st
 // message rather than replacing it. A grant is one of an OR-list, so which entry refused is
 // the diagnostic a bare condition message cannot supply.
 func denyFromCondition(clock enforcement.Clock, name string, cerr *enforcement.ConditionError) capability.EnforceResponse {
-	return denyResponseWithDetails(clock, cerr.Code, cerr.ConditionType,
+	resp := denyResponseWithDetails(clock, cerr.Code, cerr.ConditionType,
 		fmt.Sprintf("%q: %s", name, cerr.Message), cerr.Details)
+	// The handler's OVERRIDE travels with the verdict, as it does on the engine's own funnel
+	// (evalCtx.denyFromConditionError). Dropping it here meant one logical refusal was
+	// forwardable on the JWT claim path and blocking on the manifest path — and now that the
+	// class is the only other half of Downgradable, this is the whole of what a handler can
+	// say beyond its code.
+	resp.Denial.BlockOverride = cerr.BlockOverride
+	return resp
 }
 
 // hardDenyResponse builds a deny that must never be downgraded to an audit-mode
@@ -527,7 +534,7 @@ func denyFromCondition(clock enforcement.Clock, name string, cerr *enforcement.C
 // than what makes it block — see capability.DenialInfo.Downgradable.
 func hardDenyResponse(clock enforcement.Clock, code, message string) capability.EnforceResponse {
 	resp := denyResponse(clock, code, "", message)
-	resp.Denial.HardDeny = true
+	resp.Denial.BlockOverride = true
 	return resp
 }
 
@@ -1258,7 +1265,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// probe cannot catch. An as-yet-unobserved description is not denied (the probe
 	// already verified every pin at establishment). Returns hardDenyResponse: a
 	// tool-poisoning deny is not downgradable even under audit (see that helper for how
-	// HardDeny survives stamp() and isObserveDeny).
+	// BlockOverride survives stamp() and isObserveDeny).
 	//
 	// This runs BEFORE findConstraint and the no-match return below, keyed off
 	// pinnedTools (every pinned entry for this name), never off the SELECTED constraint:
@@ -1384,7 +1391,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// This guard MUST run BEFORE the audit-mode defer below; it is an
 	// ENFORCEMENT_ERROR (an engine bug, not a downgradable policy verdict), so it
 	// returns hardDenyResponse to stay non-downgradable even under audit (see that
-	// helper for how HardDeny survives stamp() and isObserveDeny).
+	// helper for how BlockOverride survives stamp() and isObserveDeny).
 	if matched.ArgumentSchema != nil && schema != validateSchema {
 		return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
 			fmt.Sprintf("constraint %q carries an argumentSchema, which is tool-only and not enforced on %s; refusing to forward a request guarded by an unenforced schema (fail closed)", matched.Target, targetOperationPhrase(target.Type)))
@@ -1781,9 +1788,9 @@ func willForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
 // The decision test is `!= DecisionAllow`, not `== DecisionDeny`, matching the transport's
 // own fail-closed gate: a zero-value or unset Decision is forwarded there, so gating on
 // `== DecisionDeny` here would let it through unredacted. Fills only when the response
-// carries none yet — a flow/record-fault deny already carries them. CollectObligations
-// returns a HardDeny for an unwired directive type; honor it (fail closed) rather than
-// forwarding unredacted.
+// carries none yet — a flow/record-fault deny already carries them. CollectObligations refuses
+// an unwired directive type with a FAULT code, which no observing route downgrades; honor it
+// (fail closed) rather than forwarding unredacted.
 //
 // chain is a PARAMETER rather than a read of delegationFromContext(ctx), so the caller states
 // which chain this response's redaction composes from. It is the same rule CollectObligations
@@ -1883,7 +1890,7 @@ func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.Enf
 	// refused, and rewriting it would hide the authorization failure the caller must fix.
 	// Only the forwardability changes, which is the one property the pin governs.
 	denial := *r.Denial
-	denial.HardDeny = true
+	denial.BlockOverride = true
 	// The two pins fail for different reasons and have different remedies, so the message
 	// must say which one fired. The FM-5 pin compares the live surface against the
 	// MANIFEST's descriptionHash (remedy: re-review the tool and re-pin); Tier-2 compares

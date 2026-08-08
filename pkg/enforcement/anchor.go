@@ -126,7 +126,9 @@ func (e *Engine) anchoredKey(prefix string, req *capability.EnforceRequest, tail
 	// for a slice nothing outlives the call to read.
 	var backing [3]string
 	head := e.appendStateAnchor(append(backing[:0], e.counterKeyNamespace), req)
-	return compositeCounterKeyJoin(prefix, head, tail)
+	// capability.CompositeKeyJoin directly rather than through a counter-side alias: the alias
+	// would be a second name for one encoding whose whole point is that there is one.
+	return capability.CompositeKeyJoin(prefix, head, tail)
 }
 
 // sequenceHistoryKey builds the per-anchor, per-target key an allowed call is recorded under

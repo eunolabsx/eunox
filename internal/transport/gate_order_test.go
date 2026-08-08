@@ -256,7 +256,7 @@ func TestGateOrder_NotificationGateAppliesTheCanonicalOrder(t *testing.T) {
 					return nil
 				},
 			}
-			if gate.admit(revisionContext(capability.DefaultRevision), mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}) {
+			if gate.admit(revisionContext(capability.DefaultRevision), mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}) == notificationForward {
 				t.Fatalf("%q must not be forwarded", tc.method)
 			}
 			if tc.wantCode == "" {
@@ -500,15 +500,22 @@ var negotiationPrimitives = map[string]string{
 	"refuseHostRevision":  "negotiateHostRevision",
 }
 
-// hostMessageDispositions are the calls that DISPOSE of a host message: dispatch it to a
-// handler, admit it through the shared notification gate, or refuse it with a kill record. The
-// value is the argument count that identifies the disposition call, since two of these names
-// are shared with unrelated helpers (recordLimiter.admit takes none or one; the gate's takes
-// ctx and the message).
+// hostMessageDispositions are the SINKS this guard recognizes as disposing of a host message:
+// dispatching it to a handler, admitting it through the shared notification gate, or refusing
+// it with a kill record. The value is the argument count that identifies the call, since two
+// of these names are shared with unrelated helpers (a record limiter's admit takes none or one;
+// the gate's takes ctx and the message).
 //
-// Reaching one of these is what makes a function an ENTRY POINT for the purposes of the guard
-// below: it is the moment the proxy acts on a message, and every gate that acts must run on a
-// context whose revision was negotiated.
+// Reaching one of them is what makes a function an ENTRY POINT here: it is the moment the proxy
+// acts on a message, and every gate that acts must run on a context whose revision was
+// negotiated.
+//
+// A NAMED set, not a derived one, and therefore not exhaustive: an arm that refuses a host
+// message through some other helper (a bare rec.RecordDeny beside a hand-built error body) is
+// not seen. That is the residual this guard does not close — it converts "a new arm reached
+// through one of the ways messages are actually disposed of" from silence into a build failure,
+// which is the shape the id-less `initialize` arm slipped through, and a new sink belongs in
+// this map the day it is written.
 var hostMessageDispositions = map[string]int{
 	"dispatchRequest":  3,
 	"admit":            2,
@@ -679,14 +686,7 @@ func hostMessageDispositionSites(fn *ast.FuncDecl) []*ast.CallExpr {
 		if !isCall {
 			return true
 		}
-		name := ""
-		switch fun := call.Fun.(type) {
-		case *ast.Ident:
-			name = fun.Name
-		case *ast.SelectorExpr:
-			name = fun.Sel.Name
-		}
-		if want, guarded := hostMessageDispositions[name]; guarded && len(call.Args) == want {
+		if want, guarded := hostMessageDispositions[callName(call)]; guarded && len(call.Args) == want {
 			sites = append(sites, call)
 		}
 		return true
@@ -735,13 +735,13 @@ func unconditionalNegotiation(stmt ast.Stmt) bool {
 	return false
 }
 
+// isNegotiationCall matches the prologue call in EITHER spelling — a method on the proxy, or a
+// package-level function, which is what a future non-method prologue would be. Matching only
+// the method form would fail a correctly-written entry point with a message telling its author
+// their message's revision was never resolved.
 func isNegotiationCall(e ast.Expr) bool {
 	call, isCall := e.(*ast.CallExpr)
-	if !isCall {
-		return false
-	}
-	sel, isSel := call.Fun.(*ast.SelectorExpr)
-	return isSel && sel.Sel.Name == "negotiateHostRevision"
+	return isCall && callName(call) == "negotiateHostRevision"
 }
 
 // TestGateOrder_SessionlessNotificationInheritsTheSharedGate pins the one thing the

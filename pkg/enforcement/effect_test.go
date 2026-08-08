@@ -181,7 +181,7 @@ func TestEffectCeiling_EscalatesConsequentialActions(t *testing.T) {
 		assert.Contains(t, resp.Denial.Details["ceiling_exceeded"], "blast_radius")
 		// An escalation must not be downgradable to a forward: performing the action and
 		// logging it is precisely what the ceiling exists to stop.
-		assert.True(t, resp.Denial.HardDeny)
+		assert.True(t, resp.Denial.BlockOverride)
 		assert.False(t, resp.AuditOnly)
 	})
 

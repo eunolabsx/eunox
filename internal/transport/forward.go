@@ -681,7 +681,7 @@ func normalizeDenial(d *capability.DenialInfo) *capability.DenialInfo {
 //
 // WHICH denials resist the downgrade is not this function's question and never was: it is a
 // property of the refusal, answered by [capability.DenialInfo.Downgradable] from the class its
-// code names, plus the producer's HardDeny override. What used to sit here was one conjunct
+// code names, plus the producer's BlockOverride override. What used to sit here was one conjunct
 // per reason — a code test for the kill switch, a bool for everything else — so a third
 // reason (the engine faults, which carried the policy-verdict code and remembered the bool
 // only sometimes) had nowhere to go. This side now contributes only the POSTURE.
@@ -1072,7 +1072,7 @@ func samplingFlowDenial(message, reason string) capability.EnforceResponse {
 			Code:          capability.ErrCodeConditionFailed,
 			ConditionType: capability.ConditionTypeFlowLabel,
 			Message:       message,
-			HardDeny:      true,
+			BlockOverride: true,
 			Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "reason": reason},
 		},
 	}

@@ -34,19 +34,24 @@ func CompositeKey(prefix string, parts ...string) string {
 // would silently address a different bucket.
 func CompositeKeyJoin(prefix string, head, tail []string) string {
 	// Pre-sized; over-estimating only wastes a few bytes of backing array.
-	size := len(prefix)
-	for _, p := range head {
-		size += len(p) + 8
-	}
-	for _, p := range tail {
-		size += len(p) + 8
-	}
+	size := len(prefix) + compositePartsSize(head) + compositePartsSize(tail)
 	var b strings.Builder
 	b.Grow(size)
 	b.WriteString(prefix)
 	writeCompositeParts(&b, head)
 	writeCompositeParts(&b, tail)
 	return b.String()
+}
+
+// compositePartsSize estimates the encoded size of parts: their bytes plus the ":<len>:" frame
+// writeCompositeParts adds. Beside that writer rather than inlined per group, so a change to
+// the framing lands on the estimate too.
+func compositePartsSize(parts []string) int {
+	size := 0
+	for _, p := range parts {
+		size += len(p) + 8
+	}
+	return size
 }
 
 // writeCompositeParts writes the length-prefixed encoding of parts. The one implementation of

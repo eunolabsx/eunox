@@ -115,7 +115,7 @@ func IsDelegationRefusal(d *capability.DenialInfo) bool {
 // delegationDenial builds the refusal every gate above returns, single-sourcing the code,
 // taxonomy slot, and details shape.
 //
-// Downgradable (HardDeny unset) by design: a delegation bound is an authorization verdict like
+// Downgradable (BlockOverride unset) by design: a delegation bound is an authorization verdict like
 // the manifest's own no-match deny, and --audit exists to preview enforcement including a
 // delegation chain being rolled out. Only refusals where forwarding would destroy evidence or
 // an invariant (declassify, ceiling, a failed state write) must survive --audit; a delegate

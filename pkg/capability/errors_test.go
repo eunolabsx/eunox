@@ -192,7 +192,7 @@ func TestDenialInfo_Downgradable(t *testing.T) {
 		want   bool
 	}{
 		{"policy verdict", &capability.DenialInfo{Code: capability.ErrCodeConditionFailed}, true},
-		{"policy verdict overridden by the producer", &capability.DenialInfo{Code: capability.ErrCodeConditionFailed, HardDeny: true}, false},
+		{"policy verdict overridden by the producer", &capability.DenialInfo{Code: capability.ErrCodeConditionFailed, BlockOverride: true}, false},
 		{"engine fault", &capability.DenialInfo{Code: capability.ErrCodeEnforcementError}, false},
 		{"revocation", &capability.DenialInfo{Code: capability.ErrCodeKillSwitch}, false},
 		{"revocation backend fault", &capability.DenialInfo{Code: capability.ErrCodeKillSwitchError}, false},

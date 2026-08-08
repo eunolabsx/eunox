@@ -135,9 +135,10 @@ type StdioProxy struct {
 	// configuredUpstreamRev is the operator's explicit pin, empty for "probe it".
 	configuredUpstreamRev capability.Revision
 
-	// hostRev is the revision this host connection's context resolved, pinned from its FIRST
-	// message and checked against every later one (resolveHostRevision), so a mid-context flip
-	// is refused rather than silently switching method tables.
+	// hostRev is the revision this host connection's context resolved, pinned from its first
+	// message that the resolved revision DEFINES (see negotiateHostRevision for why the second
+	// half is load-bearing) and checked against every later one (resolveHostRevision), so a
+	// mid-context flip is refused rather than silently switching method tables.
 	//
 	// WRITTEN only by serveHost, inline on the loop that reads host messages, before the
 	// per-request handler is spawned. Pinning it from the initialize RESPONSE instead was the
@@ -1120,7 +1121,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		checkKill:   func() *capability.EnforceResponse { return p.pdp.CheckKill(ctx, p.sessionID) },
 		leg:         legStdioNotification,
 	}
-	if !gate.admit(ctx, msg) {
+	if gate.admit(ctx, msg) != notificationForward {
 		return false
 	}
 	if !p.waitHostForwardOrShutdown(ctx) {
@@ -1221,8 +1222,10 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 	return capability.WithProtocolRevision(ctx, rev), true
 }
 
-// hostRevision returns the revision this connection's context resolved, or "" before its
-// first message has been negotiated. See StdioProxy.hostRev for the single-writer rule.
+// hostRevision returns the revision this connection's context resolved, or "" before a message
+// this proxy could act on has been negotiated — a connection whose traffic so far is methods
+// its declared revision does not define stays unpinned, which is the point. See
+// StdioProxy.hostRev for the single-writer rule.
 func (p *StdioProxy) hostRevision() capability.Revision {
 	rev, _ := p.hostRev.Load().(capability.Revision)
 	return rev

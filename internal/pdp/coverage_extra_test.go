@@ -335,7 +335,7 @@ func TestRecordAuditModeAntecedent_RecordsOnlyOnAuditDeny(t *testing.T) {
 	// never runs — so recording it would poison history with a phantom antecedent a
 	// later sequenceBlock reads as "ran", spuriously blocking a downstream call.
 	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
-		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{HardDeny: true}})
+		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{BlockOverride: true}})
 	require.Equal(t, 1, counter.writes, "an overridden audit-mode deny must NOT record an antecedent (the tool never ran)")
 
 	// The same no-op for the OTHER reason a refusal resists the downgrade, and the one this
@@ -950,12 +950,12 @@ func (unwiredDirective) ToObligation() capability.Obligation {
 	return capability.Obligation{Type: "unwiredTestDirective"}
 }
 
-// TestDecide_AuditModeUnwiredDirective_StaysHardDeny pins that an unwired directive
-// under an AUDIT-mode constraint is NOT downgraded to a logged-and-forwarded allow.
-// The engine returns a hard ENFORCEMENT_ERROR (an engine bug, not a policy verdict);
-// decideTarget's stamp must leave AuditOnly false (and HardDeny set) so the transport
-// blocks the call rather than forwarding it — the fail-closed deny must survive.
-func TestDecide_AuditModeUnwiredDirective_StaysHardDeny(t *testing.T) {
+// TestDecide_AuditModeUnwiredDirective_StaysBlocking pins that an unwired directive under an
+// AUDIT-mode constraint is NOT downgraded to a logged-and-forwarded allow. The engine refuses
+// with ENFORCEMENT_ERROR (an engine bug, not a policy verdict), whose CLASS is what no
+// observing route may downgrade; decideTarget's stamp must leave AuditOnly false so the
+// transport blocks the call rather than forwarding it.
+func TestDecide_AuditModeUnwiredDirective_StaysBlocking(t *testing.T) {
 	t.Parallel()
 	p := newTestManifestPDP(capability.Constraint{
 		Target:      "tool:export",
@@ -968,7 +968,7 @@ func TestDecide_AuditModeUnwiredDirective_StaysHardDeny(t *testing.T) {
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.False(t, resp.AuditOnly, "an audit-mode constraint must NOT downgrade a hard ENFORCEMENT_ERROR to a forward")
-	assert.True(t, resp.Denial.HardDeny, "the deny must remain hard through stamp()")
+	assert.False(t, resp.Denial.Downgradable(), "the deny must stay non-downgradable through stamp()")
 }
 
 // A doubly-encoded text body — a JSON STRING scalar whose decoded value is ANOTHER JSON

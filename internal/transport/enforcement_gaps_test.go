@@ -2571,7 +2571,7 @@ func TestDispatchList_AuditMode_RecordsPinnedHashesSoPoisoningStillDenies(t *tes
 	if dec.AuditOnly {
 		t.Error("the tool-poisoning deny must not be downgraded to observe-and-forward by audit mode")
 	}
-	if dec.Denial == nil || !dec.Denial.HardDeny {
+	if dec.Denial == nil || !dec.Denial.BlockOverride {
 		t.Errorf("the descriptionHash deny must be a hard deny; got %+v", dec.Denial)
 	}
 }
@@ -2611,7 +2611,7 @@ func TestDispatchList_AuditMode_NoRecorder_StillRecordsPinnedHashes(t *testing.T
 	if dec.Decision != capability.DecisionDeny {
 		t.Fatalf("a poisoned pinned tool must be denied on the call leg even with no audit recorder configured; got %+v", dec)
 	}
-	if dec.Denial == nil || !dec.Denial.HardDeny {
+	if dec.Denial == nil || !dec.Denial.BlockOverride {
 		t.Errorf("the descriptionHash deny must be a hard deny; got %+v", dec.Denial)
 	}
 }
@@ -2888,7 +2888,7 @@ func TestGapRevision_NotificationTablesPerRevision(t *testing.T) {
 		rec := &fwdRecorder{}
 		msg := mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}
 		gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
-		denied := !gate.admit(revisionContext(tc.rev), msg)
+		denied := gate.admit(revisionContext(tc.rev), msg) != notificationForward
 		if denied != tc.wantDenied {
 			t.Errorf("%s under %s: denied = %v, want %v", tc.method, tc.rev, denied, tc.wantDenied)
 		}
@@ -2901,7 +2901,7 @@ func TestGapRevision_NotificationTablesPerRevision(t *testing.T) {
 	rec := &fwdRecorder{}
 	gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
 	initialized := mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized}
-	if gate.admit(revisionContext(capability.Revision20251125), initialized) || len(rec.records) != 0 {
+	if gate.admit(revisionContext(capability.Revision20251125), initialized) != notificationSwallowed || len(rec.records) != 0 {
 		t.Errorf("notifications/initialized must stay swallowed (dropped, unrecorded) for an old-revision peer; records = %+v", rec.records)
 	}
 }

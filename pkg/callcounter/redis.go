@@ -101,10 +101,10 @@ type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *re
 //
 // Exported because the topology is not only this package's question: pkg/killswitch fans a
 // keyless SCAN out per server for the same reason. It returns the ITERATOR rather than a
-// yes/no because a consumer needs both answers, and answering them from two lists is how they
-// drifted before (one listed Ring, the other did not, so a Ring fell through to a single-node
-// SCAN that loaded whichever shard go-redis picked). With one list a client this package calls
-// sharding and the consumer has no iterator for is not a state that can be constructed.
+// yes/no, and is the ONLY entry point to either answer, because two — a predicate beside an
+// iterator — is how they drifted before (one list named Ring, the other did not, so a Ring fell
+// through to a single-node SCAN that loaded whichever shard go-redis picked). "Does it shard"
+// is `ShardIterator(c) != nil`, which cannot disagree with what the caller then iterates.
 func ShardIterator(client redis.Cmdable) ShardFanOut {
 	switch c := client.(type) {
 	case *redis.ClusterClient:
@@ -117,12 +117,6 @@ func ShardIterator(client redis.Cmdable) ShardFanOut {
 	return nil
 }
 
-// IsShardingClient reports whether client spreads one keyspace across several servers, DEFINED
-// as "there is a per-server iterator for it" so the predicate and the iterator cannot disagree.
-func IsShardingClient(client redis.Cmdable) bool {
-	return ShardIterator(client) != nil
-}
-
 // ServerInfoReader is the one command CheckServerNotClustered issues. A narrow parameter type
 // so a caller can drive the check with a canned reply, since standing up a cluster in a test
 // is not a thing that can be done from Go.
@@ -131,7 +125,7 @@ type ServerInfoReader interface {
 }
 
 // CheckServerNotClustered refuses a single-node client aimed at a node of a Redis Cluster.
-// It is the SERVER-side half of the refusal IsShardingClient makes client-side: an ordinary
+// It is the SERVER-side half of the refusal ShardIterator makes client-side: an ordinary
 // *redis.Client passes every type check and still cannot run AdmitAll's multi-key EVAL.
 //
 // It reads `INFO cluster` — not `CLUSTER INFO`, whose reply carries no cluster_enabled field
@@ -155,7 +149,9 @@ func CheckServerNotClustered(ctx context.Context, client ServerInfoReader) error
 // cannot supply the per-instance entropy for ZADD member uniqueness — a silent fallback there
 // would risk reintroducing the cross-replica collision the entropy prevents.
 func NewRedis(client redis.Cmdable, opts ...redisOption) (*Redis, error) {
-	if IsShardingClient(client) {
+	// "Spreads the keyspace" IS "there is a per-server iterator for it": one list, so this
+	// refusal and pkg/killswitch's fan-out cannot disagree about a client shape.
+	if ShardIterator(client) != nil {
 		return nil, fmt.Errorf("%w (got %T)", ErrClusterUnsupported, client)
 	}
 	var b [8]byte

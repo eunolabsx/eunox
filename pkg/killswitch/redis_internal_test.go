@@ -599,10 +599,8 @@ func TestShardTopology_IsOneList(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			fanOut := callcounter.ShardIterator(tc.client)
-			assert.Equal(t, tc.wantFan, fanOut != nil, "ShardIterator(%T)", tc.client)
-			assert.Equal(t, fanOut != nil, callcounter.IsShardingClient(tc.client),
-				"IsShardingClient(%T) must be exactly \"there is an iterator for it\"", tc.client)
+			assert.Equal(t, tc.wantFan, callcounter.ShardIterator(tc.client) != nil,
+				"ShardIterator(%T) decides BOTH questions this package used to answer with its own type switch: does it shard, and how is it enumerated", tc.client)
 		})
 	}
 }

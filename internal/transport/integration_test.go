@@ -927,11 +927,23 @@ func TestStdioProxy_ContextPinsFromItsFirstMessage(t *testing.T) {
 		t.Fatalf("a flip to the other revision must be refused -32022, got %+v (result %s)", flip.Error, flip.Result)
 	}
 
-	// And an undeclared request inherits the pinned revision rather than being renegotiated,
-	// so the refused flip above cannot be worked around by simply omitting the declaration.
+	// An undeclared request INHERITS the pin rather than renegotiating, and does not disturb it:
+	// the refused flip above cannot be worked around by omitting the declaration and trying
+	// again. Asserted through the pin and a second flip, since this peer's revision equals the
+	// unnegotiated fallback — so "answered" alone would hold with no pin at all.
 	bare := h.roundTrip(t, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "ping"})
 	if bare.Error != nil {
 		t.Fatalf("an undeclared request must inherit the pinned revision and stay answerable, got %+v", bare.Error)
+	}
+	if got := h.proxy.hostRevision(); got != capability.Revision20251125 {
+		t.Fatalf("context revision = %q after an undeclared request, want %q — omission must inherit the pin, not clear it", got, capability.Revision20251125)
+	}
+	retry := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "ping",
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if retry.Error == nil || retry.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Fatalf("the flip must stay refused after an undeclared request, got %+v (result %s)", retry.Error, retry.Result)
 	}
 
 	if err := h.shutdown(t); err != nil {
