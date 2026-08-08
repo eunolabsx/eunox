@@ -5,9 +5,6 @@
 // after a restart, and truncating the partial fragment a non-clean shutdown can
 // leave behind. Open drives all of it before the first append, so the chain either
 // resumes from an intact record or fails closed with an in-band marker.
-//
-// Split out of audit.go verbatim (writer core), alongside rotate.go (rotation and
-// retention) and verify.go (chain verification). No behavior change.
 
 package audit
 

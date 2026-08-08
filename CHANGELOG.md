@@ -306,6 +306,46 @@ Section conventions:
 
 ### Changed
 
+- **`eunox audit-verify` reports the oldest seq a signature PROVES, not the one the head
+  record claims.** The chain walk has to adopt an anchor before any signature verdict
+  exists, so the oldest-seq value the summary printed was taken from the head record
+  before its HMAC was checked — and that value is the one an operator reconciles against
+  an external high-water mark. The exact attack it exists to surface therefore suppressed
+  it: excise the leading records, rewrite the survivor to claim `seq 1`, and the
+  "leading records were removed or pruned" note never printed (the verdict still failed).
+  `VerifyResult` now carries `FirstVerifiedSeq` beside the claimed `FirstSeq`, the note is
+  keyed on the proven value, and a divergence between the two is stated in its own line.
+  A log that verifies clean prints exactly what it printed before.
+- **`FirstVerifiedSeq` is the minimum verified seq, not the first one `audit-verify`
+  happens to reach.** It previously latched onto whichever verifying record `classify`
+  encountered first in FILE order. A write-capable attacker with no signing key can
+  duplicate a genuine, already-signed higher-seq record to the front of the file, ahead of
+  the genuine lower-seq one — both verify individually, since neither's content changed,
+  only its position did — which reported the higher seq as "the oldest provable," in
+  exactly the class of imprecision the field above exists to close. Now tracked as a
+  running minimum across the whole pass.
+- **`eunox stats` exits 2 on a usage, config, or log-read error.** It returned 1 for every
+  failure while `proxy`/`validate`/`suggest`/`audit-verify` reserve 2 for "you asked for
+  something I could not act on" — so a script that learned the convention from a sibling
+  command read a mistyped stats flag as an operational failure. stats reports no findings,
+  so nothing needs exit 1 here, and its `-h` output now states the codes. `eunox kill`
+  stays at 1 for every failure, now documented in its own usage block as the deliberate
+  exception: under an emergency stop the only question is whether the revocation landed,
+  and a second failure code invites a script that treats one of them as success.
+- **`eunox validate` names the arguments a `--` captured.** Everything after a `--` is
+  peeled off as a `--live` stdio upstream command before flag parsing, with or without
+  `--live`, so `eunox validate -- ./manifest.yaml` reported "at least one manifest file is
+  required" against a command line that visibly named one. The error now says where the
+  tokens went.
+- **A `--` swallowed as a preceding flag's own value is no longer mistaken for a
+  terminator.** `parseFlagsAndPositionals`' "did a `--` terminator fire" check compared
+  only token position, so `eunox kill --session -- foo -b` — where Go's flag package reads
+  the literal `--` right after `--session` as that flag's VALUE, not as a terminator — was
+  misdetected as a genuine terminator and swallowed `["foo", "-b"]` as positionals in one
+  shot instead of re-parsing `-b` as the undefined flag it is. The check now looks at
+  whether the token before a trailing `--` is itself a recognized, value-needing flag in
+  separate-value form; a genuine terminator (including right after a boolean flag, or a
+  `--flag=--` already carrying its value via `=`) is unaffected.
 - **`killswitch.Redis.Status` fails closed on a cache it cannot confirm.** A snapshot
   asserts "this is the whole kill set" — `ShouldBlock`'s "nothing matches" written out —
   but `Status` answered it from any cache at all, returning a **nil** error beside a

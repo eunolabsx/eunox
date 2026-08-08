@@ -105,7 +105,7 @@ func TestConditionHandlerOverridden_ResolvesThroughTheWrapperStack(t *testing.T)
 }
 
 // The claim path's OTHER condition type is unaffected: allowedValues has a shared handler, so
-// an override there is enforced (#173's seam) rather than refused.
+// an override there is enforced through the embedder's handler seam rather than refused.
 func TestJWTClaimValues_OverrideIsEnforcedNotRefused(t *testing.T) {
 	key := newTestKey(t, "k1")
 	permissive := enforcement.WithConditionHandler(capability.ConditionTypeAllowedValues,

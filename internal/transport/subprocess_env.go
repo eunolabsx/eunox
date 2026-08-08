@@ -5,6 +5,7 @@ package transport
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"slices"
@@ -151,21 +152,23 @@ func killUpstreamCmd(cmd *exec.Cmd) {
 }
 
 // waitBounded blocks until ch fires or d elapses, reporting whether ch fired first. On
-// timeout it logs a stderr notice naming what it was waiting for, so an operator sees why
-// teardown gave up rather than the session silently hanging. It's the bounded post-kill
-// wait every teardown path needs: a subprocess has just been force-killed, and the caller
-// is waiting for that to unblock a pipe read or a handshake goroutine — but a descendant
-// that escaped the process group (a double-fork, an explicit setsid, or a platform with no
-// process-group teardown) can hold that pipe open indefinitely, and an unbounded wait here
-// would defeat the reason the caller bounded itself. The caller is expected to give up and
-// continue teardown regardless of the return value; ch's underlying goroutine, if any, is
-// left to drain and exit on its own once the pipe it's blocked on eventually closes.
-func waitBounded[T any](ch <-chan T, d time.Duration, what string) bool {
+// timeout it writes a notice to errOut naming what it was waiting for, so an operator sees
+// why teardown gave up rather than the session silently hanging (every caller has its proxy's
+// or session's writer in scope; a direct os.Stderr write would race a capturing test). It's
+// the bounded post-kill wait every teardown path needs: a subprocess has just been
+// force-killed, and the caller is waiting for that to unblock a pipe read or a handshake
+// goroutine — but a descendant that escaped the process group (a double-fork, an explicit
+// setsid, or a platform with no process-group teardown) can hold that pipe open
+// indefinitely, and an unbounded wait here would defeat the reason the caller bounded
+// itself. The caller is expected to give up and continue teardown regardless of the return
+// value; ch's underlying goroutine, if any, is left to drain and exit on its own once the
+// pipe it's blocked on eventually closes.
+func waitBounded[T any](ch <-chan T, d time.Duration, what string, errOut io.Writer) bool {
 	select {
 	case <-ch:
 		return true
 	case <-time.After(d):
-		fmt.Fprintf(os.Stderr, "[eunox] %s still open after a forced kill (a descendant may have escaped the process group); abandoning the wait.\n", what)
+		_, _ = fmt.Fprintf(resolvedErrOut(errOut), "[eunox] %s still open after a forced kill (a descendant may have escaped the process group); abandoning the wait.\n", what)
 		return false
 	}
 }

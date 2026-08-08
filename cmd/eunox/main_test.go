@@ -84,7 +84,7 @@ func TestCmdProxy_ExitCodes(t *testing.T) {
 		{"jwt flag without --jwks-uri", []string{"eunox", "proxy", "--config", cfgPath, "--jwt-issuer", "https://idp.invalid"}, 1},
 		{"redis flag without --redis-addr", []string{"eunox", "proxy", "--config", cfgPath, "--killswitch-fail-open"}, 1},
 		{"unparseable config", []string{"eunox", "proxy", "--config", writeTempFile(t, "\tnot: [yaml")}, 1},
-		// D2/#220: an explicitly-empty --session-id must not silently fall back to a
+		// An explicitly-empty --session-id must not silently fall back to a
 		// random UUID — an operator pinning --session-id "$SID" for a later
 		// `eunox kill "$SID"` must find out $SID was unset, not mint an unkillable session.
 		{"empty session-id", []string{"eunox", "proxy", "--config", cfgPath, "--session-id", ""}, 1},
@@ -130,6 +130,36 @@ func TestRun_ExitCodes(t *testing.T) {
 }
 
 // ── cmdStats ──────────────────────────────────────────────────────────────
+
+// TestCmdStats_UsageErrorsExitTwo: stats returned 1 for every failure while its sibling
+// readers reserved 2 for usage errors, so a script that learned the binary's convention from
+// suggest or audit-verify read a mistyped stats flag as an operational failure. stats reports
+// no findings, so nothing needs exit 1 here — and the usage help states the codes rather than
+// leaving a caller to infer them.
+func TestCmdStats_UsageErrorsExitTwo(t *testing.T) {
+	for name, args := range map[string][]string{
+		"undefined flag":    {"--no-such-flag"},
+		"stray positional":  {"audit.jsonl"},
+		"unreadable config": {"--config", "/no/such/config.yaml"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var code int
+			_ = captureStderr(t, func() { _ = captureStdout(t, func() { code = cmdStats(args) }) })
+			if code != statsUsageExit {
+				t.Errorf("cmdStats(%q) = %d, want %d", args, code, statsUsageExit)
+			}
+		})
+	}
+
+	help := captureStdout(t, func() {
+		if code := cmdStats([]string{"-h"}); code != 0 {
+			t.Errorf("-h must exit 0, got %d", code)
+		}
+	})
+	if !strings.Contains(help, "Exit codes:") {
+		t.Errorf("stats usage must document its exit codes; got:\n%s", help)
+	}
+}
 
 func TestCmdStats_EmptyLog(t *testing.T) {
 	path := writeTempFile(t, "")
@@ -354,11 +384,26 @@ func TestParseFlagsAndPositionals(t *testing.T) {
 		{"positionals only", []string{"a.yaml", "b.yaml"}, false, "", []string{"a.yaml", "b.yaml"}},
 		{"flags only", []string{"--live"}, true, "", nil},
 		{"empty", nil, false, "", nil},
-		// D5/#220: a "--" terminator must protect the WHOLE remainder, not just the token
+		// A "--" terminator must protect the WHOLE remainder, not just the token
 		// right after it — dash-prefixed positionals past the first one used to be
-		// re-parsed as flags and rejected with "flag provided but not defined".
+		// re-parsed as flags and rejected with "flag provided but not defined". The flags
+		// here are a synthetic fixture for the helper; `kill` is the production caller
+		// that reaches this with a terminator (validate peels its own "--" remainder off
+		// as a stdio command before calling in).
 		{"terminator protects the whole remainder", []string{"--live", "--", "-a.yaml", "-b.yaml"}, true, "", []string{"-a.yaml", "-b.yaml"}},
 		{"terminator with no flags before it", []string{"--", "-a.yaml", "-b.yaml"}, false, "", []string{"-a.yaml", "-b.yaml"}},
+		// A value-needing flag given "--flag value" form consumes the very next token as its
+		// value unconditionally, with no check that it happens to spell "--" — so this "--" is
+		// NOT a terminator. fs.Parse stops at "notaflag" (not flag-shaped), leaving "--live" in
+		// rest; the old, purely positional heuristic swallowed BOTH remaining tokens (leaving
+		// --live unparsed, still false), where the fix must re-loop and pick --live up as a
+		// real flag.
+		{"value-consumed -- is not a terminator", []string{"--upstream-url", "--", "notaflag", "--live"}, true, "--", []string{"notaflag"}},
+		// A boolean flag never consumes a value, so a "--" right after one is still genuine.
+		{"terminator right after a bool flag", []string{"--live", "--", "-x"}, true, "", []string{"-x"}},
+		// "--flag=--" already carries its value via "=", so it consumes no separate token and
+		// the "--" that follows it is a genuine terminator.
+		{"= form does not consume the following --", []string{"--upstream-url=--", "--", "-x"}, false, "--", []string{"-x"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -574,6 +619,66 @@ func TestCmdAuditVerify_VerifiesRotatedSet(t *testing.T) {
 	// All 3 records across BOTH files must be verified, with the cross-file link clean.
 	if !strings.Contains(out, "3 valid") || !strings.Contains(out, "0 chain break") {
 		t.Errorf("expected 3 valid records and 0 chain breaks across the rotated set; got:\n%s", out)
+	}
+}
+
+// TestCmdAuditVerify_ReportsTheProvenOldestSeqNotTheClaimedOne: the leading-truncation note
+// is the one an operator reconciles against an external high-water mark, and it used to be
+// keyed on the head record's CLAIMED seq — adopted by the chain walk before any signature is
+// checked. So the exact attack it exists to surface suppressed it: delete the leading records
+// and rewrite the survivor to claim seq 1, and the summary printed no note at all. Key it on
+// the oldest seq a verified signature proves instead.
+func TestCmdAuditVerify_ReportsTheProvenOldestSeqNotTheClaimedOne(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	sink, err := audit.Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for _, tool := range []string{"a", "b", "c"} {
+		sink.RecordAllow(context.Background(), "sess", tool, "tools/call", nil, nil, false, nil, nil)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Excise the genuine seq-1 record and rewrite the survivor to claim its place. The
+	// rewrite invalidates that record's own HMAC (seq is signed), but not before the walk
+	// has adopted the forged 1 — which is the point.
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 records, got %d", len(lines))
+	}
+	survivor := strings.Replace(lines[1], `"seq":2`, `"seq":1`, 1)
+	if survivor == lines[1] {
+		t.Fatalf("test setup: no seq field to rewrite in %s", lines[1])
+	}
+	if err := os.WriteFile(logPath, []byte(survivor+"\n"+lines[2]+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var code int
+	out := captureStdout(t, func() {
+		code = cmdAuditVerify([]string{"--audit-log", logPath, "--audit-key-path", keyPath})
+	})
+
+	if code != 1 {
+		t.Errorf("expected exit 1 for a log with a rewritten head record, got %d", code)
+	}
+	if !strings.Contains(out, "claims seq 1 but did not verify") {
+		t.Errorf("expected the summary to say the claimed oldest seq is unverified; got:\n%s", out)
+	}
+	if !strings.Contains(out, "the oldest seq proven by a verified signature is 3") {
+		t.Errorf("expected the proven oldest seq (3) to be named; got:\n%s", out)
+	}
+	if !strings.Contains(out, "the oldest verified record across the retained log files is seq 3, not 1") {
+		t.Errorf("expected the leading-removal note, which the forged seq 1 used to suppress; got:\n%s", out)
 	}
 }
 

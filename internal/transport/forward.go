@@ -242,9 +242,12 @@ func (fp forwardParams) errOutOrStderr() io.Writer {
 	return resolvedErrOut(fp.errOut)
 }
 
-// resolvedErrOut returns w when set, else os.Stderr — the fallback forwardParams.errOutOrStderr
-// and serverRequestParams.errOutOrStderr share, since the two params structs don't embed one
-// another but must resolve a nil errOut identically.
+// resolvedErrOut returns w when set, else os.Stderr — the package's ONE nil-writer fallback.
+// The params structs (forwardParams, serverRequestParams) don't embed one another, the two
+// proxies' errOut() read a struct field, and several helpers take the writer as a parameter
+// because they run with no proxy in scope; all of them must resolve an unset writer
+// identically, and a second copy of this three-line function is how one of them ends up
+// writing to the process-global instead.
 func resolvedErrOut(w io.Writer) io.Writer {
 	if w == nil {
 		return os.Stderr

@@ -235,7 +235,7 @@ func TestLoadCorpusBoundsEachEntryRead(t *testing.T) {
 	}
 }
 
-// TestLoadCorpusRejectsANonRegularEntry pins #219's Low-priority fix: os.ReadDir's
+// TestLoadCorpusRejectsANonRegularEntry: os.ReadDir's
 // DirEntry.IsDir() excludes directories but not other special files, so a FIFO named
 // "*.json" would reach config.ReadBoundedFile's io.ReadAll(io.LimitReader(...)) and hang
 // the CLI forever waiting for a writer that never comes — the trust-store loader already

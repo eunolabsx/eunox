@@ -2960,6 +2960,16 @@ typo'd flag is not drift, and a CI gate that treats `1` as "review the diff"
 must not be handed that code for a run that validated nothing at all. With
 `--config`, the exit code is the maximum across all routes.
 
+`2` means the same thing across `proxy`, `validate`, `suggest`, `stats`, and
+`audit-verify`: you asked for something the command could not act on (a bad
+flag, an unreadable config, a log it could not open). `1` is reserved per
+command for a *finding* — drift for `validate`, a failed chain for
+`audit-verify` — so a gate can tell "the check ran and found something" from
+"the check never ran". `eunox kill` is the one deliberate exception and returns
+`1` for every failure: under an emergency stop the only question is whether the
+revocation landed, and a second failure code invites a script that treats one of
+them as success.
+
 Relative `policy:` paths in a gateway config are resolved against the **config
 file's directory**, not the process working directory — so
 `eunox proxy --config /etc/eunox/gateway.yaml` finds

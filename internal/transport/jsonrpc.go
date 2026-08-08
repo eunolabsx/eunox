@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"sync"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -51,8 +51,9 @@ type serverReqTracker struct {
 }
 
 // track records key as an outstanding server-initiated request ID, evicting an arbitrary
-// tracked one if the bounded set is full. Only the first eviction is logged.
-func (t *serverReqTracker) track(key string) {
+// tracked one if the bounded set is full. Only the first eviction is logged, to errOut (each
+// caller holds its proxy's or session's writer), never to os.Stderr directly.
+func (t *serverReqTracker) track(key string, errOut io.Writer) {
 	t.mu.Lock()
 	var evicted bool
 	t.ids, evicted = trackServerReqID(t.ids, key)
@@ -63,7 +64,7 @@ func (t *serverReqTracker) track(key string) {
 	}
 	t.mu.Unlock()
 	if warn {
-		fmt.Fprintf(os.Stderr,
+		_, _ = fmt.Fprintf(resolvedErrOut(errOut),
 			"[eunox] WARNING: server-initiated request tracker reached its %d-entry cap; evicting an in-flight request ID to make room (the evicted request may hang until session teardown). Further evictions are counted but not individually logged.\n",
 			maxTrackedServerReqs)
 	}

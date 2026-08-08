@@ -321,10 +321,10 @@ type HTTPProxy struct {
 // rather than os.Stderr directly, so a caller wanting to capture output configures the writer
 // at construction instead of reassigning the process-global.
 func (p *HTTPProxy) errOut() io.Writer {
-	if p == nil || p.stderr == nil {
+	if p == nil {
 		return os.Stderr
 	}
-	return p.stderr
+	return resolvedErrOut(p.stderr)
 }
 
 // HTTPGatewayOptions configures a multi-upstream gateway HTTPProxy: one process fronting N

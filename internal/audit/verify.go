@@ -224,12 +224,28 @@ type VerifyResult struct {
 	UnknownKey   int // records naming a key_id absent from the verification ring (retired-key state; not tampering)
 	Unverifiable int // records naming NO key_id that no ring key matched (signing key unidentifiable; not provably tampering)
 	ChainBreaks  int // prev_hmac mismatches or seq gaps between consecutive records
-	// FirstSeq is the seq of the first record that entered the chain — i.e. the first
-	// SIGNED one. It is 0 for an empty log AND for a log that carries no signed record
-	// at all (every line unsigned: pre-signing history, or a wholesale unsigned
-	// forgery), so a consumer must read it together with Total/Invalid rather than
-	// treating 0 as "empty".
+	// FirstSeq is the seq CLAIMED by the first record that entered the chain — i.e. the
+	// first SIGNED one. It is adopted before that record's HMAC is checked (the chain walk
+	// needs an anchor before any signature verdict exists), so on a log that fails
+	// verification it is a value a write-capable forger chose: excising the leading records
+	// and rewriting the survivor to claim seq 1 makes this report 1. Reconcile an external
+	// high-water mark against FirstVerifiedSeq, not this. It is 0 for an empty log AND for a
+	// log that carries no signed record at all (every line unsigned: pre-signing history, or
+	// a wholesale unsigned forgery), so a consumer must read it together with Total/Invalid
+	// rather than treating 0 as "empty".
 	FirstSeq uint64
+	// FirstVerifiedSeq is the MINIMUM seq among every record whose HMAC verified against a
+	// key in the ring — the oldest retained seq this pass can PROVE, since the seq field is
+	// inside the signature. It equals FirstSeq on a log that passes; a divergence means the
+	// head record's claimed seq is unverified. 0 means no record verified at all.
+	//
+	// Deliberately the minimum over the WHOLE pass, not the seq of the first record classify
+	// encounters: a write-capable attacker with no key can duplicate a genuine, already-signed
+	// higher-seq record to the front of the file, ahead of the genuine lower-seq one — both
+	// verify individually, since neither's content changed. Latching onto file order would
+	// report the duplicate's higher seq as "the oldest provable," overstating how much of the
+	// log's head is missing, in exactly the class of imprecision this field exists to close.
+	FirstVerifiedSeq uint64
 }
 
 // OK reports whether the log passed: no HMAC failure, no chain break, and every record
@@ -843,6 +859,24 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	ok, err := false, dec.verifyErr
 	if err == nil {
 		ok, err = v.verifier.verifyDecodedRecord(line, rec)
+	}
+	// The seq field is inside the signature, so a verified record is the only kind that
+	// PROVES its own seq. Recorded here rather than on the report-window arms below: the
+	// --request-id/--since filter narrows what is printed, never what was verified, and an
+	// HMAC-valid record with an unparseable time still proves its seq (it fails the verdict
+	// on the time field, not on the signature).
+	//
+	// The MINIMUM over the pass, not the first verified record classify happens to reach: this
+	// runs in FILE order, which a write-capable attacker controls (deletion, duplication,
+	// reordering) even without the signing key, so the file's first verifying record is not
+	// necessarily its lowest-seq one. A genuine seq's HMAC recomputes correctly wherever the
+	// attacker moved the line to, so a duplicated higher-seq record placed ahead of the real
+	// lower-seq one would otherwise latch FirstVerifiedSeq high and understate what the log
+	// actually proves. No record reaching this branch ever carries seq 0 (processLine's
+	// forgedSeq0/unsigned gates keep both the decoy and the (unreachable in practice) genuine
+	// wrap-to-0 shape out of the verified path), so 0 remains a safe "not yet seen" sentinel.
+	if err == nil && ok && (v.res.FirstVerifiedSeq == 0 || rec.Seq < v.res.FirstVerifiedSeq) {
+		v.res.FirstVerifiedSeq = rec.Seq
 	}
 	switch {
 	case errors.Is(err, errKeyIDNotInRing):

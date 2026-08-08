@@ -411,7 +411,7 @@ func TestParseV2Claim_MissingPrefix_Error(t *testing.T) {
 	}
 }
 
-// TestParseV2Claim_SystemNamespace_Error covers M6: a system: claim parses through
+// TestParseV2Claim_SystemNamespace_Error: a system: claim parses through
 // capability.ParseTarget but is consulted by nothing (Decide never sees a system
 // target), so parseV2Claim rejects it as an inert grant, pointing at the manifest
 // opt-in. Its rejection here is what makes ValidateToken refuse such a token.

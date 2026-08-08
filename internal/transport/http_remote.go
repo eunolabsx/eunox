@@ -25,7 +25,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -57,9 +56,11 @@ const upstreamSessionDeleteTimeout = 5 * time.Second
 // DeleteMCPHTTPSession sends a best-effort, bounded MCP session-termination DELETE so the
 // remote frees the session's server-side state instead of leaking it. A blank sessID is a
 // no-op. Uses a fresh background context since it runs from teardown paths whose own
-// context is typically being canceled; failures are logged, not returned, so teardown never
-// blocks.
-func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine string, rev capability.Revision) {
+// context is typically being canceled; failures are written to errOut (nil means os.Stderr),
+// not returned, so teardown never blocks. errOut is a parameter rather than os.Stderr because
+// the in-process callers each hold a configured writer, and a direct global write would race a
+// test capturing it.
+func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine string, rev capability.Revision, errOut io.Writer) {
 	if sessID == "" || client == nil {
 		return
 	}
@@ -80,7 +81,7 @@ func DeleteMCPHTTPSession(client *http.Client, endpoint, sessID, authHeaderLine 
 	if err != nil {
 		// Scrub before logging: net/http's *url.Error strips only the password, not the
 		// username/query-string credential (same leak class as scrubURLError elsewhere).
-		_, _ = fmt.Fprintf(os.Stderr, "[eunox] upstream session DELETE failed: %v\n", scrubURLError(err))
+		_, _ = fmt.Fprintf(resolvedErrOut(errOut), "[eunox] upstream session DELETE failed: %v\n", scrubURLError(err))
 		return
 	}
 	_ = resp.Body.Close()

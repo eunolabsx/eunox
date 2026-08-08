@@ -377,7 +377,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 			// Bounded like every other wait on this channel, so a runaway descendant leaks one
 			// goroutine instead of hanging forever; runs before registerSession so a
 			// repeatedly-failing upstream isn't bounded by --max-sessions.
-			waitBounded(sess.handshakeStopped, sess.shutdownBudget(), "upstream handshake reader")
+			waitBounded(sess.handshakeStopped, sess.shutdownBudget(), "upstream handshake reader", sess.errOut())
 			_ = cmd.Wait()
 		}()
 		return nil, fmt.Errorf("upstream initialize: %w", err)
@@ -979,7 +979,7 @@ func (s *httpSession) initUpstream(ctx context.Context) error {
 		// Bounded independently: a descendant that escaped the process group can hold the
 		// pipe open indefinitely, and this giving up does not mean the goroutine stopped
 		// reading it — handshakeStopped, not this return, is what callers must join.
-		waitBounded(done, s.shutdownBudget(), "upstream initialize output stream")
+		waitBounded(done, s.shutdownBudget(), "upstream initialize output stream", s.errOut())
 		return fmt.Errorf("upstream did not complete initialize: %w", ctx.Err())
 	}
 }
@@ -1281,7 +1281,7 @@ func (s *httpSession) close(shutdownMs int) {
 			// so it is deliberately NOT closed here — released wholesale at proxy shutdown
 			// instead (UpstreamRoute.closeIdleUpstreamConns).
 			if s.upstreamSessID != "" && s.route != nil {
-				DeleteMCPHTTPSession(s.upHTTPClient, s.mcpEndpointURL(), s.upstreamSessID, s.route.upstreamAuthHeader, s.upstreamRev)
+				DeleteMCPHTTPSession(s.upHTTPClient, s.mcpEndpointURL(), s.upstreamSessID, s.route.upstreamAuthHeader, s.upstreamRev, s.errOut())
 			}
 			close(s.done)
 			return
@@ -1298,7 +1298,7 @@ func (s *httpSession) close(shutdownMs int) {
 			// Bound the post-kill wait independently: readUpstream normally closes done
 			// almost immediately after the SIGKILL, but a reader wedged in a slow PDP/kill-
 			// store call could otherwise hold teardown hostage past the shutdown deadline.
-			waitBounded(s.done, msToDuration(shutdownMs), "upstream output stream")
+			waitBounded(s.done, msToDuration(shutdownMs), "upstream output stream", s.errOut())
 		}
 	})
 }
@@ -1332,7 +1332,7 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // unblocks, rather than let it hang until teardown.
 func (s *httpSession) broadcastServerRequest(msg mcp.RPCMsg) bool {
 	if msg.ID != nil {
-		s.serverReqs.track(mcp.MsgKey(msg.ID))
+		s.serverReqs.track(mcp.MsgKey(msg.ID), s.errOut())
 	}
 	if s.deliverToOne(msg) {
 		return true

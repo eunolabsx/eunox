@@ -20,8 +20,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// flowReadingHandler is the shape #196 was about: an embedder's replacement for a stock
-// condition whose enforcement reads the flow-label set the stock one never touched.
+// flowReadingHandler is the shape the subsystem declaration exists for: an embedder's
+// replacement for a stock condition whose enforcement reads the flow-label set the stock one
+// never touched.
 type flowReadingHandler struct {
 	declares []capability.EngineSubsystem
 }

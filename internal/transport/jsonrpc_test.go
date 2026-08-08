@@ -3,7 +3,7 @@
 
 // Tests for JSON-RPC integer error codes: exact wire codes, no raw args in responses.
 //
-// Acceptance criteria (from the plan):
+// Acceptance criteria:
 //   - Each denial path returns its exact integer code.
 //   - error.message carries the symbolic name.
 //   - error.data MAY carry the failing condition type but MUST NOT echo raw
@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -662,7 +663,7 @@ func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 	var tr serverReqTracker
 	// Fill exactly to the cap: every insert is new but none overflows yet.
 	for i := 0; i < maxTrackedServerReqs; i++ {
-		tr.track(fmt.Sprintf("fill-%d", i))
+		tr.track(fmt.Sprintf("fill-%d", i), io.Discard)
 	}
 	if tr.evictions != 0 {
 		t.Fatalf("evictions after filling to the cap = %d, want 0", tr.evictions)
@@ -672,7 +673,7 @@ func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 	// the first logged one).
 	const overflow = 5
 	for i := 0; i < overflow; i++ {
-		tr.track(fmt.Sprintf("overflow-%d", i))
+		tr.track(fmt.Sprintf("overflow-%d", i), io.Discard)
 	}
 	if tr.evictions != overflow {
 		t.Fatalf("evictions after %d overflow inserts = %d, want %d", overflow, tr.evictions, overflow)
@@ -680,7 +681,7 @@ func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 
 	// The most-recently-added ID is always retained, so re-tracking it evicts
 	// nothing and leaves the tally unchanged.
-	tr.track(fmt.Sprintf("overflow-%d", overflow-1))
+	tr.track(fmt.Sprintf("overflow-%d", overflow-1), io.Discard)
 	if tr.evictions != overflow {
 		t.Fatalf("re-tracking a present ID changed the tally to %d, want %d", tr.evictions, overflow)
 	}

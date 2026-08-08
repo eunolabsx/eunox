@@ -171,7 +171,7 @@ func TestApplyRedactObligs_ContentItemSiblingDuplicateKeyFailsClosed(t *testing.
 
 // The gap the item walk itself could reopen, one type dispatch away: an image/audio item has
 // NO body pass, so if the walk skipped `text` unconditionally that key would be inspected by
-// no pass at all — the exact shape #204 closed for every other key.
+// no pass at all — the exact unwalked-key shape already closed for every other key.
 func TestApplyRedactObligs_TextOnABinaryItemIsStillWalked(t *testing.T) {
 	t.Parallel()
 	for _, typ := range []string{"image", "audio"} {

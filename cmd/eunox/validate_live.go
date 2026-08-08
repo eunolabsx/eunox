@@ -391,6 +391,17 @@ func renderLiveReport(rep liveReport, out io.Writer) int {
 	return 1
 }
 
+// capturedAfterTerminator renders the clause the no-manifest error appends when a "--" took
+// arguments off the command line before flag parsing saw them. Without it the operator reads
+// "at least one manifest file is required" against a command line that visibly names one: the
+// tokens are gone from the positional list and nothing else says where they went.
+func capturedAfterTerminator(stdioCmd []string) string {
+	if len(stdioCmd) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (note: everything after \"--\" was taken as a --live stdio upstream command, not as a manifest path: %q)", stdioCmd)
+}
+
 // cmdValidate runs the `validate` subcommand, returning the exit code (rather than
 // calling os.Exit) so tests can drive every branch including the fail-closed error paths.
 func cmdValidate(args []string) int {
@@ -436,7 +447,11 @@ Flags:
 	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the upstream (development only).")
 
 	// Split off a stdio subprocess command after the first standalone "--", before
-	// parsing (Go's flag package would otherwise consume it).
+	// parsing (Go's flag package would otherwise consume it). Unconditional, --live or not,
+	// so the remainder never reaches parseFlagsAndPositionals as manifest paths — which is
+	// why the no-manifest error below has to name what was captured, or a mistyped
+	// `eunox validate -- ./manifest.yaml` reads as "no manifest file given" against a
+	// command line that plainly has one.
 	rawArgs := args
 	var stdioCmd []string
 	for i, a := range rawArgs {
@@ -486,7 +501,7 @@ Flags:
 	}
 
 	if len(files) == 0 {
-		fmt.Fprintf(os.Stderr, "eunox validate: at least one manifest file is required (or use --config <eunox.yaml>)\n")
+		fmt.Fprintf(os.Stderr, "eunox validate: at least one manifest file is required (or use --config <eunox.yaml>)%s\n", capturedAfterTerminator(stdioCmd))
 		return 2
 	}
 

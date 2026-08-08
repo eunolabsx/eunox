@@ -231,8 +231,8 @@ func TestValidateDelegationChain_ActorsAndGrantsMustAgree(t *testing.T) {
 	assert.Contains(t, err.Error(), "chain names")
 }
 
-// TestValidateDelegationChain_ReassertsGrantsDepthCap pins the #219 Low-priority
-// defense-in-depth gap: ValidateDelegationChain re-asserts the actors cap independently of
+// TestValidateDelegationChain_ReassertsGrantsDepthCap pins a defense-in-depth gap:
+// ValidateDelegationChain re-asserts the actors cap independently of
 // ParseActorChain's own, but did not do the same for grants. ParseDelegationGrants already
 // caps a real token's claim before it reaches here, but ValidateDelegationChain is itself
 // an exported boundary a caller can reach directly with a pre-built []DelegationGrant (no

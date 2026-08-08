@@ -192,7 +192,8 @@ func TestBuildRoutes_ManifestWithRouteAuditEmitsBanner(t *testing.T) {
 	}}}
 
 	// The banner is captured by handing BuildRoutes its own writer, not by swapping the
-	// process-global os.Stderr — see route.go's BuildRoutes doc and issue 215.
+	// process-global os.Stderr, which races every other test in the package — see
+	// route.go's BuildRoutes doc.
 	var out bytes.Buffer
 	_, buildErr := BuildRoutes(cfg, nil, callcounter.NewInMemory(), nil, killswitch.NewInMemory(), false, func(*config.LocalManifest, bool) drift.CheckFunc { return nil }, &out)
 	if buildErr != nil {

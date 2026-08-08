@@ -625,7 +625,7 @@ func TestUnsupportedMediaType_RecordsRefusal(t *testing.T) {
 func TestUnsupportedMediaType_StderrLineIsBoundedAndGated(t *testing.T) {
 	t.Parallel()
 	// Captured through the proxy's own Stderr option rather than swapping the
-	// process-global os.Stderr — see route.go's BuildRoutes doc and issue 215. syncBuffer
+	// process-global os.Stderr — see route.go's BuildRoutes doc. syncBuffer
 	// because requireJSONContentType's writes race this test's own concurrent-safety
 	// requirements no differently than any other proxy background write would.
 	var out syncBuffer

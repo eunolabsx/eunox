@@ -22,9 +22,9 @@ func writeConfig(t *testing.T, cfg string) string {
 	return p
 }
 
-// TestLoadGatewayConfig_BoundsFileRead pins #219's Low-priority fix: a fat-fingered
-// --config path pointed at a large data file or disk image must produce an error, not an
-// attempt to buffer it whole into memory.
+// TestLoadGatewayConfig_BoundsFileRead: a fat-fingered --config path pointed at a large
+// data file or disk image must produce an error, not an attempt to buffer it whole into
+// memory.
 func TestLoadGatewayConfig_BoundsFileRead(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "huge.yaml")
 	f, err := os.Create(p) //nolint:gosec // G304: test-controlled path

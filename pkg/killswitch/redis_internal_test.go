@@ -439,7 +439,7 @@ func TestRedis_WithLogger_LogsRefreshFailure(t *testing.T) {
 // (reconcile tick / pub/sub resync). It must log a single warning when Redis is
 // unreachable and throttle repeats so a sustained outage does not flood the log
 // on every tick, then log exactly one recovery notice once the refresh succeeds
-// again (finding L6).
+// again.
 func TestRedis_ReconcileRefresh_LogsAndThrottles(t *testing.T) {
 	t.Parallel()
 

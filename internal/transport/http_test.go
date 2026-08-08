@@ -2633,7 +2633,7 @@ func TestHTTPHandleSessionPost_KilledServerResponseRecordsDeny(t *testing.T) {
 		upWriter: mcp.NewMsgWriter(&up),
 	})
 	// A tracked server-initiated request ID (as if one had been broadcast to the host).
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)))
+	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard)
 	proxy.mu.Lock()
 	proxy.sessions[sess.id] = sess
 	proxy.mu.Unlock()
@@ -2818,7 +2818,7 @@ func TestHTTPFailServerRequestDelivery_RepliesErrorUpstream(t *testing.T) {
 	})
 	// Track the server-initiated request ID as broadcastServerRequest would, then
 	// simulate the SSE write loop failing to deliver it.
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`9`)))
+	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`9`)), io.Discard)
 	sess.failServerRequestDelivery(
 		context.Background(),
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"},
@@ -2862,7 +2862,7 @@ func TestHTTPFailServerRequestDelivery_WritesCorrectionRecord(t *testing.T) {
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(&up),
 	})
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`9`)))
+	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`9`)), io.Discard)
 	sess.failServerRequestDelivery(
 		context.Background(),
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"},
@@ -2898,7 +2898,7 @@ func TestHTTPHandleMCPPost_RemoteModeServerResponseWarnsAndUntracks(t *testing.T
 		// upWriter intentionally nil: remote-upstream mode has no subprocess pipe.
 	})
 	// Simulate a tracked server-initiated request ID (as if one had been forwarded).
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`42`)))
+	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`42`)), io.Discard)
 	proxy.mu.Lock()
 	proxy.sessions[sess.id] = sess
 	proxy.mu.Unlock()
@@ -4941,7 +4941,7 @@ func (k *unregisterTrackingKS) ObserveRevocations(fn func(killswitch.Revocation)
 	}
 }
 
-// TestServe_UnobservesRevocationsWhenBindFails is the #219 Low-priority fix: the kill
+// TestServe_UnobservesRevocationsWhenBindFails: the kill
 // switch OUTLIVES this proxy and may be handed to a second one, so a proxy that loses the
 // bind race — and so never reaches the teardown defer inside Serve's own body — must still
 // hand its ObserveRevocations registration back rather than leaving the kill switch calling
@@ -5203,7 +5203,7 @@ func TestServe_ShutdownDuringStartupStopsBeforeServing(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	// The banner is captured via the proxy's own Stderr option rather than swapping the
-	// process-global os.Stderr — see route.go's BuildRoutes doc and issue 215. syncBuffer
+	// process-global os.Stderr — see route.go's BuildRoutes doc. syncBuffer
 	// (not bytes.Buffer) because Serve's background goroutines could still write after this
 	// test starts reading it back.
 	var out syncBuffer

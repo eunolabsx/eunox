@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -90,6 +91,42 @@ func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 	return logPath, true
 }
 
+// parseAndResolveAuditLog runs the preamble every audit-tape reader shares before it can even
+// locate its log — parseAuditReaderFlags, then resolveAuditReaderLogPath — and translates
+// parseAuditReaderFlags' generic 1 to the caller's own usageExit (audit-verify/suggest/stats
+// each reserve their non-2 codes for a command-specific outcome; see each one's own
+// <name>UsageExit doc). done reports the caller must return exitCode immediately; logPath is
+// valid only when done is false. Stops at path resolution rather than also opening the log,
+// because audit-verify's continuation (key loading, then per-file chain discovery) diverges
+// from suggest/stats' single openAuditChain call immediately after this point.
+func parseAndResolveAuditLog(name string, fs *flag.FlagSet, args []string, configPath, auditLogPath, keyPath *string, usageExit int) (logPath string, exitCode int, done bool) {
+	if code, doneParse := parseAuditReaderFlags(name, fs, args, configPath, auditLogPath, keyPath); doneParse {
+		if code != 0 {
+			return "", usageExit, true
+		}
+		return "", code, true
+	}
+	logPath, ok := resolveAuditReaderLogPath(name, *auditLogPath)
+	if !ok {
+		return "", usageExit, true
+	}
+	return logPath, 0, false
+}
+
+// openAuditChainOrExit runs openAuditChain and folds its error into the caller's own usageExit,
+// printing the (already fully-formatted) error verbatim. Shared by suggest and stats, the two
+// readers that both continue straight into a merged rotated-chain io.Reader; audit-verify does
+// not use this — it needs the discovered chain FILES themselves (audit.LogChainFiles), not a
+// merged reader, to verify per-file rather than stream one concatenated pass.
+func openAuditChainOrExit(name, logPath string, usageExit int) (r io.Reader, closeChain func(), exitCode int, done bool) {
+	r, closeChain, err := openAuditChain(name, logPath)
+	if err != nil {
+		fmt.Fprint(os.Stderr, err.Error())
+		return nil, nil, usageExit, true
+	}
+	return r, closeChain, 0, false
+}
+
 // auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution, or
 // log-read failure. Exit 1 is reserved for a log that fails verification (like validate
 // reserves it for findings), so a cron/CI job can tell tampering from a misconfigured flag.
@@ -128,17 +165,9 @@ Flags:
 	requestID := fs.String("request-id", "", "Report (count and print) only the record with this request ID. Every record\nis still HMAC-verified and the tamper-evident chain is always checked; this\nfilter narrows the report, not the verification.")
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
-	if code, done := parseAuditReaderFlags("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath); done {
-		if code != 0 {
-			// Translate the shared preamble's 1 to this command's own usage exit code;
-			// see auditVerifyUsageExit.
-			return auditVerifyUsageExit
-		}
+	logPath, code, done := parseAndResolveAuditLog("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath, auditVerifyUsageExit)
+	if done {
 		return code
-	}
-	logPath, ok := resolveAuditReaderLogPath("audit-verify", *auditLogPath)
-	if !ok {
-		return auditVerifyUsageExit
 	}
 
 	// Key path resolves: flag (already merged with config) > env var > default.
@@ -198,6 +227,17 @@ Flags:
 		return 0
 	}
 
+	printVerifySummary(res)
+	if !res.OK() {
+		return 1
+	}
+	return 0
+}
+
+// printVerifySummary writes the tallies and the operator notes a non-empty pass produces.
+// Split out of cmdAuditVerify to keep it under the length budget; the notes are the part that
+// grows, since each one names a state the verdict alone cannot distinguish.
+func printVerifySummary(res audit.VerifyResult) {
 	fmt.Printf(auditVerifySummaryFormat,
 		res.Total, res.Valid, res.Invalid, res.Skipped, res.UnknownKey, res.Unverifiable, res.ChainBreaks)
 	// A missing-key state, not tampering — kept distinct from INVALID so a key rotation
@@ -214,15 +254,27 @@ Flags:
 			"typically a pre-key_id-era record whose signing key was retired. Add the original key(s) to the ring "+
 			"to verify them; until then they cannot be distinguished from tampering and the verdict fails.\n", res.Unverifiable)
 	}
+	// Both notes below are keyed on the VERIFIED oldest seq, never the claimed one: FirstSeq
+	// is adopted from the head record before its HMAC is checked, so on a failing log it is a
+	// number the forger chose — and this is precisely the value an operator reconciles
+	// against an external high-water mark. The two agree on a log that passes, so a clean
+	// verify prints exactly what it printed before.
+	if res.FirstSeq > 0 && res.FirstVerifiedSeq != res.FirstSeq {
+		if res.FirstVerifiedSeq == 0 {
+			fmt.Printf("Note: the oldest record claims seq %d, but no record's signature verified, so no "+
+				"retained seq is proven — reconcile against your external high-water mark rather than "+
+				"the claimed value.\n", res.FirstSeq)
+		} else {
+			fmt.Printf("Note: the oldest record claims seq %d but did not verify; the oldest seq proven by a "+
+				"verified signature is %d — reconcile against that, not the claimed value.\n",
+				res.FirstSeq, res.FirstVerifiedSeq)
+		}
+	}
 	// seq > 1 across the whole chain means leading records (or whole rotated files) were
 	// removed or pruned — unprovable from local files alone without an external anchor.
-	if res.FirstSeq > 1 {
-		fmt.Printf("Note: the oldest record across the retained log files is seq %d, not 1 — "+
+	if res.FirstVerifiedSeq > 1 {
+		fmt.Printf("Note: the oldest verified record across the retained log files is seq %d, not 1 — "+
 			"leading records (or whole leading rotated files) were removed or pruned by "+
-			"retention (indistinguishable without an external anchor).\n", res.FirstSeq)
+			"retention (indistinguishable without an external anchor).\n", res.FirstVerifiedSeq)
 	}
-	if !res.OK() {
-		return 1
-	}
-	return 0
 }

@@ -60,9 +60,9 @@ func TestVelocityGrammarRejections(t *testing.T) {
 		},
 		{
 			name: "a cumulative bound past what the backends sum exactly",
-			// Canonical scientific-notation spelling ("1e+30", not "1e30"): the coercion guard
-			// added for H4 rejects "1e30" first, since it re-marshals to "1e+30" — a genuine
-			// textual coercion, just not the one this case exists to exercise.
+			// Canonical scientific-notation spelling ("1e+30", not "1e30"): the textual-coercion
+			// guard rejects "1e30" first, since it re-marshals to "1e+30" — a genuine coercion,
+			// just not the one this case exists to exercise.
 			caps:    "  - target: tool:t\n    actions: [call]\n    conditions:\n      - type: blastRadius\n        maxTotal: 1e+30\n        windowSeconds: 60\n",
 			wantErr: "sum exactly",
 		},

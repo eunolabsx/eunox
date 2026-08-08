@@ -1586,7 +1586,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// whole flag bundle for the proxy's lifetime.
 	controlTokenPath := pf.controlTokenPath
 	writeControlToken := func(ctx context.Context) error {
-		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken)
+		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken, os.Stderr)
 		if werr != nil {
 			return fmt.Errorf("kill control endpoint: %w", werr)
 		}
@@ -1732,17 +1732,55 @@ func parseFlagsAndPositionals(fs *flag.FlagSet, args []string) ([]string, error)
 		// or not: flag.Parse consumes the "--" itself (it never appears in Args()) and
 		// stops all further flag interpretation for the rest of that call. Re-parsing the
 		// tail on the next loop iteration would silently re-enable flag parsing for
-		// anything after the first token, so `eunox validate -- -a.yaml -b.yaml` failed on
-		// -b.yaml with "flag provided but not defined" — the terminator protected only the
-		// token right after it instead of the whole remainder, contradicting the flag
-		// package's own convention. Detected by checking whether the token immediately
-		// before where rest begins in THIS call's args was "--".
-		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+		// anything after the first token, so `eunox kill -- -weird-session-id` protected
+		// only the token right after the terminator and failed on any further dash-prefixed
+		// positional with "flag provided but not defined", contradicting the flag package's
+		// own convention. `kill` is the reachable case: validate peels its own "--"
+		// remainder off as a stdio command BEFORE calling here (see cmdValidate), so a
+		// terminator never survives to this loop there.
+		if consumed := len(args) - len(rest); terminatorFired(fs, args, consumed) {
 			return append(positionals, rest...), nil
 		}
 		positionals = append(positionals, rest[0])
 		args = rest[1:]
 	}
+}
+
+// terminatorFired reports whether the token immediately before where rest begins in THIS
+// call's args was a GENUINE "--" terminator, as opposed to a literal "--" swallowed as the
+// VALUE of an immediately preceding flag given in separate "--flag value" form. flag.Parse
+// special-cases a bare "--" only when scanning for the START of a new flag; mid-flag, once a
+// value-needing flag's name has been consumed, it takes the very next token as that flag's
+// value unconditionally, with no check that the token happens to spell "--". So
+// `--session -- foo -b` reads session="--" and stops at "foo" (not flag-shaped) — a plain
+// `args[consumed-1] == "--"` check then wrongly concludes a terminator fired and swallows
+// ["foo", "-b"] as positionals in one shot, instead of re-parsing "-b" as a possible flag on
+// the next loop iteration.
+func terminatorFired(fs *flag.FlagSet, args []string, consumed int) bool {
+	if consumed == 0 || args[consumed-1] != "--" {
+		return false
+	}
+	if consumed < 2 {
+		// Nothing preceded it in this call that could have consumed it as a value.
+		return true
+	}
+	prev := args[consumed-2]
+	if !strings.HasPrefix(prev, "-") || strings.Contains(prev, "=") {
+		// prev isn't a bare flag name in separate-value form (a positional, or a
+		// "--flag=value" that already carries its own value), so it cannot have eaten the
+		// "--" that follows it.
+		return true
+	}
+	fl := fs.Lookup(strings.TrimLeft(prev, "-"))
+	if fl == nil {
+		return true // not a flag this set defines; can't have consumed a value
+	}
+	if bf, ok := fl.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+		return true // a boolean flag never consumes the next token as its value
+	}
+	// prev is a recognized, value-needing flag in separate-value form: it ate the "--" that
+	// follows it as its own value, so no terminator actually fired here.
+	return false
 }
 
 // bindExposesAllInterfaces reports whether bindHost (already stripped of any surrounding
