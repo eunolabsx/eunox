@@ -392,17 +392,12 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 	return parseAdmitAllReply(res)
 }
 
-// isCrossSlot reports whether err is Redis refusing a multi-key command whose keys hash to
-// different slots — the reply a cluster gives AdmitAll's EVAL, and this package's only
-// request-time evidence that the keyspace shards.
+// isCrossSlot reports whether err is Redis refusing a multi-key command across hash slots.
 //
-// Asked of the TYPE, not of the message text. A strings.Contains on .Error() is a contract
-// with error FORMATTING: a reformatted or prefixed reply (go-redis' own HasErrorPrefix exists
-// because KVRocks-compatible backends prepend "ERR ") stops matching and the topology refusal
-// degrades to an opaque eval fault, while an unrelated error whose text happens to mention the
-// word gets mislabelled a topology refusal. Both spellings are checked because they answer
-// different questions: errors.Is catches the sentinel go-redis raises itself, HasErrorPrefix
-// the server's own reply, whose trailing text is Redis' to change.
+// Two spellings because two producers: errors.Is catches the sentinel go-redis raises itself,
+// HasErrorPrefix the server's own reply. Both are type-checked rather than text-matched — a
+// strings.Contains is a contract with formatting, which reads an unrelated error mentioning the
+// word as a topology refusal and stops recognizing a prefixed one.
 func isCrossSlot(err error) bool {
 	return errors.Is(err, redis.ErrCrossSlot) || redis.HasErrorPrefix(err, "CROSSSLOT")
 }

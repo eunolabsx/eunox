@@ -2587,3 +2587,35 @@ func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
 	assert.Equal(t, string(legHTTPNotification), claimedRec.records[0].details["transport"])
 	assert.Equal(t, "victim-real-session-id", claimedRec.records[0].details["claimed_session_id"])
 }
+
+// TestHandlerFaultDetail_KeysMatchTheTypesOwnTags pins the two spellings of one shape
+// together. handlerFaultDetail renders capability.HandlerFault into the plain map the audit
+// layer's value bounder recurses into, which means the field names exist twice: as json tags
+// on the type, and as string literals in the renderer. Nothing else ties them, so renaming a
+// tag would leave the tape emitting the old key with every test still green.
+func TestHandlerFaultDetail_KeysMatchTheTypesOwnTags(t *testing.T) {
+	t.Parallel()
+	rendered := handlerFaultDetail(capability.EnforceResponse{
+		HandlerFaults: []capability.HandlerFault{{
+			Type:     capability.ConditionTypeMaxCalls,
+			Contract: capability.HandlerContractQuotaUnderSkip,
+		}},
+	})
+	faults, ok := rendered[audit.HandlerFaultKey].([]interface{})
+	require.True(t, ok, "the detail value must be a plain slice the audit bounder recurses into")
+	require.Len(t, faults, 1)
+	got, ok := faults[0].(map[string]interface{})
+	require.True(t, ok, "each fault must be a plain map")
+
+	// Marshalling the type is what the json tags govern; the renderer must produce the same
+	// keys, or the tape and every other JSON path describe the fault differently.
+	raw, err := json.Marshal(capability.HandlerFault{
+		Type:     capability.ConditionTypeMaxCalls,
+		Contract: capability.HandlerContractQuotaUnderSkip,
+	})
+	require.NoError(t, err)
+	var viaTags map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &viaTags))
+	assert.Equal(t, viaTags, got,
+		"the audit render and capability.HandlerFault's own json tags must agree on every key")
+}

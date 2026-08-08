@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -303,8 +304,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// FACT rather than a reordering: the swallowed set is what the proxy has already
 			// handled, and pre-session it has handled nothing — so revocation still sees this
 			// message and a 202 during an emergency stop is recorded rather than being a
-			// silent readiness ack. The gate's verdict is a drop either way (nothing here has
-			// an upstream to forward to), so its answer is the ack below.
+			// silent readiness ack.
 			gate := hostNotificationGate{
 				rec:       func() auditRecorder { return p.preSessionKillRecorder(route) },
 				subject:   claimedSession(r),
@@ -312,7 +312,15 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				checkKill: func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, "") },
 				leg:       legHTTPNotification,
 			}
-			_ = gate.admit(ctx, msg)
+			if gate.admit(ctx, msg) {
+				// Unreachable: `initialize` is a swallowed notification and this arm handles no
+				// other method. Answered as the drop it must be anyway — there is no session
+				// here, so nothing to forward it on — rather than discarding the verdict and
+				// letting a future forwardable pre-session method be dropped in silence.
+				_, _ = fmt.Fprintf(p.errOut(),
+					"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
+					audit.SanitizeAuditField(msg.Method))
+			}
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
@@ -1029,13 +1037,11 @@ const (
 	killDimensionSession = "session"
 )
 
-// hostLeg is what revision negotiation needs to know about the connection a message arrived
-// on: the revision its context was opened at, the revision this proxy's upstream leg speaks,
-// and the session id a refusal is recorded under.
+// hostLeg is what revision negotiation needs to know about the connection a message arrived on.
 //
-// A struct rather than three parameters because the SESSIONLESS arms supply mostly zero
-// values, and three bare arguments at those call sites read as an oversight rather than as
-// the fact they are: no session established, and no upstream leg their message could reach.
+// A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
+// and three bare arguments at those call sites read as an oversight rather than as the fact
+// they are: no session established, and no upstream leg their message could reach.
 type hostLeg struct {
 	contextRev  capability.Revision
 	upstreamRev capability.Revision

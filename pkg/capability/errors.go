@@ -205,10 +205,12 @@ const (
 	DenialClassFault
 )
 
-// ClassifyDenialCode reports which class of refusal code names. Unrecognized codes classify
-// as policy: every code eunox mints is enumerated in AllDenialCodes and covered by
-// TestClassifyDenialCode_CoversEveryCode, so the fallback is only reached by an out-of-tree
-// PDP's own code, whose refusals are its policy by definition.
+// ClassifyDenialCode reports which class of refusal code names. It classifies the codes THIS
+// vocabulary defines (AllDenialCodes, each covered by TestClassifyDenialCode_CoversEveryCode);
+// anything else — an out-of-tree PDP's own code, or one the transport layer mints for a
+// refusal taken before policy was reached — falls to policy, which is why a consumer asking a
+// broader question (internal/transport's IsInfraDenialCode) reads this AND its own list rather
+// than only this.
 func ClassifyDenialCode(code string) DenialClass {
 	switch code {
 	case ErrCodeKillSwitch, ErrCodeKillSwitchError:
