@@ -574,7 +574,10 @@ func TestShardFanOut_CoversEveryShardingClient(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, ok := shardFanOut(tc.client)
+			_, ok, err := shardFanOut(tc.client)
+			if err != nil {
+				t.Fatalf("shardFanOut(%T): %v", tc.client, err)
+			}
 			if ok != tc.wantFan {
 				t.Fatalf("shardFanOut(%T) fan-out = %v, want %v", tc.client, ok, tc.wantFan)
 			}
@@ -582,6 +585,23 @@ func TestShardFanOut_CoversEveryShardingClient(t *testing.T) {
 				t.Fatalf("callcounter.IsShardingClient(%T) = %v, but this package's fan-out says %v; the two enumerate one set", tc.client, got, tc.wantFan)
 			}
 		})
+	}
+}
+
+// TestShardFanOut_RefusesAShardingClientItCannotEnumerate pins the direction the drift can
+// still fail in. shardFanOut no longer keeps its own list of what shards — it asks
+// callcounter.IsShardingClient — so the residual risk is the mirror case: a go-redis release
+// adds a multi-endpoint client that answers yes there and has no iterator here. That must be
+// an error the caller propagates, never a fall-through to the single-node SCAN, which
+// enumerates one server of several and reports a partial kill set as healthy.
+func TestShardFanOut_RefusesAShardingClientItCannotEnumerate(t *testing.T) {
+	t.Parallel()
+	fanOut, sharded, err := shardFanOutWhen(redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"}), true)
+	if err == nil {
+		t.Fatalf("a sharding client with no iterator: sharded=%v fanOut!=nil=%v, want an error rather than the single-node path", sharded, fanOut != nil)
+	}
+	if sharded || fanOut != nil {
+		t.Errorf("a refused client must yield no iterator: sharded=%v fanOut!=nil=%v", sharded, fanOut != nil)
 	}
 }
 

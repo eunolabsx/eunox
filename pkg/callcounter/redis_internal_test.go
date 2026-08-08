@@ -5,6 +5,8 @@ package callcounter
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -147,4 +149,45 @@ func TestRedisAdmitAll_WeightedCeilingIsAllOrNothingAcrossTheBatch(t *testing.T)
 	card, err := client.ZCard(ctx, redisWindowKey(sibling.Key, sibling.WindowSec)).Result()
 	require.NoError(t, err)
 	require.Equal(t, int64(0), card, "the sibling bucket must not have been charged")
+}
+
+// serverReply is a Redis error REPLY, the shape go-redis' exported Error interface names.
+// Hand-rolled because the concrete type go-redis decodes replies into lives in an internal
+// package: what matters to isCrossSlot is that the value answers errors.As for that interface,
+// which is exactly what the RedisError marker declares.
+type serverReply string
+
+func (e serverReply) Error() string { return string(e) }
+func (serverReply) RedisError()     {}
+
+// TestIsCrossSlot pins the request-time topology detection against the shapes a real
+// deployment produces, and against the two ways a text match got it wrong: a reply the server
+// (or a compatible backend) prefixes, and an unrelated error whose message merely mentions the
+// word. The sentinel row is the one go-redis raises itself; the prefixed row is the "ERR "
+// spelling go-redis' own HasErrorPrefix documents.
+func TestIsCrossSlot(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"go-redis sentinel", redis.ErrCrossSlot, true},
+		{"server reply", serverReply("CROSSSLOT Keys in request don't hash to the same slot"), true},
+		{"prefixed server reply", serverReply("ERR CROSSSLOT Keys in request don't hash to the same slot"), true},
+		{"wrapped sentinel", fmt.Errorf("redis eval: %w", redis.ErrCrossSlot), true},
+		{"unrelated redis error", serverReply("NOSCRIPT No matching script. Please use EVAL."), false},
+		// A plain Go error is not a Redis reply, whatever its text says: mislabelling one as a
+		// topology refusal buries the real fault behind an unrelated remediation.
+		{"non-redis error naming the word", errors.New("dial tcp: CROSSSLOT appears in this log line"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isCrossSlot(tc.err); got != tc.want {
+				t.Errorf("isCrossSlot(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
 }
