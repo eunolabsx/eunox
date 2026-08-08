@@ -208,3 +208,57 @@ func TestRegisteredHandler_OverrideReplacesTheDeclarationToo(t *testing.T) {
 	assert.True(t, builtin.dependsOn(capability.SubsystemFlowLabels))
 	assert.False(t, builtin.dependsOn(capability.SubsystemAntecedentHistory))
 }
+
+// unsetPureHandler and unsetCommittingHandler are an embedder's handlers that declare their own
+// subsystems by dereferencing themselves — the ordinary shape — so a nil pointer of either (an
+// unset config field, boxed into a non-nil interface) panics if anything calls that method. They
+// are deliberately separate types: a fixture implementing BOTH registers as committing whichever
+// option installs it, and would exercise only one of the two arms below.
+type unsetPureHandler struct{ declares []capability.EngineSubsystem }
+
+func (h *unsetPureHandler) Handle(context.Context, capability.Condition, *capability.EnforceRequest) *ConditionError {
+	return nil
+}
+
+func (h *unsetPureHandler) UsesEngineSubsystems() []capability.EngineSubsystem { return h.declares }
+
+type unsetCommittingHandler struct{ declares []capability.EngineSubsystem }
+
+func (h *unsetCommittingHandler) PrepareCommit(context.Context, capability.Condition, *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	return DeferredCommit{}, false, nil
+}
+
+func (h *unsetCommittingHandler) UsesEngineSubsystems() []capability.EngineSubsystem {
+	return h.declares
+}
+
+// TestRegisteredHandler_TypedNilDeclarationDoesNotPanicNew pins that the typed-nil rule
+// registeredHandler.commits states is applied by the OTHER reader of the same two fields. The
+// SubsystemDependent assertion succeeds for a typed nil — the itab belongs to the type, not the
+// value — so asking it to declare crashed New, i.e. the proxy never started and the fail-closed
+// CONDITION_FAILED the decision path promises for this handler was never reached.
+//
+// WithPolicyTokens is required to reproduce: without it policyUses short-circuits on
+// "the policy is unknown, wire everything" before any entry is asked.
+func TestRegisteredHandler_TypedNilDeclarationDoesNotPanicNew(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		opt  Option
+	}{
+		{"committing", WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, (*unsetCommittingHandler)(nil))},
+		{"pure", WithConditionHandler(capability.ConditionTypeAllowedValues, (*unsetPureHandler)(nil))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var e *Engine
+			require.NotPanics(t, func() {
+				e = New(WithPolicyTokens([]string{capability.ConditionTypeMaxCalls, capability.ConditionTypeAllowedValues}), tc.opt)
+			})
+			// Unclassified, so every facility stays wired: an entry that cannot declare must not
+			// be read as declaring nothing.
+			assert.False(t, e.skipFlow, "an undeclarable handler leaves the flow facility wired")
+			assert.False(t, e.skipAntecedentRecording, "and the antecedent facility too")
+		})
+	}
+}

@@ -1,6 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// The Redis backend's own behavior suite, authoritative for what it DOES — including the
+// exact error sentinels and the cache-before-publish visibility a cross-backend table cannot
+// state. conformance_test.go holds only the rules every backend must satisfy.
+//
 // Error-path tests for the Redis kill-switch that closing a miniredis server
 // cannot reach: those require Get to succeed while a later SCAN fails, or one
 // prefix's scan to succeed while the next fails. A selective fake redis.Cmdable
@@ -610,6 +614,15 @@ func TestRedis_KillAndReviveAgent(t *testing.T) {
 	blocked, err := r.ShouldBlock(ctx, "agent-xyz", "")
 	require.NoError(t, err)
 	assert.True(t, blocked)
+
+	// A kill blocks the id it NAMES and no other. Asserted here rather than left to the
+	// cross-backend table, which cannot state it more precisely than this: without it, a
+	// membership test degraded to "is anything killed?" blocks the whole fleet on one
+	// `eunox kill --agent`, and every other Redis case still passes (each either starts from an
+	// empty kill set or queries the agent it just killed).
+	blocked, err = r.ShouldBlock(ctx, "agent-other", "")
+	require.NoError(t, err)
+	assert.False(t, blocked, "killing one agent must not block an unrelated one")
 
 	require.Eventually(t, func() bool {
 		r.mu.RLock()

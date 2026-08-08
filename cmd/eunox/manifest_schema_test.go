@@ -643,3 +643,53 @@ func tokensIntroducedIn(revision string, tokens []string) []string {
 	}
 	return out
 }
+
+// TestComputeAuditStats_HandlerFaultIsCountedAndCalledOut pins the operator-facing half of the
+// repaired-fault report. The repair leaves the record looking like any other allow — the call
+// was decided exactly as a conforming handler's would have been — so if `eunox stats` does not
+// name it, an observe run tolerates a broken plugin indefinitely and the budget the run existed
+// to PREDICT is not being predicted. The probe is derived from the producer's own key for
+// declassifyProbe's reason: a respelling would make every fault silently invisible.
+func TestComputeAuditStats_HandlerFaultIsCountedAndCalledOut(t *testing.T) {
+	t.Parallel()
+	if string(handlerFaultProbe) != audit.HandlerFaultKey {
+		t.Fatalf("the stats probe %q is not the producer's key %q", handlerFaultProbe, audit.HandlerFaultKey)
+	}
+	if !audit.IsReservedDetailKey(audit.HandlerFaultKey) {
+		t.Errorf("key %q is not reserved, so `eunox suggest` would mine it as a tool argument", audit.HandlerFaultKey)
+	}
+
+	// Both records a fault can ride: the allow it was decided on, and the deny a route running
+	// --audit forwards anyway (where the deny record is the one an operator reads).
+	log := strings.Join([]string{
+		`{"decision":"allow","target":"read_file","details":{"` + audit.HandlerFaultKey + `":["maxCalls"]}}`,
+		`{"decision":"deny","audit_only":true,"target":"read_file","denial_code":"CONDITION_FAILED","details":{"` + audit.HandlerFaultKey + `":["maxCalls"]}}`,
+		`{"decision":"allow","target":"read_file","details":{"path":"/tmp/x"}}`,
+	}, "\n")
+	got, err := computeAuditStats(strings.NewReader(log))
+	if err != nil {
+		t.Fatalf("computeAuditStats: %v", err)
+	}
+	if got.handlerFaults != 2 {
+		t.Errorf("handlerFaults = %d, want 2 (the report rides whichever record the decision produced)", got.handlerFaults)
+	}
+
+	var out strings.Builder
+	printAuditStats(&out, got)
+	for _, want := range []string{"ATTENTION", "commit contract", audit.HandlerFaultKey} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("printAuditStats is missing %q:\n%s", want, out.String())
+		}
+	}
+
+	// A clean log must raise nothing: an alert an operator learns to ignore is worse than none.
+	clean, err := computeAuditStats(strings.NewReader(`{"decision":"allow","target":"read_file","details":{"path":"/tmp/x"}}`))
+	if err != nil {
+		t.Fatalf("computeAuditStats: %v", err)
+	}
+	var cleanOut strings.Builder
+	printAuditStats(&cleanOut, clean)
+	if strings.Contains(cleanOut.String(), "commit contract") {
+		t.Errorf("a healthy run must raise no handler-fault line:\n%s", cleanOut.String())
+	}
+}

@@ -424,6 +424,167 @@ func TestIsObserveDeny_Matrix(t *testing.T) {
 	}
 }
 
+// breakMode names one way contractBreakingCommitHandler breaks the engine's PrepareCommit
+// contract. Typed, and with no fall-through default, so a mistyped mode cannot silently select
+// an arm nobody chose — this fixture is what distinguishes the union's arms from each other.
+type breakMode int
+
+const (
+	modeSoftDeny breakMode = iota
+	modeUnauthorizedSkip
+	modeCommitUnderObserve
+)
+
+// contractBreakingCommitHandler is a committing condition handler that breaks the engine's
+// PrepareCommit contract in one chosen way, so this package can observe what the transport
+// does with each verdict pkg/enforcement produces for it. Its twin on the engine side is
+// sentinelCommitHandler (pkg/enforcement/engine_internal_test.go), which encodes the same
+// contract for that package's own tests; the two are kept in agreement by hand, since a shared
+// fixture would have to live in a package pkg/enforcement's internal tests cannot import.
+type contractBreakingCommitHandler struct{ mode breakMode }
+
+func (h contractBreakingCommitHandler) PrepareCommit(context.Context, capability.Condition, *capability.EnforceRequest) (enforcement.DeferredCommit, bool, *enforcement.ConditionError) {
+	switch h.mode {
+	case modeSoftDeny:
+		// A verdict, not a contract violation: an ordinary condition failure from the same path.
+		return enforcement.DeferredCommit{}, false, &enforcement.ConditionError{
+			Code:          capability.ErrCodeConditionFailed,
+			ConditionType: capability.ConditionTypeMaxCalls,
+			Message:       "over limit",
+		}
+	case modeUnauthorizedSkip:
+		return enforcement.DeferredCommit{}, true, nil
+	case modeCommitUnderObserve:
+		return enforcement.DeferredCommit{
+			Bucket: capability.QuotaBucket{Key: "fault-bucket", WindowSec: 60, Counted: true, Limit: 5},
+			Deny: func(float64, time.Duration) *enforcement.ConditionError {
+				return &enforcement.ConditionError{Code: capability.ErrCodeConditionFailed, Message: "over limit"}
+			},
+		}, false, nil
+	}
+	panic("unknown break mode")
+}
+
+// TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny is what pkg/enforcement's hard
+// denies are justified BY. That package writes "where WillForwardDeny answers yes, a
+// downgradable verdict is forwarded, and a HardDeny is not" on exactly one doc comment and
+// cites it from the refusals that depend on it — but it neither sets that flag nor implements
+// the downgrade, so nothing there could fail if this rule ever narrowed. This runs a real
+// engine verdict through the real forward core for each arm of the union.
+//
+// The constraint is `enforcement: audit` throughout: WillForwardDeny answers yes for it, and
+// it is the posture the unauthorized-skip refusal is actually reachable on (a route-level
+// --audit sets SkipQuota, which AUTHORIZES the skip).
+func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
+	caps := func(enf string) []capability.Constraint {
+		return []capability.Constraint{{
+			Target:      "tool",
+			Actions:     []string{"*"},
+			Enforcement: enf,
+			Conditions:  []capability.Condition{&capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}},
+		}}
+	}
+	decide := func(ctx context.Context, enf string, mode breakMode) capability.EnforceResponse {
+		eng := enforcement.New(
+			enforcement.WithCallCounter(callcounter.NewInMemory()),
+			enforcement.WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, contractBreakingCommitHandler{mode: mode}),
+		)
+		return eng.ValidateAction(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}, caps(enf))
+	}
+	forward := func(t *testing.T, dec capability.EnforceResponse, auditRoute bool) (*fwdRecorder, bool) {
+		t.Helper()
+		rec := &fwdRecorder{}
+		called := false
+		fp := forwardParams{
+			rec:       rec,
+			sessionID: "s",
+			audit:     auditRoute,
+			callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
+				called = true
+				return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"ok":true}`)}, nil
+			},
+		}
+		enforcedForwardCore(context.Background(), fp, nil, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+		return rec, called
+	}
+
+	t.Run("a downgradable verdict is forwarded on a route running --audit", func(t *testing.T) {
+		// The route-level arm: an ordinary ENFORCE constraint, downgraded because the ROUTE is
+		// observing. Driving only the per-constraint arm left `auditMode ||` in isObserveDeny
+		// deletable with this test still green.
+		dec := decide(enforcement.WithSkipQuota(context.Background()), "", modeSoftDeny)
+		require.Equal(t, capability.DecisionDeny, dec.Decision)
+		require.False(t, dec.AuditOnly, "the constraint is not audit-only; the route is what forwards")
+
+		rec, called := forward(t, dec, true)
+		assert.True(t, called, "a route running --audit delivers the call")
+		require.Len(t, rec.records, 2)
+		assert.Equal(t, "deny", rec.records[0].decision)
+		assert.True(t, rec.records[0].auditOnly)
+	})
+
+	t.Run("a kill-switch denial is never downgraded", func(t *testing.T) {
+		// The second exemption isObserveDeny applies, and the one WillForwardDeny cannot
+		// express: a kill carries no HardDeny and is recognized by its CODE, so a reader who
+		// took "HardDeny is the only thing that never downgrades" literally would forward an
+		// operator's emergency stop.
+		dec := capability.EnforceResponse{
+			Decision: capability.DecisionDeny,
+			Denial:   &capability.DenialInfo{Code: capability.ErrCodeKillSwitch},
+		}
+		require.False(t, dec.Denial.HardDeny, "the premise: a kill is blocked by its code, not by the flag")
+
+		rec, called := forward(t, dec, true)
+		assert.False(t, called, "an emergency stop must block even on a route running --audit")
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, "deny", rec.records[0].decision)
+		assert.False(t, rec.records[0].auditOnly)
+	})
+
+	t.Run("a downgradable verdict is forwarded on an audit-only constraint", func(t *testing.T) {
+		dec := decide(context.Background(), capability.EnforcementAudit, modeSoftDeny)
+		require.Equal(t, capability.DecisionDeny, dec.Decision)
+		require.NotNil(t, dec.Denial)
+		require.False(t, dec.Denial.HardDeny, "an ordinary condition failure is a policy verdict, not an engine bug")
+
+		rec, called := forward(t, dec, false)
+		assert.True(t, called, "the union's forwarding half: an audit-mode constraint delivers the call")
+		require.Len(t, rec.records, 2, "the downgrade records the observed verdict, then the forwarded call")
+		assert.Equal(t, "deny", rec.records[0].decision)
+		assert.True(t, rec.records[0].auditOnly, "and records it as observed rather than enforced")
+		assert.Equal(t, "allow", rec.records[1].decision)
+	})
+
+	t.Run("a HardDeny is not downgraded", func(t *testing.T) {
+		dec := decide(context.Background(), capability.EnforcementAudit, modeUnauthorizedSkip)
+		require.Equal(t, capability.DecisionDeny, dec.Decision)
+		require.NotNil(t, dec.Denial)
+		require.True(t, dec.Denial.HardDeny, "an unauthorized skip leaves the deferred set unchecked")
+
+		rec, called := forward(t, dec, false)
+		assert.False(t, called, "the flag pkg/enforcement sets to block must actually block on the one posture that reaches it")
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, "deny", rec.records[0].decision)
+		assert.False(t, rec.records[0].auditOnly, "a blocked call must not be recorded as an observed forward")
+	})
+
+	t.Run("an absorbed handler fault forwards and lands on the tape", func(t *testing.T) {
+		// The other half of the same contract, and the reason it is NOT a hard deny: a route
+		// running --audit promises never to block, and the engine consumes nothing either way.
+		dec := decide(enforcement.WithSkipQuota(context.Background()), "", modeCommitUnderObserve)
+		require.Equal(t, capability.DecisionAllow, dec.Decision)
+
+		rec, called := forward(t, dec, true)
+		assert.True(t, called, "a wiretap route must not be turned into an outage by a plugin bug")
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, "allow", rec.records[0].decision)
+		assert.Equal(t, []string{capability.ConditionTypeMaxCalls}, rec.records[0].details[audit.HandlerFaultKey],
+			"absorbing the fault must not hide it: the operator learns from the record")
+		assert.True(t, audit.IsReservedDetailKey(audit.HandlerFaultKey),
+			"an unreserved key would be mined by `eunox suggest` as a caller-supplied tool argument")
+	})
+}
+
 // TestIsObserveDeny_NilDenialPanics documents that isObserveDeny deliberately
 // has no nil guard: both callers (enforcedForwardCore's manifest leg and
 // forwardServerRequest's sampling leg) always normalize the denial via

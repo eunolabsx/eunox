@@ -106,9 +106,13 @@ func TestRedisCallCounter_Integration(t *testing.T) {
 	client := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
+	// Single-node miniredis, so neither construction refusal (a keyspace-sharding client,
+	// crypto/rand) is reachable and the error is asserted away rather than plumbed through.
+	// A NEW refusal added to NewRedis has to be reckoned with here too — see the same note in
+	// pkg/callcounter/export_test.go and internal/transport/dispatch_test.go.
 	counter, err := callcounter.NewRedis(client)
 	if err != nil {
-		t.Fatalf("NewRedis: %v", err)
+		t.Fatalf("callcounter.NewRedis: %v", err)
 	}
 	ctx := context.Background()
 

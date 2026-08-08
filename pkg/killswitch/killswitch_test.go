@@ -1,8 +1,11 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Regression test for a data race on lifecycleCtx in killswitch.Redis:
-// lifecycleCtx and cancel were written in Start without holding r.mu, but read
+// The InMemory backend's own behavior suite, plus a regression test for a data race on
+// lifecycleCtx in killswitch.Redis. This file is authoritative for what InMemory DOES;
+// conformance_test.go holds only the rules that must hold of every backend.
+//
+// The race: lifecycleCtx and cancel were written in Start without holding r.mu, but read
 // in handlePubSubMessage while r.mu was already released.  The race detector
 // flagged this as undefined behavior.  Both the write (in Start) and the
 // read (in handlePubSubMessage) now occur under r.mu.

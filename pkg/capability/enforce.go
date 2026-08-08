@@ -143,6 +143,26 @@ type EnforceResponse struct {
 	// In-process only (json:"-"), like HardDeny: a decision artifact for the transport, not a
 	// wire field.
 	Effect *ResolvedEffect `json:"-"`
+	// HandlerFaults names the condition types whose registered handler broke an engine contract
+	// in a direction the engine REPAIRED. THE one statement of that repair, which every other
+	// site cites rather than re-derives:
+	//
+	// The engine owns the only place a quota is consumed, so a handler that derives a bucket
+	// where the request authorizes no consumption is answered by dropping the bucket — the
+	// outcome a conforming handler produces for that posture, so the call is decided exactly as
+	// it would have been. Refusing instead would charge a caller for a plugin's bug, and would
+	// do it on the one posture that reaches the fault at all, whose whole contract is that it
+	// never blocks. A fault the engine CANNOT repair (one that leaves a declared restriction
+	// unevaluated) is a denial, never an entry here.
+	//
+	// Repaired is not tolerated: the transport stamps this onto the record so an operator sees
+	// the bug. It rides whatever record the decision produces, allow or deny — a fault is a
+	// fact about the decision, not about its verdict, and the posture that produces one is the
+	// posture where a deny is forwarded rather than blocking.
+	//
+	// Nil on every call in a healthy deployment. In-process only (json:"-"), like the two
+	// fields above.
+	HandlerFaults []string `json:"-"`
 }
 
 // Decision identifies the enforcement outcome.

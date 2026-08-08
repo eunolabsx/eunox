@@ -268,8 +268,9 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	caps := []capability.Constraint{{
 		Target:  "tool",
 		Actions: []string{"*"},
-		// An AUDIT-mode constraint: a handler violating the skip contract is an engine
-		// bug, not a downgradable policy verdict, so the refusal must still block here.
+		// An AUDIT-mode constraint, so WillForwardDeny answers yes for this call: the refusal
+		// must still block, which is the property HardDeny carries (see WillForwardDeny for
+		// the union and the transport test that pins the forwarding half).
 		Enforcement: capability.EnforcementAudit,
 		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path.
 		Conditions: []capability.Condition{
@@ -288,7 +289,7 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
 	if !resp.Denial.HardDeny {
-		t.Fatal("denial must be a HardDeny: an audit route forwards anything downgradable, so a skip-contract violation would ship with the budget unchecked")
+		t.Fatal("denial must be a HardDeny: WillForwardDeny answers yes here, so a downgradable skip-contract violation would ship with the budget unchecked")
 	}
 }
 
@@ -320,7 +321,7 @@ func TestCommitDeferredAtomic_UnauthorizedSkipIsRefusedOnASingleCondition(t *tes
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
 	if !resp.Denial.HardDeny {
-		t.Fatal("denial must carry HardDeny: an audit-mode constraint forwards anything downgradable, so the budget would ship unchecked")
+		t.Fatal("denial must carry HardDeny: WillForwardDeny answers yes for an audit-mode constraint, so the budget would ship unchecked")
 	}
 
 	// The assertion refuses an UNAUTHORIZED skip, not skipping: the same handler under observe
@@ -535,6 +536,8 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 //	             half: under an observe request a handler must skip or commit nothing)
 //	Count == 8 → reports skip AND hands back the bucket it prepared (belt-and-braces:
 //	             states the outcome observe requires, so the skip decides)
+//	Count == 99 → reports skip AND a validation error at once (PrepareCommit's contract puts
+//	             no exclusion between the two)
 //	otherwise  → skips under SkipQuota, commits otherwise (the well-behaved case)
 type sentinelCommitHandler struct{}
 
@@ -600,13 +603,15 @@ func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
 	}
 }
 
-// TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveFailsClosed pins the case that used
+// TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveIsAbsorbed pins the case that used
 // to need a whole post-loop guard: under observe, one bucket skips while another commits.
-// Admitting the committing bucket while dropping the skipped one is a fail-open, and the
-// answer is now the same per-condition assertion that refuses the lone committing bucket —
-// which is why "uniform across the constraint" no longer has to be re-derived after the loop.
-func TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveFailsClosed(t *testing.T) {
-	e := sentinelEngine()
+// Admitting the committing bucket while dropping the skipped one would be a fail-open; the
+// engine drops BOTH, which is what the skipping handler asked for and what the committing one
+// should have — so the set is uniform without "uniform across the constraint" being
+// re-derived after the loop.
+func TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveIsAbsorbed(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, sentinelCommitHandler{}))
 	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
 	caps := []capability.Constraint{{
 		Target:  "tool",
@@ -617,18 +622,18 @@ func TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveFailsClosed(t *testi
 		},
 	}}
 	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
-	if resp.Decision != capability.DecisionDeny {
-		t.Fatalf("decision = %q, want deny (a bucket committing beside a skipping one must fail closed)", resp.Decision)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("decision = %q, want allow (the mixed set consumes nothing, which is the observe posture's whole contract); denial %+v", resp.Decision, resp.Denial)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != capability.ConditionTypeMaxCalls {
+		t.Errorf("HandlerFaults = %v, want [%s]: absorbing the violation must not make it invisible", got, capability.ConditionTypeMaxCalls)
 	}
-	// HardDeny, or the refusal cannot actually block: this is only reachable when SkipQuota is
-	// set, which the binary sets only on a route running --audit — and there the transport
-	// downgrades and FORWARDS any non-HardDeny verdict, letting the call proceed with the
-	// skipped bucket never checked.
-	if !resp.Denial.HardDeny {
-		t.Error("the deny must be HardDeny; a downgradable verdict is forwarded on the only posture that reaches this branch, so the guard would never block")
+	spent, err := counter.Peek(context.Background(), "sentinel-bucket", 3600)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	if spent != 0 {
+		t.Errorf("observe run spent %d slots; the bucket the handler derived must be dropped, not admitted", spent)
 	}
 }
 
@@ -639,7 +644,9 @@ func TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveFailsClosed(t *testi
 // an observe run silently drained the budget it was meant only to predict.
 //
 // Every deferred condition commits here, so no partial skip is involved: this is the plain
-// case, and the assertion is that the engine refuses rather than charges.
+// case. The engine is the only consumption point, so it drops the buckets and decides the call
+// exactly as a conforming handler would have — the wiretap route the posture exists for keeps
+// its promise, and the plugin bug is reported instead of charged to the caller.
 func TestCommitDeferredAtomic_CommitUnderObserveSpendsNoQuota(t *testing.T) {
 	counter := callcounter.NewInMemory()
 	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, sentinelCommitHandler{}))
@@ -655,16 +662,15 @@ func TestCommitDeferredAtomic_CommitUnderObserveSpendsNoQuota(t *testing.T) {
 	}}
 
 	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
-	if resp.Decision != capability.DecisionDeny {
-		t.Fatalf("decision = %q, want deny (a handler committing under observe must be refused, not charged)", resp.Decision)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("decision = %q, want allow (an observe route must not be blocked by a handler bug the engine can absorb); denial %+v", resp.Decision, resp.Denial)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	// Deduped: two conditions of the same type violated the contract, and the report names the
+	// misbehaving handler once.
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != capability.ConditionTypeMaxCalls {
+		t.Errorf("HandlerFaults = %v, want [%s]", got, capability.ConditionTypeMaxCalls)
 	}
-	if !resp.Denial.HardDeny {
-		t.Error("the deny must be HardDeny: --audit is the only posture that reaches it, and there a downgradable verdict is forwarded")
-	}
-	// The substance: the observe run left the budget untouched. A refusal that still committed
+	// The substance: the observe run left the budget untouched. An allow that still committed
 	// would satisfy every assertion above and drain the quota anyway.
 	for _, windowSec := range []int{60, 3600} {
 		spent, err := counter.Peek(context.Background(), "sentinel-bucket", windowSec)
@@ -674,6 +680,37 @@ func TestCommitDeferredAtomic_CommitUnderObserveSpendsNoQuota(t *testing.T) {
 		if spent != 0 {
 			t.Errorf("observe run spent %d slots in the %ds window; an observe route must consume none", spent, windowSec)
 		}
+	}
+}
+
+// TestCommitDeferredAtomic_AbsorbedFaultYieldsToARealVerdict pins the ordering the absorption
+// must not change: the loop keeps preparing after it records a fault, so a later condition's
+// genuine condErr still decides. Reporting the allow instead would let an observe run predict
+// "allowed" for a call enforce mode denies — the divergence the two-pass commit exists to
+// prevent — and the fault report must never be the thing that hides it.
+func TestCommitDeferredAtomic_AbsorbedFaultYieldsToARealVerdict(t *testing.T) {
+	e := sentinelEngine()
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
+	caps := []capability.Constraint{{
+		Target:  "tool",
+		Actions: []string{"*"},
+		Conditions: []capability.Condition{
+			&capability.MaxCallsCondition{Count: 7, WindowSeconds: 60},    // commits, ignoring SkipQuota
+			&capability.MaxCallsCondition{Count: -1, WindowSeconds: 3600}, // invalid: condErr even under observe
+		},
+	}}
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (a later bucket's validation error outranks an absorbed contract violation)", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
+		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	}
+	// The verdict is the later condition's, and the fault is still reported: on this posture
+	// the deny is downgraded and FORWARDED, so a report that rode the allow alone would go
+	// missing for exactly the constraints whose second condition denies.
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != capability.ConditionTypeMaxCalls {
+		t.Errorf("HandlerFaults = %v, want [%s] on the deny too", got, capability.ConditionTypeMaxCalls)
 	}
 }
 
