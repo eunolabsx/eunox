@@ -54,23 +54,13 @@ Flags:
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 
-	if code, done := parseAuditReaderFlags("stats", fs, args, configPath, auditLogPath, nil); done {
-		if code != 0 {
-			// Translate the shared preamble's 1 to this command's own usage exit code;
-			// see statsUsageExit.
-			return statsUsageExit
-		}
+	logPath, code, done := parseAndResolveAuditLog("stats", fs, args, configPath, auditLogPath, nil, statsUsageExit)
+	if done {
 		return code
 	}
-	logPath, ok := resolveAuditReaderLogPath("stats", *auditLogPath)
-	if !ok {
-		return statsUsageExit
-	}
-
-	r, closeChain, err := openAuditChain("stats", logPath)
-	if err != nil {
-		fmt.Fprint(os.Stderr, err.Error())
-		return statsUsageExit
+	r, closeChain, code, done := openAuditChainOrExit("stats", logPath, statsUsageExit)
+	if done {
+		return code
 	}
 	defer closeChain()
 

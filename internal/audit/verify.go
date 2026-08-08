@@ -234,10 +234,17 @@ type VerifyResult struct {
 	// a wholesale unsigned forgery), so a consumer must read it together with Total/Invalid
 	// rather than treating 0 as "empty".
 	FirstSeq uint64
-	// FirstVerifiedSeq is the seq of the first record whose HMAC verified against a key in
-	// the ring — the oldest retained seq this pass can PROVE, since the seq field is inside
-	// the signature. It equals FirstSeq on a log that passes; a divergence means the head
-	// record's claimed seq is unverified. 0 means no record verified at all.
+	// FirstVerifiedSeq is the MINIMUM seq among every record whose HMAC verified against a
+	// key in the ring — the oldest retained seq this pass can PROVE, since the seq field is
+	// inside the signature. It equals FirstSeq on a log that passes; a divergence means the
+	// head record's claimed seq is unverified. 0 means no record verified at all.
+	//
+	// Deliberately the minimum over the WHOLE pass, not the seq of the first record classify
+	// encounters: a write-capable attacker with no key can duplicate a genuine, already-signed
+	// higher-seq record to the front of the file, ahead of the genuine lower-seq one — both
+	// verify individually, since neither's content changed. Latching onto file order would
+	// report the duplicate's higher seq as "the oldest provable," overstating how much of the
+	// log's head is missing, in exactly the class of imprecision this field exists to close.
 	FirstVerifiedSeq uint64
 }
 
@@ -858,7 +865,17 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	// --request-id/--since filter narrows what is printed, never what was verified, and an
 	// HMAC-valid record with an unparseable time still proves its seq (it fails the verdict
 	// on the time field, not on the signature).
-	if err == nil && ok && v.res.FirstVerifiedSeq == 0 {
+	//
+	// The MINIMUM over the pass, not the first verified record classify happens to reach: this
+	// runs in FILE order, which a write-capable attacker controls (deletion, duplication,
+	// reordering) even without the signing key, so the file's first verifying record is not
+	// necessarily its lowest-seq one. A genuine seq's HMAC recomputes correctly wherever the
+	// attacker moved the line to, so a duplicated higher-seq record placed ahead of the real
+	// lower-seq one would otherwise latch FirstVerifiedSeq high and understate what the log
+	// actually proves. No record reaching this branch ever carries seq 0 (processLine's
+	// forgedSeq0/unsigned gates keep both the decoy and the (unreachable in practice) genuine
+	// wrap-to-0 shape out of the verified path), so 0 remains a safe "not yet seen" sentinel.
+	if err == nil && ok && (v.res.FirstVerifiedSeq == 0 || rec.Seq < v.res.FirstVerifiedSeq) {
 		v.res.FirstVerifiedSeq = rec.Seq
 	}
 	switch {

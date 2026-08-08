@@ -1007,6 +1007,53 @@ func TestVerifyAuditLog_FirstVerifiedSeqIsNotTheClaimedHeadSeq(t *testing.T) {
 	}
 }
 
+// TestVerifyAuditLog_FirstVerifiedSeqIsTheMinimumNotTheFirstEncountered: FirstVerifiedSeq must
+// be the MINIMUM seq among every record that verifies, not the seq of whichever verifying
+// record classify happens to reach first in file order. A write-capable attacker with no
+// signing key can duplicate a genuine, already-signed HIGHER-seq record to the front of the
+// file, ahead of the genuine LOWER-seq one — both verify individually, since neither's content
+// changed, only their position did. Latching onto file order would report the duplicate's
+// higher seq as "the oldest provable," overstating how much of the log's head is missing.
+func TestVerifyAuditLog_FirstVerifiedSeqIsTheMinimumNotTheFirstEncountered(t *testing.T) {
+	t.Parallel()
+	key := nonZeroTestKey()
+	verifier := &Sink{key: key}
+
+	rec1 := auditRecord{
+		Time: "2026-06-15T10:00:00Z", Seq: 1, RequestID: "r1", SessionID: "s",
+		Decision: "allow", PrevHMAC: auditGenesisPrev,
+	}
+	line1 := signAuditLine(t, key, rec1)
+
+	// A genuine, untouched record from later in the true log (seq 50, real HMAC over its own
+	// content) — not a forgery, just relocated.
+	rec50 := auditRecord{
+		Time: "2026-06-15T10:05:00Z", Seq: 50, RequestID: "r50", SessionID: "s",
+		Decision: "allow", PrevHMAC: "sha256:whatever-preceded-it-originally",
+	}
+	line50 := signAuditLine(t, key, rec50)
+
+	// Attacker (write access, no key) reorders: the seq-50 line first, the genuine seq-1 line
+	// second. Both verify; the reordering itself trips chain breaks (seq 50 is not seq 1, so no
+	// genesis check fires for it, and the seq-1 record's prev_hmac then fails to link to
+	// seq-50's _hmac) — the verdict fails regardless of this fix. What must NOT happen is
+	// FirstVerifiedSeq reporting 50 when a verified seq-1 record is present in the same file.
+	res := verifyBytes(t, [][]byte{line50, line1}, verifier)
+	if res.OK() {
+		t.Fatalf("a reordered stream must fail the verdict on its chain breaks: %+v", res)
+	}
+	if res.FirstVerifiedSeq != 1 {
+		t.Fatalf("FirstVerifiedSeq = %d, want 1 (the minimum verified seq) — reordering must not let a higher-seq record posing as \"first\" hide that a lower seq is independently proven", res.FirstVerifiedSeq)
+	}
+
+	// Order reversed (genuine order, no reordering): the minimum and the first-encountered
+	// coincide, so this must keep passing exactly as before.
+	inOrderRes := verifyBytes(t, [][]byte{line1, line50}, verifier)
+	if inOrderRes.FirstVerifiedSeq != 1 {
+		t.Fatalf("FirstVerifiedSeq = %d, want 1 in genuine file order too", inOrderRes.FirstVerifiedSeq)
+	}
+}
+
 // hmacOf extracts the _hmac a signed line carries, for chaining a follow-on record onto it.
 func hmacOf(t *testing.T, line []byte) string {
 	t.Helper()

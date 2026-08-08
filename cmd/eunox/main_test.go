@@ -392,6 +392,18 @@ func TestParseFlagsAndPositionals(t *testing.T) {
 		// as a stdio command before calling in).
 		{"terminator protects the whole remainder", []string{"--live", "--", "-a.yaml", "-b.yaml"}, true, "", []string{"-a.yaml", "-b.yaml"}},
 		{"terminator with no flags before it", []string{"--", "-a.yaml", "-b.yaml"}, false, "", []string{"-a.yaml", "-b.yaml"}},
+		// A value-needing flag given "--flag value" form consumes the very next token as its
+		// value unconditionally, with no check that it happens to spell "--" — so this "--" is
+		// NOT a terminator. fs.Parse stops at "notaflag" (not flag-shaped), leaving "--live" in
+		// rest; the old, purely positional heuristic swallowed BOTH remaining tokens (leaving
+		// --live unparsed, still false), where the fix must re-loop and pick --live up as a
+		// real flag.
+		{"value-consumed -- is not a terminator", []string{"--upstream-url", "--", "notaflag", "--live"}, true, "--", []string{"notaflag"}},
+		// A boolean flag never consumes a value, so a "--" right after one is still genuine.
+		{"terminator right after a bool flag", []string{"--live", "--", "-x"}, true, "", []string{"-x"}},
+		// "--flag=--" already carries its value via "=", so it consumes no separate token and
+		// the "--" that follows it is a genuine terminator.
+		{"= form does not consume the following --", []string{"--upstream-url=--", "--", "-x"}, false, "--", []string{"-x"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

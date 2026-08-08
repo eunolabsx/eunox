@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -90,6 +91,42 @@ func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 	return logPath, true
 }
 
+// parseAndResolveAuditLog runs the preamble every audit-tape reader shares before it can even
+// locate its log — parseAuditReaderFlags, then resolveAuditReaderLogPath — and translates
+// parseAuditReaderFlags' generic 1 to the caller's own usageExit (audit-verify/suggest/stats
+// each reserve their non-2 codes for a command-specific outcome; see each one's own
+// <name>UsageExit doc). done reports the caller must return exitCode immediately; logPath is
+// valid only when done is false. Stops at path resolution rather than also opening the log,
+// because audit-verify's continuation (key loading, then per-file chain discovery) diverges
+// from suggest/stats' single openAuditChain call immediately after this point.
+func parseAndResolveAuditLog(name string, fs *flag.FlagSet, args []string, configPath, auditLogPath, keyPath *string, usageExit int) (logPath string, exitCode int, done bool) {
+	if code, doneParse := parseAuditReaderFlags(name, fs, args, configPath, auditLogPath, keyPath); doneParse {
+		if code != 0 {
+			return "", usageExit, true
+		}
+		return "", code, true
+	}
+	logPath, ok := resolveAuditReaderLogPath(name, *auditLogPath)
+	if !ok {
+		return "", usageExit, true
+	}
+	return logPath, 0, false
+}
+
+// openAuditChainOrExit runs openAuditChain and folds its error into the caller's own usageExit,
+// printing the (already fully-formatted) error verbatim. Shared by suggest and stats, the two
+// readers that both continue straight into a merged rotated-chain io.Reader; audit-verify does
+// not use this — it needs the discovered chain FILES themselves (audit.LogChainFiles), not a
+// merged reader, to verify per-file rather than stream one concatenated pass.
+func openAuditChainOrExit(name, logPath string, usageExit int) (r io.Reader, closeChain func(), exitCode int, done bool) {
+	r, closeChain, err := openAuditChain(name, logPath)
+	if err != nil {
+		fmt.Fprint(os.Stderr, err.Error())
+		return nil, nil, usageExit, true
+	}
+	return r, closeChain, 0, false
+}
+
 // auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution, or
 // log-read failure. Exit 1 is reserved for a log that fails verification (like validate
 // reserves it for findings), so a cron/CI job can tell tampering from a misconfigured flag.
@@ -128,17 +165,9 @@ Flags:
 	requestID := fs.String("request-id", "", "Report (count and print) only the record with this request ID. Every record\nis still HMAC-verified and the tamper-evident chain is always checked; this\nfilter narrows the report, not the verification.")
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
-	if code, done := parseAuditReaderFlags("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath); done {
-		if code != 0 {
-			// Translate the shared preamble's 1 to this command's own usage exit code;
-			// see auditVerifyUsageExit.
-			return auditVerifyUsageExit
-		}
+	logPath, code, done := parseAndResolveAuditLog("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath, auditVerifyUsageExit)
+	if done {
 		return code
-	}
-	logPath, ok := resolveAuditReaderLogPath("audit-verify", *auditLogPath)
-	if !ok {
-		return auditVerifyUsageExit
 	}
 
 	// Key path resolves: flag (already merged with config) > env var > default.

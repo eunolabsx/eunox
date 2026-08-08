@@ -636,23 +636,13 @@ Flags:
 	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
-	if code, done := parseAuditReaderFlags("suggest", fs, args, configPath, auditLogPath, nil); done {
-		if code != 0 {
-			// Translate the shared preamble's 1 to this command's own usage exit code;
-			// see suggestUsageExit.
-			return suggestUsageExit
-		}
+	logPath, code, done := parseAndResolveAuditLog("suggest", fs, args, configPath, auditLogPath, nil, suggestUsageExit)
+	if done {
 		return code
 	}
-	logPath, ok := resolveAuditReaderLogPath("suggest", *auditLogPath)
-	if !ok {
-		return suggestUsageExit
-	}
-
-	r, closeChain, err := openAuditChain("suggest", logPath)
-	if err != nil {
-		fmt.Fprint(os.Stderr, err.Error())
-		return suggestUsageExit
+	r, closeChain, code, done := openAuditChainOrExit("suggest", logPath, suggestUsageExit)
+	if done {
+		return code
 	}
 	defer closeChain()
 

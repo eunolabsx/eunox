@@ -31,6 +31,13 @@ import (
 // any goroutine (or test) that reads the process-global, which is why several sites that drifted
 // to it were only noticed by a review. Resolving a NIL writer to os.Stderr stays legal — that
 // is what resolvedErrOut/errOut() do — so the scan targets the call, not the mention.
+//
+// Also flags fmt.Fprint*(resolvedErrOut(nil), ...): resolvedErrOut(nil) IS os.Stderr, by its
+// own documented fallback, so spelling it that way at a leaf site (one syntactic hop removed
+// from a bare os.Stderr, and easy to reach for when threading a real parameter through several
+// intermediate callers looks like more work) is behaviorally the exact violation this scan
+// exists to catch, not a legitimate use of the resolver — every genuine caller passes the
+// writer already in scope (a struct field, a parameter), never a literal nil.
 func TestNoDiagnosticWritesStraightToStderr(t *testing.T) {
 	t.Parallel()
 	files, err := filepath.Glob("*.go")
@@ -44,15 +51,71 @@ func TestNoDiagnosticWritesStraightToStderr(t *testing.T) {
 		}
 		f, perr := parser.ParseFile(fset, name, nil, 0)
 		require.NoError(t, perr, name)
-		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok || len(call.Args) == 0 || !isFmtPrintToWriter(call.Fun) || !isOSStderr(call.Args[0]) {
-				return true
-			}
-			t.Errorf("%s: writes a diagnostic straight to os.Stderr; take an io.Writer from the caller and resolve it through resolvedErrOut", fset.Position(call.Pos()))
-			return true
-		})
+		for _, v := range directStderrViolations(fset, f) {
+			t.Error(v)
+		}
 	}
+}
+
+// directStderrViolations walks f (parsed with fset) and returns one message per call this
+// package's discipline forbids. Shared by the real per-file scan above and
+// TestDirectStderrViolations_DetectsBothEscapeShapes below, which proves the two shapes it
+// looks for — a literal os.Stderr and the behaviorally-identical resolvedErrOut(nil) — are
+// actually caught, against a synthetic snippet rather than trusting the real sources to
+// (never) contain either one to exercise the positive case.
+func directStderrViolations(fset *token.FileSet, f *ast.File) []string {
+	var violations []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 || !isFmtPrintToWriter(call.Fun) {
+			return true
+		}
+		arg := call.Args[0]
+		switch {
+		case isOSStderr(arg):
+			violations = append(violations, fmt.Sprintf("%s: writes a diagnostic straight to os.Stderr; take an io.Writer from the caller and resolve it through resolvedErrOut", fset.Position(call.Pos())))
+		case isResolvedErrOutOfNilLiteral(arg):
+			violations = append(violations, fmt.Sprintf("%s: resolvedErrOut(nil) IS os.Stderr — thread the caller's actual writer through instead of spelling the fallback directly", fset.Position(call.Pos())))
+		}
+		return true
+	})
+	return violations
+}
+
+// TestDirectStderrViolations_DetectsBothEscapeShapes proves directStderrViolations actually
+// fires on both forbidden shapes — not just that the real package sources happen to be clean of
+// them, which would pass equally well if the detector were a no-op. A third, legitimate call
+// (a real writer variable) pins the negative case: passing an in-scope writer is never flagged.
+func TestDirectStderrViolations_DetectsBothEscapeShapes(t *testing.T) {
+	t.Parallel()
+	const src = `package transport
+
+import (
+	"fmt"
+	"os"
+)
+
+func direct(w interface{}) {
+	fmt.Fprintf(os.Stderr, "direct: %v\n", w)
+}
+
+func viaResolvedErrOutNil(w interface{}) {
+	fmt.Fprintf(resolvedErrOut(nil), "escaped: %v\n", w)
+}
+
+func legitimate(w interface{ Write([]byte) (int, error) }) {
+	fmt.Fprintf(w, "fine: %v\n", w)
+	fmt.Fprintf(resolvedErrOut(w), "fine too: %v\n", w)
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+	require.NoError(t, err)
+
+	violations := directStderrViolations(fset, f)
+	require.Len(t, violations, 2, "expected exactly the direct os.Stderr call and the resolvedErrOut(nil) call to be flagged: %v", violations)
+	assert.Contains(t, violations[0], "straight to os.Stderr")
+	assert.Contains(t, violations[1], "resolvedErrOut(nil) IS os.Stderr")
 }
 
 // isFmtPrintToWriter reports whether e names one of fmt's writer-taking print functions.
@@ -80,6 +143,23 @@ func isOSStderr(e ast.Expr) bool {
 	}
 	pkg, ok := sel.X.(*ast.Ident)
 	return ok && pkg.Name == "os"
+}
+
+// isResolvedErrOutOfNilLiteral reports whether e is exactly resolvedErrOut(nil) — a call to
+// this package's own nil-writer fallback with a literal nil argument, which always evaluates
+// to os.Stderr. A variable that merely HAPPENS to hold nil at runtime is undecidable from
+// syntax alone and deliberately not the target here; this catches the cheap, direct spelling.
+func isResolvedErrOutOfNilLiteral(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	fn, ok := call.Fun.(*ast.Ident)
+	if !ok || fn.Name != "resolvedErrOut" {
+		return false
+	}
+	arg, ok := call.Args[0].(*ast.Ident)
+	return ok && arg.Name == "nil"
 }
 
 // TestParameterizedDiagnostics_HonorTheCallersWriter drives each helper that receives its
