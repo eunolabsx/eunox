@@ -306,6 +306,50 @@ Section conventions:
 
 ### Changed
 
+- **A refusal's CLASS is derived from its code, and engine faults stop being labelled as
+  policy verdicts.** Whether a deny blocks or is downgraded to an audit-mode forward was
+  decided by three independent things: the denial's code (for the kill switch), a hand-set
+  `HardDeny` bool on every producer, and the route posture. The bool was the weak one — set
+  from prose at each refusal site, and the sites disagreed. `capability.ErrCodeEnforcementError`
+  meanwhile sat reserved and unemitted on the condition path while every engine, backend and
+  plugin fault denied with `CONDITION_FAILED`, the policy-verdict code.
+  `capability.ClassifyDenialCode` now answers which class a code names (policy, revocation,
+  fault) and `DenialInfo.Downgradable()` folds it with the producer's override, so
+  `isObserveDeny` contributes only the posture and the kill-switch conjunct it used to spell
+  out is the same question asked of the same function. Refusals the engine produces because it
+  could not reach a verdict — an unmodelled condition type, a condition with no usable handler,
+  an unwired or failing call counter / flow-label store / session history, a backend answering
+  nonconformingly, a committing handler's unauthorized skip, a failed state commit — now carry
+  `ENFORCEMENT_ERROR` (`-32603`) instead of `CONDITION_FAILED` (`-32003`).
+  **Breaking:** a SIEM rule keyed on `CONDITION_FAILED` no longer sees engine faults, and
+  `eunox suggest` stops mining them as policy denials.
+- **The repaired-handler report names the contract, not only the handler.**
+  `capability.EnforceResponse.HandlerFaults` was a `[]string` of condition types, stamped as
+  `_eunox_handler_fault: ["maxCalls"]`. That is unambiguous exactly while one repairable
+  violation exists, and stops being so the day a second does — with the records already
+  written by then. It is now `[]HandlerFault{Type, Contract}`, with `Contract` drawn from a
+  closed vocabulary, so an operator's alert keys on what broke rather than on whose handler it
+  was. **Breaking:** the detail value becomes
+  `[{"type":"maxCalls","contract":"quota_bucket_under_skip_quota"}]`, and the field's type
+  changes for library embedders.
+- **A `_meta` protocol-revision declaration the upstream leg cannot honor is refused rather
+  than forwarded.** Host params travel verbatim while every outbound request carries eunox's
+  own `MCP-Protocol-Version`, so a host declaring `2026-07-28` in front of a `2025-11-25`
+  upstream did not have a mismatched pair relayed to it — eunox manufactured one, and a
+  first-wins and a last-wins upstream would resolve that request under different method sets.
+  Rewriting the declaration is translation, which the mismatched-pair boundary governs and
+  this release does not implement, so the pair is refused instead:
+  `UNSUPPORTED_PROTOCOL_VERSION` (-32022), recorded, before the upstream is contacted. It
+  applies only to methods whose params actually reach the upstream (a new per-method
+  declaration), so a locally-answered method still admits a declaration and a peer on the
+  newer revision keeps that revision's tables. Because every upstream leg is opened with
+  `initialize`, a host declaring `2026-07-28` cannot have a call forwarded today on any
+  upstream, pinned or not.
+- **`pkg/enforcement` ships benchmarks, and `scripts/bench.sh` covers `pkg/`.** The decision
+  path's cost — per-condition dispatch and its allocation-freeness, the two-pass structure,
+  the anchored-key builders — was measurable only out of tree. Not a CI gate; the numbers now
+  exist and are runnable.
+
 - **`eunox audit-verify` reports the oldest seq a signature PROVES, not the one the head
   record claims.** The chain walk has to adopt an anchor before any signature verdict
   exists, so the oldest-seq value the summary printed was taken from the head record
@@ -1061,6 +1105,36 @@ Section conventions:
   unreachable fail-closed branch is a branch no test can hold to account.
 
 ### Fixed
+
+- **An unknown condition type is no longer forwarded on an observing route.** Three refusals
+  mean "this condition could not be evaluated" and two of them blocked; the third — an unknown
+  condition type — was built without the non-downgradable flag, so on a route running
+  `--audit` (or an `enforcement: audit` constraint) the call was FORWARDED with the restriction
+  never evaluated once, and the observe run reported "would be allowed" for a call enforce mode
+  denies. Not reachable from a loaded manifest (the config loader refuses a token absent from
+  the prototype registry), but reachable from a programmatically built constraint and from a
+  new discriminator whose handler registration was forgotten. It now carries the fault code and
+  blocks with its siblings, and a parity test asserts every discriminator in the prototype
+  registry has a handler in `registerBuiltins`, in both directions — nothing caught that before,
+  since the subsystem-gate test passes for an unregistered token.
+- **`pkg/killswitch` asks one list which Redis clients shard the keyspace.** `shardFanOut` kept
+  its own enumeration of the client types `callcounter.IsShardingClient` already owns — the same
+  drift that fix removed inside one file, moved up a level between packages. It now asks that
+  function for the boolean and keeps only the "which iterator" dispatch, and a sharding shape it
+  has no iterator for is an error both callers propagate rather than a fall-through to the
+  single-node SCAN, which loads a partial kill set and reports healthy. `AdmitAll`'s
+  request-time `CROSSSLOT` backstop matches go-redis' typed sentinel and `HasErrorPrefix`
+  instead of the reply text, so a reformatted or `ERR `-prefixed reply cannot silently stop
+  being recognized.
+- **The sessionless HTTP arms inherit the gate order instead of restating it.** An id-less
+  `initialize` with no session reached neither the shared notification gate nor the dispatcher,
+  so the canonical per-message order was hand-placed there — a fifth copy of an order the
+  codebase declares once. All three HTTP entry points now reach revision negotiation through
+  one helper, the id-less arm routes through `hostNotificationGate` for the rest, and an AST
+  guard fails the build when a new entry point calls the negotiation primitives directly. The
+  one thing that arm answers differently is a fact rather than a reordering: the swallowed set
+  is what the proxy has already handled, and pre-session it has handled nothing, so an
+  emergency stop still records the attempt rather than returning a silent readiness ack.
 
 - **Redis Cluster is refused at the seam instead of denying on the first two-bucket policy.**
   `AdmitAll` is one multi-key `EVAL` whose keys carry distinct window suffixes, so on a sharded
