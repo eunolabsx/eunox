@@ -77,5 +77,5 @@ func IsNilClient(client redis.Cmdable) bool {
 		return true
 	}
 	v := reflect.ValueOf(client)
-	return v.Kind() == reflect.Ptr && v.IsNil()
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
