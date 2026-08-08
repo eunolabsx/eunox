@@ -405,6 +405,13 @@ func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 	}
 }
 
+// wantQuotaSkipFault is the one repairable violation this build can produce: a committing
+// handler derived a quota bucket for a request that authorizes no consumption.
+var wantQuotaSkipFault = capability.HandlerFault{
+	Type:     capability.ConditionTypeMaxCalls,
+	Contract: capability.HandlerContractQuotaUnderSkip,
+}
+
 // nilDenyResultHandler is a custom CommittingConditionHandler whose PrepareCommit
 // supplies a non-nil Deny callback that itself returns nil — the sibling handler bug
 // to nilDenyHandler's nil callback: prepareAndAdmit's guard validated that Deny was a
@@ -625,8 +632,8 @@ func TestCommitDeferredAtomic_MixedSkipAndCommitUnderObserveIsAbsorbed(t *testin
 	if resp.Decision != capability.DecisionAllow {
 		t.Fatalf("decision = %q, want allow (the mixed set consumes nothing, which is the observe posture's whole contract); denial %+v", resp.Decision, resp.Denial)
 	}
-	if got := resp.HandlerFaults; len(got) != 1 || got[0] != capability.ConditionTypeMaxCalls {
-		t.Errorf("HandlerFaults = %v, want [%s]: absorbing the violation must not make it invisible", got, capability.ConditionTypeMaxCalls)
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != wantQuotaSkipFault {
+		t.Errorf("HandlerFaults = %v, want [%+v]: absorbing the violation must not make it invisible, and naming the handler without naming what it broke stops being unambiguous the day a second repairable fault exists", got, wantQuotaSkipFault)
 	}
 	spent, err := counter.Peek(context.Background(), "sentinel-bucket", 3600)
 	if err != nil {
@@ -667,8 +674,8 @@ func TestCommitDeferredAtomic_CommitUnderObserveSpendsNoQuota(t *testing.T) {
 	}
 	// Deduped: two conditions of the same type violated the contract, and the report names the
 	// misbehaving handler once.
-	if got := resp.HandlerFaults; len(got) != 1 || got[0] != capability.ConditionTypeMaxCalls {
-		t.Errorf("HandlerFaults = %v, want [%s]", got, capability.ConditionTypeMaxCalls)
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != wantQuotaSkipFault {
+		t.Errorf("HandlerFaults = %v, want [%+v]", got, wantQuotaSkipFault)
 	}
 	// The substance: the observe run left the budget untouched. An allow that still committed
 	// would satisfy every assertion above and drain the quota anyway.
@@ -709,8 +716,8 @@ func TestCommitDeferredAtomic_AbsorbedFaultYieldsToARealVerdict(t *testing.T) {
 	// The verdict is the later condition's, and the fault is still reported: on this posture
 	// the deny is downgraded and FORWARDED, so a report that rode the allow alone would go
 	// missing for exactly the constraints whose second condition denies.
-	if got := resp.HandlerFaults; len(got) != 1 || got[0] != capability.ConditionTypeMaxCalls {
-		t.Errorf("HandlerFaults = %v, want [%s] on the deny too", got, capability.ConditionTypeMaxCalls)
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != wantQuotaSkipFault {
+		t.Errorf("HandlerFaults = %v, want [%+v] on the deny too", got, wantQuotaSkipFault)
 	}
 }
 

@@ -393,11 +393,23 @@ func declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interfac
 // contract violation, or nil for the healthy call every deployment makes. The engine decided
 // the call as if the handler had conformed (see capability.EnforceResponse.HandlerFaults), so
 // the record is the only place the plugin bug is reported at all.
+//
+// Rendered into the plain map/slice shapes the audit layer's value bounder recurses into
+// rather than handed over as the typed slice: that bounder clones and caps what it recognizes
+// and passes anything else through untouched, so a typed value would ride the tape neither
+// bounded nor detached from the decision that produced it.
 func handlerFaultDetail(dec capability.EnforceResponse) map[string]interface{} {
 	if len(dec.HandlerFaults) == 0 {
 		return nil
 	}
-	return map[string]interface{}{audit.HandlerFaultKey: dec.HandlerFaults}
+	faults := make([]interface{}, 0, len(dec.HandlerFaults))
+	for _, f := range dec.HandlerFaults {
+		faults = append(faults, map[string]interface{}{
+			"type":     f.Type,
+			"contract": string(f.Contract),
+		})
+	}
+	return map[string]interface{}{audit.HandlerFaultKey: faults}
 }
 
 // decisionDetail is the annotation set EVERY record derived from a decision carries — the

@@ -578,8 +578,11 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 		assert.True(t, called, "a wiretap route must not be turned into an outage by a plugin bug")
 		require.Len(t, rec.records, 1)
 		assert.Equal(t, "allow", rec.records[0].decision)
-		assert.Equal(t, []string{capability.ConditionTypeMaxCalls}, rec.records[0].details[audit.HandlerFaultKey],
-			"absorbing the fault must not hide it: the operator learns from the record")
+		assert.Equal(t, []interface{}{map[string]interface{}{
+			"type":     capability.ConditionTypeMaxCalls,
+			"contract": string(capability.HandlerContractQuotaUnderSkip),
+		}}, rec.records[0].details[audit.HandlerFaultKey],
+			"absorbing the fault must not hide it: the record names the handler AND the contract it broke")
 		assert.True(t, audit.IsReservedDetailKey(audit.HandlerFaultKey),
 			"an unreserved key would be mined by `eunox suggest` as a caller-supplied tool argument")
 	})

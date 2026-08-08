@@ -162,8 +162,35 @@ type EnforceResponse struct {
 	//
 	// Nil on every call in a healthy deployment. In-process only (json:"-"), like the two
 	// fields above.
-	HandlerFaults []string `json:"-"`
+	HandlerFaults []HandlerFault `json:"-"`
 }
+
+// HandlerFault names one repaired violation: WHICH registered handler misbehaved, and WHICH
+// contract it broke. Both, because the second is what an operator acts on — a report naming
+// only the condition type is unambiguous exactly while one repairable violation exists, and
+// stops being so the day a second does, with the records already written by then.
+//
+// The asymmetry it removes: the refused half of the same contract produces a full
+// *ConditionError (code, condition type, and a message naming the violated contract) while the
+// repaired half appended a bare string. Two halves of one contract, two data shapes.
+type HandlerFault struct {
+	// Type is the condition discriminator whose registered handler broke the contract.
+	Type string `json:"type"`
+	// Contract names what it broke, from the closed set below rather than as prose: this
+	// value is what an operator's alert keys on.
+	Contract HandlerContract `json:"contract"`
+}
+
+// HandlerContract is the closed vocabulary of engine contracts a registered handler can break
+// in a direction the engine REPAIRS. A violation the engine cannot repair is a denial with its
+// own code and message, never an entry here — see [EnforceResponse.HandlerFaults].
+type HandlerContract string
+
+// HandlerContractQuotaUnderSkip is the one repairable violation this build has: a committing
+// handler derived a quota bucket for a request whose context authorized no consumption
+// (observe mode). The engine drops the bucket, which is the outcome a conforming handler
+// produces for that posture.
+const HandlerContractQuotaUnderSkip HandlerContract = "quota_bucket_under_skip_quota"
 
 // Decision identifies the enforcement outcome.
 type Decision string

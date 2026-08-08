@@ -893,7 +893,7 @@ func isTypedNil(v interface{}) bool {
 //
 // Buckets may MIX accountings (a maxCalls count beside a cumulative blastRadius magnitude)
 // since the backend admits them together; the engine has no compatibility table to maintain.
-func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []deferredCondition, requestID, now string) (faults []string, deny *capability.EnforceResponse) {
+func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []deferredCondition, requestID, now string) (faults []capability.HandlerFault, deny *capability.EnforceResponse) {
 	var (
 		buckets []capability.QuotaBucket
 		denies  []func(total float64, retryAfter time.Duration) *ConditionError
@@ -940,10 +940,11 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.E
 			//
 			// The loop still prepares EVERY remaining condition: a later one's condErr is a real
 			// verdict and must win over this report, or an observe run would allow where enforce
-			// denies. Deduped by type, since the report names the misbehaving handler and a
-			// constraint may carry it twice.
-			if !slices.Contains(faults, condType) {
-				faults = append(faults, condType)
+			// denies. Deduped whole, since the report names the misbehaving handler AND what it
+			// broke, and a constraint may carry the same condition twice.
+			fault := capability.HandlerFault{Type: condType, Contract: capability.HandlerContractQuotaUnderSkip}
+			if !slices.Contains(faults, fault) {
+				faults = append(faults, fault)
 			}
 			continue
 		}
