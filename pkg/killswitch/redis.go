@@ -281,7 +281,8 @@ func WithFailOpen(failOpen bool) RedisOption {
 // A nil client (including a typed nil in a non-nil interface) does not fail here, because this
 // signature returns no error and a caller that ignored one would keep the panic either way.
 // It latches ErrNilClient instead, which every reader and writer reports and which fails closed
-// — the strongest posture available without the caller's cooperation.
+// — the strongest posture available without the caller's cooperation. A DECORATOR wrapping a nil
+// client is not caught; see redisutil.IsNilClient's scope for why it is not probed for.
 func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 	r := &Redis{
 		client:            client,

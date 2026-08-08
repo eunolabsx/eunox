@@ -1081,6 +1081,7 @@ func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMs
 		sessionID:     s.id,
 		writeUpstream: func(m mcp.RPCMsg) { _ = s.upWriter.Write(m) },
 		handle:        func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
+		revision:      s.hostRev,
 	})
 }
 

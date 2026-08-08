@@ -35,16 +35,6 @@ func unknownRevisionCall(id string) mcp.RPCMsg {
 	}
 }
 
-// encodeMsg renders a message as the single JSON line serveHostLines feeds the host reader.
-func encodeMsg(t *testing.T, msg mcp.RPCMsg) string {
-	t.Helper()
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("marshalling host message: %v", err)
-	}
-	return string(raw)
-}
-
 // TestGateOrder_RevisionRefusalPrecedesKillOnStdio pins the exception the ordering costs, on
 // the transport whose prologue places it: a revoked session's bad-version probe is recorded
 // as UNSUPPORTED_PROTOCOL_VERSION, not KILL_SWITCH. Driven through the real serve loop, so
@@ -59,13 +49,13 @@ func TestGateOrder_RevisionRefusalPrecedesKillOnStdio(t *testing.T) {
 		t.Fatalf("KillSession: %v", err)
 	}
 	sink, logPath := newTempAuditSink(t)
-	serveHostLines(t, stdioServe{
+	serveHostMessages(t, stdioServe{
 		pdp:       newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sessionID: "killed-sess",
 		sink:      sink,
 	},
-		encodeMsg(t, unknownRevisionCall(`1`)),
-		encodeMsg(t, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: methodPing}),
+		unknownRevisionCall(`1`),
+		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: methodPing},
 	)
 	_ = sink.Close()
 
@@ -644,8 +634,7 @@ func TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor(t *testing.T) {
 			if !isFunc || fn.Body == nil {
 				continue
 			}
-			recordDispositionArities(fn, arities)
-			sites := hostMessageDispositionSites(fn)
+			sites := hostMessageDispositionSites(fn, arities)
 			if len(sites) == 0 {
 				continue
 			}
@@ -702,26 +691,6 @@ func TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor(t *testing.T) {
 	}
 }
 
-// recordDispositionArities tallies, per guarded sink name, how many calls were seen at each
-// argument count — the evidence the arity assertion above reports when a signature has moved.
-func recordDispositionArities(fn *ast.FuncDecl, into map[string]map[int]int) {
-	ast.Inspect(fn, func(n ast.Node) bool {
-		call, isCall := n.(*ast.CallExpr)
-		if !isCall {
-			return true
-		}
-		name := callName(call)
-		if _, guarded := hostMessageDispositions[name]; !guarded {
-			return true
-		}
-		if into[name] == nil {
-			into[name] = map[int]int{}
-		}
-		into[name][len(call.Args)]++
-		return true
-	})
-}
-
 // totalCalls sums an arity tally, so a failure can say how many sites the name still has.
 func totalCalls(byArity map[int]int) int {
 	total := 0
@@ -733,15 +702,31 @@ func totalCalls(byArity map[int]int) int {
 
 // hostMessageDispositionSites returns every call in fn that disposes of a host message, matched
 // by name AND argument count — two of the names are shared with unrelated helpers (a rate
-// limiter's admit takes none or one argument; the notification gate's takes two).
-func hostMessageDispositionSites(fn *ast.FuncDecl) []*ast.CallExpr {
+// limiter's admit takes none or one argument; the notification gate's takes two) — and tallies
+// every call it matched BY NAME, per arity, into arities.
+//
+// One walk for both, because they are one matcher: the tally is the evidence the arity
+// assertion reports when a signature has moved, so a site matcher tightened without the tally
+// following it would report counts for calls the real guard never inspects — the fail-open
+// direction that assertion was added to close. As two passes over the same nodes they could
+// drift; as one they cannot.
+func hostMessageDispositionSites(fn *ast.FuncDecl, arities map[string]map[int]int) []*ast.CallExpr {
 	var sites []*ast.CallExpr
 	ast.Inspect(fn, func(n ast.Node) bool {
 		call, isCall := n.(*ast.CallExpr)
 		if !isCall {
 			return true
 		}
-		if want, guarded := hostMessageDispositions[callName(call)]; guarded && len(call.Args) == want {
+		name := callName(call)
+		want, guarded := hostMessageDispositions[name]
+		if !guarded {
+			return true
+		}
+		if arities[name] == nil {
+			arities[name] = map[int]int{}
+		}
+		arities[name][len(call.Args)]++
+		if len(call.Args) == want {
 			sites = append(sites, call)
 		}
 		return true

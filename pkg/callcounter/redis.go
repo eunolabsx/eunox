@@ -126,7 +126,8 @@ func NewRedis(client redis.Cmdable, opts ...redisOption) (*Redis, error) {
 	// A nil client — including a typed nil inside a non-nil interface — is refused at the seam
 	// rather than at the first command: go-redis dereferences the receiver before it can build a
 	// reply, so every command panics instead of returning the error a counter's callers fail
-	// closed on.
+	// closed on. A DECORATOR wrapping a nil client is not caught here; see IsNilClient's scope
+	// for why probing for it would refuse working wrappers.
 	if redisutil.IsNilClient(client) {
 		return nil, fmt.Errorf("callcounter: nil Redis client (got %T)", client)
 	}

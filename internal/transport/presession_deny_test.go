@@ -587,7 +587,7 @@ func TestRevisionRefusals_RollUpSuppressedCounts(t *testing.T) {
 
 	refuse := func() {
 		msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call"}
-		resp := refuseHostRevision(context.Background(), proxy.revisionRefusalRecorder(route), "", msg,
+		resp := refuseHostRevision(context.Background(), proxy.revisionRefusalRecorder(route), "", "", msg,
 			errRevisionMismatch)
 		// Every one is REFUSED on the wire — the bound elides records, never enforcement.
 		if resp.Error == nil {

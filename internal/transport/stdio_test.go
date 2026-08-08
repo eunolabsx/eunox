@@ -1081,18 +1081,11 @@ func closedUpstream(t *testing.T) (*StdioProxy, *mockHostWriter) {
 // that echo back a static response for each upstream request.
 func respondingProxy(t *testing.T, resp mcp.RPCMsg) (*StdioProxy, *mockHostWriter) {
 	t.Helper()
-	hw := &mockHostWriter{}
-
 	upR, upW := io.Pipe() // proxy writes requests here; goroutine reads
-	done := make(chan struct{})
-
-	p := &StdioProxy{
-		pdp:          pdp.AlwaysAllowPDP{},
-		sessionID:    "unit-test-sess",
-		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
-		upWriter:     mcp.NewMsgWriter(upW),
-		upstreamDone: done,
-	}
+	// The shared fixture, for the reason its own doc gives: a literal here omitted upstreamRev,
+	// so every test on it ran against a proxy with no upstream leg and skipped the honorability
+	// gate entirely.
+	p, hw := newStdioProxy(stdioServe{sessionID: "unit-test-sess", upSink: mcp.NewMsgWriter(upW)}, strings.NewReader(""))
 
 	// Goroutine: read the request from upR, push canned response into pending.
 	go func() {

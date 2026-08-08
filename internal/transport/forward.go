@@ -128,6 +128,39 @@ func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.E
 	return denialResult(id, denial.Code, denial.ConditionType, method, "")
 }
 
+// Fixed labels for the two host framings that carry no method of their own. An empty method
+// field names nothing an operator can correlate on, and deriveTargetFields collapses a record
+// with no method to no target fields at all.
+const (
+	methodLabelServerResponse = "server-response"
+	// methodLabelUnframed covers a message that is neither request, notification nor response
+	// (no id AND no method). Both serve loops discard it, but a gate ahead of that discard can
+	// still record one.
+	methodLabelUnframed = "unframed-message"
+)
+
+// auditIdentity names a message on the tape for a refusal taken with no policy decision behind
+// it: the identifier such a record may honestly claim, and the method field beside it.
+//
+// ONE answer for every such refusal, because the two halves are one question. The identifier is
+// dropped for a method that RESOLVES a target type — the sink derives target_type/target from
+// it, so recording `resources/subscribe` stamps a resource literally named after the method
+// onto the signed tape, and a notification-framed `tools/list` stamps a tool. It survives only
+// where it fabricates nothing, which is also the only case it is the sole place the name
+// reaches an operator.
+func auditIdentity(msg mcp.RPCMsg) (identifier, method string) {
+	switch {
+	case msg.IsResponse():
+		return methodLabelServerResponse, methodLabelServerResponse
+	case msg.Method == "":
+		return methodLabelUnframed, methodLabelUnframed
+	}
+	if _, resolvesTarget := capability.MethodTargetType(msg.Method); resolvesTarget {
+		return "", msg.Method
+	}
+	return msg.Method, msg.Method
+}
+
 // killDropLeg identifies the transport leg a recordKillDrop call site drops a message on,
 // stamped into the audit detail so an operator can distinguish drop sites during an incident.
 // A typed enum (not a bare string at each of the 8 call sites) makes a typo'd leg a compile
@@ -936,8 +969,11 @@ type serverRequestParams struct {
 	// request to read one from, so each transport supplies the fact and forwardServerRequest
 	// stamps it — a new server-initiated entry point inherits the stamp rather than needing it
 	// re-placed, which is how this leg came to record every sampling decision on a negotiated
-	// session as though no revision had been resolved. Empty means the host has not negotiated
-	// yet, and stays absent on the record: that IS the honest reading.
+	// session as though no revision had been resolved.
+	//
+	// Empty means the host context has not PINNED one, which is NOT "none was resolved" — a
+	// message can resolve a revision, be recorded under it, and still not pin because the proxy
+	// discarded it. So it is resolved through resolveRevision rather than left absent.
 	revision      capability.Revision
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
@@ -1150,10 +1186,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	}
 	// Stamped here for the same reason the claims are: both branches record, and a stamp
 	// placed in one transport's caller is a stamp the other transport (or the next entry
-	// point) can be written without.
-	if fp.revision != "" {
-		ctx = capability.WithProtocolRevision(ctx, fp.revision)
-	}
+	// point) can be written without. Unconditional: an absent protocol_revision is reserved for
+	// a record written before any revision could be resolved, and this leg only runs on a
+	// session whose upstream handshake is complete.
+	ctx = capability.WithProtocolRevision(ctx, resolveRevision(fp.revision))
 	if msg.Method != samplingMethod {
 		if deny := fp.pdp.CheckKill(ctx, fp.sessionID); deny != nil {
 			denial := normalizeDenial(deny.Denial)

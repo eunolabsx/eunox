@@ -43,6 +43,12 @@ type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *re
 // the switch inherits it instead of needing its author to remember. It makes the returned
 // iterator callable whenever it is non-nil; it does not make the client usable — see
 // IsNilClient for the half that does.
+//
+// A DECORATOR is matched on its own concrete type, so one wrapping a sharding client reports
+// "not sharding" and its caller enumerates a single server. For the kill switch that is a
+// PARTIAL kill set served as complete, not a loud failure — the cost of matching concrete types
+// rather than proving topology, and the reason a consumer wrapping a cluster client must pass
+// the client itself.
 func ShardIterator(client redis.Cmdable) ShardFanOut {
 	if IsNilClient(client) {
 		return nil
@@ -58,7 +64,7 @@ func ShardIterator(client redis.Cmdable) ShardFanOut {
 	return nil
 }
 
-// IsNilClient reports whether client is nil — as an interface, or as a typed nil pointer inside
+// IsNilClient reports whether client IS nil — the interface itself, or a typed nil value inside
 // a non-nil interface.
 //
 // A backend that must fail closed has to ask, because go-redis answers a nil receiver with a
@@ -69,12 +75,31 @@ func ShardIterator(client redis.Cmdable) ShardFanOut {
 // produce nor an outcome an operator can act on.
 //
 // Reflection rather than a type switch on purpose: a second list of client types is exactly
-// what ShardIterator exists to prevent, and this question is answered identically for every
-// pointer-shaped client, including one go-redis has not added yet.
+// what ShardIterator exists to prevent, and nilness is one question for every client, including
+// one go-redis has not added yet.
+//
+// It answers for a client that is itself nil, NOT for a decorator WRAPPING one — `hooked{nil}`
+// is a non-nil struct under every kind. Reflecting into the embedded field would refuse the
+// wrappers that legitimately forward elsewhere, and probing with a command puts a network round
+// trip in a constructor that performs none; a false refusal at construction is the worse of the
+// two failures, so the gap is accepted.
 func IsNilClient(client redis.Cmdable) bool {
-	if client == nil {
-		return true
+	return client == nil || isNilValue(client)
+}
+
+// isNilValue reports whether v's DYNAMIC value is a nil of a kind that can be one.
+//
+// Split out from IsNilClient because it is the half with no go-redis in it: every client type
+// eunox meets is pointer-shaped, so the other kinds are unconstructible as a redis.Cmdable and
+// only reachable — and therefore only testable — through this signature.
+func isNilValue(v any) bool {
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	// The kinds reflect's own IsNil is defined on, minus Interface (ValueOf unwraps the
+	// interface, so a dynamic value never has that kind). IsNil PANICS on any other kind, which
+	// is why they are named rather than tried: the guard must not become the crash it prevents.
+	case reflect.Pointer, reflect.Map, reflect.Func, reflect.Slice, reflect.Chan, reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		return false
 	}
-	v := reflect.ValueOf(client)
-	return v.Kind() == reflect.Pointer && v.IsNil()
 }

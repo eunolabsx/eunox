@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // maxConcurrentServerRequests bounds the in-flight handler goroutines an upstream reader
@@ -82,6 +83,11 @@ type serverRequestDispatch struct {
 	writeUpstream func(mcp.RPCMsg)
 	// handle is the server-initiated request's handler, run on its own goroutine.
 	handle func(context.Context, mcp.RPCMsg)
+	// revision is the session's negotiated host revision, stamped onto ctx BEFORE the admission
+	// gate. The handler's own leg stamps it too, but the saturation refusal returns above that,
+	// so without this an established session's refusals recorded no revision at all — which on
+	// this tape means "written before one could be resolved".
+	revision capability.Revision
 }
 
 // dispatch runs d.handle for msg on its own goroutine, or refuses msg when the pool is at
@@ -92,6 +98,7 @@ type serverRequestDispatch struct {
 // leg leaves a trace on the tamper-evident tape rather than only a stream of error replies.
 func (p *serverRequestPool) dispatch(ctx context.Context, msg mcp.RPCMsg, d serverRequestDispatch) {
 	p.semOnce.Do(func() { p.sem = make(chan struct{}, maxConcurrentServerRequests) })
+	ctx = capability.WithProtocolRevision(ctx, resolveRevision(d.revision))
 	select {
 	case p.sem <- struct{}{}:
 		// A free slot means any saturation episode is over: re-arm the gate so the next

@@ -1902,6 +1902,37 @@ const EffectReceiptKey = "_eunox_effect_receipt"
 // mines as argument names.
 const HandlerFaultKey = "_eunox_handler_fault"
 
+// UnroutableKey is the reserved detail key the transport merges into the DENY record for a
+// message no revision's routing table holds a handler for — the fail-closed default, in either
+// framing. Its value is a {"reason", "revision"} object: which of the three ways the message was
+// unroutable, and the revision whose tables were consulted.
+//
+// It exists because that refusal is recorded as AUTHORIZATION_FAILED, a genuine POLICY code,
+// for a message no policy ever evaluated. On an enforcing route the two are otherwise
+// indistinguishable on the tape; on an --audit wiretap, where policy denies nothing at all,
+// every one of them is this — and a discovery run whose whole purpose is observing the upstream
+// needs its own refusals legible as its own. Reserved-prefixed for EffectReceiptKey's reason.
+const UnroutableKey = "_eunox_unroutable"
+
+// Reason codes for the UnroutableKey marker, matched by SIEM rules rather than parsed from
+// prose (see the TruncatedKey codes below for the same argument).
+const (
+	// UnroutableUnknownMethod: this build dispatches the method under NO revision. That covers
+	// a method nobody has heard of AND one the peer's revision mandates that this build has not
+	// implemented yet, which it cannot tell apart without a second list of spec methods to keep
+	// in step with the first.
+	UnroutableUnknownMethod = "unknown_method"
+	// UnroutableRemovedInRevision: this build dispatches the method under SOME revision, but not
+	// the one the requesting peer negotiated. Routed identically to an unknown method on
+	// purpose — removal is expressed by absence — so this field is the only place the
+	// difference survives for an operator.
+	UnroutableRemovedInRevision = "removed_in_revision"
+	// UnroutableFramingUnmapped: the method exists in the peer's revision, but not in the
+	// framing it arrived in — an enforced method sent as a notification is refused separately,
+	// so this is the notification-only method that arrived as a request, and its inverse.
+	UnroutableFramingUnmapped = "framing_unmapped"
+)
+
 // The four declassification detail keys. They report the facts a declassification's
 // top-level signed fields (labels_cleared / approver / approval_id) deliberately cannot:
 // those three appear together and ONLY when a clear actually changed the session's labels,
@@ -2009,6 +2040,7 @@ var reservedDetailKeys = map[string]bool{
 	UpstreamErrorCodeKey:        true,
 	EffectReceiptKey:            true,
 	HandlerFaultKey:             true,
+	UnroutableKey:               true,
 	DeclassifySpentApprovalKey:  true,
 	DeclassifyNotAppliedKey:     true,
 	DeclassifyCommitFailedKey:   true,
@@ -2216,7 +2248,15 @@ func deriveTargetFields(method, identifier string) (mcpMethod, targetType, targe
 		// pre-dispatch denials.
 		return BoundEnvelopeField(method), "", ""
 	}
-	return method, string(tt), BoundEnvelopeField(bareTargetName(tt, identifier))
+	target = BoundEnvelopeField(bareTargetName(tt, identifier))
+	if target == "" {
+		// A refusal taken with no policy decision behind it passes no identifier — a routing
+		// refusal, a saturation refusal, a revision refusal. Emitting the METHOD's target type
+		// beside no target at all asserts half a policy target for a call nothing matched, and
+		// the method field already says which method it was.
+		return method, "", ""
+	}
+	return method, string(tt), target
 }
 
 // auditEnvelopeFieldCap bounds attacker-controlled envelope string fields (Target

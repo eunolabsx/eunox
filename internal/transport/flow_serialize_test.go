@@ -104,8 +104,8 @@ func (d *delayedAddStore) Clear(ctx context.Context, sessionKey string) error {
 // (read_secret -> labelOutput confidential) and a flow sink (send_email -> flowLabel
 // allowing only public), with per-session decision serialization ON and a mock upstream
 // that answers whatever is forwarded to it. Responses to the host are captured in hw.
-// closeUp tears the responder down.
-func newSerializedFlowProxy(t *testing.T, store capability.FlowLabelStore, sessionID string) (p *StdioProxy, hw *mockHostWriter, closeUp func()) {
+// closeUp tears the responder down; hostReader supplies the host's stdin.
+func newSerializedFlowProxy(t *testing.T, store capability.FlowLabelStore, sessionID string, hostReader io.Reader) (p *StdioProxy, hw *mockHostWriter, closeUp func()) {
 	t.Helper()
 	caps := []capability.Constraint{
 		{Target: "tool:read_secret", Actions: []string{"call"},
@@ -116,18 +116,15 @@ func newSerializedFlowProxy(t *testing.T, store capability.FlowLabelStore, sessi
 	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(store))
 	dp := pdp.NewManifestPDP(caps, engine, killswitch.NewInMemory())
 
-	hw = &mockHostWriter{}
 	upR, upW := io.Pipe()
-	p = &StdioProxy{
-		pdp:          dp,
-		sessionID:    sessionID,
-		decideGate:   newDecisionSerializer(), // per-session decision serialization ON
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostToUp:     make(map[string]*json.RawMessage),
-		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
-		upWriter:     mcp.NewMsgWriter(upW),
-		upstreamDone: make(chan struct{}),
-	}
+	// The shared fixture, so this scaffold inherits every field Start actually sets — upstreamRev
+	// above all, whose omission puts the proxy in a state production never builds.
+	p, hw = newStdioProxy(stdioServe{
+		pdp:        dp,
+		sessionID:  sessionID,
+		decideGate: newDecisionSerializer(), // per-session decision serialization ON
+		upSink:     mcp.NewMsgWriter(upW),
+	}, hostReader)
 	// Mock upstream: read each forwarded request and push a canned result back to the
 	// waiting handler (keyed by the nonce the proxy put on the wire).
 	go func() {
@@ -188,8 +185,7 @@ func TestFlowSerialize_ConcurrentEgressDeniedEveryTime(t *testing.T) {
 			// with serialization removed, every run's egress is wrongly allowed.)
 			store := &delayedAddStore{inner: be.store(t), delay: 20 * time.Millisecond}
 			for i := 0; i < runs; i++ {
-				p, hw, closeUp := newSerializedFlowProxy(t, store, fmt.Sprintf("sess-%d", i))
-				p.hostReader = mcp.NewMsgReader(strings.NewReader(input))
+				p, hw, closeUp := newSerializedFlowProxy(t, store, fmt.Sprintf("sess-%d", i), strings.NewReader(input))
 
 				ctx, cancel := context.WithCancel(context.Background())
 				done := make(chan struct{})

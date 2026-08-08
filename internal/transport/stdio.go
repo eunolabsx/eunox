@@ -1072,14 +1072,17 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 			// A response from the host to a server-initiated request the proxy
 			// forwarded (e.g. the LLM result for sampling/createMessage). Route it back
 			// to the waiting upstream; an untracked ID is ignored.
+			//
+			// Written VERBATIM, `_meta` included — which is why negotiation above has to reach
+			// this framing (paramsReachUpstream): these bytes are the one class that travels to
+			// the upstream with no dispatch decision behind it.
 			if p.serverReqs.take(mcp.MsgKey(msg.ID)) {
 				// A kill landing after the request was forwarded but before the host's reply
 				// arrives must not deliver that reply to a killed session's upstream; a kill
 				// does not tear the upstream down, so the blocked request is simply left
 				// unanswered and reclaimed on teardown.
 				if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-					// A response carries no method, so use a fixed identifier for the record.
-					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), "server-response", "server-response", legStdioServerResponse)
+					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), methodLabelServerResponse, methodLabelServerResponse, legStdioServerResponse)
 				} else {
 					_ = p.upWriter.Write(msg)
 				}
@@ -1215,15 +1218,19 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
 // serveHost, the single goroutine that owns the pin.
 func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (context.Context, bool) {
-	rev, err := resolveHostRevision(p.hostRevision(), p.upstreamRev, msg)
+	pinned := p.hostRevision()
+	rev, err := resolveHostRevision(pinned, p.upstreamRev, msg)
 	if err != nil {
-		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, msg, err)
+		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, pinned, msg, err)
 		if msg.IsRequest() {
 			_ = p.hostWriter.Write(resp)
 		}
 		return ctx, false
 	}
-	if dispatchesMessage(rev, msg) {
+	// Guarded on the pin being UNSET. It is write-once by construction — resolveHostRevision
+	// above returns early unless rev equals the pinned value — so re-answering the predicate and
+	// re-Storing costs a runtime.convTstring boxing per host message for no effect.
+	if pinned == "" && dispatchesMessage(rev, msg) {
 		p.hostRev.Store(rev)
 	}
 	return capability.WithProtocolRevision(ctx, rev), true
@@ -1283,6 +1290,7 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 		sessionID:     p.sessionID,
 		writeUpstream: func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
 		handle:        p.handleUpstreamRequest,
+		revision:      p.hostRevision(),
 	})
 }
 
@@ -1305,9 +1313,10 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		rec:       p.rec(),
 		audit:     p.audit,
 		sessionID: p.sessionID,
-		// The host context's revision is known here, so this leg's records must name it too —
-		// an absent field is reserved for a record written before any revision was resolved.
-		// forwardServerRequest does the stamping; this supplies the fact.
+		// The raw PIN, not a resolution of it: forwardServerRequest resolves the empty carrier
+		// the one way requestRevision does, so a connection that has resolved a revision but not
+		// pinned one (a message the proxy discarded) records the surface it is routed by rather
+		// than claiming nothing was ever negotiated. This supplies the fact; that leg stamps it.
 		revision:         p.hostRevision(),
 		forward:          func(m mcp.RPCMsg) bool { p.forwardServerRequestToHost(m); return true },
 		writeUpstream:    func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },

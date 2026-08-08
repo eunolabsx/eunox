@@ -1637,6 +1637,30 @@ func TestPrintProxyUsage(t *testing.T) {
 	}
 }
 
+// TestPrintProxyUsage_WiretapClaimIsHonest pins the help text against what --audit actually
+// does. It used to say "nothing is blocked", which was false in three ways an operator only
+// discovers by reading a discovery run's tape: the kill switch hard-blocks, so does a method
+// eunox cannot dispatch, and so does a revision it cannot establish (observe mode downgrades a
+// POLICY verdict, and none of the three has one).
+//
+// The marker key is asserted against the PRODUCER's constant, so a rename there fails here
+// rather than leaving the help pointing at a field the tape no longer carries — and the text
+// must name it only for the class that CARRIES it, since the revision refusal records no
+// details at all.
+func TestPrintProxyUsage_WiretapClaimIsHonest(t *testing.T) {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	out := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
+
+	if strings.Contains(out, "nothing is blocked") {
+		t.Errorf("the --audit help still claims nothing is blocked:\n%s", out)
+	}
+	for _, want := range []string{"kill switch", "cannot dispatch", "UNSUPPORTED_PROTOCOL_VERSION", audit.UnroutableKey} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the --audit help does not mention %q, so what still refuses is discoverable only from the tape:\n%s", want, out)
+		}
+	}
+}
+
 // ───────────────────────── buildCallCounterAndKillSwitch ───────────────────
 
 func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
