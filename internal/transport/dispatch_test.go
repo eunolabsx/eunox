@@ -533,10 +533,9 @@ func TestAdv5_NewMethod_AuditRecordWritten(t *testing.T) {
 // the HTTP transport, so both transports satisfy the Adv-5 audit invariant.
 func TestAdv5_NewMethod_Stdio_AuditRecordWritten(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
-	proxy, hostW, _ := newTestStdioProxy(t, pdp.AlwaysAllowPDP{}, sink)
+	proxy, _ := newTestStdioProxy(t, stdioServe{sink: sink})
 
 	proxy.handleHostRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`503`), Method: "tools/execute"})
-	_ = hostW.Close()
 	_ = sink.Close()
 
 	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), "tools/execute", "deny")
@@ -749,7 +748,7 @@ func TestAdv7_NotificationFramedEnforcedMethod_AuditRecordWritten(t *testing.T) 
 // transports satisfy the Adv-7 audit invariant.
 func TestAdv7_NotificationFramedEnforcedMethod_Stdio_AuditRecordWritten(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
-	proxy, _, _ := newTestStdioProxy(t, pdp.AlwaysAllowPDP{}, sink)
+	proxy, _ := newTestStdioProxy(t, stdioServe{sink: sink})
 
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "tools/call", Params: json.RawMessage(`{"name":"read_file","arguments":{}}`)}
 	_ = proxy.forwardHostNotification(context.Background(), msg)
@@ -948,41 +947,11 @@ func TestUnmappedMethod_HTTP_KnownMethodsUnaffected(t *testing.T) {
 	assert.Nil(t, result.Error, "tools/list must not be denied; got error: %v", result.Error)
 }
 
-// newTestStdioProxy wires a StdioProxy through in-process pipes so tests can
-// exercise handleHostRequest without a live upstream subprocess. The returned
-// channel receives each rpcMsg the proxy writes back to the host (buffered 8).
-// Close hostW to signal EOF; the background reader goroutine exits on error.
-func newTestStdioProxy(t *testing.T, dp pdp.PolicyDecisionPoint, sink *audit.Sink) (proxy *StdioProxy, hostW *io.PipeWriter, responses <-chan mcp.RPCMsg) {
-	t.Helper()
-	hostR, hostW := io.Pipe()
-	p := &StdioProxy{
-		pdp:        dp,
-		sessionID:  "test-sess",
-		hostWriter: mcp.NewMsgWriter(hostW),
-		sink:       sink,
-	}
-	ch := make(chan mcp.RPCMsg, 8)
-	go func() {
-		reader := mcp.NewMsgReader(hostR)
-		for {
-			msg, err := reader.Read()
-			if err != nil {
-				return
-			}
-			select {
-			case ch <- msg:
-			default:
-			}
-		}
-	}()
-	return p, hostW, ch
-}
-
 // TestUnmappedMethod_Stdio_Denied verifies that the stdio proxy denies
 // an unknown method with AUTHORIZATION_FAILED and writes a denial back to the
 // host instead of forwarding to upstream.
 func TestUnmappedMethod_Stdio_Denied(t *testing.T) {
-	proxy, hostW, responses := newTestStdioProxy(t, pdp.AlwaysAllowPDP{}, nil)
+	proxy, responses := newTestStdioProxy(t, stdioServe{})
 
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0",
@@ -990,7 +959,6 @@ func TestUnmappedMethod_Stdio_Denied(t *testing.T) {
 		Method:  "agents/delegate",
 	}
 	proxy.handleHostRequest(context.Background(), msg)
-	_ = hostW.Close()
 
 	result := <-responses
 	require.NotNil(t, result.Error, "expected JSON-RPC error for unmapped method in stdio mode")
@@ -1003,14 +971,14 @@ func TestUnmappedMethod_Stdio_Denied(t *testing.T) {
 }
 
 // TestUnmappedMethod_Stdio_LogsMethodName verifies that the method name
-// appears in stderr when the stdio proxy rejects an unmapped method.
+// appears in the diagnostic log when the stdio proxy rejects an unmapped method.
+//
+// Captured through the proxy's OWN configured writer rather than by reassigning os.Stderr: the
+// swap is process-global, so it races every other test in this parallel package, and the
+// package's errOut discipline exists precisely so a caller never has to.
 func TestUnmappedMethod_Stdio_LogsMethodName(t *testing.T) {
-	proxy, hostW, _ := newTestStdioProxy(t, pdp.AlwaysAllowPDP{}, nil)
-
-	old := os.Stderr
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	os.Stderr = w
+	var buf bytes.Buffer
+	proxy, _ := newTestStdioProxy(t, stdioServe{stderr: &buf})
 
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0",
@@ -1018,13 +986,6 @@ func TestUnmappedMethod_Stdio_LogsMethodName(t *testing.T) {
 		Method:  "future/extension",
 	}
 	proxy.handleHostRequest(context.Background(), msg)
-
-	_ = w.Close()
-	os.Stderr = old
-	_ = hostW.Close()
-
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
 
 	logged := buf.String()
 	assert.True(t, strings.Contains(logged, "future/extension"),
@@ -1396,25 +1357,14 @@ func TestStdioNotification_KilledSession_DroppedAndRecorded(t *testing.T) {
 	dp := newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}})
 	sink, logPath := newTempAuditSink(t)
 
-	hostR, hostW := io.Pipe()
-	var upBuf bytes.Buffer
-	p := &StdioProxy{
-		pdp:        dp,
-		sessionID:  "stdio-sess",
-		sink:       sink,
-		hostReader: mcp.NewMsgReader(hostR),
-		upWriter:   mcp.NewMsgWriter(&upBuf),
-	}
+	up := &blockingUpWriter{gate: make(chan struct{})}
+	close(up.gate) // do not hold writes; the test asserts none happen
 
-	// Feed a single host notification, then close stdin so serveHost returns.
-	go func() {
-		_ = mcp.NewMsgWriter(hostW).Write(mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/cancelled"})
-		_ = hostW.Close()
-	}()
-	p.serveHost(context.Background())
+	serveHostMessages(t, stdioServe{pdp: dp, sessionID: "stdio-sess", sink: sink, upSink: up},
+		mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsCancelled})
 
-	if upBuf.Len() != 0 {
-		t.Errorf("a killed stdio session's notification must not be forwarded upstream; got %q", upBuf.String())
+	if got := up.methods(); len(got) != 0 {
+		t.Errorf("a killed stdio session's notification must not be forwarded upstream; got %v", got)
 	}
 
 	_ = sink.Close()

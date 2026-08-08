@@ -269,6 +269,14 @@ derived from those declarations, and a method outside the requesting peer's
 tables falls to the same fail-closed default (`dispatchUnmapped`,
 `AUTHORIZATION_FAILED`, recorded) that already covers unknown methods.
 
+That default holds in observe mode too: `enforcement: audit` and `--audit`
+downgrade a policy VERDICT, and a message the tables cannot route has none.
+Those denies carry `details._eunox_unroutable` — `{reason, revision}`, with
+`reason` one of `unknown_method`, `removed_in_revision`, `framing_unmapped` —
+so a wiretap tape shows eunox's own routing refusals as its own rather than as
+the upstream's behavior, and they name no policy `target` when the method
+resolves a target type.
+
 | Method | 2025-11-25 | 2026-07-28 |
 |---|---|---|
 | `tools/call` | enforced | enforced |

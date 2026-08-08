@@ -510,9 +510,12 @@ packs as a `binary`-type bundle (one per platform).
    **Just want to try it without writing a policy?** Copy
    [`examples/eunox.example.yaml`](../examples/eunox.example.yaml), edit the
    upstream, and point the config field at your copy. It starts in audit
-   (observe-only) mode — every call is forwarded and logged, nothing is blocked —
-   so no manifest is required to begin; inspect what ran with `eunox stats`,
-   then add a `policy:` and switch to `enforce` when ready.
+   (observe-only) mode — every call eunox can route is forwarded and logged, and
+   policy blocks nothing — so no manifest is required to begin; inspect what ran
+   with `eunox stats`, then add a `policy:` and switch to `enforce` when ready.
+   (See [What observe mode does *not*
+   downgrade](#what-observe-mode-does-not-downgrade) for the two things that
+   still refuse.)
 
 The extension launches eunox in enforce mode (`proxy --config <your eunox.yaml>`),
 so the tool list Claude sees is already filtered by your manifest. As with the
@@ -772,6 +775,45 @@ reaching it — for stdio that means the `--redis-addr` row above — hard-block
 wiretap session too. A stdio proxy on the default in-memory switch has no
 out-of-band kill channel (stop the process), so this only changes behavior for a
 `--redis-addr` deployment.
+
+### What observe mode does *not* downgrade
+
+Observe mode downgrades a **policy verdict**: a call policy would deny is
+forwarded, and the would-be denial is recorded as an OBSERVED denial. A message
+eunox cannot **route** has no verdict to downgrade, so it is still refused — in
+`enforcement: audit` and under `--audit` alike:
+
+| Still refused in observe mode | Code | Why it is not downgraded |
+| --- | --- | --- |
+| The kill switch | `KILL_SWITCH` | An emergency stop that a mode flag could soften would not be one. |
+| A method absent from the MCP revision the host negotiated | `AUTHORIZATION_FAILED` | The revision's routing table holds no handler for it; forwarding it would be inventing a route, not observing one. |
+| A method this build has never heard of | `AUTHORIZATION_FAILED` | Same — the fail-closed default, unchanged since before revision scoping. |
+| An enforced method sent in notification framing | `INVALID_REQUEST` | Forwarding it verbatim would bypass both the decision and the record. |
+| A protocol revision that cannot be established, or that disagrees with the context it arrived in | `UNSUPPORTED_PROTOCOL_VERSION` | There is no revision to route by; picking one would be a guess, and each way of guessing contradicts either the declaration or the leg eunox already opened. |
+
+The routing refusals (the three `AUTHORIZATION_FAILED` rows above) carry a
+`details._eunox_unroutable` object naming `reason` and the `revision` whose
+tables were consulted:
+
+| `reason` | Meaning |
+| --- | --- |
+| `unknown_method` | No MCP revision this build speaks declares the method. |
+| `removed_in_revision` | The build dispatches it under some revision, but not the one the host negotiated. |
+| `framing_unmapped` | The method exists in the host's revision, but not in the framing it arrived in (a notification-only method sent as a request, or the reverse). |
+
+That marker is what keeps a discovery run honest: `AUTHORIZATION_FAILED` is a
+genuine policy code, and on a wiretap route no policy ran at all, so without it
+a tape of eunox's own refusals reads as the upstream's behavior. These records
+also name no policy target (`target` is left empty whenever the method resolves
+a target type), so `eunox suggest` proposes nothing from them rather than
+drafting a capability for a resource named after the method.
+
+This mostly bites when the host speaks a **newer MCP revision** than the
+upstream: `initialize`, `ping`, and the `resources/subscribe` pair exist in
+`2025-11-25` and not in `2026-07-28`, so a peer that negotiates the newer
+revision and then sends one is refused. If a wiretap tape is mostly
+`_eunox_unroutable` records, that is what happened — pin the revision the pair
+actually shares rather than reading the tape as upstream behavior.
 
 ### Lifting a revocation
 

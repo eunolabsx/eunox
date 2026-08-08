@@ -174,10 +174,32 @@ type methodSpec struct {
 	LocalForwards bool
 }
 
+// paramsReachUpstream reports whether msg's own params travel to the upstream verbatim — the
+// fact the message's revision has to be honorable for, since a declaration only manufactures a
+// mismatched pair when it actually rides beside the MCP-Protocol-Version header this proxy
+// stamps.
+//
+// Asked per FRAMING, with the method lookup as only one of its arms. A host RESPONSE carries no
+// method, so a method-keyed gate misses it entirely — and a response is the one framing whose
+// bytes are relayed to the upstream with no dispatch decision at all (the serve loops write it
+// straight through), `_meta` declaration included. That is the same per-method vs per-framing
+// split dispatchesMessage draws for the pin.
+//
+// A response is therefore allowed to CARRY a declaration and is held to it, rather than having
+// one forbidden outright. Forbidding it would be a second rule to keep in step with the
+// mismatch check that already governs every other framing — and it is that check, not a ban,
+// that a reply to a proxy-issued request needs: the revision it declares must be the one its
+// context negotiated, and one this proxy can honor on the leg the bytes are about to enter.
+func paramsReachUpstream(msg mcp.RPCMsg) bool {
+	if msg.IsResponse() {
+		return true
+	}
+	return forwardsHostParams(msg.Method)
+}
+
 // forwardsHostParams reports whether method's own params reach the upstream, in either
-// framing — the fact the request's revision has to be honorable for, since it only
-// manufactures a mismatched pair when it actually travels beside the MCP-Protocol-Version
-// header this proxy stamps.
+// framing — the per-METHOD half of paramsReachUpstream, which is the question a request or a
+// notification answers and the wrong shape for a message with no method.
 //
 // DERIVED from the handler fields rather than declared per method: a Decide entry added
 // without a hand-set flag would still dispatch and still forward with this gate silently off,
@@ -312,6 +334,44 @@ type revisionTables struct {
 	notifications map[string]notificationDisposition
 }
 
+// request resolves method's REQUEST framing: the handler these tables hold for it, whether that
+// handler is the enforced (Decide*) one, and whether either table holds it at all.
+//
+// THE walk, in one place. dispatchRequest, isEnforcedMethod and the stdio pin's predicate each
+// used to spell it out, so "the proxy acted on this message" and "this message decided which
+// revision the connection speaks" agreed by review — the shape a third table or a new fallback
+// silently breaks.
+//
+// It returns the enforced FLAG rather than dispatching, because dispatchRequest interposes the
+// kill gate BETWEEN the two tables: an enforced method carries its own richer kill record inside
+// enforcedForwardCore, a locally-answered one takes the boundary gate first. A helper that
+// returned just "the handler" could not preserve that placement, which is why the obvious
+// single-lookup helper was rejected before this shape.
+func (t revisionTables) request(method string) (handler methodHandler, enforced, ok bool) {
+	if decided, found := t.decide[method]; found {
+		return decided, true, true
+	}
+	local, found := t.local[method]
+	return local, false, found
+}
+
+// enforces reports whether method's REQUEST framing is PDP-decided under these tables. Derived
+// from request rather than probing t.decide again: one walk, so a table that starts answering
+// differently cannot answer differently for only one of its callers.
+func (t revisionTables) enforces(method string) bool {
+	_, enforced, ok := t.request(method)
+	return ok && enforced
+}
+
+// notification resolves method's NOTIFICATION framing: its disposition and whether one is
+// stored. Presence IS the "the proxy acts on it" test — notifyUnmapped is the map's zero value
+// and is never stored, so an entry exists exactly for a disposition the proxy acts on, by
+// forwarding it or by swallowing something it has already handled.
+func (t revisionTables) notification(method string) (notificationDisposition, bool) {
+	disposition, ok := t.notifications[method]
+	return disposition, ok
+}
+
 // revisionDispatch holds the per-revision tables derived from methodRegistry at init.
 var revisionDispatch = buildRevisionDispatch(methodRegistry)
 
@@ -372,25 +432,57 @@ func deriveHandshakeRevision(registry map[string]methodSpec) capability.Revision
 	return capability.DefaultRevision
 }
 
-// removedInRevision reports whether method is one this build dispatches under SOME revision
-// but not under rev — i.e. denied because the peer's revision removed it, rather than because
-// nobody has ever heard of it. The two are routed identically on purpose (removal is
-// expressed by absence); they differ only in what an audit record can honestly claim.
+// unroutableRefusal describes a message the fail-closed default is about to drop: the audit
+// IDENTIFIER the record may honestly name, and the structured detail saying WHY nothing could
+// route it. One helper for both framings, because the two arms are the same question asked of
+// a request and of a notification, and their identifier rule was hand-mirrored once already.
 //
-// A per-METHOD question, deliberately: it exists to decide what an audit record may name, and a
-// method the peer's revision has is not "removed" merely because it arrived in a framing that
-// revision does not dispatch. What the message's own framing resolves to is dispatchesMessage.
-func removedInRevision(rev capability.Revision, method string) bool {
+// The identifier is dropped for any method that RESOLVES a target type, which is exactly what
+// turns it into a fabricated policy target: the audit sink derives target_type/target from it,
+// so recording "resources/subscribe" stamps a resource literally named after the method onto
+// the signed tape, and a notification-framed "tools/list" stamps a tool. Keyed on the target
+// type rather than on "the revision removed it" because the two are not the same set — revision
+// removal is merely how the first one became reachable — and a method with no target type is
+// the only case where the identifier is the sole place the name survives for an operator. The
+// method field still names what was denied either way.
+//
+// The three reasons are a per-METHOD question crossed with the framing, deliberately: a method
+// the peer's revision has is not "removed" merely because it arrived in a framing that revision
+// does not dispatch, and an operator reading a wiretap tape needs those apart.
+func unroutableRefusal(rev capability.Revision, method string) (identifier string, detail map[string]interface{}) {
+	identifier = method
+	if _, resolvesTarget := capability.MethodTargetType(method); resolvesTarget {
+		identifier = ""
+	}
 	spec, known := methodRegistry[method]
-	// The two halves are not complements — both are false for an unknown method — and it is the
-	// `known` guard that makes them not.
-	return known && !slices.Contains(spec.In, rev)
+	switch {
+	case known && !slices.Contains(spec.In, rev):
+		return identifier, unroutableDetail(rev, audit.UnroutableRemovedInRevision)
+	case known:
+		return identifier, unroutableDetail(rev, audit.UnroutableFramingUnmapped)
+	default:
+		return identifier, unroutableDetail(rev, audit.UnroutableUnknownMethod)
+	}
+}
+
+// unroutableDetail builds the reserved marker naming a routing refusal as eunox's own.
+//
+// It is on every one of these records, not only the ones an --audit route writes: the code
+// they carry (AUTHORIZATION_FAILED) is a genuine policy code for a message no policy evaluated,
+// so on an enforcing route the marker is what tells the two apart, and on a wiretap — where
+// policy denies nothing — it is what keeps a discovery run's tape from reading as the
+// upstream's behavior.
+func unroutableDetail(rev capability.Revision, reason string) map[string]interface{} {
+	return map[string]interface{}{
+		audit.UnroutableKey: map[string]interface{}{"reason": reason, "revision": rev.String()},
+	}
 }
 
 // dispatchesMessage reports whether rev's routing tables hold a handler for msg IN THE FRAMING
-// IT ARRIVED IN — which is the same lookup dispatchRequest and hostNotificationGate.admit
-// perform one gate later, so "the proxy acted on this message" and whatever this predicate is
-// used to conclude cannot disagree.
+// IT ARRIVED IN — through the SAME lookup methods dispatchRequest and hostNotificationGate.admit
+// call one gate later, so "the proxy acted on this message" and whatever this predicate is used
+// to conclude cannot disagree. Sharing the lookup is what makes that structural rather than a
+// claim; TestDispatchesMessage_MatchesWhatTheDispatcherActuallyDoes drives both and compares.
 //
 // It is the stdio context PIN's predicate. A message about to be dropped by the fail-closed
 // default says nothing about which revision a conversation is on, and latching from one wedges
@@ -407,16 +499,10 @@ func dispatchesMessage(rev capability.Revision, msg mcp.RPCMsg) bool {
 	tables := tablesFor(rev)
 	switch {
 	case msg.IsRequest():
-		if _, ok := tables.decide[msg.Method]; ok {
-			return true
-		}
-		_, ok := tables.local[msg.Method]
+		_, _, ok := tables.request(msg.Method)
 		return ok
 	case msg.IsNotification():
-		// Presence IS the test: notifyUnmapped is the map's zero value and is never stored, so
-		// an entry exists exactly for a disposition the proxy acts on — forwarding it, or
-		// swallowing it because the proxy has already handled what it announces.
-		_, ok := tables.notifications[msg.Method]
+		_, ok := tables.notification(msg.Method)
 		return ok
 	default:
 		return false
@@ -447,7 +533,19 @@ func dispatchesMessage(rev capability.Revision, msg mcp.RPCMsg) bool {
 // refusal would need a distinguished "no peer to negotiate with" value for the legitimately
 // non-negotiating arms, which is the second carrier of one fact this seam exists to remove.
 func requestRevision(ctx context.Context) capability.Revision {
-	if rev := capability.ProtocolRevisionFromContext(ctx); rev != "" {
+	return resolveRevision(capability.ProtocolRevisionFromContext(ctx))
+}
+
+// resolveRevision applies the empty-carrier rule ONCE, for every leg that has to decide what an
+// unresolved revision means: the surface eunox already shipped.
+//
+// Named rather than inlined into requestRevision because the server-initiated leg asks it of a
+// value rather than of a context — it has no host request in scope, so it is handed the
+// session's pin as a fact. Answering it there by hand is how that leg came to record "nothing
+// was negotiated" for a session whose host-leg records name a revision: the two are the same
+// question, and a second reading of it is where they diverge.
+func resolveRevision(rev capability.Revision) capability.Revision {
+	if rev != "" {
 		return rev
 	}
 	return capability.DefaultRevision
@@ -479,8 +577,7 @@ func tablesFor(rev capability.Revision) revisionTables {
 // isEnforcedMethod reports whether method is one of the request's revision's Decide* methods,
 // derived from the same declarations dispatchRequest routes by so the two cannot drift.
 func isEnforcedMethod(ctx context.Context, method string) bool {
-	_, ok := tablesFromContext(ctx).decide[method]
-	return ok
+	return tablesFromContext(ctx).enforces(method)
 }
 
 // hostNotificationGate is the per-transport wiring the shared notification gate needs. The
@@ -545,7 +642,7 @@ const (
 // resolved their own.
 func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notificationOutcome {
 	tables := tablesFromContext(ctx)
-	disposition := tables.notifications[msg.Method]
+	disposition, _ := tables.notification(msg.Method)
 	swallowed := disposition == notifySwallow
 	// The swallowed set is what the proxy has ALREADY handled, so it is neither an error nor
 	// an event and is dropped before anything that would record it. That reasoning needs the
@@ -566,7 +663,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	}
 	// An enforced method framed as a notification (no id) is a fail-closed reject: forwarding
 	// it verbatim would bypass both the PDP decision and the audit record.
-	if _, enforced := tables.decide[msg.Method]; enforced {
+	if tables.enforces(msg.Method) {
 		if rec := g.rec(); rec != nil {
 			rec.RecordDeny(ctx, g.subject.auditSessionID(), msg.Method, msg.Method, codeInvalidRequest, "", g.subject.auditDetails(nil), false)
 		}
@@ -578,16 +675,9 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	// notifyUnmapped, the notification-framed analogue of dispatchUnmapped. Before this
 	// existed, an unrecognized notification-framed method reached the upstream invisibly while
 	// its request-framed twin was denied and logged.
-	//
-	// Identifier dropped for a method the peer's revision removed — see dispatchUnmapped for
-	// why: resources/subscribe resolves a target type, so recording it as the identifier would
-	// stamp a resource literally named after the method onto the signed tape.
-	identifier := msg.Method
-	if removedInRevision(requestRevision(ctx), msg.Method) {
-		identifier = ""
-	}
+	identifier, unroutable := unroutableRefusal(requestRevision(ctx), msg.Method)
 	if rec := g.rec(); rec != nil {
-		rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", g.subject.auditDetails(nil), false)
+		rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", g.subject.auditDetails(unroutable), false)
 	}
 	_, _ = fmt.Fprintf(resolvedErrOut(g.errOut),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
@@ -605,17 +695,19 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 // construction rather than needing killDenied re-placed inside its handler. Its position
 // relative to revision negotiation is the package gate order at the top of this file.
 func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	tables := tablesFromContext(ctx)
-	if handler, ok := tables.decide[msg.Method]; ok {
+	handler, enforced, ok := tablesFromContext(ctx).request(msg.Method)
+	if ok && enforced {
 		return handler(ctx, d, msg)
 	}
 
 	// Locally-answered set shares one simple kill gate applied once here. A killed session is
-	// recorded as KILL_SWITCH (not the method's own code) and never contacts the upstream.
+	// recorded as KILL_SWITCH (not the method's own code) and never contacts the upstream. It
+	// sits BETWEEN the two tables, which is why revisionTables.request reports which one hit
+	// rather than just dispatching.
 	if resp, killed := d.killDenied(ctx, msg); killed {
 		return resp
 	}
-	if handler, ok := tables.local[msg.Method]; ok {
+	if ok {
 		return handler(ctx, d, msg)
 	}
 	return dispatchUnmapped(ctx, d, msg)
@@ -1046,20 +1138,11 @@ func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 	// field stays raw (JSON-encoding already escapes control runes).
 	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
 	// Record-before-act: write the audit record before the stderr notice, so a crash between
-	// the two never leaves a SIEM alert with no corresponding audit trail entry.
-	//
-	// The IDENTIFIER is dropped for a method this build knows but the requesting peer's
-	// revision does not have. Until routing became revision-scoped, only methods with no
-	// target type could reach here, so deriveTargetFields left the target empty; now
-	// resources/subscribe can, and it DOES resolve a target type — which would stamp a
-	// resource literally named "resources/subscribe" onto the signed tape and let `eunox
-	// suggest` mine a capability for it. The method field still names what was denied.
-	identifier := msg.Method
-	if removedInRevision(requestRevision(ctx), msg.Method) {
-		identifier = ""
-	}
+	// the two never leaves a SIEM alert with no corresponding audit trail entry. The identifier
+	// and the routing-refusal marker are unroutableRefusal's, shared with the notification arm.
+	identifier, unroutable := unroutableRefusal(requestRevision(ctx), msg.Method)
 	if d.rec != nil {
-		d.rec.RecordDeny(ctx, d.sessionID, identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
+		d.rec.RecordDeny(ctx, d.sessionID, identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", unroutable, false)
 	}
 	_, _ = fmt.Fprintf(d.errOutOrStderr(),
 		"[eunox] SECURITY: unmapped MCP method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",

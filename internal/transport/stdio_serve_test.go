@@ -27,27 +27,13 @@ import (
 func TestServeHost_ReturnsOnContextCancel(t *testing.T) {
 	t.Parallel()
 
-	// A pipe whose write end is never written keeps hostReader.Read blocked, exactly
-	// as an idle host's open stdin would.
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { _ = pw.Close() })
-
-	p := &StdioProxy{
-		pdp:          pdp.AlwaysAllowPDP{},
-		hostReader:   mcp.NewMsgReader(pr),
-		hostWriter:   mcp.NewMsgWriter(io.Discard),
-		upWriter:     mcp.NewMsgWriter(io.Discard),
-		upstreamDone: make(chan struct{}),
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { p.serveHost(ctx); close(done) }()
-
-	cancel()
+	// No messages: the host's stdin stays open and unwritten, keeping hostReader.Read blocked
+	// exactly as an idle host's would.
+	run := serveHostRunning(t, stdioServe{})
+	run.stop()
 
 	select {
-	case <-done:
+	case <-run.done:
 		// Good: serveHost returned on cancellation rather than blocking on stdin.
 	case <-time.After(2 * time.Second):
 		t.Fatal("serveHost did not return after ctx cancellation (proxy would ignore SIGTERM)")
@@ -60,33 +46,24 @@ func TestServeHost_ReturnsOnContextCancel(t *testing.T) {
 func TestServeHost_ReturnsOnUpstreamExit(t *testing.T) {
 	t.Parallel()
 
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { _ = pw.Close() })
-	upstreamDone := make(chan struct{})
-
-	p := &StdioProxy{
-		pdp:          pdp.AlwaysAllowPDP{},
-		hostReader:   mcp.NewMsgReader(pr),
-		hostWriter:   mcp.NewMsgWriter(io.Discard),
-		upWriter:     mcp.NewMsgWriter(io.Discard),
-		upstreamDone: upstreamDone,
-	}
-
-	done := make(chan struct{})
-	go func() { p.serveHost(context.Background()); close(done) }()
-
-	close(upstreamDone)
+	run := serveHostRunning(t, stdioServe{})
+	close(run.proxy.upstreamDone)
 
 	select {
-	case <-done:
+	case <-run.done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("serveHost did not return after the upstream exited")
 	}
 }
 
-// stdioServe is the varying half of a serveHost fixture: everything else about the proxy is
-// fixed by what Start actually produces, and belongs in serveHostLines rather than in a literal
+// stdioServe is the varying half of a StdioProxy fixture: everything else about the proxy is
+// fixed by what Start actually produces, and belongs in newStdioProxy rather than in a literal
 // per test.
+//
+// Every field's zero value is the shape most tests want, so a test names only what it actually
+// varies — which is the point. The fields exist because a literal that omits one of the FIXED
+// fields (upstreamRev especially) builds a proxy production never produces, and the omission is
+// invisible at review.
 type stdioServe struct {
 	// pdp decides; nil means AlwaysAllowPDP, which is what a test asserting on framing or
 	// negotiation rather than on policy wants.
@@ -95,25 +72,35 @@ type stdioServe struct {
 	sessionID string
 	// sink, when set, gives the proxy a real audit tape so a test can read records back.
 	sink *audit.Sink
+	// hostSink captures proxy->host messages; nil means the *mockHostWriter the fixture returns.
+	// Set it for a test that must AWAIT a reply rather than read a settled slice.
+	hostSink mcp.MsgSink
+	// upSink captures proxy->upstream messages; nil discards them. Set it to assert on what
+	// reached the upstream, or to hold an upstream write open.
+	upSink mcp.MsgSink
+	// hostSem bounds in-flight host handlers; nil lets serveHost size it as production does.
+	// Set it (small) to drive the saturation path.
+	hostSem chan struct{}
+	// decideGate turns on per-anchor decision serialization, as a flow-relevant policy does in
+	// production; nil leaves decisions unserialized.
+	decideGate *decisionSerializer
+	// stderr collects the proxy's diagnostic lines; nil discards them. Set it to assert on a
+	// SECURITY/AUDIT line — through the proxy's own writer, never by reassigning os.Stderr,
+	// which races every other test in the package.
+	stderr io.Writer
+	// setup runs after construction and before anything serves, for state a test must plant on
+	// the proxy itself (a tracked server-request id, say).
+	setup func(*StdioProxy)
 }
 
-// serveHostLines drives a StdioProxy's REAL serve loop over lines — one raw JSON-RPC message
-// each, no trailing newline needed — and returns once the loop has finished, so a caller's
-// assertions run against a settled proxy.
+// newStdioProxy builds the StdioProxy every stdio fixture in this package drives, so the FIXED
+// half is written once.
 //
-// "Settled" is specifically the EOF path: closing the host's stdin is what makes serveHost wait
-// for its in-flight handlers before returning, which is what lets a caller read the host writer
-// without synchronizing. A test that ends the loop by cancelling its context instead does NOT
-// get that wait and cannot use this.
-//
-// One scaffold rather than a literal per test because the literal is the part that goes wrong.
 // It carries upstreamRev, whose omission puts the proxy in a state Start never produces (no
-// upstream leg), silently changing which declarations resolveHostRevision will honor — a test
-// that forgets it exercises a proxy production does not build, and the omission is invisible at
-// review. A field added to StdioProxy, or a change to serveHost's shutdown contract, is then one
-// edit here instead of one per copy.
-func serveHostLines(t *testing.T, cfg stdioServe, lines ...string) (*StdioProxy, *mockHostWriter) {
-	t.Helper()
+// upstream leg), silently changing which declarations resolveHostRevision will honor. A field
+// added to StdioProxy is one edit here rather than one per copy — which is the payoff the
+// scaffold exists for, and which only holds while there is exactly one of it.
+func newStdioProxy(cfg stdioServe, hostReader io.Reader) (*StdioProxy, *mockHostWriter) {
 	decider := cfg.pdp
 	if decider == nil {
 		decider = pdp.AlwaysAllowPDP{}
@@ -123,7 +110,18 @@ func serveHostLines(t *testing.T, cfg stdioServe, lines ...string) (*StdioProxy,
 		sessionID = "sess"
 	}
 	hw := &mockHostWriter{}
-	pr, pw := io.Pipe()
+	hostSink := cfg.hostSink
+	if hostSink == nil {
+		hostSink = hw
+	}
+	upSink := cfg.upSink
+	if upSink == nil {
+		upSink = mcp.NewMsgWriter(io.Discard)
+	}
+	errOut := cfg.stderr
+	if errOut == nil {
+		errOut = io.Discard
+	}
 	p := &StdioProxy{
 		pdp:       decider,
 		sessionID: sessionID,
@@ -131,35 +129,159 @@ func serveHostLines(t *testing.T, cfg stdioServe, lines ...string) (*StdioProxy,
 		// The leg Start always leaves a proxy on: eunox opens every upstream with `initialize`,
 		// so the handshake revision is what it addresses one as. Set HERE, once, because it
 		// changes what resolveHostRevision honors.
-		upstreamRev:  handshakeRevision,
-		hostReader:   mcp.NewMsgReader(pr),
-		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
-		upWriter:     mcp.NewMsgWriter(io.Discard),
-		stderr:       io.Discard,
+		upstreamRev: handshakeRevision,
+		hostReader:  mcp.NewMsgReader(hostReader),
+		hostWriter:  mcp.NewMsgWriter(&writerAdapter{hostSink}),
+		upWriter:    upSink,
+		stderr:      errOut,
+		hostSem:     cfg.hostSem,
+		decideGate:  cfg.decideGate,
+		// The two maps Start always allocates: a nil byUpstreamID panics the first forward, and
+		// a nil hostToUp drops every notifications/cancelled translation.
+		byUpstreamID: make(map[string]chan upstreamResult),
+		hostToUp:     make(map[string]*json.RawMessage),
 		upstreamDone: make(chan struct{}),
 	}
+	if cfg.setup != nil {
+		cfg.setup(p)
+	}
+	return p, hw
+}
+
+// serveHostLines drives a StdioProxy's REAL serve loop over lines — one raw JSON-RPC message
+// each, no trailing newline needed — and returns once the loop has finished, so a caller's
+// assertions run against a settled proxy.
+//
+// "Settled" is specifically the EOF path: closing the host's stdin is what makes serveHost wait
+// for its in-flight handlers before returning, which is what lets a caller read the host writer
+// without synchronizing. A test that must observe the loop MID-flight ends it by cancelling
+// instead and uses serveHostRunning.
+//
+// Raw lines, so a test can feed bytes no marshaller would produce (a duplicate key, a stray
+// member). Everything else takes serveHostMessages and lets this file own the framing.
+func serveHostLines(t *testing.T, cfg stdioServe, lines ...string) (*StdioProxy, *mockHostWriter) {
+	t.Helper()
+	pr, pw := io.Pipe()
+	p, hw := newStdioProxy(cfg, pr)
 
 	done := make(chan struct{})
 	go func() { p.serveHost(context.Background()); close(done) }()
-	// The writes run OFF this goroutine: an io.Pipe write blocks until a reader takes it, and
-	// serveHost has exits that do not drain (upstream exit, a non-EOF read error, a shutdown
-	// wake). Writing inline would then block forever with no reader and hang the test past the
-	// bounded wait below, surfacing as go test's 10-minute panic pointing at this helper rather
-	// than as the failure the caller wrote.
-	go func() {
-		for _, line := range lines {
-			if _, err := io.WriteString(pw, strings.TrimRight(line, "\n")+"\n"); err != nil {
-				return // the loop stopped reading; the wait below reports what happened
-			}
-		}
-		_ = pw.Close()
-	}()
+	go writeHostLines(pw, lines, true)
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("serveHost did not return after the host closed stdin")
 	}
 	return p, hw
+}
+
+// serveHostMessages is serveHostLines over MESSAGES: the fixture already owns the newline
+// framing, so marshalling in each caller made the framing contract two homes instead of one.
+func serveHostMessages(t *testing.T, cfg stdioServe, msgs ...mcp.RPCMsg) (*StdioProxy, *mockHostWriter) {
+	t.Helper()
+	return serveHostLines(t, cfg, encodeHostLines(t, msgs)...)
+}
+
+// stdioRun is a serve loop still RUNNING: the shape for a test that must observe the proxy
+// mid-flight (a wedged upstream write, a saturated handler pool) rather than after it settles.
+// The host's stdin stays open, so the loop ends only when the caller stops it.
+type stdioRun struct {
+	proxy *StdioProxy
+	host  *mockHostWriter
+	stop  context.CancelFunc
+	done  <-chan struct{}
+}
+
+// finish cancels the serve context and waits for the loop, so a test never leaves a goroutine
+// wedged on an upstream write past its own end.
+func (r stdioRun) finish(t *testing.T) {
+	t.Helper()
+	r.stop()
+	select {
+	case <-r.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHost did not return after its context was cancelled")
+	}
+}
+
+// serveHostRunning starts the real serve loop over msgs and returns while it is still running.
+// The pipe is deliberately left OPEN: an EOF would send the loop into its drain-and-return path,
+// which is the one thing a mid-flight assertion must not race. Pass no messages for a proxy
+// whose host is simply idle.
+func serveHostRunning(t *testing.T, cfg stdioServe, msgs ...mcp.RPCMsg) stdioRun {
+	t.Helper()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	p, hw := newStdioProxy(cfg, pr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan struct{})
+	go func() { p.serveHost(ctx); close(done) }()
+	go writeHostLines(pw, encodeHostLines(t, msgs), false)
+	return stdioRun{proxy: p, host: hw, stop: cancel, done: done}
+}
+
+// encodeHostLines renders messages as the JSON lines the host reader is fed.
+func encodeHostLines(t *testing.T, msgs []mcp.RPCMsg) []string {
+	t.Helper()
+	lines := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		raw, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("marshalling host message: %v", err)
+		}
+		lines = append(lines, string(raw))
+	}
+	return lines
+}
+
+// newTestStdioProxy is the same proxy for a test that calls a HANDLER directly
+// (handleHostRequest, forwardHostNotification) instead of driving the serve loop: nothing reads
+// the host's stdin, and each host-bound reply lands on the returned channel.
+//
+// It shares newStdioProxy rather than building its own literal — the second parallel fixture is
+// how "a field added to StdioProxy is one edit" stopped being true the first time.
+func newTestStdioProxy(t *testing.T, cfg stdioServe) (*StdioProxy, <-chan mcp.RPCMsg) {
+	t.Helper()
+	ch := make(chan mcp.RPCMsg, 8)
+	cfg.hostSink = &chanHostWriter{ch: ch}
+	// An empty reader, never read: this path has no serve loop to feed.
+	p, _ := newStdioProxy(cfg, strings.NewReader(""))
+	return p, ch
+}
+
+// toolCallMsg is a host tools/call for a tool that never answers, the request every ordering
+// and saturation fixture below wedges on.
+func toolCallMsg(id, tool string) mcp.RPCMsg {
+	return mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(id), Method: capability.MethodToolsCall,
+		Params: json.RawMessage(`{"name":"` + tool + `","arguments":{}}`),
+	}
+}
+
+// cancelNotification is the notifications/cancelled targeting the host request id.
+func cancelNotification(requestID string) mcp.RPCMsg {
+	return mcp.RPCMsg{
+		JSONRPC: "2.0", Method: methodNotificationsCancelled,
+		Params: json.RawMessage(`{"requestId":` + requestID + `}`),
+	}
+}
+
+// writeHostLines feeds the host pipe, and MUST run off the test's own goroutine: an io.Pipe
+// write blocks until a reader takes it, and serveHost has exits that do not drain (upstream
+// exit, a non-EOF read error, a shutdown wake). Writing inline would then block forever with no
+// reader and hang the test past its bounded wait, surfacing as go test's 10-minute panic
+// pointing at this helper rather than as the failure the caller wrote.
+func writeHostLines(pw *io.PipeWriter, lines []string, closeAfter bool) {
+	for _, line := range lines {
+		if _, err := io.WriteString(pw, strings.TrimRight(line, "\n")+"\n"); err != nil {
+			return // the loop stopped reading; the caller's wait reports what happened
+		}
+	}
+	if closeAfter {
+		_ = pw.Close()
+	}
 }
 
 // blockingUpWriter is an upstream sink whose Write blocks until gate is closed,
@@ -206,24 +328,10 @@ func TestServeHost_NotificationPreservesWireOrder(t *testing.T) {
 	t.Parallel()
 
 	up := &blockingUpWriter{gate: make(chan struct{})}
-	p := &StdioProxy{
-		pdp:          pdp.AlwaysAllowPDP{},
-		sessionID:    "order-sess",
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostWriter:   mcp.NewMsgWriter(io.Discard),
-		upWriter:     up,
-		upstreamDone: make(chan struct{}),
-	}
-
 	// A tools/call immediately followed by a notifications/cancelled targeting it.
-	input := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
-		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}` + "\n"
-	p.hostReader = mcp.NewMsgReader(strings.NewReader(input))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() { p.serveHost(ctx); close(done) }()
+	run := serveHostRunning(t, stdioServe{sessionID: "order-sess", upSink: up},
+		toolCallMsg(`7`, "slow"), cancelNotification(`7`))
+	defer run.finish(t)
 
 	// While the request's upstream write is held open, neither the request nor the
 	// notification may have reached the upstream: the request is blocked on the gate
@@ -252,8 +360,6 @@ func TestServeHost_NotificationPreservesWireOrder(t *testing.T) {
 		}
 	}
 
-	cancel()
-	<-done
 }
 
 // TestServeHost_CancelRequestIDRewrittenToNonce is the regression for a
@@ -267,24 +373,9 @@ func TestServeHost_CancelRequestIDRewrittenToNonce(t *testing.T) {
 
 	up := &blockingUpWriter{gate: make(chan struct{})}
 	close(up.gate) // do not hold writes: we only inspect what reaches the upstream
-	p := &StdioProxy{
-		pdp:          pdp.AlwaysAllowPDP{},
-		sessionID:    "cancel-sess",
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostToUp:     make(map[string]*json.RawMessage),
-		hostWriter:   mcp.NewMsgWriter(io.Discard),
-		upWriter:     up,
-		upstreamDone: make(chan struct{}),
-	}
-
-	input := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
-		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}` + "\n"
-	p.hostReader = mcp.NewMsgReader(strings.NewReader(input))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() { p.serveHost(ctx); close(done) }()
+	run := serveHostRunning(t, stdioServe{sessionID: "cancel-sess", upSink: up},
+		toolCallMsg(`7`, "slow"), cancelNotification(`7`))
+	defer run.finish(t)
 
 	// Wait until both the request and the cancel have reached the upstream. The
 	// request handler stays blocked awaiting a response that never comes, so its
@@ -320,9 +411,6 @@ func TestServeHost_CancelRequestIDRewrittenToNonce(t *testing.T) {
 	if got != reqNonce {
 		t.Fatalf("cancel requestId = %s, want the upstream nonce %s", got, reqNonce)
 	}
-
-	cancel()
-	<-done
 }
 
 // TestRewriteCancelToNonce_DropsWhenNothingInFlight pins that a cancel for an
@@ -379,34 +467,20 @@ func TestServeHost_NotificationBarrierInterruptibleByCancel(t *testing.T) {
 	// rather than leaking past the test.
 	t.Cleanup(func() { close(up.gate) })
 
-	p := &StdioProxy{
-		pdp:          pdp.AlwaysAllowPDP{},
-		sessionID:    "barrier-sess",
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostWriter:   mcp.NewMsgWriter(io.Discard),
-		upWriter:     up,
-		upstreamDone: make(chan struct{}),
-	}
-
-	input := `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
-		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}` + "\n"
-	p.hostReader = mcp.NewMsgReader(strings.NewReader(input))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { p.serveHost(ctx); close(done) }()
+	run := serveHostRunning(t, stdioServe{sessionID: "barrier-sess", upSink: up},
+		toolCallMsg(`9`, "slow"), cancelNotification(`9`))
 
 	// Let the request wedge on the gate and the notification block on the barrier.
 	time.Sleep(50 * time.Millisecond)
 	select {
-	case <-done:
+	case <-run.done:
 		t.Fatal("serveHost returned before cancellation (the request write should be wedged)")
 	default:
 	}
 
-	cancel()
+	run.stop()
 	select {
-	case <-done:
+	case <-run.done:
 		// Good: cancellation returned serveHost even though the barrier never drained.
 	case <-time.After(2 * time.Second):
 		t.Fatal("serveHost did not return on cancel while a notification waited on the ordering barrier")
@@ -432,28 +506,13 @@ func TestServeHost_KilledServerResponseRecordsDeny(t *testing.T) {
 	up := &blockingUpWriter{gate: make(chan struct{})}
 	close(up.gate) // do not block writes; the test asserts none happen
 
-	p := &StdioProxy{
-		pdp:          policy,
-		sessionID:    "kill-sess",
-		sink:         sink,
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostWriter:   mcp.NewMsgWriter(io.Discard),
-		upWriter:     up,
-		upstreamDone: make(chan struct{}),
-	}
 	// A host response (id 5) to a server-initiated request the proxy had forwarded.
-	p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard)
-	p.hostReader = mcp.NewMsgReader(strings.NewReader(`{"jsonrpc":"2.0","id":5,"result":{}}` + "\n"))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() { p.serveHost(ctx); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("serveHost did not return after consuming the response input")
-	}
+	serveHostLines(t, stdioServe{
+		pdp: policy, sessionID: "kill-sess", sink: sink, upSink: up,
+		setup: func(p *StdioProxy) { p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard) },
+	},
+		`{"jsonrpc":"2.0","id":5,"result":{}}`,
+	)
 
 	if got := up.messages(); len(got) != 0 {
 		t.Errorf("a killed session's host reply must NOT be routed to the upstream; got %v", up.methods())
@@ -472,14 +531,19 @@ func TestServeHost_KilledServerResponseRecordsDeny(t *testing.T) {
 	}
 }
 
-// signalingHostWriter forwards each host-bound message to a channel so a test can
-// await a specific reply without racing on a shared slice.
-type signalingHostWriter struct {
+// chanHostWriter delivers each host-bound message to a buffered channel so a test can AWAIT a
+// specific reply rather than read a settled slice. The send is non-blocking on purpose: the
+// proxy's write path must never be gated on a test's read, or a fixture becomes the thing that
+// wedges the loop it is measuring.
+type chanHostWriter struct {
 	ch chan mcp.RPCMsg
 }
 
-func (w *signalingHostWriter) Write(m mcp.RPCMsg) error {
-	w.ch <- m
+func (w *chanHostWriter) Write(m mcp.RPCMsg) error {
+	select {
+	case w.ch <- m:
+	default:
+	}
 	return nil
 }
 
@@ -493,31 +557,17 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 
 	sink, logPath := newTempAuditSink(t)
 	hostCh := make(chan mcp.RPCMsg, 4)
-	p := &StdioProxy{
-		pdp:          pdp.AlwaysAllowPDP{},
-		sessionID:    "cap-sess",
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostWriter:   mcp.NewMsgWriter(&writerAdapter{dest: &signalingHostWriter{ch: hostCh}}),
-		// The upstream accepts the write but never responds; with upstreamTimeMs=0 the
-		// first handler blocks indefinitely, holding its sole concurrency slot.
-		upWriter:     mcp.NewMsgWriter(io.Discard),
-		upstreamDone: make(chan struct{}),
-		hostSem:      make(chan struct{}, 1), // cap of 1 so the second request saturates it
-		sink:         sink,                   // wire the tape so the saturation refusal is recorded
-	}
-
-	// Three requests against a cap of 1: the first holds the sole slot on a silent
-	// upstream, and the next two are both refused without the pool ever draining — one
-	// saturation episode, so exactly one record (asserted below).
-	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
-		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n" +
-		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}` + "\n"
-	p.hostReader = mcp.NewMsgReader(strings.NewReader(input))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() { p.serveHost(ctx); close(done) }()
+	// Three requests against a cap of 1: the first holds the sole slot on a silent upstream
+	// (the default discarding sink accepts the write and never answers, and upstreamTimeMs=0
+	// means the handler waits forever), and the next two are both refused without the pool ever
+	// draining — one saturation episode, so exactly one record (asserted below).
+	run := serveHostRunning(t, stdioServe{
+		sessionID: "cap-sess",
+		sink:      sink, // wire the tape so the saturation refusal is recorded
+		hostSink:  &chanHostWriter{ch: hostCh},
+		hostSem:   make(chan struct{}, 1), // cap of 1 so the second request saturates it
+	},
+		toolCallMsg(`1`, "slow"), toolCallMsg(`2`, "slow"), toolCallMsg(`3`, "slow"))
 
 	// The first request holds the only slot (blocked on the silent upstream); the
 	// second must come straight back as a server-busy error.
@@ -547,8 +597,7 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 		t.Fatal("the second saturating request was not rejected")
 	}
 
-	cancel()
-	<-done
+	run.finish(t)
 
 	// The saturation refusal must also land on the tamper-evident tape as
 	// RESOURCE_EXHAUSTED — a silent server-busy would make a stdio DoS probe invisible.
@@ -576,8 +625,8 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 	// serveHost clears it on every successful hostSem acquire, so a LATER saturation is a
 	// new episode and records again. Without that re-arm the transport would report its
 	// first saturation ever and then stay silent for the process lifetime.
-	p.hostSaturation.clear()
-	if ok, suppressed := p.hostSaturation.admit(); !ok || suppressed != 1 {
+	run.proxy.hostSaturation.clear()
+	if ok, suppressed := run.proxy.hostSaturation.admit(); !ok || suppressed != 1 {
 		t.Fatalf("the proxy's gate must re-arm and carry the elided refusal; ok=%v suppressed=%d, want true/1", ok, suppressed)
 	}
 }

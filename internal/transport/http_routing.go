@@ -622,7 +622,7 @@ func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request
 	// operator can tell the two drop SITES apart.
 	label, leg := msg.Method, legHTTPNotification
 	if msg.IsResponse() {
-		label, leg = "server-response", legHTTPServerResponse
+		label, leg = methodLabelServerResponse, legHTTPServerResponse
 	}
 	recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), label, label, leg)
 	w.WriteHeader(http.StatusAccepted)
@@ -1187,7 +1187,7 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 		// A kill doesn't tear the upstream down; its blocked server-initiated request is
 		// intentionally left unanswered and reclaimed later by the idle reaper's hard
 		// ceiling. Record the dropped reply so it's visible on the tape.
-		recordKillDrop(ctx, asRecorder(route.sink), deny, verifiedSession(sess.id), "server-response", "server-response", legHTTPServerResponse)
+		recordKillDrop(ctx, asRecorder(route.sink), deny, verifiedSession(sess.id), methodLabelServerResponse, methodLabelServerResponse, legHTTPServerResponse)
 	case sess.upWriter != nil:
 		_ = sess.upWriter.Write(msg)
 	default:

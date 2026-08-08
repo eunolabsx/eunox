@@ -308,7 +308,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		"Set with '=': --require-audit=off (a bare --require-audit means 'strict').")
 	f := &proxyCLIFlags{
 		configPath:           fs.String("config", "", "Path to the eunox config file (YAML). Declares the host transport,\nupstream(s), per-route policy, listen settings, and audit tape.\nSee schemas/eunox-gateway-config.schema.json."),
-		audit:                fs.Bool("audit", false, "Zero-config wiretap mode: bridge stdin/stdout to the upstream named after `--`\n(or to --upstream-url). Enforced-method calls (tools/call, resources/read,\nresources/subscribe, resources/unsubscribe, prompts/get, sampling/createMessage) are forwarded and recorded without applying policy.\n…/list calls forward the full upstream catalog unfiltered (no policy is applied) and\nare recorded as enumeration events; only the kill switch still hard-blocks.\nRecorded tool-call arguments may contain secrets; treat the audit log as sensitive.\nMutually exclusive with --config."),
+		audit:                fs.Bool("audit", false, "Zero-config wiretap mode: bridge stdin/stdout to the upstream named after `--`\n(or to --upstream-url). Enforced-method calls (tools/call, resources/read,\nresources/subscribe, resources/unsubscribe, prompts/get, sampling/createMessage) are forwarded and recorded without applying policy.\n…/list calls forward the full upstream catalog unfiltered (no policy is applied) and\nare recorded as enumeration events. POLICY blocks nothing; the kill switch and\neunox's own routing still refuse — a method it cannot dispatch under the revision\nthe host negotiated, or a message whose revision it cannot establish. Observe mode\ndoes not invent routing for those; their records carry details._eunox_unroutable.\nRecorded tool-call arguments may contain secrets; treat the audit log as sensitive.\nMutually exclusive with --config."),
 		wiretapURL:           fs.String("upstream-url", "", "HTTP upstream URL for --audit mode (alternative to a `--` subprocess)."),
 		wiretapAuthHeader:    fs.String("upstream-auth-header", "", `HTTP upstream auth header for --audit mode, "Name: Value".`),
 		wiretapTLSSkipVerify: fs.Bool("upstream-tls-skip-verify", false, "Skip TLS verification for --audit --upstream-url (development only)."),
@@ -375,10 +375,16 @@ and their per-route policy:
   transport: stdio — speak MCP over stdin/stdout to exactly one upstream.
 
 With --audit, no config file is needed: eunox runs as a stdio host fronting
-the upstream you point it at, in audit (observe) mode — every request is
-forwarded, the verdict is recorded, nothing is blocked. Point your MCP host
-(Claude Desktop, Cursor, …) at this command and inspect the audit tape with
-'eunox stats' to see what an enforcement allowlist would need.
+the upstream you point it at, in audit (observe) mode — every request eunox can
+route is forwarded and its verdict recorded, and policy blocks nothing. Two
+things still refuse: the kill switch, and a message eunox cannot route at all
+(a method absent from the MCP revision your host negotiated, or a revision that
+cannot be established). Observe mode downgrades a policy verdict; a message
+eunox cannot route has none to downgrade — so those records carry
+details._eunox_unroutable, and a discovery run's tape shows them as eunox's own
+refusals rather than as the upstream's behavior. Point your MCP host (Claude
+Desktop, Cursor, …) at this command and inspect the audit tape with 'eunox
+stats' to see what an enforcement allowlist would need.
 
 Run 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.
 
@@ -402,6 +408,9 @@ func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConf
 			return nil, err
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
+		// Named rather than left to be discovered on the tape: observe mode downgrades POLICY
+		// verdicts, and a message eunox cannot route has no verdict to downgrade.
+		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: policy blocks nothing, but the kill switch and eunox's own routing still refuse (a method absent from the revision your host negotiated, or a revision that cannot be established) — those records carry details.%s.\n", audit.UnroutableKey)
 		return cfg, nil
 	case *f.configPath != "":
 		// The upstream command comes from the config in this mode; a trailing
@@ -419,7 +428,7 @@ func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConf
 		return config.LoadGatewayConfig(*f.configPath)
 	default:
 		//nolint:staticcheck // ST1005: this is printed as a multi-line usage block, not a short sentence-case error
-		return nil, errors.New("one of --config <file> or --audit is required.\n\n  --config <eunox.yaml>           policy enforcement (or audit posture) declared in a file\n  --audit -- <command> [args...]  zero-config wiretap: forward everything, log everything\n\nRun 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.")
+		return nil, errors.New("one of --config <file> or --audit is required.\n\n  --config <eunox.yaml>           policy enforcement (or audit posture) declared in a file\n  --audit -- <command> [args...]  zero-config wiretap: forward what it can route, log everything\n\nRun 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.")
 	}
 }
 

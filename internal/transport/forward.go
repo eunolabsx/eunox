@@ -128,6 +128,12 @@ func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.E
 	return denialResult(id, denial.Code, denial.ConditionType, method, "")
 }
 
+// methodLabelServerResponse names a HOST RESPONSE on the audit tape. A response carries no
+// method, and an empty method field names nothing an operator can correlate on, so every arm
+// that records one uses this label — which is also what keeps it distinguishable from the
+// notification drop sites that DO carry a method.
+const methodLabelServerResponse = "server-response"
+
 // killDropLeg identifies the transport leg a recordKillDrop call site drops a message on,
 // stamped into the audit detail so an operator can distinguish drop sites during an incident.
 // A typed enum (not a bare string at each of the 8 call sites) makes a typo'd leg a compile
@@ -936,8 +942,15 @@ type serverRequestParams struct {
 	// request to read one from, so each transport supplies the fact and forwardServerRequest
 	// stamps it — a new server-initiated entry point inherits the stamp rather than needing it
 	// re-placed, which is how this leg came to record every sampling decision on a negotiated
-	// session as though no revision had been resolved. Empty means the host has not negotiated
-	// yet, and stays absent on the record: that IS the honest reading.
+	// session as though no revision had been resolved.
+	//
+	// Empty means the host context has not PINNED one, which is not the same as "none was
+	// resolved": a message can resolve a revision, be recorded under it, and still not pin,
+	// because the proxy discarded it (see dispatchesMessage). So the empty value is resolved
+	// through resolveRevision rather than left absent — the same rule requestRevision applies on
+	// the host leg, so both legs of one session name the surface it is actually routed by. The
+	// cost is deliberate: a record can name a revision the peer never declared, exactly as the
+	// host leg's already does for an undeclared message.
 	revision      capability.Revision
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
@@ -1150,10 +1163,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	}
 	// Stamped here for the same reason the claims are: both branches record, and a stamp
 	// placed in one transport's caller is a stamp the other transport (or the next entry
-	// point) can be written without.
-	if fp.revision != "" {
-		ctx = capability.WithProtocolRevision(ctx, fp.revision)
-	}
+	// point) can be written without. Unconditional: an absent protocol_revision is reserved for
+	// a record written before any revision could be resolved, and this leg only runs on a
+	// session whose upstream handshake is complete.
+	ctx = capability.WithProtocolRevision(ctx, resolveRevision(fp.revision))
 	if msg.Method != samplingMethod {
 		if deny := fp.pdp.CheckKill(ctx, fp.sessionID); deny != nil {
 			denial := normalizeDenial(deny.Denial)

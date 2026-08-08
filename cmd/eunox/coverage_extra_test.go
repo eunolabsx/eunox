@@ -1637,6 +1637,26 @@ func TestPrintProxyUsage(t *testing.T) {
 	}
 }
 
+// TestPrintProxyUsage_WiretapClaimIsHonest pins the help text against what --audit actually
+// does. It used to say "nothing is blocked", which was false in two ways an operator only
+// discovers by reading a discovery run's tape: the kill switch hard-blocks, and so does any
+// message eunox cannot route (observe mode downgrades a POLICY verdict, and an unroutable
+// message has none). The marker key is asserted against the PRODUCER's constant, so a rename
+// there fails here rather than leaving the help pointing at a field the tape no longer carries.
+func TestPrintProxyUsage_WiretapClaimIsHonest(t *testing.T) {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	out := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
+
+	if strings.Contains(out, "nothing is blocked") {
+		t.Errorf("the --audit help still claims nothing is blocked:\n%s", out)
+	}
+	for _, want := range []string{"kill switch", "cannot route", audit.UnroutableKey} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the --audit help does not mention %q, so what still refuses is discoverable only from the tape:\n%s", want, out)
+		}
+	}
+}
+
 // ───────────────────────── buildCallCounterAndKillSwitch ───────────────────
 
 func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
