@@ -1,6 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// The Redis backend's own behavior suite, authoritative for what it DOES — including the
+// exact error sentinels and the cache-before-publish visibility a cross-backend table cannot
+// state. conformance_test.go holds only the rules every backend must satisfy.
+//
 // Error-path tests for the Redis kill-switch that closing a miniredis server
 // cannot reach: those require Get to succeed while a later SCAN fails, or one
 // prefix's scan to succeed while the next fails. A selective fake redis.Cmdable

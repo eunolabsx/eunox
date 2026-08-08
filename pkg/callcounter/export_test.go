@@ -24,6 +24,12 @@ func WithRedisTimeFunc(fn func() time.Time) redisOption {
 // wire a single-node miniredis client — where neither refusal (a sharding client, crypto/rand)
 // is reachable — and would otherwise carry two lines of error plumbing each. The refusals
 // themselves are pinned by their own tests. Compiled only under `go test`.
+//
+// It takes redisOption, so it serves this package alone; internal/transport and cmd/eunox each
+// keep their own copy for the same reason, carrying this reasoning rather than a pointer to
+// it. That duplication is the accepted cost of NOT exporting the option type: a
+// testing.TB-taking constructor in an importable package's API is a thing consumers can wire.
+// A new refusal added to NewRedis therefore has three call-site wrappers to reckon with.
 func NewRedisForTest(tb testing.TB, client redis.Cmdable, opts ...redisOption) *Redis {
 	tb.Helper()
 	r, err := NewRedis(client, opts...)

@@ -1,6 +1,19 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// The cross-backend RULES of the Manager contract, and only those: what a consumer holding
+// the interface may rely on without knowing which backend it holds. Each backend's own
+// BEHAVIOR — what a kill blocks, what Status reports, Reset, the emergency stop, the observer
+// registry's dedup and unregister semantics — is pinned per backend in killswitch_test.go,
+// redis_internal_test.go and observers_test.go, which assert it more precisely than a table
+// polling through the interface can (exact error sentinels, cache-before-publish visibility).
+// Add a behavior case THERE; add a case here only for a property that must hold of every
+// backend and that no single backend's suite can state.
+//
+// Re-running behavior here was strictly weaker than those suites — the copy could not fail
+// without the original failing first — so it read as a second, authoritative home while
+// pinning less.
+
 package killswitch
 
 import (
@@ -121,10 +134,21 @@ func awaitBlock(t *testing.T, m Manager, agentID, sessionID string, want bool, m
 	}
 }
 
-// TestManagerConformance_ReadyBackendsAnswerAlike runs the whole Manager contract against
-// every backend in its ready state, so "the backends behave alike" is checked rather than
-// assumed by a consumer holding the interface.
-func TestManagerConformance_ReadyBackendsAnswerAlike(t *testing.T) {
+// TestManagerConformance_ReadyBackendsAgreeOnRefusalsAndRevive pins the two places a backend
+// could satisfy Manager in full and still answer DIFFERENTLY from its sibling, in a direction
+// a consumer holding the interface cannot detect:
+//
+//   - an empty id is REFUSED rather than recorded. ShouldBlock skips empty ids, so a backend
+//     storing "" has a kill that blocks nothing while showing up in Status — an operator who
+//     issued it reads the snapshot as proof it took.
+//   - a revive is the exact inverse of the kill it undoes. A backend that records the revive
+//     but keeps blocking (or blocks again on its own echo) strands the id for good, and the
+//     only signal is traffic that never resumes.
+//
+// What a kill BLOCKS, what Status reports, Reset and the emergency stop are each backend's
+// own suite (see this file's header): they are pinned there against the concrete backend
+// rather than through a polling loop that must tolerate every backend's slowest path.
+func TestManagerConformance_ReadyBackendsAgreeOnRefusalsAndRevive(t *testing.T) {
 	t.Parallel()
 	for _, b := range managerBackends() {
 		t.Run(b.name, func(t *testing.T) {
@@ -134,81 +158,20 @@ func TestManagerConformance_ReadyBackendsAnswerAlike(t *testing.T) {
 
 			require.NoError(t, m.HealthStatus(), "a ready backend must report no cause: its kill set is confirmable")
 
-			// An empty id is rejected rather than recorded: ShouldBlock skips empty ids, so a
-			// stored "" would be a kill that blocks nothing while showing up in Status.
 			require.Error(t, m.KillAgent(ctx, ""), "KillAgent(\"\") must be refused, not recorded as a no-op kill")
 			require.Error(t, m.KillSession(ctx, ""), "KillSession(\"\") must be refused, not recorded as a no-op kill")
 			require.Error(t, m.ReviveAgent(ctx, ""), "ReviveAgent(\"\") must be refused for the same reason")
 			require.Error(t, m.ReviveSession(ctx, ""), "ReviveSession(\"\") must be refused for the same reason")
 
-			awaitBlock(t, m, "agent-1", "sess-1", false, "a fresh backend must block nothing")
-
 			require.NoError(t, m.KillAgent(ctx, "agent-1"))
 			awaitBlock(t, m, "agent-1", "", true, "a killed agent must block")
-			awaitBlock(t, m, "agent-2", "", false, "an unrelated agent must not block")
+			require.NoError(t, m.ReviveAgent(ctx, "agent-1"))
+			awaitBlock(t, m, "agent-1", "", false, "a revived agent must stop blocking")
 
 			require.NoError(t, m.KillSession(ctx, "sess-1"))
 			awaitBlock(t, m, "", "sess-1", true, "a killed session must block")
-
-			status, err := m.Status(ctx)
-			require.NoError(t, err, "a ready backend's snapshot is confirmable")
-			require.Equal(t, []string{"agent-1"}, status.KilledAgents)
-			require.Equal(t, []string{"sess-1"}, status.KilledSessions)
-			require.False(t, status.GlobalActive)
-
-			require.NoError(t, m.ReviveAgent(ctx, "agent-1"))
-			awaitBlock(t, m, "agent-1", "", false, "a revived agent must stop blocking")
 			require.NoError(t, m.ReviveSession(ctx, "sess-1"))
 			awaitBlock(t, m, "", "sess-1", false, "a revived session must stop blocking")
-
-			require.NoError(t, m.ActivateGlobal(ctx))
-			awaitBlock(t, m, "", "", true, "the emergency stop must block traffic naming no agent or session")
-			require.NoError(t, m.DeactivateGlobal(ctx))
-			awaitBlock(t, m, "", "", false, "a deactivated emergency stop must stop blocking")
-
-			require.NoError(t, m.KillAgent(ctx, "agent-3"))
-			require.NoError(t, m.Reset(ctx))
-			awaitBlock(t, m, "agent-3", "", false, "Reset must clear the kill set")
-			status, err = m.Status(ctx)
-			require.NoError(t, err)
-			require.Empty(t, status.KilledAgents)
-			require.Empty(t, status.KilledSessions)
-		})
-	}
-}
-
-// TestManagerConformance_RevocationsAreObservable pins the half of a kill that is not a read:
-// a consumer reclaiming what a revoked session holds has no request to hang the work off, so
-// every backend must deliver the trigger from its own write path, not only from a remote one.
-func TestManagerConformance_RevocationsAreObservable(t *testing.T) {
-	t.Parallel()
-	for _, b := range managerBackends() {
-		t.Run(b.name, func(t *testing.T) {
-			t.Parallel()
-			ctx := context.Background()
-			m := b.ready(t)
-
-			seen := make(chan Revocation, 8)
-			unregister := m.ObserveRevocations(func(ev Revocation) { seen <- ev })
-
-			require.NoError(t, m.KillSession(ctx, "sess-9"))
-			select {
-			case ev := <-seen:
-				require.Equal(t, Revocation{SessionID: "sess-9"}, ev)
-			case <-time.After(2 * time.Second):
-				t.Fatal("a kill issued through this backend must reach its own observers")
-			}
-
-			// Idempotent, and it actually stops delivery: a consumer with a shorter lifetime than
-			// the backend relies on both.
-			unregister()
-			unregister()
-			require.NoError(t, m.KillAgent(ctx, "agent-9"))
-			select {
-			case ev := <-seen:
-				t.Fatalf("observer was called after unregister: %+v", ev)
-			case <-time.After(100 * time.Millisecond):
-			}
 		})
 	}
 }

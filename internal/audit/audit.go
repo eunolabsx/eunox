@@ -1887,6 +1887,19 @@ const UpstreamErrorCodeKey = "_eunox_upstream_error_code"
 // (internal/transport) and the miner (cmd/eunox/suggest) share one spelling.
 const EffectReceiptKey = "_eunox_effect_receipt"
 
+// HandlerFaultKey is the reserved detail key the transport merges into an ALLOW record's
+// Details naming the condition types whose registered handler broke an engine contract the
+// engine then REPAIRED (see capability.EnforceResponse.HandlerFaults). Its value is an array
+// of condition types.
+//
+// It is on the tape because absorbing a fault must not be the same as ignoring it: the call
+// was decided exactly as a conforming handler would have decided it, so nothing else on the
+// record differs, and without this key an operator's observe run would tolerate a broken
+// plugin indefinitely with no signal. Reserved-prefixed for EffectReceiptKey's reason — a
+// tools/call allow's Details IS the caller's argument map in audit mode, which `eunox suggest`
+// mines as argument names.
+const HandlerFaultKey = "_eunox_handler_fault"
+
 // The four declassification detail keys. They report the facts a declassification's
 // top-level signed fields (labels_cleared / approver / approval_id) deliberately cannot:
 // those three appear together and ONLY when a clear actually changed the session's labels,
@@ -1993,6 +2006,7 @@ var reservedDetailKeys = map[string]bool{
 	TruncatedKey:                true,
 	UpstreamErrorCodeKey:        true,
 	EffectReceiptKey:            true,
+	HandlerFaultKey:             true,
 	DeclassifySpentApprovalKey:  true,
 	DeclassifyNotAppliedKey:     true,
 	DeclassifyCommitFailedKey:   true,

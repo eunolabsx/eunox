@@ -599,6 +599,12 @@ func TestAdv6_RateLimit_InMemory_SessionBypass(t *testing.T) {
 
 // newRedisCounter builds a Redis-backed counter over a single-node test client, where
 // NewRedis's construction refusals (a keyspace-sharding client, crypto/rand) are unreachable.
+//
+// A copy of callcounter's own NewRedisForTest, which takes that package's unexported option
+// type and so cannot be called from here; exporting the option to share one helper would put
+// a testing.TB-taking constructor in an importable package's API. Kept as a copy WITH the
+// reasoning rather than pointing at it: a new refusal added to NewRedis has to be reckoned
+// with wherever a test asserts one away.
 func newRedisCounter(t *testing.T, client goredis.Cmdable) *callcounter.Redis {
 	t.Helper()
 	counter, err := callcounter.NewRedis(client)

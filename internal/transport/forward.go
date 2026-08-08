@@ -389,6 +389,18 @@ func declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interfac
 	return detail
 }
 
+// handlerFaultDetail is the annotation for an allow whose decision absorbed a condition
+// handler's contract violation, or nil for the healthy call every deployment makes. The engine
+// repaired the fault rather than refusing the call (see capability.EnforceResponse.HandlerFaults),
+// so this record is the only place the plugin bug is reported at all — an absorbed fault that
+// reached nobody would be the silent tolerance the assertion exists to prevent.
+func handlerFaultDetail(dec capability.EnforceResponse) map[string]interface{} {
+	if len(dec.HandlerFaults) == 0 {
+		return nil
+	}
+	return map[string]interface{}{audit.HandlerFaultKey: dec.HandlerFaults}
+}
+
 // spentGrantDetail is the annotation for a call with nothing to clear but a burned single-use
 // grant to name, or nil when the decision burned nothing. The whole record a NO-OP clear
 // produces — nothing is "not applied", but the grant is spent for good, and this is the only
@@ -801,7 +813,9 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		// Through mergeAuditDetails, never a write into allowDetails' return: the tools/call
 		// closure's base under --audit is the caller's live parsed argument map, so writing
 		// into whatever that chain hands back would rewrite the request being described.
-		details := mergeAuditDetails(allowDetails(upResp), declDetail)
+		// The annotations are folded together FIRST and merged in once, so a healthy call —
+		// both nil — pays no second copy of the caller's argument map.
+		details := mergeAuditDetails(allowDetails(upResp), mergeAuditDetails(declDetail, handlerFaultDetail(dec)))
 		// A call that CLEARED flow labels takes the recorder that carries the approval; every
 		// other call takes the plain one. The branch is on what the commit actually CHANGED,
 		// not on what was authorized — a no-op clear would otherwise record an approver for a
@@ -1072,12 +1086,15 @@ func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method s
 			fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeEnforcementError, "", declDetail, false)
 			return
 		}
+		// The absorbed-fault annotation rides the two ALLOW arms only, as it does on the
+		// host-facing leg: the deny above records its own cause, which the fault did not cause.
+		allowDetail := mergeAuditDetails(declDetail, handlerFaultDetail(dec))
 		if len(cleared) > 0 {
-			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, method, method, declDetail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels,
+			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, method, method, allowDetail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels,
 				cleared, dec.Declassification.Approver(), dec.Declassification.ApprovalID())
 			return
 		}
-		fp.rec.RecordAllow(ctx, fp.sessionID, method, method, declDetail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
+		fp.rec.RecordAllow(ctx, fp.sessionID, method, method, allowDetail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
 	})
 }
 

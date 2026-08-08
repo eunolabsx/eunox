@@ -1,6 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// Authoritative for the observer contract — conformance_test.go states cross-backend rules
+// only, and this surface's edge cases (dedup, revive, unregister, re-entrancy) are pinned here
+// for both backends.
+//
 // Test suite for the revocationObservers registry and both backends'
 // ObserveRevocations implementations: notify-on-gain dedup, notify-outside-lock
 // (re-entrant ShouldBlock), idempotent unregister, delivery via pub/sub vs the

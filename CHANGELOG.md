@@ -1071,8 +1071,11 @@ Section conventions:
   where it binds every reader and states its one exception (`--killswitch-fail-open`, where the
   operator has chosen availability and `HealthStatus` alone reports the cause). `InMemory`
   recorded kills by assigning into nil maps and panicked on a `&InMemory{}`; the sets are now
-  created on first write. A table-driven conformance suite runs the contract across backends —
-  `contracts.go` proves the methods exist, this proves they agree.
+  created on first write. A table-driven conformance suite pins the cross-backend RULES —
+  `contracts.go` proves the methods exist, this proves the backends agree where a consumer
+  holding the interface cannot tell them apart (empty-id refusals, revive as the exact inverse
+  of a kill, and the confirmability rule). Per-backend BEHAVIOR stays in each backend's own
+  suite, which asserts it more precisely than a table polling through the interface can.
 
   **BREAKING (pre-1.0):** `killswitch.Manager` gained `HealthStatus() error`. An in-process
   backend returns nil; one that mirrors remote state must report the cause it cannot confirm,
@@ -1092,8 +1095,8 @@ Section conventions:
   was asserted; a handler that IGNORED `SkipQuota` and returned a bucket anyway was admitted
   normally and spent a real quota slot on an `--audit` route, whose contract is that none is
   consumed — nothing logged, and an operator's observe run silently drained the budget it was
-  meant only to predict. A bucket derived under `SkipQuota` is now refused with the same
-  `HardDeny` as its mirror, decided after every condition has been prepared so a later
+  meant only to predict. A bucket derived under `SkipQuota` is now DROPPED and the fault
+  reported (see the entry below), decided after every condition has been prepared so a later
   condition's real verdict still wins. An authorized skip is honored whatever else the handler
   returned, and the two assertions together make a mixed set unrepresentable, retiring the
   post-loop partial-skip guard.
@@ -1101,7 +1104,38 @@ Section conventions:
   **Migration:** drop `Handle` from a committing handler and register it with
   `WithCommittingConditionHandler`. A handler that keeps a `Handle` and goes through
   `WithConditionHandler` still registers as committing and behaves as before. A handler that
-  commits under `WithSkipQuota` is now refused rather than charged.
+  commits under `WithSkipQuota` has its bucket dropped rather than charged.
+
+- **A committing handler's contract violation no longer blocks the route that promises never
+  to block.** The refusal above shipped as a `HardDeny`, and `SkipQuota` is set only on a route
+  running `--audit` — where the transport downgrades and FORWARDS any verdict it can. So an
+  out-of-tree `CommittingConditionHandler` that returned a bucket under observe turned a
+  wiretap route into a hard outage for every call matching that constraint, and made the
+  migration path the README recommends ("run `--audit` first, then enforce") strictly riskier
+  than enforcing directly.
+
+  The engine owns the only consumption point, so this half is bookkeeping it can absorb: the
+  bucket is dropped, nothing is consumed, and the call is decided exactly as a conforming
+  handler's would have been. Absorbed is not silent — the condition types are named in
+  `capability.EnforceResponse.HandlerFaults` and the transport stamps them onto the allow
+  record's `details` under the reserved key `_eunox_handler_fault`, so the plugin bug is
+  visible to an operator without being charged to the caller. The mirror half is unchanged and
+  still hard-denies: a handler that skips unasked leaves the rest of the deferred set
+  unevaluated, and there is no verdict to fall back on.
+
+  The justification for that surviving `HardDeny` — "where `WillForwardDeny` answers yes, the
+  transport forwards a downgradable verdict and blocks a hard one" — was restated about six
+  times inside `pkg/enforcement`, a package that neither sets the flag nor implements the
+  downgrade, so all six could have gone false at once with no test failing. It is now stated
+  once, on `WillForwardDeny`, and pinned by a test in `internal/transport` that runs real
+  engine verdicts through the real forward core for each arm of the union.
+
+- **`eunox` no longer pays two registry lookups per pure condition.** The first condition pass
+  resolved each condition's handler entry to ask whether the type defers, then resolved it
+  again to run it — a redundant string-keyed map lookup and `ConditionType()` call per pure
+  condition, per request. The entry is now looked up once and handed down. Both fail-closed
+  shapes are kept distinct (an unknown type; an entry with no usable pure handler), since
+  merging the lookups must not merge those into one ambiguous cause.
 - **The harden path applies a delegation chain to its verdict, not only to its obligations.**
   `HardenRefusal` composes this PDP's verdicts onto a refusal the JWT layer produced. Its
   obligation fill read the chain off the context and applied the chain's composed

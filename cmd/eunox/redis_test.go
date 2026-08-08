@@ -101,15 +101,31 @@ func TestPingRedis_Failure(t *testing.T) {
 // callcounter.Redis integration
 // -------------------------------------------------------------------------
 
+// newRedisCounter builds a Redis-backed counter over a single-node test client, where
+// NewRedis's construction refusals (a keyspace-sharding client, crypto/rand) are unreachable,
+// so the error is asserted away rather than plumbed through every case.
+//
+// It is the third spelling of that wrapper — callcounter's own NewRedisForTest takes the
+// package's unexported option type and so cannot cross a package boundary, and exporting the
+// option to share one helper would put a testing.TB-taking constructor in an importable
+// package's API. The reasoning is repeated at each copy deliberately: a NEW refusal added to
+// NewRedis has to be reckoned with wherever a test asserts one away, and only a comment that
+// is actually THERE says so.
+func newRedisCounter(t *testing.T, client goredis.Cmdable) *callcounter.Redis {
+	t.Helper()
+	counter, err := callcounter.NewRedis(client)
+	if err != nil {
+		t.Fatalf("callcounter.NewRedis: %v", err)
+	}
+	return counter
+}
+
 func TestRedisCallCounter_Integration(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter, err := callcounter.NewRedis(client)
-	if err != nil {
-		t.Fatalf("NewRedis: %v", err)
-	}
+	counter := newRedisCounter(t, client)
 	ctx := context.Background()
 
 	// histCap is a retention cap above this test's counts, so IncrementAndGet's
