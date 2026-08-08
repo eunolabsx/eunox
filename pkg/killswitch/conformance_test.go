@@ -13,6 +13,10 @@
 // Re-running behavior here was strictly weaker than those suites — the copy could not fail
 // without the original failing first — so it read as a second, authoritative home while
 // pinning less.
+//
+// One behavior test lives here anyway: the zero-value InMemory case. Its subject is a backend
+// this table CONSTRUCTS and no per-backend suite does (`&InMemory{}`, which a library consumer
+// can write), so moving it to killswitch_test.go would leave it with nothing to test against.
 
 package killswitch
 

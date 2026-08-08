@@ -45,9 +45,13 @@ func (e *Engine) NonCommittingConditionVerdict(ctx context.Context, cond capabil
 	if !exists {
 		return nil, false
 	}
-	if handler.pure == nil {
-		// Registered as committing: it has no entry point that decides without consuming, so
-		// there is nothing to run here.
+	if handler.pure == nil || isTypedNil(handler.pure) {
+		// No entry point that decides without consuming: registered as committing, or an entry
+		// whose handler cannot be called at all. isTypedNil for the reason evalCondition applies
+		// it — a nil POINTER boxed in the interface survives == nil — and the answer here must
+		// match the decision path's, which denies this entry fail-closed. Reporting it as usable
+		// would either panic the request goroutine or, for a nil-receiver-safe Handle, report the
+		// claim condition as PASSED where the engine hard-denies it: a fail-open on the claim leg.
 		return nil, false
 	}
 	return handler.pure.Handle(ctx, cond, req), true

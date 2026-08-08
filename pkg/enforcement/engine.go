@@ -783,12 +783,23 @@ func builtinUses(name string) []capability.EngineSubsystem {
 	return uses
 }
 
+// deferredCondition is a condition the first pass resolved and set aside for the atomic commit,
+// carrying what that resolution produced. The commit pass therefore asks the registry nothing:
+// re-resolving there was a second map lookup and a second ConditionType call per quota-carrying
+// condition per request, and it needed a fail-closed guard for a registry that cannot change
+// (New populates it and never writes again) — a branch no test could reach.
+type deferredCondition struct {
+	cond     capability.Condition
+	condType string
+	handler  CommittingConditionHandler
+}
+
 // runPureConditions evaluates every PURE (non-committing) condition on matched in order
 // and returns the deferred (quota-consuming) ones for the caller to commit later. Returns
 // a non-nil deny response on the first condition with an unknown type or a Handle failure
 // (fail closed). Extracted so ValidateAction and EvaluateConditions share one dispatch
 // path and cannot diverge.
-func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) ([]capability.Condition, *capability.EnforceResponse) {
+func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, requestID, now string) ([]deferredCondition, *capability.EnforceResponse) {
 	// Two passes over matched.Conditions so a consuming condition never burns its quota for
 	// a call a later condition denies: this first pass evaluates every pure-predicate
 	// condition immediately while collecting each deferred (consuming) one into deferred
@@ -799,7 +810,7 @@ func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceR
 	// hard-deny), and on a counter-write fault it denies a call whose maxCalls slot was
 	// already committed here, not rolled back. Bounded to policies using sequenceBlock —
 	// with none, RecordSessionCall is skipped entirely (skipAntecedentRecording).
-	var deferred []capability.Condition
+	var deferred []deferredCondition
 	for _, cond := range matched.Conditions {
 		// Defense in depth: a null condition is rejected at manifest load, so a nil here
 		// means a programmatically built constraint. Fail closed rather than panic in
@@ -836,7 +847,7 @@ func (e *Engine) runPureConditions(ctx context.Context, req *capability.EnforceR
 			})
 			return nil, &resp
 		case handler.commits():
-			deferred = append(deferred, cond)
+			deferred = append(deferred, deferredCondition{cond: cond, condType: condType, handler: handler.committing})
 		default:
 			if deny := e.evalCondition(ctx, cond, condType, handler.pure, req, matched, requestID, now); deny != nil {
 				return nil, deny
@@ -872,7 +883,7 @@ func isTypedNil(v interface{}) bool {
 //
 // Buckets may MIX accountings (a maxCalls count beside a cumulative blastRadius magnitude)
 // since the backend admits them together; the engine has no compatibility table to maintain.
-func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []capability.Condition, requestID, now string) (faults []string, deny *capability.EnforceResponse) {
+func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, deferred []deferredCondition, requestID, now string) (faults []string, deny *capability.EnforceResponse) {
 	var (
 		buckets []capability.QuotaBucket
 		denies  []func(total float64, retryAfter time.Duration) *ConditionError
@@ -884,20 +895,9 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, req *capability.E
 	// skipQuota is loop-invariant: read once rather than per condition, on a path every
 	// quota-carrying policy takes.
 	skipQuota := SkipQuota(ctx)
-	for _, cond := range deferred {
-		condType := cond.ConditionType()
-		ch, ok := e.committingHandler(condType)
-		if !ok {
-			// Defensive: unreachable since deferred was gathered through the same registry
-			// question (registeredHandler.commits). Fail closed if it changed under us.
-			resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
-				Code:          capability.ErrCodeConditionFailed,
-				ConditionType: condType,
-				Message:       fmt.Sprintf("deferred condition %q has no committing handler", condType),
-			})
-			return faults, &resp
-		}
-		commit, skip, condErr := ch.PrepareCommit(ctx, cond, req)
+	for _, d := range deferred {
+		condType := d.condType
+		commit, skip, condErr := d.handler.PrepareCommit(ctx, d.cond, req)
 		// condErr is checked BEFORE skip is honored: a handler may legitimately report
 		// both, and honoring skip first would discard the verdict, letting every condition
 		// skipping ALLOW under observe where enforce denies.
@@ -1052,18 +1052,6 @@ func unauthorizedSkipError(condType string) *ConditionError {
 		HardDeny:      true,
 		Message:       fmt.Sprintf("committing condition %q reported a skip the request context did not authorize; skip must be derived solely from request context", condType),
 	}
-}
-
-// committingHandler returns the registered handler for condType when it commits state on
-// admit. The atomic commit re-resolves the entry the first pass deferred on (registeredHandler.commits),
-// asking the SAME registry the same question, so a custom committing handler participates in
-// both automatically and there is no separate list of "deferred" types to keep in sync.
-func (e *Engine) committingHandler(condType string) (CommittingConditionHandler, bool) {
-	h, ok := e.handlers[condType]
-	if !ok || !h.commits() {
-		return nil, false
-	}
-	return h.committing, true
 }
 
 // evalCondition runs a single PURE condition through the handler runPureConditions already

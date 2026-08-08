@@ -104,3 +104,35 @@ func TestNonCommittingConditionVerdict_PackageFunctionIsTheBuiltins(t *testing.T
 	assert.Equal(t, capability.ErrCodeValueNotPermitted, cerr.Code)
 	assert.Equal(t, capability.ConditionTypeAllowedValues, cerr.ConditionType)
 }
+
+// nilPureHandler implements only the pure interface, so a typed nil of it registers through
+// registerPure and reaches every reader of registeredHandler.pure.
+type nilPureHandler struct{}
+
+func (h *nilPureHandler) Handle(context.Context, capability.Condition, *capability.EnforceRequest) *enforcement.ConditionError {
+	// Nil-receiver SAFE on purpose: the panic is the loud failure, and this fixture pins the
+	// quiet one underneath it — an entry the composing layer would otherwise report as passed.
+	return nil
+}
+
+// TestNonCommittingConditionVerdict_TypedNilHandlerIsNotUsable pins that this entry point and
+// the decision path agree about an unusable handler. The engine denies it CONDITION_FAILED
+// (hard); reporting ok=true here would have the JWT capability-claim path read the condition as
+// SATISFIED for the same registration — a fail-open reachable through a claim, not a manifest.
+func TestNonCommittingConditionVerdict_TypedNilHandlerIsNotUsable(t *testing.T) {
+	t.Parallel()
+	e := enforcement.New(enforcement.WithConditionHandler(capability.ConditionTypeAllowedValues, (*nilPureHandler)(nil)))
+	cond := &capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/tmp"}}
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool", Arguments: map[string]interface{}{"path": "/etc"}}
+
+	condErr, ok := e.NonCommittingConditionVerdict(context.Background(), cond, req)
+	assert.False(t, ok, "an unusable handler must not report a verdict the caller can trust")
+	assert.Nil(t, condErr)
+
+	// The decision path's answer for the same registration, which this must not contradict.
+	caps := []capability.Constraint{{Target: "tool", Actions: []string{"*"}, Conditions: []capability.Condition{cond}}}
+	resp := e.ValidateAction(context.Background(), req, caps)
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.True(t, resp.Denial.HardDeny)
+}

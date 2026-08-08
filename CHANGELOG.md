@@ -1054,6 +1054,12 @@ Section conventions:
   are kept distinct (an unknown type; an entry with no usable pure handler), since merging the
   lookups must not merge those into one ambiguous cause.
 
+  The quota-carrying conditions — the ones that then take the expensive atomic-commit path —
+  paid the same double resolution, so the first pass now carries the resolved handler forward
+  and the commit pass asks the registry nothing. That also retires its "the registry changed
+  under us" refusal, which guarded a map `New` populates once and never writes again: an
+  unreachable fail-closed branch is a branch no test can hold to account.
+
 ### Fixed
 
 - **Redis Cluster is refused at the seam instead of denying on the first two-bucket policy.**
@@ -1141,6 +1147,14 @@ Section conventions:
   downgrade, so all six could have gone false at once with no test failing. It is now stated
   once, on `WillForwardDeny`, and pinned by a test in `internal/transport` that runs real
   engine verdicts through the real forward core for each arm of the union.
+
+- **A typed-nil condition handler is refused by the claim path as it is by the decision path.**
+  `NonCommittingConditionVerdict` — the seam a composing layer (the JWT capability-claim path)
+  asks for a verdict the deciding PDP will agree with — guarded only `handler.pure == nil`,
+  where the decision path also rejects a nil POINTER boxed in the interface. For an embedder's
+  unset handler that meant a panic on the request goroutine, or, for a nil-receiver-safe
+  `Handle`, the claim condition reading as SATISFIED while the engine hard-denies the identical
+  registration: a fail-open reachable through a claim rather than a manifest.
 
 - **A repaired handler fault no longer panics the engine at construction.** `dependsOn` asked
   whether an entry commits with a bare nil check, three lines from the `commits` predicate that
