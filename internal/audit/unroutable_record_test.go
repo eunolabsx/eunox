@@ -87,15 +87,24 @@ func TestUnroutableRecordSignAndVerifyRoundTrip(t *testing.T) {
 		}
 	}
 	// The first record's method resolves a target type; with the identifier dropped, the tape
-	// must name no target rather than one derived from the method.
+	// must name NEITHER field. A target_type beside no target asserts half a policy target for
+	// a call nothing matched — the same fabrication, one field along.
 	var first struct {
-		Target string `json:"target"`
+		TargetType string `json:"target_type"`
+		Target     string `json:"target"`
+		Method     string `json:"method"`
 	}
 	if err := json.Unmarshal(lines[0], &first); err != nil {
 		t.Fatalf("record 0: %v", err)
 	}
-	if first.Target != "" {
-		t.Errorf("target = %q, want empty — a routing refusal names no policy target", first.Target)
+	if first.Target != "" || first.TargetType != "" {
+		t.Errorf("target_type/target = %q/%q, want both empty — a routing refusal names no policy target",
+			first.TargetType, first.Target)
+	}
+	// The method survives: it is what the refusal was about, and dropping the identifier must
+	// not cost an operator the name of the method that was denied.
+	if first.Method != capability.MethodResourcesSubscribe {
+		t.Errorf("method = %q, want %q", first.Method, capability.MethodResourcesSubscribe)
 	}
 }
 

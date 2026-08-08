@@ -467,6 +467,10 @@ func TestServerInitiatedLeg_NamesTheRevisionAnUnpinnedContextIsRoutedBy(t *testi
 // the assertion survives an unrelated allocation appearing on the shared path, and still fails
 // the moment the redundant Store comes back.
 //
+// It measures the pin-is-set half only: on an already-pinned connection the guard short-circuits
+// before dispatchesMessage, which is the point. The other half — that the predicate still
+// decides WHICH message may pin — is TestStdioNegotiation_DoesNotPinFromAMessageTheFramingDiscards.
+//
 // Not parallel: AllocsPerRun panics inside one, and measures process-wide mallocs, so it must
 // not run beside another test's goroutines.
 func TestStdioNegotiation_PinIsWrittenOnce(t *testing.T) {
@@ -632,6 +636,40 @@ func TestRevisionRefusal_NamesTheContextItWasRefusedOn(t *testing.T) {
 	}
 	if target, ok := rec["target"]; ok && target != "" {
 		t.Errorf("target = %q, want none — no policy evaluated this message, so naming one fabricates it", target)
+	}
+}
+
+// TestServerRequestPool_SaturationRefusalNamesTheSessionsRevision closes the one
+// server-initiated arm the leg's own stamp cannot reach: the pool refuses above it and returns,
+// so an established session's saturation refusals recorded no revision while every admitted
+// request on the same session recorded one — and on this tape an absent protocol_revision means
+// the record was written before any revision could be resolved.
+func TestServerRequestPool_SaturationRefusalNamesTheSessionsRevision(t *testing.T) {
+	t.Parallel()
+	rec := &fwdRecorder{}
+	var pool serverRequestPool
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	held := make(chan struct{}, maxConcurrentServerRequests)
+	dispatch := serverRequestDispatch{
+		rec: rec, sessionID: "sess", writeUpstream: func(mcp.RPCMsg) {},
+		handle:   func(context.Context, mcp.RPCMsg) { held <- struct{}{}; <-release },
+		revision: capability.Revision20260728,
+	}
+	for range maxConcurrentServerRequests {
+		pool.dispatch(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`)}, dispatch)
+	}
+	for range maxConcurrentServerRequests {
+		<-held // every slot is held before the refusal is attempted
+	}
+	pool.dispatch(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "roots/list"}, dispatch)
+
+	if len(rec.records) != 1 {
+		t.Fatalf("records = %+v, want the saturation refusal", rec.records)
+	}
+	if got := rec.records[0].revision; got != capability.Revision20260728 {
+		t.Errorf("protocol_revision = %q, want %q — this session negotiated one, and absence claims none was ever resolved",
+			got, capability.Revision20260728)
 	}
 }
 

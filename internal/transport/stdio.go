@@ -1290,6 +1290,7 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 		sessionID:     p.sessionID,
 		writeUpstream: func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) },
 		handle:        p.handleUpstreamRequest,
+		revision:      p.hostRevision(),
 	})
 }
 

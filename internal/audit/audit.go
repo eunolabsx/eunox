@@ -2248,7 +2248,15 @@ func deriveTargetFields(method, identifier string) (mcpMethod, targetType, targe
 		// pre-dispatch denials.
 		return BoundEnvelopeField(method), "", ""
 	}
-	return method, string(tt), BoundEnvelopeField(bareTargetName(tt, identifier))
+	target = BoundEnvelopeField(bareTargetName(tt, identifier))
+	if target == "" {
+		// A refusal taken with no policy decision behind it passes no identifier — a routing
+		// refusal, a saturation refusal, a revision refusal. Emitting the METHOD's target type
+		// beside no target at all asserts half a policy target for a call nothing matched, and
+		// the method field already says which method it was.
+		return method, "", ""
+	}
+	return method, string(tt), target
 }
 
 // auditEnvelopeFieldCap bounds attacker-controlled envelope string fields (Target

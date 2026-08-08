@@ -45,6 +45,9 @@ type fwdCapturedRecord struct {
 	approvalID    string
 	identifier    string
 	sessionID     string
+	// revision is read off the context the recorder was called with — the ONE carrier the real
+	// sink stamps protocol_revision from, so a test asserting on it exercises the same seam.
+	revision capability.Revision
 }
 
 type fwdRecorder struct {
@@ -83,9 +86,10 @@ func (f *fwdRecorder) RecordDeclassifiedAllow(_ context.Context, sessionID, iden
 	}
 }
 
-func (f *fwdRecorder) RecordDeny(_ context.Context, sessionID, identifier, _, denialCode, _ string, details map[string]interface{}, observe bool) {
+func (f *fwdRecorder) RecordDeny(ctx context.Context, sessionID, identifier, _, denialCode, _ string, details map[string]interface{}, observe bool) {
 	f.records = append(f.records, fwdCapturedRecord{
 		decision: "deny", code: denialCode, details: details, auditOnly: observe, identifier: identifier, sessionID: sessionID,
+		revision: capability.ProtocolRevisionFromContext(ctx),
 	})
 	if f.degradeOnRecord {
 		f.degraded = true
