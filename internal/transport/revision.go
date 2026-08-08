@@ -26,18 +26,15 @@ import (
 // body it describes.
 var errRevisionMismatch = errors.New("protocol revision disagrees with the context it arrived in")
 
-// errUnhonorableUpstreamDeclaration marks a request whose `_meta` revision declaration the
-// upstream leg cannot be given honestly.
+// errUnhonorableUpstreamRevision marks a request this proxy cannot forward at the revision it
+// resolved under.
 //
-// Params are forwarded VERBATIM — nothing strips or rewrites `_meta` — and every outbound
-// request carries eunox's own MCP-Protocol-Version naming the revision its leg negotiated. So
-// forwarding a declaration that names a different revision does not relay a mismatched pair,
-// it MANUFACTURES one: the same family of enforcement confusion errRevisionMismatch refuses on
-// the host leg, with a first-wins and a last-wins upstream resolving the request under
-// different method sets while eunox decided under a third. Rewriting the declaration to match
-// is translation, which the mismatched-pair boundary governs and this build does not do — so
-// the pair is refused instead, at the same gate and with the same code as its host-side twin.
-var errUnhonorableUpstreamDeclaration = errors.New("protocol revision declaration cannot be honored by the upstream leg")
+// Params are forwarded VERBATIM and every outbound request carries eunox's own
+// MCP-Protocol-Version, so dispatching under one revision and addressing the upstream as
+// another does not relay a mismatched pair, it MANUFACTURES one — the same family of
+// enforcement confusion errRevisionMismatch refuses on the host leg. Rewriting the request to
+// match is translation, which the mismatched-pair boundary governs and this build does not do.
+var errUnhonorableUpstreamRevision = errors.New("request revision cannot be honored by the upstream leg")
 
 // resolveHostRevision decides which revision one host message is dispatched under.
 //
@@ -49,63 +46,58 @@ var errUnhonorableUpstreamDeclaration = errors.New("protocol revision declaratio
 // a default, is ADR-0004's session-creation half and not this seam's to make.)
 //
 // legRev is the revision this proxy's UPSTREAM leg negotiated, or "" for a caller with no
-// upstream leg yet (the sessionless arms, whose messages reach no upstream). It is checked
-// only against an EXPLICIT declaration: omitting one leaves the body making no claim at all,
-// which is the posture eunox has always shipped and manufactures nothing.
+// upstream leg yet (the sessionless arms, whose messages reach no upstream). See
+// checkUpstreamHonorable for what it gates.
 func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg) (capability.Revision, error) {
 	declared, present, err := mcp.DeclaredRevision(msg.Params)
 	if err != nil {
 		return "", err
 	}
-	if !present {
-		if contextRev != "" {
-			return contextRev, nil
-		}
-		return capability.DefaultRevision, nil
-	}
-	if contextRev != "" && declared != contextRev {
+	resolved := declared
+	switch {
+	case !present && contextRev != "":
+		resolved = contextRev
+	case !present:
+		resolved = capability.DefaultRevision
+	case contextRev != "" && declared != contextRev:
 		return "", fmt.Errorf("%w: context negotiated %s, request declares %s", errRevisionMismatch, contextRev, declared)
 	}
-	// Asked here, on the one decode of `_meta` the whole gate does, and only for a method whose
-	// params actually travel: a declaration on a locally-answered method contradicts nothing,
-	// so refusing it would deny a message on the strength of a forward that never happens.
+	// Only for a method whose params actually travel: a request answered without contacting the
+	// upstream contradicts nothing there, so refusing it would deny a message on the strength of
+	// a forward that never happens.
 	if forwardsHostParams(msg.Method) {
-		if err := checkUpstreamHonorable(declared, legRev); err != nil {
+		if err := checkUpstreamHonorable(resolved, legRev); err != nil {
 			return "", err
 		}
 	}
-	return declared, nil
+	return resolved, nil
 }
 
-// checkUpstreamHonorable refuses a declaration this proxy cannot forward without contradicting
-// itself. Two comparisons, because two things the upstream reads carry a revision:
+// upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg. Every leg
+// is opened with `initialize`, a method only the handshake-bearing revision has, so that is
+// what eunox negotiated there whatever the leg itself reported or an operator pinned.
 //
-//   - legRev, what the leg's handshake settled on. A declaration naming anything else would be
-//     forwarded into a conversation held at another revision.
-//   - handshakeRevision, which is what the MCP-Protocol-Version header names on every
-//     post-handshake request, unconditionally: eunox opens every upstream leg with
-//     `initialize`, a method only the handshake-bearing revision has. An operator's
-//     protocolVersion pin does not change that opener, so on a leg pinned newer the two
-//     comparisons genuinely differ, and the header is the one the upstream reads beside the
-//     body. When an opener for a newer revision exists, the second comparison becomes
-//     redundant rather than wrong.
+// One expression, read by the header stamper and by the check below, so what is sent and what
+// is checked cannot drift — including on the day an opener for a newer revision lands.
+func upstreamAddressedRevision(_ capability.Revision) capability.Revision { return handshakeRevision }
+
+// checkUpstreamHonorable refuses a request this proxy cannot forward without contradicting
+// itself: one whose RESOLVED revision is not the one the upstream leg is addressed as.
 //
-// A leg with no revision yet ("") is checked against neither: there is nothing for the
-// declaration to disagree with, and refusing would deny a message on the strength of a fact
-// nobody has established.
-func checkUpstreamHonorable(declared, legRev capability.Revision) error {
+// Resolved, not declared. A declaration is only half of how a request acquires its revision —
+// the other half is inheriting the context, which a peer pins by declaring once on a method
+// that forwards nothing. Checking the declaration alone let that peer be dispatched under the
+// newer method table and forwarded anyway, on every later request that simply omitted it.
+//
+// A leg with no revision yet ("") is not checked: there is nothing to contradict, and refusing
+// would deny a message on the strength of a fact nobody has established.
+func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
 	if legRev == "" {
 		return nil
 	}
-	if declared != legRev {
-		return fmt.Errorf("%w: the upstream leg speaks %s, request declares %s",
-			errUnhonorableUpstreamDeclaration, legRev, declared)
-	}
-	// Reached only on a leg pinned to something the opener cannot negotiate, which is why the
-	// two comparisons are separate arms and say different things.
-	if declared != handshakeRevision {
-		return fmt.Errorf("%w: the upstream leg is addressed as %s, request declares %s",
-			errUnhonorableUpstreamDeclaration, handshakeRevision, declared)
+	if addressed := upstreamAddressedRevision(legRev); resolved != addressed {
+		return fmt.Errorf("%w: this proxy addresses its upstream leg as %s, request resolves to %s",
+			errUnhonorableUpstreamRevision, addressed, resolved)
 	}
 	return nil
 }
@@ -121,7 +113,7 @@ func revisionRefusalReason(err error) string {
 	// this proxy's own leg revisions). Anything else collapses to a fixed string rather than
 	// leaking an unreviewed message.
 	if errors.Is(err, errRevisionMismatch) || errors.Is(err, mcp.ErrUnknownRevision) ||
-		errors.Is(err, errUnhonorableUpstreamDeclaration) {
+		errors.Is(err, errUnhonorableUpstreamRevision) {
 		return err.Error()
 	}
 	return "protocol revision could not be established"

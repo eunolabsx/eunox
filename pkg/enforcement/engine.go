@@ -477,12 +477,10 @@ func SkipQuota(ctx context.Context) bool {
 // three call sites cannot drift into three slightly different answers where the narrowest
 // one silently forwards unredacted.
 //
-// It is also the ONE statement of the fact every [ConditionError.HardDeny] in this package is
-// justified by, so no site re-derives it: where this answers yes, the transport delivers the
-// call to the upstream and records the verdict instead of blocking. Two verdicts are exempt
-// there and neither is expressible here — a HardDeny, and a kill-switch denial (which carries
-// no HardDeny and is recognized by its CODE) — so this reports the POSTURE and the transport
-// owns the exemptions. That half is pinned by a test there
+// It reports the POSTURE only. WHICH refusals are exempt from the downgrade is a property of
+// the refusal, not of the route: [capability.DenialInfo.Downgradable] answers it from the
+// class the denial's code names (a revocation, an engine fault) plus the producer's explicit
+// HardDeny override, and nothing here can see either. That half is pinned by a test there
 // (TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny) rather than only asserted here:
 // a comment justifying a hard deny by a fact nothing checks becomes false silently.
 //
@@ -661,7 +659,9 @@ type evalCtx struct {
 }
 
 // auditOnly reports whether this decision's constraint is a per-constraint observe entry.
-func (ec evalCtx) auditOnly() bool { return ec.matched.IsAuditOnly() }
+// Nil-guarded like WillForwardDeny's own read: IsAuditOnly has a pointer receiver that
+// dereferences unconditionally, and this is now the one path every refusal builder takes.
+func (ec evalCtx) auditOnly() bool { return ec.matched != nil && ec.matched.IsAuditOnly() }
 
 // deny is denyResponse for a check that holds the decision, so it states only what is
 // specific to the refusal.
@@ -681,12 +681,13 @@ func (ec evalCtx) escalate(denial capability.DenialInfo) capability.EnforceRespo
 }
 
 // recordFailureDenial builds the fail-closed response returned when RecordSessionCall
-// cannot persist a marker. Attributed to sequenceBlock (the only feature the marker
-// backs), with a Details "phase":"record" marker distinguishing it from an actual hit.
-// auditOnly logs-and-forwards a transient recording failure under an audit-mode
-// constraint (an infrastructure fault, not a policy verdict). obligations MUST be
-// preserved: dropping them on a forwarded audit-mode response would leak fields the
-// manifest marked for redaction.
+// cannot persist a marker. Attributed to sequenceBlock (the only feature the marker backs),
+// with a Details "phase":"record" marker distinguishing it from an actual hit.
+//
+// It carries the FAULT code, so no posture forwards it: a marker that did not persist leaves
+// a later sequenceBlock Peek reading a falsely-absent antecedent, and there is no verdict to
+// downgrade to. obligations still ride it so a caller inspecting the response sees what would
+// have applied; nothing redacts, because nothing is forwarded.
 func recordFailureDenial(requestID, now string, auditOnly bool, obligations []capability.Obligation) capability.EnforceResponse {
 	return denyResponse(requestID, now, auditOnly, obligations, capability.DenialInfo{
 		Code:          capability.ErrCodeEnforcementError,
@@ -732,6 +733,11 @@ func denyResponse(requestID, now string, auditOnly bool, obligations []capabilit
 // consequential action the ceiling flagged. Leaving AuditOnly unset keeps it unforwardable.
 func escalateResponse(requestID, now string, denial capability.DenialInfo) capability.EnforceResponse {
 	denial.Details = BoundDenialDetails(denial.Details)
+	// Not a producer's bool to remember: an escalation is "a human has not approved this yet",
+	// so there is no posture on which forwarding it is the right answer. Leaving AuditOnly
+	// unset is NOT what keeps it unforwardable — isObserveDeny also fires on the route-level
+	// --audit flag, which no response field can see — so the block is set here, once.
+	denial.HardDeny = true
 	return capability.EnforceResponse{
 		RequestID: requestID,
 		Decision:  capability.DecisionEscalate,

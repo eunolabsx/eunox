@@ -46,20 +46,27 @@ func TestResolveHostRevision(t *testing.T) {
 		// JSON null needs its own case, since it takes a different path through the decoder.
 		{name: "explicit null revision inherits the context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, contextRev: capability.Revision20260728, want: capability.Revision20260728},
 		{name: "explicit null revision with no context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, want: capability.Revision20251125},
-		// The upstream leg. A declaration is forwarded VERBATIM beside a header naming the
-		// leg's own revision, so one the leg did not negotiate is refused rather than
-		// manufactured into a mismatched pair; an OMITTED one still inherits, since a body
-		// making no claim contradicts no header.
-		{name: "declared agreeing with the upstream leg", contextRev: capability.Revision20251125, legRev: capability.Revision20251125, declared: "2025-11-25", want: capability.Revision20251125},
-		{name: "declared disagreeing with the upstream leg", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", wantErr: errUnhonorableUpstreamDeclaration},
-		{name: "undeclared against a lagging upstream leg still inherits", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, want: capability.Revision20260728},
-		// A leg pinned newer than the opener: the MCP-Protocol-Version header still names the
-		// handshake revision, because eunox opens every leg with `initialize`. Honoring the pin
-		// alone would forward a body and a header naming different revisions.
-		{name: "declared matching a pin the opener cannot reach", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, declared: "2026-07-28", wantErr: errUnhonorableUpstreamDeclaration},
-		// A method answered without contacting the upstream carries its declaration nowhere, so
+		// The upstream leg. What a forwarded request must not contradict is the revision this
+		// proxy ADDRESSES its upstream as, which is the handshake revision on every leg eunox
+		// can open — not whatever the leg itself reported, which appears nowhere in the bytes
+		// sent.
+		{name: "resolving to the addressed revision", contextRev: capability.Revision20251125, legRev: capability.Revision20251125, declared: "2025-11-25", want: capability.Revision20251125},
+		{name: "resolving past the addressed revision", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", wantErr: errUnhonorableUpstreamRevision},
+		// The regression: an upstream that merely ANSWERS initialize with a newer version puts
+		// the leg there with no operator action. The host's declaration then agrees with both
+		// its own context and the header eunox stamps, so refusing it would kill every
+		// declaring host on that route for a pair that is consistent.
+		{name: "leg reported newer, request agrees with the header", contextRev: capability.Revision20251125, legRev: capability.Revision20260728, declared: "2025-11-25", want: capability.Revision20251125},
+		// An operator pin the opener cannot reach is the same shape: the pin does not change
+		// what the leg is addressed as, so a request resolving to it is still refused.
+		{name: "resolving to a pin the opener cannot reach", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, declared: "2026-07-28", wantErr: errUnhonorableUpstreamRevision},
+		// INHERITED, not declared: a peer pins the newer revision by declaring once on a method
+		// that forwards nothing, then omits the declaration forever after. Checking the
+		// declaration alone let exactly that request through.
+		{name: "inheriting a revision the leg is not addressed as", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, wantErr: errUnhonorableUpstreamRevision},
+		// A method answered without contacting the upstream carries its revision nowhere, so
 		// the leg has nothing to be contradicted by and the message resolves normally.
-		{name: "declared on a locally answered method", method: methodPing, contextRev: capability.Revision20251125, legRev: capability.Revision20251125, declared: "2025-11-25", want: capability.Revision20251125},
+		{name: "declared on a locally answered method", method: methodPing, contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", want: capability.Revision20260728},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -67,7 +67,7 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetForARemovedMethod(t *test
 	t.Parallel()
 	rec := &fwdRecorder{}
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodResourcesSubscribe}
-	gate := hostNotificationGate{rec: rec, subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+	gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
 	if gate.admit(revisionContext(capability.Revision20260728), msg) {
 		t.Fatal("a method the revision removed must be denied in notification framing too")
 	}

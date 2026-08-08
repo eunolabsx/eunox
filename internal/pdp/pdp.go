@@ -449,14 +449,6 @@ func killCheck(ctx context.Context, clock enforcement.Clock, ks killswitch.Check
 	return nil
 }
 
-// IsKillSwitchDenial reports whether a denial originated from the kill switch
-// (an active kill or a kill-store error). These are an operator emergency stop
-// and must hard-block even in audit (observe) mode, unlike policy denials, which
-// audit mode logs and forwards.
-func IsKillSwitchDenial(d *capability.DenialInfo) bool {
-	return d != nil && (d.Code == capability.ErrCodeKillSwitch || d.Code == capability.ErrCodeKillSwitchError)
-}
-
 // denyResponse builds a deny EnforceResponse. Like newAllowResponse it stamps a
 // fresh RequestID and RFC3339Nano DecidedAt — the audit-correlation fields the
 // engine stamps on every deny — so a PDP-layer deny is never structurally
@@ -491,6 +483,12 @@ func denyResponseWithDetails(clock enforcement.Clock, code, condType, message st
 			ConditionType: condType,
 			Message:       message,
 			Details:       enforcement.BoundDenialDetails(details),
+			// Derived from the class the code names, exactly as pkg/enforcement's own funnel
+			// does. Both layers must answer the same way: this package's eight readers of the
+			// raw bool are predicting what the transport will do, and the transport asks
+			// DenialInfo.Downgradable — so a fault-class refusal minted here with the bool unset
+			// would have the PDP commit session state for a call the transport then blocks.
+			HardDeny: capability.ClassifyDenialCode(code) != capability.DenialClassPolicy,
 		},
 	}
 }
@@ -1546,7 +1544,7 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 			var perr error
 			incoming, perr = engine.PeekSessionLabels(ctx, req)
 			if perr != nil {
-				deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed,
+				deny := hardDenyResponse(clock, capability.ErrCodeEnforcementError,
 					"audit-mode flow-label peek failed: "+perr.Error())
 				return &deny
 			}
@@ -1566,7 +1564,7 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 			if cerr.Flow {
 				msg = "audit-mode flow-label record failed: "
 			}
-			deny := hardDenyResponse(clock, capability.ErrCodeConditionFailed, msg+cerr.Error())
+			deny := hardDenyResponse(clock, capability.ErrCodeEnforcementError, msg+cerr.Error())
 			return &deny
 		}
 		if flowRelevant {

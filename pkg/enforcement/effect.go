@@ -357,9 +357,6 @@ func (e *Engine) checkEffectCeiling(ec evalCtx, eff *capability.ResolvedEffect, 
 		ConditionType: ceilingConditionType,
 		Message:       message,
 		Details:       details,
-		// Hard, same reason AuditOnly stays false: --audit must not turn "needs human
-		// approval" into "performed anyway, logged".
-		HardDeny: true,
 	})
 	return &resp
 }

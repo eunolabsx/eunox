@@ -1799,7 +1799,8 @@ before in the session.
 - **Recording** is fail-closed too. Every allowed call is written to session
   history (so any tool can later serve as an antecedent), and if the counter
   backend errors during that write, the call that triggered it is **denied**
-  (`CONDITION_FAILED`) rather than allowed. A swallowed write would leave the
+  (`ENFORCEMENT_ERROR` — a fault, not a policy verdict, so an observing route does not
+  downgrade it to a forward) rather than allowed. A swallowed write would leave the
   marker missing, and a later `sequenceBlock` lookup on that empty key would
   conclude the antecedent never ran and fail open — so a transient backend fault
   must not silently disarm the block. Because recording is indiscriminate, a

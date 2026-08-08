@@ -1113,7 +1113,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 // further requests would be Add-concurrent-with-Wait, a WaitGroup misuse that panics.
 func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg) (stop bool) {
 	gate := hostNotificationGate{
-		rec:         p.rec(),
+		rec:         p.rec,
 		subject:     verifiedSession(p.sessionID),
 		established: true,
 		errOut:      p.errOut(),

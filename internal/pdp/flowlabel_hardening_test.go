@@ -159,7 +159,8 @@ func TestFlowHardening_AuditModePeekFailsClosed(t *testing.T) {
 
 	require.NotNil(t, override, "a peek fault must hard-deny, not forward with unreliable flow state")
 	require.NotNil(t, override.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, override.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, override.Denial.Code,
+		"a store fault is not a policy verdict; the tape has to separate the two, and this is the code an observing route never downgrades")
 	assert.True(t, override.Denial.HardDeny, "the peek-fault deny must be non-downgradable even under audit")
 	assert.Contains(t, override.Denial.Message, "audit-mode flow-label peek failed")
 }

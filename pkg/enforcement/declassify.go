@@ -290,9 +290,6 @@ func (e *Engine) declassifyRefusal(ec evalCtx, carriedLabels, want []string, ext
 		ConditionType: declassifyConditionType,
 		Message:       message,
 		Details:       details,
-		// Hard, same reason the ceiling's escalation is: --audit must not downgrade this to a
-		// forward.
-		HardDeny: true,
 	})
 	resp.CarriedLabels = carriedLabels
 	return &resp

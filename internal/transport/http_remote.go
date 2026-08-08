@@ -530,14 +530,12 @@ func (s *httpSession) doRemoteHTTP(ctx context.Context, msg mcp.RPCMsg, sessID s
 
 // setNegotiatedVersionHeader stamps MCP-Protocol-Version on a post-handshake upstream request.
 //
-// The header names the revision the HANDSHAKE negotiated, and eunox opens every upstream leg
-// with `initialize` — a method only the handshake-bearing revision has — so that revision is
-// what this leg negotiated regardless of what either peer would prefer. rev is the leg's
-// pinned revision, carried so the newer revision's own per-request declaration can be emitted
-// here once an opener for it exists; until then it must not SUPPRESS the header, because
-// omitting it without emitting a replacement leaves the request with no version signal at
-// all, which a conformant upstream answers with 400 (including the terminating DELETE, whose
+// The value is upstreamAddressedRevision's, which the honorability check reads too — a request
+// this proxy refuses to forward and the header it would have forwarded it under must never be
+// two independent expressions. It must not be SUPPRESSED for a leg pinned newer: omitting the
+// header without emitting a replacement leaves the request with no version signal at all,
+// which a conformant upstream answers with 400 (including the terminating DELETE, whose
 // failure leaks the upstream session).
-func setNegotiatedVersionHeader(req *http.Request, _ capability.Revision) {
-	req.Header.Set("MCP-Protocol-Version", handshakeRevision.String())
+func setNegotiatedVersionHeader(req *http.Request, rev capability.Revision) {
+	req.Header.Set("MCP-Protocol-Version", upstreamAddressedRevision(rev).String())
 }

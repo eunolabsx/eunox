@@ -1553,8 +1553,9 @@ func TestAuditOnly_NoManifest_ForwardsAll(t *testing.T) {
 // kill is active the proxy returns a KILL_SWITCH JSON-RPC error to the host and
 // never contacts the upstream. The PDP- and BuildRoutes-level tests stop at the
 // decision; this one exercises the load-bearing forward.go observe gate
-// (!IsKillSwitchDenial && audit), which must hard-block rather than log-and-forward
-// the kill-switch denial even though the route is in audit mode.
+// (Downgradable() && audit — a revocation is not a policy verdict, so its class refuses the
+// downgrade), which must hard-block rather than log-and-forward the kill-switch denial even
+// though the route is in audit mode.
 func TestAuditOnly_WiretapRoute_Kill_HardBlocks(t *testing.T) {
 	t.Parallel()
 

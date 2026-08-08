@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"slices"
 	"sort"
 	"strings"
@@ -48,15 +51,16 @@ func TestMethodRegistry_EveryMethodDeclaresRevisionMembership(t *testing.T) {
 		if handler, _ := spec.handler(); handler == nil && spec.Notification == notifyUnmapped {
 			t.Errorf("method %q declares neither a handler nor a notification disposition, so it dispatches nowhere — delete the entry rather than leaving a no-op", method)
 		}
-		// A PDP-decided call IS the forward, so the declaration cannot disagree with the
-		// handler field. Left undeclared, the host's `_meta` revision declaration would be
-		// forwarded beside a header naming the leg's own revision with nothing refusing the
-		// pair — silently, since the method still dispatches.
-		if spec.Decide != nil && !spec.ForwardsHostParams {
-			t.Errorf("method %q is PDP-decided but does not declare ForwardsHostParams; an allow forwards the host's own params", method)
+		// forwardsHostParams derives the two halves the handler fields already answer, so what
+		// is left to check is that the remaining declaration is not claimed by a method whose
+		// handler cannot forward: LocalForwards on a Decide entry (redundant, and a sign the
+		// author thought the flag was load-bearing) or on an entry with no Local handler at
+		// all (a declaration about a handler that does not exist).
+		if spec.LocalForwards && spec.Local == nil {
+			t.Errorf("method %q declares LocalForwards but has no Local handler to forward from", method)
 		}
-		if spec.Notification == notifyForward && !forwardsHostParams(method) {
-			t.Errorf("method %q forwards its notification framing verbatim but forwardsHostParams says otherwise", method)
+		if spec.LocalForwards && spec.Decide != nil {
+			t.Errorf("method %q is PDP-decided, which already forwards; LocalForwards says nothing here", method)
 		}
 	}
 }
@@ -299,4 +303,83 @@ func metaParams(t *testing.T, version any, extra map[string]any) json.RawMessage
 func requestWithRevision(t *testing.T, id, method string, rev any) mcp.RPCMsg {
 	t.Helper()
 	return mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(fmt.Sprintf("%q", id)), Method: method, Params: metaParams(t, rev, nil)}
+}
+
+// TestMethodRegistry_EveryUpstreamForwardingLocalHandlerDeclaresIt closes the one direction
+// forwardsHostParams cannot derive.
+//
+// A Decide method forwards by definition and a notifyForward notification says so in its
+// disposition, so both halves are read off fields that already exist. A LOCAL handler that
+// forwards is invisible to the type system — dispatchList sends the host's request upstream
+// and filters the reply, dispatchPing and dispatchInitialize contact nothing — so it is the
+// one fact still declared by hand, and a forgotten declaration silently turns the
+// upstream-revision gate off for that method while it keeps dispatching.
+//
+// This walks the registry literal for Local handlers that reach the upstream and requires the
+// declaration, so the next */list-shaped method fails the build rather than review.
+func TestMethodRegistry_EveryUpstreamForwardingLocalHandlerDeclaresIt(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "dispatch.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parsing dispatch.go: %v", err)
+	}
+	// The registry is one composite literal keyed by method; each value is a methodSpec
+	// literal whose Local field holds the handler whose body is being inspected.
+	checked := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		var local ast.Expr
+		declared := false
+		for _, elt := range spec.Elts {
+			kv, isKV := elt.(*ast.KeyValueExpr)
+			if !isKV {
+				continue
+			}
+			key, isIdent := kv.Key.(*ast.Ident)
+			if !isIdent {
+				continue
+			}
+			switch key.Name {
+			case "Local":
+				local = kv.Value
+			case "LocalForwards":
+				declared = true
+			}
+		}
+		if local == nil {
+			return true
+		}
+		checked++
+		forwards := false
+		ast.Inspect(local, func(inner ast.Node) bool {
+			call, isCall := inner.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			// Either spelling of reaching the upstream from a Local handler: the shared
+			// list forwarder, or the raw call.
+			switch fn := call.Fun.(type) {
+			case *ast.Ident:
+				forwards = forwards || fn.Name == "dispatchList"
+			case *ast.SelectorExpr:
+				forwards = forwards || fn.Sel.Name == "callUpstream"
+			}
+			return true
+		})
+		if forwards && !declared {
+			t.Errorf("a Local handler at %s forwards the host's request upstream but its entry does not declare LocalForwards; the upstream-revision gate is off for that method",
+				fset.Position(local.Pos()))
+		}
+		if !forwards && declared {
+			t.Errorf("an entry at %s declares LocalForwards but its handler reaches no upstream", fset.Position(local.Pos()))
+		}
+		return true
+	})
+	if checked == 0 {
+		t.Fatal("no Local handlers found in the registry literal; the walk is not seeing what it claims to")
+	}
 }

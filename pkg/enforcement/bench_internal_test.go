@@ -22,8 +22,8 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
-	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
@@ -53,10 +53,23 @@ func benchPureConditions(n int) (conds []capability.Condition, args map[string]i
 	return conds, args
 }
 
-// benchEngine wires the counter every quota-carrying policy needs. In-memory so the
-// measurement is the engine's own work rather than a backend's.
+// benchCounter admits everything in constant time, so the cells below measure the ENGINE.
+//
+// The in-memory counter is not a stand-in for "no backend": it retains one timestamp per
+// admitted call and rescans the in-window slice on each admission, so a benchmark whose
+// budget never denies is quadratic in b.N — the reported ns/op then tracks -benchtime rather
+// than the code, and one cell ran ~14x its requested budget.
+type benchCounter struct{}
+
+func (benchCounter) IncrementAndGet(context.Context, string, int, int) (int64, error) { return 1, nil }
+func (benchCounter) Peek(context.Context, string, int) (int64, error)                 { return 0, nil }
+func (benchCounter) AdmitAll(context.Context, []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	return true, 0, 0, 0, nil
+}
+
+// benchEngine wires the constant-time counter every quota-carrying policy needs.
 func benchEngine() *Engine {
-	return New(WithCallCounter(callcounter.NewInMemory()))
+	return New(WithCallCounter(benchCounter{}))
 }
 
 // runValidateAction is the shared loop: an ALLOW every iteration, since a deny short-circuits
@@ -96,9 +109,10 @@ func BenchmarkValidateAction_PureConditions(b *testing.B) {
 }
 
 // BenchmarkValidateAction_PureAndCommitting adds the second pass: the same pure set plus one
-// quota-consuming condition, so the difference from the cell above is what deferral, bucket
-// derivation and the atomic admission cost. The window is long and the count high enough that
-// every iteration admits — a refused admission measures the deny path instead.
+// quota-consuming condition, so the difference from the cell above is what deferral and bucket
+// derivation cost the engine. The admission itself is constant-time here on purpose — see
+// benchCounter; measuring a backend's data structure would make the number a function of how
+// long the benchmark ran.
 func BenchmarkValidateAction_PureAndCommitting(b *testing.B) {
 	conds, args := benchPureConditions(4)
 	conds = append(conds, &capability.MaxCallsCondition{Count: 1 << 30, WindowSeconds: 3600})
@@ -120,7 +134,7 @@ func BenchmarkAnchoredKey(b *testing.B) {
 		req    *capability.EnforceRequest
 	}{
 		{"session anchored", benchEngine(), sessionReq},
-		{"task anchored", New(WithCallCounter(callcounter.NewInMemory()), WithTaskAnchoredState()), taskReq},
+		{"task anchored", New(WithCallCounter(benchCounter{}), WithTaskAnchoredState()), taskReq},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()

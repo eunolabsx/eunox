@@ -160,26 +160,29 @@ type methodSpec struct {
 	Local methodHandler
 	// Notification is the disposition of this method's notification framing.
 	Notification notificationDisposition
-	// ForwardsHostParams declares that this method sends the HOST's own params to the
-	// upstream — the fact the `_meta` revision declaration's honorability turns on, since a
-	// declaration only manufactures a mismatched pair when it actually travels beside the
-	// MCP-Protocol-Version header this proxy stamps. True for every Decide method (a
-	// PDP-decided call IS the forward) and for the */list methods, whose local handler
-	// forwards the request and filters the reply; false for the methods answered without
-	// contacting the upstream at all. Its agreement with the two handler fields is asserted
-	// by TestMethodRegistry_EveryMethodDeclaresRevisionMembership.
-	ForwardsHostParams bool
+	// LocalForwards declares that this method's LOCAL handler sends the host's own params to
+	// the upstream — the */list methods, whose handler forwards the request and filters the
+	// reply. The only half of forwardsHostParams the other fields cannot answer.
+	LocalForwards bool
 }
 
 // forwardsHostParams reports whether method's own params reach the upstream, in either
-// framing. Revision-independent on purpose: a method outside the peer's revision is denied
-// before it could forward anything, so the question is about the METHOD, not the table.
+// framing — the fact the request's revision has to be honorable for, since it only
+// manufactures a mismatched pair when it actually travels beside the MCP-Protocol-Version
+// header this proxy stamps.
+//
+// DERIVED from the handler fields rather than declared per method: a Decide entry added
+// without a hand-set flag would still dispatch and still forward with this gate silently off,
+// caught only by a registry test someone had to remember to write.
+//
+// Revision-independent on purpose: a method outside the peer's revision is denied before it
+// could forward anything, so the question is about the METHOD, not the table.
 func forwardsHostParams(method string) bool {
 	spec, known := methodRegistry[method]
 	if !known {
 		return false
 	}
-	return spec.ForwardsHostParams || spec.Notification == notifyForward
+	return spec.Decide != nil || spec.LocalForwards || spec.Notification == notifyForward
 }
 
 // handler returns the method's request handler and whether it is the enforced (Decide*) one.
@@ -209,29 +212,24 @@ var methodRegistry = map[string]methodSpec{
 	// Enforced (Decide*) methods. The resources/subscribe pair is 2025-11-25 only:
 	// 2026-07-28 replaces it with subscriptions/listen, which is not implemented yet.
 	capability.MethodToolsCall: {
-		In:                 []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Decide:             dispatchToolsCall,
-		ForwardsHostParams: true,
+		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide: dispatchToolsCall,
 	},
 	capability.MethodResourcesRead: {
-		In:                 []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Decide:             dispatchResourcesRead,
-		ForwardsHostParams: true,
+		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide: dispatchResourcesRead,
 	},
 	capability.MethodResourcesSubscribe: {
-		In:                 []capability.Revision{capability.Revision20251125},
-		Decide:             dispatchResourcesSubscribe,
-		ForwardsHostParams: true,
+		In:     []capability.Revision{capability.Revision20251125},
+		Decide: dispatchResourcesSubscribe,
 	},
 	capability.MethodResourcesUnsubscribe: {
-		In:                 []capability.Revision{capability.Revision20251125},
-		Decide:             dispatchResourcesUnsubscribe,
-		ForwardsHostParams: true,
+		In:     []capability.Revision{capability.Revision20251125},
+		Decide: dispatchResourcesUnsubscribe,
 	},
 	capability.MethodPromptsGet: {
-		In:                 []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Decide:             dispatchPromptsGet,
-		ForwardsHostParams: true,
+		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide: dispatchPromptsGet,
 	},
 
 	// Locally answered methods. initialize and ping are handshake/utility methods
@@ -255,24 +253,21 @@ var methodRegistry = map[string]methodSpec{
 		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
 		},
-		// The local handler forwards the host's request and filters the reply.
-		ForwardsHostParams: true,
+		LocalForwards: true,
 	},
 	capability.MethodToolsList: {
 		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
 		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterToolsList)
 		},
-		// The local handler forwards the host's request and filters the reply.
-		ForwardsHostParams: true,
+		LocalForwards: true,
 	},
 	capability.MethodPromptsList: {
 		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
 		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterPromptsList)
 		},
-		// The local handler forwards the host's request and filters the reply.
-		ForwardsHostParams: true,
+		LocalForwards: true,
 	},
 
 	// Notification-only methods. notifications/initialized closes a handshake 2026-07-28
@@ -440,7 +435,12 @@ func isEnforcedMethod(ctx context.Context, method string) bool {
 // gate itself — which checks run, and in what order — is not per-transport; see the package
 // gate order at the top of this file.
 type hostNotificationGate struct {
-	rec auditRecorder
+	// rec is a THUNK, not a recorder, for the same reason checkKill is one and then some: a
+	// pre-session leg's recorder is drawn from a rate-limit bucket, so resolving it for a
+	// message that records nothing spends a token on nothing — and an unauthenticated peer can
+	// send those at will, emptying the bucket that bounds the kill records an emergency stop
+	// depends on. Resolved only where a record is actually written.
+	rec func() auditRecorder
 	// subject names WHOSE session a record describes and whether this proxy can vouch for the
 	// name: a leg with a session supplies the id it established, a pre-session one the id the
 	// client claimed. See killSubject.
@@ -480,7 +480,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 		return false
 	}
 	if kill := g.checkKill(); kill != nil {
-		recordKillDrop(ctx, g.rec, kill, g.subject, msg.Method, msg.Method, g.leg)
+		recordKillDrop(ctx, g.rec(), kill, g.subject, msg.Method, msg.Method, g.leg)
 		return false
 	}
 	if swallowed {
@@ -491,8 +491,8 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 	// An enforced method framed as a notification (no id) is a fail-closed reject: forwarding
 	// it verbatim would bypass both the PDP decision and the audit record.
 	if _, enforced := tables.decide[msg.Method]; enforced {
-		if g.rec != nil {
-			g.rec.RecordDeny(ctx, g.subject.auditSessionID(), msg.Method, msg.Method, codeInvalidRequest, "", g.subject.auditDetails(nil), false)
+		if rec := g.rec(); rec != nil {
+			rec.RecordDeny(ctx, g.subject.auditSessionID(), msg.Method, msg.Method, codeInvalidRequest, "", g.subject.auditDetails(nil), false)
 		}
 		return false
 	}
@@ -510,8 +510,8 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 	if removedInRevision(requestRevision(ctx), msg.Method) {
 		identifier = ""
 	}
-	if g.rec != nil {
-		g.rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", g.subject.auditDetails(nil), false)
+	if rec := g.rec(); rec != nil {
+		rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", g.subject.auditDetails(nil), false)
 	}
 	_, _ = fmt.Fprintf(resolvedErrOut(g.errOut),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",

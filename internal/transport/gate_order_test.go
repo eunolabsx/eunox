@@ -251,7 +251,7 @@ func TestGateOrder_NotificationGateAppliesTheCanonicalOrder(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			gate := hostNotificationGate{
-				rec: rec, subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
+				rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
 				checkKill: func() *capability.EnforceResponse {
 					if tc.revoked {
 						return killed
@@ -487,6 +487,13 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 	}
 }
 
+// staticRecorder adapts a test recorder to the gate's rec THUNK. Production supplies a thunk
+// because a pre-session recorder costs a rate-limit token to resolve; a test recorder costs
+// nothing, so it is handed over as a constant.
+func staticRecorder(rec auditRecorder) func() auditRecorder {
+	return func() auditRecorder { return rec }
+}
+
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and
 // the one function allowed to call them. Every host message must reach revision negotiation
 // through a transport's negotiateHostRevision — the shared prologue — rather than through a
@@ -586,10 +593,13 @@ func TestGateOrder_SessionlessNotificationInheritsTheSharedGate(t *testing.T) {
 	}
 	proxy := newTestHTTPProxy()
 
+	// NO session header: that absence is what selects this arm. With one set, handleMCPPost
+	// routes to handleSessionPost's unknown-session branch instead, which produces an
+	// identically shaped record — so every assertion below would pass while testing the wrong
+	// code path (it did).
 	req := httptest.NewRequest(http.MethodPost, "/mcp",
 		strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
 	req.Header.Set("Content-Type", CTJSON)
-	req.Header.Set(SessionHeader, "a-session-this-proxy-never-established")
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, route)
 	_ = sink.Close()
@@ -605,8 +615,52 @@ func TestGateOrder_SessionlessNotificationInheritsTheSharedGate(t *testing.T) {
 		t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeKillSwitch)
 	}
 	// The gate's own subject rule, inherited rather than re-implemented: this arm resolved no
-	// session, so the client-supplied header must not be signed into session_id as fact.
+	// session, so nothing may be signed into session_id as fact.
 	if got, _ := rec["session_id"].(string); got != "" {
-		t.Errorf("session_id = %q, want empty — a pre-session record must not vouch for a claimed id", got)
+		t.Errorf("session_id = %q, want empty — a pre-session record must not vouch for a session", got)
+	}
+	// The discriminator between this arm and handleSessionPost's: only this one negotiates
+	// before recording, so only its record names the revision it decided under.
+	if got, _ := rec["protocol_revision"].(string); got != string(handshakeRevision) {
+		t.Fatalf("protocol_revision = %q, want %q — the record came from an arm that never negotiated, so this test is not exercising the sessionless gate", got, string(handshakeRevision))
+	}
+}
+
+// TestGateOrder_SessionlessNotificationSpendsNoKillRecordBudget pins the direction the shared
+// gate must NOT change: resolving the recorder is not free on a pre-session leg.
+//
+// preSessionKillRecorder draws from the catKill token bucket, which exists so an
+// unauthenticated flood cannot make the tape unbounded. Building the gate with the recorder
+// already resolved spent a token on every id-less `initialize` — a message that is 202-acked,
+// allocates nothing and records nothing — so a peer sending them faster than the bucket
+// refills could empty it and silence the pre-session KILL_SWITCH records an emergency stop
+// depends on. The recorder is a thunk for that reason, and this is what says so.
+func TestGateOrder_SessionlessNotificationSpendsNoKillRecordBudget(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink, upstream: "up1"},
+	}
+	proxy := newTestHTTPProxy()
+
+	// Comfortably more than the bucket's burst: if each one spends a token, nothing is left.
+	for range 25 {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
+		req.Header.Set("Content-Type", CTJSON)
+		w := httptest.NewRecorder()
+		proxy.handleMCPPost(w, req, route)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", w.Code)
+		}
+	}
+	// The budget must be untouched, so a real refusal still records.
+	if rec := proxy.preSessionKillRecorder(route); rec == nil {
+		t.Fatal("the kill-record budget was spent by notifications that recorded nothing; an unauthenticated flood can now silence the emergency stop's own records")
+	}
+	_ = sink.Close()
+	if recs := readAuditRecords(t, logPath); len(recs) != 0 {
+		t.Errorf("no kill was active, so nothing should have been recorded; got %d record(s)", len(recs))
 	}
 }

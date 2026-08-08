@@ -321,8 +321,14 @@ Section conventions:
   an unwired or failing call counter / flow-label store / session history, a backend answering
   nonconformingly, a committing handler's unauthorized skip, a failed state commit — now carry
   `ENFORCEMENT_ERROR` (`-32603`) instead of `CONDITION_FAILED` (`-32003`).
-  **Breaking:** a SIEM rule keyed on `CONDITION_FAILED` no longer sees engine faults, and
-  `eunox suggest` stops mining them as policy denials.
+  **Breaking, and worth reading twice:** a SIEM rule keyed on `CONDITION_FAILED` no longer sees
+  engine faults, and `eunox suggest` stops mining them as policy denials. The reclassification
+  also covers TRANSIENT backend faults — an unreachable Redis call counter or flow-label store
+  — so a route running `--audit` over a Redis-backed policy now blocks for the duration of a
+  failover where it previously logged and forwarded. That is deliberate (an unevaluable
+  restriction has no verdict to downgrade to, which is the rule this class exists to express),
+  but it is a real availability change for an observe-only deployment, and the mitigation is
+  the same as for enforce mode: run the backend the enforcement path depends on.
 - **The repaired-handler report names the contract, not only the handler.**
   `capability.EnforceResponse.HandlerFaults` was a `[]string` of condition types, stamped as
   `_eunox_handler_fault: ["maxCalls"]`. That is unambiguous exactly while one repairable

@@ -306,7 +306,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// silent readiness ack. The gate's verdict is a drop either way (nothing here has
 			// an upstream to forward to), so its answer is the ack below.
 			gate := hostNotificationGate{
-				rec:       p.preSessionKillRecorder(route),
+				rec:       func() auditRecorder { return p.preSessionKillRecorder(route) },
 				subject:   claimedSession(r),
 				errOut:    p.errOut(),
 				checkKill: func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, "") },
@@ -437,7 +437,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
 		gate := hostNotificationGate{
-			rec:         asRecorder(route.sink),
+			rec:         func() auditRecorder { return asRecorder(route.sink) },
 			subject:     verifiedSession(sessionID),
 			established: true,
 			errOut:      p.errOut(),
@@ -1062,11 +1062,16 @@ func (s *httpSession) leg() hostLeg {
 // This is the FIRST gate every host message passes — ahead of the kill check, deliberately;
 // see the gate order in dispatch.go for why, and for the one labelling exception it costs.
 //
-// ALL THREE of this transport's entry points call it — the established session, the
+// Every arm that DISPATCHES a host message calls it — the established session, the
 // session-creating `initialize`, and the id-less one — because the two sessionless arms
 // previously restated the same three lines each, and a restated gate is one that drifts: the
 // id-less arm did not negotiate at all until it was noticed, and recorded either the wrong
 // code or nothing while stdio recorded UNSUPPORTED_PROTOCOL_VERSION for the same bytes.
+//
+// handleSessionPost's unresolved-session arm is the one refusal that does not: it answers a
+// session id this proxy never established, so there is no context to negotiate against and it
+// records KILL_SWITCH with no revision. Named here rather than left for a reader to discover,
+// since the AST guard cannot see an arm that calls nothing.
 func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, leg hostLeg, msg mcp.RPCMsg) (capability.Revision, bool) {
 	rev, err := resolveHostRevision(leg.contextRev, leg.upstreamRev, msg)
 	if err == nil {

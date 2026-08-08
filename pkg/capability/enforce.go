@@ -143,9 +143,9 @@ type EnforceResponse struct {
 	// In-process only (json:"-"), like HardDeny: a decision artifact for the transport, not a
 	// wire field.
 	Effect *ResolvedEffect `json:"-"`
-	// HandlerFaults names the condition types whose registered handler broke an engine contract
-	// in a direction the engine REPAIRED. THE one statement of that repair, which every other
-	// site cites rather than re-derives:
+	// HandlerFaults names each registered handler that broke an engine contract in a direction
+	// the engine REPAIRED, and which contract it broke. THE one statement of that repair, which
+	// every other site cites rather than re-derives:
 	//
 	// The engine owns the only place a quota is consumed, so a handler that derives a bucket
 	// where the request authorizes no consumption is answered by dropping the bucket — the
