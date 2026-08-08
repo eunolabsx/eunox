@@ -1044,6 +1044,16 @@ Section conventions:
   fractional counted bound would otherwise deny silently in memory and fault the Redis
   script's retry pivot — the backend divergence that check exists to prevent).
 
+### Performance
+
+- **The condition dispatch resolves each handler once per request instead of twice.** The first
+  pass resolved a condition's registry entry to ask whether the type defers, then resolved it
+  again to run it — a redundant string-keyed map lookup and `ConditionType()` call per pure
+  condition, per request, plus a 64-byte entry copy for the one 16-byte field the callee reads.
+  The entry is looked up once and only its pure handler is handed down. Both fail-closed shapes
+  are kept distinct (an unknown type; an entry with no usable pure handler), since merging the
+  lookups must not merge those into one ambiguous cause.
+
 ### Fixed
 
 - **Redis Cluster is refused at the seam instead of denying on the first two-bucket policy.**
@@ -1117,11 +1127,13 @@ Section conventions:
   The engine owns the only consumption point, so this half is bookkeeping it can absorb: the
   bucket is dropped, nothing is consumed, and the call is decided exactly as a conforming
   handler's would have been. Absorbed is not silent — the condition types are named in
-  `capability.EnforceResponse.HandlerFaults` and the transport stamps them onto the allow
-  record's `details` under the reserved key `_eunox_handler_fault`, so the plugin bug is
-  visible to an operator without being charged to the caller. The mirror half is unchanged and
-  still hard-denies: a handler that skips unasked leaves the rest of the deferred set
-  unevaluated, and there is no verdict to fall back on.
+  `capability.EnforceResponse.HandlerFaults`, the transport stamps them onto whatever record
+  the decision produces under the reserved key `_eunox_handler_fault`, and `eunox stats` raises
+  them as an ATTENTION line. The report rides the DENY records too, because the posture that
+  produces a fault is the one that forwards a deny: an allow-only report would go missing for
+  exactly the constraints whose second condition denies, and for a call whose upstream then
+  failed. The mirror half is unchanged and still hard-denies: a handler that skips unasked
+  leaves the rest of the deferred set unevaluated, and there is no verdict to fall back on.
 
   The justification for that surviving `HardDeny` — "where `WillForwardDeny` answers yes, the
   transport forwards a downgradable verdict and blocks a hard one" — was restated about six
@@ -1130,12 +1142,13 @@ Section conventions:
   once, on `WillForwardDeny`, and pinned by a test in `internal/transport` that runs real
   engine verdicts through the real forward core for each arm of the union.
 
-- **`eunox` no longer pays two registry lookups per pure condition.** The first condition pass
-  resolved each condition's handler entry to ask whether the type defers, then resolved it
-  again to run it — a redundant string-keyed map lookup and `ConditionType()` call per pure
-  condition, per request. The entry is now looked up once and handed down. Both fail-closed
-  shapes are kept distinct (an unknown type; an entry with no usable pure handler), since
-  merging the lookups must not merge those into one ambiguous cause.
+- **A repaired handler fault no longer panics the engine at construction.** `dependsOn` asked
+  whether an entry commits with a bare nil check, three lines from the `commits` predicate that
+  exists because that test is unsafe for a typed nil — and the `SubsystemDependent` assertion
+  succeeds for one (the itab belongs to the type, not the value), so an embedder wiring an
+  unset handler crashed inside `enforcement.New` instead of reaching the fail-closed
+  `CONDITION_FAILED` the decision path promises for it. Both arms now apply the rule, and an
+  entry that cannot declare stays unclassified — every facility wired, the safe direction.
 - **The harden path applies a delegation chain to its verdict, not only to its obligations.**
   `HardenRefusal` composes this PDP's verdicts onto a refusal the JWT layer produced. Its
   obligation fill read the chain off the context and applied the chain's composed

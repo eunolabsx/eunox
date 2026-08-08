@@ -143,21 +143,25 @@ type EnforceResponse struct {
 	// In-process only (json:"-"), like HardDeny: a decision artifact for the transport, not a
 	// wire field.
 	Effect *ResolvedEffect `json:"-"`
-	// HandlerFaults names the condition types whose registered handler broke an engine
-	// contract in a direction the engine could REPAIR — the fault changed neither the verdict
-	// nor the state this call touched, so the decision stands and the fault is reported here
-	// instead of being charged to the caller as a denial.
+	// HandlerFaults names the condition types whose registered handler broke an engine contract
+	// in a direction the engine REPAIRED. THE one statement of that repair, which every other
+	// site cites rather than re-derives:
 	//
-	// A fault that changes the verdict is a denial and never an entry here: this field exists
-	// for exactly the case where refusing would be the engine punishing a caller for a plugin
-	// bug it had already absorbed. It rides an ALLOW only — a call refused below the repair
-	// records its own cause, which the absorbed fault did not contribute to.
+	// The engine owns the only place a quota is consumed, so a handler that derives a bucket
+	// where the request authorizes no consumption is answered by dropping the bucket — the
+	// outcome a conforming handler produces for that posture, so the call is decided exactly as
+	// it would have been. Refusing instead would charge a caller for a plugin's bug, and would
+	// do it on the one posture that reaches the fault at all, whose whole contract is that it
+	// never blocks. A fault the engine CANNOT repair (one that leaves a declared restriction
+	// unevaluated) is a denial, never an entry here.
 	//
-	// Nil on every call in a healthy deployment. The transport stamps a non-nil one onto the
-	// allow record so the bug is visible to an operator rather than silently tolerated, which
-	// is the whole reason absorbing it is not the same as ignoring it.
+	// Repaired is not tolerated: the transport stamps this onto the record so an operator sees
+	// the bug. It rides whatever record the decision produces, allow or deny — a fault is a
+	// fact about the decision, not about its verdict, and the posture that produces one is the
+	// posture where a deny is forwarded rather than blocking.
 	//
-	// In-process only (json:"-"), like the two fields above.
+	// Nil on every call in a healthy deployment. In-process only (json:"-"), like the two
+	// fields above.
 	HandlerFaults []string `json:"-"`
 }
 

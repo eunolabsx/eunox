@@ -389,16 +389,33 @@ func declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interfac
 	return detail
 }
 
-// handlerFaultDetail is the annotation for an allow whose decision absorbed a condition
-// handler's contract violation, or nil for the healthy call every deployment makes. The engine
-// repaired the fault rather than refusing the call (see capability.EnforceResponse.HandlerFaults),
-// so this record is the only place the plugin bug is reported at all — an absorbed fault that
-// reached nobody would be the silent tolerance the assertion exists to prevent.
+// handlerFaultDetail is the annotation for a decision that repaired a condition handler's
+// contract violation, or nil for the healthy call every deployment makes. The engine decided
+// the call as if the handler had conformed (see capability.EnforceResponse.HandlerFaults), so
+// the record is the only place the plugin bug is reported at all.
 func handlerFaultDetail(dec capability.EnforceResponse) map[string]interface{} {
 	if len(dec.HandlerFaults) == 0 {
 		return nil
 	}
 	return map[string]interface{}{audit.HandlerFaultKey: dec.HandlerFaults}
+}
+
+// decisionDetail is the annotation set EVERY record derived from a decision carries — the
+// declassification facts plus a repaired handler fault — and is one helper for the reason
+// declassifyRefusalDetail is: an exit that reports a decision-side fact nothing else records
+// must not be able to forget it by being written by hand. The posture that produces a fault is
+// the one that FORWARDS a deny, so "the refusal records its own cause" is not a substitute.
+//
+// The healthy path returns declassifyRefusalDetail's own map rather than a copy of it: that map
+// is already function-owned, and merging a nil annotation into it would allocate on every
+// declassifying call to add nothing.
+func decisionDetail(dec capability.EnforceResponse) map[string]interface{} {
+	decl := declassifyRefusalDetail(dec)
+	fault := handlerFaultDetail(dec)
+	if len(fault) == 0 {
+		return decl
+	}
+	return mergeAuditDetails(decl, fault)
 }
 
 // spentGrantDetail is the annotation for a call with nothing to clear but a burned single-use
@@ -627,7 +644,7 @@ func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, a
 	if !tripped {
 		return mcp.RPCMsg{}, false
 	}
-	detail = mergeAuditDetails(detail, declassifyRefusalDetail(dec))
+	detail = mergeAuditDetails(detail, decisionDetail(dec))
 	// detail carries discrete counts (dropped_count/write_failure_count); the prose
 	// reason is for the host-facing error and the stderr warning only, never the
 	// structured audit field.
@@ -688,7 +705,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 			// refusal exit is never silently unreported.
 			if fp.rec != nil {
 				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType,
-					mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), false)
+					mergeAuditDetails(denial.Details, decisionDetail(dec)), false)
 			}
 			return denialResult(msg.ID, denial.Code, denial.ConditionType, denialTarget, denialArgument(denial))
 		}
@@ -712,7 +729,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	if observe {
 		// The same declassify merge the hard-deny arm makes: no exit below the decision may
 		// silently fail to report a spent grant.
-		observeDetail := mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec))
+		observeDetail := mergeAuditDetails(denial.Details, decisionDetail(dec))
 		warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 			if fp.rec != nil {
 				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, observeDetail, true)
@@ -737,7 +754,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		// The declassification is likewise NOT committed here: keeping a label for a call
 		// that may have run over-blocks (resolved with another approval), while clearing it
 		// for a call that did NOT run silently admits the egress the label exists to stop.
-		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method, declassifyRefusalDetail(dec))
+		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method, decisionDetail(dec))
 	}
 
 	// Apply post-allow obligations (redactFields) before the response reaches the host. Only
@@ -753,7 +770,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 			// The third exit below the decision, and the only one the upstream may have
 			// ANSWERED before it was taken. declassifyRedactionDetail decides what the record
 			// may CLAIM about that reply (see its doc).
-			redactDetail := declassifyRedactionDetail(dec, upResp)
+			redactDetail := mergeAuditDetails(declassifyRedactionDetail(dec, upResp), handlerFaultDetail(dec))
 			warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
@@ -792,8 +809,9 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// a PDP that stamps a handle on a deny).
 	if dec.Decision == capability.DecisionAllow && declassifyCommitted(upResp) {
 		labelsCleared, declDetail = commitDeclassify(ctx, fp.errOutOrStderr(), committer, fp.sessionID, dec, kind, denialTarget)
+		declDetail = mergeAuditDetails(declDetail, handlerFaultDetail(dec))
 	} else {
-		declDetail = declassifyRefusalDetail(dec)
+		declDetail = decisionDetail(dec)
 	}
 	// The commit was the last thing that had to be inside the decision turn, so release it
 	// HERE rather than at handler return — the audit enqueue and response write that follow
@@ -813,9 +831,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		// Through mergeAuditDetails, never a write into allowDetails' return: the tools/call
 		// closure's base under --audit is the caller's live parsed argument map, so writing
 		// into whatever that chain hands back would rewrite the request being described.
-		// The annotations are folded together FIRST and merged in once, so a healthy call —
-		// both nil — pays no second copy of the caller's argument map.
-		details := mergeAuditDetails(allowDetails(upResp), mergeAuditDetails(declDetail, handlerFaultDetail(dec)))
+		details := mergeAuditDetails(allowDetails(upResp), declDetail)
 		// A call that CLEARED flow labels takes the recorder that carries the approval; every
 		// other call takes the plain one. The branch is on what the commit actually CHANGED,
 		// not on what was authorized — a no-op clear would otherwise record an approver for a
@@ -1060,7 +1076,7 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 	// Record BEFORE replying to the upstream (record-before-act), matching the other legs, so
 	// a crash between the two can't leave the upstream answered with no matching record.
 	fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeAuditUnavailable, "",
-		mergeAuditDetails(detail, declassifyRefusalDetail(dec)), false)
+		mergeAuditDetails(detail, decisionDetail(dec)), false)
 	fp.writeUpstream(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, capability.ErrCodeAuditUnavailable))
 	warnStrictAuditOnce(fp.errOutOrStderr(), fp.strictAuditWarned, reason)
 	return true
@@ -1076,25 +1092,23 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 //
 // dec supplies the record's flow fields and, when a clear changed something, the
 // declassification's signed triple. The non-sampling leg passes the zero decision (commits no
-// clear today). declDetail carries the annotations for a clear that did not land.
-func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method string, delivered, auditOnly bool, dec capability.EnforceResponse, cleared []string, declDetail map[string]interface{}) {
+// clear today). detail carries the decision-side annotations (decisionDetail): a clear that did
+// not land, and a repaired handler fault.
+func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method string, delivered, auditOnly bool, dec capability.EnforceResponse, cleared []string, detail map[string]interface{}) {
 	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, method, func() {
 		if fp.rec == nil {
 			return
 		}
 		if !delivered {
-			fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeEnforcementError, "", declDetail, false)
+			fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeEnforcementError, "", detail, false)
 			return
 		}
-		// The absorbed-fault annotation rides the two ALLOW arms only, as it does on the
-		// host-facing leg: the deny above records its own cause, which the fault did not cause.
-		allowDetail := mergeAuditDetails(declDetail, handlerFaultDetail(dec))
 		if len(cleared) > 0 {
-			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, method, method, allowDetail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels,
+			fp.rec.RecordDeclassifiedAllow(ctx, fp.sessionID, method, method, detail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels,
 				cleared, dec.Declassification.Approver(), dec.Declassification.ApprovalID())
 			return
 		}
-		fp.rec.RecordAllow(ctx, fp.sessionID, method, method, allowDetail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
+		fp.rec.RecordAllow(ctx, fp.sessionID, method, method, detail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
 	})
 }
 
@@ -1171,7 +1185,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// Carry the sampling decision's flow labels onto the tape, or the tape and state
 		// disagree for the sampling leg. declassifyRefusalDetail names a burned grant if one
 		// ever reaches this leg, at no cost otherwise.
-		fp.recordForwardOutcome(ctx, samplingMethod, delivered, fp.audit, dec, nil, declassifyRefusalDetail(dec))
+		fp.recordForwardOutcome(ctx, samplingMethod, delivered, fp.audit, dec, nil, decisionDetail(dec))
 		return
 	}
 
@@ -1188,7 +1202,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			// Pass denial.Details: a flowLabel deny on system:sampling names the blocked
 			// provenance class there, which dropping details would leave absent from the tape.
 			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
-				mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), false)
+				mergeAuditDetails(denial.Details, decisionDetail(dec)), false)
 		}
 		fp.writeUpstream(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code))
 		return
@@ -1205,7 +1219,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// Carry denial.Details here too: the would-be flowLabel deny's blocked label must
 		// reach the tape.
 		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
-			mergeAuditDetails(denial.Details, declassifyRefusalDetail(dec)), true)
+			mergeAuditDetails(denial.Details, decisionDetail(dec)), true)
 	}
 	_, _ = fmt.Fprintf(fp.errOutOrStderr(),
 		"[eunox] AUDIT: sampling/createMessage would be denied (%s) — forwarding (audit mode)\n",
@@ -1217,5 +1231,5 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	//
 	// No commit: a downgraded deny is still a deny, and untainting on one would drop a label
 	// for a call policy refused (the same rule enforcedForwardCore's DecisionAllow gate states).
-	fp.recordForwardOutcome(ctx, samplingMethod, delivered, true, dec, nil, declassifyRefusalDetail(dec))
+	fp.recordForwardOutcome(ctx, samplingMethod, delivered, true, dec, nil, decisionDetail(dec))
 }

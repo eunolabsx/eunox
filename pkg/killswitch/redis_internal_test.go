@@ -615,6 +615,15 @@ func TestRedis_KillAndReviveAgent(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, blocked)
 
+	// A kill blocks the id it NAMES and no other. Asserted here rather than left to the
+	// cross-backend table, which cannot state it more precisely than this: without it, a
+	// membership test degraded to "is anything killed?" blocks the whole fleet on one
+	// `eunox kill --agent`, and every other Redis case still passes (each either starts from an
+	// empty kill set or queries the agent it just killed).
+	blocked, err = r.ShouldBlock(ctx, "agent-other", "")
+	require.NoError(t, err)
+	assert.False(t, blocked, "killing one agent must not block an unrelated one")
+
 	require.Eventually(t, func() bool {
 		r.mu.RLock()
 		defer r.mu.RUnlock()

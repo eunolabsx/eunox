@@ -111,7 +111,12 @@ type auditStatsSummary struct {
 	declassifyResultWithheld int
 	// spentApprovals counts single-use grants this log shows being burned — the
 	// reconciliation signal for "which of my outstanding one-shot approvals are still live?".
-	spentApprovals  int
+	spentApprovals int
+	// handlerFaults counts records naming a condition handler whose contract violation the
+	// engine repaired. It is the ONLY operator-visible trace of that repair — the call was
+	// decided exactly as a conforming handler's would have been — so a run that never surfaces
+	// it is the silent tolerance the report exists to prevent.
+	handlerFaults   int
 	other           int // records with a decision outside "allow" | "deny" | "escalate"
 	blockedDenials  map[denialKey]int
 	observedDenials map[denialKey]int
@@ -148,6 +153,7 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 			continue
 		}
 		out.addDeclassifyDetails(line)
+		out.addHandlerFaultDetails(line)
 		switch rec.Decision {
 		case "allow":
 			out.allowed++
@@ -216,6 +222,28 @@ func (s *auditStatsSummary) addDeclassifyDetails(line []byte) {
 	}
 }
 
+// handlerFaultProbe is addHandlerFaultDetails' pre-filter, derived from the producer's own key
+// so the two cannot drift — the same shape declassifyProbe uses, and for the same reason: the
+// caller's whole argument map must not be decoded on every record to answer a rare question.
+var handlerFaultProbe = []byte(audit.HandlerFaultKey)
+
+// addHandlerFaultDetails tallies records reporting a repaired condition-handler fault. A miss
+// reads as "no fault", the direction that under-reports rather than inventing an alert.
+func (s *auditStatsSummary) addHandlerFaultDetails(line []byte) {
+	if !bytes.Contains(line, handlerFaultProbe) {
+		return
+	}
+	var rec struct {
+		Details map[string]json.RawMessage `json:"details"`
+	}
+	if err := json.Unmarshal(line, &rec); err != nil {
+		return
+	}
+	if _, ok := rec.Details[audit.HandlerFaultKey]; ok {
+		s.handlerFaults++
+	}
+}
+
 // printAuditStats renders the bucketed summary in two tables — BLOCKED (enforced)
 // and OBSERVED (audit-mode, call forwarded) — so an audit-mode denial is never
 // mistaken for a block.
@@ -237,6 +265,15 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 	}
 	if s.declassified > 0 {
 		wf("  (declassified = %d allow(s) cleared a flow label under a human approval; every one names its approver in the record.)\n", s.declassified)
+	}
+	// An ATTENTION line for the same reason the declassification one is: it names a
+	// deployment fault an operator must act on, and it would otherwise be a raw JSONL key
+	// nobody greps for. A repaired call looks like every other call on this summary.
+	if s.handlerFaults > 0 {
+		wf("\n  ATTENTION: %d record(s) name a condition handler that broke the engine's commit contract\n", s.handlerFaults)
+		wln("  (a registered handler derived a quota bucket on a request that authorizes no consumption; eunox dropped the")
+		wln("   bucket and decided the call as a conforming handler would, so nothing was charged and nothing was blocked —")
+		wf("   but the handler is buggy and its budget is NOT being predicted by this run. details.%s names each condition type.)\n", audit.HandlerFaultKey)
 	}
 	// FIRST among the declassification notes: means a session is not in the state the
 	// policy describes — the approved clear did not land, so taint remains.

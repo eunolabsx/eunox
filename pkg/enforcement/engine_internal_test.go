@@ -536,6 +536,8 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 //	             half: under an observe request a handler must skip or commit nothing)
 //	Count == 8 → reports skip AND hands back the bucket it prepared (belt-and-braces:
 //	             states the outcome observe requires, so the skip decides)
+//	Count == 99 → reports skip AND a validation error at once (PrepareCommit's contract puts
+//	             no exclusion between the two)
 //	otherwise  → skips under SkipQuota, commits otherwise (the well-behaved case)
 type sentinelCommitHandler struct{}
 
@@ -704,8 +706,11 @@ func TestCommitDeferredAtomic_AbsorbedFaultYieldsToARealVerdict(t *testing.T) {
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
 		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
 	}
-	if resp.HandlerFaults != nil {
-		t.Errorf("HandlerFaults = %v, want nil: the report rides an allow, and this call was refused on its own cause", resp.HandlerFaults)
+	// The verdict is the later condition's, and the fault is still reported: on this posture
+	// the deny is downgraded and FORWARDED, so a report that rode the allow alone would go
+	// missing for exactly the constraints whose second condition denies.
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != capability.ConditionTypeMaxCalls {
+		t.Errorf("HandlerFaults = %v, want [%s] on the deny too", got, capability.ConditionTypeMaxCalls)
 	}
 }
 
