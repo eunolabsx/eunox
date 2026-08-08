@@ -128,11 +128,38 @@ func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.E
 	return denialResult(id, denial.Code, denial.ConditionType, method, "")
 }
 
-// methodLabelServerResponse names a HOST RESPONSE on the audit tape. A response carries no
-// method, and an empty method field names nothing an operator can correlate on, so every arm
-// that records one uses this label — which is also what keeps it distinguishable from the
-// notification drop sites that DO carry a method.
-const methodLabelServerResponse = "server-response"
+// Fixed labels for the two host framings that carry no method of their own. An empty method
+// field names nothing an operator can correlate on, and deriveTargetFields collapses a record
+// with no method to no target fields at all.
+const (
+	methodLabelServerResponse = "server-response"
+	// methodLabelUnframed covers a message that is neither request, notification nor response
+	// (no id AND no method). Both serve loops discard it, but a gate ahead of that discard can
+	// still record one.
+	methodLabelUnframed = "unframed-message"
+)
+
+// auditIdentity names a message on the tape for a refusal taken with no policy decision behind
+// it: the identifier such a record may honestly claim, and the method field beside it.
+//
+// ONE answer for every such refusal, because the two halves are one question. The identifier is
+// dropped for a method that RESOLVES a target type — the sink derives target_type/target from
+// it, so recording `resources/subscribe` stamps a resource literally named after the method
+// onto the signed tape, and a notification-framed `tools/list` stamps a tool. It survives only
+// where it fabricates nothing, which is also the only case it is the sole place the name
+// reaches an operator.
+func auditIdentity(msg mcp.RPCMsg) (identifier, method string) {
+	switch {
+	case msg.IsResponse():
+		return methodLabelServerResponse, methodLabelServerResponse
+	case msg.Method == "":
+		return methodLabelUnframed, methodLabelUnframed
+	}
+	if _, resolvesTarget := capability.MethodTargetType(msg.Method); resolvesTarget {
+		return "", msg.Method
+	}
+	return msg.Method, msg.Method
+}
 
 // killDropLeg identifies the transport leg a recordKillDrop call site drops a message on,
 // stamped into the audit detail so an operator can distinguish drop sites during an incident.
@@ -944,13 +971,9 @@ type serverRequestParams struct {
 	// re-placed, which is how this leg came to record every sampling decision on a negotiated
 	// session as though no revision had been resolved.
 	//
-	// Empty means the host context has not PINNED one, which is not the same as "none was
-	// resolved": a message can resolve a revision, be recorded under it, and still not pin,
-	// because the proxy discarded it (see dispatchesMessage). So the empty value is resolved
-	// through resolveRevision rather than left absent — the same rule requestRevision applies on
-	// the host leg, so both legs of one session name the surface it is actually routed by. The
-	// cost is deliberate: a record can name a revision the peer never declared, exactly as the
-	// host leg's already does for an undeclared message.
+	// Empty means the host context has not PINNED one, which is NOT "none was resolved" — a
+	// message can resolve a revision, be recorded under it, and still not pin because the proxy
+	// discarded it. So it is resolved through resolveRevision rather than left absent.
 	revision      capability.Revision
 	forward       func(mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)

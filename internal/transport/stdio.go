@@ -1218,21 +1218,19 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
 // serveHost, the single goroutine that owns the pin.
 func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (context.Context, bool) {
-	rev, err := resolveHostRevision(p.hostRevision(), p.upstreamRev, msg)
+	pinned := p.hostRevision()
+	rev, err := resolveHostRevision(pinned, p.upstreamRev, msg)
 	if err != nil {
-		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, msg, err)
+		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, pinned, msg, err)
 		if msg.IsRequest() {
 			_ = p.hostWriter.Write(resp)
 		}
 		return ctx, false
 	}
-	// Guarded on the pin being UNSET, not merely idempotent. The pin is write-once by
-	// construction — resolveHostRevision above guarantees rev equals the pinned value once there
-	// is one, since a disagreeing declaration took the early return — so after the first pinning
-	// message both the predicate and the Store re-answer a question whose answer cannot change.
-	// Neither is free: the Store boxes a string-kind value through runtime.convTstring (an
-	// allocation per host message) and dirties the cache line every dispatchParams read touches.
-	if p.hostRevision() == "" && dispatchesMessage(rev, msg) {
+	// Guarded on the pin being UNSET. It is write-once by construction — resolveHostRevision
+	// above returns early unless rev equals the pinned value — so re-answering the predicate and
+	// re-Storing costs a runtime.convTstring boxing per host message for no effect.
+	if pinned == "" && dispatchesMessage(rev, msg) {
 		p.hostRev.Store(rev)
 	}
 	return capability.WithProtocolRevision(ctx, rev), true

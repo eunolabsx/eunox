@@ -132,7 +132,7 @@ func TestRefuseHostRevision_EmitsSpecCodeAndRecords(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unknown declared revision must not resolve")
 	}
-	resp := refuseHostRevision(context.Background(), rec, "sess-1", msg, err)
+	resp := refuseHostRevision(context.Background(), rec, "sess-1", "", msg, err)
 	if resp.Error == nil || resp.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
 		t.Fatalf("response error = %+v, want code %d", resp.Error, capability.JSONRPCCodeUnsupportedProtocolVersion)
 	}
@@ -166,7 +166,7 @@ func TestRefuseHostRevision_NotificationGetsNoReply(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unknown declared revision must not resolve")
 	}
-	resp := refuseHostRevision(context.Background(), rec, "sess-1", notif, err)
+	resp := refuseHostRevision(context.Background(), rec, "sess-1", "", notif, err)
 	if resp.Error != nil || resp.ID != nil || resp.JSONRPC != "" {
 		t.Errorf("a notification refusal must produce no reply, got %+v", resp)
 	}

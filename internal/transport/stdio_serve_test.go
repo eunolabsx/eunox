@@ -187,9 +187,10 @@ func serveHostMessages(t *testing.T, cfg stdioServe, msgs ...mcp.RPCMsg) (*Stdio
 // The host's stdin stays open, so the loop ends only when the caller stops it.
 type stdioRun struct {
 	proxy *StdioProxy
-	host  *mockHostWriter
 	stop  context.CancelFunc
 	done  <-chan struct{}
+	// No host writer: a mid-flight run's replies must be AWAITED (stdioServe.hostSink), never
+	// read off a slice the serve goroutine is still appending to.
 }
 
 // finish cancels the serve context and waits for the loop, so a test never leaves a goroutine
@@ -212,14 +213,14 @@ func serveHostRunning(t *testing.T, cfg stdioServe, msgs ...mcp.RPCMsg) stdioRun
 	t.Helper()
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close() })
-	p, hw := newStdioProxy(cfg, pr)
+	p, _ := newStdioProxy(cfg, pr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	done := make(chan struct{})
 	go func() { p.serveHost(ctx); close(done) }()
 	go writeHostLines(pw, encodeHostLines(t, msgs), false)
-	return stdioRun{proxy: p, host: hw, stop: cancel, done: done}
+	return stdioRun{proxy: p, stop: cancel, done: done}
 }
 
 // encodeHostLines renders messages as the JSON lines the host reader is fed.

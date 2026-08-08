@@ -100,7 +100,7 @@ func TestOldRevisionWire_RefusalIsByteStable(t *testing.T) {
 	if err == nil {
 		t.Fatal("a revision this build does not speak must not resolve")
 	}
-	if werr := mcp.NewMsgWriter(&buf).Write(refuseHostRevision(context.Background(), nil, "sess", msg, err)); werr != nil {
+	if werr := mcp.NewMsgWriter(&buf).Write(refuseHostRevision(context.Background(), nil, "sess", capability.Revision20251125, msg, err)); werr != nil {
 		t.Fatalf("write refusal: %v", werr)
 	}
 	const want = `{"jsonrpc":"2.0","id":9,"error":{"code":-32022,"message":"UNSUPPORTED_PROTOCOL_VERSION: mcp: unsupported protocol revision: \"1999-01-01\"","data":{"code":"UNSUPPORTED_PROTOCOL_VERSION","supported":["2025-11-25","2026-07-28"]}}}`

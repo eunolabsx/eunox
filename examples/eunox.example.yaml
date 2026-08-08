@@ -7,10 +7,13 @@
 # binary archive; pointing eunox at it makes it fail closed at startup ("looks
 # like a ZIP archive … not a text config").
 #
-# This starts in AUDIT (observe-only) mode: every call is forwarded and recorded, and
-# nothing is blocked — so you need no policy manifest to begin. Run the agent for
-# a session, inspect what it did with `eunox stats`, then add a `policy:` and
-# flip `enforcement: enforce` once you know what to allow.
+# This starts in AUDIT (observe-only) mode: every call eunox can route is forwarded
+# and recorded, and POLICY blocks nothing — so you need no policy manifest to
+# begin. (Observe mode downgrades a policy verdict; the kill switch and a message
+# eunox cannot route at all have none, so those still refuse — see "What observe
+# mode does not downgrade" in docs/client-integration.md.) Run the agent for a
+# session, inspect what it did with `eunox stats`, then add a `policy:` and flip
+# `enforcement: enforce` once you know what to allow.
 schemaVersion: "0.1"
 transport: stdio                       # speak MCP to Claude Desktop over stdin/stdout
 audit:

@@ -634,15 +634,11 @@ func (m *mockUpstreamWriter) Write(msg mcp.RPCMsg) error {
 // writers so we can capture what's written without starting real processes.
 func newStdioProxyForSamplingTest(t *testing.T, dp pdp.PolicyDecisionPoint) (*StdioProxy, *mockHostWriter, *mockUpstreamWriter) {
 	t.Helper()
-	hw := &mockHostWriter{}
 	uw := &mockUpstreamWriter{}
-
-	p := &StdioProxy{
-		pdp:        dp,
-		sessionID:  "test-sess",
-		hostWriter: mcp.NewMsgWriter(&writerAdapter{hw}),
-		upWriter:   mcp.NewMsgWriter(&writerAdapter{uw}),
-	}
+	// The shared fixture, so this scaffold inherits every field Start sets — upstreamRev above
+	// all: without it checkUpstreamHonorable returns nil unconditionally, and the sampling
+	// round trip below is the one test that drives a real host RESPONSE through serveHost.
+	p, hw := newStdioProxy(stdioServe{pdp: dp, sessionID: "test-sess", upSink: uw}, strings.NewReader(""))
 	return p, hw, uw
 }
 

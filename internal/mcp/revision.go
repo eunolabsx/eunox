@@ -23,6 +23,11 @@ import (
 // request arrived in.
 var ErrUnknownRevision = errors.New("mcp: unsupported protocol revision")
 
+// ErrConflictingRevision marks a message declaring a revision in more than one member. Two
+// declarations are two claims; picking either is a guess, and the peer already has one way to
+// state its revision.
+var ErrConflictingRevision = errors.New("mcp: protocol revision declared in more than one member")
+
 // maxReflectedRevisionLen bounds how much of a rejected version string is echoed back to the
 // peer. The value reaches the error precisely BECAUSE it failed the closed-set match, so it
 // is arbitrary caller text up to the transport's whole frame — reflecting it unbounded would
@@ -87,6 +92,36 @@ func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared
 		return "", true, fmt.Errorf("%w: %q", ErrUnknownRevision, boundReflected(version))
 	}
 	return parsed, true, nil
+}
+
+// DeclaredRevisionOf reads msg's declaration from every member whose bytes travel to the peer
+// this message is relayed to — which is NOT the same member for every framing.
+//
+// A request or notification declares in `params`. A RESPONSE has no params at all: MCP puts a
+// result's metadata in `result._meta`, and a response is the one framing a proxy relays
+// verbatim, so reading only `params` there sees nothing while the declaration reaches the
+// upstream unread. That was the whole hole a per-framing honorability gate was supposed to
+// close; a gate that is framing-aware over a reader that is not closes nothing.
+//
+// A response's `params` is checked too, even though no conforming client sends one: an
+// RPCMsg re-marshals whatever it decoded, so those bytes travel as well. Declaring in both and
+// disagreeing is refused rather than resolved.
+func DeclaredRevisionOf(msg RPCMsg) (rev capability.Revision, declared bool, err error) {
+	fromParams, inParams, err := DeclaredRevision(msg.Params)
+	if err != nil || !msg.IsResponse() {
+		return fromParams, inParams, err
+	}
+	fromResult, inResult, err := DeclaredRevision(msg.Result)
+	switch {
+	case err != nil:
+		return "", inResult, err
+	case inParams && inResult && fromParams != fromResult:
+		return "", true, fmt.Errorf("%w: params declares %s, result declares %s", ErrConflictingRevision, fromParams, fromResult)
+	case inResult:
+		return fromResult, true, nil
+	default:
+		return fromParams, inParams, nil
+	}
 }
 
 // boundReflected truncates a rejected version string to what is safe to echo back to the peer

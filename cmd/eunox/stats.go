@@ -12,7 +12,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -116,7 +118,12 @@ type auditStatsSummary struct {
 	// engine repaired. It is the ONLY operator-visible trace of that repair — the call was
 	// decided exactly as a conforming handler's would have been — so a run that never surfaces
 	// it is the silent tolerance the report exists to prevent.
-	handlerFaults   int
+	handlerFaults int
+	// unroutable counts eunox's OWN routing refusals per reason, and unroutableTotal their sum.
+	// Kept apart from the denial buckets because they carry a policy code for a message no
+	// policy evaluated — see addUnroutableDetails.
+	unroutable      map[string]int
+	unroutableTotal int
 	other           int // records with a decision outside "allow" | "deny" | "escalate"
 	blockedDenials  map[denialKey]int
 	observedDenials map[denialKey]int
@@ -154,6 +161,7 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 		}
 		out.addDeclassifyDetails(line)
 		out.addHandlerFaultDetails(line)
+		out.addUnroutableDetails(line)
 		switch rec.Decision {
 		case "allow":
 			out.allowed++
@@ -244,6 +252,45 @@ func (s *auditStatsSummary) addHandlerFaultDetails(line []byte) {
 	}
 }
 
+// unroutableProbe is addUnroutableDetails' pre-filter, derived from the producer's own key for
+// handlerFaultProbe's reason.
+var unroutableProbe = []byte(audit.UnroutableKey)
+
+// addUnroutableDetails tallies refusals eunox's own routing produced, per reason.
+//
+// They record AUTHORIZATION_FAILED — a policy code — so on this summary they are otherwise
+// indistinguishable from a policy block, and on a wiretap route (where policy blocks nothing)
+// every one of them is one. Without this, the tool the --audit banner points an operator at
+// reports a discovery run's routing refusals as if the upstream or a policy had produced them.
+func (s *auditStatsSummary) addUnroutableDetails(line []byte) {
+	if !bytes.Contains(line, unroutableProbe) {
+		return
+	}
+	// Decoded through the producer's KEY, not a struct tag naming it: a rename there is a
+	// compile error at the probe above and would otherwise leave this silently matching nothing.
+	var rec struct {
+		Details map[string]json.RawMessage `json:"details"`
+	}
+	if err := json.Unmarshal(line, &rec); err != nil {
+		return
+	}
+	raw, present := rec.Details[audit.UnroutableKey]
+	if !present {
+		return
+	}
+	var marker struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &marker); err != nil || marker.Reason == "" {
+		return
+	}
+	if s.unroutable == nil {
+		s.unroutable = map[string]int{}
+	}
+	s.unroutable[marker.Reason]++
+	s.unroutableTotal++
+}
+
 // printAuditStats renders the bucketed summary in two tables — BLOCKED (enforced)
 // and OBSERVED (audit-mode, call forwarded) — so an audit-mode denial is never
 // mistaken for a block.
@@ -274,6 +321,18 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 		wln("  (a registered handler derived a quota bucket on a request that authorizes no consumption; eunox dropped the")
 		wln("   bucket and decided the call as a conforming handler would, so nothing was charged and nothing was blocked —")
 		wf("   but the handler is buggy and its budget is NOT being predicted by this run. details.%s names each handler and the contract it broke.)\n", audit.HandlerFaultKey)
+	}
+	// Named rather than left in the blocked bucket: these are eunox's OWN refusals, not the
+	// upstream's behavior and not a policy verdict, and telling them apart is the whole reason
+	// an operator runs a wiretap.
+	if s.unroutableTotal > 0 {
+		wf("\n  NOTE: %d refusal(s) were eunox's own routing, not a policy verdict\n", s.unroutableTotal)
+		for _, reason := range slices.Sorted(maps.Keys(s.unroutable)) {
+			wf("   - %s: %d\n", reason, s.unroutable[reason])
+		}
+		wln("  (the method is not dispatched under the MCP revision the host negotiated, so no policy evaluated it;")
+		wln("   observe mode downgrades a policy verdict and these have none. If this dominates the tape, the host and")
+		wln("   the upstream are on revisions that do not share the methods being called.)")
 	}
 	// FIRST among the declassification notes: means a session is not in the state the
 	// policy describes — the approved clear did not land, so taint remains.

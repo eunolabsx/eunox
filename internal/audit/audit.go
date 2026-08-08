@@ -1917,7 +1917,10 @@ const UnroutableKey = "_eunox_unroutable"
 // Reason codes for the UnroutableKey marker, matched by SIEM rules rather than parsed from
 // prose (see the TruncatedKey codes below for the same argument).
 const (
-	// UnroutableUnknownMethod: no revision this build speaks declares the method at all.
+	// UnroutableUnknownMethod: this build dispatches the method under NO revision. That covers
+	// a method nobody has heard of AND one the peer's revision mandates that this build has not
+	// implemented yet, which it cannot tell apart without a second list of spec methods to keep
+	// in step with the first.
 	UnroutableUnknownMethod = "unknown_method"
 	// UnroutableRemovedInRevision: this build dispatches the method under SOME revision, but not
 	// the one the requesting peer negotiated. Routed identically to an unknown method on

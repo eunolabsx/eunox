@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"maps"
 	"net/http"
@@ -348,35 +349,73 @@ func TestDispatchesMessage_RejectsTheRequestFramedNotification(t *testing.T) {
 // declaration relayed into a leg eunox opened and addresses as the handshake revision — the
 // manufactured mismatched pair errUnhonorableUpstreamRevision exists to refuse, reached through
 // the framing whose bytes travel with no dispatch decision at all.
+//
+// The FIRST case is the one that matters and the one a framing-aware gate over a request-shaped
+// READER still missed: a conforming response has no `params` at all — MCP puts a result's
+// metadata in `result._meta` — so reading the declaration from params saw nothing while the
+// bytes carrying it went upstream unread. The second is the non-conforming hybrid, whose params
+// travel too because an RPCMsg re-marshals whatever it decoded.
 func TestHonorabilityGate_CoversTheHostResponseFraming(t *testing.T) {
 	t.Parallel()
-	up := &blockingUpWriter{gate: make(chan struct{})}
-	close(up.gate) // do not hold writes; the test asserts none happen
-	sink, logPath := newTempAuditSink(t)
+	const declaration = `{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}`
+	cases := []struct {
+		name string
+		line string
+	}{
+		{"declared where a conforming response carries _meta", `{"jsonrpc":"2.0","id":5,"result":{"_meta":` + declaration + `}}`},
+		{"declared in a params member no conforming response has", `{"jsonrpc":"2.0","id":5,"params":{"_meta":` + declaration + `},"result":{}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			up := &blockingUpWriter{gate: make(chan struct{})}
+			close(up.gate) // do not hold writes; the test asserts none happen
+			sink, logPath := newTempAuditSink(t)
 
-	// A reply to a server-initiated request the proxy had forwarded, declaring the revision the
-	// upstream leg is NOT addressed as. Its params ride to the upstream untouched.
-	p, _ := serveHostLines(t, stdioServe{
-		sink:   sink,
-		upSink: up,
-		setup:  func(p *StdioProxy) { p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard) },
-	},
-		`{"jsonrpc":"2.0","id":5,"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}},"result":{}}`,
-	)
-	_ = sink.Close()
+			// A reply to a server-initiated request the proxy had forwarded, declaring the
+			// revision the upstream leg is NOT addressed as.
+			p, _ := serveHostLines(t, stdioServe{
+				sink:   sink,
+				upSink: up,
+				setup:  func(p *StdioProxy) { p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard) },
+			}, tc.line)
+			_ = sink.Close()
 
-	if got := up.messages(); len(got) != 0 {
-		t.Errorf("the response reached the upstream carrying a revision declaration the leg is not addressed as; got %+v", got)
+			if got := up.messages(); len(got) != 0 {
+				t.Errorf("the response reached the upstream carrying a revision declaration the leg is not addressed as; got %+v", got)
+			}
+			if got := p.hostRevision(); got != "" {
+				t.Errorf("pinned revision = %q, want unpinned — a response is dispatched by neither table", got)
+			}
+			rec := findAuditRecordByMethod(readAuditRecords(t, logPath), methodLabelServerResponse, "deny")
+			if rec == nil {
+				t.Fatal("the refused response left no record; a refusal the tape does not carry is the blind spot the framing guards exist to close")
+			}
+			if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnsupportedProtocolVersion {
+				t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeUnsupportedProtocolVersion)
+			}
+		})
 	}
-	if got := p.hostRevision(); got != "" {
-		t.Errorf("pinned revision = %q, want unpinned — a response is dispatched by neither table", got)
+}
+
+// TestHonorabilityGate_RefusesAResponseDeclaringTwoRevisions pins the one shape reading two
+// members introduces: a message declaring in both. Resolving either is a guess, and a peer that
+// wants to state its revision has one place to do it.
+func TestHonorabilityGate_RefusesAResponseDeclaringTwoRevisions(t *testing.T) {
+	t.Parallel()
+	msg := mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`5`),
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}`),
+		Result: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
 	}
-	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), methodLabelServerResponse, "deny")
-	if rec == nil {
-		t.Fatal("the refused response left no record; a refusal the tape does not carry is the blind spot the framing guards exist to close")
+	_, err := resolveHostRevision("", handshakeRevision, msg)
+	if !errors.Is(err, mcp.ErrConflictingRevision) {
+		t.Errorf("err = %v, want a conflicting-declaration refusal", err)
 	}
-	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnsupportedProtocolVersion {
-		t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeUnsupportedProtocolVersion)
+	// The refusal text is echoed to the peer, so it must stay on the allowlist rather than
+	// collapsing to the opaque fallback.
+	if reason := revisionRefusalReason(err); !strings.Contains(reason, "2026-07-28") {
+		t.Errorf("refusal reason = %q, want the class and the declared revisions", reason)
 	}
 }
 
@@ -457,9 +496,9 @@ func TestStdioNegotiation_PinIsWrittenOnce(t *testing.T) {
 	}
 }
 
-// TestObserveMode_DoesNotDowngradeARoutingRefusal is the decision #247 asked for, written down
-// as behavior: observe mode downgrades a POLICY verdict, and a message no revision's tables can
-// route has no verdict to downgrade.
+// TestObserveMode_DoesNotDowngradeARoutingRefusal states the rule as behavior: observe mode
+// downgrades a POLICY verdict, and a message no revision's tables can route has no verdict to
+// downgrade.
 //
 // The three alternatives were weighed. Forwarding verbatim makes observe mode invent a route it
 // has no entry for — the one thing a wiretap must not do, and the reason the fail-closed default
@@ -561,6 +600,38 @@ func assertUnroutableDetail(t *testing.T, details map[string]interface{}, rev ca
 	}
 	if got, _ := marker["revision"].(string); got != rev.String() {
 		t.Errorf("revision = %q, want %q — the marker must name the tables that were consulted", got, rev)
+	}
+}
+
+// TestRevisionRefusal_NamesTheContextItWasRefusedOn pins the two halves of what a -32022 record
+// may claim, both of which the fail-closed routing sibling already got right.
+//
+// The MESSAGE resolved no revision — that is why it is refused — but its CONTEXT may have one,
+// and an absent protocol_revision is reserved for a record written before anything could be
+// resolved. And the identifier follows the same no-policy-decision rule as every other refusal:
+// tools/call resolves a target type, so naming it would stamp a tool that no policy matched.
+func TestRevisionRefusal_NamesTheContextItWasRefusedOn(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	// ping pins the context; the tools/call then declares a revision that disagrees with it.
+	serveHostLines(t, stdioServe{pdp: newTestManifestPDP(), sink: sink},
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"x","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`,
+	)
+	_ = sink.Close()
+
+	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), capability.MethodToolsCall, "deny")
+	if rec == nil {
+		t.Fatal("the mid-context flip left no record")
+	}
+	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnsupportedProtocolVersion {
+		t.Fatalf("denial_code = %q, want %q", code, capability.ErrCodeUnsupportedProtocolVersion)
+	}
+	if got, _ := rec["protocol_revision"].(string); got != handshakeRevision.String() {
+		t.Errorf("protocol_revision = %q, want %q — this session HAS a negotiated surface, and absence claims none was ever resolved", got, handshakeRevision)
+	}
+	if target, ok := rec["target"]; ok && target != "" {
+		t.Errorf("target = %q, want none — no policy evaluated this message, so naming one fabricates it", target)
 	}
 }
 

@@ -2,9 +2,11 @@
 #
 # Use this when you're standing up an unfamiliar MCP server and don't yet
 # know what tools your agent calls, with what arguments, or how often. The
-# upstream's traffic is recorded to the audit log with full arguments;
-# nothing is blocked. Read the tape, then write a real allowlist (use one of
-# the other files in this directory as a template).
+# upstream's traffic is recorded to the audit log with full arguments; POLICY
+# blocks nothing (the kill switch and a message eunox cannot route still refuse —
+# observe mode downgrades a policy verdict, and neither has one). Read the tape,
+# then write a real allowlist (use one of the other files in this directory as a
+# template).
 #
 # This file is intentionally empty of capabilities — the *route* is what
 # observes, not the manifest. Reference this file from a route that sets

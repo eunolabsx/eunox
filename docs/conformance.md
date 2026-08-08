@@ -274,8 +274,9 @@ downgrade a policy VERDICT, and a message the tables cannot route has none.
 Those denies carry `details._eunox_unroutable` — `{reason, revision}`, with
 `reason` one of `unknown_method`, `removed_in_revision`, `framing_unmapped` —
 so a wiretap tape shows eunox's own routing refusals as its own rather than as
-the upstream's behavior, and they name no policy `target` when the method
-resolves a target type.
+the upstream's behavior. They name no policy `target` when the method resolves
+a target type, which is the same rule every refusal taken with no policy
+decision behind it follows (the `-32022` revision refusal included).
 
 | Method | 2025-11-25 | 2026-07-28 |
 |---|---|---|

@@ -42,9 +42,13 @@ type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *re
 // The check is ONE precondition rather than a copy per arm, so the next client type added to
 // the switch inherits it instead of needing its author to remember. It makes the returned
 // iterator callable whenever it is non-nil; it does not make the client usable — see
-// IsNilClient for the half that does, and for why a DECORATOR wrapping a nil client is admitted
-// by both (this one reports "not sharding" for it, which is the same answer it gives any
-// wrapper: the concrete type is what is matched).
+// IsNilClient for the half that does.
+//
+// A DECORATOR is matched on its own concrete type, so one wrapping a sharding client reports
+// "not sharding" and its caller enumerates a single server. For the kill switch that is a
+// PARTIAL kill set served as complete, not a loud failure — the cost of matching concrete types
+// rather than proving topology, and the reason a consumer wrapping a cluster client must pass
+// the client itself.
 func ShardIterator(client redis.Cmdable) ShardFanOut {
 	if IsNilClient(client) {
 		return nil
@@ -74,17 +78,11 @@ func ShardIterator(client redis.Cmdable) ShardFanOut {
 // what ShardIterator exists to prevent, and nilness is one question for every client, including
 // one go-redis has not added yet.
 //
-// SCOPE, because the sibling above advertises a shape this cannot see: it answers for a client
-// that is itself nil, NOT for a decorator that WRAPS one. `hooked{nil}` — a struct embedding a
-// nil redis.Cmdable — is a non-nil struct under every kind, so no IsNil-shaped predicate can
-// catch it, and its first promoted command panics exactly as a bare nil would. Two ways to close
-// that were weighed and declined. Reflecting into the embedded field answers a DIFFERENT
-// question: a decorator may hold a nil embedded value and legitimately forward elsewhere, so the
-// refusal would be a false one — and refusing a working client at construction is a hard outage,
-// where missing this one is a panic on a mis-wiring nobody shipped. Probing with a cheap command
-// would settle it honestly, but puts a network round trip inside a constructor that performs
-// none, on a path an operator expects to be local. So the guard covers direct clients, and this
-// paragraph is the claim it makes rather than the one its callers might read into it.
+// It answers for a client that is itself nil, NOT for a decorator WRAPPING one — `hooked{nil}`
+// is a non-nil struct under every kind. Reflecting into the embedded field would refuse the
+// wrappers that legitimately forward elsewhere, and probing with a command puts a network round
+// trip in a constructor that performs none; a false refusal at construction is the worse of the
+// two failures, so the gap is accepted.
 func IsNilClient(client redis.Cmdable) bool {
 	return client == nil || isNilValue(client)
 }

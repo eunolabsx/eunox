@@ -51,16 +51,16 @@ var errUnhonorableUpstreamRevision = errors.New("request revision cannot be hono
 // upstream leg yet (the sessionless arms, whose messages reach no upstream). See
 // checkUpstreamHonorable for what it gates.
 func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg) (capability.Revision, error) {
-	declared, present, err := mcp.DeclaredRevision(msg.Params)
+	declared, present, err := mcp.DeclaredRevisionOf(msg)
 	if err != nil {
 		return "", err
 	}
 	resolved := declared
 	switch {
-	case !present && contextRev != "":
-		resolved = contextRev
 	case !present:
-		resolved = capability.DefaultRevision
+		// resolveRevision, not a second spelling of it: an unnegotiated context resolves to the
+		// surface eunox already shipped, and that rule has exactly one home.
+		resolved = resolveRevision(contextRev)
 	case contextRev != "" && declared != contextRev:
 		return "", fmt.Errorf("%w: context negotiated %s, request declares %s", errRevisionMismatch, contextRev, declared)
 	}
@@ -127,7 +127,7 @@ func revisionRefusalReason(err error) string {
 	// this proxy's own leg revisions). Anything else collapses to a fixed string rather than
 	// leaking an unreviewed message.
 	if errors.Is(err, errRevisionMismatch) || errors.Is(err, mcp.ErrUnknownRevision) ||
-		errors.Is(err, errUnhonorableUpstreamRevision) {
+		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUnhonorableUpstreamRevision) {
 		return err.Error()
 	}
 	return "protocol revision could not be established"
@@ -146,15 +146,20 @@ func revisionRefusalReason(err error) string {
 // A NOTIFICATION gets the record and a zero RPCMsg: JSON-RPC forbids replying to one, and
 // stamping the response with a null id would read as a reply to a different request. A host
 // RESPONSE — reachable since the honorability gate became framing-aware — is dropped the same
-// way, and recorded under methodLabelServerResponse because it carries no method of its own.
-func refuseHostRevision(ctx context.Context, rec auditRecorder, sessionID string, msg mcp.RPCMsg, err error) mcp.RPCMsg {
+// way; the upstream request it would have answered is left unanswered and reclaimed on
+// teardown, as a kill-dropped reply already is. What the record may name is auditIdentity's.
+func refuseHostRevision(ctx context.Context, rec auditRecorder, sessionID string, contextRev capability.Revision, msg mcp.RPCMsg, err error) mcp.RPCMsg {
 	reason := revisionRefusalReason(err)
-	label := msg.Method
-	if msg.IsResponse() {
-		label = methodLabelServerResponse
+	// The message resolved no revision — that is why it is here — but its CONTEXT may have one,
+	// and that is what the record should name: a mid-context flip is refused on a session whose
+	// surface is established. Absence stays reserved for a refusal taken before anything could
+	// be resolved, which is the only reading the tape's convention allows it.
+	if contextRev != "" {
+		ctx = capability.WithProtocolRevision(ctx, contextRev)
 	}
 	if rec != nil {
-		rec.RecordDeny(ctx, sessionID, label, label, capability.ErrCodeUnsupportedProtocolVersion, "", nil, false)
+		identifier, method := auditIdentity(msg)
+		rec.RecordDeny(ctx, sessionID, identifier, method, capability.ErrCodeUnsupportedProtocolVersion, "", nil, false)
 	}
 	if !msg.IsRequest() {
 		return mcp.RPCMsg{}

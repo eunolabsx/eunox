@@ -1158,7 +1158,7 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	// Rate-limited like every other caller-driven refusal: a suppressed record still gets its
 	// -32022 on the wire, so the peer is refused either way — what the bucket bounds is the
 	// tape write, which is the part a flood turns into an availability problem.
-	resp := refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), leg.sessionID, msg, err)
+	resp := refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), leg.sessionID, leg.contextRev, msg, err)
 	if msg.IsRequest() {
 		writeJSONMsg(w, resp)
 	} else {

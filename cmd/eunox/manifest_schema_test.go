@@ -644,6 +644,62 @@ func tokensIntroducedIn(revision string, tokens []string) []string {
 	return out
 }
 
+// TestComputeAuditStats_UnroutableIsCountedAndCalledOut pins the operator-facing half of the
+// routing-refusal marker: it records AUTHORIZATION_FAILED, a genuine policy code, so on this
+// summary a wiretap run's own refusals are otherwise indistinguishable from policy blocks — in a
+// posture where policy blocks nothing. The banner tells the operator to read the tape with this
+// tool, so this tool has to say which is which. The probe is derived from the producer's key.
+func TestComputeAuditStats_UnroutableIsCountedAndCalledOut(t *testing.T) {
+	t.Parallel()
+	if string(unroutableProbe) != audit.UnroutableKey {
+		t.Fatalf("the stats probe %q is not the producer's key %q", unroutableProbe, audit.UnroutableKey)
+	}
+	marker := func(reason string) string {
+		return `{"` + audit.UnroutableKey + `":{"reason":"` + reason + `","revision":"2026-07-28"}}`
+	}
+	log := strings.Join([]string{
+		`{"decision":"deny","method":"resources/subscribe","denial_code":"AUTHORIZATION_FAILED","details":` + marker(audit.UnroutableRemovedInRevision) + `}`,
+		`{"decision":"deny","method":"agents/delegate","target":"agents/delegate","denial_code":"AUTHORIZATION_FAILED","details":` + marker(audit.UnroutableUnknownMethod) + `}`,
+		`{"decision":"deny","method":"agents/delegate","target":"agents/delegate","denial_code":"AUTHORIZATION_FAILED","details":` + marker(audit.UnroutableUnknownMethod) + `}`,
+		// A genuine policy denial, which must NOT be folded in.
+		`{"decision":"deny","target_type":"tool","target":"read_file","denial_code":"AUTHORIZATION_FAILED"}`,
+	}, "\n")
+	got, err := computeAuditStats(strings.NewReader(log))
+	if err != nil {
+		t.Fatalf("computeAuditStats: %v", err)
+	}
+	if got.unroutableTotal != 3 {
+		t.Errorf("unroutableTotal = %d, want 3", got.unroutableTotal)
+	}
+	if got.unroutable[audit.UnroutableUnknownMethod] != 2 || got.unroutable[audit.UnroutableRemovedInRevision] != 1 {
+		t.Errorf("per-reason tally = %v, want 2 unknown_method and 1 removed_in_revision", got.unroutable)
+	}
+	// Still counted as blocked: they WERE refused, and the summary's arithmetic must reconcile.
+	if got.blocked != 4 {
+		t.Errorf("blocked = %d, want 4 — the note explains the refusals, it does not remove them", got.blocked)
+	}
+
+	var out strings.Builder
+	printAuditStats(&out, got)
+	for _, want := range []string{"eunox's own routing", audit.UnroutableUnknownMethod, audit.UnroutableRemovedInRevision} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("printAuditStats is missing %q:\n%s", want, out.String())
+		}
+	}
+
+	// A tape with no routing refusals must raise nothing: a note an operator learns to ignore is
+	// worse than none.
+	clean, err := computeAuditStats(strings.NewReader(`{"decision":"deny","target_type":"tool","target":"read_file","denial_code":"AUTHORIZATION_FAILED"}`))
+	if err != nil {
+		t.Fatalf("computeAuditStats: %v", err)
+	}
+	var cleanOut strings.Builder
+	printAuditStats(&cleanOut, clean)
+	if strings.Contains(cleanOut.String(), "eunox's own routing") {
+		t.Errorf("a clean tape must raise no routing note:\n%s", cleanOut.String())
+	}
+}
+
 // TestComputeAuditStats_HandlerFaultIsCountedAndCalledOut pins the operator-facing half of the
 // repaired-fault report. The repair leaves the record looking like any other allow — the call
 // was decided exactly as a conforming handler's would have been — so if `eunox stats` does not
