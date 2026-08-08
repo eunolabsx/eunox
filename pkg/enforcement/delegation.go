@@ -30,11 +30,11 @@ const delegationConditionType = "delegation"
 // before the constraint's conditions, since it doesn't depend on them: the manifest may permit
 // the target and every condition pass, and the call can still be one this delegate wasn't
 // handed.
-func (e *Engine) checkDelegationTarget(req *capability.EnforceRequest, auditOnly bool, requestID, now string) *capability.EnforceResponse {
-	if req == nil {
+func (e *Engine) checkDelegationTarget(ec evalCtx) *capability.EnforceResponse {
+	if ec.req == nil {
 		return nil
 	}
-	return DelegationTargetDenial(req.Delegation, canonicalApprovalTarget(req), auditOnly, requestID, now)
+	return DelegationTargetDenial(ec.req.Delegation, canonicalApprovalTarget(ec.req), ec.auditOnly(), ec.requestID, ec.now)
 }
 
 // DelegationTargetDenial is the ONE construction of the target-axis refusal, exported because
@@ -67,15 +67,15 @@ func DelegationTargetDenial(chain *capability.DelegationChain, target string, au
 // the chain's tightest maxEffectClass. Reads the SAME ResolveEffect the ceiling and the two
 // effect conditions read, so the bounds can't disagree about the call's effect. Composes with
 // the ceiling rather than replacing it — the more restrictive of the two refuses first.
-func (e *Engine) checkDelegationEffectClass(req *capability.EnforceRequest, eff *capability.ResolvedEffect, auditOnly bool, requestID, now string) *capability.EnforceResponse {
-	if req == nil || req.Delegation.IsEmpty() || eff == nil {
+func (e *Engine) checkDelegationEffectClass(ec evalCtx, eff *capability.ResolvedEffect) *capability.EnforceResponse {
+	if ec.req == nil || ec.req.Delegation.IsEmpty() || eff == nil {
 		return nil
 	}
-	cap0, subject, capped := req.Delegation.EffectClassCap()
+	cap0, subject, capped := ec.req.Delegation.EffectClassCap()
 	if !capped || capability.EffectClassAtMost(eff.Class, cap0) {
 		return nil
 	}
-	return delegationDenial(auditOnly, requestID, now, "effect_class", subject,
+	return delegationDenial(ec.auditOnly(), ec.requestID, ec.now, "effect_class", subject,
 		fmt.Sprintf("this action's effect class %q exceeds the %q cap delegated to %q", eff.Class, cap0, subject),
 		map[string]interface{}{"effect_class": eff.Class, "delegated_max_effect_class": cap0})
 }
@@ -98,7 +98,8 @@ func (e *Engine) DelegationEffectClassVerdictFor(_ context.Context, req *capabil
 		return nil
 	}
 	effect := capability.ResolveEffect(matched.Effect, req.Arguments)
-	return e.checkDelegationEffectClass(req, effect, matched.IsAuditOnly(), NewRequestID(), e.clock.Now().UTC().Format(time.RFC3339Nano))
+	ec := evalCtx{req: req, matched: matched, requestID: NewRequestID(), now: e.clock.Now().UTC().Format(time.RFC3339Nano)}
+	return e.checkDelegationEffectClass(ec, effect)
 }
 
 // IsDelegationRefusal reports whether d is a refusal one of the delegation gates produced.
