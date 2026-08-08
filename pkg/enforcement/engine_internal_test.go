@@ -285,8 +285,8 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny (non-uniform skip must fail closed)", resp.Decision)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
 	if !resp.Denial.HardDeny {
 		t.Fatal("denial must be a HardDeny: WillForwardDeny answers yes here, so a downgradable skip-contract violation would ship with the budget unchecked")
@@ -317,8 +317,8 @@ func TestCommitDeferredAtomic_UnauthorizedSkipIsRefusedOnASingleCondition(t *tes
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny for a skip the request context did not authorize", resp.Decision)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
 	if !resp.Denial.HardDeny {
 		t.Fatal("denial must carry HardDeny: WillForwardDeny answers yes for an audit-mode constraint, so the budget would ship unchecked")
@@ -400,8 +400,8 @@ func TestCommitDeferredAtomic_NilDenyCallbackFailsClosed(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny (a nil Deny callback must fail closed, not panic)", resp.Decision)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
 }
 
@@ -458,8 +458,8 @@ func TestCommitDeferredAtomic_NilDenyResultFailsClosed(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny (a Deny callback returning nil must fail closed, not allow or panic)", resp.Decision)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
 }
 
@@ -519,8 +519,8 @@ func TestCommitDeferredAtomic_NilCounterFailsClosed(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny (a nil call counter must fail closed, not panic)", resp.Decision)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
 }
 
@@ -599,7 +599,7 @@ func TestCommitDeferredAtomic_ObserveSurfacesLaterBucketCondErr(t *testing.T) {
 		t.Fatalf("decision = %q, want deny (observe must surface a later bucket's validation error, not mask it on the first skip)", resp.Decision)
 	}
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+		t.Fatalf("denial = %+v, want the handler's own CONDITION_FAILED verdict", resp.Denial)
 	}
 }
 
@@ -704,7 +704,7 @@ func TestCommitDeferredAtomic_AbsorbedFaultYieldsToARealVerdict(t *testing.T) {
 		t.Fatalf("decision = %q, want deny (a later bucket's validation error outranks an absorbed contract violation)", resp.Decision)
 	}
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+		t.Fatalf("denial = %+v, want the handler's own CONDITION_FAILED verdict", resp.Denial)
 	}
 	// The verdict is the later condition's, and the fault is still reported: on this posture
 	// the deny is downgraded and FORWARDED, so a report that rode the allow alone would go
@@ -737,7 +737,7 @@ func TestCommitDeferredAtomic_SkipDoesNotSwallowCondErr(t *testing.T) {
 		t.Fatalf("decision = %q, want deny (a skipping bucket's own condErr must not be swallowed)", resp.Decision)
 	}
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+		t.Fatalf("denial = %+v, want the handler's own CONDITION_FAILED verdict", resp.Denial)
 	}
 }
 
@@ -840,8 +840,8 @@ func TestRunConditions_TypedNilConditionFailsClosed(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny (a typed-nil condition must fail closed, not panic)", resp.Decision)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Fatalf("denial = %+v, want CONDITION_FAILED", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
 	// HardDeny, like the two sibling engine-bug denies in runConditions. Without it an
 	// audit-only constraint (or a route under --audit) downgrades this verdict and

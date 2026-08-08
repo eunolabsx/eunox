@@ -33,13 +33,15 @@ const (
 	// condition missing its 'argument' field with CONDITION_FAILED.
 	ErrCodeOperationNotPermitted = "OPERATION_NOT_PERMITTED"
 	ErrCodeValueNotPermitted     = "VALUE_NOT_PERMITTED"
-	// ErrCodeEnforcementError is a reserved, fail-closed code for an internal
-	// enforcement-engine failure — a request that can be neither allowed nor cleanly
-	// rejected by policy. No condition path emits it today; the PDP keeps it as a
-	// defensive guard so a future internal error denies distinctly rather than falling
-	// open. The transport layer does emit it on reachable fail-closed paths (a
-	// redaction failure, an undelivered server-initiated request, a malformed */list
-	// response). Maps to JSON-RPC -32603.
+	// ErrCodeEnforcementError is the fail-closed code for a request that can be neither
+	// allowed nor cleanly rejected BY POLICY: the engine, one of its backends, or a
+	// registered handler failed in a way that left a declared restriction unevaluated.
+	// It is the fault half of [ClassifyDenialCode] — the distinction an operator filtering
+	// the tape needs in order to tell "the caller hit their budget" from "the budget could
+	// not be evaluated" — so a condition path that cannot reach a verdict denies with THIS
+	// rather than with the policy-verdict CONDITION_FAILED. The PDP and transport layers
+	// emit it for their own fail-closed paths (a redaction failure, an undelivered
+	// server-initiated request, a malformed */list response). Maps to JSON-RPC -32603.
 	ErrCodeEnforcementError = "ENFORCEMENT_ERROR"
 	// ErrCodeAuditUnavailable denies an otherwise-authorized call under
 	// --require-audit=strict when the audit trail has degraded (a record dropped
@@ -174,4 +176,64 @@ func DenialWireCode(code string) (wire int, ok bool) {
 	default:
 		return JSONRPCCodeCapabilityDenied, false
 	}
+}
+
+// DenialClass says what KIND of thing refused a call: the policy, the emergency stop, or a
+// failure that stopped either from reaching a verdict.
+//
+// It is DERIVED from the denial's code rather than carried beside it. The alternative — a
+// second field, or the hand-set bool it would join — asks every producer to restate in a flag
+// what it has already said in the code, and the sites disagreed: refusals of the same class,
+// written weeks apart, blocked or downgraded depending on which neighbour was copied. A code
+// is a thing a refusal cannot omit, so classifying from it is the one answer nothing can
+// forget to give.
+type DenialClass uint8
+
+const (
+	// DenialClassPolicy is a verdict the policy reached: the rules were evaluated and they
+	// refuse this call. The only class an observing route may downgrade to a forward, because
+	// it is the only one where "what would enforce mode have done" is actually known.
+	DenialClassPolicy DenialClass = iota
+	// DenialClassRevocation is the emergency stop. Separate from a fault because it is not a
+	// failure at all — the system is working exactly as intended — and separate from a policy
+	// verdict because no policy was consulted.
+	DenialClassRevocation
+	// DenialClassFault is a refusal produced because no verdict could be reached: an engine
+	// bug, a backend that failed or answered nonconformingly, a registered handler that broke
+	// its contract, or the audit trail that must record the call being unavailable. Never
+	// downgradable — there is no verdict to stand in for the one that never ran.
+	DenialClassFault
+)
+
+// ClassifyDenialCode reports which class of refusal code names. Unrecognized codes classify
+// as policy: every code eunox mints is enumerated in AllDenialCodes and covered by
+// TestClassifyDenialCode_CoversEveryCode, so the fallback is only reached by an out-of-tree
+// PDP's own code, whose refusals are its policy by definition.
+func ClassifyDenialCode(code string) DenialClass {
+	switch code {
+	case ErrCodeKillSwitch, ErrCodeKillSwitchError:
+		return DenialClassRevocation
+	// AUDIT_UNAVAILABLE joins the engine faults: the call was authorized and the refusal is
+	// that it cannot be durably recorded, which is a property of the trail, not of the caller.
+	case ErrCodeEnforcementError, ErrCodeAuditUnavailable:
+		return DenialClassFault
+	// A peer whose protocol revision cannot be established was never matched against policy,
+	// and the refusal precedes every gate that could reach one.
+	case ErrCodeUnsupportedProtocolVersion:
+		return DenialClassFault
+	default:
+		return DenialClassPolicy
+	}
+}
+
+// Downgradable reports whether an OBSERVING route (whole-route --audit, or a per-constraint
+// `enforcement: audit`) may forward the call this denial refuses instead of blocking it.
+//
+// The two reasons not to are asked separately because they answer to different owners: the
+// CLASS is a property of the refusal, derived from its code, and HardDeny is a producer's
+// explicit override for a policy verdict that must block anyway (one whose downgrade would
+// itself corrupt state the verdict protects). A nil denial is not downgradable: defaulting an
+// absent reason to "forward it" is the wrong direction to fail in.
+func (d *DenialInfo) Downgradable() bool {
+	return d != nil && !d.HardDeny && ClassifyDenialCode(d.Code) == DenialClassPolicy
 }

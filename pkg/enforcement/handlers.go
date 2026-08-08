@@ -311,7 +311,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 
 	if e.counter == nil {
 		return nil, "", false, &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
+			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypeMaxCalls,
 			Message:       "call counter not configured",
 		}
@@ -1185,7 +1185,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 
 	if e.counter == nil {
 		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
+			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypeSequenceBlock,
 			Message:       "call counter not configured",
 		}
@@ -1238,7 +1238,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		count, err := e.counter.Peek(histCtx, key, sequenceHistoryWindowSec)
 		if err != nil {
 			return &ConditionError{
-				Code:          capability.ErrCodeConditionFailed,
+				Code:          capability.ErrCodeEnforcementError,
 				ConditionType: capability.ConditionTypeSequenceBlock,
 				Message:       fmt.Sprintf("session history lookup failed: %v", err),
 			}

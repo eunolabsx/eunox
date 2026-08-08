@@ -583,19 +583,51 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 		assert.True(t, audit.IsReservedDetailKey(audit.HandlerFaultKey),
 			"an unreserved key would be mined by `eunox suggest` as a caller-supplied tool argument")
 	})
+
+	t.Run("an unevaluable condition is not downgraded", func(t *testing.T) {
+		// The third unevaluable-condition refusal, and the one that used to be forwarded: it
+		// was built as a policy verdict while its two siblings set the flag, so an observing
+		// route delivered the call with the restriction never evaluated once, and reported
+		// "would be allowed" for a call enforce mode denies. It carries the fault code now, and
+		// what blocks it is the class rather than a bool a fourth refusal might forget.
+		eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+		dec := eng.ValidateAction(context.Background(), &capability.EnforceRequest{SessionID: "s", TargetName: "tool"},
+			[]capability.Constraint{{
+				Target:      "tool",
+				Actions:     []string{"*"},
+				Enforcement: capability.EnforcementAudit,
+				Conditions:  []capability.Condition{unmodelledCondition{}},
+			}})
+		require.Equal(t, capability.DecisionDeny, dec.Decision)
+		require.NotNil(t, dec.Denial)
+		require.Equal(t, capability.ErrCodeEnforcementError, dec.Denial.Code)
+
+		rec, called := forward(t, dec, true)
+		assert.False(t, called, "a condition nothing could evaluate must not be forwarded as though it had passed")
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, "deny", rec.records[0].decision)
+		assert.False(t, rec.records[0].auditOnly)
+	})
 }
 
-// TestIsObserveDeny_NilDenialPanics documents that isObserveDeny deliberately
-// has no nil guard: both callers (enforcedForwardCore's manifest leg and
-// forwardServerRequest's sampling leg) always normalize the denial via
-// normalizeDenial before calling this function. A prior version silently
-// treated a nil denial as "safe to downgrade to an observed forward" in audit
-// mode, which would fail-open. Panicking instead makes a future caller that
-// skips normalization fail loudly rather than silently fail-open.
-func TestIsObserveDeny_NilDenialPanics(t *testing.T) {
-	assert.Panics(t, func() {
-		isObserveDeny(nil, true, false)
-	})
+// unmodelledCondition carries a discriminator no build models — the shape a programmatically
+// built constraint, or a prototype-registry entry whose handler registration was forgotten,
+// presents to the engine.
+type unmodelledCondition struct{}
+
+// ConditionType implements capability.Condition.
+func (unmodelledCondition) ConditionType() string { return "definitely-not-a-real-condition" }
+
+// TestIsObserveDeny_NilDenialIsNotDowngradable pins the direction a missing reason must fail
+// in. Both callers (enforcedForwardCore's manifest leg and forwardServerRequest's sampling
+// leg) normalize via normalizeDenial first, so nil is unreachable in-tree; the property is
+// what happens if one ever stops. An early version treated nil as "safe to downgrade to an
+// observed forward", a fail-open; a later one dereferenced it, which is loud but takes the
+// proxy down from the enforcement goroutine. Answering false is both: the call is blocked, and
+// nothing is forwarded on the strength of a reason nobody supplied.
+func TestIsObserveDeny_NilDenialIsNotDowngradable(t *testing.T) {
+	assert.False(t, isObserveDeny(nil, true, false),
+		"a denial with no reason must not be downgraded to a forward on an observing route")
 }
 
 // TestEnforcedForwardCore_StrictAudit_DegradedDeniesAndSkipsUpstream pins the

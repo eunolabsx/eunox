@@ -372,10 +372,9 @@ func (e *Engine) burnApproval(ctx context.Context, ledgerID string) error {
 // a detail key so the audit layer stamps it identically on allow and refusal.
 func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentApprovalID string) capability.EnforceResponse {
 	resp := denyResponse(requestID, now, auditOnly, nil, capability.DenialInfo{
-		Code:          capability.ErrCodeConditionFailed,
+		Code:          capability.ErrCodeEnforcementError,
 		ConditionType: declassifyConditionType,
 		Message:       "the declassification leg of this call's state commit failed; the approved clear was not applied and the call is refused",
-		HardDeny:      true,
 		Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 	})
 	if spentApprovalID != "" {

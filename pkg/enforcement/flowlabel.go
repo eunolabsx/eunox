@@ -93,7 +93,7 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	// set can't be mistaken for "clean context".
 	if e.flowStore == nil {
 		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
+			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypeFlowLabel,
 			Message:       "flow-label store not configured; flow-label state is unavailable",
 		}
@@ -114,7 +114,7 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 		peeked, err := e.peekSessionLabels(ctx, req)
 		if err != nil {
 			return &ConditionError{
-				Code:          capability.ErrCodeConditionFailed,
+				Code:          capability.ErrCodeEnforcementError,
 				ConditionType: capability.ConditionTypeFlowLabel,
 				Message:       fmt.Sprintf("flow-label state lookup failed: %v", err),
 			}
@@ -584,10 +584,9 @@ func constraintHasFlow(matched *capability.Constraint) bool {
 // hardDenyResponse for the analogous sequenceBlock case.
 func labelRecordFailureDenial(requestID, now string, auditOnly bool, obligations []capability.Obligation) capability.EnforceResponse {
 	return denyResponse(requestID, now, auditOnly, obligations, capability.DenialInfo{
-		Code:          capability.ErrCodeConditionFailed,
+		Code:          capability.ErrCodeEnforcementError,
 		ConditionType: capability.ConditionTypeFlowLabel,
 		Message:       "flow-label recording failed; source->sink flow state is unreliable",
-		HardDeny:      true,
 		Details: map[string]interface{}{
 			// Without this, a filter keyed on the flow discriminator missed the one flow
 			// event an operator most needs: the hard deny raised when a source's label

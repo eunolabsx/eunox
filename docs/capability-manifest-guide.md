@@ -627,7 +627,7 @@ exact. This is the authoritative set.
 | `NO_JWT_CLAIMS` | `-32001` | JWT mode is active but the request carried no validated token claims (an authentication miss, surfaced as a capability denial). |
 | `CAPABILITY_DENIED` | `-32002` | A matched entry's verdict is deny (e.g. the action is not granted for the target). |
 | `SAMPLING_DENIED` | `-32001` | A server-initiated `sampling/createMessage` is not permitted — no `system:sampling/createMessage` entry, or a JWT claim withholds it. Surfaced to the upstream initiator as `AUTHORIZATION_FAILED` (`-32001`); the symbolic `SAMPLING_DENIED` is what the audit log records. |
-| `CONDITION_FAILED` | `-32003` | A condition rejected the call for a structural reason (e.g. an `allowedOperations` entry missing its `argument`, or a malformed condition input). |
+| `CONDITION_FAILED` | `-32003` | A condition rejected the call for a structural reason (e.g. an `allowedOperations` entry missing its `argument`, or a malformed condition input). A refusal the engine produced because it could not *evaluate* the condition carries `ENFORCEMENT_ERROR` instead. |
 | `VALUE_NOT_PERMITTED` | `-32003` | An `allowedValues` condition: the argument value is outside the permitted set. |
 | `OPERATION_NOT_PERMITTED` | `-32003` | An `allowedOperations` condition: the operation is outside the permitted set. |
 | `RATE_LIMITED` | `-32003` | A `maxCalls` condition's count/window was exceeded. |
@@ -636,7 +636,7 @@ exact. This is the authoritative set.
 | `KILL_SWITCH` | `-32603`* | The session or agent has been killed via the kill switch. |
 | `KILL_SWITCH_ERROR` | `-32603`* | The kill-switch backend errored; the proxy fails closed rather than treat the error as "not blocked". |
 | `AUDIT_UNAVAILABLE` | `-32603` | Under `--require-audit=strict`, the audit trail has degraded (a record was dropped or a write failed); an otherwise-authorized call is denied rather than forwarded unaudited. |
-| `ENFORCEMENT_ERROR` | `-32603` | Defensive fail-closed guard for an internal enforcement-engine error (not emitted on any reachable path today). |
+| `ENFORCEMENT_ERROR` | `-32603` | The engine could not reach a verdict: an unmodelled condition type, a condition with no usable handler, a quota/history/flow-label backend that failed or answered nonconformingly, or a registered handler that broke its contract. Distinct from `CONDITION_FAILED`, which is a verdict the policy *did* reach, and never downgraded to a forward on an observing route. |
 
 `*` The kill-switch codes are infrastructure failures mapped to the internal-error
 class on the wire; the symbolic code in `error.data.code` disambiguates them from a

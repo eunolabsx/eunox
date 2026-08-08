@@ -136,3 +136,75 @@ func TestDenialWireCode_KnownMappings(t *testing.T) {
 		t.Errorf("DenialWireCode(unknown) = (%d, %v), want (%d, false)", got, ok, capability.JSONRPCCodeCapabilityDenied)
 	}
 }
+
+// TestClassifyDenialCode_CoversEveryCode is the second derivation over AllDenialCodes, beside
+// the wire-code one: every symbolic code must be classified DELIBERATELY, in the switch, not
+// by the default arm.
+//
+// The default exists for an out-of-tree PDP's own code, whose refusals are its policy by
+// definition — but reaching it from an in-tree code is how a fault-class refusal would come to
+// be treated as a policy verdict and forwarded on an observing route. The expected class is
+// spelled out per code rather than recomputed, so changing one is a diff a reviewer sees.
+func TestClassifyDenialCode_CoversEveryCode(t *testing.T) {
+	t.Parallel()
+	want := map[string]capability.DenialClass{
+		capability.ErrCodeAuthorizationFailed:        capability.DenialClassPolicy,
+		capability.ErrCodeCapabilityDenied:           capability.DenialClassPolicy,
+		capability.ErrCodeInvalidParams:              capability.DenialClassPolicy,
+		capability.ErrCodeConditionFailed:            capability.DenialClassPolicy,
+		capability.ErrCodeKillSwitch:                 capability.DenialClassRevocation,
+		capability.ErrCodeKillSwitchError:            capability.DenialClassRevocation,
+		capability.ErrCodeMissingContext:             capability.DenialClassPolicy,
+		capability.ErrCodeRateLimited:                capability.DenialClassPolicy,
+		capability.ErrCodeNoJWTClaims:                capability.DenialClassPolicy,
+		capability.ErrCodeOperationNotPermitted:      capability.DenialClassPolicy,
+		capability.ErrCodeValueNotPermitted:          capability.DenialClassPolicy,
+		capability.ErrCodeEnforcementError:           capability.DenialClassFault,
+		capability.ErrCodeAuditUnavailable:           capability.DenialClassFault,
+		capability.ErrCodeSamplingDenied:             capability.DenialClassPolicy,
+		capability.ErrCodeEscalationRequired:         capability.DenialClassPolicy,
+		capability.ErrCodeUnsupportedProtocolVersion: capability.DenialClassFault,
+	}
+	for _, code := range capability.AllDenialCodes {
+		expected, listed := want[code]
+		if !listed {
+			t.Errorf("denial code %q is unclassified here: name its class, since the default arm would silently make it a policy verdict an observing route forwards", code)
+			continue
+		}
+		if got := capability.ClassifyDenialCode(code); got != expected {
+			t.Errorf("ClassifyDenialCode(%q) = %d, want %d", code, got, expected)
+		}
+	}
+	if len(want) != len(capability.AllDenialCodes) {
+		t.Errorf("this table has %d codes and AllDenialCodes has %d; a stale entry means a removed code is still being classified", len(want), len(capability.AllDenialCodes))
+	}
+}
+
+// TestDenialInfo_Downgradable pins the two independent reasons a refusal resists an observing
+// route's downgrade, and the one shape that used to decide it alone. Before the class, every
+// producer restated "must this block" as a bool beside a code that already said so, and the
+// engine's own fault refusals disagreed with each other about it.
+func TestDenialInfo_Downgradable(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		denial *capability.DenialInfo
+		want   bool
+	}{
+		{"policy verdict", &capability.DenialInfo{Code: capability.ErrCodeConditionFailed}, true},
+		{"policy verdict overridden by the producer", &capability.DenialInfo{Code: capability.ErrCodeConditionFailed, HardDeny: true}, false},
+		{"engine fault", &capability.DenialInfo{Code: capability.ErrCodeEnforcementError}, false},
+		{"revocation", &capability.DenialInfo{Code: capability.ErrCodeKillSwitch}, false},
+		{"revocation backend fault", &capability.DenialInfo{Code: capability.ErrCodeKillSwitchError}, false},
+		// An absent reason is not a reason to forward.
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tc.denial.Downgradable(); got != tc.want {
+				t.Errorf("Downgradable() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
