@@ -726,6 +726,11 @@ func (route *UpstreamRoute) recordSessionGateDeny(ctx context.Context, sessionID
 // paths: runs sessionGateVerdict and, on denial, writes the record and returns the gate.
 // Kept separate from the check-only verdict so DELETE can run it under p.mu and render its
 // own 403 + record off the same predicate.
+//
+// It runs BEFORE revision negotiation, so its record names none (the exception is declared in
+// dispatch.go's gate order and in gate_order_test.go's dispositionPrologue). Negotiating first
+// would read and refuse against the VICTIM session's revision for a caller who has not cleared
+// the binding — an oracle for that revision, recorded under that session's id as fact.
 func (route *UpstreamRoute) enforceSessionGates(ctx context.Context, sess *httpSession, sessionID, method, transportTag string) (sessionGate, bool) {
 	gate, denied := route.sessionGateVerdict(ctx, sess)
 	if denied {

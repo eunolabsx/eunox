@@ -51,9 +51,12 @@ func (w *ConditionWrapper) UnmarshalJSON(data []byte) error {
 // IsTypedNil reports whether v is a non-nil interface wrapping a nil pointer — the
 // "typed nil" that slips past a plain v == nil check yet panics on any method call whose
 // receiver it dereferences (a value-receiver ConditionType/DirectiveType on a decoded
-// condition/directive). It is the single reflect-based typed-nil predicate, so the
-// validation and marshaling guards that reject a typed nil before such a call share one
-// definition. A plain-nil interface returns false (reflect.ValueOf(nil) has Kind Invalid),
+// condition/directive). It is the one such predicate for the manifest, engine and config
+// layers, so the validation and marshaling guards that reject a typed nil before such a call
+// share one definition. (internal/redisutil answers the same question for a go-redis client
+// separately, because it depends on go-redis and the stdlib alone — importing this package for
+// two lines would put the whole manifest vocabulary in a kill-switch-only consumer's binary.)
+// A plain-nil interface returns false (reflect.ValueOf(nil) has Kind Invalid),
 // so callers pair it with an explicit v == nil check where a plain nil is also rejected.
 func IsTypedNil(v any) bool {
 	rv := reflect.ValueOf(v)

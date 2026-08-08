@@ -16,7 +16,10 @@
 //     bad-version probe is recorded as UNSUPPORTED_PROTOCOL_VERSION rather than KILL_SWITCH,
 //     on a message refused either way that contacts no upstream and mutates no state.
 //     Negotiation is also what stamps the revision onto the context every later gate records
-//     under, so a gate placed ahead of it would write a record naming no revision at all.
+//     under, so a gate placed ahead of it would write a record naming no revision at all. ONE
+//     gate is deliberately ahead of it and therefore records no revision: HTTP's session-owner
+//     binding, which decides whether the caller may act on this session at all and so must not
+//     read the session's negotiated state first (see enforceSessionGates).
 //  2. The SWALLOWED set (notification framing only): a method the proxy has already handled
 //     is neither an error nor an event, so it is dropped before anything that would record it.
 //     "Already handled" is a property of the LEG, not of the method: a pre-session arm has
@@ -373,27 +376,51 @@ func deriveHandshakeRevision(registry map[string]methodSpec) capability.Revision
 // but not under rev — i.e. denied because the peer's revision removed it, rather than because
 // nobody has ever heard of it. The two are routed identically on purpose (removal is
 // expressed by absence); they differ only in what an audit record can honestly claim.
+//
+// A per-METHOD question, deliberately: it exists to decide what an audit record may name, and a
+// method the peer's revision has is not "removed" merely because it arrived in a framing that
+// revision does not dispatch. What the message's own framing resolves to is dispatchesMessage.
 func removedInRevision(rev capability.Revision, method string) bool {
-	// Expressed through definesMethod so the membership test lives in ONE place: the two are
-	// not complements (both are false for an unknown method), and it is the `known` guard that
-	// makes them not, so stating it twice is how they would come to disagree about one.
-	_, known := methodRegistry[method]
-	return known && !definesMethod(rev, method)
+	spec, known := methodRegistry[method]
+	// The two halves are not complements — both are false for an unknown method — and it is the
+	// `known` guard that makes them not.
+	return known && !slices.Contains(spec.In, rev)
 }
 
-// definesMethod reports whether rev's method set contains method, derived from the same
-// declarations the routing tables are so it cannot disagree with what the dispatcher will do
-// with the message.
+// dispatchesMessage reports whether rev's routing tables hold a handler for msg IN THE FRAMING
+// IT ARRIVED IN — which is the same lookup dispatchRequest and hostNotificationGate.admit
+// perform one gate later, so "the proxy acted on this message" and whatever this predicate is
+// used to conclude cannot disagree.
 //
-// It answers "is this message one the peer's revision actually has?", which is the question a
-// context PIN depends on: a message the revision does not define is about to be dropped by the
-// fail-closed default, so it says nothing about which revision the conversation is on.
+// It is the stdio context PIN's predicate. A message about to be dropped by the fail-closed
+// default says nothing about which revision a conversation is on, and latching from one wedges
+// the connection for the process's life; the same fact, phrased per METHOD instead, does not
+// close that class. `notifications/progress` exists in both revisions with a forwarding
+// disposition and NO request handler, so a REQUEST-framed one satisfies "the revision has this
+// method", pins from it, and is then discarded by dispatchUnmapped — a message nothing acted on
+// deciding what the peer speaks.
 //
-// Distinct from removedInRevision, which is true only for a method some OTHER revision has. An
-// entirely unknown method is defined by no revision, and is no more evidence than a removed one.
-func definesMethod(rev capability.Revision, method string) bool {
-	spec, known := methodRegistry[method]
-	return known && slices.Contains(spec.In, rev)
+// Framings are answered exhaustively rather than by falling through: a message that is neither
+// framing (a RESPONSE to a request this proxy issued) is dispatched by neither table and carries
+// no method to look up, so it pins nothing.
+func dispatchesMessage(rev capability.Revision, msg mcp.RPCMsg) bool {
+	tables := tablesFor(rev)
+	switch {
+	case msg.IsRequest():
+		if _, ok := tables.decide[msg.Method]; ok {
+			return true
+		}
+		_, ok := tables.local[msg.Method]
+		return ok
+	case msg.IsNotification():
+		// Presence IS the test: notifyUnmapped is the map's zero value and is never stored, so
+		// an entry exists exactly for a disposition the proxy acts on — forwarding it, or
+		// swallowing it because the proxy has already handled what it announces.
+		_, ok := tables.notifications[msg.Method]
+		return ok
+	default:
+		return false
+	}
 }
 
 // requestRevision returns the revision this request is dispatched under, read from the ONE
@@ -414,6 +441,11 @@ func definesMethod(rev capability.Revision, method string) bool {
 // differently. The audit sink's omission is not a third reading of the same question: it
 // records what was negotiated, and "nothing was" is a fact a pre-negotiation refusal needs to
 // be able to state.
+//
+// Refusing here instead — turning "an entry point forgot to negotiate" into a runtime denial —
+// was weighed and declined: the gate-order source guard already holds that at build time, and a
+// refusal would need a distinguished "no peer to negotiate with" value for the legitimately
+// non-negotiating arms, which is the second carrier of one fact this seam exists to remove.
 func requestRevision(ctx context.Context) capability.Revision {
 	if rev := capability.ProtocolRevisionFromContext(ctx); rev != "" {
 		return rev

@@ -8,11 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"go/ast"
-	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/audit"
@@ -154,11 +151,10 @@ func successfulReply() mcp.RPCMsg {
 // details through mergeAuditDetails, and must not assign into the map that merge returns —
 // the write that, on the empty-extra path, used to land in the caller's own arguments.
 func TestDispatchToolsCall_NoInlineDetailsMergeSurvives(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "dispatch.go", nil, 0)
-	require.NoError(t, err)
+	src := dispatchSource(t)
+	fset := src.fset
 
-	fn := findFuncDecl(file, "dispatchToolsCall")
+	fn := findFuncDecl(src.file, "dispatchToolsCall")
 	require.NotNil(t, fn, "dispatchToolsCall must exist for this guard to mean anything")
 
 	// Names bound to a mergeAuditDetails result. Derived rather than hardcoded: keying the
@@ -275,18 +271,12 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 		filepath.Join("..", "audit"),
 		filepath.Join("..", "..", "cmd", "eunox"),
 	} {
-		entries, err := os.ReadDir(dir)
-		require.NoError(t, err)
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-				continue
-			}
-			path := filepath.Join(dir, e.Name())
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
-			require.NoError(t, err)
+		// The shared enumeration, not a hand-rolled ReadDir loop: this guard fails OPEN too, and
+		// the per-file parse (rather than a directory parse) is what keeps build-tagged files in
+		// the walk — the reasoning packageSourcesIn carries once for every guard that needs it.
+		for _, src := range packageSourcesIn(t, dir) {
 			scanned++
-			ast.Inspect(file, func(n ast.Node) bool {
+			ast.Inspect(src.file, func(n ast.Node) bool {
 				// Only where the literal is used as a details-map KEY — written into a map
 				// literal, or indexed into one. The same spelling as a plain call argument
 				// is the flow-label store's key prefix, an unrelated namespace this
@@ -305,7 +295,7 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 					return true
 				}
 				t.Errorf("%s:%d spells the flow discriminator as a details key literal; use capability.FlowAuditDetailKey",
-					path, fset.Position(lit.Pos()).Line)
+					src.path, src.fset.Position(lit.Pos()).Line)
 				return true
 			})
 		}

@@ -95,6 +95,10 @@ func upstreamAddressedRevision(_ capability.Revision) capability.Revision { retu
 //
 // A leg with no revision yet ("") is not checked: there is nothing to contradict, and refusing
 // would deny a message on the strength of a fact nobody has established.
+//
+// Consequence worth stating: today no method the newer revision declares reaches the PIN against
+// a live leg, so nothing downstream may assume the pin's value — that is incidental, not a
+// property to rely on.
 func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
 	if legRev == "" {
 		return nil

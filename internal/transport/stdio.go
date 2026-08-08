@@ -136,9 +136,10 @@ type StdioProxy struct {
 	configuredUpstreamRev capability.Revision
 
 	// hostRev is the revision this host connection's context resolved, pinned from its first
-	// message that the resolved revision DEFINES (see negotiateHostRevision for why the second
-	// half is load-bearing) and checked against every later one (resolveHostRevision), so a
-	// mid-context flip is refused rather than silently switching method tables.
+	// message the resolved revision DISPATCHES in the framing it arrived in (see
+	// negotiateHostRevision for why the second half is load-bearing) and checked against every
+	// later one (resolveHostRevision), so a mid-context flip is refused rather than silently
+	// switching method tables.
 	//
 	// WRITTEN only by serveHost, inline on the loop that reads host messages, before the
 	// per-request handler is spawned. Pinning it from the initialize RESPONSE instead was the
@@ -1187,17 +1188,23 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its
-// first resolved message that the resolved revision actually DEFINES, so every later message
+// first resolved message that the resolved revision actually DISPATCHES, so every later message
 // is checked against it — which is what makes the mid-context-flip refusal reachable for a
 // peer that never sends initialize.
 //
-// The "defines it" half is what keeps that pin from being a wedge. A message whose method the
-// declared revision does not have is about to be dropped by the fail-closed routing default,
-// so it is not evidence about which revision this conversation is on — and latching from one
-// ends the connection: a single id-less `initialize` declaring the revision that REMOVED
-// `initialize` pinned that revision, and the host's real handshake was then denied under a
-// table with no `initialize` in it, with a re-declaration refused as a mid-context flip and an
-// omission inheriting the pin. There is no way back; the peer's only recourse is a new process.
+// The "dispatches it" half is what keeps that pin from being a wedge. A message the resolved
+// revision's tables have no handler for is about to be dropped by the fail-closed routing
+// default, so it is not evidence about which revision this conversation is on — and latching
+// from one ends the connection: a single id-less `initialize` declaring the revision that
+// REMOVED `initialize` pinned that revision, and the host's real handshake was then denied
+// under a table with no `initialize` in it, with a re-declaration refused as a mid-context flip
+// and an omission inheriting the pin. There is no way back; the peer's only recourse is a new
+// process.
+//
+// The predicate is dispatchesMessage; its doc holds the reasoning. Pinning HERE rather than
+// after dispatch resolves a handler — which would make the property structural — keeps hostRev
+// single-writer: serveHost dispatches each request on its own goroutine, and this call runs on
+// the reader.
 //
 // It returns the STAMPED context rather than the bare revision: that context is the one
 // carrier of the decided revision (the tables route by it, the tape records it), so a caller
@@ -1216,15 +1223,15 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 		}
 		return ctx, false
 	}
-	if definesMethod(rev, msg.Method) {
+	if dispatchesMessage(rev, msg) {
 		p.hostRev.Store(rev)
 	}
 	return capability.WithProtocolRevision(ctx, rev), true
 }
 
 // hostRevision returns the revision this connection's context resolved, or "" before a message
-// this proxy could act on has been negotiated — a connection whose traffic so far is methods
-// its declared revision does not define stays unpinned, which is the point. See
+// this proxy could act on has been negotiated — a connection whose traffic so far is messages
+// its declared revision dispatches nowhere stays unpinned, which is the point. See
 // StdioProxy.hostRev for the single-writer rule.
 func (p *StdioProxy) hostRevision() capability.Revision {
 	rev, _ := p.hostRev.Load().(capability.Revision)

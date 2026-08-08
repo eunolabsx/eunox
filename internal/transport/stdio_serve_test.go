@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -81,6 +82,84 @@ func TestServeHost_ReturnsOnUpstreamExit(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("serveHost did not return after the upstream exited")
 	}
+}
+
+// stdioServe is the varying half of a serveHost fixture: everything else about the proxy is
+// fixed by what Start actually produces, and belongs in serveHostLines rather than in a literal
+// per test.
+type stdioServe struct {
+	// pdp decides; nil means AlwaysAllowPDP, which is what a test asserting on framing or
+	// negotiation rather than on policy wants.
+	pdp pdp.PolicyDecisionPoint
+	// sessionID defaults to "sess". Set it when a kill switch names a session.
+	sessionID string
+	// sink, when set, gives the proxy a real audit tape so a test can read records back.
+	sink *audit.Sink
+}
+
+// serveHostLines drives a StdioProxy's REAL serve loop over lines — one raw JSON-RPC message
+// each, no trailing newline needed — and returns once the loop has finished, so a caller's
+// assertions run against a settled proxy.
+//
+// "Settled" is specifically the EOF path: closing the host's stdin is what makes serveHost wait
+// for its in-flight handlers before returning, which is what lets a caller read the host writer
+// without synchronizing. A test that ends the loop by cancelling its context instead does NOT
+// get that wait and cannot use this.
+//
+// One scaffold rather than a literal per test because the literal is the part that goes wrong.
+// It carries upstreamRev, whose omission puts the proxy in a state Start never produces (no
+// upstream leg), silently changing which declarations resolveHostRevision will honor — a test
+// that forgets it exercises a proxy production does not build, and the omission is invisible at
+// review. A field added to StdioProxy, or a change to serveHost's shutdown contract, is then one
+// edit here instead of one per copy.
+func serveHostLines(t *testing.T, cfg stdioServe, lines ...string) (*StdioProxy, *mockHostWriter) {
+	t.Helper()
+	decider := cfg.pdp
+	if decider == nil {
+		decider = pdp.AlwaysAllowPDP{}
+	}
+	sessionID := cfg.sessionID
+	if sessionID == "" {
+		sessionID = "sess"
+	}
+	hw := &mockHostWriter{}
+	pr, pw := io.Pipe()
+	p := &StdioProxy{
+		pdp:       decider,
+		sessionID: sessionID,
+		sink:      cfg.sink,
+		// The leg Start always leaves a proxy on: eunox opens every upstream with `initialize`,
+		// so the handshake revision is what it addresses one as. Set HERE, once, because it
+		// changes what resolveHostRevision honors.
+		upstreamRev:  handshakeRevision,
+		hostReader:   mcp.NewMsgReader(pr),
+		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
+		upWriter:     mcp.NewMsgWriter(io.Discard),
+		stderr:       io.Discard,
+		upstreamDone: make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() { p.serveHost(context.Background()); close(done) }()
+	// The writes run OFF this goroutine: an io.Pipe write blocks until a reader takes it, and
+	// serveHost has exits that do not drain (upstream exit, a non-EOF read error, a shutdown
+	// wake). Writing inline would then block forever with no reader and hang the test past the
+	// bounded wait below, surfacing as go test's 10-minute panic pointing at this helper rather
+	// than as the failure the caller wrote.
+	go func() {
+		for _, line := range lines {
+			if _, err := io.WriteString(pw, strings.TrimRight(line, "\n")+"\n"); err != nil {
+				return // the loop stopped reading; the wait below reports what happened
+			}
+		}
+		_ = pw.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHost did not return after the host closed stdin")
+	}
+	return p, hw
 }
 
 // blockingUpWriter is an upstream sink whose Write blocks until gate is closed,

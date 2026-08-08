@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"slices"
 	"sort"
 	"strings"
@@ -319,15 +317,11 @@ func requestWithRevision(t *testing.T, id, method string, rev any) mcp.RPCMsg {
 // declaration, so the next */list-shaped method fails the build rather than review.
 func TestMethodRegistry_EveryUpstreamForwardingLocalHandlerDeclaresIt(t *testing.T) {
 	t.Parallel()
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "dispatch.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parsing dispatch.go: %v", err)
-	}
+	src := dispatchSource(t)
 	// The registry is one composite literal keyed by method; each value is a methodSpec
 	// literal whose Local field holds the handler whose body is being inspected.
 	checked := 0
-	ast.Inspect(file, func(n ast.Node) bool {
+	ast.Inspect(src.file, func(n ast.Node) bool {
 		spec, ok := n.(*ast.CompositeLit)
 		if !ok {
 			return true
@@ -372,10 +366,10 @@ func TestMethodRegistry_EveryUpstreamForwardingLocalHandlerDeclaresIt(t *testing
 		})
 		if forwards && !declared {
 			t.Errorf("a Local handler at %s forwards the host's request upstream but its entry does not declare LocalForwards; the upstream-revision gate is off for that method",
-				fset.Position(local.Pos()))
+				src.fset.Position(local.Pos()))
 		}
 		if !forwards && declared {
-			t.Errorf("an entry at %s declares LocalForwards but its handler reaches no upstream", fset.Position(local.Pos()))
+			t.Errorf("an entry at %s declares LocalForwards but its handler reaches no upstream", src.fset.Position(local.Pos()))
 		}
 		return true
 	})

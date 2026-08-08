@@ -2564,8 +2564,12 @@ func TestJWTPDP_OpScanAllArgs_DeeplyNestedArgs_Denied(t *testing.T) {
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("deeply nested args must fail closed in scan-all mode; got %v", resp.Decision)
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Errorf("want CONDITION_FAILED denial for over-deep args; got %+v", resp.Denial)
+	// ENFORCEMENT_ERROR, not CONDITION_FAILED: the scan bailed, so the verb check never
+	// ran. This arm is CALLER-reachable (nest past maxArgStringDepth), so minting a
+	// downgradable policy code let an --audit route forward the call with the claim's
+	// allowedOperations unevaluated.
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Errorf("want ENFORCEMENT_ERROR denial for over-deep args; got %+v", resp.Denial)
 	}
 }
 
@@ -2574,8 +2578,9 @@ func TestJWTPDP_OpScanAllArgs_DeeplyNestedArgs_Denied(t *testing.T) {
 // TestJWTPDP_OpCondition_NamedArgumentFailsClosed: the capability-claim grammar
 // never names the operation argument (buildV2Constraint always emits Argument: ""),
 // so a named-argument AllowedOperationsCondition can only arrive on a
-// programmatically built constraint. It must fail closed with CONDITION_FAILED
-// rather than run an evaluation path unreachable from a validated claim.
+// programmatically built constraint. It must fail closed with ENFORCEMENT_ERROR
+// rather than run an evaluation path unreachable from a validated claim: the grant
+// carries a form this build cannot enforce, so the condition is never evaluated.
 func TestJWTPDP_OpCondition_NamedArgumentFailsClosed(t *testing.T) {
 	t.Parallel()
 	cond := capability.AllowedOperationsCondition{
@@ -2588,14 +2593,17 @@ func TestJWTPDP_OpCondition_NamedArgumentFailsClosed(t *testing.T) {
 	if resp == nil {
 		t.Fatal("a named-argument allowedOperations condition must fail closed, got allow")
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Errorf("expected CONDITION_FAILED for the unsupported named-argument form; got %+v", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Errorf("expected ENFORCEMENT_ERROR for the unsupported named-argument form; got %+v", resp.Denial)
 	}
 }
 
 // TestJWTPDP_UnknownConditionType_FailsClosed verifies that a JWT condition type
 // without an evaluator in evaluateJWTConditions is denied (fail closed) rather
-// than silently skipped, matching the engine's unknown-condition-type invariant.
+// than silently skipped, matching the engine's unknown-condition-type invariant —
+// including the CODE, which is what carries the fail-closed posture forward: a
+// condition nothing evaluated is a fault, and only a policy verdict may be
+// downgraded to a forward by an observing route.
 func TestJWTPDP_UnknownConditionType_FailsClosed(t *testing.T) {
 	t.Parallel()
 
@@ -2603,8 +2611,8 @@ func TestJWTPDP_UnknownConditionType_FailsClosed(t *testing.T) {
 	if resp == nil {
 		t.Fatal("an unevaluable JWT condition type must deny (fail closed), not pass silently")
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Errorf("expected CONDITION_FAILED for the unknown condition type; got %+v", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Errorf("expected ENFORCEMENT_ERROR for the unknown condition type; got %+v", resp.Denial)
 	}
 }
 
@@ -4882,34 +4890,35 @@ func TestEvaluateJWTConditionsAllowedOperations(t *testing.T) {
 		// CONDITION_FAILED regardless of whether the operation would otherwise be
 		// permitted, denied, or absent.
 		{
-			name:     "named arg (would-be permitted) fails closed CONDITION_FAILED",
+			name:     "named arg (would-be permitted) fails closed ENFORCEMENT_ERROR",
 			conds:    op("sql", "SELECT"),
 			args:     map[string]interface{}{"sql": "select * from t"},
 			wantDeny: true,
-			wantCode: capability.ErrCodeConditionFailed,
+			wantCode: capability.ErrCodeEnforcementError,
 		},
 		{
-			name:     "named arg (would-be denied) fails closed CONDITION_FAILED",
+			name:     "named arg (would-be denied) fails closed ENFORCEMENT_ERROR",
 			conds:    op("sql", "SELECT"),
 			args:     map[string]interface{}{"sql": "DROP table t"},
 			wantDeny: true,
-			wantCode: capability.ErrCodeConditionFailed,
+			wantCode: capability.ErrCodeEnforcementError,
 		},
 		{
-			name:     "named arg absent fails closed CONDITION_FAILED",
+			name:     "named arg absent fails closed ENFORCEMENT_ERROR",
 			conds:    op("sql", "SELECT"),
 			args:     map[string]interface{}{},
 			wantDeny: true,
-			wantCode: capability.ErrCodeConditionFailed,
+			wantCode: capability.ErrCodeEnforcementError,
 		},
 		// Scan-all-args branch. Sound only for SQL operations; a non-SQL op in this
-		// bare form (no named argument) fails closed with CONDITION_FAILED.
+		// bare form (no named argument) fails closed with ENFORCEMENT_ERROR — nothing
+		// evaluated the restriction, so there is no verdict to downgrade.
 		{
-			name:     "scan-all-args non-SQL op fails closed CONDITION_FAILED",
+			name:     "scan-all-args non-SQL op fails closed ENFORCEMENT_ERROR",
 			conds:    op("", "PUBLISH"),
 			args:     map[string]interface{}{"action": "publish now"},
 			wantDeny: true,
-			wantCode: capability.ErrCodeConditionFailed,
+			wantCode: capability.ErrCodeEnforcementError,
 		},
 		{
 			name:     "scan-all-args disallowed SQL verb in any argument denies",
@@ -4923,7 +4932,7 @@ func TestEvaluateJWTConditionsAllowedOperations(t *testing.T) {
 			conds:    op("", "PUBLISH"),
 			args:     map[string]interface{}{"note": "hello world"},
 			wantDeny: true,
-			wantCode: capability.ErrCodeConditionFailed,
+			wantCode: capability.ErrCodeEnforcementError,
 		},
 		{
 			name:     "scan-all-args SQL op with no matching argument denies MISSING_CONTEXT",

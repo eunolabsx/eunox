@@ -4,7 +4,6 @@
 package transport
 
 import (
-	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -130,18 +129,21 @@ func TestGuardedCompositeLiterals(t *testing.T) {
 	}
 }
 
-// packageSource is one parsed non-test source of this package, paired with the name it was
-// parsed under so a guard's failure can name the file.
+// packageSource is one parsed non-test source, paired with the name it was parsed under so a
+// guard's failure can name the file. path carries the directory too, for the cross-package
+// guards whose failures would otherwise name a bare file name found in several of them.
 type packageSource struct {
 	name string
+	path string
 	file *ast.File
 	fset *token.FileSet
 }
 
-// packageSources parses every non-test .go file in this package's directory. It is the ONE
-// enumeration every source guard here walks (this file's literal guard, the negotiation
-// prologue, the committer pairing, the stderr discipline), because all of them fail OPEN —
-// fewer files parsed means fewer violations found — so a narrowed enumeration would weaken
+// packageSources parses every non-test .go file in this package's directory. Every source guard
+// here reaches its files through this one enumeration — directly (the literal guard, the
+// negotiation prologue, the committer pairing, the stderr discipline) or through the two
+// narrowings derived from it below, packageSourcesIn and dispatchSource — because all of them
+// fail OPEN: fewer files parsed means fewer violations found, so a narrowed enumeration weakens
 // each of them silently, and only one copy carried the reasoning below.
 //
 // The files are enumerated and parsed directly rather than through parser.ParseDir. Two
@@ -155,21 +157,56 @@ type packageSource struct {
 // provenance struct directly, drive the negotiation primitives — to pin the rule itself, and
 // holding them to it would say nothing about production while making every new table-driven
 // test edit an allowlist.
-// Parsed ONCE per test binary: five guards walk the same ~13k lines, and the result is
-// read-only in every one of them.
 func packageSources(t *testing.T) []packageSource {
 	t.Helper()
-	sources, err := parsePackageSources()
+	return packageSourcesIn(t, ".")
+}
+
+// packageSourcesIn is packageSources for any directory: the cross-package guards (the flow
+// discriminator, which must see every package that builds a details map) need the same
+// enumeration over internal/pdp, internal/audit, pkg/enforcement and cmd/eunox, and hand-rolling
+// the ReadDir/skip-_test.go/ParseFile loop per guard is how one of them comes to skip the
+// build-tagged files the reasoning above is about.
+//
+// Parsed ONCE per directory per test binary: several guards walk the same sources, and the
+// result is read-only in every one of them.
+func packageSourcesIn(t *testing.T, dir string) []packageSource {
+	t.Helper()
+	sources, err := parsePackageSources(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return sources
 }
 
-var parsePackageSources = sync.OnceValues(func() ([]packageSource, error) {
-	entries, err := os.ReadDir(".")
+// dispatchSource is the narrower walk two guards need: dispatch.go alone, parsed through the
+// shared enumeration so "the file this rule is about" is named once rather than re-spelled as a
+// literal at each site.
+func dispatchSource(t *testing.T) packageSource {
+	t.Helper()
+	for _, src := range packageSources(t) {
+		if src.name == "dispatch.go" {
+			return src
+		}
+	}
+	t.Fatal("dispatch.go is not among this package's sources; the guards keyed on it are walking nothing")
+	return packageSource{}
+}
+
+var (
+	sourceCacheMu sync.Mutex
+	sourceCache   = map[string][]packageSource{}
+)
+
+func parsePackageSources(dir string) ([]packageSource, error) {
+	sourceCacheMu.Lock()
+	defer sourceCacheMu.Unlock()
+	if cached, ok := sourceCache[dir]; ok {
+		return cached, nil
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("listing package sources: %w", err)
+		return nil, fmt.Errorf("listing package sources in %s: %w", dir, err)
 	}
 	fset := token.NewFileSet()
 	var sources []packageSource
@@ -178,19 +215,21 @@ var parsePackageSources = sync.OnceValues(func() ([]packageSource, error) {
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		file, perr := parser.ParseFile(fset, name, nil, 0)
+		path := filepath.Join(dir, name)
+		file, perr := parser.ParseFile(fset, path, nil, 0)
 		if perr != nil {
-			return nil, fmt.Errorf("parsing %s: %w", name, perr)
+			return nil, fmt.Errorf("parsing %s: %w", path, perr)
 		}
-		sources = append(sources, packageSource{name: filepath.Base(name), file: file, fset: fset})
+		sources = append(sources, packageSource{name: name, path: path, file: file, fset: fset})
 	}
 	// Every caller's guard passes vacuously on an empty walk, so the emptiness is refused here
 	// rather than re-checked (or forgotten) at each one.
 	if len(sources) == 0 {
-		return nil, errors.New("no package sources found; every source guard would pass vacuously")
+		return nil, fmt.Errorf("no package sources found in %s; every source guard would pass vacuously", dir)
 	}
+	sourceCache[dir] = sources
 	return sources, nil
-})
+}
 
 // walkLiterals visits every composite literal under n, reporting the named type of each and
 // the literal itself (so a caller can also inspect its elements). elem is the type name an

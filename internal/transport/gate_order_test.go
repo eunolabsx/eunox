@@ -13,12 +13,12 @@ import (
 	"context"
 	"encoding/json"
 	"go/ast"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
@@ -35,6 +35,16 @@ func unknownRevisionCall(id string) mcp.RPCMsg {
 	}
 }
 
+// encodeMsg renders a message as the single JSON line serveHostLines feeds the host reader.
+func encodeMsg(t *testing.T, msg mcp.RPCMsg) string {
+	t.Helper()
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshalling host message: %v", err)
+	}
+	return string(raw)
+}
+
 // TestGateOrder_RevisionRefusalPrecedesKillOnStdio pins the exception the ordering costs, on
 // the transport whose prologue places it: a revoked session's bad-version probe is recorded
 // as UNSUPPORTED_PROTOCOL_VERSION, not KILL_SWITCH. Driven through the real serve loop, so
@@ -49,35 +59,14 @@ func TestGateOrder_RevisionRefusalPrecedesKillOnStdio(t *testing.T) {
 		t.Fatalf("KillSession: %v", err)
 	}
 	sink, logPath := newTempAuditSink(t)
-	pr, pw := io.Pipe()
-	hw := &mockHostWriter{}
-	p := &StdioProxy{
-		pdp:          newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
-		sessionID:    "killed-sess",
-		sink:         sink,
-		hostReader:   mcp.NewMsgReader(pr),
-		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
-		upWriter:     mcp.NewMsgWriter(io.Discard),
-		stderr:       io.Discard,
-		upstreamDone: make(chan struct{}),
-	}
-
-	done := make(chan struct{})
-	go func() { p.serveHost(context.Background()); close(done) }()
-
-	enc := json.NewEncoder(pw)
-	if err := enc.Encode(unknownRevisionCall(`1`)); err != nil {
-		t.Fatalf("write probe: %v", err)
-	}
-	if err := enc.Encode(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: methodPing}); err != nil {
-		t.Fatalf("write ping: %v", err)
-	}
-	_ = pw.Close()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("serveHost did not return after the host closed stdin")
-	}
+	serveHostLines(t, stdioServe{
+		pdp:       newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sessionID: "killed-sess",
+		sink:      sink,
+	},
+		encodeMsg(t, unknownRevisionCall(`1`)),
+		encodeMsg(t, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: methodPing}),
+	)
 	_ = sink.Close()
 
 	records := readAuditRecords(t, logPath)
@@ -501,26 +490,38 @@ var negotiationPrimitives = map[string]string{
 }
 
 // hostMessageDispositions are the SINKS this guard recognizes as disposing of a host message:
-// dispatching it to a handler, admitting it through the shared notification gate, or refusing
-// it with a kill record. The value is the argument count that identifies the call, since two
-// of these names are shared with unrelated helpers (a record limiter's admit takes none or one;
-// the gate's takes ctx and the message).
+// dispatching it to a handler, admitting it through the shared notification gate, or refusing it
+// with a kill or session-gate record. The value is the argument count that identifies the call,
+// since two of these names are shared with unrelated helpers (a record limiter's admit takes
+// none or one; the gate's takes ctx and the message).
 //
 // Reaching one of them is what makes a function an ENTRY POINT here: it is the moment the proxy
 // acts on a message, and every gate that acts must run on a context whose revision was
 // negotiated.
 //
-// A NAMED set, not a derived one, and therefore not exhaustive: an arm that refuses a host
-// message through some other helper (a bare rec.RecordDeny beside a hand-built error body) is
-// not seen. That is the residual this guard does not close — it converts "a new arm reached
-// through one of the ways messages are actually disposed of" from silence into a build failure,
-// which is the shape the id-less `initialize` arm slipped through, and a new sink belongs in
-// this map the day it is written.
+// A NAMED set rather than one derived from "writes a deny record", and the choice is measured
+// rather than assumed. Deriving it from the recorder's own RecordDeny flags twenty-one
+// functions, and almost none of them is an arm this guard wants: most sit BELOW a dispatch that
+// already negotiated (dispatchUnmapped, malformedDeny, dispatchList, enforcedForwardCore and its
+// record helpers), several dispose of no host message at all (the server-initiated leg, the
+// drift refusal, the saturation record), two are the kill sinks already named here — and, the
+// tell, one is rolledUpRecorder.RecordDeny, which IS the recorder rather than a caller of it. A
+// name-matched walk cannot tell those apart, so the derivation buys one new class of coverage at
+// the cost of turning dispositionPrologue into twenty entries of boilerplate, which is a table
+// nobody reads and therefore not the review signal it exists to be.
+//
+// So it stays named and therefore NOT exhaustive: an arm that refuses a host message through
+// some other helper — a bare rec.RecordDeny beside a hand-built error body — is still not seen,
+// and belongs in this map the day it is written. What the guard does close is the shape the
+// id-less `initialize` arm slipped through: an arm reached through one of the ways messages are
+// actually disposed of is a build failure rather than silence. The site-count assertion below
+// closes the direction where that promise would rot without anyone noticing.
 var hostMessageDispositions = map[string]int{
-	"dispatchRequest":  3,
-	"admit":            2,
-	"recordKillDenial": 6,
-	"recordKillDrop":   7,
+	"dispatchRequest":       3,
+	"admit":                 2,
+	"recordKillDenial":      6,
+	"recordKillDrop":        7,
+	"recordSessionGateDeny": 5,
 }
 
 // dispositionPrologue is the INVERTED guard's table: every function that disposes of a host
@@ -553,7 +554,13 @@ var dispositionPrologue = map[string]string{
 	// Arms with no host message to negotiate FOR.
 	"denyUnresolvedSession":   "answers a session id this proxy never established: no context to negotiate against, so the record carries no revision (see its doc)",
 	"handleMCPGet":            "an SSE GET carries no JSON-RPC envelope, so there is no message and no declaration to resolve",
+	"handleMCPDelete":         "a DELETE carries no JSON-RPC envelope either; it terminates a session rather than dispatching a message",
 	"routeHostServerResponse": "handleSessionPost negotiated this POST before routing it; a response carries no method to dispatch",
+	// The session gate runs AHEAD of negotiation on purpose; see enforceSessionGates for the
+	// two reasons, both of which are about not acting on a victim session's state for a caller
+	// who has not cleared the binding. (recordSessionGateDeny needs no entry of its own: it
+	// WRITES that refusal's record rather than reaching a sink, so the walk sees its callers.)
+	"enforceSessionGates": "refuses a caller that may not act on this session at all, before anything reads the session's negotiated state (see its doc)",
 	// An UPSTREAM-initiated message. Host-side negotiation governs host messages, and this is
 	// not one — the upstream leg's revision is pinned once per route at its own handshake.
 	"readUpstream": "drops an upstream-initiated notification on a revoked session; not a host message",
@@ -630,12 +637,14 @@ func TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue(t *testing.T
 func TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor(t *testing.T) {
 	t.Parallel()
 	seen := map[string]bool{}
+	arities := map[string]map[int]int{} // sink name -> argument count -> calls seen
 	for _, src := range packageSources(t) {
 		for _, decl := range src.file.Decls {
 			fn, isFunc := decl.(*ast.FuncDecl)
 			if !isFunc || fn.Body == nil {
 				continue
 			}
+			recordDispositionArities(fn, arities)
 			sites := hostMessageDispositionSites(fn)
 			if len(sites) == 0 {
 				continue
@@ -657,9 +666,11 @@ func TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor(t *testing.T) {
 				if negotiationDominates(fn, site) {
 					continue
 				}
-				t.Errorf("%s: %s disposes of a host message at line %d with no negotiateHostRevision call dominating it.\n"+
-					"  This arm records or routes a message whose revision was never resolved, so its record names none\n"+
-					"  and its routing falls back to a table the peer did not declare.",
+				t.Errorf("%s: %s disposes of a host message at line %d with no HONORED negotiateHostRevision call dominating it.\n"+
+					"  Either no call precedes it as a statement of an enclosing block, or its ok result never reaches a\n"+
+					"  return/continue. Both leave this arm acting on a message whose revision was never established: its\n"+
+					"  record names none, its routing falls back to a table the peer did not declare, and a discarded ok\n"+
+					"  means it acts on a message the prologue has already refused and answered on the wire.",
 					src.name, fn.Name.Name, src.fset.Position(site.Pos()).Line)
 			}
 		}
@@ -674,6 +685,50 @@ func TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor(t *testing.T) {
 	if len(seen) == 0 {
 		t.Error("no host-message disposition found in any non-test file; hostMessageDispositions has been renamed out of the sources it guards")
 	}
+
+	// The arity that identifies each sink must still match something. This is the direction the
+	// walk fails OPEN in: adding a parameter to recordKillDrop drops every one of its call sites
+	// from the guard, and the only symptom is that a guard which found violations yesterday finds
+	// none today. The opposite drift — an unrelated helper growing INTO a guarded arity — fails
+	// loudly on its own, by demanding a prologue entry for a function that disposes of nothing.
+	for name, want := range hostMessageDispositions {
+		if arities[name][want] > 0 {
+			continue
+		}
+		t.Errorf("no call to %s takes %d argument(s); the guard matched %d call(s) by name at other arities (%v).\n"+
+			"  If its signature changed, update hostMessageDispositions — until then every one of its sites is\n"+
+			"  silently outside this walk, and an arm that disposes of a host message through it is invisible.",
+			name, want, totalCalls(arities[name]), arities[name])
+	}
+}
+
+// recordDispositionArities tallies, per guarded sink name, how many calls were seen at each
+// argument count — the evidence the arity assertion above reports when a signature has moved.
+func recordDispositionArities(fn *ast.FuncDecl, into map[string]map[int]int) {
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		name := callName(call)
+		if _, guarded := hostMessageDispositions[name]; !guarded {
+			return true
+		}
+		if into[name] == nil {
+			into[name] = map[int]int{}
+		}
+		into[name][len(call.Args)]++
+		return true
+	})
+}
+
+// totalCalls sums an arity tally, so a failure can say how many sites the name still has.
+func totalCalls(byArity map[int]int) int {
+	total := 0
+	for _, n := range byArity {
+		total += n
+	}
+	return total
 }
 
 // hostMessageDispositionSites returns every call in fn that disposes of a host message, matched
@@ -695,10 +750,16 @@ func hostMessageDispositionSites(fn *ast.FuncDecl) []*ast.CallExpr {
 }
 
 // negotiationDominates reports whether a negotiateHostRevision call is guaranteed to have run
-// before site within fn: it must be a STATEMENT of some block enclosing site, positioned before
-// the statement site sits in. Deliberately not "appears anywhere earlier in the function" — a
-// call inside an if-branch says nothing about a site after that if, which is the false pass
-// that let a whole arm negotiate nothing.
+// before site within fn AND that its refusal was HONORED: it must be a STATEMENT of some block
+// enclosing site, positioned before the statement site sits in, and its ok result must reach a
+// return/continue/break before that statement.
+//
+// Deliberately not "appears anywhere earlier in the function" — a call inside an if-branch says
+// nothing about a site after that if, which is the false pass that let a whole arm negotiate
+// nothing. And deliberately not "the call happened": `rev, _ := p.negotiateHostRevision(...)`
+// followed by an unconditional dispatch runs every gate on a message the prologue already
+// refused, which is a WORSE outcome than never negotiating, since the refusal has been recorded
+// and answered on the wire by then.
 func negotiationDominates(fn *ast.FuncDecl, site ast.Node) bool {
 	dominated := false
 	ast.Inspect(fn, func(n ast.Node) bool {
@@ -706,11 +767,11 @@ func negotiationDominates(fn *ast.FuncDecl, site ast.Node) bool {
 		if !isBlock || site.Pos() < block.Pos() || site.Pos() > block.End() {
 			return true
 		}
-		for _, stmt := range block.List {
+		for i, stmt := range block.List {
 			if stmt.End() > site.Pos() {
 				break // the statement containing site, or one after it
 			}
-			if unconditionalNegotiation(stmt) {
+			if negotiationPrologueAt(stmt, block.List[i+1:], site) {
 				dominated = true
 			}
 		}
@@ -719,18 +780,117 @@ func negotiationDominates(fn *ast.FuncDecl, site ast.Node) bool {
 	return dominated
 }
 
-// unconditionalNegotiation reports whether stmt IS a negotiateHostRevision call — an assignment
-// from it or a bare call — rather than merely containing one somewhere inside a nested branch.
-func unconditionalNegotiation(stmt ast.Stmt) bool {
+// negotiationPrologueAt reports whether stmt IS a negotiateHostRevision call whose refusal is
+// honored — rather than merely containing one somewhere inside a nested branch.
+//
+// Two spellings, because both are how a correct prologue is actually written: an assignment
+// whose ok is tested by a following if, and the same call in an if's own init clause. A BARE
+// call is not one: it discards the result the refusal travels on.
+func negotiationPrologueAt(stmt ast.Stmt, rest []ast.Stmt, site ast.Node) bool {
 	switch s := stmt.(type) {
 	case *ast.AssignStmt:
-		for _, rhs := range s.Rhs {
-			if isNegotiationCall(rhs) {
-				return true
-			}
+		name, negotiates := negotiationOKName(s)
+		return negotiates && refusalHonored(rest, site, name)
+	case *ast.IfStmt:
+		init, isAssign := s.Init.(*ast.AssignStmt)
+		if !isAssign {
+			return false
 		}
-	case *ast.ExprStmt:
-		return isNegotiationCall(s.X)
+		name, negotiates := negotiationOKName(init)
+		return negotiates && negatesIdent(s.Cond, name) && terminates(s.Body)
+	}
+	return false
+}
+
+// negotiationOKName returns the identifier bound to a negotiateHostRevision call's ok result.
+// The blank identifier reports false: an arm that discards the refusal has no way to honor it,
+// which is exactly the shape this guard now rejects.
+func negotiationOKName(assign *ast.AssignStmt) (string, bool) {
+	negotiates := false
+	for _, rhs := range assign.Rhs {
+		negotiates = negotiates || isNegotiationCall(rhs)
+	}
+	if !negotiates || len(assign.Lhs) == 0 {
+		return "", false
+	}
+	ident, isIdent := assign.Lhs[len(assign.Lhs)-1].(*ast.Ident)
+	if !isIdent || ident.Name == "_" {
+		return "", false
+	}
+	return ident.Name, true
+}
+
+// refusalHonored reports whether some statement before site tests name and leaves the flow —
+// the `if !ok { return }` / `if !ok { continue }` every prologue here is written as.
+//
+// Two things beyond "the name appears in a terminating if", because without either the guard
+// advertises a guarantee it does not hold (both shapes below were confirmed to pass a
+// mention-only check): the condition must NEGATE the name, since `if ok { return }` honors the
+// opposite of the refusal; and the name must not be REBOUND first, since a later
+// `x, ok := …` makes the surviving `if !ok` test somebody else's result while the negotiation's
+// own is silently discarded.
+func refusalHonored(rest []ast.Stmt, site ast.Node, name string) bool {
+	for _, stmt := range rest {
+		if stmt.End() > site.Pos() {
+			return false // reached the disposition without honoring the refusal
+		}
+		if ifStmt, isIf := stmt.(*ast.IfStmt); isIf && negatesIdent(ifStmt.Cond, name) && terminates(ifStmt.Body) {
+			return true
+		}
+		if rebinds(stmt, name) {
+			return false
+		}
+	}
+	return false
+}
+
+// rebinds reports whether stmt assigns to name, which invalidates any later test of it as a
+// statement about the negotiation's result.
+func rebinds(stmt ast.Stmt, name string) bool {
+	assign, isAssign := stmt.(*ast.AssignStmt)
+	if !isAssign {
+		return false
+	}
+	for _, lhs := range assign.Lhs {
+		if ident, isIdent := lhs.(*ast.Ident); isIdent && ident.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// terminates reports whether a block's last statement leaves the enclosing flow, which is what
+// makes a refusal branch a refusal rather than a log line.
+func terminates(body *ast.BlockStmt) bool {
+	if body == nil || len(body.List) == 0 {
+		return false
+	}
+	switch last := body.List[len(body.List)-1].(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return last.Tok == token.CONTINUE || last.Tok == token.BREAK
+	}
+	return false
+}
+
+// negatesIdent reports whether expr tests the named identifier for FALSEHOOD — `!ok`, or `!ok`
+// as an operand of a wider condition. Polarity is the point: a mention-only match accepts
+// `if ok { return }`, which returns on the success path and dispatches on the refused one.
+func negatesIdent(expr ast.Expr, name string) bool {
+	switch e := expr.(type) {
+	case *ast.UnaryExpr:
+		if e.Op != token.NOT {
+			return false
+		}
+		ident, isIdent := e.X.(*ast.Ident)
+		return isIdent && ident.Name == name
+	case *ast.BinaryExpr:
+		// `!ok || …` / `… || !ok`: either operand refusing on the negation is enough, since
+		// the branch terminates for it.
+		return negatesIdent(e.X, name) || negatesIdent(e.Y, name)
+	case *ast.ParenExpr:
+		return negatesIdent(e.X, name)
 	}
 	return false
 }

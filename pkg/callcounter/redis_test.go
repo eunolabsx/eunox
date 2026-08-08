@@ -52,6 +52,34 @@ func TestNewRedis_RefusesKeyspaceShardingClients(t *testing.T) {
 	}
 }
 
+// TestNewRedis_RefusesANilClient pins the constructor's other refusal, and the ORDER between
+// the two: go-redis dereferences the receiver before it can build a reply, so a nil client
+// panics on every command rather than returning the error a counter's callers fail closed on.
+//
+// The order is behavior, not an implementation detail. A typed-nil sharding client is refused
+// as nil rather than as ErrClusterUnsupported, because "nil" is the actionable fact — the
+// cluster guidance would send an operator to fix a topology when the handle is simply unset.
+func TestNewRedis_RefusesANilClient(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		client redis.Cmdable
+	}{
+		{"untyped nil", nil},
+		{"typed-nil single node", (*redis.Client)(nil)},
+		{"typed-nil cluster", (*redis.ClusterClient)(nil)},
+		{"typed-nil ring", (*redis.Ring)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			counter, err := callcounter.NewRedis(tc.client)
+			require.Error(t, err)
+			require.Nil(t, counter, "a refused construction must hand back nothing to admit against")
+			require.Contains(t, err.Error(), "nil Redis client")
+			require.NotErrorIs(t, err, callcounter.ErrClusterUnsupported,
+				"a nil handle is a nil handle; the cluster sentinel would point an operator at the wrong wiring decision")
+		})
+	}
+}
+
 // TestNewRedis_AcceptsSingleNodeClient is the positive control: the refusal is on sharding
 // topologies, not on Redis.
 func TestNewRedis_AcceptsSingleNodeClient(t *testing.T) {
