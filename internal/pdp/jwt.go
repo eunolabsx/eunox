@@ -2063,7 +2063,13 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 			// (ok=false) a type it cannot evaluate without committing.
 			cerr, ok := claimConditionVerdict(eval, ctx, c, req)
 			if !ok {
-				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, c.ConditionType(),
+				// ENFORCEMENT_ERROR, not CONDITION_FAILED: the condition guarding this call was
+				// never evaluated once — the handler commits state, or is not registered at all —
+				// so there is no policy verdict for an observing route to downgrade to a forward.
+				// The class is read off the CODE (capability.ClassifyDenialCode), so minting the
+				// policy code here made --audit forward a call whose claim condition nothing
+				// checked, and report it as "would be allowed" when enforce mode denies it.
+				resp := denyResponseWithDetails(clock, capability.ErrCodeEnforcementError, c.ConditionType(),
 					fmt.Sprintf("%q: the deciding policy's %s handler cannot be evaluated ahead of its own decision (it commits state, or is not registered); deny (fail closed)", name, c.ConditionType()),
 					map[string]interface{}{"conditionType": c.ConditionType()})
 				return &resp
@@ -2076,7 +2082,11 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 			// Fail closed on any condition type without an evaluator. buildV2Constraint
 			// emits only AllowedOperations/AllowedValues today, so this is unreachable —
 			// but a new type added there without a case here must deny, not be skipped.
-			resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, cond.ConditionType(),
+			//
+			// ENFORCEMENT_ERROR for the same reason as the arm above, and matching the engine's
+			// own unmodelled-condition-type refusal: an unevaluated restriction is a fault, and a
+			// fault is the one class an observing route may not downgrade to a forward.
+			resp := denyResponseWithDetails(clock, capability.ErrCodeEnforcementError, cond.ConditionType(),
 				fmt.Sprintf("%q: JWT condition type %q has no evaluator; deny (fail closed)", name, cond.ConditionType()),
 				map[string]interface{}{"conditionType": cond.ConditionType()})
 			return &resp

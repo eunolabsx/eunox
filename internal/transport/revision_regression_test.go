@@ -5,10 +5,10 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
@@ -77,7 +77,7 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetForARemovedMethod(t *test
 	}
 }
 
-// TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDefines is the regression for a
+// TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDispatches is the regression for a
 // connection that could be wedged for the process's lifetime by one stray line.
 //
 // The stdio context pins from its first RESOLVED message, which is what makes the flip refusal
@@ -90,36 +90,13 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetForARemovedMethod(t *test
 //
 // The stray notification is still dropped by the fail-closed default, and still recorded — what
 // changes is that it no longer speaks for the connection.
-func TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDefines(t *testing.T) {
+func TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDispatches(t *testing.T) {
 	t.Parallel()
-	hw := &mockHostWriter{}
-	pr, pw := io.Pipe()
-	p := &StdioProxy{
-		pdp:       newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
-		sessionID: "sess",
-		// The leg Start always leaves a proxy on: eunox opens every upstream with `initialize`,
-		// so the handshake revision is what it addresses one as. Set here because it changes
-		// what resolveHostRevision will honor, and a fixture that omits it tests a state
-		// production never reaches.
-		upstreamRev:  handshakeRevision,
-		hostReader:   mcp.NewMsgReader(pr),
-		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
-		upWriter:     mcp.NewMsgWriter(io.Discard),
-		stderr:       io.Discard,
-		upstreamDone: make(chan struct{}),
-	}
-	done := make(chan struct{})
-	go func() { p.serveHost(context.Background()); close(done) }()
-
 	// The stray line, then the host's real handshake declaring nothing at all.
-	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`+"\n")
-	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n")
-	_ = pw.Close()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("serveHost did not return after the host closed stdin")
-	}
+	p, hw := serveHostLines(t, stdioServe{pdp: newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}})},
+		`{"jsonrpc":"2.0","method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+	)
 
 	if len(hw.messages) != 1 {
 		t.Fatalf("host received %d message(s), want exactly the handshake reply: %+v", len(hw.messages), hw.messages)
@@ -132,44 +109,25 @@ func TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDefines(t *testing.T) {
 	}
 }
 
-// TestStdioNegotiation_StillPinsFromADefinedMethod is the other half: the wedge fix must not
+// TestStdioNegotiation_StillPinsFromADispatchedMethod is the other half: the wedge fix must not
 // cost the property the pin exists for. A peer that never sends `initialize` still latches its
 // revision from its first ordinary message, so a later declaration disagreeing with it is
 // refused as the mid-context flip it is.
 //
 // The peer declares the HANDSHAKE revision, which is the only one a live upstream leg can
 // dispatch: eunox addresses every leg it opens as that revision, and every method 2026-07-28
-// defines forwards its params, so a declaration of the newer one is refused by
-// checkUpstreamHonorable one gate before the pin is even consulted. A fixture that pinned
-// 2026-07-28 would only reach the pin by leaving the leg revision unset — a state Start never
-// produces.
-func TestStdioNegotiation_StillPinsFromADefinedMethod(t *testing.T) {
+// currently declares forwards its params, so a declaration of the newer one is refused by
+// checkUpstreamHonorable one gate before the pin is even consulted (see its doc — that is
+// incidental, not something the pin relies on). A fixture that pinned 2026-07-28 would only
+// reach the pin by leaving the leg revision unset — a state Start never produces.
+func TestStdioNegotiation_StillPinsFromADispatchedMethod(t *testing.T) {
 	t.Parallel()
-	hw := &mockHostWriter{}
-	pr, pw := io.Pipe()
-	p := &StdioProxy{
-		pdp:          newTestManifestPDP(),
-		sessionID:    "sess",
-		upstreamRev:  handshakeRevision,
-		hostReader:   mcp.NewMsgReader(pr),
-		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
-		upWriter:     mcp.NewMsgWriter(io.Discard),
-		stderr:       io.Discard,
-		upstreamDone: make(chan struct{}),
-	}
-	done := make(chan struct{})
-	go func() { p.serveHost(context.Background()); close(done) }()
-
 	// ping is answered locally and exists in the declared revision, so it both pins and is
 	// dispatched — unlike the `initialize` above, which the revision IT declared had removed.
-	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`+"\n")
-	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":2,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`+"\n")
-	_ = pw.Close()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("serveHost did not return after the host closed stdin")
-	}
+	p, hw := serveHostLines(t, stdioServe{pdp: newTestManifestPDP()},
+		`{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`,
+	)
 
 	if got := p.hostRevision(); got != handshakeRevision {
 		t.Fatalf("pinned revision = %q, want %q from the first message the revision defines", got, handshakeRevision)
@@ -187,6 +145,86 @@ func TestStdioNegotiation_StillPinsFromADefinedMethod(t *testing.T) {
 	}
 	if !flipped {
 		t.Errorf("no -32022 among %+v; the second declaration disagrees with the pinned context and must be refused as a mid-context flip", hw.messages)
+	}
+}
+
+// TestStdioNegotiation_DoesNotPinFromAMessageTheFramingDiscards is the wedge CLASS, not the one
+// instance of it. Pinning from "the revision has this method" closed the id-less `initialize`
+// and left the shape open: revision membership is declared per METHOD, so a REQUEST-framed
+// `notifications/progress` names a method both revisions have, satisfies that predicate, pins
+// the connection — and is then dropped by dispatchUnmapped, which is a message the fail-closed
+// default discards deciding what the peer speaks.
+//
+// Driven through the real serve loop at the handshake revision, which is the framing/revision
+// pair a live upstream leg actually admits. The message is still denied; what must not happen
+// is the latch.
+func TestStdioNegotiation_DoesNotPinFromAMessageTheFramingDiscards(t *testing.T) {
+	t.Parallel()
+	p, hw := serveHostLines(t, stdioServe{},
+		`{"jsonrpc":"2.0","id":1,"method":"notifications/progress","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`,
+	)
+
+	if len(hw.messages) != 1 || hw.messages[0].Error == nil {
+		t.Fatalf("host received %+v, want the fail-closed refusal: a notification-only method has no request handler in either revision", hw.messages)
+	}
+	if got := p.hostRevision(); got != "" {
+		t.Errorf("pinned revision = %q, want unpinned — the proxy discarded this message, so it is no evidence about which revision the conversation is on", got)
+	}
+}
+
+// TestDispatchesMessage_AgreesWithTheDispatchTables is the structural guard the predicate needs:
+// the pin's question and the dispatcher's are the SAME table lookup, so no cell of the registry
+// can make them disagree.
+//
+// Derived over every published revision, every declared method, and both framings, rather than
+// spot-checked — the failure this replaces was one cell (a notification-only method in request
+// framing) in a predicate that read as obviously right.
+func TestDispatchesMessage_AgreesWithTheDispatchTables(t *testing.T) {
+	t.Parallel()
+	for _, rev := range capability.PublishedRevisions() {
+		tables := tablesFor(rev)
+		for method := range methodRegistry {
+			_, decided := tables.decide[method]
+			_, local := tables.local[method]
+			_, notified := tables.notifications[method]
+
+			request := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: method}
+			if got := dispatchesMessage(rev, request); got != (decided || local) {
+				t.Errorf("%s %s (request framing): dispatchesMessage = %v, tables hold a handler = %v", rev, method, got, decided || local)
+			}
+			notification := mcp.RPCMsg{JSONRPC: "2.0", Method: method}
+			if got := dispatchesMessage(rev, notification); got != notified {
+				t.Errorf("%s %s (notification framing): dispatchesMessage = %v, tables hold a disposition = %v", rev, method, got, notified)
+			}
+		}
+		// A response carries no method and is dispatched by neither table, so it can never pin.
+		if dispatchesMessage(rev, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{}`)}) {
+			t.Errorf("%s: a response must not pin a context; the proxy routes it to a waiting upstream, it does not dispatch it", rev)
+		}
+		// And an unknown method, in either framing.
+		if dispatchesMessage(rev, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "agents/delegate"}) ||
+			dispatchesMessage(rev, mcp.RPCMsg{JSONRPC: "2.0", Method: "agents/delegate"}) {
+			t.Errorf("%s: an unmapped method must not pin a context", rev)
+		}
+	}
+}
+
+// TestDispatchesMessage_RejectsTheRequestFramedNotification names the cell the per-method
+// predicate got wrong, in both revisions, so a future predicate that answers per METHOD again
+// fails here rather than in a wedged connection.
+func TestDispatchesMessage_RejectsTheRequestFramedNotification(t *testing.T) {
+	t.Parallel()
+	for _, rev := range []capability.Revision{capability.Revision20251125, capability.Revision20260728} {
+		request := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: methodNotificationsProgress}
+		if dispatchesMessage(rev, request) {
+			t.Errorf("%s: a request-framed %s must not pin — %s has no request handler in any revision, so the message is about to be discarded",
+				rev, methodNotificationsProgress, methodNotificationsProgress)
+		}
+		// The same method in its own framing IS acted on, so it does pin: the predicate is about
+		// the framing, not about the method being second-class.
+		if !dispatchesMessage(rev, mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress}) {
+			t.Errorf("%s: %s in notification framing is forwarded, so it is evidence about the conversation's revision", rev, methodNotificationsProgress)
+		}
 	}
 }
 

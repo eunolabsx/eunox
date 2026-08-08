@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/eunolabs/eunox/pkg/callcounter"
+	"github.com/eunolabs/eunox/internal/redisutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -582,8 +582,8 @@ func TestScanPrefix_VisitsEveryShard(t *testing.T) {
 }
 
 // TestShardTopology_IsOneList pins what replaced this package's own type switch: the iterator
-// and the "does this client shard" predicate both come from callcounter, so a client one calls
-// sharding and the other has no iterator for is not a state that can be constructed. The
+// and the "does this client shard" predicate both come from redisutil, so a client one caller
+// calls sharding and the other has no iterator for is not a state that can be constructed. The
 // previous shape — two hand-written lists, agreeing by review — had already drifted once.
 func TestShardTopology_IsOneList(t *testing.T) {
 	t.Parallel()
@@ -599,9 +599,32 @@ func TestShardTopology_IsOneList(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tc.wantFan, callcounter.ShardIterator(tc.client) != nil,
+			assert.Equal(t, tc.wantFan, redisutil.ShardIterator(tc.client) != nil,
 				"ShardIterator(%T) decides BOTH questions this package used to answer with its own type switch: does it shard, and how is it enumerated", tc.client)
 		})
+	}
+}
+
+// TestForEachNode_NilClientErrorsRatherThanPanics is the consumer-side half of the typed-nil
+// rule, asserted where the hazard actually lands. forEachNode CALLS whatever iterator it is
+// handed, on the reconcile goroutine, so an iterator bound to a nil receiver is a nil-pointer
+// dereference inside go-redis — process death on the emergency-stop path.
+//
+// Routing the typed nil to the single-node path is not by itself the fix: go-redis dereferences
+// the receiver before it can build a reply, so the SCAN there panics too. The nil client is
+// refused up front, which refreshState answers by going degraded — fail-closed by default.
+//
+// Reachable by a library consumer wiring this backend with a nil-valued handle (a config path
+// that leaves the client unset, an ignored constructor error). The shipped binary is single-node.
+func TestForEachNode_NilClientErrorsRatherThanPanics(t *testing.T) {
+	t.Parallel()
+	for _, client := range []redis.Cmdable{nil, (*redis.ClusterClient)(nil), (*redis.Ring)(nil), (*redis.Client)(nil)} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		// scanPrefix is the real caller: it fans out, and each node runs a SCAN.
+		err := (&Redis{client: client}).scanPrefix(ctx, redisSessionPfx, map[string]bool{})
+		cancel()
+		assert.ErrorIs(t, err, errNilClient,
+			"%T: a nil client must be refused as an error the kill switch fails closed on, not a panic on the reconcile goroutine", client)
 	}
 }
 

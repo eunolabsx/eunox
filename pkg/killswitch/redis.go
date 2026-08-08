@@ -15,7 +15,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/eunolabs/eunox/pkg/callcounter"
+	"github.com/eunolabs/eunox/internal/redisutil"
 	"github.com/eunolabs/eunox/pkg/durationsentinel"
 )
 
@@ -86,6 +86,13 @@ var ErrNotStarted = errors.New("killswitch: redis kill switch queried before Sta
 // canceled and the convergence loops have exited: like ErrNotStarted, a liveness
 // condition that fails closed regardless of WithFailOpen.
 var ErrStopped = errors.New("killswitch: redis kill switch convergence stopped (Start context canceled); failing closed (state can no longer be confirmed)")
+
+// errNilClient refuses a backend wired with no Redis client at all — a WIRING error, like
+// ErrNotStarted, reported rather than left to the first command: go-redis dereferences the
+// receiver before it can build a reply, so the command panics instead of erroring, and the
+// enumeration that would hit it runs on the reconcile goroutine. Unexported because the fix is
+// to pass a client, not to match this.
+var errNilClient = errors.New("killswitch: redis kill switch wired with a nil client; failing closed (kill-switch state cannot be loaded)")
 
 // Redis is a Redis-backed kill-switch manager with pub/sub propagation and local cache.
 type Redis struct {
@@ -994,13 +1001,21 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 // keyless-command sites cannot drift — the shape they were in before, when one of them fell
 // through to a single-node SCAN for a *redis.Ring and loaded whichever shard go-redis picked.
 //
-// The topology comes from callcounter.ShardIterator, which is also what DEFINES "does this
-// client shard", so this cannot be handed a shape it has no iterator for.
+// The topology comes from redisutil.ShardIterator, which is also what DEFINES "does this
+// client shard", so this cannot be handed a shape it has no iterator for — including the typed
+// nil that would otherwise hand back an iterator bound to a nil receiver and panic here.
 //
 // Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary is
 // single-node, and callcounter.NewRedis refuses a sharding client outright.
 func (r *Redis) forEachNode(ctx context.Context, fn func(context.Context, redis.Cmdable) error) error {
-	if fanOut := callcounter.ShardIterator(r.client); fanOut != nil {
+	// A nil client is refused HERE rather than left to the first command: go-redis dereferences
+	// the receiver before it can build a reply, so a nil one panics instead of erroring, and this
+	// runs on the reconcile goroutine where that is process death. As an error it is a backend
+	// that failed, which refreshState already answers by going degraded — fail-closed by default.
+	if redisutil.IsNilClient(r.client) {
+		return errNilClient
+	}
+	if fanOut := redisutil.ShardIterator(r.client); fanOut != nil {
 		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error { return fn(ctx, node) })
 	}
 	return fn(ctx, r.client)

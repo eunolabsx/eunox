@@ -2595,7 +2595,10 @@ func TestJWTPDP_OpCondition_NamedArgumentFailsClosed(t *testing.T) {
 
 // TestJWTPDP_UnknownConditionType_FailsClosed verifies that a JWT condition type
 // without an evaluator in evaluateJWTConditions is denied (fail closed) rather
-// than silently skipped, matching the engine's unknown-condition-type invariant.
+// than silently skipped, matching the engine's unknown-condition-type invariant —
+// including the CODE, which is what carries the fail-closed posture forward: a
+// condition nothing evaluated is a fault, and only a policy verdict may be
+// downgraded to a forward by an observing route.
 func TestJWTPDP_UnknownConditionType_FailsClosed(t *testing.T) {
 	t.Parallel()
 
@@ -2603,8 +2606,8 @@ func TestJWTPDP_UnknownConditionType_FailsClosed(t *testing.T) {
 	if resp == nil {
 		t.Fatal("an unevaluable JWT condition type must deny (fail closed), not pass silently")
 	}
-	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeConditionFailed {
-		t.Errorf("expected CONDITION_FAILED for the unknown condition type; got %+v", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Errorf("expected ENFORCEMENT_ERROR for the unknown condition type; got %+v", resp.Denial)
 	}
 }
 

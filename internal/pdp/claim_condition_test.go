@@ -91,9 +91,40 @@ func TestJWTPath_FailsClosedOnACommittingOverride(t *testing.T) {
 
 	require.NotNil(t, resp, "a committing handler cannot be evaluated ahead of the decision; deny")
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeAllowedValues, resp.Denial.ConditionType)
 	assert.Equal(t, capability.ConditionTypeAllowedValues, resp.Denial.Details["conditionType"])
+}
+
+// TestJWTClaimConditions_UnevaluatedConditionsAreFaultsNotPolicyVerdicts is the property the
+// two codes above carry, stated where it bites rather than left implicit in a constant.
+//
+// A refusal's CLASS is read off its code at every layer that asks, and the one thing a policy
+// verdict permits that a fault does not is an observing route downgrading it to a forward. Both
+// of these arms mean the condition guarding the call was never evaluated once, so there is no
+// verdict to stand in for the one that never ran — an --audit route minting the policy code here
+// forwarded the call to the upstream and reported "would be allowed" for a call enforce mode
+// denies.
+func TestJWTClaimConditions_UnevaluatedConditionsAreFaultsNotPolicyVerdicts(t *testing.T) {
+	engine := enforcement.New(enforcement.WithConditionHandler(
+		capability.ConditionTypeAllowedValues, committingOverride{}))
+	inner := NewManifestPDP(nil, engine, killswitch.NewInMemory())
+
+	for name, resp := range map[string]*capability.EnforceResponse{
+		"handler cannot be evaluated ahead of the decision": evaluateJWTConditions(context.Background(), nil, inner,
+			[]capability.Condition{capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/tmp/*"}}},
+			jwtCondReq("read_file", map[string]interface{}{"path": "/tmp/ok"}, nil)),
+		"condition type has no evaluator": evaluateJWTConditions(context.Background(), nil, nil,
+			[]capability.Condition{capability.TimeWindowCondition{NotAfter: "2099-01-01T00:00:00Z"}},
+			jwtCondReq("storage_access", map[string]interface{}{}, nil)),
+	} {
+		require.NotNil(t, resp, "%s: must deny", name)
+		require.NotNil(t, resp.Denial, "%s: must carry a denial", name)
+		assert.Equal(t, capability.DenialClassFault, capability.ClassifyDenialCode(resp.Denial.Code),
+			"%s: the class vocabulary calls this a fault; the code is its only encoding", name)
+		assert.False(t, resp.Denial.Downgradable(),
+			"%s: an observing route must BLOCK a call whose condition nothing evaluated, not forward it", name)
+	}
 }
 
 // unregisteredCondition names a discriminator no engine registers a handler for — the
