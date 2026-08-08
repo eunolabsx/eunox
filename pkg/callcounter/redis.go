@@ -89,19 +89,38 @@ func (r *Redis) newMember(now time.Time) string {
 // from the logical key a bucket arrives with. Until that is worth doing, this is the posture.
 var ErrClusterUnsupported = errors.New("callcounter: Redis Cluster and Ring clients are not supported: a multi-bucket admission is one multi-key EVAL whose keys can hash to different slots (CROSSSLOT); wire a single-node or Sentinel-backed *redis.Client")
 
-// IsShardingClient reports whether client spreads one keyspace across several servers.
-// Matched on the CONCRETE type — a decorator (a hooked client, a custom Cmdable) can still
-// wrap one — so it catches the ordinary wiring mistake rather than proving the topology.
+// ShardFanOut visits every server a sharding client spreads its keyspace over, running fn
+// against each. It is what a KEYLESS command (SCAN) needs there: routed to one server it
+// enumerates one shard of several and reports success.
+type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *redis.Client) error) error
+
+// ShardIterator returns the per-server iterator for a client that spreads one keyspace across
+// several servers, and nil for one that keeps it on a single server. Matched on the CONCRETE
+// type — a decorator (a hooked client, a custom Cmdable) can still wrap one — so it catches
+// the ordinary wiring mistake rather than proving the topology.
 //
-// Exported because it is not only this package's question: pkg/killswitch fans a keyless SCAN
-// out per server for the same reason, and two hand-written type switches drifted (one listed
-// Ring, the other did not) while both claimed to enumerate the same thing.
-func IsShardingClient(client redis.Cmdable) bool {
-	switch client.(type) {
-	case *redis.ClusterClient, *redis.Ring:
-		return true
+// Exported because the topology is not only this package's question: pkg/killswitch fans a
+// keyless SCAN out per server for the same reason. It returns the ITERATOR rather than a
+// yes/no because a consumer needs both answers, and answering them from two lists is how they
+// drifted before (one listed Ring, the other did not, so a Ring fell through to a single-node
+// SCAN that loaded whichever shard go-redis picked). With one list a client this package calls
+// sharding and the consumer has no iterator for is not a state that can be constructed.
+func ShardIterator(client redis.Cmdable) ShardFanOut {
+	switch c := client.(type) {
+	case *redis.ClusterClient:
+		// Masters only: a replica holds the same keys, so scanning them would double the work
+		// and, mid-failover, disagree with its master about what is there.
+		return c.ForEachMaster
+	case *redis.Ring:
+		return c.ForEachShard
 	}
-	return false
+	return nil
+}
+
+// IsShardingClient reports whether client spreads one keyspace across several servers, DEFINED
+// as "there is a per-server iterator for it" so the predicate and the iterator cannot disagree.
+func IsShardingClient(client redis.Cmdable) bool {
+	return ShardIterator(client) != nil
 }
 
 // ServerInfoReader is the one command CheckServerNotClustered issues. A narrow parameter type

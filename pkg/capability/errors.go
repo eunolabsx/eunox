@@ -236,6 +236,11 @@ func ClassifyDenialCode(code string) DenialClass {
 // explicit override for a policy verdict that must block anyway (one whose downgrade would
 // itself corrupt state the verdict protects). A nil denial is not downgradable: defaulting an
 // absent reason to "forward it" is the wrong direction to fail in.
+//
+// It is the ONLY complete answer to "will an observing route forward this?", and every layer
+// asks it here rather than reading HardDeny — which is half the answer, and the half a
+// producer can forget. Reading the raw bool is how a fault-class refusal minted by a third
+// constructor gets committed session state for a call the transport then blocks.
 func (d *DenialInfo) Downgradable() bool {
 	return d != nil && !d.HardDeny && ClassifyDenialCode(d.Code) == DenialClassPolicy
 }

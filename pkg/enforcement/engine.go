@@ -202,6 +202,14 @@ func compositeCounterKey(prefix string, parts ...string) string {
 	return capability.CompositeKey(prefix, parts...)
 }
 
+// compositeCounterKeyJoin is compositeCounterKey for parts already held in two groups — a fixed
+// head and a bucket-specific tail — so a caller does not flatten them into a third slice, and
+// one heap allocation, per key built. Same encoding: capability.CompositeKey IS this with an
+// empty head.
+func compositeCounterKeyJoin(prefix string, head, tail []string) string {
+	return capability.CompositeKeyJoin(prefix, head, tail)
+}
+
 // sequenceHistoryMaxEntries caps how many per-(session, tool) call markers the history
 // retains. sequenceBlock only asks "did this tool run at least once?", so one marker
 // suffices; more would grow the slice unboundedly for a one-bit question.
@@ -701,18 +709,17 @@ func recordFailureDenial(requestID, now string, auditOnly bool, obligations []ca
 // for a blocking or audit-mode denial. Every deny path routes through it, so auditing a
 // new top-level EnforceResponse field means checking this one constructor, not every
 // deny site.
+//
+// It deliberately does NOT stamp Denial.HardDeny for a non-policy code. That was a
+// derivation of the class onto a second field, and it had to be repeated by every other
+// denial constructor to stay true; now the class is the only encoding and every reader asks
+// capability.DenialInfo.Downgradable, which reads the code itself. A producer sets HardDeny
+// only to OVERRIDE the class — a policy verdict that must block anyway.
 func denyResponse(requestID, now string, auditOnly bool, obligations []capability.Obligation, denial capability.DenialInfo) capability.EnforceResponse {
 	// Every deny passes through here, so this is the one place that can bound the
 	// caller-controlled values condition handlers echo, without asking each handler's
 	// Details literal to remember. See BoundDenialDetails.
 	denial.Details = BoundDenialDetails(denial.Details)
-	// And the one place the "must not be downgraded" bool is DERIVED from the class the code
-	// already names, rather than re-argued at each producer — the divergence that had refusals
-	// of one class blocking or forwarding depending on which neighbour was copied. Producers
-	// set HardDeny only to override the class: a POLICY verdict that must block anyway.
-	if capability.ClassifyDenialCode(denial.Code) != capability.DenialClassPolicy {
-		denial.HardDeny = true
-	}
 	return capability.EnforceResponse{
 		RequestID:   requestID,
 		Decision:    capability.DecisionDeny,
@@ -1171,8 +1178,9 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 			if resp.Decision == capability.DecisionAllow || resp.Obligations != nil {
 				return
 			}
-			// A HardDeny is never downgraded to a forward, so it has no response to redact.
-			if resp.Denial != nil && resp.Denial.HardDeny {
+			// A refusal the observe posture cannot downgrade is never forwarded, so it has no
+			// response to redact.
+			if resp.Denial != nil && !resp.Denial.Downgradable() {
 				return
 			}
 			resp.Obligations = obligations

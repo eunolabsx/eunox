@@ -77,6 +77,14 @@ type dispatchParams struct {
 	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
 	// ignored (union-only, so falling back to the session join is the stricter reading).
 	honorAttribution bool
+
+	// killCheck is this request's revocation lookup, when the transport leg has already made
+	// one. Set by a caller that shares one memoized answer across the gates of a single
+	// message (the HTTP session leg); nil means ask the PDP here, which is what stdio and every
+	// test do. Sharing it is what keeps two gates on one message from disagreeing about whether
+	// it is revoked, and stops a locally-answered method paying a second round trip for an
+	// answer the leg already has.
+	killCheck func() *capability.EnforceResponse
 }
 
 // finishDecision closes the decision critical section (if open) right after the PDP decision
@@ -99,11 +107,23 @@ func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
 // their own richer kill record via enforcedForwardCore). Applied once at the dispatchRequest
 // boundary so a new locally-answered method inherits revocation by construction; malformedDeny
 // is the one other caller, reached before the PDP.
+//
+// Through d.checkKill, so a leg that already asked about this message answers from that one
+// lookup rather than making a second one that could disagree with it.
 func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
-	if deny := d.pdp.CheckKill(ctx, d.sessionID); deny != nil {
+	if deny := d.checkKill(ctx); deny != nil {
 		return recordKillDenial(ctx, d.rec, deny, msg.ID, verifiedSession(d.sessionID), msg.Method), true
 	}
 	return mcp.RPCMsg{}, false
+}
+
+// checkKill answers whether this request's session is revoked, from the leg's memoized lookup
+// when it has one and from the PDP otherwise.
+func (d dispatchParams) checkKill(ctx context.Context) *capability.EnforceResponse {
+	if d.killCheck != nil {
+		return d.killCheck()
+	}
+	return d.pdp.CheckKill(ctx, d.sessionID)
 }
 
 // decideCtx applies the audit-mode quota skip: in observe mode MaxCalls is skipped
@@ -376,6 +396,21 @@ func removedInRevision(rev capability.Revision, method string) bool {
 	return !slices.Contains(spec.In, rev)
 }
 
+// definesMethod reports whether rev's method set contains method, derived from the same
+// declarations the routing tables are so it cannot disagree with what the dispatcher will do
+// with the message.
+//
+// It answers "is this message one the peer's revision actually has?", which is the question a
+// context PIN depends on: a message the revision does not define is about to be dropped by the
+// fail-closed default, so it says nothing about which revision the conversation is on.
+//
+// Distinct from removedInRevision, which is true only for a method some OTHER revision has. An
+// entirely unknown method is defined by no revision, and is no more evidence than a removed one.
+func definesMethod(rev capability.Revision, method string) bool {
+	spec, known := methodRegistry[method]
+	return known && slices.Contains(spec.In, rev)
+}
+
 // requestRevision returns the revision this request is dispatched under, read from the ONE
 // carrier: the context the transports stamp at negotiation, which is also where the audit
 // sink reads protocol_revision from.
@@ -453,6 +488,12 @@ type hostNotificationGate struct {
 	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
 	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
 	// notification is dropped before revocation is even a question.
+	//
+	// A thunk only saves what its supplier has not already spent: the HTTP session leg
+	// computed the answer eagerly and handed over a constant, so this leg's saving was real
+	// only on stdio. Both legs now supply a lazy (and, on HTTP, memoized) lookup, and
+	// TestSessionLeg_RevocationIsLookedUpAtMostOncePerPost counts it rather than leaving the
+	// claim to the comment.
 	checkKill func() *capability.EnforceResponse
 	// leg names this transport's notification leg in a kill-drop record.
 	leg killDropLeg

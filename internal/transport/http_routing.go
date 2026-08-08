@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/audit"
@@ -338,37 +339,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sessionID string, msg mcp.RPCMsg) {
 	sess := p.getSession(sessionID)
 	if sess == nil {
-		// A killed session is proactively torn out of the registry, so its id no longer
-		// resolves — but the kill contract is that its requests are DENIED with
-		// KILL_SWITCH, not a bare 404 hiding why the session vanished. The kill store
-		// outlives the reaped registry entry, so consult it: a killed id (or an active
-		// global kill) renders the deny the dispatcher's kill gate would have given had the
-		// session still existed. A genuinely unknown, unkilled id still 404s. Handled here
-		// rather than via resolveSessionForRoute (the GET/SSE path) because only this
-		// request/notification framing can carry a JSON-RPC KILL_SWITCH body.
-		//
-		// sessionID is the raw, unverified client-supplied header (unlike every other
-		// CheckKill call site's, which comes from an established session). Stamping it into
-		// the signed session_id field would let anyone forge kill records against an
-		// arbitrary session id; claimedSession(r) keeps session_id empty and preserves it
-		// only as details.claimed_session_id.
-		if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
-			if msg.IsRequest() {
-				writeJSONMsg(w, recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), msg.Method))
-			} else {
-				// Fire-and-forget: record the drop and ack with a bodyless 202. A response
-				// carries no method, so it's identified as "server-response" (distinct from
-				// "http-notification") so an operator can tell the two drop SITES apart.
-				label, leg := msg.Method, legHTTPNotification
-				if msg.IsResponse() {
-					label, leg = "server-response", legHTTPServerResponse
-				}
-				recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), label, label, leg)
-				w.WriteHeader(http.StatusAccepted)
-			}
-			return
-		}
-		http.Error(w, "session not found", http.StatusNotFound)
+		p.denyUnresolvedSession(w, r, route, sessionID, msg)
 		return
 	}
 	if sess.route != route {
@@ -427,16 +398,32 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// requires the derivation from r.Context() to be visible at the site; that the pairing
 	// holds is pinned by TestGateOrder_RevisionRidesOneCarrier and its HTTP sibling.
 	ctx := capability.WithProtocolRevision(r.Context(), rev)
-	// Check the kill switch BEFORE touchRequest so a killed session's denied POSTs can't
-	// keep deferring idle reaping (a request may race teardownSessionByID's proactive
-	// teardown). Gate ONLY touchRequest on it: enforced requests and re-initialize still
-	// flow through the dispatcher below, which re-checks the kill with the precise
-	// per-target audit identifier rather than this coarse method-only check.
-	kill := route.pdp.CheckKill(ctx, sessionID)
-	if kill == nil {
-		// A live POST is active host-initiated traffic (distinct from passively holding
-		// an SSE GET open): it defers both the idle reaper and the hard idle ceiling.
-		sess.touchRequest()
+	// ONE revocation lookup for this POST, resolved on FIRST use and shared by every consumer
+	// below: the notification gate, the server-response leg, and the dispatcher's gate for a
+	// locally-answered method.
+	//
+	// LAZY for the reason hostNotificationGate.checkKill is a thunk — on a Redis-backed kill
+	// switch this is a network round trip, and the swallowed set is dropped before revocation
+	// is even a question. Computing it here unconditionally is what made that thunk save
+	// nothing on this leg: every `notifications/initialized` the gate exists to drop for free
+	// paid a round trip first.
+	//
+	// MEMOIZED so the consumers of one request cannot disagree about whether it is revoked: a
+	// kill landing between two lookups would otherwise have one gate admit the message and the
+	// next refuse it, on the same POST. The enforced leg's own check is deliberately not folded
+	// in — it belongs to the PDP decision, and asking again a moment later is the fresher answer
+	// for the one message that actually reaches the upstream.
+	kill := sync.OnceValue(func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, sessionID) })
+	// A live POST is active host-initiated traffic (distinct from passively holding an SSE GET
+	// open): it defers both the idle reaper and the hard idle ceiling. Gated on the kill so a
+	// revoked session's denied POSTs can't keep deferring their own reaping (a request may race
+	// teardownSessionByID's proactive teardown, and the reaper's killed arm is the backstop that
+	// would otherwise never fire). Called from each branch below rather than here, so a message
+	// the gates drop neither defers reaping nor pays for the answer.
+	touchIfLive := func() {
+		if kill() == nil {
+			sess.touchRequest()
+		}
 	}
 	// Host notifications don't flow through the dispatcher, so they take the swallowed set,
 	// the kill, and the two fail-closed rejects from the shared gate instead — one call, in
@@ -449,10 +436,14 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			subject:     verifiedSession(sessionID),
 			established: true,
 			errOut:      p.errOut(),
-			checkKill:   func() *capability.EnforceResponse { return kill },
+			checkKill:   kill,
 			leg:         legHTTPNotification,
 		}
 		if gate.admit(ctx, msg) {
+			// Admitted for forwarding, so the gate has already resolved the revocation memo and
+			// this costs no second lookup. A notification the gate DROPPED — swallowed, revoked,
+			// or refused — is not traffic the proxy acts on, so it defers nothing.
+			touchIfLive()
 			// Bound concurrent in-flight notification forwards on this session — its own
 			// pool, deliberately separate from the enforced-request slot below, so a burst of
 			// tool calls blocked on the upstream can never exhaust it and start dropping
@@ -485,10 +476,12 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	}
 
 	if !msg.IsRequest() {
+		touchIfLive()
 		p.routeHostServerResponse(ctx, route, sess, kill, msg)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
+	touchIfLive()
 
 	var resp mcp.RPCMsg
 	if msg.Method == mcp.MethodInitialize {
@@ -498,7 +491,13 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// here, and is not subject to the in-flight cap below since it contacts no upstream.
 		// dispatchInitialize skips strictAuditDenial intentionally: this is a pure local
 		// echo of already-captured state, not a fresh decision against upstream state.
-		resp = dispatchRequest(ctx, p.dispatchParams(sess, p.sourceIP(r)), msg)
+		//
+		// The leg's memoized revocation answer is handed down rather than left for the
+		// dispatcher's gate to re-ask: this is the locally-answered method that used to pay a
+		// second kill-store round trip for a question this handler had already answered.
+		d := p.dispatchParams(sess, p.sourceIP(r))
+		d.killCheck = kill
+		resp = dispatchRequest(ctx, d, msg)
 	} else {
 		// Bound concurrent in-flight enforced requests on this session (the HTTP analogue
 		// of stdio's hostSem). Non-blocking acquire: on saturation reject with a retryable
@@ -534,6 +533,10 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			return
 		}
 		d := p.dispatchParams(sess, p.sourceIP(r))
+		// The same memoized answer the gates above used. A Decide* method's own kill check
+		// lives inside the PDP decision and is NOT this one; what this covers is the pre-PDP
+		// refusal path (malformedDeny), which would otherwise ask a second time.
+		d.killCheck = kill
 		// Serialize the decision phase for a flow-/sequenceBlock-relevant route, so a
 		// source's state write isn't raced ahead of by a later sink's read on the same
 		// ANCHOR. Only enforced methods take the turn; the Decide* handler releases it via
@@ -570,6 +573,48 @@ var (
 	sseFrameEnd       = []byte("\n\n")
 	sseKeepaliveFrame = []byte(": keepalive\n\n")
 )
+
+// denyUnresolvedSession answers a POST naming a session id this proxy does not have.
+//
+// A killed session is proactively torn out of the registry, so its id no longer resolves — but
+// the kill contract is that its requests are DENIED with KILL_SWITCH, not a bare 404 hiding why
+// the session vanished. The kill store outlives the reaped registry entry, so consult it: a
+// killed id (or an active global kill) renders the deny the dispatcher's kill gate would have
+// given had the session still existed. A genuinely unknown, unkilled id still 404s. Handled
+// here rather than via resolveSessionForRoute (the GET/SSE path) because only this
+// request/notification framing can carry a JSON-RPC KILL_SWITCH body.
+//
+// It is the ONE host-message arm that negotiates no protocol revision, and its own function so
+// that exception is named in the entry-point table rather than hidden inside a branch of a
+// longer one (see hostMessageDispositions in gate_order_test.go). There is nothing to negotiate
+// AGAINST: the leg it would check the declaration against is a session this proxy never
+// established, so the record it writes carries no protocol_revision — the same "absent means
+// nothing was negotiated" convention every pre-session record follows.
+//
+// sessionID is the raw, unverified client-supplied header (unlike every other CheckKill call
+// site's, which comes from an established session). Stamping it into the signed session_id
+// field would let anyone forge kill records against an arbitrary session id; claimedSession(r)
+// keeps session_id empty and preserves it only as details.claimed_session_id.
+func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sessionID string, msg mcp.RPCMsg) {
+	deny := route.pdp.CheckKill(r.Context(), sessionID)
+	if deny == nil {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	if msg.IsRequest() {
+		writeJSONMsg(w, recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), msg.Method))
+		return
+	}
+	// Fire-and-forget: record the drop and ack with a bodyless 202. A response carries no
+	// method, so it's identified as "server-response" (distinct from "http-notification") so an
+	// operator can tell the two drop SITES apart.
+	label, leg := msg.Method, legHTTPNotification
+	if msg.IsResponse() {
+		label, leg = "server-response", legHTTPServerResponse
+	}
+	recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), label, label, leg)
+	w.WriteHeader(http.StatusAccepted)
+}
 
 // resolveSessionForRoute looks up the session for sessionID and verifies it is bound to
 // route, writing the canonical 404/409 and returning nil on a mismatch. The caller must
@@ -1051,6 +1096,14 @@ type hostLeg struct {
 // sessionlessLeg is the leg every pre-session arm negotiates against: `initialize` exists only
 // in the handshake-bearing revision, so that is the context, and nothing this arm answers
 // reaches an upstream.
+//
+// It is also why the same stray bytes are refused under DIFFERENT codes on the two transports,
+// which is a property of the legs rather than a drift between them: these arms exist only to
+// answer `initialize`, so a declaration naming any other revision contradicts the context and
+// is refused UNSUPPORTED_PROTOCOL_VERSION. stdio has no such arm — its first message may
+// legitimately declare any revision, since a peer there need never handshake — so the identical
+// line resolves, is dropped by the fail-closed routing default as AUTHORIZATION_FAILED, and
+// (see StdioProxy.negotiateHostRevision) does not pin the connection on its way out.
 func sessionlessLeg() hostLeg { return hostLeg{contextRev: handshakeRevision} }
 
 // leg is the established session's answer to the same question.
@@ -1074,10 +1127,12 @@ func (s *httpSession) leg() hostLeg {
 // id-less arm did not negotiate at all until it was noticed, and recorded either the wrong
 // code or nothing while stdio recorded UNSUPPORTED_PROTOCOL_VERSION for the same bytes.
 //
-// handleSessionPost's unresolved-session arm is the one refusal that does not: it answers a
-// session id this proxy never established, so there is no context to negotiate against and it
-// records KILL_SWITCH with no revision. Named here rather than left for a reader to discover,
-// since the AST guard cannot see an arm that calls nothing.
+// denyUnresolvedSession is the one refusal that does not: it answers a session id this proxy
+// never established, so there is no context to negotiate against and it records KILL_SWITCH
+// with no revision. That exception is declared in gate_order_test.go's dispositionPrologue,
+// which enumerates the arms rather than the calls — a guard phrased as "who may call the
+// primitives" is blind to an arm that calls neither, which is how an entry point came to
+// negotiate nothing at all.
 func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, leg hostLeg, msg mcp.RPCMsg) (capability.Revision, bool) {
 	rev, err := resolveHostRevision(leg.contextRev, leg.upstreamRev, msg)
 	if err == nil {
@@ -1101,16 +1156,20 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 // tracked ID); anything else is ignored, and the caller acks either way.
 //
 // Split out of handleSessionPost to keep that function within its complexity bound.
-func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *UpstreamRoute, sess *httpSession, kill *capability.EnforceResponse, msg mcp.RPCMsg) {
+//
+// kill is the caller's memoized revocation lookup, taken as the thunk rather than the value so
+// a response the proxy never forwarded (an untracked id, dropped below) asks nothing of the
+// kill store.
+func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *UpstreamRoute, sess *httpSession, kill func() *capability.EnforceResponse, msg mcp.RPCMsg) {
 	if !msg.IsResponse() || !sess.serverReqs.take(mcp.MsgKey(msg.ID)) {
 		return
 	}
-	switch {
-	case kill != nil:
+	switch deny := kill(); {
+	case deny != nil:
 		// A kill doesn't tear the upstream down; its blocked server-initiated request is
 		// intentionally left unanswered and reclaimed later by the idle reaper's hard
 		// ceiling. Record the dropped reply so it's visible on the tape.
-		recordKillDrop(ctx, asRecorder(route.sink), kill, verifiedSession(sess.id), "server-response", "server-response", legHTTPServerResponse)
+		recordKillDrop(ctx, asRecorder(route.sink), deny, verifiedSession(sess.id), "server-response", "server-response", legHTTPServerResponse)
 	case sess.upWriter != nil:
 		_ = sess.upWriter.Write(msg)
 	default:

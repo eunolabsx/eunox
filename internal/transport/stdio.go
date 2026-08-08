@@ -1186,8 +1186,17 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its
-// FIRST resolved message, so every later message is checked against it — which is what makes
-// the mid-context-flip refusal reachable for a peer that never sends initialize.
+// first resolved message that the resolved revision actually DEFINES, so every later message
+// is checked against it — which is what makes the mid-context-flip refusal reachable for a
+// peer that never sends initialize.
+//
+// The "defines it" half is what keeps that pin from being a wedge. A message whose method the
+// declared revision does not have is about to be dropped by the fail-closed routing default,
+// so it is not evidence about which revision this conversation is on — and latching from one
+// ends the connection: a single id-less `initialize` declaring the revision that REMOVED
+// `initialize` pinned that revision, and the host's real handshake was then denied under a
+// table with no `initialize` in it, with a re-declaration refused as a mid-context flip and an
+// omission inheriting the pin. There is no way back; the peer's only recourse is a new process.
 //
 // It returns the STAMPED context rather than the bare revision: that context is the one
 // carrier of the decided revision (the tables route by it, the tape records it), so a caller
@@ -1206,7 +1215,9 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 		}
 		return ctx, false
 	}
-	p.hostRev.Store(rev)
+	if definesMethod(rev, msg.Method) {
+		p.hostRev.Store(rev)
+	}
 	return capability.WithProtocolRevision(ctx, rev), true
 }
 

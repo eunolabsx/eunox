@@ -461,6 +461,12 @@ func denyResponse(clock enforcement.Clock, code, condType, message string) capab
 // denyResponseWithDetails is denyResponse for a deny that carries structured details, and it
 // is the ONE place in this package that may set Denial.Details.
 //
+// It sets no Denial.HardDeny for a non-policy code: whether an observing route may forward a
+// refusal is read off the CODE, by capability.DenialInfo.Downgradable, at every site that
+// asks. Deriving it onto the bool here too made the field mean "override OR one of the two
+// non-policy classes" — two meanings, both of which a third denial constructor could get
+// wrong on its own. hardDenyResponse below is the override, and it is explicit.
+//
 // The bound lives here rather than at each call site for the reason pkg/enforcement gives for
 // putting it inside its own denyResponse: a denial's details echo caller-controlled values —
 // the argument that missed the allowlist, the operation that was refused — so every denied
@@ -483,12 +489,6 @@ func denyResponseWithDetails(clock enforcement.Clock, code, condType, message st
 			ConditionType: condType,
 			Message:       message,
 			Details:       enforcement.BoundDenialDetails(details),
-			// Derived from the class the code names, exactly as pkg/enforcement's own funnel
-			// does. Both layers must answer the same way: this package's eight readers of the
-			// raw bool are predicting what the transport will do, and the transport asks
-			// DenialInfo.Downgradable — so a fault-class refusal minted here with the bool unset
-			// would have the PDP commit session state for a call the transport then blocks.
-			HardDeny: capability.ClassifyDenialCode(code) != capability.DenialClassPolicy,
 		},
 	}
 }
@@ -519,8 +519,12 @@ func denyFromCondition(clock enforcement.Clock, name string, cerr *enforcement.C
 // --audit). Use it for any deny that is an engine bug or a non-negotiable security
 // gate rather than a downgradable policy verdict (e.g. an unenforceable stray
 // argumentSchema, a tool-poisoning descriptionHash mismatch, an engine-evaluation
-// error, an unhandled target type, or an antecedent-record failure). Analogous to
-// the kill-switch treatment.
+// error, an unhandled target type, or an antecedent-record failure).
+//
+// It sets the producer OVERRIDE, which is what a POLICY-coded refusal here needs (the
+// descriptionHash pin denies AUTHORIZATION_FAILED). A fault- or revocation-coded refusal is
+// already exempt by its class, so routing one through here is belt-and-suspenders rather
+// than what makes it block — see capability.DenialInfo.Downgradable.
 func hardDenyResponse(clock enforcement.Clock, code, message string) capability.EnforceResponse {
 	resp := denyResponse(clock, code, "", message)
 	resp.Denial.HardDeny = true
@@ -1394,10 +1398,12 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// of a named return) keeps which verdicts are downgradable visible in the
 	// control flow, so a future early return added below cannot silently inherit it.
 	stamp := func(r capability.EnforceResponse) capability.EnforceResponse {
-		// Never stamp/forward a hard deny: it blocks even on an audit-only constraint or a
-		// route running under --audit (e.g. antecedent record failure), so it reaches no
-		// host and needs no forwarded-response obligations.
-		if r.Denial != nil && r.Denial.HardDeny {
+		// Never stamp/forward a refusal the observe posture cannot downgrade: it blocks even on
+		// an audit-only constraint or a route running under --audit (an antecedent record
+		// failure, a revocation), so it reaches no host and needs no forwarded-response
+		// obligations. Asked of DenialInfo.Downgradable, the same seam the transport's own
+		// forward gate asks, so the two layers cannot answer this differently for one refusal.
+		if r.Denial != nil && !r.Denial.Downgradable() {
 			return r
 		}
 		// The per-entry flag records only the per-CONSTRAINT audit posture. The whole-route
@@ -1491,8 +1497,8 @@ func targetOperationPhrase(t capability.TargetType) string {
 // carried and fails OPEN (RecordLabels closes this — the data was produced, so it must
 // be labeled). The genuine-allow path already records both inside EvaluateConditions,
 // and an enforced deny means the tool never ran, so neither needs this — and neither
-// does a HardDeny audit-mode deny: it is NOT downgraded, so recording would attribute
-// state to a call that never ran (the bug the HardDeny check below prevents).
+// does a NON-DOWNGRADABLE audit-mode deny: it is NOT forwarded, so recording would attribute
+// state to a call that never ran (the bug the Downgradable check below prevents).
 //
 // When either record fails the corresponding integrity guarantee cannot be upheld, so
 // the call returns a hardDenyResponse CONDITION_FAILED deny — non-downgradable even
@@ -1528,7 +1534,7 @@ func recordAuditModeAntecedent(ctx context.Context, engine *enforcement.Engine, 
 	// fp.audit || dec.AuditOnly). Without the SkipQuota leg a route-level --audit deny is
 	// forwarded but its antecedent is never recorded, so a later enforced sequenceBlock
 	// naming this tool Peeks empty history and fails OPEN.
-	if willForwardDeny(ctx, matched) && resp.Decision != capability.DecisionAllow && (resp.Denial == nil || !resp.Denial.HardDeny) {
+	if willForwardDeny(ctx, matched) && resp.Decision != capability.DecisionAllow && (resp.Denial == nil || resp.Denial.Downgradable()) {
 		flowRelevant := capability.ConstraintHasFlow(matched)
 		// Capture the carried set before any write, only for a flow-relevant constraint
 		// whose deny did not already stamp it (a condition deny routed through
@@ -1761,8 +1767,9 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 // --audit posture (which arrives as SkipQuota on the ctx) — and every concern that must
 // track "this deny is really a forward" reads it from here rather than restating the
 // union. matched may be nil (a no-match deny), which only a route-level --audit forwards.
-// The kill-switch and HardDeny exclusions the transport also applies are handled at each
-// call site, which has the response in hand.
+// WHICH refusals are exempt from the downgrade is the other half and not this one's question:
+// capability.DenialInfo.Downgradable answers it from the refusal itself, at each call site,
+// which has the response in hand.
 func willForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
 	return enforcement.WillForwardDeny(ctx, matched)
 }
@@ -1861,7 +1868,7 @@ func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.E
 // Only tools/call carries an advertised surface to pin, matching the schema gate the two
 // blocks inside Decide use.
 func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.EnforceResponse, target EnforceTarget) (capability.EnforceResponse, bool) {
-	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || !r.Denial.Downgradable() {
 		return r, false
 	}
 	if target.Type != capability.TargetTypeTool {
@@ -2007,7 +2014,7 @@ func composeHardened(r, verdict capability.EnforceResponse) capability.EnforceRe
 // appended to the message so an operator fixing the token still sees why authorization
 // failed.
 func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
-	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || !r.Denial.Downgradable() {
 		return r, false
 	}
 	matched := sel.matched
@@ -2040,7 +2047,7 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 // constraint's contract, which is why it can run on a path the inner PDP deliberately never
 // reached.
 func (p *ManifestPDP) hardenOnDelegatedEffectClass(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
-	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || !r.Denial.Downgradable() {
 		return r, false
 	}
 	// The overwhelmingly common case: no token, or a token declaring no delegation. Asked here
@@ -2093,7 +2100,7 @@ func (p *ManifestPDP) hardenViaVerdict(
 		return r, false
 	}
 	out := composeHardened(r, *verdict)
-	if out.Denial != nil && out.Denial.HardDeny {
+	if out.Denial != nil && !out.Denial.Downgradable() {
 		// Never forwarded (the escalate arm), so there is no response to redact and
 		// obligations would be a claim that a redaction ran.
 		out.Obligations = nil
@@ -2186,7 +2193,7 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if r.Decision == capability.DecisionAllow {
 		return r
 	}
-	if r.Denial != nil && r.Denial.HardDeny {
+	if r.Denial != nil && !r.Denial.Downgradable() {
 		// Already non-downgradable and carrying no forwarded response to redact; there is
 		// nothing this PDP could add that would make it harder.
 		return r
@@ -2264,7 +2271,7 @@ func (p *ManifestPDP) ConditionHandlerOverridden(condType string) bool {
 // JWT-wrapped one missing the field an approver needs first ("what is this session already
 // carrying"). One resolver, one refusal builder, one record shape.
 func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
-	if r.Decision == capability.DecisionAllow || r.Denial == nil || r.Denial.HardDeny {
+	if r.Decision == capability.DecisionAllow || r.Denial == nil || !r.Denial.Downgradable() {
 		return r, false
 	}
 	// No engine means no checkDeclassify on the unwrapped path either, so there is no verdict

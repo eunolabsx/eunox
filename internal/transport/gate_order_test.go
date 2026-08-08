@@ -13,12 +13,9 @@ import (
 	"context"
 	"encoding/json"
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -503,6 +500,58 @@ var negotiationPrimitives = map[string]string{
 	"refuseHostRevision":  "negotiateHostRevision",
 }
 
+// hostMessageDispositions are the calls that DISPOSE of a host message: dispatch it to a
+// handler, admit it through the shared notification gate, or refuse it with a kill record. The
+// value is the argument count that identifies the disposition call, since two of these names
+// are shared with unrelated helpers (recordLimiter.admit takes none or one; the gate's takes
+// ctx and the message).
+//
+// Reaching one of these is what makes a function an ENTRY POINT for the purposes of the guard
+// below: it is the moment the proxy acts on a message, and every gate that acts must run on a
+// context whose revision was negotiated.
+var hostMessageDispositions = map[string]int{
+	"dispatchRequest":  3,
+	"admit":            2,
+	"recordKillDenial": 6,
+	"recordKillDrop":   7,
+}
+
+// dispositionPrologue is the INVERTED guard's table: every function that disposes of a host
+// message, mapped to how its message's revision was negotiated. An empty value means the
+// function negotiates for itself, and every disposition it performs must be dominated by that
+// call; a non-empty value is the documented reason this function's dispositions run on a
+// context someone else negotiated — or on none at all.
+//
+// The forward guard below (only negotiateHostRevision may call the primitives) catches a
+// hand-placed COPY of the prologue. It cannot catch what actually happened: the id-less
+// `initialize` arm called NEITHER primitive, so it negotiated nothing and passed the guard in
+// silence. A guard phrased as "each negotiation must be in one place" is blind to an entry
+// point that never negotiates; this one is phrased the other way round, so the next such arm
+// fails until someone writes down why it is admissible.
+var dispositionPrologue = map[string]string{
+	// Negotiates for itself, ahead of every disposition it performs — checked, not asserted:
+	// these three are the entry points whose prologue the guard actually verifies.
+	"handleMCPPost":     "",
+	"handleSessionPost": "",
+	"serveHost":         "",
+	// Reached from a serveHost that has already negotiated and stamped the context. stdio
+	// negotiates in its READ loop, on the single goroutine that owns the pin, and the handlers
+	// below run on the context it returns.
+	"handleHostRequest":       "serveHost negotiates and stamps the context before spawning this handler",
+	"forwardHostNotification": "serveHost negotiates before calling this, on the message it is about to forward",
+	// The gate and the boundary gate are the dispositions themselves, reached only from an
+	// entry point above.
+	"admit":      "the shared notification gate; its caller negotiated before building it",
+	"killDenied": "the dispatchRequest boundary gate, reached only through a negotiated dispatch",
+	// Arms with no host message to negotiate FOR.
+	"denyUnresolvedSession":   "answers a session id this proxy never established: no context to negotiate against, so the record carries no revision (see its doc)",
+	"handleMCPGet":            "an SSE GET carries no JSON-RPC envelope, so there is no message and no declaration to resolve",
+	"routeHostServerResponse": "handleSessionPost negotiated this POST before routing it; a response carries no method to dispatch",
+	// An UPSTREAM-initiated message. Host-side negotiation governs host messages, and this is
+	// not one — the upstream leg's revision is pinned once per route at its own handshake.
+	"readUpstream": "drops an upstream-initiated notification on a revoked session; not a host message",
+}
+
 // TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue is the derivation-style guard
 // the entry points had no equivalent of.
 //
@@ -519,24 +568,10 @@ var negotiationPrimitives = map[string]string{
 func TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue(t *testing.T) {
 	t.Parallel()
 
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("listing package sources: %v", err)
-	}
-	fset := token.NewFileSet()
 	calls := 0
-	for _, e := range entries {
-		name := e.Name()
-		// Non-test sources only: a test legitimately drives the primitives directly to pin
-		// the negotiation rule itself.
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		file, perr := parser.ParseFile(fset, name, nil, 0)
-		if perr != nil {
-			t.Fatalf("parsing %s: %v", name, perr)
-		}
-		for _, decl := range file.Decls {
+	for _, src := range packageSources(t) {
+		name := src.name
+		for _, decl := range src.file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok {
 				continue
@@ -568,6 +603,145 @@ func TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue(t *testing.T
 	if calls < len(negotiationPrimitives) {
 		t.Errorf("found %d guarded call(s); expected at least one per primitive (%d) — has one been renamed?", calls, len(negotiationPrimitives))
 	}
+}
+
+// TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor is the INVERTED guard: it walks the
+// entry points and requires each to negotiate, rather than requiring each negotiation to be in
+// one place.
+//
+// The forward guard above cannot see the failure it was written for. The id-less `initialize`
+// arm called NEITHER primitive, so it negotiated nothing at all and passed in silence — an arm
+// that calls nothing is invisible to a rule about who may call what. This one starts from the
+// dispositions instead (dispatch it, admit it through the notification gate, refuse it with a
+// kill record) and requires every function performing one either to negotiate before it or to
+// carry a written reason it does not. A new arm is a build failure until someone states which.
+//
+// Dominance is approximated the way these prologues are actually written: the negotiate call
+// must be a STATEMENT of a block enclosing the disposition, positioned before it. A call buried
+// inside a conditional does not count — that is precisely how the id-less arm looked "already
+// negotiated for" while it was not.
+func TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor(t *testing.T) {
+	t.Parallel()
+	seen := map[string]bool{}
+	for _, src := range packageSources(t) {
+		for _, decl := range src.file.Decls {
+			fn, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fn.Body == nil {
+				continue
+			}
+			sites := hostMessageDispositionSites(fn)
+			if len(sites) == 0 {
+				continue
+			}
+			seen[fn.Name.Name] = true
+			reason, declared := dispositionPrologue[fn.Name.Name]
+			if !declared {
+				t.Errorf("%s: %s disposes of a host message but is not in dispositionPrologue.\n"+
+					"  Every arm that dispatches, admits, or records a refusal for a host message must first\n"+
+					"  negotiate its protocol revision — see the gate order in dispatch.go. Add an entry:\n"+
+					"  \"\" if it calls negotiateHostRevision itself, or the reason its message was negotiated elsewhere.",
+					src.name, fn.Name.Name)
+				continue
+			}
+			if reason != "" {
+				continue
+			}
+			for _, site := range sites {
+				if negotiationDominates(fn, site) {
+					continue
+				}
+				t.Errorf("%s: %s disposes of a host message at line %d with no negotiateHostRevision call dominating it.\n"+
+					"  This arm records or routes a message whose revision was never resolved, so its record names none\n"+
+					"  and its routing falls back to a table the peer did not declare.",
+					src.name, fn.Name.Name, src.fset.Position(site.Pos()).Line)
+			}
+		}
+	}
+	// A stale entry silently re-permits a future disposition in a function that no longer has
+	// one — the same failure mode guardedStructs' allowlist check exists for.
+	for name := range dispositionPrologue {
+		if !seen[name] {
+			t.Errorf("dispositionPrologue names %s, which disposes of no host message; drop the stale entry so it cannot silently excuse a future one", name)
+		}
+	}
+	if len(seen) == 0 {
+		t.Error("no host-message disposition found in any non-test file; hostMessageDispositions has been renamed out of the sources it guards")
+	}
+}
+
+// hostMessageDispositionSites returns every call in fn that disposes of a host message, matched
+// by name AND argument count — two of the names are shared with unrelated helpers (a rate
+// limiter's admit takes none or one argument; the notification gate's takes two).
+func hostMessageDispositionSites(fn *ast.FuncDecl) []*ast.CallExpr {
+	var sites []*ast.CallExpr
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		name := ""
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			name = fun.Name
+		case *ast.SelectorExpr:
+			name = fun.Sel.Name
+		}
+		if want, guarded := hostMessageDispositions[name]; guarded && len(call.Args) == want {
+			sites = append(sites, call)
+		}
+		return true
+	})
+	return sites
+}
+
+// negotiationDominates reports whether a negotiateHostRevision call is guaranteed to have run
+// before site within fn: it must be a STATEMENT of some block enclosing site, positioned before
+// the statement site sits in. Deliberately not "appears anywhere earlier in the function" — a
+// call inside an if-branch says nothing about a site after that if, which is the false pass
+// that let a whole arm negotiate nothing.
+func negotiationDominates(fn *ast.FuncDecl, site ast.Node) bool {
+	dominated := false
+	ast.Inspect(fn, func(n ast.Node) bool {
+		block, isBlock := n.(*ast.BlockStmt)
+		if !isBlock || site.Pos() < block.Pos() || site.Pos() > block.End() {
+			return true
+		}
+		for _, stmt := range block.List {
+			if stmt.End() > site.Pos() {
+				break // the statement containing site, or one after it
+			}
+			if unconditionalNegotiation(stmt) {
+				dominated = true
+			}
+		}
+		return true
+	})
+	return dominated
+}
+
+// unconditionalNegotiation reports whether stmt IS a negotiateHostRevision call — an assignment
+// from it or a bare call — rather than merely containing one somewhere inside a nested branch.
+func unconditionalNegotiation(stmt ast.Stmt) bool {
+	switch s := stmt.(type) {
+	case *ast.AssignStmt:
+		for _, rhs := range s.Rhs {
+			if isNegotiationCall(rhs) {
+				return true
+			}
+		}
+	case *ast.ExprStmt:
+		return isNegotiationCall(s.X)
+	}
+	return false
+}
+
+func isNegotiationCall(e ast.Expr) bool {
+	call, isCall := e.(*ast.CallExpr)
+	if !isCall {
+		return false
+	}
+	sel, isSel := call.Fun.(*ast.SelectorExpr)
+	return isSel && sel.Sel.Name == "negotiateHostRevision"
 }
 
 // TestGateOrder_SessionlessNotificationInheritsTheSharedGate pins the one thing the

@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -40,18 +39,8 @@ import (
 // writer already in scope (a struct field, a parameter), never a literal nil.
 func TestNoDiagnosticWritesStraightToStderr(t *testing.T) {
 	t.Parallel()
-	files, err := filepath.Glob("*.go")
-	require.NoError(t, err)
-	require.NotEmpty(t, files)
-
-	fset := token.NewFileSet()
-	for _, name := range files {
-		if strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		f, perr := parser.ParseFile(fset, name, nil, 0)
-		require.NoError(t, perr, name)
-		for _, v := range directStderrViolations(fset, f) {
+	for _, src := range packageSources(t) {
+		for _, v := range directStderrViolations(src.fset, src.file) {
 			t.Error(v)
 		}
 	}

@@ -301,11 +301,14 @@ func (c *recordingCounter) AdmitAll(context.Context, []capability.QuotaBucket) (
 // recordAuditModeAntecedent records a session-history antecedent ONLY when the
 // matched constraint is audit-only AND the decision is a DOWNGRADABLE deny — every
 // other combination must be a no-op (a genuine allow is already recorded inside the
-// engine; an enforced deny or a HardDeny audit-mode deny means the tool never ran).
-// The counting counter makes the distinction observable, so a regression that
-// broadened or inverted the guard (recording on an allow, an enforced deny, or a
-// HardDeny deny) fails here rather than silently corrupting later sequenceBlock
-// antecedent history.
+// engine; an enforced deny, or an audit-mode deny the observe posture cannot downgrade,
+// means the tool never ran). The counting counter makes the distinction observable, so a
+// regression that broadened or inverted the guard fails here rather than silently corrupting
+// later sequenceBlock antecedent history.
+//
+// "Cannot downgrade" is asked of capability.DenialInfo.Downgradable, so all three of its
+// shapes are covered below: the producer's override, a fault-class code, and a revocation.
+// The last two were invisible to the raw-bool check this replaced.
 func TestRecordAuditModeAntecedent_RecordsOnlyOnAuditDeny(t *testing.T) {
 	t.Parallel()
 	counter := &recordingCounter{}
@@ -328,12 +331,29 @@ func TestRecordAuditModeAntecedent_RecordsOnlyOnAuditDeny(t *testing.T) {
 		&capability.EnforceResponse{Decision: capability.DecisionDeny})
 	require.Equal(t, 1, counter.writes, "an audit-mode deny must record exactly one antecedent")
 
-	// No-op: an audit-mode deny that is HARD (HardDeny) is NOT downgraded — the tool
+	// No-op: an audit-mode deny carrying the producer's override is NOT downgraded — the tool
 	// never runs — so recording it would poison history with a phantom antecedent a
 	// later sequenceBlock reads as "ran", spuriously blocking a downstream call.
 	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{HardDeny: true}})
-	require.Equal(t, 1, counter.writes, "a HardDeny audit-mode deny must NOT record an antecedent (the tool never ran)")
+	require.Equal(t, 1, counter.writes, "an overridden audit-mode deny must NOT record an antecedent (the tool never ran)")
+
+	// The same no-op for the OTHER reason a refusal resists the downgrade, and the one this
+	// guard used to miss: a fault-class code with the override unset. The transport asks
+	// DenialInfo.Downgradable and hard-blocks it; a reader of the raw bool would answer
+	// "forwarded" and commit an antecedent for a call that never ran. Reachable from any
+	// denial constructor that does not stamp the bool — a transport-layer literal, an
+	// out-of-tree PDP.
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
+		&capability.EnforceResponse{Decision: capability.DecisionDeny,
+			Denial: &capability.DenialInfo{Code: capability.ErrCodeEnforcementError}})
+	require.Equal(t, 1, counter.writes, "a fault-class deny is blocked by its CODE, so it must not record an antecedent either")
+
+	// And a revocation, the third shape: an emergency stop never forwards.
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
+		&capability.EnforceResponse{Decision: capability.DecisionDeny,
+			Denial: &capability.DenialInfo{Code: capability.ErrCodeKillSwitch}})
+	require.Equal(t, 1, counter.writes, "a revoked call never runs, so it leaves no antecedent")
 }
 
 // TestRecordAuditModeAntecedent_BackfillsFlowLabels asserts the audit-mode downgrade

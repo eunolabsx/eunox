@@ -1114,6 +1114,30 @@ Section conventions:
 
 ### Fixed
 
+- **One stray line can no longer wedge a stdio connection for the process's life.** The host
+  context pins its protocol revision from the first RESOLVED message, which is what makes the
+  mid-context-flip refusal reachable for a peer that never handshakes. An id-less `initialize`
+  is a notification by the structural classification and resolved like any other message, so a
+  single line declaring the revision that REMOVED `initialize` latched that revision — and the
+  host's real handshake was then denied under a table with no `initialize` in it, with a
+  re-declaration refused as a mid-context flip and an omission inheriting the pin. There was no
+  way to renegotiate. The pin now latches only from a message the resolved revision DEFINES: a
+  message the fail-closed routing default is about to drop is not evidence about which revision
+  the conversation is on. Every message that is actually dispatched still pins, so the flip
+  refusal is unchanged. The same bytes on HTTP were already refused cleanly, for a reason that
+  is a property of the legs rather than a drift — the pre-session arms exist only to answer
+  `initialize`, so their context IS the handshake revision — and that is now written down where
+  the two legs differ.
+- **The HTTP session leg makes at most one kill-switch lookup per POST.** The notification
+  gate's revocation check is a thunk so a swallowed notification costs no lookup — on a
+  Redis-backed kill switch that is a network round trip. The session leg computed the answer
+  eagerly before building the gate, so the thunk returned an already-paid value and the saving
+  was never taken; an enforced or locally-answered request then paid a SECOND lookup inside the
+  dispatcher's gate. The leg now shares one lazily-resolved, memoized answer with every gate on
+  the message, which also means the gates of a single POST cannot disagree about whether it is
+  revoked. Consequence: a notification the gates DROP (swallowed, revoked, unmapped) no longer
+  defers that session's idle reaping — the conservative direction, since a revoked session must
+  not keep itself alive.
 - **An unknown condition type is no longer forwarded on an observing route.** Three refusals
   mean "this condition could not be evaluated" and two of them blocked; the third — an unknown
   condition type — was built without the non-downgradable flag, so on a route running
@@ -1133,7 +1157,20 @@ Section conventions:
   single-node SCAN, which loads a partial kill set and reports healthy. `AdmitAll`'s
   request-time `CROSSSLOT` backstop matches go-redis' typed sentinel and `HasErrorPrefix`
   instead of the reply text, so a reformatted or `ERR `-prefixed reply cannot silently stop
-  being recognized.
+  being recognized. There is now ONE list rather than two that agree: `callcounter.ShardIterator`
+  returns the per-server iterator (nil for a single-node client) and `IsShardingClient` is
+  defined as `iterator != nil`, so a client one side calls sharding and the other has no
+  iterator for is unrepresentable — the error branch, and the test seam that existed to reach
+  it, are gone.
+- **The denial CLASS is the only encoding of "may an observing route forward this?"** Nine sites
+  in `internal/pdp` and `pkg/enforcement` still read the raw `HardDeny` bool to predict what the
+  transport would do, while the transport asked `DenialInfo.Downgradable()`; the two agreed only
+  because both denial funnels derived the bool from the class. They now all ask `Downgradable()`,
+  and the funnels no longer derive the bool — it means what its doc always said, a producer's
+  override for a policy verdict that must block anyway. No refusal changes its verdict; what
+  changes is that a fault- or revocation-coded denial minted with the bool unset (a
+  transport-layer literal, an out-of-tree PDP) can no longer have the PDP commit session state
+  for a call the transport then hard-blocks.
 - **The sessionless HTTP arms inherit the gate order instead of restating it.** An id-less
   `initialize` with no session reached neither the shared notification gate nor the dispatcher,
   so the canonical per-message order was hand-placed there — a fifth copy of an order the

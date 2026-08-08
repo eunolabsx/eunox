@@ -218,11 +218,12 @@ type DenialInfo struct {
 	ConditionType string                 `json:"conditionType"`
 	Message       string                 `json:"message"`
 	Details       map[string]interface{} `json:"details,omitempty"`
-	// HardDeny marks a deny that must not be downgraded to an audit-mode forward
-	// even when the matched constraint is in audit-only mode or the route runs
-	// under --audit. Analogous to a kill-switch denial; used by
-	// recordAuditModeAntecedent when RecordSessionCall fails and the sequenceBlock
-	// integrity guarantee can no longer be upheld.
+	// HardDeny is the producer's OVERRIDE of the denial class: a POLICY verdict that must
+	// block anyway, because forwarding it would corrupt the very state the verdict protects
+	// (an unanchorable call's split state, a tool-poisoning pin). It is not the general
+	// "never downgrade" signal and must not be read as one — a revocation or a fault sets
+	// nothing here and is exempt by its CODE. Ask DenialInfo.Downgradable, which is the whole
+	// answer; this field alone is one of its two halves.
 	HardDeny bool `json:"-"` // transport-only signal; never written to the audit record
 }
 

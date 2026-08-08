@@ -189,7 +189,7 @@ func TestDeclassifyOnce_LedgerFaultEscalates(t *testing.T) {
 			declassifyCaps("publish", capability.FlowLabelPII))
 		require.Equal(t, capability.DecisionDeny, resp.Decision)
 		require.NotNil(t, resp.Denial)
-		assert.True(t, resp.Denial.HardDeny, "a grant that could not be burned must not clear a label anyway")
+		assert.False(t, resp.Denial.Downgradable(), "a grant that could not be burned must not clear a label anyway")
 	})
 }
 
@@ -434,7 +434,7 @@ func TestDeclassifyOnce_BurnedGrantIsNamedWhenTheCommitFaults(t *testing.T) {
 
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.True(t, resp.Denial.HardDeny,
+	assert.False(t, resp.Denial.Downgradable(),
 		"a call whose one-shot approval was just spent must not be downgraded and forwarded by an --audit route")
 	assert.Equal(t, "apr-1", resp.Declassification.SpentApprovalID(),
 		"the grant is burned and the call never ran, so this refusal is the only record that can name it")

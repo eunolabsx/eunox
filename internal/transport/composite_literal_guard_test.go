@@ -79,48 +79,17 @@ var guardedStructs = map[string]struct {
 func TestGuardedCompositeLiterals(t *testing.T) {
 	t.Parallel()
 
-	fset := token.NewFileSet()
-	// Enumerate and parse the files directly rather than through parser.ParseDir. Two
-	// reasons, and the second is the one that matters: ParseDir is deprecated, and it
-	// associates files with packages WITHOUT considering build tags — so a literal in a
-	// file behind a build tag could be dropped from the walk and pass the guard unseen. A
-	// guard that silently skips files is worse than no guard. Every .go file in the
-	// package directory is parsed here regardless of its tags.
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("listing package sources: %v", err)
-	}
-	var sources []string
-	for _, e := range entries {
-		name := e.Name()
-		// Non-test sources only: tests legitimately build these structs directly to drive
-		// a path, and holding test files to the rule would say nothing about production
-		// provenance while making every new table-driven test edit this allowlist.
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		sources = append(sources, name)
-	}
-	if len(sources) == 0 {
-		t.Fatal("no package sources found; the guard would pass vacuously")
-	}
-
 	found := map[string][]string{} // type name -> files containing a literal
-	for _, path := range sources {
-		file, perr := parser.ParseFile(fset, path, nil, 0)
-		if perr != nil {
-			t.Fatalf("parsing %s: %v", path, perr)
-		}
-		base := filepath.Base(path)
+	for _, src := range packageSources(t) {
 		// A literal of a guarded type reaches this walk in two spellings, and matching only
 		// the first is how a guard passes while the thing it guards is bypassed:
 		// `killSubject{...}` names its type directly, while an element of
 		// `[]killSubject{{...}}` or `map[string]forwardParams{"k": {…}}` ELIDES it
 		// (lit.Type == nil) and inherits it from the enclosing literal's element type.
 		// ast.Inspect gives no parent link, so the walk threads that context itself.
-		walkLiterals(file, "", func(name string, _ *ast.CompositeLit) {
+		walkLiterals(src.file, "", func(name string, _ *ast.CompositeLit) {
 			if _, guarded := guardedStructs[name]; guarded {
-				found[name] = append(found[name], base)
+				found[name] = append(found[name], src.name)
 			}
 		})
 	}
@@ -156,6 +125,58 @@ func TestGuardedCompositeLiterals(t *testing.T) {
 			}
 		}
 	}
+}
+
+// packageSource is one parsed non-test source of this package, paired with the name it was
+// parsed under so a guard's failure can name the file.
+type packageSource struct {
+	name string
+	file *ast.File
+	fset *token.FileSet
+}
+
+// packageSources parses every non-test .go file in this package's directory. It is the ONE
+// enumeration every source guard here walks (this file's literal guard, the negotiation
+// prologue, the committer pairing, the stderr discipline), because all of them fail OPEN —
+// fewer files parsed means fewer violations found — so a narrowed enumeration would weaken
+// each of them silently, and only one copy carried the reasoning below.
+//
+// The files are enumerated and parsed directly rather than through parser.ParseDir. Two
+// reasons, and the second is the one that matters: ParseDir is deprecated, and it associates
+// files with packages WITHOUT considering build tags — so a violation in a file behind a build
+// tag could be dropped from the walk and pass unseen. A guard that silently skips files is
+// worse than no guard. Every .go file in the package directory is parsed here regardless of
+// its tags.
+//
+// Non-test sources only: tests legitimately do the things these guards forbid — build a
+// provenance struct directly, drive the negotiation primitives — to pin the rule itself, and
+// holding them to it would say nothing about production while making every new table-driven
+// test edit an allowlist.
+func packageSources(t *testing.T) []packageSource {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("listing package sources: %v", err)
+	}
+	fset := token.NewFileSet()
+	var sources []packageSource
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parsing %s: %v", name, perr)
+		}
+		sources = append(sources, packageSource{name: filepath.Base(name), file: file, fset: fset})
+	}
+	// Every caller's guard passes vacuously on an empty walk, so the emptiness is refused here
+	// rather than re-checked (or forgotten) at each one.
+	if len(sources) == 0 {
+		t.Fatal("no package sources found; every source guard would pass vacuously")
+	}
+	return sources
 }
 
 // walkLiterals visits every composite literal under n, reporting the named type of each and

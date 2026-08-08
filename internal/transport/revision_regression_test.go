@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
@@ -73,6 +74,108 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetForARemovedMethod(t *test
 	}
 	if len(rec.records) != 1 || rec.records[0].identifier != "" {
 		t.Fatalf("records = %+v, want one record naming no policy target", rec.records)
+	}
+}
+
+// TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDefines is the regression for a
+// connection that could be wedged for the process's lifetime by one stray line.
+//
+// The stdio context pins from its first RESOLVED message, which is what makes the flip refusal
+// reachable for a peer that never handshakes. An id-less `initialize` is a notification by
+// IsNotification's structural classification and resolves like any other message — so a single
+// one declaring the revision that REMOVED `initialize` latched that revision, and the host's
+// real handshake was then denied under a table with no `initialize` in it. Re-declaring the
+// older revision was refused as a mid-context flip; omitting the declaration inherited the pin.
+// There was no way to renegotiate.
+//
+// The stray notification is still dropped by the fail-closed default, and still recorded — what
+// changes is that it no longer speaks for the connection.
+func TestStdioNegotiation_PinsOnlyFromAMessageTheRevisionDefines(t *testing.T) {
+	t.Parallel()
+	hw := &mockHostWriter{}
+	pr, pw := io.Pipe()
+	p := &StdioProxy{
+		pdp:          newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sessionID:    "sess",
+		hostReader:   mcp.NewMsgReader(pr),
+		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
+		upWriter:     mcp.NewMsgWriter(io.Discard),
+		stderr:       io.Discard,
+		upstreamDone: make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() { p.serveHost(context.Background()); close(done) }()
+
+	// The stray line, then the host's real handshake declaring nothing at all.
+	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`+"\n")
+	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n")
+	_ = pw.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHost did not return after the host closed stdin")
+	}
+
+	if len(hw.messages) != 1 {
+		t.Fatalf("host received %d message(s), want exactly the handshake reply: %+v", len(hw.messages), hw.messages)
+	}
+	if resp := hw.messages[0]; resp.Error != nil || resp.Result == nil {
+		t.Fatalf("the handshake was refused (%+v); one stray notification must not decide which revision this connection speaks", resp.Error)
+	}
+	if got := p.hostRevision(); got != handshakeRevision {
+		t.Errorf("pinned revision = %q, want %q — the pin belongs to the message that actually negotiated", got, handshakeRevision)
+	}
+}
+
+// TestStdioNegotiation_StillPinsFromADefinedMethod is the other half: the wedge fix must not
+// cost the property the pin exists for. A peer that never sends `initialize` still latches its
+// revision from its first ordinary message, so a later declaration disagreeing with it is
+// refused as the mid-context flip it is.
+func TestStdioNegotiation_StillPinsFromADefinedMethod(t *testing.T) {
+	t.Parallel()
+	hw := &mockHostWriter{}
+	pr, pw := io.Pipe()
+	p := &StdioProxy{
+		// No capabilities: the calls below are denied by policy, so neither reaches an upstream
+		// this proxy does not have.
+		pdp:          newTestManifestPDP(),
+		sessionID:    "sess",
+		hostReader:   mcp.NewMsgReader(pr),
+		hostWriter:   mcp.NewMsgWriter(&writerAdapter{hw}),
+		upWriter:     mcp.NewMsgWriter(io.Discard),
+		stderr:       io.Discard,
+		upstreamDone: make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() { p.serveHost(context.Background()); close(done) }()
+
+	// tools/call exists in BOTH revisions, so declaring the newer one here is evidence about
+	// the conversation — unlike the `initialize` above, which the declared revision removed.
+	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`+"\n")
+	_, _ = io.WriteString(pw, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"probe","_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`+"\n")
+	_ = pw.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHost did not return after the host closed stdin")
+	}
+
+	if got := p.hostRevision(); got != capability.Revision20260728 {
+		t.Fatalf("pinned revision = %q, want %q from the first message the revision defines", got, capability.Revision20260728)
+	}
+	if len(hw.messages) != 2 {
+		t.Fatalf("host received %d message(s), want two: %+v", len(hw.messages), hw.messages)
+	}
+	// Order-independent: the flip is refused inline by the read loop while the first call's
+	// policy denial is written by its own handler goroutine, so either may land first.
+	flipped := false
+	for _, m := range hw.messages {
+		if m.Error != nil && m.Error.Code == capability.JSONRPCCodeUnsupportedProtocolVersion {
+			flipped = true
+		}
+	}
+	if !flipped {
+		t.Errorf("no -32022 among %+v; the second declaration disagrees with the pinned context and must be refused as a mid-context flip", hw.messages)
 	}
 }
 

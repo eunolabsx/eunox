@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"go/ast"
-	"go/parser"
 	"go/printer"
 	"go/token"
 	"os"
@@ -537,18 +536,10 @@ func TestEnforcedForwardCore_BoundsTheSpentApprovalID(t *testing.T) {
 // the call rather than as a rule about who may write a field.
 func TestEnforcedForwardCore_CommitsWithTheDecidingPDP(t *testing.T) {
 	t.Parallel()
-	entries, err := os.ReadDir(".")
-	require.NoError(t, err)
-	fset := token.NewFileSet()
 	checked := 0
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		file, perr := parser.ParseFile(fset, name, nil, 0)
-		require.NoError(t, perr)
-		ast.Inspect(file, func(n ast.Node) bool {
+	for _, src := range packageSources(t) {
+		name := src.name
+		ast.Inspect(src.file, func(n ast.Node) bool {
 			call, isCall := n.(*ast.CallExpr)
 			if !isCall {
 				return true
@@ -562,7 +553,7 @@ func TestEnforcedForwardCore_CommitsWithTheDecidingPDP(t *testing.T) {
 			if params == "" || committer == "" || params != committer {
 				t.Errorf("%s: enforcedForwardCore must be handed the decision point that MADE the decision "+
 					"(pass d.forwardParams and d.pdp for the same d); got %s and %s",
-					name, exprText(fset, call.Args[1]), exprText(fset, call.Args[2]))
+					name, exprText(src.fset, call.Args[1]), exprText(src.fset, call.Args[2]))
 			}
 			return true
 		})

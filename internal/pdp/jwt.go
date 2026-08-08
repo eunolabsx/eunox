@@ -1022,9 +1022,9 @@ func (p *JWTPDP) routeAudienceSatisfied(claims *JWTClaims) bool {
 	return false
 }
 
-// audienceDeny is marked HardDeny so a route running under --audit does NOT downgrade
-// it to a logged forward: audience is an authentication/tenancy boundary (like the
-// kill switch), not a per-call policy decision.
+// audienceDeny carries the producer's HardDeny override so a route running under --audit does
+// NOT downgrade it to a logged forward: audience is an authentication/tenancy boundary (like
+// the kill switch), not the per-call policy decision its AUTHORIZATION_FAILED code names.
 func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 	resp := denyResponse(p.clock, capability.ErrCodeAuthorizationFailed, "jwtAudience", message)
 	resp.Denial.HardDeny = true
@@ -1034,7 +1034,7 @@ func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 // withInnerVerdicts composes the inner PDP's own verdicts onto one of JWTPDP's own
 // denies produced by short-circuiting above the inner PDP.
 //
-// JWTPDP short-circuits on three non-HardDeny paths (unlisted target, a JWT
+// JWTPDP short-circuits on three DOWNGRADABLE paths (unlisted target, a JWT
 // condition failure, no-capabilities-with-no-backstop), so the inner PDP never
 // contributes the redaction obligations a --audit route needs on downgrade, the
 // interface-pin break, or the effect ceiling — each omission made the composed
@@ -1048,7 +1048,7 @@ func (p *JWTPDP) withInnerVerdicts(ctx context.Context, sessionID string, r capa
 	if p.inner == nil || r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
 		return r
 	}
-	if r.Denial != nil && r.Denial.HardDeny {
+	if r.Denial != nil && !r.Denial.Downgradable() {
 		// Never downgraded to a forward, so nothing to redact or harden.
 		return r
 	}
