@@ -53,7 +53,7 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 	if respHdr != nil {
 		if sessID = respHdr.Get(transport.SessionHeader); sessID != "" {
 			//nolint:contextcheck // teardown deliberately uses the helper's own bounded background context: it runs from the defer as the probe's request context is being canceled.
-			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, handshakeRev)
+			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, handshakeRev, os.Stderr)
 		}
 	}
 	if err != nil {

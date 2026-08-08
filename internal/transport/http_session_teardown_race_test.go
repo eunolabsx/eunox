@@ -14,13 +14,13 @@ import (
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
-// TestHandleSessionPost_TeardownRaceAfterInFlightIncrement is the regression for H3, in its
-// #234/C1 shape: inFlight is now incremented for the WHOLE handler (right after the
-// route-binding check, before the session gates and the existing-session CheckKill this test
-// hooks — see TestHandleSessionPost_InFlightCoversWholeHandler for that), so a session torn
-// out of the registry from inside CheckKill can no longer land in the narrow resolve-to-Add(1)
-// gap the original H3 fix re-validated against. This test now covers the WIDER window the
-// re-validation is kept as a fail-closed backstop for: a teardown landing anywhere between the
+// TestHandleSessionPost_TeardownRaceAfterInFlightIncrement covers the teardown race across
+// the whole handler: inFlight is incremented right after the route-binding check, before the
+// session gates and the existing-session CheckKill this test hooks (see
+// TestHandleSessionPost_InFlightCoversWholeHandler for that), so a session torn out of the
+// registry from inside CheckKill can no longer land in the narrow resolve-to-Add(1) gap the
+// dispatch branch's re-validation was originally added for. This test covers the WIDER window
+// that re-validation is now kept as a fail-closed backstop for: a teardown landing between the
 // initial getSession resolve and the enforced-dispatch branch's own re-check must still deny
 // with a retryable error rather than take a decision turn on a gate/PDP state the teardown
 // already released. It uses killGateHookPDP (defined alongside
@@ -70,8 +70,8 @@ func TestHandleSessionPost_TeardownRaceAfterInFlightIncrement(t *testing.T) {
 	}
 }
 
-// TestHandleSessionPost_InFlightCoversWholeHandler pins #234/C1's adopted shape: inFlight is
-// incremented right after the route-binding check, before the session gates and the
+// TestHandleSessionPost_InFlightCoversWholeHandler pins where the counting window opens:
+// inFlight is incremented right after the route-binding check, before the session gates and the
 // existing-session CheckKill run — not only around the enforced-dispatch branch's upstream
 // call, as it was before. It hooks CheckKill (which this request reaches well before the old
 // Add(1) site) to observe inFlight mid-handler, proving the reaper would already spare this

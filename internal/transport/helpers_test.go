@@ -64,8 +64,8 @@ func waitForLog(t *testing.T, _ *bytes.Buffer, _ string) {
 // read it back: a proxy's diagnostic lines can be written from a background goroutine (session
 // reaping, cleanup) concurrently with the test's own read of the captured text, which a plain
 // bytes.Buffer does not allow under -race. Replaces captureStderr's process-global os.Stderr
-// swap (issue 215): the proxy under test gets its own writer at construction instead of
-// racing every other test in the package over the same global.
+// swap: the proxy under test gets its own writer at construction instead of racing every
+// other test in the package over the same global.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer

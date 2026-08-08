@@ -198,6 +198,17 @@ Flags:
 		return 0
 	}
 
+	printVerifySummary(res)
+	if !res.OK() {
+		return 1
+	}
+	return 0
+}
+
+// printVerifySummary writes the tallies and the operator notes a non-empty pass produces.
+// Split out of cmdAuditVerify to keep it under the length budget; the notes are the part that
+// grows, since each one names a state the verdict alone cannot distinguish.
+func printVerifySummary(res audit.VerifyResult) {
 	fmt.Printf(auditVerifySummaryFormat,
 		res.Total, res.Valid, res.Invalid, res.Skipped, res.UnknownKey, res.Unverifiable, res.ChainBreaks)
 	// A missing-key state, not tampering — kept distinct from INVALID so a key rotation
@@ -214,15 +225,27 @@ Flags:
 			"typically a pre-key_id-era record whose signing key was retired. Add the original key(s) to the ring "+
 			"to verify them; until then they cannot be distinguished from tampering and the verdict fails.\n", res.Unverifiable)
 	}
+	// Both notes below are keyed on the VERIFIED oldest seq, never the claimed one: FirstSeq
+	// is adopted from the head record before its HMAC is checked, so on a failing log it is a
+	// number the forger chose — and this is precisely the value an operator reconciles
+	// against an external high-water mark. The two agree on a log that passes, so a clean
+	// verify prints exactly what it printed before.
+	if res.FirstSeq > 0 && res.FirstVerifiedSeq != res.FirstSeq {
+		if res.FirstVerifiedSeq == 0 {
+			fmt.Printf("Note: the oldest record claims seq %d, but no record's signature verified, so no "+
+				"retained seq is proven — reconcile against your external high-water mark rather than "+
+				"the claimed value.\n", res.FirstSeq)
+		} else {
+			fmt.Printf("Note: the oldest record claims seq %d but did not verify; the oldest seq proven by a "+
+				"verified signature is %d — reconcile against that, not the claimed value.\n",
+				res.FirstSeq, res.FirstVerifiedSeq)
+		}
+	}
 	// seq > 1 across the whole chain means leading records (or whole rotated files) were
 	// removed or pruned — unprovable from local files alone without an external anchor.
-	if res.FirstSeq > 1 {
-		fmt.Printf("Note: the oldest record across the retained log files is seq %d, not 1 — "+
+	if res.FirstVerifiedSeq > 1 {
+		fmt.Printf("Note: the oldest verified record across the retained log files is seq %d, not 1 — "+
 			"leading records (or whole leading rotated files) were removed or pruned by "+
-			"retention (indistinguishable without an external anchor).\n", res.FirstSeq)
+			"retention (indistinguishable without an external anchor).\n", res.FirstVerifiedSeq)
 	}
-	if !res.OK() {
-		return 1
-	}
-	return 0
 }

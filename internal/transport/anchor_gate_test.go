@@ -366,7 +366,7 @@ func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
 	}
 }
 
-// TestSessionGate_TimedOutDrainHandsOffTheDropRatherThanForcingIt is issue 214: a handler still
+// TestSessionGate_TimedOutDrainHandsOffTheDropRatherThanForcingIt: a handler still
 // holding the session's pinned turn when releaseSessionState's bounded drain gives up must not
 // have its gate deleted out from under it. Forcing the drop at that point would let the
 // registry reap the entry and hand the next caller on the same anchor a FRESH gate with an

@@ -8008,9 +8008,9 @@ func TestUnwiredDirective_DoesNotPreemptTheConditionVerdict(t *testing.T) {
 	assert.Empty(t, bug.Obligations, "a hard deny carries no obligations")
 }
 
-// TestUnwiredDirective_DoesNotDropASiblingsObligations is the fix pinned for #219's
-// "CollectObligations drops already-collected redactions when a later directive has an
-// unknown obligation type" finding. evaluateMatched calls CollectObligations UP FRONT and
+// TestUnwiredDirective_DoesNotDropASiblingsObligations pins that CollectObligations keeps
+// already-collected redactions when a LATER directive carries an unknown obligation type.
+// evaluateMatched calls CollectObligations UP FRONT and
 // stamps whatever it collected onto a LATER, unrelated condition-driven deny via a
 // deferred closure — the ordering TestUnwiredDirective_DoesNotPreemptTheConditionVerdict
 // pins. Before the fix, CollectObligations discarded every already-collected obligation

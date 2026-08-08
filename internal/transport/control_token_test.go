@@ -26,7 +26,7 @@ func TestControlToken_GenerateWriteResolve_RoundTrip(t *testing.T) {
 		t.Fatalf("token length = %d, want 64 hex chars", len(tok))
 	}
 
-	written, err := WriteControlTokenFile(context.Background(), path, tok)
+	written, err := WriteControlTokenFile(context.Background(), path, tok, io.Discard)
 	if err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestWriteControlTokenFile_OverwritesLooseModeWith0600(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil { //nolint:gosec // test fixture: deliberately loose mode
 		t.Fatal(err)
 	}
-	if _, err := WriteControlTokenFile(context.Background(), path, "newtoken"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), path, "newtoken", io.Discard); err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
 	info, err := os.Stat(path)
@@ -105,7 +105,7 @@ func TestResolveControlToken_WhitespaceOnlyEnv_FallsThroughToFile(t *testing.T) 
 	// source, mirroring the flag arm's trim-then-test behavior.
 	t.Setenv("EUNOX_CONTROL_TOKEN", "  \n\t ")
 	path := filepath.Join(t.TempDir(), "control.token")
-	if _, err := WriteControlTokenFile(context.Background(), path, "file-token"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), path, "file-token", io.Discard); err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
 	got, err := ResolveControlToken("", path)
@@ -130,7 +130,7 @@ func TestWriteControlTokenFile_DoesNotMutatePreexistingDirMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "control.token")
-	if _, err := WriteControlTokenFile(context.Background(), path, "tok"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), path, "tok", io.Discard); err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
 	info, err := os.Stat(dir)
@@ -148,7 +148,7 @@ func TestWriteControlTokenFile_TightensDirItCreatesTo0700(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "created-by-eunox")
 	path := filepath.Join(dir, "control.token")
-	if _, err := WriteControlTokenFile(context.Background(), path, "tok"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), path, "tok", io.Discard); err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
 	info, err := os.Stat(dir)
@@ -174,26 +174,15 @@ func TestWriteControlTokenFile_WarnsOnPreexistingLooseDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Capture os.Stderr for the duration of the write.
-	origStderr := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stderr = w
-	_, writeErr := WriteControlTokenFile(context.Background(), filepath.Join(dir, "control.token"), "tok")
-	os.Stderr = origStderr
-	_ = w.Close()
-
+	// Captured through the writer this call is handed, not by reassigning the process-global
+	// os.Stderr, which races every other test in the package.
+	var out syncBuffer
+	_, writeErr := WriteControlTokenFile(context.Background(), filepath.Join(dir, "control.token"), "tok", &out)
 	if writeErr != nil {
 		t.Fatalf("WriteControlTokenFile: %v", writeErr)
 	}
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(out); !strings.Contains(got, "WARNING") || !strings.Contains(got, "group/world-accessible") {
-		t.Errorf("expected a group/world-accessible WARNING on stderr for a pre-existing 0750 dir, got %q", got)
+	if got := out.String(); !strings.Contains(got, "WARNING") || !strings.Contains(got, "group/world-accessible") {
+		t.Errorf("expected a group/world-accessible WARNING for a pre-existing 0750 dir, got %q", got)
 	}
 }
 
@@ -232,7 +221,7 @@ func TestWriteControlTokenFile_TightensEunoxOwnedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := WriteControlTokenFile(context.Background(), "", "tok"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), "", "tok", io.Discard); err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
 
@@ -260,7 +249,7 @@ func TestWriteControlTokenFile_RefusesWorldWritableOperatorDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := WriteControlTokenFile(context.Background(), filepath.Join(dir, "control.token"), "tok")
+	_, err := WriteControlTokenFile(context.Background(), filepath.Join(dir, "control.token"), "tok", io.Discard)
 	if err == nil {
 		t.Fatal("expected a fail-closed error for a world-writable, non-sticky control-token directory")
 	}
@@ -283,7 +272,7 @@ func TestWriteControlTokenFile_AllowsStickyOperatorDir(t *testing.T) {
 	}
 
 	path := filepath.Join(dir, "control.token")
-	if _, err := WriteControlTokenFile(context.Background(), path, "tok"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), path, "tok", io.Discard); err != nil {
 		t.Fatalf("a sticky world-writable directory must remain usable, got %v", err)
 	}
 	got, err := ResolveControlToken("", path)
@@ -308,7 +297,7 @@ func TestWriteControlTokenFile_WarnsButAllowsReadableOperatorDir(t *testing.T) {
 	}
 
 	path := filepath.Join(dir, "control.token")
-	if _, err := WriteControlTokenFile(context.Background(), path, "tok"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), path, "tok", io.Discard); err != nil {
 		t.Fatalf("a group/world-readable operator directory must remain usable, got %v", err)
 	}
 	info, err := os.Stat(dir)
@@ -341,7 +330,7 @@ func TestWriteControlTokenFile_NeverChmodsThroughSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := WriteControlTokenFile(context.Background(), "", "tok"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), "", "tok", io.Discard); err != nil {
 		t.Fatalf("a symlinked control-token directory must remain usable, got %v", err)
 	}
 
@@ -374,7 +363,7 @@ func TestWriteControlTokenFile_TightensDefaultDirSpelledAbsolutely(t *testing.T)
 
 	// The absolute spelling of the default path, as a unit file or an expanding shell
 	// would pass it.
-	if _, err := WriteControlTokenFile(context.Background(), filepath.Join(dir, "control.token"), "tok"); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), filepath.Join(dir, "control.token"), "tok", io.Discard); err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
 
@@ -398,7 +387,7 @@ func TestWriteControlTokenFile_ExpiredContextLeavesExistingTokenIntact(t *testin
 
 	// Stand in for the token a running proxy already published.
 	const running = "running-proxy-token"
-	if _, err := WriteControlTokenFile(context.Background(), path, running); err != nil {
+	if _, err := WriteControlTokenFile(context.Background(), path, running, io.Discard); err != nil {
 		t.Fatalf("seed write: %v", err)
 	}
 	before, err := os.ReadFile(path)
@@ -408,7 +397,7 @@ func TestWriteControlTokenFile_ExpiredContextLeavesExistingTokenIntact(t *testin
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := WriteControlTokenFile(ctx, path, "usurper-token"); err == nil {
+	if _, err := WriteControlTokenFile(ctx, path, "usurper-token", io.Discard); err == nil {
 		t.Fatal("an expired context must abort the write, not publish it")
 	} else if !errors.Is(err, context.Canceled) {
 		t.Errorf("error should wrap the context cause, got %v", err)
@@ -435,7 +424,7 @@ func TestWriteControlTokenFile_ExpiredContextLeavesNoTempFile(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := WriteControlTokenFile(ctx, path, "tok"); err == nil {
+	if _, err := WriteControlTokenFile(ctx, path, "tok", io.Discard); err == nil {
 		t.Fatal("an expired context must abort the write")
 	}
 
@@ -461,7 +450,7 @@ func TestWriteControlTokenFile_GenerousDeadlinePublishes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	written, err := WriteControlTokenFile(ctx, path, "tok-ok")
+	written, err := WriteControlTokenFile(ctx, path, "tok-ok", io.Discard)
 	if err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}

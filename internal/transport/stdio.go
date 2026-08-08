@@ -233,10 +233,10 @@ type StdioProxy struct {
 // errOut returns p's diagnostic writer, falling back to os.Stderr for a nil proxy or one
 // assembled by a bare struct literal (stderr left unset).
 func (p *StdioProxy) errOut() io.Writer {
-	if p == nil || p.stderr == nil {
+	if p == nil {
 		return os.Stderr
 	}
-	return p.stderr
+	return resolvedErrOut(p.stderr)
 }
 
 // StdioProxyOptions configures a StdioProxy. The upstream is either a local
@@ -671,7 +671,7 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 		// in the ordinary case, but a descendant that escaped the process group can still
 		// hold it open, and an unbounded wait here would leave the proxy never exiting and
 		// never flushing its audit sink.
-		waitBounded(p.upstreamDone, p.killDelay(), "upstream output stream")
+		waitBounded(p.upstreamDone, p.killDelay(), "upstream output stream", p.errOut())
 	}
 }
 
@@ -747,7 +747,7 @@ func (p *StdioProxy) runBoundedStartup(ctx context.Context, fn func() error) err
 		p.killUpstream() //nolint:contextcheck // teardown: detached, bounded background context; no request context here.
 		// Bound the post-kill wait too: an escaped-process-group descendant can hold the
 		// pipe open indefinitely, and this watchdog's whole job is to bound a wedged upstream.
-		waitBounded(done, p.killDelay(), "upstream startup output stream")
+		waitBounded(done, p.killDelay(), "upstream startup output stream", p.errOut())
 		return fmt.Errorf("upstream did not complete startup within %s: %w", timeout, startCtx.Err())
 	}
 }
@@ -1237,7 +1237,7 @@ func (p *StdioProxy) trackServerRequest(id *json.RawMessage) {
 	if id == nil {
 		return
 	}
-	p.serverReqs.track(mcp.MsgKey(id))
+	p.serverReqs.track(mcp.MsgKey(id), p.errOut())
 }
 
 // forwardServerRequestToHost tracks msg's ID and forwards the server-initiated

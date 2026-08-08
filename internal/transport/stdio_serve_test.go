@@ -363,7 +363,7 @@ func TestServeHost_KilledServerResponseRecordsDeny(t *testing.T) {
 		upstreamDone: make(chan struct{}),
 	}
 	// A host response (id 5) to a server-initiated request the proxy had forwarded.
-	p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)))
+	p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard)
 	p.hostReader = mcp.NewMsgReader(strings.NewReader(`{"jsonrpc":"2.0","id":5,"result":{}}` + "\n"))
 
 	ctx, cancel := context.WithCancel(context.Background())

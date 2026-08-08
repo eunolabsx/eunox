@@ -436,8 +436,8 @@ func TestOriginAllowed_BracketedIPv6Bind(t *testing.T) {
 	}
 }
 
-// TestOriginAllowed_AllowlistFoldIsASCIIOnly pins #219's Low-priority internal-consistency
-// fix: originAllowed's allowlist comparison must fold like this file's own isJSONMediaType
+// TestOriginAllowed_AllowlistFoldIsASCIIOnly pins one internal consistency:
+// originAllowed's allowlist comparison must fold like this file's own isJSONMediaType
 // (asciiEqualFold), not strings.EqualFold's Unicode folding — a mismatch between the two
 // case-insensitive comparisons this file makes would be surprising even though it is not
 // practically exploitable (RFC 6454 origins are ASCII scheme://host[:port], and Go's URL

@@ -1586,7 +1586,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// whole flag bundle for the proxy's lifetime.
 	controlTokenPath := pf.controlTokenPath
 	writeControlToken := func(ctx context.Context) error {
-		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken)
+		controlTokenFile, werr := transport.WriteControlTokenFile(ctx, controlTokenPath, controlToken, os.Stderr)
 		if werr != nil {
 			return fmt.Errorf("kill control endpoint: %w", werr)
 		}
@@ -1732,11 +1732,13 @@ func parseFlagsAndPositionals(fs *flag.FlagSet, args []string) ([]string, error)
 		// or not: flag.Parse consumes the "--" itself (it never appears in Args()) and
 		// stops all further flag interpretation for the rest of that call. Re-parsing the
 		// tail on the next loop iteration would silently re-enable flag parsing for
-		// anything after the first token, so `eunox validate -- -a.yaml -b.yaml` failed on
-		// -b.yaml with "flag provided but not defined" — the terminator protected only the
-		// token right after it instead of the whole remainder, contradicting the flag
-		// package's own convention. Detected by checking whether the token immediately
-		// before where rest begins in THIS call's args was "--".
+		// anything after the first token, so `eunox kill -- -weird-session-id` protected
+		// only the token right after the terminator and failed on any further dash-prefixed
+		// positional with "flag provided but not defined", contradicting the flag package's
+		// own convention. `kill` is the reachable case: validate peels its own "--"
+		// remainder off as a stdio command BEFORE calling here (see cmdValidate), so a
+		// terminator never survives to this loop there. Detected by checking whether the
+		// token immediately before where rest begins in THIS call's args was "--".
 		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
 			return append(positionals, rest...), nil
 		}

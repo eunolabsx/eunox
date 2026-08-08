@@ -4,9 +4,6 @@
 // HMAC key management for the audit log: resolving the key path, loading or
 // creating the signing key, publishing the verification key set, and the file-mode
 // tightening that keeps a key readable only by its owner.
-//
-// Split out of audit.go verbatim (writer core), alongside rotate.go (rotation and
-// retention) and verify.go (chain verification). No behavior change.
 
 package audit
 

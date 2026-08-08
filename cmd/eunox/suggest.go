@@ -591,10 +591,10 @@ func targetLess(a, b *observedTarget) bool {
 }
 
 // suggestUsageExit is suggest's exit code for a usage, config, or audit-log-read error,
-// matching the binary's proxy/validate/audit-verify convention (2 = usage error, so it
+// matching the binary's proxy/validate/stats/audit-verify convention (2 = usage error, so it
 // reads as distinguishable from an operation-specific failure — here, --output write
 // failure, exit 1). Was the other way around; pre-1.0 permits the clean swap over a
-// compat shim.
+// compat shim. `kill` is the one deliberate exception, documented in its own usage block.
 const suggestUsageExit = 2
 
 // cmdSuggest runs the `suggest` subcommand, returning the exit code (rather than calling

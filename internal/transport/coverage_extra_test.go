@@ -500,7 +500,7 @@ func TestWriteControlTokenFile_BareFilenameUsesCurrentDir(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	written, err := WriteControlTokenFile(context.Background(), "relative.token", "tok-bare")
+	written, err := WriteControlTokenFile(context.Background(), "relative.token", "tok-bare", io.Discard)
 	if err != nil {
 		t.Fatalf("WriteControlTokenFile: %v", err)
 	}
@@ -1047,8 +1047,8 @@ func TestDeleteMCPHTTPSession_NoOpGuards(t *testing.T) {
 	t.Parallel()
 	// A blank session ID is a no-op: nothing was initialized to terminate. A nil
 	// client is likewise a no-op. Neither must panic or make a request.
-	DeleteMCPHTTPSession(http.DefaultClient, "http://127.0.0.1:0/mcp", "", "", capability.Revision20251125)
-	DeleteMCPHTTPSession(nil, "http://127.0.0.1:0/mcp", "sess", "", capability.Revision20251125)
+	DeleteMCPHTTPSession(http.DefaultClient, "http://127.0.0.1:0/mcp", "", "", capability.Revision20251125, io.Discard)
+	DeleteMCPHTTPSession(nil, "http://127.0.0.1:0/mcp", "sess", "", capability.Revision20251125, io.Discard)
 }
 
 func TestDeleteMCPHTTPSession_SendsDeleteWithAuthHeader(t *testing.T) {
@@ -1063,7 +1063,7 @@ func TestDeleteMCPHTTPSession_SendsDeleteWithAuthHeader(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	DeleteMCPHTTPSession(srv.Client(), srv.URL+"/mcp", "up-sess-1", "Authorization: Bearer tok", capability.Revision20251125)
+	DeleteMCPHTTPSession(srv.Client(), srv.URL+"/mcp", "up-sess-1", "Authorization: Bearer tok", capability.Revision20251125, io.Discard)
 	select {
 	case s := <-got:
 		if s.method != http.MethodDelete {

@@ -19,6 +19,13 @@ import (
 	"github.com/eunolabs/eunox/internal/audit"
 )
 
+// statsUsageExit is stats' exit code for a usage, config, or audit-log-read error, matching
+// the proxy/validate/suggest/audit-verify convention (2 = usage error). stats reports no
+// findings, so nothing here is reserved for exit 1 the way validate reserves it for drift and
+// audit-verify for a failed chain — but the code still has to mean the same thing across the
+// binary, or a script gating on it learns a rule with one silent exception.
+const statsUsageExit = 2
+
 // cmdStats runs the `stats` subcommand, returning the exit code (rather than calling
 // os.Exit) so tests can drive every branch.
 func cmdStats(args []string) int {
@@ -33,6 +40,12 @@ into BLOCKED (enforce-mode — request was rejected) and OBSERVED (audit-mode
 that an operator running in audit mode while staging an allowlist can see
 exactly what would be blocked if enforcement were enabled.
 
+Exit codes:
+  0  The histogram was printed (including for a log with no denials).
+  2  Usage error, or a config or audit-log-read failure. There is no findings
+     code: stats reports what the log already holds, so a busy histogram is
+     not a failure.
+
 Flags:
 `)
 		fs.SetOutput(w)
@@ -42,24 +55,29 @@ Flags:
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 
 	if code, done := parseAuditReaderFlags("stats", fs, args, configPath, auditLogPath, nil); done {
+		if code != 0 {
+			// Translate the shared preamble's 1 to this command's own usage exit code;
+			// see statsUsageExit.
+			return statsUsageExit
+		}
 		return code
 	}
 	logPath, ok := resolveAuditReaderLogPath("stats", *auditLogPath)
 	if !ok {
-		return 1
+		return statsUsageExit
 	}
 
 	r, closeChain, err := openAuditChain("stats", logPath)
 	if err != nil {
 		fmt.Fprint(os.Stderr, err.Error())
-		return 1
+		return statsUsageExit
 	}
 	defer closeChain()
 
 	summary, err := computeAuditStats(r)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox stats: reading log: %v\n", err)
-		return 1
+		return statsUsageExit
 	}
 	printAuditStats(os.Stdout, summary)
 	return 0

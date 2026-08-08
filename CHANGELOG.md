@@ -306,6 +306,29 @@ Section conventions:
 
 ### Changed
 
+- **`eunox audit-verify` reports the oldest seq a signature PROVES, not the one the head
+  record claims.** The chain walk has to adopt an anchor before any signature verdict
+  exists, so the oldest-seq value the summary printed was taken from the head record
+  before its HMAC was checked — and that value is the one an operator reconciles against
+  an external high-water mark. The exact attack it exists to surface therefore suppressed
+  it: excise the leading records, rewrite the survivor to claim `seq 1`, and the
+  "leading records were removed or pruned" note never printed (the verdict still failed).
+  `VerifyResult` now carries `FirstVerifiedSeq` beside the claimed `FirstSeq`, the note is
+  keyed on the proven value, and a divergence between the two is stated in its own line.
+  A log that verifies clean prints exactly what it printed before.
+- **`eunox stats` exits 2 on a usage, config, or log-read error.** It returned 1 for every
+  failure while `proxy`/`validate`/`suggest`/`audit-verify` reserve 2 for "you asked for
+  something I could not act on" — so a script that learned the convention from a sibling
+  command read a mistyped stats flag as an operational failure. stats reports no findings,
+  so nothing needs exit 1 here, and its `-h` output now states the codes. `eunox kill`
+  stays at 1 for every failure, now documented in its own usage block as the deliberate
+  exception: under an emergency stop the only question is whether the revocation landed,
+  and a second failure code invites a script that treats one of them as success.
+- **`eunox validate` names the arguments a `--` captured.** Everything after a `--` is
+  peeled off as a `--live` stdio upstream command before flag parsing, with or without
+  `--live`, so `eunox validate -- ./manifest.yaml` reported "at least one manifest file is
+  required" against a command line that visibly named one. The error now says where the
+  tokens went.
 - **`killswitch.Redis.Status` fails closed on a cache it cannot confirm.** A snapshot
   asserts "this is the whole kill set" — `ShouldBlock`'s "nothing matches" written out —
   but `Status` answered it from any cache at all, returning a **nil** error beside a

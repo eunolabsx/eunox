@@ -2384,6 +2384,32 @@ func TestCmdValidate_ConfigAndUpstreamURL(t *testing.T) {
 	}
 }
 
+// TestCmdValidate_NamesArgumentsCapturedAfterTheTerminator: validate peels everything after a
+// "--" off as a --live stdio command BEFORE flag parsing, with or without --live. So a
+// manifest passed there is gone from the positional list, and the bare "at least one manifest
+// file is required" contradicted a command line that visibly named one. The error must say
+// where the tokens went.
+func TestCmdValidate_NamesArgumentsCapturedAfterTheTerminator(t *testing.T) {
+	var code int
+	out := captureStderr(t, func() { code = cmdValidate([]string{"--", "./manifest.yaml"}) })
+	if code != 2 {
+		t.Errorf("expected exit code 2 (usage error), got %d", code)
+	}
+	if !strings.Contains(out, `everything after "--" was taken as a --live stdio upstream command`) {
+		t.Errorf("expected the error to name the captured arguments; got %q", out)
+	}
+	if !strings.Contains(out, "./manifest.yaml") {
+		t.Errorf("expected the captured tokens themselves in the error; got %q", out)
+	}
+
+	// No terminator, no clause: the note must not attach itself to an ordinary missing-file
+	// error, where it would only be noise.
+	plain := captureStderr(t, func() { cmdValidate(nil) })
+	if strings.Contains(plain, `after "--"`) {
+		t.Errorf("the captured-arguments note must not fire without a terminator; got %q", plain)
+	}
+}
+
 func TestCmdValidate_ConfigLoadError(t *testing.T) {
 	code := cmdValidate([]string{"--config", "/no/such/eunox.yaml"})
 	if code != 2 {
@@ -2604,15 +2630,15 @@ func TestCmdAuditVerify_ConfigLoadError(t *testing.T) {
 func TestCmdStats_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	code := cmdStats([]string{"--audit-log", logPath})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (no audit log), got %d", code)
+	if code != statsUsageExit {
+		t.Errorf("expected exit code %d (no audit log), got %d", statsUsageExit, code)
 	}
 }
 
 func TestCmdStats_ConfigLoadError(t *testing.T) {
 	code := cmdStats([]string{"--config", "/no/such/config.yaml"})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (config load error), got %d", code)
+	if code != statsUsageExit {
+		t.Errorf("expected exit code %d (config load error), got %d", statsUsageExit, code)
 	}
 }
 

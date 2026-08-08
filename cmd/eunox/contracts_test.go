@@ -450,9 +450,8 @@ func TestContractsAttestPayloadRejectsBadInput(t *testing.T) {
 		"bad statement":     {"--dir", dir, "--attest-payload", "acme/mcp.send", "--statement", "maybe"},
 		"two query modes":   {"--dir", dir, "--attest-payload", "acme/mcp.send", "--ref", "acme/mcp.send"},
 		"missing key store": {"--dir", dir, "--trust-keys", filepath.Join(dir, "absent.json")},
-		// #219 Low-priority: --role/--statement without --attest-payload used to be
-		// silently inert, the one exemption from the binary's otherwise-uniform
-		// inert-flag rejection.
+		// --role/--statement without --attest-payload used to be silently inert, the one
+		// exemption from the binary's otherwise-uniform inert-flag rejection.
 		"role without attest-payload":      {"--dir", dir, "--role", "reviewer"},
 		"statement without attest-payload": {"--dir", dir, "--statement", "disputes"},
 	} {

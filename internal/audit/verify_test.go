@@ -943,6 +943,80 @@ func TestVerifyAuditLog_UnsignedHeadIsInvalid(t *testing.T) {
 	}
 }
 
+// TestVerifyAuditLog_FirstVerifiedSeqIsNotTheClaimedHeadSeq: the chain walk adopts the head
+// record's seq as FirstSeq before any signature verdict exists, so a write-capable forger who
+// excises the leading records and rewrites the survivor to claim seq 1 chooses the number the
+// summary reports. FirstVerifiedSeq must instead be the oldest seq a verified signature
+// covers, since that is the value an operator reconciles against an external high-water mark.
+func TestVerifyAuditLog_FirstVerifiedSeqIsNotTheClaimedHeadSeq(t *testing.T) {
+	t.Parallel()
+	key := nonZeroTestKey()
+	verifier := &Sink{key: key}
+
+	// The survivor of a leading truncation, rewritten to claim seq 1 (and the genesis
+	// sentinel) so nothing local proves records were removed. Its HMAC covers seq 500, so
+	// the rewrite fails per-record verification — but only AFTER FirstSeq was adopted.
+	genuine := auditRecord{
+		Time: "2026-06-15T10:00:00Z", Seq: 500, RequestID: "r500", SessionID: "s",
+		Decision: "allow", PrevHMAC: "sha256:whatever-preceded-it",
+	}
+	line := signAuditLine(t, key, genuine)
+	forged := bytes.Replace(line, []byte(`"seq":500`), []byte(`"seq":1`), 1)
+	forged = bytes.Replace(forged, []byte(`"prev_hmac":"sha256:whatever-preceded-it"`), []byte(`"prev_hmac":"`+auditGenesisPrev+`"`), 1)
+	if bytes.Equal(forged, line) {
+		t.Fatalf("test setup: the seq/prev_hmac rewrite did not apply to %s", line)
+	}
+
+	// A genuine seq-501 record follows, linked to the survivor's real _hmac.
+	next := signAuditLine(t, key, auditRecord{
+		Time: "2026-06-15T10:00:01Z", Seq: 501, RequestID: "r501", SessionID: "s",
+		Decision: "allow", PrevHMAC: hmacOf(t, line),
+	})
+
+	res := verifyBytes(t, [][]byte{forged, next}, verifier)
+	if res.OK() {
+		t.Fatalf("a rewritten head record must fail the verdict: %+v", res)
+	}
+	if res.FirstSeq != 1 {
+		t.Fatalf("FirstSeq = %d, want the CLAIMED head seq 1 (it is adopted before verification)", res.FirstSeq)
+	}
+	if res.FirstVerifiedSeq != 501 {
+		t.Fatalf("FirstVerifiedSeq = %d, want 501 — the oldest seq a verified signature proves", res.FirstVerifiedSeq)
+	}
+
+	// On a log that passes, the claimed and proven values are the same, so a clean verify
+	// reports what it always did.
+	clean := signAuditLine(t, key, auditRecord{
+		Time: "2026-06-15T10:00:00Z", Seq: 1, RequestID: "r1", SessionID: "s",
+		Decision: "allow", PrevHMAC: auditGenesisPrev,
+	})
+	cleanRes := verifyBytes(t, [][]byte{clean}, verifier)
+	if !cleanRes.OK() {
+		t.Fatalf("clean log must pass: %+v", cleanRes)
+	}
+	if cleanRes.FirstSeq != 1 || cleanRes.FirstVerifiedSeq != 1 {
+		t.Fatalf("clean log: FirstSeq=%d FirstVerifiedSeq=%d, want 1 and 1", cleanRes.FirstSeq, cleanRes.FirstVerifiedSeq)
+	}
+
+	// Nothing verifiable at all: the claimed head seq stands alone and must not be mistaken
+	// for a proven one.
+	unsignedOnly := []byte(`{"class_uid":6003,"category_uid":6,"activity_id":1,"time":"2026-06-15T10:00:00Z","seq":9,"request_id":"r","decision":"allow"}`)
+	noneRes := verifyBytes(t, [][]byte{unsignedOnly}, verifier)
+	if noneRes.FirstVerifiedSeq != 0 {
+		t.Fatalf("FirstVerifiedSeq = %d, want 0 when no record verified", noneRes.FirstVerifiedSeq)
+	}
+}
+
+// hmacOf extracts the _hmac a signed line carries, for chaining a follow-on record onto it.
+func hmacOf(t *testing.T, line []byte) string {
+	t.Helper()
+	var rec auditRecord
+	if err := json.Unmarshal(line, &rec); err != nil {
+		t.Fatalf("unmarshal signed line: %v", err)
+	}
+	return rec.HMAC
+}
+
 // TestVerifyAuditLog_ForgedEmptyPrevSeq1_IsChainBreak guards the genesis-sentinel
 // empty-prev_hmac bypass: a signing-key holder truncates the leading records and
 // forges a seq-1 record with prev_hmac="" and a valid HMAC. It must be flagged — with
@@ -2310,7 +2384,7 @@ func TestTruncatePartialTail_ReReadFailureFailsClosed(t *testing.T) {
 // ENDS-AT-BOUNDARY path (no orphan to truncate), not the clipped-record path the tests
 // above cover. Before the fix, an all-whitespace window read as "the log is empty," which
 // silently rewinds the chain and reissues seqs with no chain_resume_failed marker — the
-// exact silent-break M3 closes. It must instead fail closed the same way the newline-less
+// exact silent break this path exists to refuse. It must fail closed the same way the newline-less
 // overflow case does: the last real record's boundary cannot be located within the window.
 func TestTruncatePartialTail_WhitespaceFillsWholeWindowFailsClosed(t *testing.T) {
 	dir := t.TempDir()

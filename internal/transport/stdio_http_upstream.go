@@ -336,7 +336,7 @@ func (h *httpUpstream) close() {
 		h.mu.Lock()
 		sid, rev := h.sessID, h.rev
 		h.mu.Unlock()
-		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader, rev)
+		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader, rev, h.errOutOrStderr())
 		close(h.done)
 		h.cancel()
 	})

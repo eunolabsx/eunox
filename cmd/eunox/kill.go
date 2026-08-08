@@ -74,6 +74,13 @@ There are two transports, matching how the proxy shares kill-switch state:
 A plain stdio proxy using the default in-memory kill switch has no out-of-band
 revocation channel: it is a single process, so stop that process to halt it.
 
+Exit codes:
+  0  The revocation (or --revive) was accepted by the proxy or written to Redis.
+  1  Anything else. Unlike the binary's other subcommands, kill does NOT split
+     usage errors out as 2: the only question its caller has under pressure is
+     whether the kill landed, and a second failure code would invite a script
+     that treats one of them as success.
+
 Flags:
 `)
 		fs.SetOutput(w)
@@ -99,6 +106,9 @@ Flags:
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
+		// 1, not the 2 its sibling commands use for a usage error: kill answers one
+		// question — did the revocation land — and every failure is the same answer. See
+		// the Exit codes block above.
 		return 1
 	}
 	target, err := resolveKillTarget(pos, *sessionTarget, flagWasSet(fs, "session"), *agentTarget, flagWasSet(fs, "agent"))

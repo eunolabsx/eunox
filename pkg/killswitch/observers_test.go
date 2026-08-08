@@ -4,9 +4,9 @@
 // Test suite for the revocationObservers registry and both backends'
 // ObserveRevocations implementations: notify-on-gain dedup, notify-outside-lock
 // (re-entrant ShouldBlock), idempotent unregister, delivery via pub/sub vs the
-// reconcile loop, and concurrency of observe/unregister against notify. Before
-// H1/H2 this surface had no coverage at all; both fixes would have been caught
-// by tests in this file.
+// reconcile loop, and concurrency of observe/unregister against notify. This surface
+// once shipped with no coverage at all, and both bugs the tests below pin (the
+// notify/unregister data race and the missed local-kill notify) went out with it.
 
 package killswitch
 
@@ -24,7 +24,7 @@ import (
 )
 
 // TestRevocationObservers_ConcurrentObserveUnregisterNotify is the -race
-// regression test for H1: notify copies only the slice header under RLock and
+// regression test: notify copies only the slice header under RLock and
 // iterates after releasing the lock, so an unregister that mutates the shared
 // backing array in place (the pre-fix slices.DeleteFunc(o.fns, ...)) races a
 // concurrent notify's iteration over that same array. Run with -race.
@@ -200,8 +200,8 @@ func TestInMemory_ObserveRevocations_NilFuncIsNoop(t *testing.T) {
 	})
 }
 
-// TestRedis_ObserveRevocations_LocalKillNotifies is the regression test for
-// H2: a kill issued through THIS instance's own Manager (KillAgent, KillSession,
+// TestRedis_ObserveRevocations_LocalKillNotifies is the regression test for the
+// missed local kill: one issued through THIS instance's own Manager (KillAgent, KillSession,
 // ActivateGlobal) must reach this instance's own observers exactly once, not
 // zero times. Before the fix, setBlock/ActivateGlobal updated the local cache
 // but never called observers.notify, and the instance's own pub/sub echo

@@ -4493,9 +4493,9 @@ capabilities:
 	}
 }
 
-// TestLoadManifest_BoundsFileRead pins #219's Low-priority fix: a fat-fingered --config/
-// manifest path pointed at a large data file or disk image must produce an error, not an
-// attempt to buffer it whole into memory.
+// TestLoadManifest_BoundsFileRead: a fat-fingered --config/manifest path pointed at a large
+// data file or disk image must produce an error, not an attempt to buffer it whole into
+// memory.
 func TestLoadManifest_BoundsFileRead(t *testing.T) {
 	f, err := os.CreateTemp(t.TempDir(), "huge-*.yaml")
 	if err != nil {

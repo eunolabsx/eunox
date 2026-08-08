@@ -307,12 +307,12 @@ func TestVerifyAttestations_UnsignedEntryIsBlank(t *testing.T) {
 	assert.Equal(t, 1, store.Len())
 }
 
-// TestVerifyAttestations_ProseFieldsAreOutsideTheSignature pins the M4/#220 documentation
-// fix's boundary: Summary, Notes, and Server are NOT part of AttestationPayload, so
-// rewriting them on an already-signed entry must not trip VerifyAttestations. This is the
-// negative control to TestVerifyAttestations_TamperedEntryIsAnError, which pins that
-// rewriting the EFFECT content does trip it — together they pin exactly where the signed
-// boundary sits, which is the property #219's M4 finding said no test pinned either way.
+// TestVerifyAttestations_ProseFieldsAreOutsideTheSignature pins where the signed boundary
+// sits: Summary, Notes, and Server are NOT part of AttestationPayload, so rewriting them on
+// an already-signed entry must not trip VerifyAttestations. This is the negative control to
+// TestVerifyAttestations_TamperedEntryIsAnError, which pins that rewriting the EFFECT content
+// does trip it — together they fix the boundary in both directions, which neither pinned on
+// its own.
 func TestVerifyAttestations_ProseFieldsAreOutsideTheSignature(t *testing.T) {
 	c, pub, priv := signedEntry(t)
 	sign(t, &c, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)

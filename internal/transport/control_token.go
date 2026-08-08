@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,10 @@ const defaultControlTokenPath = "~/.eunox/control.token" //nolint:gosec // G101:
 // fi is the RESOLVED directory (symlinks followed): eunoxOwned is false for a symlink so the
 // chmod never fires through one — os.Chmod follows links and there is no portable lchmod, so
 // tightening a symlinked ~/.eunox would silently rewrite whatever it points at.
-func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
+//
+// errOut takes the warning (nil means os.Stderr), so this startup-only path is no exception to
+// the package rule that a diagnostic goes where the caller configured it.
+func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool, errOut io.Writer) error {
 	perm := fi.Mode().Perm()
 	if perm&0o077 == 0 {
 		return nil
@@ -58,7 +62,7 @@ func tightenTokenDir(dir string, fi os.FileInfo, eunoxOwned bool) error {
 	if perm&0o022 != 0 && fi.Mode()&os.ModeSticky == 0 {
 		return fmt.Errorf("control-token directory %q has mode %v (group/world-writable, no sticky bit): another local user could replace the loopback control token and take over the emergency stop; restrict it to 0700 or point --control-token-path elsewhere", dir, perm)
 	}
-	fmt.Fprintf(os.Stderr, "[eunox] WARNING: control-token directory %q has mode %v (group/world-accessible); eunox does not tighten a pre-existing directory it did not create — restrict it to 0700 yourself to protect the loopback control token\n", dir, perm)
+	_, _ = fmt.Fprintf(resolvedErrOut(errOut), "[eunox] WARNING: control-token directory %q has mode %v (group/world-accessible); eunox does not tighten a pre-existing directory it did not create — restrict it to 0700 yourself to protect the loopback control token\n", dir, perm)
 	return nil
 }
 
@@ -101,7 +105,11 @@ func GenerateControlToken() (string, error) {
 // fsync, and Serve runs this after the listener binds but before accepting — an unbounded hang
 // here would leave `eunox kill` (the client most likely racing startup) hung instead of
 // getting an immediate connection-refused.
-func WriteControlTokenFile(ctx context.Context, path, token string) (string, error) {
+//
+// errOut receives the directory-mode warning and the best-effort fsync notices (nil means
+// os.Stderr). Running once at startup is not a licence to write to the process-global: the
+// caller already holds the writer it configured for every other startup line.
+func WriteControlTokenFile(ctx context.Context, path, token string, errOut io.Writer) (string, error) {
 	if path == "" {
 		path = defaultControlTokenPath
 	}
@@ -125,7 +133,7 @@ func WriteControlTokenFile(ctx context.Context, path, token string) (string, err
 		if dirPreexisted {
 			// Reuse the FileInfo from the pre-existence stat above (MkdirAll does not
 			// touch an already-present dir), so the mode is read exactly once.
-			if err := tightenTokenDir(dir, fi, eunoxOwnedTokenDir(dir)); err != nil {
+			if err := tightenTokenDir(dir, fi, eunoxOwnedTokenDir(dir), errOut); err != nil {
 				return "", err
 			}
 		}
@@ -172,10 +180,10 @@ func WriteControlTokenFile(ctx context.Context, path, token string) (string, err
 	// diagnostic (some filesystems reject directory fsync); a crash-recovery edge case, not
 	// worth failing the write over since the token data itself is already synced.
 	if d, err := os.Open(dir); err != nil { //nolint:gosec // G304: dir derives from the operator-configured --control-token-path
-		fmt.Fprintf(os.Stderr, "[eunox] WARN: cannot open control-token dir %q to fsync: %v\n", dir, err)
+		_, _ = fmt.Fprintf(resolvedErrOut(errOut), "[eunox] WARN: cannot open control-token dir %q to fsync: %v\n", dir, err)
 	} else {
 		if err := d.Sync(); err != nil {
-			fmt.Fprintf(os.Stderr, "[eunox] WARN: cannot fsync control-token dir %q: %v\n", dir, err)
+			_, _ = fmt.Fprintf(resolvedErrOut(errOut), "[eunox] WARN: cannot fsync control-token dir %q: %v\n", dir, err)
 		}
 		_ = d.Close()
 	}

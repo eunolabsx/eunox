@@ -15,7 +15,7 @@ import (
 )
 
 // TestAdmitAll_CountedBucketOnWeightedKeyIgnoresTheWeightedCeiling pins both backends to
-// the same semantics for the shape #219/#220 flagged as diverging: a counted bucket
+// the same semantics for the shape they used to diverge on: a counted bucket
 // landing on a (Key, WindowSec) key a PRIOR weighted bucket already filled to the
 // weighted-entry ceiling (reachable across calls, e.g. a manifest edit that changes a
 // key's accounting). The counted bucket's own `maxCalls` limit already bounds how many
