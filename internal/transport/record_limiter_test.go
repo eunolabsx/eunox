@@ -309,7 +309,7 @@ func TestSaturationGates_AreIndependentPerPool(t *testing.T) {
 // do with.
 func TestPreSessionLimiterAndSaturationGate_DoNotShareABucket(t *testing.T) {
 	t.Parallel()
-	preSession := newPreSessionDenyLimiter()
+	preSession := newRefusalRecordLimiter()
 	var g saturationGate
 
 	// Drain the saturation gate's bucket via the flip-flop pattern.

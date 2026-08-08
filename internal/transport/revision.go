@@ -145,9 +145,10 @@ func revisionRefusalReason(err error) string {
 //
 // A NOTIFICATION gets the record and a zero RPCMsg: JSON-RPC forbids replying to one, and
 // stamping the response with a null id would read as a reply to a different request. A host
-// RESPONSE — reachable since the honorability gate became framing-aware — is dropped the same
-// way; the upstream request it would have answered is left unanswered and reclaimed on
-// teardown, as a kill-dropped reply already is. What the record may name is auditIdentity's.
+// RESPONSE — reachable since the honorability gate became framing-aware — gets the record and no
+// host-facing reply for the same reason, but its INITIATOR is answered separately by each
+// transport's negotiation arm; see takeRefusedServerReply. What the record may name is
+// auditIdentity's.
 func refuseHostRevision(ctx context.Context, rec auditRecorder, sessionID string, contextRev capability.Revision, msg mcp.RPCMsg, err error) mcp.RPCMsg {
 	reason := revisionRefusalReason(err)
 	// The message resolved no revision — that is why it is here — but its CONTEXT may have one,
@@ -165,6 +166,40 @@ func refuseHostRevision(ctx context.Context, rec auditRecorder, sessionID string
 		return mcp.RPCMsg{}
 	}
 	return mcp.UnsupportedProtocolVersionResponse(msg.ID, reason)
+}
+
+// refusedReplyUpstreamError is what eunox answers a blocked upstream with when it refuses the
+// host's reply to that upstream's own request. Fixed text of eunox's own: the reply was refused,
+// so nothing the host said may be relayed, and the id it is stamped with is one this proxy
+// itself issued.
+const refusedReplyUpstreamError = "eunox: the host's reply declared an MCP protocol revision that could not be established; the reply was refused and cannot be relayed"
+
+// takeRefusedServerReply consumes the tracked id of a host reply that revision negotiation
+// refused, and returns the error to answer the blocked upstream with. ok=false means the message
+// was not a reply to a request this proxy issued, and nothing happened.
+//
+// A refused reply leaves the upstream blocked on a request nothing will ever answer — until
+// teardown, which on stdio means until the host disconnects. Answering it is right HERE and
+// wrong at the leg's other drop site because of what each drop IS. This is a PROTOCOL refusal:
+// eunox has nothing to relay, but it can say so at its own revision, and the initiator learns
+// its request failed instead of hanging. A REVOCATION drop is an emergency stop, not an error to
+// report — the session is being torn down around it, and the blocked request is deliberately
+// left to be reclaimed with the rest of it (see routeHostServerResponse and stdio's IsResponse
+// arm). broadcastServerRequest, which fails a request no subscriber could receive, is this shape.
+//
+// No revocation lookup is interposed, so a revoked session's refused reply may still unblock the
+// initiator. That costs nothing the kill protects: what a kill forbids is DELIVERING the host's
+// reply to a killed session's upstream, and the refused reply's bytes go nowhere — this answer
+// is eunox's own, carrying a fixed string and an id this proxy issued.
+//
+// The write itself stays with each transport: their upstream sinks differ in type, and a nil
+// concrete writer handed to a shared interface parameter is a non-nil interface that panics on
+// use rather than the "no upstream to answer" case each caller already tests for.
+func takeRefusedServerReply(reqs *serverReqTracker, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
+	if !msg.IsResponse() || !reqs.take(mcp.MsgKey(msg.ID)) {
+		return mcp.RPCMsg{}, false
+	}
+	return mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, refusedReplyUpstreamError), true
 }
 
 // resolveUpstreamRevision pins the revision a route speaks to its upstream: the operator's

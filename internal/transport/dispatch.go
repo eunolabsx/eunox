@@ -453,11 +453,11 @@ func unroutableReason(rev capability.Revision, method string) string {
 
 // unroutableDetail builds the reserved marker naming a routing refusal as eunox's own.
 //
-// It is on every one of these records, not only the ones an --audit route writes: the code
-// they carry (AUTHORIZATION_FAILED) is a genuine policy code for a message no policy evaluated,
-// so on an enforcing route the marker is what tells the two apart, and on a wiretap — where
-// policy denies nothing — it is what keeps a discovery run's tape from reading as the
-// upstream's behavior.
+// The refusal's own code (UNROUTABLE_METHOD) is what says WHOSE refusal it is, and its class is
+// what keeps an observing route from downgrading it; the marker adds the part a code cannot
+// carry — WHICH of the three ways the message was unroutable, and the revision the tables were
+// consulted for. It rides every one of these records rather than only an --audit route's,
+// because "the peer's revision removed this method" is the same diagnosis either way.
 func unroutableDetail(rev capability.Revision, reason string) map[string]interface{} {
 	return map[string]interface{}{
 		audit.UnroutableKey: map[string]interface{}{"reason": reason, "revision": rev.String()},
@@ -665,11 +665,11 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	if rec := g.rec(); rec != nil {
 		rev := requestRevision(ctx)
 		identifier, method := auditIdentity(msg)
-		rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, method, capability.ErrCodeAuthorizationFailed, "",
+		rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, method, capability.ErrCodeUnroutableMethod, "",
 			g.subject.auditDetails(unroutableDetail(rev, unroutableReason(rev, msg.Method))), false)
 	}
 	_, _ = fmt.Fprintf(resolvedErrOut(g.errOut),
-		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
+		"[eunox] SECURITY: unmapped notification method %q denied (UNROUTABLE_METHOD) — not forwarded\n",
 		audit.SanitizeAuditField(msg.Method))
 	return notificationRefused
 }
@@ -744,8 +744,8 @@ func dispatchInitialize(_ context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 }
 
 // dispatchPing answers the MCP utility ping locally with the spec's empty result: ping
-// authorizes nothing, so falling through to dispatchUnmapped's AUTHORIZATION_FAILED broke a
-// liveness probe every host is entitled to send. Answered locally (not forwarded) so a ping
+// authorizes nothing, so falling through to dispatchUnmapped's refusal broke a liveness probe
+// every host is entitled to send. Answered locally (not forwarded) so a ping
 // can't probe upstream liveness through the proxy; the shared kill gate still applies, so a
 // killed session gets KILL_SWITCH, not a pong. No audit record — a heartbeat, not a guarded
 // action.
@@ -1117,9 +1117,16 @@ func completeToolsListing(params, result json.RawMessage) bool {
 	return res.NextCursor == ""
 }
 
-// dispatchUnmapped is the fail-closed default: an unmapped MCP method is denied
-// with AUTHORIZATION_FAILED and never forwarded to the upstream. The method name
-// is logged so operators can detect protocol drift or novel MCP extensions.
+// dispatchUnmapped is the fail-closed default: a method no routing table can route is denied
+// with UNROUTABLE_METHOD and never forwarded to the upstream. The method name is logged so
+// operators can detect protocol drift or novel MCP extensions.
+//
+// The code is what makes the refusal resist an observing route's downgrade: it classifies as a
+// FAULT, so [capability.DenialInfo.Downgradable] is false for it whoever asks. It used to be
+// AUTHORIZATION_FAILED, and the property held only because this path builds no DenialInfo and
+// so never reaches isObserveDeny — a bypass, which the obvious cleanup (routing the default
+// through enforcedForwardCore like every other refusal) would have removed along with the
+// property, leaving --audit forwarding a message it has no route for.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	// Kill-switch check runs at the dispatchRequest boundary, so a killed session is reported
 	// as KILL_SWITCH before reaching this handler. msg.Method is attacker-controlled; sanitize
@@ -1132,12 +1139,12 @@ func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp
 	if d.rec != nil {
 		rev := requestRevision(ctx)
 		identifier, method := auditIdentity(msg)
-		d.rec.RecordDeny(ctx, d.sessionID, identifier, method, capability.ErrCodeAuthorizationFailed, "",
+		d.rec.RecordDeny(ctx, d.sessionID, identifier, method, capability.ErrCodeUnroutableMethod, "",
 			unroutableDetail(rev, unroutableReason(rev, msg.Method)), false)
 	}
 	_, _ = fmt.Fprintf(d.errOutOrStderr(),
-		"[eunox] SECURITY: unmapped MCP method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
+		"[eunox] SECURITY: unmapped MCP method %q denied (UNROUTABLE_METHOD) — not forwarded\n",
 		sanitizedMethod,
 	)
-	return denialResult(msg.ID, capability.ErrCodeAuthorizationFailed, "", sanitizedMethod, "")
+	return denialResult(msg.ID, capability.ErrCodeUnroutableMethod, "", sanitizedMethod, "")
 }

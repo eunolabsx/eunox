@@ -141,6 +141,9 @@ func newStdioProxy(cfg stdioServe, hostReader io.Reader) (*StdioProxy, *mockHost
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 		upstreamDone: make(chan struct{}),
+		// Wired as the constructor wires it: without it the revision refusal records unbounded,
+		// which is a state NewStdioProxy does not produce.
+		refusalLimiter: newRefusalRecordLimiter(),
 	}
 	if cfg.setup != nil {
 		cfg.setup(p)

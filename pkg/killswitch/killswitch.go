@@ -34,8 +34,9 @@ type Checker interface {
 // CONFIRMABILITY is the contract every method shares, stated here rather than on whichever
 // one was last touched. A backend answers from a local view of the kill set, and "nothing
 // matches" is byte-identical to "the whole kill set is empty" — so a backend that cannot
-// currently confirm its view (never loaded, no longer converging, backend unreachable) must
-// report that cause from EVERY reader: HealthStatus, ShouldBlock on a non-match, and Status.
+// currently confirm its view (never loaded, no longer converging, backend unreachable, or wired
+// in a way that cannot enumerate the whole kill set) must report that cause from EVERY reader:
+// HealthStatus, ShouldBlock on a non-match, and Status.
 // Returning (false, nil) or an empty snapshot in that state is a silent all-clear, which is
 // exactly the failure the kill switch exists to prevent. A present kill still blocks
 // unconditionally — confidence only decides what a NON-match means.

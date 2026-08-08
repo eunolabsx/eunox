@@ -545,7 +545,10 @@ func (f publishFailCmdable) Publish(_ context.Context, _ string, _ interface{}) 
 // genuine failed write) is a deliberate test update, not a silent behavior change.
 func TestReviveViaRedis_PublishOnlyFailureIsReportedAsError(t *testing.T) {
 	errPublishOnly := errors.New("publish-only failure")
-	ks := killswitch.NewRedis(publishFailCmdable{pubErr: errPublishOnly})
+	// WithSingleNodeKeyspace because a fake Cmdable is a concrete type killswitch cannot
+	// classify, and an unclassifiable client is refused outright (ErrUnknownTopology) rather
+	// than assumed single-node. This double stands in for one server, so it says so.
+	ks := killswitch.NewRedis(publishFailCmdable{pubErr: errPublishOnly}, killswitch.WithSingleNodeKeyspace())
 
 	err := reviveViaRedis(context.Background(), ks, killTarget{kind: killTargetSession, id: "sess-1"})
 	require.Error(t, err)

@@ -170,6 +170,11 @@ type StdioProxy struct {
 	// episode into one record carrying the elided-refusal count. Zero value usable.
 	hostSaturation saturationGate
 
+	// refusalLimiter bounds the refusal records this transport's host can drive directly —
+	// today catRevision alone, the one refusal HTTP already meters. nil (a proxy assembled by a
+	// bare struct literal) records unbounded, as the HTTP sibling's nil does.
+	refusalLimiter *categoryRecordLimiter
+
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
 	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
 	// server-initiated request to it rather than running the handler inline — see
@@ -349,6 +354,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
+		refusalLimiter:        newRefusalRecordLimiter(),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -1221,9 +1227,15 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 	pinned := p.hostRevision()
 	rev, err := resolveHostRevision(pinned, p.upstreamRev, msg)
 	if err != nil {
-		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, pinned, msg, err)
+		resp := refuseHostRevision(ctx, p.revisionRefusalRecorder(), p.sessionID, pinned, msg, err)
 		if msg.IsRequest() {
 			_ = p.hostWriter.Write(resp)
+		}
+		// A refused RESPONSE never reaches the serve loop's IsResponse arm, so the upstream it
+		// would have answered would otherwise stay blocked until the host disconnects — this
+		// transport has no idle reaper to reclaim it. See takeRefusedServerReply.
+		if answer, unblocked := takeRefusedServerReply(&p.serverReqs, msg); unblocked && p.upWriter != nil {
+			_ = p.upWriter.Write(answer)
 		}
 		return ctx, false
 	}
@@ -1234,6 +1246,25 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 		p.hostRev.Store(rev)
 	}
 	return capability.WithProtocolRevision(ctx, rev), true
+}
+
+// revisionRefusalRecorder returns the recorder the -32022 refusal writes through, or nil when
+// the catRevision bucket suppressed this one — refuseHostRevision writes nothing for a nil
+// recorder, so the peer is refused either way and only the tape write is bounded.
+//
+// The HTTP proxy meters this refusal because an unauthenticated peer can force it for free.
+// stdio has no such peer — its host is the process that launched the proxy — so the argument
+// here is a different one: this is the only record the serve loop writes with no bound of any
+// kind (hostSem bounds concurrency for requests, and the saturation gate collapses the record
+// that pool writes), on the goroutine that is also the only one routing host replies back to a
+// blocked upstream. Metering it elides nothing, since a suppressed refusal folds into the next
+// admitted record's rollup — and it keeps the same bytes treated the same way on both transports.
+func (p *StdioProxy) revisionRefusalRecorder() auditRecorder {
+	rec := p.rec()
+	if rec == nil || p.refusalLimiter == nil {
+		return rec
+	}
+	return admitRefusalRecord(rec, p.refusalLimiter, catRevision)
 }
 
 // hostRevision returns the revision this connection's context resolved, or "" before a message

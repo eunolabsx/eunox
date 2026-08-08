@@ -1907,11 +1907,11 @@ const HandlerFaultKey = "_eunox_handler_fault"
 // framing. Its value is a {"reason", "revision"} object: which of the three ways the message was
 // unroutable, and the revision whose tables were consulted.
 //
-// It exists because that refusal is recorded as AUTHORIZATION_FAILED, a genuine POLICY code,
-// for a message no policy ever evaluated. On an enforcing route the two are otherwise
-// indistinguishable on the tape; on an --audit wiretap, where policy denies nothing at all,
-// every one of them is this — and a discovery run whose whole purpose is observing the upstream
-// needs its own refusals legible as its own. Reserved-prefixed for EffectReceiptKey's reason.
+// The refusal's own code (UNROUTABLE_METHOD) already says it is eunox's routing rather than a
+// policy verdict; this key carries what a code cannot — WHICH of the three ways, and against
+// which revision's tables — so an operator reading a discovery run's tape can tell a method the
+// peer's revision removed from one nobody has heard of. Reserved-prefixed for EffectReceiptKey's
+// reason.
 const UnroutableKey = "_eunox_unroutable"
 
 // Reason codes for the UnroutableKey marker, matched by SIEM rules rather than parsed from

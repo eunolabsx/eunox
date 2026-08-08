@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
-	l := newPreSessionDenyLimiter()
+	l := newRefusalRecordLimiter()
 	l.setNow(func() time.Time { return now })
 
 	admitted := 0
@@ -75,7 +76,7 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	now := base
-	lim := newPreSessionDenyLimiter()
+	lim := newRefusalRecordLimiter()
 	lim.setNow(func() time.Time { return now })
 	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
 	other := &UpstreamRoute{
@@ -158,7 +159,7 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	base := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
-	lim := newPreSessionDenyLimiter()
+	lim := newRefusalRecordLimiter()
 	lim.setNow(func() time.Time { return base })
 	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
 	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
@@ -204,7 +205,7 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 // one, quietly re-creating the cross-category suppression the split exists to remove.
 func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
 	t.Parallel()
-	lim := newPreSessionDenyLimiter()
+	lim := newRefusalRecordLimiter()
 	seen := map[*recordRateLimiter]refusalCategory{}
 	for _, cat := range refusalCategories {
 		b := lim.bucket(cat)
@@ -232,7 +233,7 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
-	l := newPreSessionDenyLimiter()
+	l := newRefusalRecordLimiter()
 	l.setNow(func() time.Time { return now })
 
 	catBurst := int(perCategoryDenyBurst)
@@ -267,7 +268,7 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	now := base
-	l := newPreSessionDenyLimiter()
+	l := newRefusalRecordLimiter()
 	l.setNow(func() time.Time { return now })
 	for i := 0; i < int(perCategoryDenyBurst); i++ {
 		l.admit(catAuth)
@@ -570,6 +571,76 @@ func TestPreSessionAudienceDenials_AreRateLimited(t *testing.T) {
 	}
 }
 
+// TestStdioRevisionRefusals_AreBoundedLikeTheirHTTPTwin is the same property on the transport
+// that had no limiter at all.
+//
+// The bucket's threat model is the HTTP proxy's unauthenticated peer, which stdio does not have.
+// What stdio does have is a host that can drive this record inline on the serve loop with no
+// bound of any kind — no slot to hold, no saturation gate, and on the one goroutine that also
+// routes host replies to a blocked upstream. Enough of them latch AuditDegraded(), which under
+// --require-audit=strict denies every enforced call for the rest of the process's life.
+//
+// The fold contract is asserted here too: metering may not cost the tape its count, or a bounded
+// transport would report a quieter flood than an unbounded one.
+func TestStdioRevisionRefusals_AreBoundedLikeTheirHTTPTwin(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	base := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	now := base
+	lim := newRefusalRecordLimiter()
+	lim.setNow(func() time.Time { return now })
+	// The slice-backed host writer, not the channel one: every attempt below writes its -32022
+	// to the host, and a buffered channel would block long before the flood is over.
+	p, hw := newStdioProxy(stdioServe{
+		sessionID: "stdio-sess", sink: sink,
+		setup: func(p *StdioProxy) { p.refusalLimiter = lim },
+	}, strings.NewReader(""))
+
+	// A revision this build does not speak: the cheapest refusal a host can force.
+	bad := mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}`),
+	}
+	const attempts = 200
+	for i := 0; i < attempts; i++ {
+		if i == attempts-1 {
+			// One more after a refill second, so a record IS admitted to carry the rollup.
+			now = base.Add(time.Second)
+		}
+		if _, ok := p.negotiateHostRevision(context.Background(), bad); ok {
+			t.Fatalf("attempt %d resolved a revision this build does not speak", i)
+		}
+	}
+	if len(hw.messages) != attempts {
+		t.Fatalf("host got %d replies, want %d — the bound elides RECORDS, never the refusal itself", len(hw.messages), attempts)
+	}
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("audit.Close: %v", err)
+	}
+	denies, rollup := 0, uint64(0)
+	for _, rec := range readAuditRecords(t, logPath) {
+		if d, _ := rec["decision"].(string); d != "deny" {
+			continue
+		}
+		denies++
+		if details, _ := rec["details"].(map[string]interface{}); details != nil {
+			if n, ok := details[detailSuppressedRefusalCount].(float64); ok {
+				rollup += uint64(n)
+			}
+		}
+	}
+	if denies == 0 {
+		t.Fatal("the first refusals in a burst must be recorded in full — the bound caps the rate, it does not silence the evidence")
+	}
+	if denies >= attempts {
+		t.Fatalf("%d of %d stdio revision-refusal records were written; the host must not set the audit write rate", denies, attempts)
+	}
+	if got := uint64(denies) + rollup; got != attempts {
+		t.Errorf("recorded %d + suppressed %d = %d, want %d — a suppressed refusal must be counted, not lost", denies, rollup, got, attempts)
+	}
+}
+
 // TestRevisionRefusals_RollUpSuppressedCounts pins catRevision to the limiter's fold
 // contract the two pre-session siblings already honor: a suppressed revision refusal must
 // surface as suppressed_refusal_count on the next admitted -32022 record, not vanish.
@@ -580,7 +651,7 @@ func TestRevisionRefusals_RollUpSuppressedCounts(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	base := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 	now := base
-	lim := newPreSessionDenyLimiter()
+	lim := newRefusalRecordLimiter()
 	lim.setNow(func() time.Time { return now })
 	proxy := &HTTPProxy{sink: sink, preSessionDenies: lim}
 	route := &UpstreamRoute{name: "github", sink: &routeSink{sink: sink, upstream: "github"}}

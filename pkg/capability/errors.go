@@ -80,6 +80,22 @@ const (
 	// It names no policy target (the request was never matched), so IsInfraDenialCode
 	// treats it as infrastructure and `eunox suggest` skips it.
 	ErrCodeUnsupportedProtocolVersion = "UNSUPPORTED_PROTOCOL_VERSION"
+	// ErrCodeUnroutableMethod refuses a message no routing table can route: a method this
+	// build dispatches under no revision, one the requesting peer's revision removed, or one
+	// that arrived in a framing that revision does not dispatch. It is the fail-closed routing
+	// default's own code, in BOTH framings.
+	//
+	// It exists because the class is the encoding. This refusal used to borrow
+	// AUTHORIZATION_FAILED — a genuine policy code for a message no policy evaluated — so
+	// [ClassifyDenialCode] called it a policy verdict and [DenialInfo.Downgradable] answered
+	// true for it; what actually kept an observing route from forwarding a message it has no
+	// route for was that the fail-closed path never built a DenialInfo and so never asked.
+	// Routing it through the shared deny path — the obvious cleanup, and the shape every other
+	// refusal already has — would have turned that into a wiretap inventing a route.
+	//
+	// The WIRE code stays -32001, so what changes for a host is error.data.code (and the
+	// symbolic code a SIEM rule matches), not the JSON-RPC integer it branches on.
+	ErrCodeUnroutableMethod = "UNROUTABLE_METHOD"
 )
 
 // Fixed JSON-RPC integer error codes for denial responses.
@@ -126,6 +142,7 @@ var AllDenialCodes = []string{
 	ErrCodeSamplingDenied,
 	ErrCodeEscalationRequired,
 	ErrCodeUnsupportedProtocolVersion,
+	ErrCodeUnroutableMethod,
 }
 
 // DenialWireCode maps a symbolic denial code (ErrCode*) to the JSON-RPC integer
@@ -145,10 +162,14 @@ func DenialWireCode(code string) (wire int, ok bool) {
 	// problems, not capability misses. SAMPLING_DENIED is a server-initiated-request
 	// denial that also surfaces as -32001 (forwardServerRequest's hard deny), distinct
 	// from the host-facing -32002.
+	// UNROUTABLE_METHOD shares -32001 too: it is the code AUTHORIZATION_FAILED's wire
+	// half already carried for the fail-closed routing default, kept so splitting the
+	// symbolic code off does not also move the integer every host branches on.
 	case ErrCodeAuthorizationFailed,
 		ErrCodeKillSwitch, ErrCodeKillSwitchError,
 		ErrCodeNoJWTClaims,
-		ErrCodeSamplingDenied:
+		ErrCodeSamplingDenied,
+		ErrCodeUnroutableMethod:
 		return JSONRPCCodeAuthorizationFailed, true
 	// Condition-failure codes share -32003: a failed maxCalls (RATE_LIMITED), a
 	// missing required argument (MISSING_CONTEXT), and the allowedOperations/
@@ -200,8 +221,10 @@ const (
 	DenialClassRevocation
 	// DenialClassFault is a refusal produced because no verdict could be reached: an engine
 	// bug, a backend that failed or answered nonconformingly, a registered handler that broke
-	// its contract, or the audit trail that must record the call being unavailable. Never
-	// downgradable — there is no verdict to stand in for the one that never ran.
+	// its contract, the audit trail that must record the call being unavailable, or a message
+	// that never reached policy at all (its revision could not be established, or no routing
+	// table could route it). Never downgradable — there is no verdict to stand in for the one
+	// that never ran.
 	DenialClassFault
 )
 
@@ -219,9 +242,11 @@ func ClassifyDenialCode(code string) DenialClass {
 	// that it cannot be durably recorded, which is a property of the trail, not of the caller.
 	case ErrCodeEnforcementError, ErrCodeAuditUnavailable:
 		return DenialClassFault
-	// A peer whose protocol revision cannot be established was never matched against policy,
-	// and the refusal precedes every gate that could reach one.
-	case ErrCodeUnsupportedProtocolVersion:
+	// Neither of these was ever matched against policy: one peer's protocol revision could not
+	// be established, and the other's message no revision's routing tables could route. Both
+	// refusals precede every gate that could reach a verdict, so an observing route has none of
+	// its own to forward in their place.
+	case ErrCodeUnsupportedProtocolVersion, ErrCodeUnroutableMethod:
 		return DenialClassFault
 	default:
 		return DenialClassPolicy

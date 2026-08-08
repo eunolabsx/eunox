@@ -26,7 +26,7 @@ The proxy enforces policy on the following MCP methods:
 | `prompts/get` | PDP decision — allow or deny based on manifest + conditions |
 | `prompts/list` | Filter response to permitted prompts only (`get` / `*` action) |
 | `sampling/createMessage` | Denied by default; opt-in with `allow` / `*` action (see §2b for HTTP-mode limitation) |
-| unmapped host-originated request methods | Denied (`AUTHORIZATION_FAILED`) — never forwarded to upstream; prevents enumeration via unknown methods (see [threat model §1](threat-model-mcp.md#1-system-overview)) |
+| unmapped host-originated request methods | Denied (`UNROUTABLE_METHOD`) — never forwarded to upstream; prevents enumeration via unknown methods (see [threat model §1](threat-model-mcp.md#1-system-overview)) |
 | host notifications (e.g. `notifications/cancelled`) | Forwarded verbatim to upstream (except `notifications/initialized`, which the proxy absorbs during handshake) |
 | upstream-initiated requests other than `sampling/createMessage` (e.g. `roots/list`) | Forwarded verbatim to the host — no policy check, no audit record |
 
@@ -623,7 +623,8 @@ exact. This is the authoritative set.
 
 | `denial_code` | JSON-RPC | When |
 | ------------- | -------- | ---- |
-| `AUTHORIZATION_FAILED` | `-32001` | No manifest entry matches the target (allowlist miss), or an unmapped method reached the enforced path. |
+| `AUTHORIZATION_FAILED` | `-32001` | No manifest entry matches the target (allowlist miss). |
+| `UNROUTABLE_METHOD` | `-32001` | No routing table could route the message: the method exists in no revision this build speaks, the requesting peer's revision removed it, or it arrived in a framing that revision does not dispatch. No policy evaluated it, so an observing route (`--audit`, `enforcement: audit`) does **not** downgrade it — see [conformance](conformance.md). The record carries `details._eunox_unroutable` naming which of the three applied. Shares `-32001` with `AUTHORIZATION_FAILED`, which it used to be recorded as. |
 | `NO_JWT_CLAIMS` | `-32001` | JWT mode is active but the request carried no validated token claims (an authentication miss, surfaced as a capability denial). |
 | `CAPABILITY_DENIED` | `-32002` | A matched entry's verdict is deny (e.g. the action is not granted for the target). |
 | `SAMPLING_DENIED` | `-32001` | A server-initiated `sampling/createMessage` is not permitted — no `system:sampling/createMessage` entry, or a JWT claim withholds it. Surfaced to the upstream initiator as `AUTHORIZATION_FAILED` (`-32001`); the symbolic `SAMPLING_DENIED` is what the audit log records. |

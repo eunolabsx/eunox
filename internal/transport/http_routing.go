@@ -376,21 +376,16 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		}
 		return
 	}
-	// Note which state anchor this request resolved. On a task-anchored route a session may
-	// legitimately span tasks, and every host request is decided, keyed and serialized on
-	// its OWN anchor — but the server-initiated leg has no host request in scope, so the
-	// session records the span here and that leg refuses for the rest of its life. See
-	// httpSession.noteRequestAnchor. Placed here (a write) rather than in the check-only
-	// session-gate verdict, one of whose callers runs under the session-registry lock.
 	// Negotiate FIRST: every table below is revision-scoped, so resolving after the lookup
-	// would route by one table and record under another — and a refused message must not have
-	// written session state on its way to being refused (noteRequestAnchor latches a span for
-	// the session's life, which would outlive a request that was never dispatched).
+	// would route by one table and record under another.
 	rev, ok := p.negotiateHostRevision(w, r, route, sess.leg(), msg)
 	if !ok {
+		// A refused host RESPONSE would have answered a request the upstream is blocked on.
+		// Unblock it rather than let it hang: a protocol refusal is not an emergency stop, and
+		// eunox answers with its own error at its own revision — see unblockRefusedServerReply.
+		sess.unblockRefusedServerReply(msg)
 		return
 	}
-	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
 	// The stamped context is the ONE carrier of the decided revision from here down: the
 	// tables route by it and the tape records it, so neither can name a revision the other
 	// did not. Stamped inline rather than returned already-stamped because contextcheck
@@ -504,6 +499,21 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		return
 	}
 	touchIfLive()
+	// Note which state anchor this REQUEST resolved. On a task-anchored route a session may
+	// legitimately span tasks, and every host request is decided, keyed and serialized on its
+	// OWN anchor — but the server-initiated leg has no host request in scope, so the session
+	// records the span here and that leg refuses for the rest of its life. See
+	// httpSession.noteRequestAnchor. Placed here (a write) rather than in the check-only
+	// session-gate verdict, one of whose callers runs under the session-registry lock.
+	//
+	// Below the framing branches, not above them: the latch is sticky for the session's LIFE,
+	// so a message the leg never acts on must not set it. Above, one POST that is neither
+	// request, notification nor response — no id and no method, which decodes fine since
+	// mcp.MsgReader does no framing validation — reached it on its way to being answered 202
+	// and disabled sampling for the connection permanently, as did a reply whose id this proxy
+	// never issued. A notification does not latch either: it is forwarded verbatim with no
+	// decision, so it commits no anchored state for the sampling leg to peek past.
+	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
 
 	var resp mcp.RPCMsg
 	if msg.Method == mcp.MethodInitialize {
@@ -1119,7 +1129,7 @@ type hostLeg struct {
 // answer `initialize`, so a declaration naming any other revision contradicts the context and
 // is refused UNSUPPORTED_PROTOCOL_VERSION. stdio has no such arm — its first message may
 // legitimately declare any revision, since a peer there need never handshake — so the identical
-// line resolves, is dropped by the fail-closed routing default as AUTHORIZATION_FAILED, and
+// line resolves, is dropped by the fail-closed routing default as UNROUTABLE_METHOD, and
 // (see StdioProxy.negotiateHostRevision) does not pin the connection on its way out.
 func sessionlessLeg() hostLeg { return hostLeg{contextRev: handshakeRevision} }
 
@@ -1221,12 +1231,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	if p.preSessionDenies == nil {
 		return rec
 	}
-	admitted, suppressed := p.preSessionDenies.admit(catRevision)
-	if !admitted {
-		return nil
-	}
-	if suppressed == 0 {
-		return rec
-	}
-	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+	return admitRefusalRecord(rec, p.preSessionDenies, catRevision)
 }

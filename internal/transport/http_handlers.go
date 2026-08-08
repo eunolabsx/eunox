@@ -102,11 +102,12 @@ const (
 // policy decision. Consumers mining the audit tape for policy signals skip these.
 func IsInfraDenialCode(code string) bool {
 	// The codes the DENIAL VOCABULARY itself classifies as non-policy — an emergency stop, the
-	// strict-audit gate, a revision that could not be established, an engine/backend fault —
-	// are asked of it rather than listed again here. Three of those four were listed by hand,
-	// which is how the fourth came to be missing: an engine fault names the target of a call
-	// policy never decided, and mining it fabricates a deny-only suggestion for a capability
-	// nothing refused.
+	// strict-audit gate, a revision that could not be established, a message nothing could
+	// route, an engine/backend fault — are asked of it rather than listed again here. Several
+	// were listed by hand, which is how one came to be missing: an engine fault names the target
+	// of a call policy never decided, and mining it fabricates a deny-only suggestion for a
+	// capability nothing refused. The routing refusal was the mirror case, skipped only because
+	// its target happens to be blank rather than because any code said it was non-policy.
 	if capability.ClassifyDenialCode(code) != capability.DenialClassPolicy {
 		return true
 	}

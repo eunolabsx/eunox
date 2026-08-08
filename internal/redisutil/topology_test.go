@@ -12,46 +12,80 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TestShardIterator_IsOneList pins the definition both backends read: the iterator and the
-// "does this client shard" predicate are the same answer, so a client one package calls
-// sharding and the other has no iterator for is not a state that can be constructed. The shape
-// this replaced — a hand-written type list per package, agreeing by review — had already
-// drifted once, and a *redis.Ring fell through to a single-node SCAN that loaded whichever
-// shard go-redis picked.
-func TestShardIterator_IsOneList(t *testing.T) {
+// TestClassifyTopology_IsOneList pins the definition both backends read: the iterator and the
+// "does this client shard" answer are one call, so a client one package calls sharding and the
+// other has no iterator for is not a state that can be constructed. The shape this replaced — a
+// hand-written type list per package, agreeing by review — had already drifted once, and a
+// *redis.Ring fell through to a single-node SCAN that loaded whichever shard go-redis picked.
+//
+// The THREE-valued answer is the second property. "Recognized single node" and "not recognized"
+// both used to answer "no iterator", which is what let a decorator wrapping a cluster client
+// enumerate one shard of several and report success.
+func TestClassifyTopology_IsOneList(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name    string
-		client  redis.Cmdable
-		wantFan bool
+		name     string
+		client   redis.Cmdable
+		want     Topology
+		wantIter bool
 	}{
-		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}}), true},
-		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000"}}), true},
-		{"single node", redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"}), false},
-		{"universal single node", redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{"127.0.0.1:7000"}}), false},
+		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}}), TopologySharded, true},
+		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000"}}), TopologySharded, true},
+		{"single node", redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"}), TopologySingleNode, false},
+		{"universal single node", redis.NewUniversalClient(&redis.UniversalOptions{Addrs: []string{"127.0.0.1:7000"}}), TopologySingleNode, false},
+		// A sentinel-backed failover client is a *redis.Client, so it is recognized as the single
+		// keyspace it is rather than refused for being unfamiliar.
+		{"failover", redis.NewFailoverClient(&redis.FailoverOptions{MasterName: "mymaster", SentinelAddrs: []string{"127.0.0.1:26379"}}), TopologySingleNode, false},
+		// A decorator proves nothing about what it wraps, so it is neither — which is the answer
+		// a consumer whose correctness depends on visiting every server has to be able to refuse.
+		{"decorator over a cluster client", hookedClient{Cmdable: redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}})}, TopologyUnknown, false},
+		{"decorator over a single-node client", hookedClient{Cmdable: redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"})}, TopologyUnknown, false},
 		// A typed nil matches the sharding arm, and its per-server iterator is a NON-nil func
-		// value bound to a nil receiver: answering "sharding" hands the caller something that
-		// panics inside go-redis the moment it is called, violating the one thing a non-nil
-		// answer here is supposed to mean.
-		{"typed-nil cluster", (*redis.ClusterClient)(nil), false},
-		{"typed-nil ring", (*redis.Ring)(nil), false},
-		{"typed-nil single node", (*redis.Client)(nil), false},
-		{"untyped nil", nil, false},
+		// value bound to a nil receiver: handing that back is something that panics inside
+		// go-redis the moment it is called, violating the one thing a non-nil iterator means.
+		{"typed-nil cluster", (*redis.ClusterClient)(nil), TopologyUnknown, false},
+		{"typed-nil ring", (*redis.Ring)(nil), TopologyUnknown, false},
+		{"typed-nil single node", (*redis.Client)(nil), TopologyUnknown, false},
+		{"untyped nil", nil, TopologyUnknown, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			iterator := ShardIterator(tc.client)
-			if (iterator != nil) != tc.wantFan {
-				t.Fatalf("ShardIterator(%T) != nil = %v, want %v — this one call decides BOTH questions a consumer asks: does it shard, and how is it enumerated",
-					tc.client, iterator != nil, tc.wantFan)
+			topology, iterator := ClassifyTopology(tc.client)
+			if topology != tc.want {
+				t.Errorf("ClassifyTopology(%T) = %s, want %s", tc.client, topology, tc.want)
+			}
+			if (iterator != nil) != tc.wantIter {
+				t.Fatalf("ClassifyTopology(%T) iterator != nil = %v, want %v — one call decides BOTH questions a consumer asks: what the topology is, and how it is enumerated",
+					tc.client, iterator != nil, tc.wantIter)
+			}
+			if (topology == TopologySharded) != (iterator != nil) {
+				t.Errorf("ClassifyTopology(%T) = %s with iterator != nil = %v; a sharded client without an iterator (or the reverse) is the disagreement this one call exists to make unrepresentable",
+					tc.client, topology, iterator != nil)
 			}
 		})
 	}
 }
 
-// TestIsNilClient_CoversTheTypedNil pins the half ShardIterator's guard does NOT deliver on its
-// own. Routing a typed nil to the single-node path makes the returned iterator honest; it does
+// TestTopology_String covers the rendering an error or a log line reads, including the zero
+// value: an unrecognized client is the case an operator will actually be shown, so it must not
+// render as a bare integer.
+func TestTopology_String(t *testing.T) {
+	t.Parallel()
+	for topology, want := range map[Topology]string{
+		TopologyUnknown:    "unknown",
+		TopologySingleNode: "single-node",
+		TopologySharded:    "sharded",
+		Topology(99):       "unknown",
+	} {
+		if got := topology.String(); got != want {
+			t.Errorf("Topology(%d).String() = %q, want %q", int(topology), got, want)
+		}
+	}
+}
+
+// TestIsNilClient_CoversTheTypedNil pins the half ClassifyTopology's guard does NOT deliver on
+// its own. Withholding an iterator from a typed nil makes the answer honest; it does
 // not make the client usable, because go-redis dereferences the receiver before it can build a
 // reply — every command panics rather than returning an error. A backend that must fail closed
 // therefore has to ask this question rather than let the first command answer it.
@@ -80,8 +114,8 @@ func TestIsNilClient_CoversTheTypedNil(t *testing.T) {
 	}
 }
 
-// hookedClient is the decorator shape ShardIterator's own doc advertises — "a hooked client, a
-// custom Cmdable" — with nothing overridden, so every command is the embedded value's.
+// hookedClient is the decorator shape this package's docs name — "a decorator, or a consumer's
+// own Cmdable" — with nothing overridden, so every command is the embedded value's.
 type hookedClient struct{ redis.Cmdable }
 
 // TestIsNilClient_DoesNotSeeThroughADecorator pins the SCOPE the guard claims, in both
@@ -103,10 +137,16 @@ func TestIsNilClient_DoesNotSeeThroughADecorator(t *testing.T) {
 	if IsNilClient(hookedClient{Cmdable: live}) {
 		t.Error("IsNilClient must admit a decorator wrapping a live client: refusing a working wrapper at construction is a hard outage, where missing the nil one is a panic on a mis-wiring")
 	}
-	// And the same shape at the topology seam: a wrapper is matched on its CONCRETE type, so it
-	// reports "not sharding" whatever it wraps.
-	if ShardIterator(hookedClient{Cmdable: redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}})}) != nil {
-		t.Error("ShardIterator claims to match the concrete type; a decorator wrapping a cluster client must not report a fan-out it cannot perform")
+	// The same shape at the topology seam has a DIFFERENT resolution, and this is where the two
+	// part company. Nilness answers "not nil" for a wrapper and accepts the residual, because the
+	// failure it misses is a loud panic on a mis-wiring nobody shipped. Topology cannot: an
+	// unrecognized client that silently takes the single-node path serves a partial kill set as
+	// complete. So it reports UNKNOWN rather than a reassuring "not sharding", and the consumer
+	// that cannot live with that refuses it.
+	topology, iterator := ClassifyTopology(hookedClient{Cmdable: redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}})})
+	if topology != TopologyUnknown || iterator != nil {
+		t.Errorf("ClassifyTopology(decorator) = %s (iterator != nil = %v), want unknown with no iterator: a concrete-type match proves nothing about what a wrapper wraps, and saying otherwise is how a cluster-backed kill switch enumerates one shard and reports healthy",
+			topology, iterator != nil)
 	}
 }
 

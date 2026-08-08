@@ -294,6 +294,13 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
 // session's sampling leg decides against (captured at initialize, no host request in scope) —
 // otherwise a session spanning two task anchors could let a source tag one task's taint while
 // sampling peeks the other, clean. See spansAnchors for the refusal this feeds.
+//
+// Called for a REQUEST only, and only once the leg has committed to dispatching it: the latch is
+// sticky for the session's life, so a message that resolves no anchor because it is never
+// decided against one must not set it. cur is the request's own validated claims, which is the
+// same input the engine's key builder resolves its anchor from — so for a request that reaches
+// dispatch, "the claims present at POST time" and "the anchor the request resolved" are one
+// answer, not two that could disagree.
 func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 	rt := s.route
 	if rt == nil || !rt.taskAnchored {
@@ -307,6 +314,25 @@ func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 // spansAnchors reports whether this session has resolved a state anchor other than the one its
 // server-initiated leg decides against; it is the predicate that leg refuses on.
 func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() }
+
+// unblockRefusedServerReply answers the upstream request a revision-refused host reply would
+// have completed, so it does not stay blocked until this session's idle ceiling reclaims it.
+// See takeRefusedServerReply for which drops answer the initiator and which deliberately do not.
+func (s *httpSession) unblockRefusedServerReply(msg mcp.RPCMsg) {
+	answer, ok := takeRefusedServerReply(&s.serverReqs, msg)
+	if !ok {
+		return
+	}
+	if s.upWriter == nil {
+		// Remote-upstream mode has no writer to answer through. Unreachable today (remote
+		// sessions issue no server-initiated requests, so no id could have been tracked), and
+		// reported rather than dropped for the same reason routeHostServerResponse reports it.
+		_, _ = fmt.Fprintf(s.errOut(),
+			"[eunox] WARNING: a refused host reply left a server-initiated request unanswered: no upstream writer in remote-upstream mode\n")
+		return
+	}
+	_ = s.upWriter.Write(answer)
+}
 
 // newSession spawns an upstream subprocess and performs the MCP initialize handshake. The
 // session registers before readUpstream starts so cleanup finds it even on immediate exit.

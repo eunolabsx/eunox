@@ -119,6 +119,9 @@ func TestDenialWireCode_KnownMappings(t *testing.T) {
 		{capability.ErrCodeAuthorizationFailed, capability.JSONRPCCodeAuthorizationFailed},
 		{capability.ErrCodeKillSwitch, capability.JSONRPCCodeAuthorizationFailed},
 		{capability.ErrCodeSamplingDenied, capability.JSONRPCCodeAuthorizationFailed},
+		// The routing refusal keeps the integer AUTHORIZATION_FAILED carried for it before it
+		// had a symbolic code of its own: the class moved, the wire contract did not.
+		{capability.ErrCodeUnroutableMethod, capability.JSONRPCCodeAuthorizationFailed},
 		{capability.ErrCodeConditionFailed, capability.JSONRPCCodeConditionFailed},
 		{capability.ErrCodeRateLimited, capability.JSONRPCCodeConditionFailed},
 		{capability.ErrCodeValueNotPermitted, capability.JSONRPCCodeConditionFailed},
@@ -164,6 +167,7 @@ func TestClassifyDenialCode_CoversEveryCode(t *testing.T) {
 		capability.ErrCodeSamplingDenied:             capability.DenialClassPolicy,
 		capability.ErrCodeEscalationRequired:         capability.DenialClassPolicy,
 		capability.ErrCodeUnsupportedProtocolVersion: capability.DenialClassFault,
+		capability.ErrCodeUnroutableMethod:           capability.DenialClassFault,
 	}
 	for _, code := range capability.AllDenialCodes {
 		expected, listed := want[code]

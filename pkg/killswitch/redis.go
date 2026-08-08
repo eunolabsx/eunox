@@ -97,6 +97,23 @@ var ErrStopped = errors.New("killswitch: redis kill switch convergence stopped (
 // erroring, and the first ones to run are Start's Subscribe and the reconcile goroutine's Get.
 var ErrNilClient = errors.New("killswitch: redis kill switch wired with a nil client; failing closed (kill-switch state cannot be loaded)")
 
+// ErrUnknownTopology refuses a backend whose client's KEYSPACE TOPOLOGY cannot be established:
+// a concrete type redisutil does not recognize, which is a decorator (a metrics or tracing
+// wrapper) or a consumer's own Cmdable.
+//
+// Refused rather than assumed single-node, because assuming is fail-OPEN and silent. This
+// backend's full enumeration is a keyless SCAN; routed to one server of several it loads a
+// PARTIAL kill set, ShouldBlock then answers "not killed" for every session whose key hashed
+// elsewhere, and HealthStatus reports ready. An operator issues a kill, gets `{"ok":true}`, and
+// the instance behind the wrapper never learns of it. The Manager contract says the opposite: a
+// backend that cannot confirm its kill set reports the cause from every reader.
+//
+// Latched like ErrNilClient, and fails closed regardless of WithFailOpen for the same reason —
+// fail-open trades revocation for availability during a TRANSIENT outage, and a wiring fault
+// never heals. A consumer that knows what its wrapper wraps says so with WithSingleNodeKeyspace
+// or WithShardFanOut, which is the escape hatch this refusal is only tolerable with.
+var ErrUnknownTopology = errors.New("killswitch: redis kill switch wired with a client whose keyspace topology cannot be determined (a decorator or a custom Cmdable); failing closed, since a keyless SCAN over a sharded keyspace loads a PARTIAL kill set and reports it as complete. Pass the client itself, or declare the topology with killswitch.WithSingleNodeKeyspace()/WithShardFanOut()")
+
 // Redis is a Redis-backed kill-switch manager with pub/sub propagation and local cache.
 type Redis struct {
 	client redis.Cmdable
@@ -105,7 +122,16 @@ type Redis struct {
 	// entry point that would touch the client checks it FIRST, which is what makes the refusal
 	// cover the write and pub/sub paths rather than only the node enumeration.
 	wiringErr error
-	logger    *slog.Logger
+	// shardFanOut visits every server this client spreads its keyspace over, or nil when the
+	// whole keyspace lives on one. Resolved ONCE at construction, from the client's type or from
+	// the consumer's own declaration, so no enumeration re-asks a question whose answer cannot
+	// change and the two keyless-command sites cannot be handed different topologies.
+	shardFanOut redisutil.ShardFanOut
+	// topologyKnown says the answer above is established rather than merely absent — the
+	// distinction ErrUnknownTopology exists for. Set by the classification or by a declaring
+	// option; false latches the wiring error.
+	topologyKnown bool
+	logger        *slog.Logger
 
 	// observers receive a Revocation the moment this instance's local view gains one,
 	// including a kill issued ELSEWHERE that this instance learns of via pub/sub or the
@@ -256,6 +282,45 @@ func WithReconcileInterval(d time.Duration) RedisOption {
 	}
 }
 
+// ShardFanOut visits every server a sharding client spreads its keyspace over, running fn
+// against each — what a KEYLESS command (SCAN) needs there, since routed to one server it
+// enumerates one shard of several and reports success.
+//
+// Declared here rather than reused from the internal package that classifies client types, so a
+// consumer outside this module can name the parameter WithShardFanOut takes.
+type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *redis.Client) error) error
+
+// WithSingleNodeKeyspace declares that a client this package cannot classify keeps its WHOLE
+// keyspace on one server, so a keyless SCAN against it enumerates all of it.
+//
+// The escape hatch for the ordinary decorator: a metrics or tracing wrapper around a plain
+// *redis.Client is invisible to a concrete-type match, and without this it latches
+// ErrUnknownTopology. Declaring it wrongly — for a wrapper that in fact fronts a cluster — puts
+// the backend back in the silent partial-kill-set state the refusal exists to prevent, so it is
+// a statement about a client the caller built, not a way to quiet a startup error.
+func WithSingleNodeKeyspace() RedisOption {
+	return func(r *Redis) {
+		r.shardFanOut = nil
+		r.topologyKnown = true
+	}
+}
+
+// WithShardFanOut declares that a client this package cannot classify SPREADS its keyspace over
+// several servers, and supplies the per-server iterator every full enumeration must use.
+//
+// A nil iterator is not a way to say "single node" — that is WithSingleNodeKeyspace, whose name
+// says so — so it leaves the topology undeclared and the backend refuses as before rather than
+// silently adopting the single-node path.
+func WithShardFanOut(fanOut ShardFanOut) RedisOption {
+	return func(r *Redis) {
+		if fanOut == nil {
+			return
+		}
+		r.shardFanOut = redisutil.ShardFanOut(fanOut)
+		r.topologyKnown = true
+	}
+}
+
 // WithLogger sets a structured logger on the kill-switch for operational visibility.
 // If set, initial state-refresh failures are logged as warnings rather than silently dropped.
 func WithLogger(logger *slog.Logger) RedisOption {
@@ -283,19 +348,35 @@ func WithFailOpen(failOpen bool) RedisOption {
 // It latches ErrNilClient instead, which every reader and writer reports and which fails closed
 // — the strongest posture available without the caller's cooperation. A DECORATOR wrapping a nil
 // client is not caught; see redisutil.IsNilClient's scope for why it is not probed for.
+//
+// The client's keyspace TOPOLOGY is resolved here too, and a client whose type does not establish
+// it latches ErrUnknownTopology unless an option declares it. That refusal is the one this
+// constructor makes on its own initiative, and it is a trade: it refuses a decorator wrapping a
+// perfectly ordinary single-node client until its consumer says so, in exchange for never serving
+// a partial kill set as complete. See ErrUnknownTopology.
 func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
+	topology, fanOut := redisutil.ClassifyTopology(client)
 	r := &Redis{
 		client:            client,
+		shardFanOut:       fanOut,
+		topologyKnown:     topology != redisutil.TopologyUnknown,
 		killedAgents:      make(map[string]bool),
 		killedSessions:    make(map[string]bool),
 		reconcileInterval: defaultReconcileInterval,
 		sessionKillTTL:    defaultSessionKillTTL,
 	}
-	if redisutil.IsNilClient(client) {
-		r.wiringErr = ErrNilClient
-	}
+	// Options run BEFORE the latch below: declaring the topology is precisely how a consumer
+	// answers a question the type could not.
 	for _, opt := range opts {
 		opt(r)
+	}
+	switch {
+	case redisutil.IsNilClient(client):
+		// Ahead of the topology: a nil client has none, and reporting the derived cause would
+		// send an operator looking for a wrapper that is not there.
+		r.wiringErr = ErrNilClient
+	case !r.topologyKnown:
+		r.wiringErr = ErrUnknownTopology
 	}
 	return r
 }
@@ -1053,13 +1134,14 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 }
 
 // forEachNode runs fn against every server holding part of this keyspace: each shard of a
-// sharding client, or the one node otherwise. The ONE place that decision is made, so the two
+// sharding client, or the one node otherwise. The ONE place that decision is applied, so the two
 // keyless-command sites cannot drift — the shape they were in before, when one of them fell
 // through to a single-node SCAN for a *redis.Ring and loaded whichever shard go-redis picked.
 //
-// The topology comes from redisutil.ShardIterator, which is also what DEFINES "does this
-// client shard", so this cannot be handed a shape it has no iterator for — including the typed
-// nil that would otherwise hand back an iterator bound to a nil receiver and panic here.
+// The topology was RESOLVED at construction (from the client's type, or from the consumer's own
+// declaration) and a client whose topology could not be established never reaches here: it
+// latches ErrUnknownTopology, which every entry point above refuses on. So a nil iterator here
+// means "the whole keyspace is on one server", established, rather than "nothing is known".
 //
 // Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary is
 // single-node, and callcounter.NewRedis refuses a sharding client outright.
@@ -1070,8 +1152,8 @@ func (r *Redis) forEachNode(ctx context.Context, fn func(context.Context, redis.
 	if redisutil.IsNilClient(r.client) {
 		return ErrNilClient
 	}
-	if fanOut := redisutil.ShardIterator(r.client); fanOut != nil {
-		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error { return fn(ctx, node) })
+	if r.shardFanOut != nil {
+		return r.shardFanOut(ctx, func(ctx context.Context, node *redis.Client) error { return fn(ctx, node) })
 	}
 	return fn(ctx, r.client)
 }

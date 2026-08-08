@@ -39,9 +39,9 @@ your IdP) and enforces a fine-grained YAML policy on top of it.
 | Upstream-initiated non-sampling requests (e.g. `roots/list`) | **Forwarded** for local subprocess upstreams — not policy-enforced (no allow/deny decision), but kill-switch-checked, `--require-audit=strict`-gated, and audited (an allow record on delivery, an `ENFORCEMENT_ERROR` deny if no client received it); the host's response is routed back to the upstream | Remote HTTP upstreams have no background reader and do not consume server-initiated messages. These share the concurrency bound and the ordering caveat noted for `sampling/createMessage` above, on both hosts |
 | `initialize` *(host→proxy)* | **Handled by proxy** — eunox sends its own `initialize` to the upstream at startup and synthesizes the host-facing response using the upstream's declared capabilities | Host never sees the upstream's raw response |
 | `ping` *(host→proxy)* | **Answered locally** with the spec's empty result. It carries no arguments, names no target, and reaches no upstream, so there is nothing for a manifest to authorize; it is not forwarded, so it cannot be used to probe upstream liveness through the proxy. | Upstream is never called. Subject to the shared kill gate: a killed session gets `KILL_SWITCH`, not a pong. No audit record (a handshake-level utility, not a guarded action). |
-| Host notifications (`notifications/*`) *(host→upstream)* | **Allowlisted** — only `notifications/cancelled`, `notifications/progress`, and `notifications/roots/list_changed` are forwarded verbatim (no PDP evaluation of their contents). Any other notification-framed method is denied and recorded (`AUTHORIZATION_FAILED`), never reaching the upstream: an enforced method smuggled in as a notification (no `id`) is rejected rather than bypassing its PDP decision, and any other unmapped method gets the same fail-closed default its request-framed twin gets from `dispatchUnmapped` | Exceptions: `notifications/initialized` is swallowed (the proxy has already sent its own to the upstream); `notifications/cancelled` has its `params.requestId` rewritten to the proxy nonce the upstream saw for that request (host request ids are nonce-rewritten on the wire), so the cancel actually targets the in-flight call — a cancel for a request no longer in flight is dropped. Cancellation is best-effort on HTTP: a cancel delivered on a separate connection concurrently with its target request (before the request registered) is dropped, matching the MCP spec's inherently-racy cancellation. A killed session's notifications are dropped (ack'd) rather than forwarded. |
+| Host notifications (`notifications/*`) *(host→upstream)* | **Allowlisted** — only `notifications/cancelled`, `notifications/progress`, and `notifications/roots/list_changed` are forwarded verbatim (no PDP evaluation of their contents). Any other notification-framed method is denied and recorded (`UNROUTABLE_METHOD`), never reaching the upstream: an enforced method smuggled in as a notification (no `id`) is rejected rather than bypassing its PDP decision, and any other unmapped method gets the same fail-closed default its request-framed twin gets from `dispatchUnmapped` | Exceptions: `notifications/initialized` is swallowed (the proxy has already sent its own to the upstream); `notifications/cancelled` has its `params.requestId` rewritten to the proxy nonce the upstream saw for that request (host request ids are nonce-rewritten on the wire), so the cancel actually targets the in-flight call — a cancel for a request no longer in flight is dropped. Cancellation is best-effort on HTTP: a cancel delivered on a separate connection concurrently with its target request (before the request registered) is dropped, matching the MCP spec's inherently-racy cancellation. A killed session's notifications are dropped (ack'd) rather than forwarded. |
 | Upstream notifications (`notifications/*`) *(upstream→host)* | **Relayed** — stdio writes to the host, HTTP broadcasts to the session's SSE stream(s) | A killed session stops receiving the relay: both transports gate the relay on the kill switch (so a Redis-backed kill, which does not evict SSE streams, still shuts the server→client channel), and the drop is recorded to the audit tape. |
-| All other **host-originated request** methods | **Denied** — `AUTHORIZATION_FAILED` returned to host; upstream never called | Fail-closed default for unmapped host requests |
+| All other **host-originated request** methods | **Denied** — `UNROUTABLE_METHOD` (JSON-RPC `-32001`) returned to host; upstream never called | Fail-closed default for unmapped host requests |
 
 > **MCP deprecation note (SEP-2577).** The MCP specification has deprecated
 > server-initiated **sampling**, **roots**, and **logging** as an advisory change —
@@ -267,7 +267,7 @@ Each method declares the revisions it exists in once
 (`internal/transport/dispatch.go`, `methodRegistry`); the routing tables are
 derived from those declarations, and a method outside the requesting peer's
 tables falls to the same fail-closed default (`dispatchUnmapped`,
-`AUTHORIZATION_FAILED`, recorded) that already covers unknown methods.
+`UNROUTABLE_METHOD`, recorded) that already covers unknown methods.
 
 That default holds in observe mode too: `enforcement: audit` and `--audit`
 downgrade a policy VERDICT, and a message the tables cannot route has none.
@@ -534,7 +534,7 @@ are otherwise untouched.
 tamper-evident tape):
 
 - **Denied unmapped methods** (any method with no registered handler) — denied
-  with `AUTHORIZATION_FAILED`. A deny record is written to the
+  with `UNROUTABLE_METHOD`. A deny record is written to the
   audit tape (record-before-act), then a stderr notice is logged, and the
   upstream is never called.
 - **`*/list` filtering** (`tools/list`, `resources/list`, `prompts/list`) —

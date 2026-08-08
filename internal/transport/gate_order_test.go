@@ -219,7 +219,7 @@ func TestGateOrder_NotificationGateAppliesTheCanonicalOrder(t *testing.T) {
 		},
 		{
 			name: "unmapped on a live session", method: "agents/delegate",
-			wantCode: capability.ErrCodeAuthorizationFailed,
+			wantCode: capability.ErrCodeUnroutableMethod,
 		},
 	}
 	for _, tc := range cases {

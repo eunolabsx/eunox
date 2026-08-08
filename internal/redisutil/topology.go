@@ -11,6 +11,12 @@
 // made the other link that package's EVAL scripts and instance-id machinery for a type switch —
 // and put the next topology question (a Sentinel failover client, a UniversalClient wrapper)
 // in a package with no reason to know a keyless SCAN exists.
+//
+// What it answers is what a CONCRETE TYPE proves, which is why an unrecognized one is a value of
+// its own rather than a default. Each consumer then decides what to do about it: the counter
+// admits it (its own failure mode is a loud, fail-closed CROSSSLOT at the first multi-bucket
+// admission), and the kill switch refuses it, because a partial kill set served as complete is
+// fail-open and silent.
 package redisutil
 
 import (
@@ -25,43 +31,76 @@ import (
 // enumerates one shard of several and reports success.
 type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *redis.Client) error) error
 
-// ShardIterator returns the per-server iterator for a client that spreads one keyspace across
-// several servers, and nil for one that keeps it on a single server. Matched on the CONCRETE
-// type — a decorator (a hooked client, a custom Cmdable) can still wrap one — so it catches
-// the ordinary wiring mistake rather than proving the topology.
+// Topology is what this package could establish about how a client spreads its keyspace.
 //
-// It returns the ITERATOR rather than a yes/no, and is the ONLY entry point to either answer,
-// because two — a predicate beside an iterator — is how they drifted before (one list named
-// Ring, the other did not, so a Ring fell through to a single-node SCAN that loaded whichever
-// shard go-redis picked). "Does it shard" is `ShardIterator(c) != nil`, which cannot disagree
-// with what the caller then iterates.
+// THREE values, not a bool, because the concrete-type match has three outcomes and collapsing
+// them loses the one that matters. "Recognized, single server" and "not recognized" both used to
+// answer "no iterator", so a decorator wrapping a cluster client enumerated one shard of several
+// and reported success — for the kill switch, a partial kill set served as complete, silently, in
+// the fail-OPEN direction the Manager contract says a backend must never take.
+type Topology int
+
+const (
+	// TopologyUnknown is what an unrecognized concrete type establishes — a decorator, or a
+	// consumer's own Cmdable. NOTHING follows about the keyspace: it may live on one server or be
+	// spread over many, and the two are indistinguishable without proving it over the network.
+	// A consumer whose correctness depends on visiting every server must refuse this or be told
+	// the answer (see the topology-declaring options on pkg/killswitch's Redis).
+	TopologyUnknown Topology = iota
+	// TopologySingleNode means the whole keyspace lives on one server, so a keyless command
+	// reaches all of it.
+	TopologySingleNode
+	// TopologySharded means the keyspace is spread across several servers, so a keyless command
+	// must be run against each — ClassifyTopology returns the iterator that does so.
+	TopologySharded
+)
+
+// String renders a topology for an error or a log line.
+func (t Topology) String() string {
+	switch t {
+	case TopologySingleNode:
+		return "single-node"
+	case TopologySharded:
+		return "sharded"
+	default:
+		return "unknown"
+	}
+}
+
+// ClassifyTopology reports how client spreads its keyspace and, for a sharding one, the
+// per-server iterator a KEYLESS command (SCAN) needs there. Matched on the CONCRETE type: this
+// proves nothing about a client it does not recognize, which is exactly what TopologyUnknown
+// says and why it is a value rather than an omission.
 //
-// A TYPED NIL reports "not sharding". A nil *redis.ClusterClient matches its arm but its
-// ForEachMaster is a non-nil func value bound to a nil receiver, so without the guard the
-// definition hands a caller an iterator that panics inside go-redis the moment it is called.
-// The check is ONE precondition rather than a copy per arm, so the next client type added to
-// the switch inherits it instead of needing its author to remember. It makes the returned
-// iterator callable whenever it is non-nil; it does not make the client usable — see
-// IsNilClient for the half that does.
+// It is the ONLY entry point to either answer, because two — a predicate beside an iterator — is
+// how they drifted before (one list named Ring, the other did not, so a Ring fell through to a
+// single-node SCAN that loaded whichever shard go-redis picked). Returning both together makes
+// "does it shard" and "what the caller then iterates" one answer.
 //
-// A DECORATOR is matched on its own concrete type, so one wrapping a sharding client reports
-// "not sharding" and its caller enumerates a single server. For the kill switch that is a
-// PARTIAL kill set served as complete, not a loud failure — the cost of matching concrete types
-// rather than proving topology, and the reason a consumer wrapping a cluster client must pass
-// the client itself.
-func ShardIterator(client redis.Cmdable) ShardFanOut {
+// A TYPED NIL is classified TopologyUnknown with no iterator. A nil *redis.ClusterClient matches
+// its arm but its ForEachMaster is a non-nil func value bound to a nil receiver, so without the
+// guard the definition hands a caller an iterator that panics inside go-redis the moment it is
+// called. The check is ONE precondition rather than a copy per arm, so the next client type added
+// to the switch inherits it. It makes a returned iterator callable whenever it is non-nil; it
+// does not make the client usable — see IsNilClient for the half that does, which every consumer
+// asks first because nilness is the more actionable cause.
+func ClassifyTopology(client redis.Cmdable) (Topology, ShardFanOut) {
 	if IsNilClient(client) {
-		return nil
+		return TopologyUnknown, nil
 	}
 	switch c := client.(type) {
+	case *redis.Client, *redis.Conn:
+		// *redis.Client covers the Sentinel-backed failover client too, which NewFailoverClient
+		// returns as this type: one master holds the whole keyspace.
+		return TopologySingleNode, nil
 	case *redis.ClusterClient:
 		// Masters only: a replica holds the same keys, so scanning them would double the work
 		// and, mid-failover, disagree with its master about what is there.
-		return c.ForEachMaster
+		return TopologySharded, c.ForEachMaster
 	case *redis.Ring:
-		return c.ForEachShard
+		return TopologySharded, c.ForEachShard
 	}
-	return nil
+	return TopologyUnknown, nil
 }
 
 // IsNilClient reports whether client IS nil — the interface itself, or a typed nil value inside
@@ -75,8 +114,8 @@ func ShardIterator(client redis.Cmdable) ShardFanOut {
 // produce nor an outcome an operator can act on.
 //
 // Reflection rather than a type switch on purpose: a second list of client types is exactly
-// what ShardIterator exists to prevent, and nilness is one question for every client, including
-// one go-redis has not added yet.
+// what ClassifyTopology exists to prevent, and nilness is one question for every client,
+// including one go-redis has not added yet.
 //
 // It answers for a client that is itself nil, NOT for a decorator WRAPPING one — `hooked{nil}`
 // is a non-nil struct under every kind. Reflecting into the embedded field would refuse the

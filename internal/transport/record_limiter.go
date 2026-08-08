@@ -2,8 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Admission control over refusal records whose write rate a caller (not the policy) sets:
-// pre-session transport refusals (recordRateLimiter) and pool-saturation refusals
-// (saturationGate). No policy ALLOW/DENY record is ever admission-controlled.
+// transport refusals taken before or beside a policy decision (recordRateLimiter) and
+// pool-saturation refusals (saturationGate). No policy ALLOW/DENY record is ever
+// admission-controlled.
+//
+// What is NOT metered, deliberately: the fail-closed ROUTING refusal (dispatchUnmapped and the
+// notification gate's unmapped arm), on either transport. Reaching it means a peer whose other
+// traffic writes policy DENY records at the same one-record-per-message cost — and those may
+// never be admission-controlled, since a policy verdict elided is a policy verdict an incident
+// responder does not have. Metering the routing refusal alone would lower no ceiling; it would
+// only make the cheapest way to fill the queue the one that leaves the better tape.
 
 package transport
 
@@ -66,6 +74,14 @@ const (
 	// upstream. Ungated, that is enough records to latch AuditDegraded(), which under
 	// --require-audit=strict denies every route — the same shape catKill and catAudience
 	// exist to bound, minus even the need for a credential.
+	//
+	// The one category BOTH transports meter. Its threat model is the HTTP proxy's
+	// unauthenticated peer, which stdio does not have — but the refusal is the same refusal
+	// for the same bytes, and on stdio it is written inline on the serve loop, the goroutine
+	// that also routes host replies back to a blocked upstream. Metering it there costs the
+	// tape nothing (a suppressed record folds into the next admitted one's
+	// suppressed_refusal_count) and keeps identical bytes treated identically on the two
+	// transports, which is the property that stops the pair drifting.
 	catRevision refusalCategory = "revision"
 )
 
@@ -105,9 +121,10 @@ var (
 	perCategoryDenyBurst = perCategoryShare(preSessionDenyBurst, len(refusalCategories))
 )
 
-// newPreSessionDenyLimiter builds the per-category buckets, each holding an equal share of
-// the aggregate rate/burst (see perCategoryDenyRate/perCategoryDenyBurst).
-func newPreSessionDenyLimiter() *categoryRecordLimiter {
+// newRefusalRecordLimiter builds the per-category buckets, each holding an equal share of
+// the aggregate rate/burst (see perCategoryDenyRate/perCategoryDenyBurst). Held per PROXY —
+// the HTTP proxy for its pre-session refusals, the stdio proxy for catRevision.
+func newRefusalRecordLimiter() *categoryRecordLimiter {
 	c := &categoryRecordLimiter{
 		buckets: make(map[refusalCategory]*recordRateLimiter, len(refusalCategories)),
 		unknown: newRecordRateLimiter(perCategoryFloor, perCategoryFloor),
@@ -153,6 +170,27 @@ func (c *categoryRecordLimiter) setNow(now func() time.Time) {
 		b.now = now
 	}
 	c.unknown.now = now
+}
+
+// admitRefusalRecord applies limiter's verdict for category to rec: nil when this record is
+// suppressed (the refusal itself still stands — only the tape write is bounded), rec when nothing
+// was elided since the last admitted one, and a rollup-stamping wrapper when something was.
+//
+// The tail every limited-recorder site shares, so a new one cannot forget the rollup and silently
+// under-count a flood. A nil limiter panics here exactly as it did at each of those sites: a live
+// sink with no bucket beside it is a construction bug, and a "defensive" fallback would write the
+// unbounded records the bucket exists to prevent. A caller that legitimately has none (a proxy
+// assembled by a bare struct literal in a test) tests for it and does not call.
+func admitRefusalRecord(rec auditRecorder, limiter *categoryRecordLimiter, category refusalCategory) auditRecorder {
+	admitted, suppressed := limiter.admit(category)
+	switch {
+	case !admitted:
+		return nil
+	case suppressed == 0:
+		return rec
+	default:
+		return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+	}
 }
 
 // Rollup keys carried by a refusal record, and the scope values that qualify the count.

@@ -425,7 +425,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		controlToken:       opts.ControlToken,
 		afterListen:        opts.AfterListen,
 		authTimingKey:      newAuthTimingKey(),
-		preSessionDenies:   newPreSessionDenyLimiter(),
+		preSessionDenies:   newRefusalRecordLimiter(),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
 		trustedProxyHops:   opts.TrustedProxyHops,
