@@ -19,6 +19,9 @@
 //     under, so a gate placed ahead of it would write a record naming no revision at all.
 //  2. The SWALLOWED set (notification framing only): a method the proxy has already handled
 //     is neither an error nor an event, so it is dropped before anything that would record it.
+//     "Already handled" is a property of the LEG, not of the method: a pre-session arm has
+//     completed no handshake, so nothing is swallowed there and the gates below still see the
+//     message (hostNotificationGate.established).
 //  3. REVOCATION (kill switch). Locally-answered requests share dispatchRequest's boundary
 //     gate; Decide* requests carry their own richer record inside enforcedForwardCore;
 //     notifications take it from hostNotificationGate.
@@ -437,9 +440,16 @@ func isEnforcedMethod(ctx context.Context, method string) bool {
 // gate itself — which checks run, and in what order — is not per-transport; see the package
 // gate order at the top of this file.
 type hostNotificationGate struct {
-	rec       auditRecorder
-	sessionID string
-	errOut    io.Writer
+	rec auditRecorder
+	// subject names WHOSE session a record describes and whether this proxy can vouch for the
+	// name: a leg with a session supplies the id it established, a pre-session one the id the
+	// client claimed. See killSubject.
+	subject killSubject
+	// established says this leg has completed its handshake, which is what makes the
+	// swallowed set apply to it. Its zero value costs a revocation lookup on a message that
+	// would otherwise be dropped for free — the direction that records more, not less.
+	established bool
+	errOut      io.Writer
 	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
 	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
 	// notification is dropped before revocation is even a question.
@@ -460,18 +470,29 @@ type hostNotificationGate struct {
 func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 	tables := tablesFromContext(ctx)
 	disposition := tables.notifications[msg.Method]
-	if disposition == notifySwallow {
+	swallowed := disposition == notifySwallow
+	// The swallowed set is what the proxy has ALREADY handled, so it is neither an error nor
+	// an event and is dropped before anything that would record it. That reasoning needs the
+	// proxy to have handled it: on a leg with no session it has not, and an id-less
+	// `initialize` arriving during an emergency stop is precisely the attempt an operator
+	// needs on the tape rather than a silent readiness ack.
+	if swallowed && g.established {
 		return false
 	}
 	if kill := g.checkKill(); kill != nil {
-		recordKillDrop(ctx, g.rec, kill, verifiedSession(g.sessionID), msg.Method, msg.Method, g.leg)
+		recordKillDrop(ctx, g.rec, kill, g.subject, msg.Method, msg.Method, g.leg)
+		return false
+	}
+	if swallowed {
+		// Pre-session, and revocation had nothing to say: there is no upstream to forward to
+		// and nothing the later arms could add, so the drop is the whole disposition.
 		return false
 	}
 	// An enforced method framed as a notification (no id) is a fail-closed reject: forwarding
 	// it verbatim would bypass both the PDP decision and the audit record.
 	if _, enforced := tables.decide[msg.Method]; enforced {
 		if g.rec != nil {
-			g.rec.RecordDeny(ctx, g.sessionID, msg.Method, msg.Method, codeInvalidRequest, "", nil, false)
+			g.rec.RecordDeny(ctx, g.subject.auditSessionID(), msg.Method, msg.Method, codeInvalidRequest, "", g.subject.auditDetails(nil), false)
 		}
 		return false
 	}
@@ -490,7 +511,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 		identifier = ""
 	}
 	if g.rec != nil {
-		g.rec.RecordDeny(ctx, g.sessionID, identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", nil, false)
+		g.rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, msg.Method, capability.ErrCodeAuthorizationFailed, "", g.subject.auditDetails(nil), false)
 	}
 	_, _ = fmt.Fprintf(resolvedErrOut(g.errOut),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
