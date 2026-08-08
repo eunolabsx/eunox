@@ -36,5 +36,5 @@ go test \
     -benchtime="${BENCHTIME}" \
     -benchmem \
     -count="${COUNT}" \
-    ./internal/... \
+    ./internal/... ./pkg/... \
     2>&1 | grep -v '^\[eunox\]'
