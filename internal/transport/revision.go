@@ -29,11 +29,13 @@ var errRevisionMismatch = errors.New("protocol revision disagrees with the conte
 // errUnhonorableUpstreamRevision marks a request this proxy cannot forward at the revision it
 // resolved under.
 //
-// Params are forwarded VERBATIM and every outbound request carries eunox's own
-// MCP-Protocol-Version, so dispatching under one revision and addressing the upstream as
-// another does not relay a mismatched pair, it MANUFACTURES one — the same family of
-// enforcement confusion errRevisionMismatch refuses on the host leg. Rewriting the request to
-// match is translation, which the mismatched-pair boundary governs and this build does not do.
+// Params are forwarded VERBATIM into a conversation eunox itself opened with `initialize`, so
+// dispatching under one revision and addressing the upstream as another does not relay a
+// mismatched pair, it MANUFACTURES one — the same family of enforcement confusion
+// errRevisionMismatch refuses on the host leg. The handshake is the carrier both legs have; a
+// remote HTTP upstream reads a second one, the MCP-Protocol-Version header, which names the
+// same revision. Rewriting the request to match is translation, which the mismatched-pair
+// boundary governs and this build does not do.
 var errUnhonorableUpstreamRevision = errors.New("request revision cannot be honored by the upstream leg")
 
 // resolveHostRevision decides which revision one host message is dispatched under.
@@ -75,7 +77,9 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 
 // upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg. Every leg
 // is opened with `initialize`, a method only the handshake-bearing revision has, so that is
-// what eunox negotiated there whatever the leg itself reported or an operator pinned.
+// what eunox negotiated there whatever the leg itself reported or an operator pinned — true of
+// a subprocess upstream, which reads bare JSON-RPC and no header at all, as much as of a
+// remote HTTP one.
 //
 // One expression, read by the header stamper and by the check below, so what is sent and what
 // is checked cannot drift — including on the day an opener for a newer revision lands.

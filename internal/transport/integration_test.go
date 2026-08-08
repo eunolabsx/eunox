@@ -858,9 +858,10 @@ func TestStdioProxy_NewRevisionPeerLosesRemovedMethods(t *testing.T) {
 	}
 
 	// tools/call exists in both revisions, so the peer's own tables admit it — and it is
-	// refused anyway, one gate earlier: its params travel to an upstream leg speaking
-	// 2025-11-25, and forwarding a body declaring 2026-07-28 beside the MCP-Protocol-Version
-	// header this proxy stamps would MANUFACTURE the mismatched pair the host leg refuses.
+	// refused anyway, one gate earlier: its params travel into a conversation eunox opened
+	// with `initialize` at 2025-11-25, and forwarding a body declaring 2026-07-28 into it
+	// would MANUFACTURE the mismatched pair the host leg refuses. This upstream is a
+	// subprocess, so there is no header here — the handshake is the carrier both legs have.
 	// The refusal names the leg rather than the method, which is the difference from ping's.
 	call := h.roundTrip(t, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call",

@@ -346,9 +346,11 @@ Section conventions:
   Rewriting the declaration is translation, which the mismatched-pair boundary governs and
   this release does not implement, so the pair is refused instead:
   `UNSUPPORTED_PROTOCOL_VERSION` (-32022), recorded, before the upstream is contacted. It
-  applies only to methods whose params actually reach the upstream (a new per-method
-  declaration), so a locally-answered method still admits a declaration and a peer on the
-  newer revision keeps that revision's tables. Because every upstream leg is opened with
+  applies only to messages whose params actually reach the upstream — the enforced methods,
+  `*/list`, and the verbatim-forwarded notifications — so a locally-answered method still
+  admits a declaration and a peer on the newer revision keeps that revision's tables. It reads
+  the RESOLVED revision, not just an explicit declaration, since a peer pins its context by
+  declaring once on a method that forwards nothing. Because every upstream leg is opened with
   `initialize`, a host declaring `2026-07-28` cannot have a call forwarded today on any
   upstream, pinned or not.
 - **`pkg/enforcement` ships benchmarks, and `scripts/bench.sh` covers `pkg/`.** The decision

@@ -1494,7 +1494,7 @@ func TestEngine_PolicyCondition_DenyWhenNoEvaluatorConfigured(t *testing.T) {
 	})
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypePolicy, resp.Denial.ConditionType)
 	assert.Contains(t, resp.Denial.Message, "WithPolicyEvaluator")
 }
@@ -1580,7 +1580,7 @@ func TestEngine_CustomCondition_DenyWhenNoHandlerRegistered(t *testing.T) {
 	})
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeCustom, resp.Denial.ConditionType)
 	assert.Contains(t, resp.Denial.Message, "my-check")
 	assert.Contains(t, resp.Denial.Message, "WithConditionHandler")
