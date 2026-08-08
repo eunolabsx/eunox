@@ -1201,18 +1201,10 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // and an omission inheriting the pin. There is no way back; the peer's only recourse is a new
 // process.
 //
-// The predicate is dispatchesMessage — the tables, consulted in the message's own FRAMING —
-// rather than the method's revision membership, because the two disagree exactly where the
-// wedge lives: a request-framed `notifications/progress` is a method the revision has and a
-// message the dispatcher discards. Deriving it from the tables the dispatcher itself routes by
-// is what makes "the proxy acted on it" and "it pinned" one question.
-//
-// The pin is taken HERE rather than after dispatch resolves a handler, which would make the
-// property structural rather than a predicate agreeing with the dispatcher by construction.
-// Two reasons, and the second is decisive: the tables are read off the context this call stamps,
-// so the pin has to exist before routing; and serveHost dispatches each request on its own
-// goroutine, so pinning at the handler would move a field with a documented single-writer rule
-// (StdioProxy.hostRev) onto N of them.
+// The predicate is dispatchesMessage; its doc holds the reasoning. Pinning HERE rather than
+// after dispatch resolves a handler — which would make the property structural — keeps hostRev
+// single-writer: serveHost dispatches each request on its own goroutine, and this call runs on
+// the reader.
 //
 // It returns the STAMPED context rather than the bare revision: that context is the one
 // carrier of the decided revision (the tables route by it, the tape records it), so a caller

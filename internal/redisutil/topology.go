@@ -36,24 +36,23 @@ type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *re
 // shard go-redis picked). "Does it shard" is `ShardIterator(c) != nil`, which cannot disagree
 // with what the caller then iterates.
 //
-// A TYPED NIL reports "not sharding". A nil *redis.ClusterClient matches the arm but its
-// ForEachMaster is a non-nil func value bound to a nil receiver, so without the guards below
-// the definition hands a caller an iterator that panics inside go-redis the moment it is
-// called. Reporting "not sharding" is what makes the returned iterator callable whenever it is
-// non-nil; it does not make the client usable — see IsNilClient for the half that does.
+// A TYPED NIL reports "not sharding". A nil *redis.ClusterClient matches its arm but its
+// ForEachMaster is a non-nil func value bound to a nil receiver, so without the guard the
+// definition hands a caller an iterator that panics inside go-redis the moment it is called.
+// The check is ONE precondition rather than a copy per arm, so the next client type added to
+// the switch inherits it instead of needing its author to remember. It makes the returned
+// iterator callable whenever it is non-nil; it does not make the client usable — see
+// IsNilClient for the half that does.
 func ShardIterator(client redis.Cmdable) ShardFanOut {
+	if IsNilClient(client) {
+		return nil
+	}
 	switch c := client.(type) {
 	case *redis.ClusterClient:
-		if c == nil {
-			return nil
-		}
 		// Masters only: a replica holds the same keys, so scanning them would double the work
 		// and, mid-failover, disagree with its master about what is there.
 		return c.ForEachMaster
 	case *redis.Ring:
-		if c == nil {
-			return nil
-		}
 		return c.ForEachShard
 	}
 	return nil

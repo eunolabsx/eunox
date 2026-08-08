@@ -307,16 +307,21 @@ Section conventions:
 ### Changed
 
 - **Two JWT capability-claim refusals are reclassified from policy verdicts to faults.** The
-  claim-condition path denies fail-closed when a condition type has no evaluator, and when the
-  deciding policy's handler cannot be run ahead of its own decision (it commits state, or is not
-  registered at all). Both mean the condition guarding the call was never evaluated once, which
-  is what the class vocabulary calls a fault — but both minted `CONDITION_FAILED`, the
-  policy-verdict code, so `DenialInfo.Downgradable()` answered yes and a route running `--audit`
-  (or an `enforcement: audit` constraint) FORWARDED the call to the upstream and reported it as
-  "would be allowed" when enforce mode denies it. They now carry `ENFORCEMENT_ERROR`, matching
-  the engine's own unmodelled-condition-type refusal. **Operator-visible twice:** the wire code
-  moves from `-32003` to `-32603` and the symbolic code a SIEM rule matches changes with it, and
-  an observing deployment starts BLOCKING these where it forwarded.
+  claim-condition path has SEVEN arms that refuse without ever evaluating the condition — no
+  request to check against, a handler that cannot be run ahead of the decision (it commits
+  state, or is not registered), a grant shape this build cannot enforce (a named argument the
+  claim grammar cannot express, a non-SQL operation), an argument tree too deep to scan, and a
+  condition type with no evaluator. All minted `CONDITION_FAILED`, the policy-verdict code, so
+  `DenialInfo.Downgradable()` answered yes and a route running `--audit` (or an
+  `enforcement: audit` constraint) FORWARDED the call to the upstream and reported it as "would
+  be allowed" when enforce mode denies it. The deep-nesting arm is CALLER-reachable, so that was
+  drivable from the wire. All seven now carry `ENFORCEMENT_ERROR` under one stated rule: on this
+  path a `CONDITION_FAILED`-family code means the condition was EVALUATED and the call failed
+  it. Relatedly, when a claim's OR-list produces both, the fault now survives the later grant's
+  policy verdict rather than being overwritten by it — otherwise the order the grants sat in
+  decided whether an observing route forwarded. **Operator-visible twice:** the wire code moves
+  from `-32003` to `-32603` and the symbolic code a SIEM rule matches changes with it, and an
+  observing deployment starts BLOCKING these where it forwarded.
 - **The go-redis topology helpers moved to `internal/redisutil`.** `ShardFanOut` and
   `ShardIterator` answer a pure go-redis question that both Redis backends ask, and hosting them
   in `pkg/callcounter` made `pkg/killswitch`'s backend link that package's EVAL scripts and
@@ -1151,14 +1156,19 @@ Section conventions:
 - **A nil Redis client no longer kills the process on the emergency-stop path.**
   `ShardIterator` matched a typed-nil `*redis.ClusterClient`/`*redis.Ring` and returned that
   client's per-server iterator — a non-nil func value bound to a nil receiver — so the kill
-  switch's keyless SCAN fan-out called it and dereferenced nil inside go-redis, on the reconcile
-  goroutine. The type switch now guards each receiver, which makes a returned iterator callable
-  whenever it is non-nil; and because go-redis dereferences the receiver before it can build a
-  reply (so a nil client panics on ANY command rather than erroring), both backends now refuse a
-  nil client at their seam instead: `callcounter.NewRedis` returns an error, and the kill
-  switch's node enumeration fails, which its reconcile answers by going degraded — fail-closed
-  by default. Reachable only by a library consumer wiring a Redis backend directly; the shipped
-  binary is single-node.
+  switch's keyless SCAN fan-out called it and dereferenced nil inside go-redis. A single nil
+  precondition on the type switch makes a returned iterator callable whenever it is non-nil.
+  That alone does not make the CLIENT usable, though: go-redis dereferences the receiver before
+  it can build a reply, so every command on a nil client panics rather than erroring — and the
+  first to run are `Start`'s `Subscribe` (a typed nil satisfies the pub/sub type assertion) and
+  the reconcile goroutine's `Get`, so any guard further down the call graph is unreachable. Both
+  backends therefore refuse at CONSTRUCTION: `callcounter.NewRedis` returns an error, and
+  `killswitch.NewRedis` — whose signature returns none, and where a caller that ignored one
+  would keep the panic anyway — latches the new exported `killswitch.ErrNilClient`. `Start`
+  then launches nothing, and every reader and writer reports it, failing closed **regardless of
+  `--killswitch-fail-open`**: fail-open trades revocation for availability during a transient
+  outage that a reconcile heals, and a nil client never can. Reachable only by a library
+  consumer wiring a Redis backend directly; the shipped binary is single-node.
 - **One stray line can no longer wedge a stdio connection for the process's life.** The host
   context pins its protocol revision from the first RESOLVED message, which is what makes the
   mid-context-flip refusal reachable for a peer that never handshakes. An id-less `initialize`

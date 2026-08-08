@@ -172,13 +172,17 @@ func TestStdioNegotiation_DoesNotPinFromAMessageTheFramingDiscards(t *testing.T)
 	}
 }
 
-// TestDispatchesMessage_AgreesWithTheDispatchTables is the structural guard the predicate needs:
-// the pin's question and the dispatcher's are the SAME table lookup, so no cell of the registry
-// can make them disagree.
+// TestDispatchesMessage_AgreesWithTheDispatchTables pins WHICH SOURCE the predicate reads: the
+// revision's derived tables, in the message's framing, across every published revision, every
+// declared method and both framings.
 //
-// Derived over every published revision, every declared method, and both framings, rather than
-// spot-checked — the failure this replaces was one cell (a notification-only method in request
-// framing) in a predicate that read as obviously right.
+// Deliberately not billed as proving the predicate and the dispatcher agree — its expectation
+// is computed from the same tablesFor result the predicate reads, so a rewrite of
+// dispatchesMessage is the only thing it can fail. What it does catch is the tempting
+// "simplification" to a methodRegistry + spec.In membership test, which reports true for a
+// revision this build does not speak while buildRevisionDispatch gives it empty tables — a pin
+// onto a revision that dispatches nothing. The behavioral regression for the wedge itself is
+// its hardcoded sibling below.
 func TestDispatchesMessage_AgreesWithTheDispatchTables(t *testing.T) {
 	t.Parallel()
 	for _, rev := range capability.PublishedRevisions() {

@@ -16,7 +16,10 @@
 //     bad-version probe is recorded as UNSUPPORTED_PROTOCOL_VERSION rather than KILL_SWITCH,
 //     on a message refused either way that contacts no upstream and mutates no state.
 //     Negotiation is also what stamps the revision onto the context every later gate records
-//     under, so a gate placed ahead of it would write a record naming no revision at all.
+//     under, so a gate placed ahead of it would write a record naming no revision at all. ONE
+//     gate is deliberately ahead of it and therefore records no revision: HTTP's session-owner
+//     binding, which decides whether the caller may act on this session at all and so must not
+//     read the session's negotiated state first (see enforceSessionGates).
 //  2. The SWALLOWED set (notification framing only): a method the proxy has already handled
 //     is neither an error nor an event, so it is dropped before anything that would record it.
 //     "Already handled" is a property of the LEG, not of the method: a pre-session arm has
@@ -439,30 +442,10 @@ func dispatchesMessage(rev capability.Revision, msg mcp.RPCMsg) bool {
 // records what was negotiated, and "nothing was" is a fact a pre-negotiation refusal needs to
 // be able to state.
 //
-// # Why this RESOLVES rather than refuses
-//
-// The obvious hardening — deny a dispatch whose context carries no negotiated revision, turning
-// "an entry point forgot to negotiate" into a fail-closed refusal at runtime — is deliberately
-// NOT taken. The guarantee wanted from it is already held, at build time, by
-// TestGateOrder_EveryHostMessageDispositionIsNegotiatedFor: every arm that disposes of a host
-// message either negotiates ahead of it or carries a written reason it does not, so the arm
-// that would trip a runtime refusal cannot be committed in the first place.
-//
-// What refusing would ADD is worse than what it would catch:
-//
-//   - It would need a spelling for "this caller has no peer to negotiate with" — the SSE GET,
-//     the arms answering a session this proxy never established, the upstream-initiated legs,
-//     every dispatchParams a test builds. That distinguished value is a second carrier of the
-//     same fact, in a seam whose whole point is that the revision rides exactly one, and it is
-//     the shape whose two zero-value semantics let an entry point record "no revision decided"
-//     for a request it had decided under one.
-//   - The fallback is not a default standing in for a missing answer; it is the answer. A
-//     context that negotiated nothing routes by the method set eunox already shipped, which is
-//     what makes omission structurally unable to reach a NEWER one. A refusal replaces that
-//     guarantee with an outage for the legitimate non-negotiating arms, on a path where the
-//     conservative direction was already available for free.
-//
-// So the AST guard is the whole answer, and this fallback is load-bearing rather than lenient.
+// Refusing here instead — turning "an entry point forgot to negotiate" into a runtime denial —
+// was weighed and declined: the gate-order source guard already holds that at build time, and a
+// refusal would need a distinguished "no peer to negotiate with" value for the legitimately
+// non-negotiating arms, which is the second carrier of one fact this seam exists to remove.
 func requestRevision(ctx context.Context) capability.Revision {
 	if rev := capability.ProtocolRevisionFromContext(ctx); rev != "" {
 		return rev

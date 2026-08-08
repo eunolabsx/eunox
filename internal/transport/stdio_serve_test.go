@@ -141,12 +141,19 @@ func serveHostLines(t *testing.T, cfg stdioServe, lines ...string) (*StdioProxy,
 
 	done := make(chan struct{})
 	go func() { p.serveHost(context.Background()); close(done) }()
-	for _, line := range lines {
-		if _, err := io.WriteString(pw, strings.TrimRight(line, "\n")+"\n"); err != nil {
-			t.Fatalf("writing host line: %v", err)
+	// The writes run OFF this goroutine: an io.Pipe write blocks until a reader takes it, and
+	// serveHost has exits that do not drain (upstream exit, a non-EOF read error, a shutdown
+	// wake). Writing inline would then block forever with no reader and hang the test past the
+	// bounded wait below, surfacing as go test's 10-minute panic pointing at this helper rather
+	// than as the failure the caller wrote.
+	go func() {
+		for _, line := range lines {
+			if _, err := io.WriteString(pw, strings.TrimRight(line, "\n")+"\n"); err != nil {
+				return // the loop stopped reading; the wait below reports what happened
+			}
 		}
-	}
-	_ = pw.Close()
+		_ = pw.Close()
+	}()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):

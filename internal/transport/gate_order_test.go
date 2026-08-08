@@ -797,7 +797,7 @@ func negotiationPrologueAt(stmt ast.Stmt, rest []ast.Stmt, site ast.Node) bool {
 			return false
 		}
 		name, negotiates := negotiationOKName(init)
-		return negotiates && mentionsIdent(s.Cond, name) && terminates(s.Body)
+		return negotiates && negatesIdent(s.Cond, name) && terminates(s.Body)
 	}
 	return false
 }
@@ -822,13 +822,37 @@ func negotiationOKName(assign *ast.AssignStmt) (string, bool) {
 
 // refusalHonored reports whether some statement before site tests name and leaves the flow —
 // the `if !ok { return }` / `if !ok { continue }` every prologue here is written as.
+//
+// Two things beyond "the name appears in a terminating if", because without either the guard
+// advertises a guarantee it does not hold (both shapes below were confirmed to pass a
+// mention-only check): the condition must NEGATE the name, since `if ok { return }` honors the
+// opposite of the refusal; and the name must not be REBOUND first, since a later
+// `x, ok := …` makes the surviving `if !ok` test somebody else's result while the negotiation's
+// own is silently discarded.
 func refusalHonored(rest []ast.Stmt, site ast.Node, name string) bool {
 	for _, stmt := range rest {
 		if stmt.End() > site.Pos() {
 			return false // reached the disposition without honoring the refusal
 		}
-		ifStmt, isIf := stmt.(*ast.IfStmt)
-		if isIf && mentionsIdent(ifStmt.Cond, name) && terminates(ifStmt.Body) {
+		if ifStmt, isIf := stmt.(*ast.IfStmt); isIf && negatesIdent(ifStmt.Cond, name) && terminates(ifStmt.Body) {
+			return true
+		}
+		if rebinds(stmt, name) {
+			return false
+		}
+	}
+	return false
+}
+
+// rebinds reports whether stmt assigns to name, which invalidates any later test of it as a
+// statement about the negotiation's result.
+func rebinds(stmt ast.Stmt, name string) bool {
+	assign, isAssign := stmt.(*ast.AssignStmt)
+	if !isAssign {
+		return false
+	}
+	for _, lhs := range assign.Lhs {
+		if ident, isIdent := lhs.(*ast.Ident); isIdent && ident.Name == name {
 			return true
 		}
 	}
@@ -850,17 +874,25 @@ func terminates(body *ast.BlockStmt) bool {
 	return false
 }
 
-// mentionsIdent reports whether expr reads the named identifier, in any spelling a refusal test
-// takes (`!ok`, `ok == false`, `!ok || …`).
-func mentionsIdent(expr ast.Expr, name string) bool {
-	found := false
-	ast.Inspect(expr, func(n ast.Node) bool {
-		if ident, isIdent := n.(*ast.Ident); isIdent && ident.Name == name {
-			found = true
+// negatesIdent reports whether expr tests the named identifier for FALSEHOOD — `!ok`, or `!ok`
+// as an operand of a wider condition. Polarity is the point: a mention-only match accepts
+// `if ok { return }`, which returns on the success path and dispatches on the refused one.
+func negatesIdent(expr ast.Expr, name string) bool {
+	switch e := expr.(type) {
+	case *ast.UnaryExpr:
+		if e.Op != token.NOT {
+			return false
 		}
-		return true
-	})
-	return found
+		ident, isIdent := e.X.(*ast.Ident)
+		return isIdent && ident.Name == name
+	case *ast.BinaryExpr:
+		// `!ok || …` / `… || !ok`: either operand refusing on the negation is enough, since
+		// the branch terminates for it.
+		return negatesIdent(e.X, name) || negatesIdent(e.Y, name)
+	case *ast.ParenExpr:
+		return negatesIdent(e.X, name)
+	}
+	return false
 }
 
 // isNegotiationCall matches the prologue call in EITHER spelling — a method on the proxy, or a

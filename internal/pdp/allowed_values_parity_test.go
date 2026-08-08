@@ -240,12 +240,12 @@ func TestAllowedOperations_EveryJWTRefusalCarriesDetails(t *testing.T) {
 		"named argument is unenforceable from a claim": {
 			capability.AllowedOperationsCondition{Argument: "op", Operations: []string{"SELECT"}},
 			map[string]interface{}{"op": "SELECT"},
-			capability.ErrCodeConditionFailed, []string{"argument", "allowedOperations"},
+			capability.ErrCodeEnforcementError, []string{"argument", "allowedOperations"},
 		},
 		"non-SQL op cannot be scanned for": {
 			capability.AllowedOperationsCondition{Operations: []string{"publish"}},
 			map[string]interface{}{"topic": "x"},
-			capability.ErrCodeConditionFailed, []string{"operation", "allowedOperations"},
+			capability.ErrCodeEnforcementError, []string{"operation", "allowedOperations"},
 		},
 		"no argument matched any permitted operation": {
 			capability.AllowedOperationsCondition{Operations: []string{"SELECT"}},

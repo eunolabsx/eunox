@@ -118,9 +118,10 @@ func CheckServerNotClustered(ctx context.Context, client ServerInfoReader) error
 }
 
 // NewRedis creates a Redis-backed call counter. It fails rather than returning a counter that
-// cannot admit: on a keyspace-sharding client (ErrClusterUnsupported), or when crypto/rand
-// cannot supply the per-instance entropy for ZADD member uniqueness — a silent fallback there
-// would risk reintroducing the cross-replica collision the entropy prevents.
+// cannot admit: on a nil client (checked FIRST, so a typed-nil sharding handle reports the nil
+// rather than the topology), on a keyspace-sharding client (ErrClusterUnsupported), or when
+// crypto/rand cannot supply the per-instance entropy for ZADD member uniqueness — a silent
+// fallback there would risk reintroducing the cross-replica collision the entropy prevents.
 func NewRedis(client redis.Cmdable, opts ...redisOption) (*Redis, error) {
 	// A nil client — including a typed nil inside a non-nil interface — is refused at the seam
 	// rather than at the first command: go-redis dereferences the receiver before it can build a

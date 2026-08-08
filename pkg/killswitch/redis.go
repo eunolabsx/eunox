@@ -87,17 +87,25 @@ var ErrNotStarted = errors.New("killswitch: redis kill switch queried before Sta
 // condition that fails closed regardless of WithFailOpen.
 var ErrStopped = errors.New("killswitch: redis kill switch convergence stopped (Start context canceled); failing closed (state can no longer be confirmed)")
 
-// errNilClient refuses a backend wired with no Redis client at all — a WIRING error, like
-// ErrNotStarted, reported rather than left to the first command: go-redis dereferences the
-// receiver before it can build a reply, so the command panics instead of erroring, and the
-// enumeration that would hit it runs on the reconcile goroutine. Unexported because the fix is
-// to pass a client, not to match this.
-var errNilClient = errors.New("killswitch: redis kill switch wired with a nil client; failing closed (kill-switch state cannot be loaded)")
+// ErrNilClient refuses a backend wired with no Redis client at all. A WIRING error like
+// ErrNotStarted, and it fails closed regardless of WithFailOpen for the same reason: fail-open
+// trades revocation for availability during a TRANSIENT outage that a later reconcile heals,
+// and this one never can.
+//
+// Detected at construction rather than left to the first command, because go-redis dereferences
+// the receiver before it can build a reply — every command on a nil client PANICS instead of
+// erroring, and the first ones to run are Start's Subscribe and the reconcile goroutine's Get.
+var ErrNilClient = errors.New("killswitch: redis kill switch wired with a nil client; failing closed (kill-switch state cannot be loaded)")
 
 // Redis is a Redis-backed kill-switch manager with pub/sub propagation and local cache.
 type Redis struct {
 	client redis.Cmdable
-	logger *slog.Logger
+	// wiringErr latches a construction-time fault that makes the client unusable for the
+	// instance's whole life. Immutable after NewRedis, so it is read without the lock; every
+	// entry point that would touch the client checks it FIRST, which is what makes the refusal
+	// cover the write and pub/sub paths rather than only the node enumeration.
+	wiringErr error
+	logger    *slog.Logger
 
 	// observers receive a Revocation the moment this instance's local view gains one,
 	// including a kill issued ELSEWHERE that this instance learns of via pub/sub or the
@@ -269,6 +277,11 @@ func WithFailOpen(failOpen bool) RedisOption {
 // NewRedis creates a Redis-backed kill-switch manager. Every setting is supplied here
 // (see RedisOption), so the instance is fully configured before Start's background
 // loops begin reading it.
+//
+// A nil client (including a typed nil in a non-nil interface) does not fail here, because this
+// signature returns no error and a caller that ignored one would keep the panic either way.
+// It latches ErrNilClient instead, which every reader and writer reports and which fails closed
+// — the strongest posture available without the caller's cooperation.
 func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 	r := &Redis{
 		client:            client,
@@ -276,6 +289,9 @@ func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 		killedSessions:    make(map[string]bool),
 		reconcileInterval: defaultReconcileInterval,
 		sessionKillTTL:    defaultSessionKillTTL,
+	}
+	if redisutil.IsNilClient(client) {
+		r.wiringErr = ErrNilClient
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -295,6 +311,16 @@ func (r *Redis) Start(ctx context.Context) {
 	// Start at most once. If Stop already ran, do not start either: launching
 	// goroutines now would orphan them beyond Stop's reach.
 	if r.startedOnce || r.stopped {
+		return
+	}
+	// A latched wiring fault means every command below would panic rather than error, so
+	// nothing is subscribed and no goroutine is launched. started stays false, and every
+	// reader reports ErrNilClient (fail closed) instead of a cache nobody can refresh.
+	if r.wiringErr != nil {
+		if r.logger != nil {
+			r.logger.Error("kill switch: wired with no redis client; the switch is permanently degraded and every check fails closed",
+				slog.String("error", r.wiringErr.Error()))
+		}
 		return
 	}
 	r.startedOnce = true
@@ -424,7 +450,7 @@ func (r *Redis) drainRefreshTrigger(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-r.refreshTrigger:
-			// r.client is always set by NewRedis, so no nil guard is needed.
+			// A nil client never reaches here: Start refuses to launch this loop for one.
 			r.reconcileRefresh(ctx)
 		}
 	}
@@ -495,6 +521,9 @@ func (r *Redis) HealthStatus() error {
 	// Mirror ShouldBlock's gate ORDER exactly so a health probe and the data plane never
 	// disagree. Checked before r.mu so a never-Started switch (which denies 100% of
 	// traffic) reports the wiring cause instead of a misleading nil "healthy".
+	if r.wiringErr != nil {
+		return r.wiringErr
+	}
 	if !r.started.Load() {
 		return ErrNotStarted
 	}
@@ -526,6 +555,11 @@ func (r *Redis) ShouldBlock(_ context.Context, agentID, sessionID string) (bool,
 	// Fail closed until Start has seeded the cache: an unstarted switch has an empty
 	// cache and nil lastRefreshErr, indistinguishable from an all-clear, so a NewRedis
 	// wired in but never Started would otherwise ignore every kill in Redis silently.
+	// Ahead of the started gate: a nil client is a permanent wiring fault, and reporting it
+	// as "never started" would send an operator looking for a missing Start call.
+	if r.wiringErr != nil {
+		return false, r.wiringErr
+	}
 	if !r.started.Load() {
 		return false, ErrNotStarted
 	}
@@ -650,6 +684,9 @@ func (r *Redis) staleLocked() bool {
 
 // ActivateGlobal activates the global kill switch.
 func (r *Redis) ActivateGlobal(ctx context.Context) error {
+	if r.wiringErr != nil {
+		return r.wiringErr
+	}
 	if err := r.client.Set(ctx, redisGlobalKey, "1", 0).Err(); err != nil {
 		return err
 	}
@@ -672,6 +709,9 @@ func (r *Redis) ActivateGlobal(ctx context.Context) error {
 
 // DeactivateGlobal deactivates the global kill switch.
 func (r *Redis) DeactivateGlobal(ctx context.Context) error {
+	if r.wiringErr != nil {
+		return r.wiringErr
+	}
 	if err := r.client.Del(ctx, redisGlobalKey).Err(); err != nil {
 		return err
 	}
@@ -690,6 +730,9 @@ func (r *Redis) DeactivateGlobal(ctx context.Context) error {
 // rather than writing the bare prefix key and triggering a spurious full refresh on every
 // replica.
 func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) error {
+	if r.wiringErr != nil {
+		return r.wiringErr
+	}
 	verb := "Kill"
 	if !kill {
 		verb = "Revive"
@@ -771,6 +814,9 @@ func (r *Redis) ReviveSession(ctx context.Context, sessionID string) error {
 
 // Reset clears all kill-switch state.
 func (r *Redis) Reset(ctx context.Context) error {
+	if r.wiringErr != nil {
+		return r.wiringErr
+	}
 	// Delete the global key; propagate the error so a silent failure does not leave
 	// the global switch active while the caller believes it cleared.
 	if err := r.client.Del(ctx, redisGlobalKey).Err(); err != nil {
@@ -830,6 +876,9 @@ func (r *Redis) Reset(ctx context.Context) error {
 // three readers from disagreeing about the same instance.
 func (r *Redis) Status(_ context.Context) (*Status, error) {
 	// Before mu, as the siblings do: a never-Started switch has no cache to lock over.
+	if r.wiringErr != nil {
+		return nil, r.wiringErr
+	}
 	if !r.started.Load() {
 		return nil, ErrNotStarted
 	}
@@ -853,6 +902,9 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 // already happened, so a publish failure does NOT undo the kill — it only delays remote
 // convergence to the next reconcile. Publish is part of redis.Cmdable, so no assertion needed.
 func (r *Redis) publish(ctx context.Context, msg string) error {
+	if r.wiringErr != nil {
+		return r.wiringErr
+	}
 	return r.client.Publish(ctx, redisPubSubChan, msg).Err()
 }
 
@@ -867,6 +919,9 @@ func (r *Redis) recordRefreshErr(err error) error {
 }
 
 func (r *Redis) refreshState(ctx context.Context) error {
+	if r.wiringErr != nil {
+		return r.recordRefreshErr(r.wiringErr)
+	}
 	// Serialize refreshes so two scans cannot interleave and commit out of order: a
 	// cacheGen match only guards against a racing cache MUTATION, not against a
 	// second refresh that captured the same generation, so without this an older
@@ -1008,12 +1063,11 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 // Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary is
 // single-node, and callcounter.NewRedis refuses a sharding client outright.
 func (r *Redis) forEachNode(ctx context.Context, fn func(context.Context, redis.Cmdable) error) error {
-	// A nil client is refused HERE rather than left to the first command: go-redis dereferences
-	// the receiver before it can build a reply, so a nil one panics instead of erroring, and this
-	// runs on the reconcile goroutine where that is process death. As an error it is a backend
-	// that failed, which refreshState already answers by going degraded — fail-closed by default.
+	// Backstop only: NewRedis latches ErrNilClient and every entry point above refuses before
+	// reaching here, so this catches a *Redis assembled by some other means (the package's own
+	// tests) rather than anything a consumer can reach.
 	if redisutil.IsNilClient(r.client) {
-		return errNilClient
+		return ErrNilClient
 	}
 	if fanOut := redisutil.ShardIterator(r.client); fanOut != nil {
 		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error { return fn(ctx, node) })

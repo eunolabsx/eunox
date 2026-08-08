@@ -96,15 +96,9 @@ func upstreamAddressedRevision(_ capability.Revision) capability.Revision { retu
 // A leg with no revision yet ("") is not checked: there is nothing to contradict, and refusing
 // would deny a message on the strength of a fact nobody has established.
 //
-// One consequence worth stating rather than rediscovering: against a LIVE leg this refuses every
-// message resolving to anything but the handshake revision, and every method the newer revision
-// currently declares forwards its params — so today a host context standing in front of a live
-// upstream can only ever resolve, and therefore only ever pin, the handshake revision, and the
-// mid-context-flip refusal is unreachable for a peer declaring the newer one. That is
-// fail-closed (those messages are refused here, one gate earlier) and it is incidental, not
-// load-bearing: the day a locally-answered method for the newer revision lands, such a message
-// resolves, pins, and is dispatched — which is correct, because the peer declared a revision on
-// a message this proxy acted on. Nothing downstream may assume the pin's value.
+// Consequence worth stating: today no method the newer revision declares reaches the PIN against
+// a live leg, so nothing downstream may assume the pin's value — that is incidental, not a
+// property to rely on.
 func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
 	if legRev == "" {
 		return nil

@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -24,7 +25,6 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/eunolabs/eunox/internal/redisutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -581,50 +581,46 @@ func TestScanPrefix_VisitsEveryShard(t *testing.T) {
 		"a keyless SCAN reached %v, not both shards; the kill set loaded from one server of several would report healthy while missing every kill on the others", found)
 }
 
-// TestShardTopology_IsOneList pins what replaced this package's own type switch: the iterator
-// and the "does this client shard" predicate both come from redisutil, so a client one caller
-// calls sharding and the other has no iterator for is not a state that can be constructed. The
-// previous shape — two hand-written lists, agreeing by review — had already drifted once.
-func TestShardTopology_IsOneList(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name    string
-		client  redis.Cmdable
-		wantFan bool
-	}{
-		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}}), true},
-		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000"}}), true},
-		{"single node", redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"}), false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tc.wantFan, redisutil.ShardIterator(tc.client) != nil,
-				"ShardIterator(%T) decides BOTH questions this package used to answer with its own type switch: does it shard, and how is it enumerated", tc.client)
-		})
-	}
-}
-
-// TestForEachNode_NilClientErrorsRatherThanPanics is the consumer-side half of the typed-nil
-// rule, asserted where the hazard actually lands. forEachNode CALLS whatever iterator it is
-// handed, on the reconcile goroutine, so an iterator bound to a nil receiver is a nil-pointer
-// dereference inside go-redis — process death on the emergency-stop path.
+// TestNilClient_EveryEntryPointFailsClosedRatherThanPanicking drives the REAL lifecycle, which
+// is the whole point: go-redis dereferences the receiver before it can build a reply, so every
+// command on a nil client panics rather than erroring — and the first two to run are Start's
+// Subscribe (a typed nil satisfies the pubSubClient assertion, since that tests the dynamic
+// type) and the reconcile goroutine's Get inside refreshState. A guard placed further down the
+// call graph is unreachable: nothing gets that far.
 //
-// Routing the typed nil to the single-node path is not by itself the fix: go-redis dereferences
-// the receiver before it can build a reply, so the SCAN there panics too. The nil client is
-// refused up front, which refreshState answers by going degraded — fail-closed by default.
+// So the refusal is latched at construction and every entry point reports it. An unrecovered
+// panic on the reconcile goroutine is process death on the emergency-stop path; ErrNilClient is
+// a kill switch that denies everything, which is the fail-closed outcome.
 //
 // Reachable by a library consumer wiring this backend with a nil-valued handle (a config path
 // that leaves the client unset, an ignored constructor error). The shipped binary is single-node.
-func TestForEachNode_NilClientErrorsRatherThanPanics(t *testing.T) {
+func TestNilClient_EveryEntryPointFailsClosedRatherThanPanicking(t *testing.T) {
 	t.Parallel()
-	for _, client := range []redis.Cmdable{nil, (*redis.ClusterClient)(nil), (*redis.Ring)(nil), (*redis.Client)(nil)} {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		// scanPrefix is the real caller: it fans out, and each node runs a SCAN.
-		err := (&Redis{client: client}).scanPrefix(ctx, redisSessionPfx, map[string]bool{})
-		cancel()
-		assert.ErrorIs(t, err, errNilClient,
-			"%T: a nil client must be refused as an error the kill switch fails closed on, not a panic on the reconcile goroutine", client)
+	for _, client := range []redis.Cmdable{nil, (*redis.Client)(nil), (*redis.ClusterClient)(nil), (*redis.Ring)(nil)} {
+		t.Run(fmt.Sprintf("%T", client), func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			// Every one of these panicked before: Start on Subscribe, the readers on the
+			// reconcile goroutine's Get, the writers on Set/Del, Reset on Del.
+			r := NewRedis(client, WithFailOpen(true))
+			r.Start(ctx)
+			defer r.Stop()
+
+			blocked, err := r.ShouldBlock(ctx, "agent", "sess")
+			assert.False(t, blocked)
+			assert.ErrorIs(t, err, ErrNilClient,
+				"fail-OPEN must not turn a permanent wiring fault into a silent all-clear; it trades revocation for availability during a TRANSIENT outage, and this one never heals")
+			assert.ErrorIs(t, r.HealthStatus(), ErrNilClient)
+			assert.ErrorIs(t, r.ActivateGlobal(ctx), ErrNilClient)
+			assert.ErrorIs(t, r.KillSession(ctx, "sess"), ErrNilClient)
+			assert.ErrorIs(t, r.KillAgent(ctx, "agent"), ErrNilClient)
+			assert.ErrorIs(t, r.Reset(ctx), ErrNilClient)
+			_, _, ttlErr := r.PublishSessionKillTTL(ctx)
+			assert.ErrorIs(t, ttlErr, ErrNilClient)
+			_, statusErr := r.Status(ctx)
+			assert.ErrorIs(t, statusErr, ErrNilClient)
+		})
 	}
 }
 

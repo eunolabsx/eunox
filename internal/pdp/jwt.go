@@ -1145,7 +1145,14 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 			break
 		}
 		if resp := evaluateJWTConditions(ctx, p.clock, p.inner, matched.Conditions, condReq); resp != nil {
-			lastDeny = resp
+			// A FAULT survives a later grant's policy verdict. Both refuse, so the call is
+			// denied either way — but only a policy verdict is downgradable, so overwriting
+			// "this grant's condition could never be evaluated" with "that grant's condition
+			// says no" hands an observing route a forward for a restriction nothing checked,
+			// decided by the order the grants happen to sit in the claim.
+			if lastDeny == nil || lastDeny.Denial == nil || lastDeny.Denial.Downgradable() {
+				lastDeny = resp
+			}
 			continue
 		}
 		// This entry's conditions all passed.
@@ -1954,11 +1961,23 @@ func collectArgStringsDepth(v interface{}, out *[]string, depth int) bool {
 // built-in directly here would enforce the override on the manifest path and the
 // shipped predicate here, for the same condition on the same call. nil means a
 // JWT-only route with no engine, where the built-ins ARE the semantics.
+//
+// # Which denial CODE each refusal mints
+//
+// One rule, because the code is the sole encoding of the refusal's class and an observing
+// route may downgrade only a policy verdict: a refusal here is CONDITION_FAILED-family only
+// when the condition was actually EVALUATED and the call failed it (OPERATION_NOT_PERMITTED
+// for a scanned verb outside the set, MISSING_CONTEXT for a scan that found no operation, and
+// whatever denyFromCondition carries up from the shared evaluator). Every arm that refuses
+// WITHOUT completing the check mints ENFORCEMENT_ERROR — no request to check against, a
+// handler that cannot be run ahead of the decision, a grant shape this build cannot enforce,
+// a condition type with no evaluator, or an argument tree too deep to scan. Those leave the
+// restriction guarding the call unchecked, so there is no verdict for --audit to stand in for.
 func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval claimConditionEvaluator, conditions []capability.Condition, req *capability.EnforceRequest) *capability.EnforceResponse {
 	if req == nil {
 		// Unreachable from Decide (which always builds one), but a nil request must
 		// DENY rather than read as a grant whose conditions all passed.
-		resp := denyResponse(clock, capability.ErrCodeConditionFailed, "",
+		resp := denyResponse(clock, capability.ErrCodeEnforcementError, "",
 			"JWT capability-claim conditions were evaluated with no request to check against; deny (fail closed)")
 		return &resp
 	}
@@ -1975,7 +1994,7 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 			// path. Startup refuses that wiring outright (WrapRoutesWithJWT); this is
 			// the backstop for a JWTPDP built directly.
 			if claimConditionOverridden(eval, capability.ConditionTypeAllowedOperations) {
-				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+				resp := denyResponseWithDetails(clock, capability.ErrCodeEnforcementError, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: the deciding policy redefines %s, and this capability claim's argument-less op= form cannot be judged by that handler; deny (fail closed) — grant the operation through a manifest constraint that names the operation argument instead",
 						name, capability.ConditionTypeAllowedOperations),
 					map[string]interface{}{"conditionType": capability.ConditionTypeAllowedOperations, "reason": "handler_override_unsupported"})
@@ -1988,7 +2007,7 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 				// than falling to scan-all-args below, since a named argument means
 				// "match THIS one" and scanning all would silently match an
 				// alternative (the "never silently match alternatives" invariant).
-				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+				resp := denyResponseWithDetails(clock, capability.ErrCodeEnforcementError, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: allowedOperations with a named argument is not supported from a capability claim", name),
 					map[string]interface{}{"argument": c.Argument, "allowedOperations": c.Operations})
 				return &resp
@@ -1998,7 +2017,7 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 			// "disallowed verbs" set to check against, so fail closed instead.
 			for _, op := range c.Operations {
 				if !isSQLVerb(op) {
-					resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+					resp := denyResponseWithDetails(clock, capability.ErrCodeEnforcementError, capability.ConditionTypeAllowedOperations,
 						fmt.Sprintf("%q: non-SQL operation %q cannot be safely enforced without an explicit argument naming the operation parameter; use the manifest form that names the argument", name, op),
 						map[string]interface{}{"operation": op, "allowedOperations": c.Operations})
 					return &resp
@@ -2014,7 +2033,7 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 			// order keeps the result deterministic despite map iteration order.
 			var argStrings []string
 			if !collectArgStrings(args, &argStrings) {
-				resp := denyResponseWithDetails(clock, capability.ErrCodeConditionFailed, capability.ConditionTypeAllowedOperations,
+				resp := denyResponseWithDetails(clock, capability.ErrCodeEnforcementError, capability.ConditionTypeAllowedOperations,
 					fmt.Sprintf("%q: arguments nested too deeply to scan for operations", name),
 					map[string]interface{}{"maxDepth": maxArgStringDepth, "allowedOperations": c.Operations})
 				return &resp
