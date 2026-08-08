@@ -135,9 +135,10 @@ type StdioProxy struct {
 	// configuredUpstreamRev is the operator's explicit pin, empty for "probe it".
 	configuredUpstreamRev capability.Revision
 
-	// hostRev is the revision this host connection's context resolved, pinned from its FIRST
-	// message and checked against every later one (resolveHostRevision), so a mid-context flip
-	// is refused rather than silently switching method tables.
+	// hostRev is the revision this host connection's context resolved, pinned from its first
+	// message that the resolved revision DEFINES (see negotiateHostRevision for why the second
+	// half is load-bearing) and checked against every later one (resolveHostRevision), so a
+	// mid-context flip is refused rather than silently switching method tables.
 	//
 	// WRITTEN only by serveHost, inline on the loop that reads host messages, before the
 	// per-request handler is spawned. Pinning it from the initialize RESPONSE instead was the
@@ -1120,7 +1121,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		checkKill:   func() *capability.EnforceResponse { return p.pdp.CheckKill(ctx, p.sessionID) },
 		leg:         legStdioNotification,
 	}
-	if !gate.admit(ctx, msg) {
+	if gate.admit(ctx, msg) != notificationForward {
 		return false
 	}
 	if !p.waitHostForwardOrShutdown(ctx) {
@@ -1186,8 +1187,17 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its
-// FIRST resolved message, so every later message is checked against it — which is what makes
-// the mid-context-flip refusal reachable for a peer that never sends initialize.
+// first resolved message that the resolved revision actually DEFINES, so every later message
+// is checked against it — which is what makes the mid-context-flip refusal reachable for a
+// peer that never sends initialize.
+//
+// The "defines it" half is what keeps that pin from being a wedge. A message whose method the
+// declared revision does not have is about to be dropped by the fail-closed routing default,
+// so it is not evidence about which revision this conversation is on — and latching from one
+// ends the connection: a single id-less `initialize` declaring the revision that REMOVED
+// `initialize` pinned that revision, and the host's real handshake was then denied under a
+// table with no `initialize` in it, with a re-declaration refused as a mid-context flip and an
+// omission inheriting the pin. There is no way back; the peer's only recourse is a new process.
 //
 // It returns the STAMPED context rather than the bare revision: that context is the one
 // carrier of the decided revision (the tables route by it, the tape records it), so a caller
@@ -1206,12 +1216,16 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 		}
 		return ctx, false
 	}
-	p.hostRev.Store(rev)
+	if definesMethod(rev, msg.Method) {
+		p.hostRev.Store(rev)
+	}
 	return capability.WithProtocolRevision(ctx, rev), true
 }
 
-// hostRevision returns the revision this connection's context resolved, or "" before its
-// first message has been negotiated. See StdioProxy.hostRev for the single-writer rule.
+// hostRevision returns the revision this connection's context resolved, or "" before a message
+// this proxy could act on has been negotiated — a connection whose traffic so far is methods
+// its declared revision does not define stays unpinned, which is the point. See
+// StdioProxy.hostRev for the single-writer rule.
 func (p *StdioProxy) hostRevision() capability.Revision {
 	rev, _ := p.hostRev.Load().(capability.Revision)
 	return rev

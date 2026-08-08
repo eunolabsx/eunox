@@ -661,11 +661,11 @@ func TestStdioUpstreamRequest_ReturnsWhileTheTurnIsHeld(t *testing.T) {
 	assert.NotNil(t, uw.messages[0].Error)
 }
 
-// TestDecideSampling_RefusedTurnIsAHardDeny pins what a refused turn produces. The refusal has
+// TestDecideSampling_RefusedTurnIsABlockOverride pins what a refused turn produces. The refusal has
 // to be a DENY rather than an unserialized decision (the peek would be racing a host source's
 // label write, the exact fail-open the turn exists to close), and it has to be HARD so an
 // --audit route cannot downgrade it into the forward it exists to prevent.
-func TestDecideSampling_RefusedTurnIsAHardDeny(t *testing.T) {
+func TestDecideSampling_RefusedTurnIsABlockOverride(t *testing.T) {
 	t.Parallel()
 	fp := serverRequestParams{
 		sessionID:  "sess-a",
@@ -677,7 +677,7 @@ func TestDecideSampling_RefusedTurnIsAHardDeny(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, dec.Decision, "an unenterable turn must not be decided unserialized")
 	require.NotNil(t, dec.Denial)
 	assert.Equal(t, capability.ConditionTypeFlowLabel, dec.Denial.ConditionType)
-	assert.True(t, dec.Denial.HardDeny, "an --audit route must not downgrade it into the forward it prevents")
+	assert.True(t, dec.Denial.BlockOverride, "an --audit route must not downgrade it into the forward it prevents")
 	assert.Equal(t, "turn_unavailable", dec.Denial.Details["reason"])
 }
 

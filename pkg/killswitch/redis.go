@@ -969,42 +969,6 @@ func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]boo
 	return gained
 }
 
-// shardFanOut returns the per-server iterator for a client that shards the keyspace, sharded
-// false for one that keeps it on a single server, and an error for a client that shards but
-// has no iterator here.
-//
-// ONE resolver for both keyless-command sites (the refresh SCAN and the reset sweep). Whether
-// a client shards is ASKED of callcounter.IsShardingClient rather than re-enumerated: the two
-// hand-written switches this replaced had already drifted inside one file (both named
-// ClusterClient, neither named Ring), and a second list one package over is that same drift
-// with a package boundary hiding it. What stays here is only WHICH iterator to call.
-//
-// A shape IsShardingClient names and this switch has no iterator for is an error, not a
-// fall-through: the single-node path would SCAN one server of several and load a partial kill
-// set while reporting healthy, which is the fail-open the *redis.Ring case already was.
-func shardFanOut(client redis.Cmdable) (fanOut func(context.Context, func(context.Context, *redis.Client) error) error, sharded bool, err error) {
-	return shardFanOutWhen(client, callcounter.IsShardingClient(client))
-}
-
-// shardFanOutWhen is shardFanOut with the "does this client shard" answer supplied. The seam
-// exists so the disagreement branch is reachable from a test: the two questions are answered
-// from one type list today, which is the point, and a branch guarding the day they diverge
-// cannot otherwise be exercised.
-func shardFanOutWhen(client redis.Cmdable, sharding bool) (fanOut func(context.Context, func(context.Context, *redis.Client) error) error, sharded bool, err error) {
-	if !sharding {
-		return nil, false, nil
-	}
-	switch c := client.(type) {
-	case *redis.ClusterClient:
-		// Masters only: a replica holds the same keys, so scanning them would double the work
-		// and, mid-failover, disagree with its master about what is there.
-		return c.ForEachMaster, true, nil
-	case *redis.Ring:
-		return c.ForEachShard, true, nil
-	}
-	return nil, false, fmt.Errorf("kill switch: %T spreads the keyspace across servers but this build has no per-server iterator for it; refusing a keyless SCAN that would enumerate only one of them", client)
-}
-
 // scanner is the subset of a Redis node needed to enumerate keys by prefix. A PARAMETER
 // type for the per-node helpers (called with both r.client and an individual
 // ForEachMaster master), not a capability test.
@@ -1017,23 +981,29 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	// full enumeration must visit each and merge the scans — otherwise refreshState loads a
 	// partial kill set and reports healthy, a fail-open on the emergency stop.
 	//
-	// Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary
-	// is single-node, and callcounter.NewRedis refuses a sharding client outright. Kept, and
-	// kept covering BOTH shapes callcounter.IsShardingClient names, because the half-handled
-	// version was the dangerous one — a Ring fell through to the single-node path and loaded
-	// whichever shard go-redis picked at random for that refresh.
-	fanOut, sharded, err := shardFanOut(r.client)
-	if err != nil {
-		return err
+	// The mutex is taken unconditionally: on the single-node path it is uncontended, and
+	// making it conditional is what would put a second copy of the topology decision here.
+	var mu sync.Mutex
+	return r.forEachNode(ctx, func(ctx context.Context, node redis.Cmdable) error {
+		return scanNode(ctx, node, prefix, target, &mu)
+	})
+}
+
+// forEachNode runs fn against every server holding part of this keyspace: each shard of a
+// sharding client, or the one node otherwise. The ONE place that decision is made, so the two
+// keyless-command sites cannot drift — the shape they were in before, when one of them fell
+// through to a single-node SCAN for a *redis.Ring and loaded whichever shard go-redis picked.
+//
+// The topology comes from callcounter.ShardIterator, which is also what DEFINES "does this
+// client shard", so this cannot be handed a shape it has no iterator for.
+//
+// Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary is
+// single-node, and callcounter.NewRedis refuses a sharding client outright.
+func (r *Redis) forEachNode(ctx context.Context, fn func(context.Context, redis.Cmdable) error) error {
+	if fanOut := callcounter.ShardIterator(r.client); fanOut != nil {
+		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error { return fn(ctx, node) })
 	}
-	if sharded {
-		var mu sync.Mutex
-		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
-			return scanNode(ctx, node, prefix, target, &mu)
-		})
-	}
-	// r.client satisfies scanner by construction: Scan is part of redis.Cmdable.
-	return scanNode(ctx, r.client, prefix, target, nil)
+	return fn(ctx, r.client)
 }
 
 // scanNode SCANs a single node for keys matching prefix and records the stripped IDs in
@@ -1069,20 +1039,11 @@ type scanDeleter interface {
 }
 
 func (r *Redis) deleteByPrefix(ctx context.Context, prefix string) error {
-	// As with scanPrefix, a sharding client SCANs only one server, so a reset must visit each;
-	// otherwise Reset() reports success while leaving kills on the others.
-	fanOut, sharded, err := shardFanOut(r.client)
-	if err != nil {
-		return err
-	}
-	if sharded {
-		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
-			return deleteNodeKeys(ctx, node, prefix)
-		})
-	}
-	// r.client satisfies scanDeleter by construction: Scan and Del are both part of
-	// redis.Cmdable.
-	return deleteNodeKeys(ctx, r.client, prefix)
+	// Through the same resolver as scanPrefix: a sharding client SCANs only one server, so a
+	// reset must visit each or Reset() reports success while leaving kills on the others.
+	return r.forEachNode(ctx, func(ctx context.Context, node redis.Cmdable) error {
+		return deleteNodeKeys(ctx, node, prefix)
+	})
 }
 
 // deleteNodeKeys SCANs a single node and deletes keys one at a time: a multi-key DEL can

@@ -879,12 +879,18 @@ func TestStdioProxy_NewRevisionPeerLosesRemovedMethods(t *testing.T) {
 // TestStdioProxy_ContextPinsFromItsFirstMessage is the regression for a pin that only landed
 // when `initialize` was answered.
 //
-// Two defects shared that placement. A peer on a revision with no `initialize` never pinned at
-// all, so `resolveHostRevision` accepted whatever each request declared and the peer could
-// alternate method tables per message for the connection's life — the mid-context-flip refusal
-// was inert for exactly the revision that mandates per-request declarations. And the pin was
-// written from a handler goroutine while the serve loop read it for the next message, so a
-// pipelined follow-up resolved against an unpinned context depending on scheduling.
+// Two defects shared that placement. A peer that never sends `initialize` never pinned at all,
+// so `resolveHostRevision` accepted whatever each request declared and the peer could alternate
+// method tables per message for the connection's life — the mid-context-flip refusal was inert
+// for exactly the peers that declare per request. And the pin was written from a handler
+// goroutine while the serve loop read it for the next message, so a pipelined follow-up
+// resolved against an unpinned context depending on scheduling.
+//
+// The peer here declares the OLDER revision, and never handshakes. Declaring the newer one
+// cannot be exercised against a live upstream leg at all: every method 2026-07-28 defines
+// forwards its params, so each is refused for contradicting the leg eunox opened at the
+// handshake revision, one gate before the pin. That the newer revision pins on a leg with
+// nothing to contradict is TestStdioNegotiation_StillPinsFromADefinedMethod's cell.
 func TestStdioProxy_ContextPinsFromItsFirstMessage(t *testing.T) {
 	if testing.Short() {
 		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
@@ -896,35 +902,48 @@ func TestStdioProxy_ContextPinsFromItsFirstMessage(t *testing.T) {
 		ShutdownMs: 2000,
 	})
 
-	// First message declares the newer revision and never handshakes: that IS the negotiation.
-	// A locally-answered method, so the pin is what is under test rather than the upstream
-	// leg's ability to honor the declaration — ping is denied here because 2026-07-28 removed
-	// it, which is the peer's own table answering and proof the pin landed.
+	// First message declares its revision and never handshakes: that IS the negotiation. A
+	// locally-answered method, so the pin is what is under test rather than the upstream leg's
+	// ability to honor the declaration — and one the declared revision DEFINES, since a message
+	// the proxy is about to refuse says nothing about which revision this conversation is on.
 	first := h.roundTrip(t, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "ping",
-		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
-	})
-	if first.Error == nil || first.Error.Code != capability.JSONRPCCodeAuthorizationFailed {
-		t.Fatalf("the first message must resolve under the revision it declares, whose tables have no ping; got %+v (result %s)", first.Error, first.Result)
-	}
-	if got := h.proxy.hostRevision(); got != capability.Revision20260728 {
-		t.Fatalf("context revision = %q, want %q — the pin must land on the FIRST resolved message, not only on initialize", got, capability.Revision20260728)
-	}
-
-	// Flipping back to the older (larger) table on the same connection must now be refused.
-	flip := h.roundTrip(t, mcp.RPCMsg{
-		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "ping",
 		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}`),
 	})
-	if flip.Error == nil || flip.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
-		t.Fatalf("a flip back to the older revision must be refused -32022, got %+v (result %s)", flip.Error, flip.Result)
+	if first.Error != nil {
+		t.Fatalf("the first message must resolve under the revision it declares, whose tables have ping; got %+v", first.Error)
+	}
+	if got := h.proxy.hostRevision(); got != capability.Revision20251125 {
+		t.Fatalf("context revision = %q, want %q — the pin must land on the FIRST message this proxy acts on, not only on initialize", got, capability.Revision20251125)
 	}
 
-	// And an undeclared request inherits the pinned revision rather than the default, so it
-	// cannot regain a removed method by simply omitting the declaration.
+	// Flipping to the other table on the same connection must now be refused, rather than
+	// re-negotiated. With no pin this would simply resolve to the declared revision.
+	flip := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "ping",
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if flip.Error == nil || flip.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Fatalf("a flip to the other revision must be refused -32022, got %+v (result %s)", flip.Error, flip.Result)
+	}
+
+	// An undeclared request INHERITS the pin rather than renegotiating, and does not disturb it:
+	// the refused flip above cannot be worked around by omitting the declaration and trying
+	// again. Asserted through the pin and a second flip, since this peer's revision equals the
+	// unnegotiated fallback — so "answered" alone would hold with no pin at all.
 	bare := h.roundTrip(t, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "ping"})
-	if bare.Error == nil {
-		t.Fatalf("ping must stay denied on a context pinned to the revision that removed it, got result %s", bare.Result)
+	if bare.Error != nil {
+		t.Fatalf("an undeclared request must inherit the pinned revision and stay answerable, got %+v", bare.Error)
+	}
+	if got := h.proxy.hostRevision(); got != capability.Revision20251125 {
+		t.Fatalf("context revision = %q after an undeclared request, want %q — omission must inherit the pin, not clear it", got, capability.Revision20251125)
+	}
+	retry := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "ping",
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if retry.Error == nil || retry.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Fatalf("the flip must stay refused after an undeclared request, got %+v (result %s)", retry.Error, retry.Result)
 	}
 
 	if err := h.shutdown(t); err != nil {

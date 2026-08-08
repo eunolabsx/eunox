@@ -83,7 +83,7 @@ func TestTier2_DescriptionChangeOnUnpinnedToolTripsPinBreak(t *testing.T) {
 	}
 	// The break must not be downgradable: an audit-mode route forwarding the call would
 	// deliver the rewritten tool to the host, which is the whole thing being prevented.
-	if !dec.Denial.HardDeny {
+	if !dec.Denial.BlockOverride {
 		t.Fatal("a Tier-2 pin break must be a hard deny, not one an audit route can forward")
 	}
 }
@@ -563,7 +563,7 @@ func TestTier2BreakSurvivesAJWTShortCircuitDeny(t *testing.T) {
 			ctrl := inner.Decide(context.Background(), sessionID,
 				EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"},
 				map[string]interface{}{"path": "/etc/shadow"}, "")
-			if ctrl.Denial == nil || !ctrl.Denial.HardDeny {
+			if ctrl.Denial == nil || !ctrl.Denial.BlockOverride {
 				t.Fatalf("control: a tier-2 break through the manifest PDP must be a hard deny, got %+v", ctrl.Denial)
 			}
 
@@ -580,8 +580,8 @@ func TestTier2BreakSurvivesAJWTShortCircuitDeny(t *testing.T) {
 			if got.Denial == nil {
 				t.Fatal("a refusal must carry a denial")
 			}
-			if !got.Denial.HardDeny {
-				t.Errorf("HardDeny = false: an --audit route would downgrade this to a forward and send\n"+
+			if !got.Denial.BlockOverride {
+				t.Errorf("BlockOverride = false: an --audit route would downgrade this to a forward and send\n"+
 					"the call to the upstream whose interface was rewritten. denial = %+v", got.Denial)
 			}
 			if len(got.Obligations) != 0 {
@@ -617,7 +617,7 @@ func TestJWTShortCircuitDenyStaysSoftWithAnIntactPin(t *testing.T) {
 	if got.Denial == nil {
 		t.Fatal("want a denial")
 	}
-	if got.Denial.HardDeny {
+	if got.Denial.BlockOverride {
 		t.Error("a plain JWT authorization deny with no pin break must stay downgradable")
 	}
 }

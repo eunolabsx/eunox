@@ -269,8 +269,8 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 		Target:  "tool",
 		Actions: []string{"*"},
 		// An AUDIT-mode constraint, so WillForwardDeny answers yes for this call: the refusal
-		// must still block, which is the property HardDeny carries (see WillForwardDeny for
-		// the union and the transport test that pins the forwarding half).
+		// must still block, which is the property DenialInfo.Downgradable answers (see
+		// WillForwardDeny for the union and the transport test that pins the forwarding half).
 		Enforcement: capability.EnforcementAudit,
 		// Two maxCalls with DISTINCT windows: forces the multi-deferred atomic-commit path.
 		Conditions: []capability.Condition{
@@ -288,8 +288,8 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
 		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
-	if !resp.Denial.HardDeny {
-		t.Fatal("denial must be a HardDeny: WillForwardDeny answers yes here, so a downgradable skip-contract violation would ship with the budget unchecked")
+	if resp.Denial.Downgradable() {
+		t.Fatal("denial must not be downgradable: WillForwardDeny answers yes here, so a downgradable skip-contract violation would ship with the budget unchecked")
 	}
 }
 
@@ -298,7 +298,7 @@ func TestCommitDeferredAtomic_NonUniformSkipFailsClosed(t *testing.T) {
 // ONE committing condition whose handler skips unasked is refused exactly as the two-bucket
 // case is. There is one consumption site now, so there is one refusal to test — the retired
 // single-condition path had its own copy of this guard, and the two had already drifted on
-// HardDeny, the field that decides whether an audit route forwards the call anyway.
+// whether an audit route forwards the call anyway.
 func TestCommitDeferredAtomic_UnauthorizedSkipIsRefusedOnASingleCondition(t *testing.T) {
 	handler := &nonUniformSkipHandler{}
 	e := New(WithCallCounter(callcounter.NewInMemory()), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, handler))
@@ -320,8 +320,8 @@ func TestCommitDeferredAtomic_UnauthorizedSkipIsRefusedOnASingleCondition(t *tes
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
 		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
-	if !resp.Denial.HardDeny {
-		t.Fatal("denial must carry HardDeny: WillForwardDeny answers yes for an audit-mode constraint, so the budget would ship unchecked")
+	if resp.Denial.Downgradable() {
+		t.Fatal("denial must not be downgradable: WillForwardDeny answers yes for an audit-mode constraint, so the budget would ship unchecked")
 	}
 
 	// The assertion refuses an UNAUTHORIZED skip, not skipping: the same handler under observe
@@ -801,7 +801,7 @@ func TestCommitDeferredAtomic_SkipWithPreparedBucketIsHonored(t *testing.T) {
 // is decided AFTER every condition is prepared. Returning on the first over-committing bucket
 // would replace a later condition's real validation verdict with a handler complaint — the
 // observe run would stop predicting what enforce mode reports, which is the divergence the
-// two-pass commit exists to prevent — and would flip the denial's HardDeny, changing whether
+// two-pass commit exists to prevent — and would flip the denial's class, changing whether
 // an audit route forwards.
 func TestCommitDeferredAtomic_ObserveCommitDoesNotMaskLaterCondErr(t *testing.T) {
 	e := sentinelEngine()
@@ -850,13 +850,13 @@ func TestRunConditions_TypedNilConditionFailsClosed(t *testing.T) {
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
 		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", resp.Denial)
 	}
-	// HardDeny, like the two sibling engine-bug denies in runConditions. Without it an
+	// Non-downgradable, like the two sibling engine-bug denies in runConditions. Otherwise an
 	// audit-only constraint (or a route under --audit) downgrades this verdict and
 	// FORWARDS the call — so a restriction the policy declared but the engine could not
 	// evaluate even once would let the call through, which is the fail-open the guard
 	// exists to prevent.
-	if !resp.Denial.HardDeny {
-		t.Error("denial.HardDeny = false; an unevaluable condition is a construction fault, not a downgradable policy verdict")
+	if resp.Denial.Downgradable() {
+		t.Error("the denial is downgradable; an unevaluable condition is a construction fault, not a policy verdict an audit route may forward")
 	}
 }
 
@@ -878,8 +878,8 @@ func TestRunConditions_NullConditionIsNotDowngradedUnderAuditMode(t *testing.T) 
 	if resp.Decision != capability.DecisionDeny {
 		t.Fatalf("decision = %q, want deny", resp.Decision)
 	}
-	if resp.Denial == nil || !resp.Denial.HardDeny {
-		t.Fatalf("denial = %+v, want HardDeny so the audit-only constraint cannot downgrade it to a forward", resp.Denial)
+	if resp.Denial == nil || resp.Denial.Downgradable() {
+		t.Fatalf("denial = %+v, want non-downgradable so the audit-only constraint cannot forward it", resp.Denial)
 	}
 }
 

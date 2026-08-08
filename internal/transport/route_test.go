@@ -178,7 +178,7 @@ func TestBuildRoutes_NoPolicyInheritsAudit(t *testing.T) {
 
 // TestBuildRoutes_ManifestWithRouteAuditEmitsBanner pins: a route with a
 // REAL manifest (all entries normal) AND route-level enforcement: audit downgrades
-// every downgradable deny to a forwarded observe (kill-switch and other HardDeny
+// every downgradable deny to a forwarded observe (kill-switch and other BlockOverride
 // denials still hard-block), but AuditOnlyCount() == 0 so the per-entry
 // NOTICE never fires. BuildRoutes must still emit a loud AUDIT MODE banner, matching
 // the stdio host, so a globally-observed policy is not silently un-enforced.

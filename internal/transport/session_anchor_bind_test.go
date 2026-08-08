@@ -212,7 +212,7 @@ func TestTaskAnchoredSession_SpanningRefusesTheSinkNotTheRequest(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, dec.Decision,
 		"the sink peeked the session's clean anchor while another task carried the taint")
 	require.NotNil(t, dec.Denial)
-	assert.True(t, dec.Denial.HardDeny, "an --audit route must not downgrade this into the forward it prevents")
+	assert.True(t, dec.Denial.BlockOverride, "an --audit route must not downgrade this into the forward it prevents")
 	assert.Equal(t, capability.ConditionTypeFlowLabel, dec.Denial.ConditionType)
 	assert.Equal(t, "session_spans_anchors", dec.Denial.Details["reason"])
 

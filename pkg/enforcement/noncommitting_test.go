@@ -134,5 +134,5 @@ func TestNonCommittingConditionVerdict_TypedNilHandlerIsNotUsable(t *testing.T) 
 	resp := e.ValidateAction(context.Background(), req, caps)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.True(t, resp.Denial.HardDeny)
+	assert.False(t, resp.Denial.Downgradable())
 }

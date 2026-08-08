@@ -5446,7 +5446,7 @@ func TestObligationLoop_UnhandledDirectiveFailsClosed(t *testing.T) {
 		assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 		assert.Contains(t, resp.Denial.Message, "unhandled obligation type")
 		assert.False(t, resp.AuditOnly, "an unwired directive is an engine bug, not a downgradable verdict")
-		assert.True(t, resp.Denial.HardDeny, "the deny must be hard so stamp()/isObserveDeny cannot downgrade it to a forward")
+		assert.False(t, resp.Denial.Downgradable(), "the deny must not be downgradable, so stamp()/isObserveDeny cannot turn it into a forward")
 	})
 
 	t.Run("ValidateAction", func(t *testing.T) {
@@ -7873,7 +7873,7 @@ func TestEngine_MultiMaxCalls_AtomicUnderConcurrency(t *testing.T) {
 }
 
 // unwiredDirective is a Directive whose obligation type the engine does not know how to
-// apply. CollectObligations returns a HardDeny for it — an engine bug, not a verdict.
+// apply. CollectObligations returns a BlockOverride for it — an engine bug, not a verdict.
 type unwiredDirective struct{}
 
 func (unwiredDirective) DirectiveType() string { return "notARealDirective" }
@@ -7970,7 +7970,7 @@ func TestDirectives_CollectedOnDowngradableDeny(t *testing.T) {
 // wiretap route from blocking. CollectObligations runs before the conditions so its
 // result can be stamped onto a downgradable deny, but its DENY must still be returned
 // where the original ordering returned it: after runConditions. Returning it early would
-// preempt the condition verdict, and an unwired directive produces a HardDeny — which
+// preempt the condition verdict, and an unwired directive produces a BlockOverride — which
 // isObserveDeny refuses to downgrade, so an audit-mode constraint documented never to
 // block would start BLOCKING live traffic.
 func TestUnwiredDirective_DoesNotPreemptTheConditionVerdict(t *testing.T) {
@@ -7995,7 +7995,7 @@ func TestUnwiredDirective_DoesNotPreemptTheConditionVerdict(t *testing.T) {
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeValueNotPermitted, resp.Denial.Code,
 		"the condition verdict must win; an unwired directive must not preempt it")
-	assert.False(t, resp.Denial.HardDeny, "an audit-mode route must not be made to block")
+	assert.False(t, resp.Denial.BlockOverride, "an audit-mode route must not be made to block")
 
 	// With the conditions PASSING, the unwired directive is still caught — a real engine
 	// bug must hard-deny rather than be silently skipped.
@@ -8004,7 +8004,7 @@ func TestUnwiredDirective_DoesNotPreemptTheConditionVerdict(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, bug.Decision)
 	require.NotNil(t, bug.Denial)
 	assert.Equal(t, capability.ErrCodeEnforcementError, bug.Denial.Code)
-	assert.True(t, bug.Denial.HardDeny, "an unwired directive must block even under audit mode")
+	assert.False(t, bug.Denial.Downgradable(), "an unwired directive must block even under audit mode")
 	assert.Empty(t, bug.Obligations, "a hard deny carries no obligations")
 }
 
@@ -8046,7 +8046,7 @@ func TestUnwiredDirective_DoesNotDropASiblingsObligations(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeValueNotPermitted, resp.Denial.Code, "the condition verdict must still win")
-	assert.False(t, resp.Denial.HardDeny, "an audit-mode route must not be made to block")
+	assert.False(t, resp.Denial.BlockOverride, "an audit-mode route must not be made to block")
 	require.Len(t, resp.Obligations, 1,
 		"a sibling directive's unwired obligation type must not drop this forwarded deny's redactFields")
 	assert.Equal(t, capability.DirectiveTypeRedactFields, resp.Obligations[0].Type)

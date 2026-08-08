@@ -2850,8 +2850,8 @@ func TestJWTPDP_DecideSampling_NoClaims_HardDenied(t *testing.T) {
 	if dec.Decision != capability.DecisionDeny || dec.Denial == nil || dec.Denial.Code != capability.ErrCodeNoJWTClaims {
 		t.Fatalf("sampling with no validated claims must hard-deny NO_JWT_CLAIMS; got %+v", dec)
 	}
-	if !dec.Denial.HardDeny {
-		t.Error("an authentication-boundary denial must be a HardDeny so --audit cannot downgrade it to a logged forward")
+	if !dec.Denial.BlockOverride {
+		t.Error("an authentication-boundary denial must be a BlockOverride so --audit cannot downgrade it to a logged forward")
 	}
 }
 
@@ -3287,8 +3287,8 @@ func TestJWT_decideInner_RoutesByTargetType(t *testing.T) {
 			if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
 				t.Errorf("denial = %+v, want code %s", resp.Denial, capability.ErrCodeEnforcementError)
 			}
-			if resp.Denial != nil && !resp.Denial.HardDeny {
-				t.Error("decideInner fail-closed deny must be HardDeny so a route under --audit cannot downgrade the engine-bug guard to a forward")
+			if resp.Denial != nil && !resp.Denial.BlockOverride {
+				t.Error("decideInner fail-closed deny must be BlockOverride so a route under --audit cannot downgrade the engine-bug guard to a forward")
 			}
 
 			if resp.RequestID == "sentinel" {
@@ -5120,12 +5120,12 @@ func TestJWTPDP_Decide_KillSwitchStillEnforced(t *testing.T) {
 	}
 }
 
-// TestJWTPDP_Decide_NoJWTClaimsHardDeny guards that the "no validated JWT claims in
+// TestJWTPDP_Decide_NoJWTClaimsBlockOverride guards that the "no validated JWT claims in
 // context" backstop is a HARD deny: the token was never validated, an authentication
 // boundary a route running under --audit must not downgrade to a logged forward — the
 // same treatment the cross-audience audience deny gets. Before the fix it used a soft
 // denyResponse that isObserveDeny could downgrade.
-func TestJWTPDP_Decide_NoJWTClaimsHardDeny(t *testing.T) {
+func TestJWTPDP_Decide_NoJWTClaimsBlockOverride(t *testing.T) {
 	p := NewJWTPDP(JWTPDPOptions{})
 	resp := p.Decide(context.Background(), "sess-1",
 		EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"},
@@ -5136,7 +5136,7 @@ func TestJWTPDP_Decide_NoJWTClaimsHardDeny(t *testing.T) {
 	if resp.Denial.Code != capability.ErrCodeNoJWTClaims {
 		t.Fatalf("expected %q, got %q", capability.ErrCodeNoJWTClaims, resp.Denial.Code)
 	}
-	if !resp.Denial.HardDeny {
+	if !resp.Denial.BlockOverride {
 		t.Fatal("NO_JWT_CLAIMS backstop must be a hard deny (not downgradable under --audit)")
 	}
 }
@@ -5666,8 +5666,8 @@ func TestJWTPDP_RouteAudience_NarrowsPerRoute(t *testing.T) {
 	}
 	// The audience pin is an authn/tenancy boundary: it must be a HARD deny so an
 	// --audit/observe-posture route cannot downgrade it to a forwarded call.
-	if !resp.Denial.HardDeny {
-		t.Fatal("a cross-audience deny must be HardDeny (not observe-downgradable)")
+	if !resp.Denial.BlockOverride {
+		t.Fatal("a cross-audience deny must be BlockOverride (not observe-downgradable)")
 	}
 }
 

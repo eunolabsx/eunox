@@ -62,7 +62,8 @@ func ResolveStateAnchor(taskAnchored, hasTask bool, taskID, sessionID string) St
 func (a StateAnchor) Key() string { return string(a.Kind) + "\x00" + a.ID }
 
 // appendStateAnchor appends the anchor's key components. It appends rather than returning a
-// fresh slice so its two callers can reuse a backing array instead of allocating per key build.
+// fresh slice so its caller can supply a stack array as the backing store instead of
+// allocating one per key build.
 func (e *Engine) appendStateAnchor(dst []string, req *capability.EnforceRequest) []string {
 	anchor := e.resolveAnchor(req)
 	if anchor.Kind == AnchorKindTask {
@@ -118,12 +119,16 @@ func (e *Engine) anchorUnresolved(req *capability.EnforceRequest) bool {
 // piece of state can't accidentally land on session keying while everything else follows the
 // task.
 func (e *Engine) anchoredKey(prefix string, req *capability.EnforceRequest, tail ...string) string {
-	// Sized once so the anchor lands in this slice rather than one of its own.
-	parts := make([]string, 0, 3+len(tail))
-	parts = append(parts, e.counterKeyNamespace)
-	parts = e.appendStateAnchor(parts, req)
-	parts = append(parts, tail...)
-	return compositeCounterKey(prefix, parts...)
+	// Head backed by a STACK array, and joined with the tail rather than flattened onto it:
+	// namespace plus the anchor is at most three components, and the joiner only reads them.
+	// The `make([]string, 0, 3+len(tail))` this replaced was a heap allocation per key built —
+	// half the allocations on a path that runs per quota bucket and per sequenceBlock lookup —
+	// for a slice nothing outlives the call to read.
+	var backing [3]string
+	head := e.appendStateAnchor(append(backing[:0], e.counterKeyNamespace), req)
+	// capability.CompositeKeyJoin directly rather than through a counter-side alias: the alias
+	// would be a second name for one encoding whose whole point is that there is one.
+	return capability.CompositeKeyJoin(prefix, head, tail)
 }
 
 // sequenceHistoryKey builds the per-anchor, per-target key an allowed call is recorded under

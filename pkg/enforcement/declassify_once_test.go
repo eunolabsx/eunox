@@ -84,7 +84,7 @@ func TestDeclassifyOnce_SecondPresentationEscalates(t *testing.T) {
 	assert.Equal(t, "approval_consumed", replay.Denial.Details["reason"],
 		"a spent grant must read as consumed, not as 'no approval covers this' — the two send an operator to different fixes")
 	assert.Equal(t, "apr-1", replay.Denial.Details["consumed_approval_id"])
-	assert.True(t, replay.Denial.HardDeny, "a consumed-approval escalation must not be downgraded and forwarded by an audit route")
+	assert.True(t, replay.Denial.BlockOverride, "a consumed-approval escalation must not be downgraded and forwarded by an audit route")
 }
 
 // TestDeclassifyOnce_StandingGrantStillReplays pins that the mechanism is opt-in per grant: a
@@ -189,7 +189,7 @@ func TestDeclassifyOnce_LedgerFaultEscalates(t *testing.T) {
 			declassifyCaps("publish", capability.FlowLabelPII))
 		require.Equal(t, capability.DecisionDeny, resp.Decision)
 		require.NotNil(t, resp.Denial)
-		assert.True(t, resp.Denial.HardDeny, "a grant that could not be burned must not clear a label anyway")
+		assert.False(t, resp.Denial.Downgradable(), "a grant that could not be burned must not clear a label anyway")
 	})
 }
 
@@ -347,7 +347,7 @@ func TestDeclassifyVerdictFor_TracksConsumption(t *testing.T) {
 	verdict = eng.DeclassifyVerdictFor(ctx, onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII), &caps[0])
 	require.NotNil(t, verdict, "a burned grant must not read as authorization to a layer above the engine")
 	assert.Equal(t, "approval_consumed", verdict.Denial.Details["reason"])
-	assert.True(t, verdict.Denial.HardDeny, "the composed refusal must not be downgradable")
+	assert.True(t, verdict.Denial.BlockOverride, "the composed refusal must not be downgradable")
 
 	// A standing grant is always usable — it is never burned.
 	standing := approvedReq("s", "publish", "ada", capability.FlowLabelPII)
@@ -372,7 +372,7 @@ func TestDeclassifyVerdictFor_LedgerFaultHardens(t *testing.T) {
 		onceApprovedReq("s", "publish", "ada", "apr-1", capability.FlowLabelPII), &caps[0])
 	require.NotNil(t, verdict)
 	assert.Equal(t, "ledger_unavailable", verdict.Denial.Details["reason"])
-	assert.True(t, verdict.Denial.HardDeny)
+	assert.True(t, verdict.Denial.BlockOverride)
 }
 
 // TestDeclassifyVerdictFor_TrimsThePaddedTarget is the divergence the seam exists to remove.
@@ -434,7 +434,7 @@ func TestDeclassifyOnce_BurnedGrantIsNamedWhenTheCommitFaults(t *testing.T) {
 
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.True(t, resp.Denial.HardDeny,
+	assert.False(t, resp.Denial.Downgradable(),
 		"a call whose one-shot approval was just spent must not be downgraded and forwarded by an --audit route")
 	assert.Equal(t, "apr-1", resp.Declassification.SpentApprovalID(),
 		"the grant is burned and the call never ran, so this refusal is the only record that can name it")

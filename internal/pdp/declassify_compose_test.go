@@ -110,7 +110,7 @@ func TestDeclassify_ComposedRefusalStaysHard(t *testing.T) {
 	if hardened.Decision != capability.DecisionEscalate {
 		t.Fatalf("decision = %v, want escalate", hardened.Decision)
 	}
-	if hardened.Denial == nil || !hardened.Denial.HardDeny {
+	if hardened.Denial == nil || !hardened.Denial.BlockOverride {
 		t.Fatalf("the composed refusal must be hard so --audit cannot forward it: %+v", hardened.Denial)
 	}
 	if hardened.Denial.Code != capability.ErrCodeEscalationRequired {
@@ -166,7 +166,7 @@ func TestDeclassify_ComposedRefusalHardensOnAnUnreadableLedger(t *testing.T) {
 		},
 	}
 	hardened := p.HardenRefusal(ctx, "s", soft, EnforceTarget{Type: capability.TargetTypeTool, Name: "sanitize"}, map[string]interface{}{})
-	if hardened.Denial == nil || !hardened.Denial.HardDeny {
+	if hardened.Denial == nil || !hardened.Denial.BlockOverride {
 		t.Fatalf("an unreadable ledger must leave a non-downgradable refusal: %+v", hardened.Denial)
 	}
 	if got := hardened.Denial.Details["reason"]; got != "ledger_unavailable" {

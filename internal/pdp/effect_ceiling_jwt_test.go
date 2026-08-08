@@ -96,8 +96,8 @@ func TestEffectCeilingSurvivesAJWTShortCircuitDeny(t *testing.T) {
 			if got.Denial.Code != capability.ErrCodeEscalationRequired {
 				t.Errorf("code = %q, want %q", got.Denial.Code, capability.ErrCodeEscalationRequired)
 			}
-			if !got.Denial.HardDeny {
-				t.Errorf("HardDeny = false: an --audit route would downgrade this to a forward and perform\n"+
+			if !got.Denial.BlockOverride {
+				t.Errorf("BlockOverride = false: an --audit route would downgrade this to a forward and perform\n"+
 					"the very consequential action the ceiling flagged. denial = %+v", got.Denial)
 			}
 			if len(got.Obligations) != 0 {
@@ -164,9 +164,9 @@ func TestJWTShortCircuitDenyStaysSoftUnderTheCeiling(t *testing.T) {
 	if got.Denial == nil {
 		t.Fatal("want a denial")
 	}
-	if got.Decision != capability.DecisionDeny || got.Denial.HardDeny {
+	if got.Decision != capability.DecisionDeny || got.Denial.BlockOverride {
 		t.Errorf("a JWT deny for a call within the ceiling must stay an ordinary downgradable deny, got %s hard=%v",
-			got.Decision, got.Denial.HardDeny)
+			got.Decision, got.Denial.BlockOverride)
 	}
 }
 
@@ -185,7 +185,7 @@ func TestJWTShortCircuitDenyStaysSoftWithNoCeiling(t *testing.T) {
 	ctx := makeJWTCtx(t, jp, makeJWTToken(t, key, []string{"tool:other_tool"}))
 	got := jp.Decide(ctx, "sess-none", EnforceTarget{Type: capability.TargetTypeTool, Name: "wire_transfer"}, nil, "")
 
-	if got.Denial == nil || got.Denial.HardDeny || got.Decision != capability.DecisionDeny {
+	if got.Denial == nil || got.Denial.BlockOverride || got.Decision != capability.DecisionDeny {
 		t.Errorf("with no effectCeiling authored, a JWT deny must be unchanged, got %s %+v", got.Decision, got.Denial)
 	}
 }
@@ -214,7 +214,7 @@ func TestCeilingHardeningSkipsATargetTheManifestDoesNotGovern(t *testing.T) {
 
 	for _, name := range []string{"wire_transfer", "not_in_the_manifest"} {
 		got := jp.Decide(ctx, "sess-ungoverned", EnforceTarget{Type: capability.TargetTypeTool, Name: name}, nil, "")
-		if got.Decision != capability.DecisionDeny || (got.Denial != nil && got.Denial.HardDeny) {
+		if got.Decision != capability.DecisionDeny || (got.Denial != nil && got.Denial.BlockOverride) {
 			t.Errorf("%s: a target the manifest refuses before the ceiling must not be re-labelled, got %s %+v",
 				name, got.Decision, got.Denial)
 		}
@@ -346,7 +346,7 @@ func TestHardeningReachesANonManifestInner(t *testing.T) {
 		harden: func(sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 			calls++
 			gotSessionID, gotTarget, gotArgs = sessionID, target.Name, args
-			r.Denial.HardDeny = true
+			r.Denial.BlockOverride = true
 			r.Obligations = []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"account"}}}
 			return r
 		},
@@ -361,7 +361,7 @@ func TestHardeningReachesANonManifestInner(t *testing.T) {
 
 	require.NotNil(t, got.Denial)
 	require.Equal(t, 1, calls, "the wrapper must reach its inner through the contract, whatever the inner's concrete type")
-	assert.True(t, got.Denial.HardDeny,
+	assert.True(t, got.Denial.BlockOverride,
 		"the inner's hardening must survive composition; the type assertion to *ManifestPDP dropped it")
 	assert.NotEmpty(t, got.Obligations,
 		"the inner's obligations must survive composition, or a downgraded forward reaches the host unmasked")

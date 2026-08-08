@@ -556,12 +556,36 @@ func newStartedTestRedis(t *testing.T, opts ...RedisOption) (*Redis, *miniredis.
 	return r, mr
 }
 
-// TestShardFanOut_CoversEveryShardingClient pins that the keyless-SCAN fan-out enumerates the
-// same client shapes callcounter.IsShardingClient refuses. The two used to be hand-written
-// type switches that had already drifted: a *redis.Ring took the single-node path, so a refresh
-// loaded whichever shard go-redis happened to pick and reported healthy — a partial kill set is
-// a fail-open on the emergency stop.
-func TestShardFanOut_CoversEveryShardingClient(t *testing.T) {
+// TestScanPrefix_VisitsEveryShard is the keyless-SCAN fan-out asserted on behavior rather than
+// on which type switch answered. A *redis.Ring once took the single-node path, so a refresh
+// loaded whichever shard go-redis happened to pick and reported healthy — and a partial kill
+// set is a fail-open on the emergency stop.
+//
+// Both keys are written straight to their server, so the assertion does not depend on where the
+// Ring's hashing would place one: what is under test is that BOTH servers are enumerated.
+func TestScanPrefix_VisitsEveryShard(t *testing.T) {
+	t.Parallel()
+	shardA, shardB := miniredis.RunT(t), miniredis.RunT(t)
+	require.NoError(t, shardA.Set(redisSessionPfx+"sess-a", "1"))
+	require.NoError(t, shardB.Set(redisSessionPfx+"sess-b", "1"))
+
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:       map[string]string{"a": shardA.Addr(), "b": shardB.Addr()},
+		DialTimeout: 200 * time.Millisecond,
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+
+	found := map[string]bool{}
+	require.NoError(t, (&Redis{client: ring}).scanPrefix(context.Background(), redisSessionPfx, found))
+	assert.True(t, found["sess-a"] && found["sess-b"],
+		"a keyless SCAN reached %v, not both shards; the kill set loaded from one server of several would report healthy while missing every kill on the others", found)
+}
+
+// TestShardTopology_IsOneList pins what replaced this package's own type switch: the iterator
+// and the "does this client shard" predicate both come from callcounter, so a client one calls
+// sharding and the other has no iterator for is not a state that can be constructed. The
+// previous shape — two hand-written lists, agreeing by review — had already drifted once.
+func TestShardTopology_IsOneList(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name    string
@@ -574,34 +598,10 @@ func TestShardFanOut_CoversEveryShardingClient(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, ok, err := shardFanOut(tc.client)
-			if err != nil {
-				t.Fatalf("shardFanOut(%T): %v", tc.client, err)
-			}
-			if ok != tc.wantFan {
-				t.Fatalf("shardFanOut(%T) fan-out = %v, want %v", tc.client, ok, tc.wantFan)
-			}
-			if got := callcounter.IsShardingClient(tc.client); got != tc.wantFan {
-				t.Fatalf("callcounter.IsShardingClient(%T) = %v, but this package's fan-out says %v; the two enumerate one set", tc.client, got, tc.wantFan)
-			}
+			t.Parallel()
+			assert.Equal(t, tc.wantFan, callcounter.ShardIterator(tc.client) != nil,
+				"ShardIterator(%T) decides BOTH questions this package used to answer with its own type switch: does it shard, and how is it enumerated", tc.client)
 		})
-	}
-}
-
-// TestShardFanOut_RefusesAShardingClientItCannotEnumerate pins the direction the drift can
-// still fail in. shardFanOut no longer keeps its own list of what shards — it asks
-// callcounter.IsShardingClient — so the residual risk is the mirror case: a go-redis release
-// adds a multi-endpoint client that answers yes there and has no iterator here. That must be
-// an error the caller propagates, never a fall-through to the single-node SCAN, which
-// enumerates one server of several and reports a partial kill set as healthy.
-func TestShardFanOut_RefusesAShardingClientItCannotEnumerate(t *testing.T) {
-	t.Parallel()
-	fanOut, sharded, err := shardFanOutWhen(redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"}), true)
-	if err == nil {
-		t.Fatalf("a sharding client with no iterator: sharded=%v fanOut!=nil=%v, want an error rather than the single-node path", sharded, fanOut != nil)
-	}
-	if sharded || fanOut != nil {
-		t.Errorf("a refused client must yield no iterator: sharded=%v fanOut!=nil=%v", sharded, fanOut != nil)
 	}
 }
 

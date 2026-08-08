@@ -241,7 +241,7 @@ func TestDelegationGate_ComposedVerdictIsNotHardened(t *testing.T) {
 	if full.Decision == capability.DecisionAllow {
 		t.Fatal("the delegated class cap must refuse this call on the full path")
 	}
-	if full.Denial == nil || full.Denial.HardDeny {
-		t.Fatalf("a delegation refusal is downgradable by design; got HardDeny=%v", full.Denial)
+	if full.Denial == nil || full.Denial.BlockOverride {
+		t.Fatalf("a delegation refusal is downgradable by design; got BlockOverride=%v", full.Denial)
 	}
 }

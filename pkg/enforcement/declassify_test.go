@@ -253,7 +253,7 @@ func TestDeclassify_WithoutApprovalEscalates(t *testing.T) {
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeEscalationRequired, resp.Denial.Code)
 	assert.Equal(t, capability.DirectiveTypeDeclassify, resp.Denial.ConditionType)
-	assert.True(t, resp.Denial.HardDeny, "an unapproved declassification must not be downgradable by --audit")
+	assert.True(t, resp.Denial.BlockOverride, "an unapproved declassification must not be downgradable by --audit")
 	assert.False(t, resp.AuditOnly, "AuditOnly stays unset so an audit route cannot forward it")
 	assert.Equal(t, true, resp.Denial.Details["flow"])
 	assert.Equal(t, "no_approval", resp.Denial.Details["reason"])

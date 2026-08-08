@@ -250,9 +250,12 @@ over-cite:
 ### Per-revision method disposition
 
 A peer's revision is established per context and checked per request. A context
-pins its revision from its FIRST resolved message — not from the `initialize`
-response, since a peer on a revision that removed the handshake would never pin
-one. A request declaring `io.modelcontextprotocol/protocolVersion` in its `_meta`
+pins its revision from the first resolved message whose method that revision
+DEFINES — not from the `initialize` response, since a peer on a revision that
+removed the handshake would never pin one, and not from just any resolved message,
+since one the fail-closed default is about to drop is not evidence about the
+conversation (an id-less `initialize` declaring the revision that removed
+`initialize` would otherwise latch a table with no handshake in it). A request declaring `io.modelcontextprotocol/protocolVersion` in its `_meta`
 is a request of the revision it names; the declaration is read by decoding the
 params, so an escaped spelling of the key cannot hide it. A request declaring nothing inherits its context's revision,
 and a context that negotiated none resolves to 2025-11-25 — omission never

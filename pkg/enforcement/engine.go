@@ -149,7 +149,8 @@ func (d DeferredCommit) Commits() bool { return d.Bucket.Key != "" }
 //   - Outside SkipQuota(ctx), skip MUST be false. The atomic commit treats a skip as skipping
 //     the whole deferred set, so a handler skipping for its OWN reason (its config, its
 //     arguments) fails the buckets it never checked open. Nothing can stand in for the
-//     verdicts that never ran, so this direction is a HardDeny.
+//     verdicts that never ran, so this direction refuses with ENFORCEMENT_ERROR, whose class
+//     no observing route downgrades.
 //   - Under SkipQuota(ctx), a handler MUST NOT return a bucket: it either reports skip, or
 //     reports a zero DeferredCommit because this configuration consumes nothing (a per-call
 //     only blastRadius). A bucket here is dropped and REPORTED rather than refused; the
@@ -163,15 +164,17 @@ type CommittingConditionHandler interface {
 
 // ConditionError describes a condition evaluation failure.
 //
-// HardDeny marks a failure that must block even under an audit-mode constraint, for the
-// engine/plugin BUGS a policy verdict cannot be downgraded from — without it the shared
-// error type could not express what the deferred path's own refusals already needed, so a
-// refusal moved onto this type silently became forwardable.
+// BlockOverride is a handler's OVERRIDE of its Code's class: it forces a POLICY verdict to
+// block even under an audit-mode constraint, for the rare refusal whose downgrade would corrupt
+// the state the verdict protects. It is not how an engine or plugin BUG blocks — that is what
+// ErrCodeEnforcementError is for, and [capability.ClassifyDenialCode] answers it from the code
+// with nothing for a handler to remember. Carried through to
+// [capability.DenialInfo.BlockOverride], which documents the same rule.
 type ConditionError struct {
 	Code          string
 	ConditionType string
 	Message       string
-	HardDeny      bool
+	BlockOverride bool
 	Details       map[string]interface{}
 }
 
@@ -480,7 +483,7 @@ func SkipQuota(ctx context.Context) bool {
 // It reports the POSTURE only. WHICH refusals are exempt from the downgrade is a property of
 // the refusal, not of the route: [capability.DenialInfo.Downgradable] answers it from the
 // class the denial's code names (a revocation, an engine fault) plus the producer's explicit
-// HardDeny override, and nothing here can see either. That half is pinned by a test there
+// BlockOverride override, and nothing here can see either. That half is pinned by a test there
 // (TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny) rather than only asserted here:
 // a comment justifying a hard deny by a fact nothing checks becomes false silently.
 //
@@ -701,18 +704,17 @@ func recordFailureDenial(requestID, now string, auditOnly bool, obligations []ca
 // for a blocking or audit-mode denial. Every deny path routes through it, so auditing a
 // new top-level EnforceResponse field means checking this one constructor, not every
 // deny site.
+//
+// It deliberately does NOT stamp Denial.BlockOverride for a non-policy code. That was a
+// derivation of the class onto a second field, and it had to be repeated by every other
+// denial constructor to stay true; now the class is the only encoding and every reader asks
+// capability.DenialInfo.Downgradable, which reads the code itself. A producer sets BlockOverride
+// only to OVERRIDE the class — a policy verdict that must block anyway.
 func denyResponse(requestID, now string, auditOnly bool, obligations []capability.Obligation, denial capability.DenialInfo) capability.EnforceResponse {
 	// Every deny passes through here, so this is the one place that can bound the
 	// caller-controlled values condition handlers echo, without asking each handler's
 	// Details literal to remember. See BoundDenialDetails.
 	denial.Details = BoundDenialDetails(denial.Details)
-	// And the one place the "must not be downgraded" bool is DERIVED from the class the code
-	// already names, rather than re-argued at each producer — the divergence that had refusals
-	// of one class blocking or forwarding depending on which neighbour was copied. Producers
-	// set HardDeny only to override the class: a POLICY verdict that must block anyway.
-	if capability.ClassifyDenialCode(denial.Code) != capability.DenialClassPolicy {
-		denial.HardDeny = true
-	}
 	return capability.EnforceResponse{
 		RequestID:   requestID,
 		Decision:    capability.DecisionDeny,
@@ -737,7 +739,7 @@ func escalateResponse(requestID, now string, denial capability.DenialInfo) capab
 	// so there is no posture on which forwarding it is the right answer. Leaving AuditOnly
 	// unset is NOT what keeps it unforwardable — isObserveDeny also fires on the route-level
 	// --audit flag, which no response field can see — so the block is set here, once.
-	denial.HardDeny = true
+	denial.BlockOverride = true
 	return capability.EnforceResponse{
 		RequestID: requestID,
 		Decision:  capability.DecisionEscalate,
@@ -1086,7 +1088,7 @@ func (ec evalCtx) denyFromConditionError(condErr *ConditionError) *capability.En
 		Code:          condErr.Code,
 		ConditionType: condErr.ConditionType,
 		Message:       condErr.Message,
-		HardDeny:      condErr.HardDeny,
+		BlockOverride: condErr.BlockOverride,
 		Details:       condErr.Details,
 	})
 }
@@ -1161,7 +1163,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 	//
 	// The deny CollectObligations can itself return (an unwired directive — an engine bug)
 	// is held back to where the original ordering returned it, after runConditions below:
-	// returning it here would preempt the condition verdict, and its HardDeny would BLOCK
+	// returning it here would preempt the condition verdict, and its FAULT class would BLOCK
 	// a call an audit route should have denied-and-forwarded instead.
 	obligations, obligDeny := e.CollectObligations(ec.req.Delegation, ec.matched, ec.requestID, ec.now)
 	if WillForwardDeny(ctx, ec.matched) {
@@ -1171,8 +1173,9 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 			if resp.Decision == capability.DecisionAllow || resp.Obligations != nil {
 				return
 			}
-			// A HardDeny is never downgraded to a forward, so it has no response to redact.
-			if resp.Denial != nil && resp.Denial.HardDeny {
+			// A refusal the observe posture cannot downgrade is never forwarded, so it has no
+			// response to redact.
+			if resp.Denial != nil && !resp.Denial.Downgradable() {
 				return
 			}
 			resp.Obligations = obligations
@@ -1190,13 +1193,13 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 		return ec.deny(nil, capability.DenialInfo{
 			Code:          capability.ErrCodeMissingContext,
 			ConditionType: string(AnchorKindTask),
-			// HardDeny: a downgradable refusal is FORWARDED on an audit-only constraint, and
+			// BlockOverride: a downgradable refusal is FORWARDED on an audit-only constraint, and
 			// the observe path's antecedent recorder would then key this call's labels and
 			// sequence marker on the SESSION anyway — the very split this check exists to
 			// refuse.
-			HardDeny: true,
-			Message:  "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
-			Details:  map[string]interface{}{"anchor": string(AnchorKindTask), "reason": "no_task_id"},
+			BlockOverride: true,
+			Message:       "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
+			Details:       map[string]interface{}{"anchor": string(AnchorKindTask), "reason": "no_task_id"},
 		})
 	}
 
@@ -1306,8 +1309,8 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 			return declassifyRecordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), cerr.SpentApprovalID)
 		}
 		if cerr.Flow {
-			// No obligations: this sets HardDeny, never downgraded to a forward, so there is
-			// no response to redact.
+			// No obligations: it refuses with a FAULT code, which no observing route downgrades
+			// to a forward, so there is no response to redact.
 			return labelRecordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), nil)
 		}
 		return recordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), obligations)
@@ -1634,13 +1637,12 @@ func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *
 		}
 		ob := dir.ToObligation()
 		if !knownObligationTypes[ob.Type] {
+			// No BlockOverride: an unwired directive is an engine bug, and ENFORCEMENT_ERROR's
+			// own class is what stops an observing route forwarding it. Setting the override too
+			// would put the fault back in two places, which is what the class replaced.
 			resp := denyResponse(requestID, now, false, nil, capability.DenialInfo{
-				Code: capability.ErrCodeEnforcementError,
-				// HardDeny so the verdict survives isObserveDeny: an unwired directive is an
-				// engine bug, not a downgradable policy verdict, and must block even under
-				// an audit-mode constraint.
-				HardDeny: true,
-				Message:  fmt.Sprintf("unhandled obligation type %q from directive %T; register it in knownObligationTypes and implement its consumer", ob.Type, dir),
+				Code:    capability.ErrCodeEnforcementError,
+				Message: fmt.Sprintf("unhandled obligation type %q from directive %T; register it in knownObligationTypes and implement its consumer", ob.Type, dir),
 			})
 			return obligations, &resp
 		}

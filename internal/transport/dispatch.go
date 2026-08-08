@@ -99,6 +99,11 @@ func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
 // their own richer kill record via enforcedForwardCore). Applied once at the dispatchRequest
 // boundary so a new locally-answered method inherits revocation by construction; malformedDeny
 // is the one other caller, reached before the PDP.
+//
+// The lookup is FRESH, never a value the transport leg resolved earlier for the same message:
+// this gate can be reached after an unbounded wait for the decision turn, and the whole point
+// of it is that a kill landing during that wait is recorded as KILL_SWITCH rather than as the
+// method's own refusal.
 func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if deny := d.pdp.CheckKill(ctx, d.sessionID); deny != nil {
 		return recordKillDenial(ctx, d.rec, deny, msg.ID, verifiedSession(d.sessionID), msg.Method), true
@@ -369,11 +374,26 @@ func deriveHandshakeRevision(registry map[string]methodSpec) capability.Revision
 // nobody has ever heard of it. The two are routed identically on purpose (removal is
 // expressed by absence); they differ only in what an audit record can honestly claim.
 func removedInRevision(rev capability.Revision, method string) bool {
+	// Expressed through definesMethod so the membership test lives in ONE place: the two are
+	// not complements (both are false for an unknown method), and it is the `known` guard that
+	// makes them not, so stating it twice is how they would come to disagree about one.
+	_, known := methodRegistry[method]
+	return known && !definesMethod(rev, method)
+}
+
+// definesMethod reports whether rev's method set contains method, derived from the same
+// declarations the routing tables are so it cannot disagree with what the dispatcher will do
+// with the message.
+//
+// It answers "is this message one the peer's revision actually has?", which is the question a
+// context PIN depends on: a message the revision does not define is about to be dropped by the
+// fail-closed default, so it says nothing about which revision the conversation is on.
+//
+// Distinct from removedInRevision, which is true only for a method some OTHER revision has. An
+// entirely unknown method is defined by no revision, and is no more evidence than a removed one.
+func definesMethod(rev capability.Revision, method string) bool {
 	spec, known := methodRegistry[method]
-	if !known {
-		return false
-	}
-	return !slices.Contains(spec.In, rev)
+	return known && slices.Contains(spec.In, rev)
 }
 
 // requestRevision returns the revision this request is dispatched under, read from the ONE
@@ -453,21 +473,45 @@ type hostNotificationGate struct {
 	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
 	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
 	// notification is dropped before revocation is even a question.
+	//
+	// A thunk only saves what its supplier has not already spent, and the HTTP session leg used
+	// to resolve the answer eagerly and hand over a constant — so this saving was real on stdio
+	// alone. Both legs now supply a lazy lookup, and
+	// TestSessionLeg_RevocationIsLookedUpAtMostOncePerPost counts it rather than leaving the
+	// claim to the comment. Never nil: every gate below calls it unconditionally.
 	checkKill func() *capability.EnforceResponse
 	// leg names this transport's notification leg in a kill-drop record.
 	leg killDropLeg
 }
 
+// notificationOutcome is what the shared gate DID with a notification. Three outcomes, not a
+// bool, because a transport needs more than "may I forward it": whether the proxy ENGAGED with
+// the message at all is a separate question, and the answer differs for the two ways a
+// notification is dropped. The swallowed set is dropped for free — no record, no revocation
+// lookup — while a refusal writes to the tamper-evident tape, which is work done on the
+// session's behalf.
+type notificationOutcome int
+
+const (
+	// notificationSwallowed: dropped for free. The proxy had already handled what it announces,
+	// so it is neither an error nor an event, and nothing about the session's liveness follows.
+	notificationSwallowed notificationOutcome = iota
+	// notificationRefused: dropped WITH its record — revoked, an enforced method smuggled as a
+	// notification, or unmapped.
+	notificationRefused
+	// notificationForward: admitted for verbatim forwarding to the upstream.
+	notificationForward
+)
+
 // admit applies every cross-cutting gate a host->upstream notification passes, in the one
-// canonical order, and reports whether it may be forwarded verbatim. A false return means the
-// gate already disposed of the notification — swallowed silently, or dropped WITH its record —
-// and the caller need only ack.
+// canonical order, and reports what it did with it. Anything but notificationForward means the
+// gate has already disposed of the notification and the caller need only ack.
 //
 // Shared by both transports so the checks, their order, and their audit records cannot drift
 // between them; before it existed each transport hand-placed the same four steps. It also
 // resolves the revision's tables ONCE, where the three separate predicates it replaces each
 // resolved their own.
-func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
+func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notificationOutcome {
 	tables := tablesFromContext(ctx)
 	disposition := tables.notifications[msg.Method]
 	swallowed := disposition == notifySwallow
@@ -477,16 +521,16 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 	// `initialize` arriving during an emergency stop is precisely the attempt an operator
 	// needs on the tape rather than a silent readiness ack.
 	if swallowed && g.established {
-		return false
+		return notificationSwallowed
 	}
 	if kill := g.checkKill(); kill != nil {
 		recordKillDrop(ctx, g.rec(), kill, g.subject, msg.Method, msg.Method, g.leg)
-		return false
+		return notificationRefused
 	}
 	if swallowed {
 		// Pre-session, and revocation had nothing to say: there is no upstream to forward to
 		// and nothing the later arms could add, so the drop is the whole disposition.
-		return false
+		return notificationSwallowed
 	}
 	// An enforced method framed as a notification (no id) is a fail-closed reject: forwarding
 	// it verbatim would bypass both the PDP decision and the audit record.
@@ -494,10 +538,10 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 		if rec := g.rec(); rec != nil {
 			rec.RecordDeny(ctx, g.subject.auditSessionID(), msg.Method, msg.Method, codeInvalidRequest, "", g.subject.auditDetails(nil), false)
 		}
-		return false
+		return notificationRefused
 	}
 	if disposition == notifyForward {
-		return true
+		return notificationForward
 	}
 	// notifyUnmapped, the notification-framed analogue of dispatchUnmapped. Before this
 	// existed, an unrecognized notification-framed method reached the upstream invisibly while
@@ -516,7 +560,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) bool {
 	_, _ = fmt.Fprintf(resolvedErrOut(g.errOut),
 		"[eunox] SECURITY: unmapped notification method %q denied (AUTHORIZATION_FAILED) — not forwarded\n",
 		audit.SanitizeAuditField(msg.Method))
-	return false
+	return notificationRefused
 }
 
 // dispatchRequest routes an enforced MCP request to its handler and returns the JSON-RPC

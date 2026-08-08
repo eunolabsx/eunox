@@ -193,7 +193,7 @@ func TestTaskAnchor_RefusesAnAuthenticatedCallerWithNoTaskID(t *testing.T) {
 	// path's own antecedent recorder would then write this call's labels and sequence marker
 	// through the session key, performing the very state split the check refuses — on a route
 	// whose other constraints read the task-keyed bucket.
-	assert.True(t, resp.Denial.HardDeny, "an unaccountable call must not be downgraded and forwarded")
+	assert.True(t, resp.Denial.BlockOverride, "an unaccountable call must not be downgraded and forwarded")
 
 	// A caller with NO token still falls back to its session, unchanged.
 	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, req("s", "read_customer"), caps).Decision)

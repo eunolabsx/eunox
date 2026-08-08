@@ -719,8 +719,8 @@ func TestFilterToolsList_PoisonStickyAcrossCleanReobservation(t *testing.T) {
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeAuthorizationFailed {
 		t.Errorf("denial = %+v, want AUTHORIZATION_FAILED", resp.Denial)
 	}
-	if resp.Denial != nil && !resp.Denial.HardDeny {
-		t.Error("sticky-poison deny must be HardDeny")
+	if resp.Denial != nil && !resp.Denial.BlockOverride {
+		t.Error("sticky-poison deny must be BlockOverride")
 	}
 }
 
@@ -1075,8 +1075,8 @@ func TestDecideTarget_DescriptionHashDenyNotDowngradedByAuditMode(t *testing.T) 
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeAuthorizationFailed {
 		t.Errorf("denial = %+v, want AUTHORIZATION_FAILED", resp.Denial)
 	}
-	if resp.Denial != nil && !resp.Denial.HardDeny {
-		t.Error("descriptionHash deny must be HardDeny so a route running under --audit (isObserveDeny) cannot downgrade the tool-poisoning block to a forward")
+	if resp.Denial != nil && !resp.Denial.BlockOverride {
+		t.Error("descriptionHash deny must be BlockOverride so a route running under --audit (isObserveDeny) cannot downgrade the tool-poisoning block to a forward")
 	}
 }
 
@@ -1241,8 +1241,8 @@ func TestDecideTarget_DescriptionHashPinFiresEvenWhenActionNotPermitted(t *testi
 	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeAuthorizationFailed {
 		t.Errorf("denial = %+v, want AUTHORIZATION_FAILED (poisoning takes precedence over the action-mismatch code)", resp.Denial)
 	}
-	if resp.Denial != nil && !resp.Denial.HardDeny {
-		t.Error("descriptionHash deny must be HardDeny so an audit-mode route cannot downgrade the tool-poisoning block to a forward")
+	if resp.Denial != nil && !resp.Denial.BlockOverride {
+		t.Error("descriptionHash deny must be BlockOverride so an audit-mode route cannot downgrade the tool-poisoning block to a forward")
 	}
 }
 
@@ -1382,8 +1382,8 @@ func TestDecideTarget_StraySchema_AuditOnly_StillDenies(t *testing.T) {
 	if resp.AuditOnly {
 		t.Error("AuditOnly = true, want false: the stray-schema deny must NOT be downgraded to an observed allow")
 	}
-	if resp.Denial != nil && !resp.Denial.HardDeny {
-		t.Error("stray-schema deny must be HardDeny so a route running under --audit (isObserveDeny) cannot downgrade it to a forward")
+	if resp.Denial != nil && !resp.Denial.BlockOverride {
+		t.Error("stray-schema deny must be BlockOverride so a route running under --audit (isObserveDeny) cannot downgrade it to a forward")
 	}
 	if resp.Denial == nil {
 		t.Fatal("Denial = nil, want a populated DenialInfo")

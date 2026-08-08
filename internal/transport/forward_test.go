@@ -157,7 +157,7 @@ func TestEnforcedForwardCore_AllowCleanSuccessHasNoDetail(t *testing.T) {
 	assert.Nil(t, rec.records[0].details, "a clean success must record no extra detail")
 }
 
-func TestEnforcedForwardCore_HardDenyDoesNotCallUpstream(t *testing.T) {
+func TestEnforcedForwardCore_BlockOverrideDoesNotCallUpstream(t *testing.T) {
 	rec := &fwdRecorder{}
 	called := false
 	fp := forwardParams{
@@ -398,8 +398,8 @@ func TestEnforcedForwardCore_NilDenialDoesNotPanic(t *testing.T) {
 // audit mode, a hard denial is never downgraded, and only a soft denial in
 // audit or audit-only mode is downgraded to observe.
 func TestIsObserveDeny_Matrix(t *testing.T) {
-	soft := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, HardDeny: false}
-	hard := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, HardDeny: true}
+	soft := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, BlockOverride: false}
+	hard := &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, BlockOverride: true}
 	killSwitch := &capability.DenialInfo{Code: capability.ErrCodeKillSwitch}
 
 	cases := []struct {
@@ -467,10 +467,12 @@ func (h contractBreakingCommitHandler) PrepareCommit(context.Context, capability
 
 // TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny is what pkg/enforcement's hard
 // denies are justified BY. That package writes "where WillForwardDeny answers yes, a
-// downgradable verdict is forwarded, and a HardDeny is not" on exactly one doc comment and
-// cites it from the refusals that depend on it — but it neither sets that flag nor implements
-// the downgrade, so nothing there could fail if this rule ever narrowed. This runs a real
-// engine verdict through the real forward core for each arm of the union.
+// downgradable verdict is forwarded and a non-downgradable one is not" on exactly one doc
+// comment and cites it from the refusals that depend on it — but it neither answers
+// Downgradable nor implements the downgrade, so nothing there could fail if this rule ever
+// narrowed. This runs a real engine verdict through the real forward core for each arm of the
+// union, and for BOTH reasons a refusal resists the downgrade: the class its code names, and
+// the producer's explicit override.
 //
 // The constraint is `enforcement: audit` throughout: WillForwardDeny answers yes for it, and
 // it is the posture the unauthorized-skip refusal is actually reachable on (a route-level
@@ -525,14 +527,14 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 
 	t.Run("a kill-switch denial is never downgraded", func(t *testing.T) {
 		// The second exemption isObserveDeny applies, and the one WillForwardDeny cannot
-		// express: a kill carries no HardDeny and is recognized by its CODE, so a reader who
-		// took "HardDeny is the only thing that never downgrades" literally would forward an
-		// operator's emergency stop.
+		// express: a kill is recognized by its CODE and sets no override, so a reader who took
+		// "the BlockOverride flag is the only thing that never downgrades" literally would forward
+		// an operator's emergency stop.
 		dec := capability.EnforceResponse{
 			Decision: capability.DecisionDeny,
 			Denial:   &capability.DenialInfo{Code: capability.ErrCodeKillSwitch},
 		}
-		require.False(t, dec.Denial.HardDeny, "the premise: a kill is blocked by its code, not by the flag")
+		require.False(t, dec.Denial.BlockOverride, "the premise: a kill is blocked by its code, not by the flag")
 
 		rec, called := forward(t, dec, true)
 		assert.False(t, called, "an emergency stop must block even on a route running --audit")
@@ -545,7 +547,7 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 		dec := decide(context.Background(), capability.EnforcementAudit, modeSoftDeny)
 		require.Equal(t, capability.DecisionDeny, dec.Decision)
 		require.NotNil(t, dec.Denial)
-		require.False(t, dec.Denial.HardDeny, "an ordinary condition failure is a policy verdict, not an engine bug")
+		require.False(t, dec.Denial.BlockOverride, "an ordinary condition failure is a policy verdict, not an engine bug")
 
 		rec, called := forward(t, dec, false)
 		assert.True(t, called, "the union's forwarding half: an audit-mode constraint delivers the call")
@@ -555,17 +557,39 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 		assert.Equal(t, "allow", rec.records[1].decision)
 	})
 
-	t.Run("a HardDeny is not downgraded", func(t *testing.T) {
+	t.Run("a fault-class refusal is not downgraded", func(t *testing.T) {
+		// An unauthorized skip leaves the deferred set unchecked, so the engine reached no
+		// verdict — a FAULT, and the class is what blocks it. The flag is not set here and does
+		// not need to be: that is the whole point of deriving the exemption from the code.
 		dec := decide(context.Background(), capability.EnforcementAudit, modeUnauthorizedSkip)
 		require.Equal(t, capability.DecisionDeny, dec.Decision)
 		require.NotNil(t, dec.Denial)
-		require.True(t, dec.Denial.HardDeny, "an unauthorized skip leaves the deferred set unchecked")
+		require.Equal(t, capability.ErrCodeEnforcementError, dec.Denial.Code)
+		require.False(t, dec.Denial.Downgradable(), "no verdict was reached, so there is none to stand in for the call")
 
 		rec, called := forward(t, dec, false)
-		assert.False(t, called, "the flag pkg/enforcement sets to block must actually block on the one posture that reaches it")
+		assert.False(t, called, "the exemption pkg/enforcement relies on must actually block on the one posture that reaches it")
 		require.Len(t, rec.records, 1)
 		assert.Equal(t, "deny", rec.records[0].decision)
 		assert.False(t, rec.records[0].auditOnly, "a blocked call must not be recorded as an observed forward")
+	})
+
+	t.Run("a producer's override blocks a policy verdict", func(t *testing.T) {
+		// The other reason Downgradable answers no, and the only one a CODE cannot express: a
+		// policy verdict whose producer marked it non-downgradable because forwarding it would
+		// corrupt the state the verdict protects (the engine's anchorUnresolved, the PDP's
+		// descriptionHash pin). Same code as the forwarded arm above; only the override differs.
+		dec := capability.EnforceResponse{
+			Decision: capability.DecisionDeny,
+			Denial:   &capability.DenialInfo{Code: capability.ErrCodeConditionFailed, BlockOverride: true},
+		}
+		require.Equal(t, capability.DenialClassPolicy, capability.ClassifyDenialCode(dec.Denial.Code),
+			"the premise: the class alone would forward this")
+
+		rec, called := forward(t, dec, true)
+		assert.False(t, called, "a producer's override must block even on a route running --audit")
+		require.Len(t, rec.records, 1)
+		assert.False(t, rec.records[0].auditOnly)
 	})
 
 	t.Run("an absorbed handler fault forwards and lands on the tape", func(t *testing.T) {
