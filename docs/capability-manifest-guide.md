@@ -1254,10 +1254,12 @@ different case and still loads, denying fail-closed at request time.
 > JWT/manifest intersection: the claim path asks the deciding PDP for the verdict rather
 > than calling the shipped predicate, so the two cannot enforce different rules for the
 > same call. The one narrowing is that a replacement which **commits state** on admit
-> (implements `CommittingConditionHandler`) cannot be evaluated ahead of the decision —
-> running it there would charge the call's quota twice — so a claim carrying that
-> condition type is **refused**, naming the type, rather than silently falling back to
-> the built-in.
+> (a `CommittingConditionHandler`, registered with `WithCommittingConditionHandler`)
+> cannot be evaluated ahead of the decision — running it there would charge the call's
+> quota twice — so a claim carrying that condition type is **refused**, naming the type,
+> rather than silently falling back to the built-in. A committing handler has exactly one
+> entry point, `PrepareCommit`, which the engine runs in its atomic multi-condition
+> admission; it carries no `Handle`, so there is no second path with different semantics.
 >
 > The claim grammar emits exactly two condition types, and `allowedOperations` is
 > deliberately **not** covered: its claim-side semantics are different by design (the

@@ -56,7 +56,7 @@ func TestAdmitAll_CountedBucketOnWeightedKeyIgnoresTheWeightedCeiling(t *testing
 		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 		t.Cleanup(func() { _ = client.Close() })
 
-		r := NewRedis(client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(2))
+		r := NewRedisForTest(t, client, withTimeFunc(func() time.Time { return now }), withRedisMaxWeightedEntries(2))
 		for i := 1; i <= 2; i++ {
 			admitted, _, _, _, err := r.AdmitAll(ctx, []capability.QuotaBucket{weighted})
 			require.NoError(t, err)

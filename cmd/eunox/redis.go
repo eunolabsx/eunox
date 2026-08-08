@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/eunolabs/eunox/pkg/callcounter"
+
 	goredis "github.com/redis/go-redis/v9"
 )
 
@@ -34,12 +36,25 @@ func buildRedisClient(addr, password string, useTLS bool) (*goredis.Client, erro
 	return goredis.NewClient(opts), nil
 }
 
-// pingRedis checks connectivity, returning an error safe to print on startup.
+// pingRedis checks connectivity AND refuses a topology eunox cannot use, returning an error
+// safe to print on startup.
+//
+// The topology check lives here rather than beside one caller because this is the one round
+// trip every path that reaches for Redis already makes (`proxy --redis-addr` and `kill
+// --redis-addr` today), so a future subcommand inherits the refusal instead of being a new
+// place to remember it.
 func pingRedis(ctx context.Context, client *goredis.Client) error {
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pingCtx, cancel := context.WithTimeout(ctx, redisStartupTimeout)
 	defer cancel()
 	if err := client.Ping(pingCtx).Err(); err != nil {
 		return fmt.Errorf("redis ping failed: %w (check --redis-addr, --redis-password, --redis-tls)", err)
 	}
-	return nil
+	// Same deadline as the ping, not a second budget of its own: the two are one startup
+	// handshake, and a slow server should not be able to double the time before the proxy
+	// either serves or says why it will not.
+	return callcounter.CheckServerNotClustered(pingCtx, client)
 }
+
+// redisStartupTimeout bounds the startup handshake (ping plus topology probe). One budget for
+// the pair, so tuning it cannot leave two halves disagreeing.
+const redisStartupTimeout = 5 * time.Second

@@ -447,6 +447,11 @@ silently multiplied by your replica count and revocations do not propagate — t
 proxy prints a startup notice when a policy uses `maxCalls` but no Redis is
 configured. Point all instances at one Redis (`--redis-addr`) to share both.
 
+Redis **Cluster is not supported**, and the proxy refuses to start against one
+rather than discovering it later: a capability carrying two quota bounds is
+admitted in a single multi-key script, whose keys can land on different shards.
+Use a single node, or Sentinel for failover.
+
 > **The Redis kill switch fails closed during a Redis outage by default —
 > monitor Redis health.** The kill switch is checked on the request hot path from
 > a process-local cache that a background listener refreshes; it never makes a
@@ -462,7 +467,7 @@ configured. Point all instances at one Redis (`--redis-addr`) to share both.
 > last-known state and allow traffic not already known to be killed instead.
 > Either way, because the degraded window is exactly the window in which Redis is
 > degraded, **alert on `killSwitchHealthy` / `eunox_kill_switch_healthy`
-> (`0` = degraded) and run Redis with HA (Sentinel/cluster)**. Full rationale and
+> (`0` = degraded) and run Redis with HA (Sentinel — see the Cluster note above)**. Full rationale and
 > alternatives: [ADR-0003](./docs/adr/0003-redis-killswitch-fail-open.md).
 
 ---

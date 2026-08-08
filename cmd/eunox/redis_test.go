@@ -106,7 +106,10 @@ func TestRedisCallCounter_Integration(t *testing.T) {
 	client := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter, err := callcounter.NewRedis(client)
+	if err != nil {
+		t.Fatalf("NewRedis: %v", err)
+	}
 	ctx := context.Background()
 
 	// histCap is a retention cap above this test's counts, so IncrementAndGet's

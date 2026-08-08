@@ -130,7 +130,7 @@ func directivesToRegoInput(directives []capability.Directive) ([]interface{}, er
 func (e *Engine) registerBuiltins() {
 	e.registerBuiltin(capability.ConditionTypeTimeWindow, ConditionHandlerFunc(e.handleTimeWindow))
 	e.registerBuiltin(capability.ConditionTypeIPRange, ConditionHandlerFunc(e.handleIPRange))
-	e.registerBuiltin(capability.ConditionTypeMaxCalls, maxCallsHandler{e: e})
+	e.registerBuiltinCommitting(capability.ConditionTypeMaxCalls, maxCallsHandler{e: e})
 	e.registerBuiltin(capability.ConditionTypeAllowedOperations, ConditionHandlerFunc(e.handleAllowedOperations))
 	e.registerBuiltin(capability.ConditionTypeAllowedExtensions, ConditionHandlerFunc(e.handleAllowedExtensions))
 	e.registerBuiltin(capability.ConditionTypeAllowedTables, ConditionHandlerFunc(e.handleAllowedTables))
@@ -139,7 +139,7 @@ func (e *Engine) registerBuiltins() {
 	e.registerBuiltin(capability.ConditionTypeSequenceBlock, ConditionHandlerFunc(e.handleSequenceBlock))
 	e.registerBuiltin(capability.ConditionTypeFlowLabel, ConditionHandlerFunc(e.handleFlowLabel))
 	e.registerBuiltin(capability.ConditionTypeEffectClass, ConditionHandlerFunc(e.handleEffectClass))
-	e.registerBuiltin(capability.ConditionTypeBlastRadius, blastRadiusHandler{e: e})
+	e.registerBuiltinCommitting(capability.ConditionTypeBlastRadius, blastRadiusHandler{e: e})
 	// `policy` answers from the PolicyEvaluator its dispatch calls rather than from its
 	// registry entry, since what an out-of-tree evaluator reads is knowable from the
 	// evaluator but not from a token TYPE. See policyConditionHandler.
@@ -301,9 +301,7 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 }
 
 // maxCallsBucket derives the counter bucket for a maxCalls condition: casts the condition,
-// applies the skip-quota bypass, and validates the counter, session, and target. Both the
-// direct handler path and the engine's atomic multi-condition commit reach it through
-// PrepareCommit, so they build the SAME key under the SAME fail-closed guards. skip is true
+// applies the skip-quota bypass, and validates the counter, session, and target. skip is true
 // under --audit observe mode (treat as satisfied); condErr is non-nil on any deny.
 func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (mc *capability.MaxCallsCondition, key string, skip bool, condErr *ConditionError) {
 	mc, condErr = castCondition[capability.MaxCallsCondition](cond)
@@ -357,20 +355,13 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 }
 
 // maxCallsHandler is the built-in maxCalls condition handler. It commits a sliding-window
-// slot on admit, so it implements CommittingConditionHandler: the engine treats it as
-// deferred (run after all pure predicates) and admits it via the atomic multi-bucket
-// commit when a constraint carries more than one. Both facets share maxCallsBucket.
+// slot on admit, so it is a CommittingConditionHandler: the engine runs it after every pure
+// predicate and admits it through the atomic multi-bucket commit.
 type maxCallsHandler struct{ e *Engine }
 
-// Handle implements ConditionHandler by routing through PrepareCommit and admitting the
-// single bucket, so the pure checks and bucket derivation have ONE implementation.
-func (h maxCallsHandler) Handle(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) *ConditionError {
-	return h.e.prepareAndAdmit(ctx, h, cond, req)
-}
-
-// PrepareCommit implements CommittingConditionHandler: derives the counter bucket WITHOUT
-// consuming a slot, so the engine can admit several deferred conditions in one atomic
-// AdmitAll.
+// PrepareCommit implements CommittingConditionHandler: runs the condition's pure checks and
+// derives the counter bucket WITHOUT consuming a slot, so the engine can admit several
+// deferred conditions in one atomic AdmitAll.
 func (h maxCallsHandler) PrepareCommit(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	mc, key, skip, condErr := h.e.maxCallsBucket(ctx, cond, req)
 	if condErr != nil {

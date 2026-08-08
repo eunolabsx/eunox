@@ -17,6 +17,12 @@ import (
 type Checker interface {
 	// ShouldBlock returns true if the given agent/session combination is killed.
 	// An empty agentID or sessionID means the field is not evaluated for that dimension.
+	//
+	// A non-nil error means the backend could not CONFIRM its kill set, not that the answer
+	// is "no": (false, err) must be treated as a denial, since an unconfirmable non-match is
+	// indistinguishable from a confirmed all-clear. See the rule on [Manager], which binds
+	// this method too — a backend reaches the hot path through this interface, so a consumer
+	// that only ever sees a Checker still has to fail closed on the error.
 	ShouldBlock(ctx context.Context, agentID, sessionID string) (bool, error)
 }
 
@@ -24,8 +30,39 @@ type Checker interface {
 // admin and control-plane operations. Wire the full Manager where both read
 // and write access is needed (e.g., the admin API handler); pass only Checker
 // to read-only consumers.
+//
+// CONFIRMABILITY is the contract every method shares, stated here rather than on whichever
+// one was last touched. A backend answers from a local view of the kill set, and "nothing
+// matches" is byte-identical to "the whole kill set is empty" — so a backend that cannot
+// currently confirm its view (never loaded, no longer converging, backend unreachable) must
+// report that cause from EVERY reader: HealthStatus, ShouldBlock on a non-match, and Status.
+// Returning (false, nil) or an empty snapshot in that state is a silent all-clear, which is
+// exactly the failure the kill switch exists to prevent. A present kill still blocks
+// unconditionally — confidence only decides what a NON-match means.
+//
+// A backend whose state lives in-process is always confirmable and simply never reports a
+// cause; the rule binds the ones that mirror remote state.
+//
+// The ONE exception is an explicit operator choice to prefer availability: the Redis backend's
+// WithFailOpen (--killswitch-fail-open, ADR-0003) serves the last-known cache from ShouldBlock
+// and Status during an outage rather than denying, and HealthStatus alone reports the cause.
+// That is a configured trade, not a backend answering as it likes — a consumer that must not
+// be surprised by it either declines to wire fail-open, or polls HealthStatus, which reports
+// the cause under both postures.
 type Manager interface {
 	Checker
+
+	// HealthStatus reports whether this backend can confirm its kill set right now: nil when
+	// it can, otherwise the reason it cannot. It is the readiness question asked WITHOUT a
+	// request in hand — a health probe, a startup gate, an operator's /healthz — which
+	// ShouldBlock cannot answer, since a caller cannot tell "not ready yet" from "backend
+	// down" from an error it must fail closed on either way.
+	//
+	// It reports the CURRENT cause, not a latched one: a backend that recovers reports nil
+	// again. Implementations answer through the same gate chain their readers use — and it is
+	// the one reader that reports a cause even under fail-open, where the others deliberately
+	// serve the cache, so it is what an operator alerts on.
+	HealthStatus() error
 
 	// ActivateGlobal activates the global kill switch (blocks all requests).
 	ActivateGlobal(ctx context.Context) error
@@ -52,10 +89,9 @@ type Manager interface {
 	Reset(ctx context.Context) error
 
 	// Status returns the current kill-switch state. A snapshot asserts "this is the whole
-	// kill set", the same claim ShouldBlock makes when nothing matches, so a backend whose
-	// cache cannot be confirmed must report the same cause here instead (the Redis
-	// backend's ErrNotStarted / ErrStopped / ErrBackendUnreachable) — an unconfirmable
-	// snapshot cannot be told from a confirmed all-clear.
+	// kill set", so an unconfirmable one reports the cause instead (the Redis backend's
+	// ErrNotStarted / ErrStopped / ErrBackendUnreachable) — see the confirmability rule on
+	// this interface.
 	Status(ctx context.Context) (*Status, error)
 
 	// ObserveRevocations registers fn to be called whenever this backend's LOCAL view

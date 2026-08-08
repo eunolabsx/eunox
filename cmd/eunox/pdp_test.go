@@ -575,6 +575,10 @@ type ksTestError struct{ msg string }
 
 func (e *ksTestError) Error() string { return e.msg }
 
+// HealthStatus reports the same cause ShouldBlock fails on: killswitch.Manager's
+// confirmability rule requires a probe and the data plane to agree.
+func (e *errKillSwitch) HealthStatus() error { return errKillSwitchFailed }
+
 func (e *errKillSwitch) ActivateGlobal(_ context.Context) error          { return nil }
 func (e *errKillSwitch) DeactivateGlobal(_ context.Context) error        { return nil }
 func (e *errKillSwitch) KillAgent(_ context.Context, _ string) error     { return nil }

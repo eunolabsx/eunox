@@ -329,9 +329,9 @@ func TestRedis_ObserveRevocations_PubSubDelivers(t *testing.T) {
 // for a dropped publish.
 func TestRedis_ObserveRevocations_ReconcileDelivers(t *testing.T) {
 	t.Parallel()
-	r, mr := newTestRedis(t)
-	// Do not Start: no pub/sub listener runs, isolating the reconcile-only path.
-	r.started.Store(true)
+	// newStartedTestRedis, not Start: no pub/sub listener runs, isolating the
+	// reconcile-only path.
+	r, mr := newStartedTestRedis(t)
 
 	var got atomic.Pointer[Revocation]
 	r.ObserveRevocations(func(ev Revocation) { got.Store(&ev) })

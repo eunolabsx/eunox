@@ -29,7 +29,7 @@ func TestShouldBlock_StaleCacheFailsClosed(t *testing.T) {
 		reconcileInterval: 30 * time.Second,
 		now:               func() time.Time { return now },
 	}
-	r.started.Store(true)
+	markStarted(t, r)
 	r.lastRefreshOK = base // a refresh just succeeded
 
 	// Fresh cache: a non-match is a confident all-clear.
@@ -84,7 +84,7 @@ func TestShouldBlock_StaleCacheServedUnderFailOpen(t *testing.T) {
 		failOpen:          true,
 		now:               func() time.Time { return now },
 	}
-	r.started.Store(true)
+	markStarted(t, r)
 	r.lastRefreshOK = base
 
 	now = base.Add(10 * time.Minute)
@@ -109,7 +109,7 @@ func TestShouldBlock_CachedKillBlocksEvenWhenStale(t *testing.T) {
 		reconcileInterval: 30 * time.Second,
 		now:               func() time.Time { return now },
 	}
-	r.started.Store(true)
+	markStarted(t, r)
 	r.lastRefreshOK = base
 	now = base.Add(time.Hour)
 
@@ -175,7 +175,7 @@ func TestStaleness_LowIntervalDoesNotDenyAHealthyBackend(t *testing.T) {
 		reconcileInterval: time.Second,
 		now:               func() time.Time { return now },
 	}
-	r.started.Store(true)
+	markStarted(t, r)
 	r.lastRefreshOK = base
 
 	// A slow-but-successful refresh cycle: well past 2 intervals, well inside the floor.

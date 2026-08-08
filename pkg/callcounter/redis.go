@@ -7,8 +7,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -70,17 +72,76 @@ func (r *Redis) newMember(now time.Time) string {
 	return fmt.Sprintf("%s-%020d-%020d", r.instanceID, now.UnixNano(), r.seq.Add(1))
 }
 
-// NewRedis creates a Redis-backed call counter. Panics if crypto/rand cannot supply the
-// per-instance entropy for ZADD member uniqueness — a silent fallback would risk
-// reintroducing the cross-replica collision the entropy prevents.
+// ErrClusterUnsupported is returned by NewRedis for a client that spreads ONE keyspace across
+// several servers: a Redis Cluster, or a client-side Ring.
 //
-// Redis Cluster is NOT supported — see AdmitAll for the mechanism (a multi-key EVAL a
-// cluster can refuse with CROSSSLOT). Stated at the constructor because that is where a
-// *redis.ClusterClient is wired in, and redis.Cmdable accepts one.
-func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
+// AdmitAll is a single multi-key EVAL, and a batch's keys carry distinct window suffixes, so
+// they can hash to different slots and the script is refused with CROSSSLOT. That fails
+// closed — the engine maps the error to a deny, never an over-admission — which is precisely
+// why it must be refused at the seam: nothing is unsafe, so the wiring error stays invisible
+// until the first policy carrying two quota buckets denies in production. Worse, unrelated
+// suffixes may collide into one slot by chance, so a deployment can look healthy across
+// several policies and then deny on the next one.
+//
+// Making it WORK instead would mean co-locating one anchor's buckets in a slot, which is a
+// physical key-layout change (a migration resetting live counters) on a key that is opaque by
+// construction: CompositeKey is injective but not parseable, so a hash tag cannot be recovered
+// from the logical key a bucket arrives with. Until that is worth doing, this is the posture.
+var ErrClusterUnsupported = errors.New("callcounter: Redis Cluster and Ring clients are not supported: a multi-bucket admission is one multi-key EVAL whose keys can hash to different slots (CROSSSLOT); wire a single-node or Sentinel-backed *redis.Client")
+
+// IsShardingClient reports whether client spreads one keyspace across several servers.
+// Matched on the CONCRETE type — a decorator (a hooked client, a custom Cmdable) can still
+// wrap one — so it catches the ordinary wiring mistake rather than proving the topology.
+//
+// Exported because it is not only this package's question: pkg/killswitch fans a keyless SCAN
+// out per server for the same reason, and two hand-written type switches drifted (one listed
+// Ring, the other did not) while both claimed to enumerate the same thing.
+func IsShardingClient(client redis.Cmdable) bool {
+	switch client.(type) {
+	case *redis.ClusterClient, *redis.Ring:
+		return true
+	}
+	return false
+}
+
+// ServerInfoReader is the one command CheckServerNotClustered issues. A narrow parameter type
+// so a caller can drive the check with a canned reply, since standing up a cluster in a test
+// is not a thing that can be done from Go.
+type ServerInfoReader interface {
+	Info(ctx context.Context, section ...string) *redis.StringCmd
+}
+
+// CheckServerNotClustered refuses a single-node client aimed at a node of a Redis Cluster.
+// It is the SERVER-side half of the refusal IsShardingClient makes client-side: an ordinary
+// *redis.Client passes every type check and still cannot run AdmitAll's multi-key EVAL.
+//
+// It reads `INFO cluster` — not `CLUSTER INFO`, whose reply carries no cluster_enabled field
+// at all (that lives only in INFO's Cluster section), and which a standalone server refuses
+// outright, so a check written against it could never fire in either direction.
+//
+// A server that cannot answer INFO (an emulator, a proxy, an ACL that denies it) is treated as
+// unclustered, since the alternative is refusing to start against every Redis-protocol server
+// that answers the commands eunox actually issues. That branch is inconclusive rather than
+// safe, which is why AdmitAll also maps a CROSSSLOT back to this error at request time.
+func CheckServerNotClustered(ctx context.Context, client ServerInfoReader) error {
+	info, err := client.Info(ctx, "cluster").Result()
+	if err != nil || !strings.Contains(info, "cluster_enabled:1") {
+		return nil
+	}
+	return fmt.Errorf("%w (the server at the configured address reports cluster_enabled:1)", ErrClusterUnsupported)
+}
+
+// NewRedis creates a Redis-backed call counter. It fails rather than returning a counter that
+// cannot admit: on a keyspace-sharding client (ErrClusterUnsupported), or when crypto/rand
+// cannot supply the per-instance entropy for ZADD member uniqueness — a silent fallback there
+// would risk reintroducing the cross-replica collision the entropy prevents.
+func NewRedis(client redis.Cmdable, opts ...redisOption) (*Redis, error) {
+	if IsShardingClient(client) {
+		return nil, fmt.Errorf("%w (got %T)", ErrClusterUnsupported, client)
+	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		panic(fmt.Errorf("callcounter: crypto/rand unavailable: %w", err))
+		return nil, fmt.Errorf("callcounter: crypto/rand unavailable: %w", err)
 	}
 	r := &Redis{
 		client:             client,
@@ -91,7 +152,7 @@ func NewRedis(client redis.Cmdable, opts ...redisOption) *Redis {
 	for _, opt := range opts {
 		opt(r)
 	}
-	return r
+	return r, nil
 }
 
 // IncrementAndGet atomically records a call via a MULTI/EXEC transaction, returning the
@@ -282,9 +343,11 @@ return {1, 0, string.format('%.17g', maxTotal), 0}
 `)
 
 // AdmitAll admits against several quota buckets atomically, mixing counted and weighted
-// accountings in one script (see admitAllScript). This is a multi-key EVAL: buckets carry
-// distinct windowSec suffixes, so on a Redis Cluster they can hash to different slots and
-// CROSSSLOT surfaces here, which the engine maps to a deny (fails closed, never over-admits).
+// accountings in one script (see admitAllScript). This is the multi-key EVAL that makes a
+// sharded keyspace unusable: NewRedis refuses a sharding CLIENT and CheckServerNotClustered
+// refuses a single-node client aimed at a cluster NODE, but the second is a probe that can be
+// inconclusive, so a CROSSSLOT surfacing here is mapped back to ErrClusterUnsupported rather
+// than reported as an opaque backend fault at the first two-bucket policy.
 func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
 	// checkBuckets is shared with InMemory: without it, two buckets sharing a window key
 	// would ZADD two members into one set (double-count), diverging from InMemory.
@@ -319,6 +382,11 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 
 	res, runErr := admitAllScript.Run(ctx, r.client, redisKeys, argv...).Result()
 	if runErr != nil {
+		if strings.Contains(runErr.Error(), "CROSSSLOT") {
+			// Self-diagnosing: the startup probe swallows an unanswerable INFO, so this is the
+			// only place a keyspace that shards can still announce itself. Still a deny.
+			return false, 0, 0, 0, fmt.Errorf("%w: %v", ErrClusterUnsupported, runErr)
+		}
 		return false, 0, 0, 0, fmt.Errorf("redis eval: %w", runErr)
 	}
 	return parseAdmitAllReply(res)

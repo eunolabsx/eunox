@@ -45,8 +45,10 @@ func (e *Engine) NonCommittingConditionVerdict(ctx context.Context, cond capabil
 	if !exists {
 		return nil, false
 	}
-	if _, commits := handler.ConditionHandler.(CommittingConditionHandler); commits {
+	if handler.pure == nil {
+		// Registered as committing: it has no entry point that decides without consuming, so
+		// there is nothing to run here.
 		return nil, false
 	}
-	return handler.Handle(ctx, cond, req), true
+	return handler.pure.Handle(ctx, cond, req), true
 }

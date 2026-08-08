@@ -129,10 +129,18 @@ prefix maps directly onto release-notes grouping in
 | `feat:` | a new user-visible capability | 🚀 Features |
 | `fix:` | a bug fix | 🐛 Bug Fixes |
 | `sec:` | a security hardening | 🔒 Security |
+| `perf:` | a faster or cheaper path, same behavior | ⚡ Performance |
+| `refactor:` | internal restructuring, no behavior change | hidden |
 | `docs:` | docs only | hidden from release notes |
 | `test:` | tests only | hidden |
 | `ci:` | CI / workflow / release tooling | hidden |
 | `chore:` | maintenance, dep bumps | hidden |
+
+`refactor:` is hidden precisely because it must carry no behavior change. If
+a restructuring also fixes something an operator could observe — a wrong
+decision, a leak, a divergence between two paths — it is a `fix:` (or `sec:`)
+and belongs in the release notes under that prefix, however much of the diff
+is moving code. Retitle rather than let it land in the hidden set.
 
 Add `!` after the prefix for a breaking change (`feat!: rename
 manifest.policy → manifest.capabilities`) and include a `BREAKING CHANGE:`
@@ -251,8 +259,9 @@ rules:
   build (`policy`, `custom`): what an embedder's evaluator reads is not
   knowable from the token type. Those two ask the wired `PolicyEvaluator`
   instead when it implements `enforcement.SubsystemDependent`, which is also
-  how an embedder replacing a stock handler via `WithConditionHandler` declares
-  what the REPLACEMENT reads — an override is otherwise unclassified, and so
+  how an embedder replacing a stock handler via `WithConditionHandler` (or, for a
+  quota-consuming one, `WithCommittingConditionHandler`) declares what the
+  REPLACEMENT reads — an override is otherwise unclassified, and so
   keeps every facility wired.
 - For new MCP method coverage, add an enforcement-gap-style test in
   `internal/transport/enforcement_gaps_test.go`. That includes **per-revision**

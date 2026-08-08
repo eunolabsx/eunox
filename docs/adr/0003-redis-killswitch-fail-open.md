@@ -70,7 +70,9 @@ on those paths already denies.
   refresh. This is the intended trade-off for an emergency-stop control, but it
   means **Redis is now on the data-plane critical path for `--redis-addr`
   deployments** unless `--killswitch-fail-open` is set. Run Redis with HA
-  (Sentinel/cluster) and size the reconcile interval accordingly. Recovery from a
+  (Sentinel; Redis Cluster is unsupported and refused at startup, since the call
+  counter admits a multi-bucket quota in one multi-key script) and size the
+  reconcile interval accordingly. Recovery from a
   transient blip is bounded by the reconcile interval (the denial window persists
   until the next successful refresh, not until Redis itself recovers), so
   fail-closed deployments can shorten it with `--killswitch-reconcile-interval`

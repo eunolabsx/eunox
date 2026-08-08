@@ -5,6 +5,7 @@ package callcounter_test
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"strings"
@@ -21,12 +22,102 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
+// TestNewRedis_RefusesKeyspaceShardingClients pins the client-side wiring guard: a client that
+// spreads one keyspace across servers cannot run AdmitAll's multi-key EVAL, and the failure is
+// a CROSSSLOT that fails closed — so without this it is invisible until the first policy
+// carrying two quota buckets denies in production, and nondeterministically even then, since
+// unrelated window suffixes may collide into one slot by chance.
+//
+// Neither constructor call reaches a server: go-redis connects lazily, and the refusal is on
+// the client TYPE.
+func TestNewRedis_RefusesKeyspaceShardingClients(t *testing.T) {
+	cases := []struct {
+		name     string
+		client   redis.Cmdable
+		wantType string
+	}{
+		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000", "127.0.0.1:7001"}}), "*redis.ClusterClient"},
+		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"}}), "*redis.Ring"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			counter, err := callcounter.NewRedis(tc.client)
+			require.ErrorIs(t, err, callcounter.ErrClusterUnsupported)
+			require.Nil(t, counter, "a refused construction must hand back nothing to admit against")
+			// Asserted on the CONCRETE type, not on a substring the sentinel's own text already
+			// contains: the operator reading a startup failure needs to know which wiring
+			// decision produced it, and only this names it.
+			require.Contains(t, err.Error(), "got "+tc.wantType)
+		})
+	}
+}
+
+// TestNewRedis_AcceptsSingleNodeClient is the positive control: the refusal is on sharding
+// topologies, not on Redis.
+func TestNewRedis_AcceptsSingleNodeClient(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	counter, err := callcounter.NewRedis(client)
+	require.NoError(t, err)
+	require.NotNil(t, counter)
+}
+
+// fakeServerInfo answers INFO with a canned reply, so the clustered branch is reachable
+// without standing up a cluster.
+type fakeServerInfo struct {
+	reply    string
+	err      error
+	sections []string
+}
+
+func (f *fakeServerInfo) Info(_ context.Context, section ...string) *redis.StringCmd {
+	f.sections = section
+	return redis.NewStringResult(f.reply, f.err)
+}
+
+// TestCheckServerNotClustered pins the SERVER-side half. The binary builds a single-node
+// client, so its spelling of the unsupported wiring is an ordinary client aimed at a clustered
+// server: every command eunox issues works there until a policy carries two quota bounds.
+//
+// The reply bodies are verbatim `INFO cluster` output from redis-server, and the error row is
+// the real answer from a server that does not implement it. An earlier version of this check
+// read `CLUSTER INFO` and matched cluster_enabled:1 in its reply — a field that command never
+// returns — so it was dead in both directions while a hand-written fake said otherwise. Assert
+// against what the wire actually carries.
+func TestCheckServerNotClustered(t *testing.T) {
+	cases := []struct {
+		name       string
+		info       *fakeServerInfo
+		wantRefuse bool
+	}{
+		{"clustered", &fakeServerInfo{reply: "# Cluster\r\ncluster_enabled:1\r\n"}, true},
+		{"standalone", &fakeServerInfo{reply: "# Cluster\r\ncluster_enabled:0\r\n"}, false},
+		// Inconclusive, not safe: an emulator or a denying ACL must not stop the proxy starting
+		// against a server that answers every command eunox actually issues. AdmitAll's
+		// CROSSSLOT mapping is what covers this arm at request time.
+		{"info unsupported", &fakeServerInfo{err: errors.New("ERR unknown command 'info'")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := callcounter.CheckServerNotClustered(context.Background(), tc.info)
+			require.Equal(t, []string{"cluster"}, tc.info.sections, "the probe must read INFO's Cluster section; cluster_enabled exists nowhere else")
+			if tc.wantRefuse {
+				require.ErrorIs(t, err, callcounter.ErrClusterUnsupported)
+				return
+			}
+			require.NoError(t, err, "startup must not fail against a non-cluster server")
+		})
+	}
+}
+
 func TestRedis_IncrementAndGet_Basic(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	count, err := counter.IncrementAndGet(ctx, "key1", 60, noTrimCap)
@@ -48,7 +139,7 @@ func TestRedis_IncrementAndGet_CapsToMaxEntries(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	const (
@@ -81,7 +172,7 @@ func TestRedis_IncrementAndGet_CapKeepsNewest(t *testing.T) {
 
 	base := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
 	now := base
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
 	ctx := context.Background()
 
 	const (
@@ -118,7 +209,7 @@ func TestRedis_IncrementAndGet_RejectsNonPositiveMaxEntries(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 	for _, mx := range []int{0, -1} {
 		_, err := counter.IncrementAndGet(ctx, "k", 60, mx)
@@ -137,7 +228,7 @@ func TestRedis_IncrementAndGet_RejectsOversizedMaxEntries(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 	// Only representable oversized values: on a 32-bit platform MaxEntries equals
 	// math.MaxInt, so no int can exceed it and there is nothing to reject above the
@@ -163,7 +254,7 @@ func TestRedis_RejectsOutOfRangeWindow(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	huge := int(callcounter.MaxWindowSeconds) + 1
@@ -188,7 +279,7 @@ func TestRedis_Peek_DoesNotMutate(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	// Unknown key reads as zero.
@@ -226,7 +317,7 @@ func TestRedis_Peek_ExcludesExactCutoff(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	now := time.Unix(1_700_000_000, 0)
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
 	ctx := context.Background()
 
 	// Record one call, then advance exactly one window so the recorded entry sits
@@ -258,7 +349,7 @@ func TestRedis_Peek_IncludesJustInsideWindow(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	now := time.Unix(1_700_000_000, 0)
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
 	ctx := context.Background()
 
 	_, err := counter.IncrementAndGet(ctx, "boundary", 60, noTrimCap)
@@ -285,7 +376,7 @@ func TestRedis_IncrementAndGet_SlidingWindowExpiry(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	// Make 3 calls with a 2-second window (key TTL = 2×2 = 4 s).
@@ -313,7 +404,7 @@ func TestRedis_IncrementAndGet_ConcurrentCallsNoDuplicate(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	const n = 50
@@ -340,7 +431,7 @@ func TestRedis_AdmitCounted_AdmitsUpToLimit(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	for i := 1; i <= 3; i++ {
@@ -380,7 +471,7 @@ func TestRedis_AdmitCounted_AtomicUnderConcurrency(t *testing.T) {
 			client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 			t.Cleanup(func() { _ = client.Close() })
 
-			counter := callcounter.NewRedis(client)
+			counter := callcounter.NewRedisForTest(t, client)
 			ctx := context.Background()
 
 			const goroutines = 64
@@ -417,7 +508,7 @@ func TestRedis_AdmitCounted_RejectsOutOfRangeWindow(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	_, _, _, err := admitCounted(ctx, counter, "k", 0, 1)
@@ -436,7 +527,7 @@ func TestRedis_AdmitCounted_RejectsNonPositiveLimit(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	for _, limit := range []int64{0, -1} {
@@ -463,7 +554,7 @@ func TestRedis_AdmitCounted_DeniedCallsDoNotExtendLockout(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	now := time.Unix(1_700_000_000, 0)
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
 	ctx := context.Background()
 
 	// Fill the window: 2 calls at T=0 with a limit of 2.
@@ -508,7 +599,7 @@ func TestRedis_AdmitCounted_DeniedCallRefreshesTTL(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	now := time.Unix(1_700_000_000, 0)
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
 	ctx := context.Background()
 
 	const windowSec = 60 // TTL = windowSec * 2 = 120s
@@ -551,7 +642,7 @@ func TestRedis_AdmitCounted_RetryAfterWhenCountExceedsLimit(t *testing.T) {
 
 	base := time.Unix(1_700_000_000, 0)
 	now := base
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
 	ctx := context.Background()
 
 	const (
@@ -597,7 +688,7 @@ func TestRedis_ScoreEncoding_ConsistentAcrossMethods(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	now := time.Unix(1_700_000_000, 0)
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return now }))
 	ctx := context.Background()
 
 	const (
@@ -635,7 +726,7 @@ func TestRedis_IncrementAndGet_ConnectionLoss_ReturnsError(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 
 	// Simulate Redis becoming unreachable mid-operation.
 	mr.Close()
@@ -662,7 +753,7 @@ func TestRedis_IncrementAndGet_WrongType_ReturnsError(t *testing.T) {
 	// ("callcounter:<key>:<windowSec>"), so the ZCard inside EXEC hits WRONGTYPE.
 	require.NoError(t, mr.Set("callcounter:key1:60", "not-a-sorted-set"))
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	_, err := counter.IncrementAndGet(context.Background(), "key1", 60, noTrimCap)
 	require.Error(t, err, "IncrementAndGet must surface a per-command (WRONGTYPE) error so the engine fails closed instead of reading a zero count")
 }
@@ -680,7 +771,7 @@ func TestRedis_Peek_ConnectionLoss_ReturnsError(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = client.Close() })
 
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	mr.Close()
 
 	_, err := counter.Peek(context.Background(), "key1", 60)
@@ -702,8 +793,8 @@ func TestRedis_MultiInstance_SharedCount(t *testing.T) {
 		_ = clientB.Close()
 	})
 
-	instanceA := callcounter.NewRedis(clientA)
-	instanceB := callcounter.NewRedis(clientB)
+	instanceA := callcounter.NewRedisForTest(t, clientA)
+	instanceB := callcounter.NewRedisForTest(t, clientB)
 	ctx := context.Background()
 
 	n, err := instanceA.IncrementAndGet(ctx, "shared", 60, noTrimCap)
@@ -744,8 +835,8 @@ func TestRedis_MultiInstance_SameTick_NoCollision(t *testing.T) {
 	pinned := time.Unix(1_700_000_000, 0)
 	clock := func() time.Time { return pinned }
 
-	instanceA := callcounter.NewRedis(clientA, callcounter.WithRedisTimeFunc(clock))
-	instanceB := callcounter.NewRedis(clientB, callcounter.WithRedisTimeFunc(clock))
+	instanceA := callcounter.NewRedisForTest(t, clientA, callcounter.WithRedisTimeFunc(clock))
+	instanceB := callcounter.NewRedisForTest(t, clientB, callcounter.WithRedisTimeFunc(clock))
 	ctx := context.Background()
 
 	const n = 50
@@ -881,7 +972,7 @@ func TestBackendParity_SubMicrosecondWindowBoundary(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	rds := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(clock))
+	rds := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(clock))
 
 	ctx := context.Background()
 
@@ -917,7 +1008,7 @@ func TestRedis_IncrementAndGet_CapKeepsNewestAcrossDigitBoundary(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	fixed := time.Date(2026, 6, 15, 7, 10, 0, 123456789, time.UTC)
-	counter := callcounter.NewRedis(client, callcounter.WithRedisTimeFunc(func() time.Time { return fixed }))
+	counter := callcounter.NewRedisForTest(t, client, callcounter.WithRedisTimeFunc(func() time.Time { return fixed }))
 	ctx := context.Background()
 
 	const (
@@ -955,7 +1046,7 @@ func TestRedis_AdmitAll_AllOrNothing(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = client.Close() }()
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	buckets := []capability.QuotaBucket{
@@ -990,7 +1081,7 @@ func TestRedis_AdmitAll_MixedAccounting(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = client.Close() }()
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	mixed := func(weight float64) []capability.QuotaBucket {
@@ -1058,7 +1149,7 @@ func TestAdmitAll_DuplicateBucketsFailClosed_BothBackends(t *testing.T) {
 		counter capability.CallCounter
 	}{
 		{"memory", callcounter.NewInMemory()},
-		{"redis", callcounter.NewRedis(client)},
+		{"redis", callcounter.NewRedisForTest(t, client)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			admitted, _, _, _, err := tc.counter.AdmitAll(ctx, dup)
@@ -1081,7 +1172,7 @@ func TestRedis_AdmitAll_AdmittedReturnsTotal(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = client.Close() }()
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	buckets := []capability.QuotaBucket{
@@ -1106,7 +1197,7 @@ func TestRedis_AdmitAll_ValidatesInputs(t *testing.T) {
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer func() { _ = client.Close() }()
-	counter := callcounter.NewRedis(client)
+	counter := callcounter.NewRedisForTest(t, client)
 	ctx := context.Background()
 
 	_, _, _, _, err := counter.AdmitAll(ctx, nil)
