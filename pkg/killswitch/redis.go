@@ -15,6 +15,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/durationsentinel"
 )
 
@@ -968,23 +969,40 @@ func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]boo
 	return gained
 }
 
-// shardFanOut returns the per-server iterator for a client that shards the keyspace, or ok
-// false for one that keeps it on a single server.
+// shardFanOut returns the per-server iterator for a client that shards the keyspace, sharded
+// false for one that keeps it on a single server, and an error for a client that shards but
+// has no iterator here.
 //
-// ONE resolver for both keyless-command sites (the refresh SCAN and the reset sweep), covering
-// the same shapes callcounter.IsShardingClient names: the two hand-written type switches it
-// replaces had drifted — both named ClusterClient, neither named Ring — so a Ring took the
-// single-node path over a keyspace it holds only part of.
-func shardFanOut(client redis.Cmdable) (func(context.Context, func(context.Context, *redis.Client) error) error, bool) {
+// ONE resolver for both keyless-command sites (the refresh SCAN and the reset sweep). Whether
+// a client shards is ASKED of callcounter.IsShardingClient rather than re-enumerated: the two
+// hand-written switches this replaced had already drifted inside one file (both named
+// ClusterClient, neither named Ring), and a second list one package over is that same drift
+// with a package boundary hiding it. What stays here is only WHICH iterator to call.
+//
+// A shape IsShardingClient names and this switch has no iterator for is an error, not a
+// fall-through: the single-node path would SCAN one server of several and load a partial kill
+// set while reporting healthy, which is the fail-open the *redis.Ring case already was.
+func shardFanOut(client redis.Cmdable) (fanOut func(context.Context, func(context.Context, *redis.Client) error) error, sharded bool, err error) {
+	return shardFanOutWhen(client, callcounter.IsShardingClient(client))
+}
+
+// shardFanOutWhen is shardFanOut with the "does this client shard" answer supplied. The seam
+// exists so the disagreement branch is reachable from a test: the two questions are answered
+// from one type list today, which is the point, and a branch guarding the day they diverge
+// cannot otherwise be exercised.
+func shardFanOutWhen(client redis.Cmdable, sharding bool) (fanOut func(context.Context, func(context.Context, *redis.Client) error) error, sharded bool, err error) {
+	if !sharding {
+		return nil, false, nil
+	}
 	switch c := client.(type) {
 	case *redis.ClusterClient:
 		// Masters only: a replica holds the same keys, so scanning them would double the work
 		// and, mid-failover, disagree with its master about what is there.
-		return c.ForEachMaster, true
+		return c.ForEachMaster, true, nil
 	case *redis.Ring:
-		return c.ForEachShard, true
+		return c.ForEachShard, true, nil
 	}
-	return nil, false
+	return nil, false, fmt.Errorf("kill switch: %T spreads the keyspace across servers but this build has no per-server iterator for it; refusing a keyless SCAN that would enumerate only one of them", client)
 }
 
 // scanner is the subset of a Redis node needed to enumerate keys by prefix. A PARAMETER
@@ -1004,7 +1022,11 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	// kept covering BOTH shapes callcounter.IsShardingClient names, because the half-handled
 	// version was the dangerous one — a Ring fell through to the single-node path and loaded
 	// whichever shard go-redis picked at random for that refresh.
-	if fanOut, ok := shardFanOut(r.client); ok {
+	fanOut, sharded, err := shardFanOut(r.client)
+	if err != nil {
+		return err
+	}
+	if sharded {
 		var mu sync.Mutex
 		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
 			return scanNode(ctx, node, prefix, target, &mu)
@@ -1049,7 +1071,11 @@ type scanDeleter interface {
 func (r *Redis) deleteByPrefix(ctx context.Context, prefix string) error {
 	// As with scanPrefix, a sharding client SCANs only one server, so a reset must visit each;
 	// otherwise Reset() reports success while leaving kills on the others.
-	if fanOut, ok := shardFanOut(r.client); ok {
+	fanOut, sharded, err := shardFanOut(r.client)
+	if err != nil {
+		return err
+	}
+	if sharded {
 		return fanOut(ctx, func(ctx context.Context, node *redis.Client) error {
 			return deleteNodeKeys(ctx, node, prefix)
 		})

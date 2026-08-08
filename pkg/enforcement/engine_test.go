@@ -1494,7 +1494,7 @@ func TestEngine_PolicyCondition_DenyWhenNoEvaluatorConfigured(t *testing.T) {
 	})
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypePolicy, resp.Denial.ConditionType)
 	assert.Contains(t, resp.Denial.Message, "WithPolicyEvaluator")
 }
@@ -1580,7 +1580,7 @@ func TestEngine_CustomCondition_DenyWhenNoHandlerRegistered(t *testing.T) {
 	})
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeCustom, resp.Denial.ConditionType)
 	assert.Contains(t, resp.Denial.Message, "my-check")
 	assert.Contains(t, resp.Denial.Message, "WithConditionHandler")
@@ -2918,7 +2918,7 @@ func TestEngine_MaxCalls_CounterError(t *testing.T) {
 	})
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Contains(t, resp.Denial.Message, "call counter error")
 }
 
@@ -3390,7 +3390,7 @@ func TestEngine_MaxCalls_NoCounterFailsClosed(t *testing.T) {
 	}})
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeMaxCalls, resp.Denial.ConditionType)
 }
 
@@ -6099,7 +6099,7 @@ func TestDirectives_UnknownConditionTypeFailsClosed(t *testing.T) {
 	req := &capability.EnforceRequest{SessionID: "sess", TargetName: "read_file"}
 	resp := e.EvaluateConditions(context.Background(), req, &constraint)
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Contains(t, resp.Denial.Message, "definitely-not-a-real-condition")
 }
 
@@ -7696,7 +7696,7 @@ func TestSequenceBlock_RecordFailureFailsClosed(t *testing.T) {
 	resp := callOnce(t, engine, "sess-1", "read_credentials", caps)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
 	assert.Equal(t, recordFailureMessage, resp.Denial.Message)
 	// phase=record marks this as a recording-path failure, distinct from an
@@ -7715,7 +7715,7 @@ func TestSequenceBlock_RecordFailureFailsClosed_EvaluateConditions(t *testing.T)
 	resp := engine.EvaluateConditions(context.Background(), req, matched)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
 	assert.Equal(t, recordFailureMessage, resp.Denial.Message)
 	assert.Equal(t, "record", resp.Denial.Details["phase"])

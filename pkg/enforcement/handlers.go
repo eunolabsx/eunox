@@ -311,7 +311,7 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 
 	if e.counter == nil {
 		return nil, "", false, &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
+			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypeMaxCalls,
 			Message:       "call counter not configured",
 		}
@@ -1185,7 +1185,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 
 	if e.counter == nil {
 		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
+			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypeSequenceBlock,
 			Message:       "call counter not configured",
 		}
@@ -1238,7 +1238,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		count, err := e.counter.Peek(histCtx, key, sequenceHistoryWindowSec)
 		if err != nil {
 			return &ConditionError{
-				Code:          capability.ErrCodeConditionFailed,
+				Code:          capability.ErrCodeEnforcementError,
 				ConditionType: capability.ConditionTypeSequenceBlock,
 				Message:       fmt.Sprintf("session history lookup failed: %v", err),
 			}
@@ -1272,11 +1272,12 @@ func (e *Engine) handlePolicy(ctx context.Context, cond capability.Condition, re
 		return condErr
 	}
 
-	// Fail closed: a policy condition must not be silently allowed when no evaluator
-	// is wired up. Configure one via WithPolicyEvaluator.
+	// The extension point's own "no usable handler" refusal, and the same class as the
+	// registry's: nothing evaluated the condition, so there is no verdict for an observing
+	// route to downgrade to.
 	if e.policyEvaluator == nil {
 		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
+			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypePolicy,
 			Message:       "no policy evaluator configured; register one via WithPolicyEvaluator",
 			Details: map[string]interface{}{
@@ -1294,10 +1295,11 @@ func (e *Engine) handleCustom(_ context.Context, cond capability.Condition, _ *c
 		return condErr
 	}
 
-	// Fail closed: no handler is registered for custom conditions. Supply one via
+	// As handlePolicy's: an unwired extension point evaluated nothing, so the refusal is a
+	// fault rather than a verdict. Supply a handler via
 	// WithConditionHandler(capability.ConditionTypeCustom, handler).
 	return &ConditionError{
-		Code:          capability.ErrCodeConditionFailed,
+		Code:          capability.ErrCodeEnforcementError,
 		ConditionType: capability.ConditionTypeCustom,
 		Message:       fmt.Sprintf("no handler registered for custom condition %q; register one via enforcement.WithConditionHandler", cc.Name),
 		Details: map[string]interface{}{

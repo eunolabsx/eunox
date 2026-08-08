@@ -314,10 +314,38 @@ request.
 The pin names the revision eunox speaks to that upstream; it does not yet change the
 opener. Every upstream leg is opened with `initialize`, so the `MCP-Protocol-Version`
 header its post-handshake requests carry names the handshake revision regardless of
-the pin. A host request's own `_meta` declaration is likewise forwarded verbatim, so
-a host on one revision in front of an upstream on another can produce a header and
-body naming different revisions — rewriting that pair is translation, which the
-mismatched-pair boundary governs and this release does not implement.
+the pin.
+
+A host request's own `_meta` declaration is forwarded **verbatim** — nothing strips or
+rewrites `_meta`. Rewriting it to match the leg is translation, which the mismatched-pair
+boundary governs and this release does not implement, so eunox instead **refuses** a
+declaration it cannot forward honestly: a request whose declared revision differs from the
+one the upstream leg speaks (or from the revision that leg is addressed as) is refused
+`UNSUPPORTED_PROTOCOL_VERSION` (`-32022`) and recorded, before the upstream is contacted.
+Otherwise the proxy would not be relaying a mismatched pair but manufacturing one — a body
+declaring one revision beside a header naming another, which a first-wins and a last-wins
+upstream resolve differently while eunox decided under a third.
+
+Two consequences worth stating plainly:
+
+- The refusal applies only to messages whose params actually travel upstream: the enforced
+  methods, `*/list`, and the notifications forwarded verbatim (`notifications/cancelled`,
+  `notifications/progress`, `notifications/roots/list_changed`). A declaration on a
+  locally-answered method (`ping`, `initialize`) contradicts nothing and is admitted, so a peer
+  on the newer revision still gets that revision's tables and its own removals. Note the cost
+  on the notification half: JSON-RPC forbids replying to one, so a refused
+  `notifications/cancelled` is recorded and acked bodyless — the cancel does not reach the
+  upstream and the call it targeted runs to completion.
+- What a request must not contradict is the revision eunox ADDRESSES the upstream as, which is
+  the one its own `initialize` negotiated — not whatever the upstream reported back. An
+  upstream answering the handshake with a newer revision does not make a host's declaration of
+  the negotiated one unhonorable; that pair is consistent and is forwarded.
+- The check reads the request's RESOLVED revision, not just an explicit declaration. A peer
+  that declares once on a locally-answered method pins its context, and every later request
+  inherits that revision whether or not it says so.
+- Because every leg is opened with `initialize`, a host declaring `2026-07-28` cannot have
+  a call forwarded today, on any upstream, pinned or not. It is refused with the leg's
+  revision named, rather than served into a conversation held at another revision.
 
 ---
 

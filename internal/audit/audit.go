@@ -1888,9 +1888,11 @@ const UpstreamErrorCodeKey = "_eunox_upstream_error_code"
 const EffectReceiptKey = "_eunox_effect_receipt"
 
 // HandlerFaultKey is the reserved detail key the transport merges into an ALLOW record's
-// Details naming the condition types whose registered handler broke an engine contract the
-// engine then REPAIRED (see capability.EnforceResponse.HandlerFaults). Its value is an array
-// of condition types.
+// Details naming the registered handlers that broke an engine contract the engine then
+// REPAIRED (see capability.EnforceResponse.HandlerFaults). Its value is an array of
+// {"type","contract"} objects: which handler, and which contract it broke. The second field
+// is what an alert keys on — a report naming only the condition type is unambiguous exactly
+// while one repairable violation exists.
 //
 // It is on the tape because absorbing a fault must not be the same as ignoring it: the call
 // was decided exactly as a conforming handler would have decided it, so nothing else on the

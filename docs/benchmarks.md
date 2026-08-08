@@ -23,7 +23,7 @@ benchstat bench-10.txt
 Or run directly:
 
 ```sh
-go test -run='^$' -bench=. -benchtime=3s -benchmem -count=3 ./internal/... \
+go test -run='^$' -bench=. -benchtime=3s -benchmem -count=3 ./internal/... ./pkg/... \
     2>&1 | grep -v '^\[eunox\]'
 ```
 
@@ -123,6 +123,30 @@ The stdio baseline is ~4 µs vs the HTTP baseline of ~32 µs — the difference 
 the TCP loopback RTT eliminated by the in-process pipe.  The proxy overhead
 (2.6 µs) is comparable to HTTP mode (7.6 µs) minus the TCP stack cost, which is
 expected since both share the same PDP hot path.
+
+### 6. Decision path — the engine itself
+
+`internal/`'s `BenchmarkManifestPDP` above measures a decision end to end, dominated by
+manifest matching and JSON work. These isolate what `pkg/enforcement` does inside it: the
+per-condition dispatch loop, the two-pass structure a quota-carrying constraint takes, and the
+anchored-key builders every piece of accumulated state routes through.
+
+Read the condition cells against each other rather than against a target. The property worth
+holding is that **allocs/op is constant in n** — dispatch itself allocates nothing, so a
+refactor that starts allocating per condition shows up as a rising column while every test
+still passes. `PureAndCommitting` minus `PureConditions/n=4` is what deferral, bucket
+derivation and the atomic admission cost on an in-memory counter.
+
+| Benchmark | What it isolates |
+|---|---|
+| ValidateAction / NoConditions | The floor: matching, target resolution, allow tail |
+| ValidateAction / PureConditions (n=1,4,8) | Per-condition dispatch; allocs must not grow with n |
+| ValidateAction / PureAndCommitting | The second pass: deferral + `AdmitAll` |
+| AnchoredKey (session, task) | The key builder on every quota bucket and history lookup |
+
+No numbers are recorded here on purpose: unlike the tables above, these have no target to
+meet, and a figure copied from one machine into a document is the thing a reader mistakes for
+a baseline. Run them and compare against your own `benchstat` output.
 
 ## Benchmark methodology
 

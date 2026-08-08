@@ -393,11 +393,23 @@ func declassifyRefusalDetail(dec capability.EnforceResponse) map[string]interfac
 // contract violation, or nil for the healthy call every deployment makes. The engine decided
 // the call as if the handler had conformed (see capability.EnforceResponse.HandlerFaults), so
 // the record is the only place the plugin bug is reported at all.
+//
+// Rendered into the plain map/slice shapes the audit layer's value bounder recurses into
+// rather than handed over as the typed slice: that bounder clones and caps what it recognizes
+// and passes anything else through untouched, so a typed value would ride the tape neither
+// bounded nor detached from the decision that produced it.
 func handlerFaultDetail(dec capability.EnforceResponse) map[string]interface{} {
 	if len(dec.HandlerFaults) == 0 {
 		return nil
 	}
-	return map[string]interface{}{audit.HandlerFaultKey: dec.HandlerFaults}
+	faults := make([]interface{}, 0, len(dec.HandlerFaults))
+	for _, f := range dec.HandlerFaults {
+		faults = append(faults, map[string]interface{}{
+			"type":     f.Type,
+			"contract": string(f.Contract),
+		})
+	}
+	return map[string]interface{}{audit.HandlerFaultKey: faults}
 }
 
 // decisionDetail is the annotation set EVERY record derived from a decision carries — the
@@ -664,12 +676,17 @@ func normalizeDenial(d *capability.DenialInfo) *capability.DenialInfo {
 }
 
 // isObserveDeny reports whether a deny decision should be downgraded to a logged forward
-// (audit/observe mode) instead of hard-blocked. Kill-switch and hard denials are never
-// downgraded. Shared by the forward core and the sampling leg so their observe gates agree.
+// (audit/observe mode) instead of hard-blocked. Shared by the forward core and the sampling
+// leg so their observe gates agree.
+//
+// WHICH denials resist the downgrade is not this function's question and never was: it is a
+// property of the refusal, answered by [capability.DenialInfo.Downgradable] from the class its
+// code names, plus the producer's HardDeny override. What used to sit here was one conjunct
+// per reason — a code test for the kill switch, a bool for everything else — so a third
+// reason (the engine faults, which carried the policy-verdict code and remembered the bool
+// only sometimes) had nowhere to go. This side now contributes only the POSTURE.
 func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) bool {
-	// denial is always non-nil here (both callers normalize first); intentionally no nil
-	// guard, since defaulting nil to observable would be the wrong direction to fail in.
-	return !pdp.IsKillSwitchDenial(denial) && !denial.HardDeny && (auditMode || auditOnly)
+	return denial.Downgradable() && (auditMode || auditOnly)
 }
 
 // enforcedForwardCore is the shared deny/observe/forward/record decision both transports apply

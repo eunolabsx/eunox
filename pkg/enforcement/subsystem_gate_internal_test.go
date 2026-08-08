@@ -262,3 +262,35 @@ func TestRegisteredHandler_TypedNilDeclarationDoesNotPanicNew(t *testing.T) {
 		})
 	}
 }
+
+// TestRegisterBuiltins_CoversEveryDiscriminatorInTheVocabulary closes the in-tree half of the
+// unknown-condition-type refusal: a token in pkg/capability's prototype registry whose
+// registerBuiltins line was forgotten loads clean from a manifest (the loader checks the
+// prototype registry) and then hits "unknown condition type" on every call carrying it.
+//
+// Nothing caught that before. The subsystem-gate test above still passes for such a token,
+// because policyUses falls back to the declaration when the type is absent from e.handlers —
+// so the two registries could disagree with every test green.
+func TestRegisterBuiltins_CoversEveryDiscriminatorInTheVocabulary(t *testing.T) {
+	t.Parallel()
+	e := New()
+	for _, condType := range capability.KnownConditionTypes() {
+		handler, ok := e.handlers[condType]
+		if !ok {
+			t.Errorf("condition type %q is in the grammar but has no handler: a manifest carrying it loads clean and then refuses every call as an unknown type", condType)
+			continue
+		}
+		// An entry holding neither shape is the same gap one level in: registered, and still
+		// unable to evaluate anything.
+		if handler.pure == nil && handler.committing == nil {
+			t.Errorf("condition type %q has a registry entry with no handler in either field", condType)
+		}
+	}
+	// The other direction. A handler for a type the grammar does not model can never be
+	// reached through a manifest, so it is dead code that reads as coverage.
+	for condType := range e.handlers {
+		if _, known := capability.NewConditionPrototype(condType); !known {
+			t.Errorf("handler registered for %q, which is not a condition discriminator this build models", condType)
+		}
+	}
+}

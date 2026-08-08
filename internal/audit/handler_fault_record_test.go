@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -20,9 +21,9 @@ import (
 // absorbed fault produces, so it has to survive the tamper-evident chain rather than merely
 // reach the sink.
 //
-// Its value is the shape numeric details have bitten on before: a []string on the way in,
-// decoded as []interface{} by VerifyRecord's own JSON round trip. It verifies today; without
-// this, a later change to the canonical form would break it silently.
+// Its value is the shape numeric details have bitten on before: objects on the way in, decoded
+// as []interface{} of map[string]interface{} by VerifyRecord's own JSON round trip. It verifies
+// today; without this, a later change to the canonical form would break it silently.
 func TestHandlerFaultRecordSignAndVerifyRoundTrip(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -33,7 +34,11 @@ func TestHandlerFaultRecordSignAndVerifyRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	faults := []string{capability.ConditionTypeMaxCalls, capability.ConditionTypeBlastRadius}
+	// The shape the transport renders: which handler, and which contract it broke.
+	faults := []interface{}{
+		map[string]interface{}{"type": capability.ConditionTypeMaxCalls, "contract": string(capability.HandlerContractQuotaUnderSkip)},
+		map[string]interface{}{"type": capability.ConditionTypeBlastRadius, "contract": string(capability.HandlerContractQuotaUnderSkip)},
+	}
 	// Both records the fault can ride: the allow it was decided on, and the deny a route
 	// running --audit forwards anyway.
 	sink.RecordAllow(context.Background(), "sess", "read_file", capability.MethodToolsCall,
@@ -67,10 +72,10 @@ func TestHandlerFaultRecordSignAndVerifyRoundTrip(t *testing.T) {
 		}
 		got, ok := rec.Details[HandlerFaultKey].([]interface{})
 		if !ok {
-			t.Fatalf("record %d: %s = %#v, want an array of condition types", i, HandlerFaultKey, rec.Details[HandlerFaultKey])
+			t.Fatalf("record %d: %s = %#v, want an array of {type, contract} objects", i, HandlerFaultKey, rec.Details[HandlerFaultKey])
 		}
-		if len(got) != len(faults) || got[0] != faults[0] || got[1] != faults[1] {
-			t.Fatalf("record %d: %s = %v, want %v", i, HandlerFaultKey, got, faults)
+		if !reflect.DeepEqual(got, faults) {
+			t.Fatalf("record %d: %s = %#v, want %#v", i, HandlerFaultKey, got, faults)
 		}
 	}
 

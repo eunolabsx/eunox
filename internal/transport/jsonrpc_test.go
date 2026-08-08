@@ -110,13 +110,12 @@ func TestJSONRPCCode_DenialCodeMapping_VALUE_NOT_PERMITTED(t *testing.T) {
 
 func TestJSONRPCCode_DenialCodeMapping_ENFORCEMENT_ERROR(t *testing.T) {
 	t.Parallel()
-	// ENFORCEMENT_ERROR is the reserved, fail-closed code for an internal
-	// enforcement-engine failure. It is a server-side internal error, not a policy
-	// denial, so it maps to -32603 (the standard JSON-RPC internal-error code)
-	// rather than the -32002 CAPABILITY_DENIED fallback used for unknown codes.
-	// The engine does not currently surface such an error (condition failures
-	// resolve to CONDITION_FAILED), so this asserts the wire mapping the PDP's
-	// defensive guard would emit.
+	// ENFORCEMENT_ERROR is the code for a refusal the engine produced because it could
+	// not reach a verdict. It is a server-side internal error, not a policy denial, so
+	// it maps to -32603 (the standard JSON-RPC internal-error code) rather than the
+	// -32002 CAPABILITY_DENIED fallback used for unknown codes. Every unevaluable
+	// condition, unwired or failing backend, and broken handler contract reaches the
+	// host through this mapping.
 	assert.Equal(t, -32603, denialToJSONRPCCode(capability.ErrCodeEnforcementError))
 	assert.Equal(t, capability.JSONRPCCodeEnforcementError, denialToJSONRPCCode(capability.ErrCodeEnforcementError))
 }

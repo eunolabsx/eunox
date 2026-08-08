@@ -96,7 +96,7 @@ func TestOldRevisionWire_RefusalIsByteStable(t *testing.T) {
 		JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: capability.MethodToolsCall,
 		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}`),
 	}
-	_, err := resolveHostRevision(capability.Revision20251125, msg)
+	_, err := resolveHostRevision(capability.Revision20251125, "", msg)
 	if err == nil {
 		t.Fatal("a revision this build does not speak must not resolve")
 	}

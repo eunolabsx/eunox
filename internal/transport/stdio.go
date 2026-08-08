@@ -1113,11 +1113,12 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 // further requests would be Add-concurrent-with-Wait, a WaitGroup misuse that panics.
 func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg) (stop bool) {
 	gate := hostNotificationGate{
-		rec:       p.rec(),
-		sessionID: p.sessionID,
-		errOut:    p.errOut(),
-		checkKill: func() *capability.EnforceResponse { return p.pdp.CheckKill(ctx, p.sessionID) },
-		leg:       legStdioNotification,
+		rec:         p.rec,
+		subject:     verifiedSession(p.sessionID),
+		established: true,
+		errOut:      p.errOut(),
+		checkKill:   func() *capability.EnforceResponse { return p.pdp.CheckKill(ctx, p.sessionID) },
+		leg:         legStdioNotification,
 	}
 	if !gate.admit(ctx, msg) {
 		return false
@@ -1197,7 +1198,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
 // serveHost, the single goroutine that owns the pin.
 func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (context.Context, bool) {
-	rev, err := resolveHostRevision(p.hostRevision(), msg)
+	rev, err := resolveHostRevision(p.hostRevision(), p.upstreamRev, msg)
 	if err != nil {
 		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, msg, err)
 		if msg.IsRequest() {

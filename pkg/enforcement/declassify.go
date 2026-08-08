@@ -144,13 +144,13 @@ func (e *Engine) selectLiveApproval(ctx context.Context, approvals []capability.
 // is what `escalate` exists to name — and it is HARD (AuditOnly unset), so --audit cannot
 // turn it into a forward: that would perform the action while also clearing the taint meant
 // to stop it.
-func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, carriedLabels []string, requestID, now string) (declassifyOutcome, *capability.EnforceResponse) {
+func (e *Engine) checkDeclassify(ctx context.Context, ec evalCtx, carriedLabels []string) (declassifyOutcome, *capability.EnforceResponse) {
 	if e.skipFlow {
 		// No flow state to read or clear; the config layer keeps this unreachable in-tree by
 		// counting declassify as flow-relevant, and this is defense in depth for that.
 		return declassifyOutcome{}, nil
 	}
-	want := capability.DeclassifyLabelsOf(matched)
+	want := capability.DeclassifyLabelsOf(ec.matched)
 	if len(want) == 0 {
 		return declassifyOutcome{}, nil
 	}
@@ -159,7 +159,7 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 	// manifest cannot reach here with one, but a programmatically built constraint can.
 	for _, l := range want {
 		if !capability.IsFlowLabel(l) {
-			return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
+			return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want, nil,
 				fmt.Sprintf("declassify names unknown flow label %q; valid native labels are %v", l, flowLabelVocab),
 				"unknown_label")
 		}
@@ -168,28 +168,28 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 	// The store and session guards mirror recordLabels': without both, the Remove cannot be
 	// performed, and forwarding while a clear silently failed would mislead the operator.
 	if e.flowStore == nil {
-		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
+		return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want, nil,
 			"flow-label store not configured; a declassification cannot be applied", "no_store")
 	}
-	if req.SessionID == "" {
-		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
+	if ec.req.SessionID == "" {
+		return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want, nil,
 			"sessionId is required to apply a declassification", "no_session")
 	}
 
-	target := canonicalApprovalTarget(req)
+	target := canonicalApprovalTarget(ec.req)
 	if target == "" {
-		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
+		return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want, nil,
 			"the request carries no resolvable target, so no approval can be scoped to it", "no_target")
 	}
 
 	// First still-live grant among those scoped to this call; DeclassifyVerdictFor reaches
 	// this same walk, so hardening can't answer more loosely than the decision.
-	sel, err := e.selectLiveApproval(ctx, req.DeclassifyApprovals, target, want)
+	sel, err := e.selectLiveApproval(ctx, ec.req.DeclassifyApprovals, target, want)
 	if err != nil {
 		// Unreadable ledger means "already used" can't be distinguished from "never used";
 		// escalating is the only answer that doesn't make an unreachable backend a replay
 		// vector.
-		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, nil,
+		return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want, nil,
 			fmt.Sprintf("single-use declassify approval state could not be read: %v", err),
 			"ledger_unavailable")
 	}
@@ -200,7 +200,7 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 			// spent, a different operator action than widening scope. consumed_approval_id
 			// (not approval_id, reserved for a signed successful clear) joins this refusal to
 			// the allow that spent it.
-			return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want,
+			return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want,
 				map[string]interface{}{"approvals_consumed": consumed, "consumed_approval_id": covering[0].ID},
 				fmt.Sprintf("the human approval covering flow label(s) %v at %s is single-use and has already been consumed; a new approval is required", want, target),
 				"approval_consumed")
@@ -208,7 +208,7 @@ func (e *Engine) checkDeclassify(ctx context.Context, req *capability.EnforceReq
 		// One message for "no grant" and "a grant that doesn't cover this" — the distinction
 		// isn't actionable differently, and enumerating missing labels would echo the token
 		// back to it.
-		return declassifyOutcome{}, e.declassifyRefusal(requestID, now, carriedLabels, want, approvalCountDetail(req),
+		return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want, approvalCountDetail(ec.req),
 			fmt.Sprintf("clearing flow label(s) %v at %s requires a human approval covering all of them; the request carries none", want, target),
 			"no_approval")
 	}
@@ -263,14 +263,14 @@ func (e *Engine) DeclassifyVerdictFor(ctx context.Context, req *capability.Enfor
 		}
 	}
 	// Outcome discarded: it describes what a COMMIT would apply, and this commits nothing.
-	_, refusal := e.checkDeclassify(ctx, req, matched, carriedLabels, requestID, now)
+	_, refusal := e.checkDeclassify(ctx, evalCtx{req: req, matched: matched, requestID: requestID, now: now}, carriedLabels)
 	return refusal
 }
 
 // declassifyRefusal builds the ESCALATION_REQUIRED refusal for an unauthorized
 // declassification. Every arm routes through it so BoundDenialDetails and the details shape
 // are single-sourced.
-func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []string, extra map[string]interface{}, message, reason string) *capability.EnforceResponse {
+func (e *Engine) declassifyRefusal(ec evalCtx, carriedLabels, want []string, extra map[string]interface{}, message, reason string) *capability.EnforceResponse {
 	details := map[string]interface{}{
 		// Marks this a flow-layer refusal, same discriminator a flowLabel sink denial carries.
 		capability.FlowAuditDetailKey: true,
@@ -285,14 +285,11 @@ func (e *Engine) declassifyRefusal(requestID, now string, carriedLabels, want []
 	if len(carriedLabels) > 0 {
 		details["carried_labels"] = carriedLabels
 	}
-	resp := escalateResponse(requestID, now, capability.DenialInfo{
+	resp := ec.escalate(capability.DenialInfo{
 		Code:          capability.ErrCodeEscalationRequired,
 		ConditionType: declassifyConditionType,
 		Message:       message,
 		Details:       details,
-		// Hard, same reason the ceiling's escalation is: --audit must not downgrade this to a
-		// forward.
-		HardDeny: true,
 	})
 	resp.CarriedLabels = carriedLabels
 	return &resp
@@ -372,10 +369,9 @@ func (e *Engine) burnApproval(ctx context.Context, ledgerID string) error {
 // a detail key so the audit layer stamps it identically on allow and refusal.
 func declassifyRecordFailureDenial(requestID, now string, auditOnly bool, spentApprovalID string) capability.EnforceResponse {
 	resp := denyResponse(requestID, now, auditOnly, nil, capability.DenialInfo{
-		Code:          capability.ErrCodeConditionFailed,
+		Code:          capability.ErrCodeEnforcementError,
 		ConditionType: declassifyConditionType,
 		Message:       "the declassification leg of this call's state commit failed; the approved clear was not applied and the call is refused",
-		HardDeny:      true,
 		Details:       map[string]interface{}{capability.FlowAuditDetailKey: true, "phase": "record"},
 	})
 	if spentApprovalID != "" {

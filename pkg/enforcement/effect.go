@@ -318,7 +318,7 @@ func effectDenial(condType, message string, details map[string]interface{}) *Con
 // Escalate is a REFUSAL, not a pending state: with no approval integration in-path, the
 // fail-closed reading of "escalate" is "not forwarded" — what it buys over a plain deny is the
 // decision=escalate record for an auditor or control plane.
-func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *capability.Constraint, carriedLabels []string, requestID, now string) *capability.EnforceResponse {
+func (e *Engine) checkEffectCeiling(ec evalCtx, eff *capability.ResolvedEffect, carriedLabels []string) *capability.EnforceResponse {
 	exceeds, reasons := e.effectCeiling.Exceeds(eff)
 	if !exceeds {
 		return nil
@@ -345,22 +345,18 @@ func (e *Engine) checkEffectCeiling(eff *capability.ResolvedEffect, matched *cap
 	// argument, and a hand-built literal skipped the bound on the one refusal shape a human is
 	// meant to read.
 	if e.effectCeiling.Outcome() == capability.OnExceedDeny {
-		resp := denyResponse(requestID, now, matched.IsAuditOnly(), nil, capability.DenialInfo{
+		return ec.denyPtr(nil, capability.DenialInfo{
 			Code:          capability.ErrCodeConditionFailed,
 			ConditionType: ceilingConditionType,
 			Message:       message,
 			Details:       details,
 		})
-		return &resp
 	}
-	resp := escalateResponse(requestID, now, capability.DenialInfo{
+	resp := ec.escalate(capability.DenialInfo{
 		Code:          capability.ErrCodeEscalationRequired,
 		ConditionType: ceilingConditionType,
 		Message:       message,
 		Details:       details,
-		// Hard, same reason AuditOnly stays false: --audit must not turn "needs human
-		// approval" into "performed anyway, logged".
-		HardDeny: true,
 	})
 	return &resp
 }
@@ -415,7 +411,7 @@ func (e *Engine) CeilingVerdictFor(ctx context.Context, req *capability.EnforceR
 		}
 	}
 
-	resp := e.checkEffectCeiling(effect, matched, carriedLabels, requestID, now)
+	resp := e.checkEffectCeiling(evalCtx{req: req, matched: matched, requestID: requestID, now: now}, effect, carriedLabels)
 	if resp == nil {
 		return nil
 	}

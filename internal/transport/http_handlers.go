@@ -101,21 +101,20 @@ const (
 // IsInfraDenialCode reports whether code marks an infrastructure failure rather than a
 // policy decision. Consumers mining the audit tape for policy signals skip these.
 func IsInfraDenialCode(code string) bool {
+	// The codes the DENIAL VOCABULARY itself classifies as non-policy — an emergency stop, the
+	// strict-audit gate, a revision that could not be established, an engine/backend fault —
+	// are asked of it rather than listed again here. Three of those four were listed by hand,
+	// which is how the fourth came to be missing: an engine fault names the target of a call
+	// policy never decided, and mining it fabricates a deny-only suggestion for a capability
+	// nothing refused.
+	if capability.ClassifyDenialCode(code) != capability.DenialClassPolicy {
+		return true
+	}
 	switch code {
 	case codeUpstreamError, codeUpstreamTimeout, codeRequestCanceled, codeInvalidRequest:
 		// codeInvalidRequest is a host protocol fault, not a policy decision — mining it
 		// would fabricate a phantom target like "tool:tools/call". Deliberately NOT keyed on
 		// capability.ErrCodeInvalidParams, which is a real policy denial suggest must keep seeing.
-		return true
-	case capability.ErrCodeKillSwitch, capability.ErrCodeKillSwitchError, capability.ErrCodeAuditUnavailable:
-		// Operator/infra denials, not policy decisions: an emergency stop or the strict-audit
-		// gate tripping. Mining these would fabricate a deny-only suggestion for a target
-		// policy never actually denied.
-		return true
-	case capability.ErrCodeUnsupportedProtocolVersion:
-		// A refusal taken before any policy match: no target was ever parsed, so the record's
-		// identifier is the bare method name. Mining it would fabricate a phantom target from
-		// caller-controlled text, and a peer can drive these at will.
 		return true
 	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType:
 		// Non-policy refusals recorded before/independent of a PDP decision. None names a

@@ -52,6 +52,9 @@ func TestManifestPDP_HandlerFaultSurvivesTheDecision(t *testing.T) {
 	resp := p.Decide(ctx, "sess-1", EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"}, nil, "")
 
 	require.Equal(t, capability.DecisionAllow, resp.Decision, "denial: %+v", resp.Denial)
-	assert.Equal(t, []string{capability.ConditionTypeMaxCalls}, resp.HandlerFaults,
-		"the PDP must hand the engine's fault report on; nothing else reports it")
+	assert.Equal(t, []capability.HandlerFault{{
+		Type:     capability.ConditionTypeMaxCalls,
+		Contract: capability.HandlerContractQuotaUnderSkip,
+	}}, resp.HandlerFaults,
+		"the PDP must hand the engine's fault report on, whole; nothing else reports it")
 }

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -196,7 +197,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// must be refused without that side effect. Answering initialize is itself the
 		// negotiation, so the only admissible declaration here is the revision that defines
 		// the method.
-		rev, ok := p.negotiateCreatingInitialize(w, r, route, msg)
+		rev, ok := p.negotiateHostRevision(w, r, route, sessionlessLeg(), msg)
 		if !ok {
 			return
 		}
@@ -288,32 +289,37 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// An initialize notification (excluded from the session-creation branch above)
 		// expects no response: accept and drop it without allocating session state.
 		if msg.Method == mcp.MethodInitialize && msg.IsNotification() {
-			// Negotiate FIRST, as the session-creating arm and stdio's serve loop both do
-			// for these same bytes: this arm reaches neither hostNotificationGate.admit nor
-			// dispatchRequest, so dispatch.go's canonical order has to be applied by hand
-			// here or the identical notification records UNSUPPORTED_PROTOCOL_VERSION on
-			// stdio and either KILL_SWITCH or nothing at all here.
-			rev, rerr := resolveHostRevision(handshakeRevision, msg)
-			if rerr != nil {
-				// A notification MUST NOT receive a JSON-RPC response, so the refusal is
-				// recorded and acked bodyless — the same framing the kill arm below uses,
-				// and why refuseHostRevision's response is discarded rather than written.
-				_ = refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), "", msg, rerr)
-				w.WriteHeader(http.StatusAccepted)
+			// The same two gates every other host message passes, in the same order, from the
+			// same two helpers: negotiation first (a refusal is recorded and acked bodyless,
+			// which is what negotiateHostRevision does for a notification), then the shared
+			// notification gate. Hand-placing them here is what left this arm negotiating
+			// nothing at all while stdio recorded UNSUPPORTED_PROTOCOL_VERSION for identical
+			// bytes.
+			rev, ok := p.negotiateHostRevision(w, r, route, sessionlessLeg(), msg)
+			if !ok {
 				return
 			}
 			ctx := capability.WithProtocolRevision(r.Context(), rev)
-			// Consult the kill switch BEFORE the 202 ack: a 202 to an initialize
-			// notification is a readiness acknowledgement, so returning it during a global
-			// emergency stop would tell the client the server is ready, unaudited.
-			if deny := route.pdp.CheckKill(ctx, ""); deny != nil {
-				// A notification MUST NOT receive a JSON-RPC response: msg.ID is nil, so
-				// recordKillDenial's response would carry "id":null and, with no prior
-				// WriteHeader, send an implicit 200 indistinguishable from a successful
-				// readiness ack. Record the deny directly and ack the drop with a bodyless 202.
-				recordKillDrop(ctx, p.preSessionKillRecorder(route), deny, claimedSession(r), msg.Method, msg.Method, legHTTPNotification)
-				w.WriteHeader(http.StatusAccepted)
-				return
+			// established:false is the one thing this arm answers differently, and it is a
+			// FACT rather than a reordering: the swallowed set is what the proxy has already
+			// handled, and pre-session it has handled nothing — so revocation still sees this
+			// message and a 202 during an emergency stop is recorded rather than being a
+			// silent readiness ack.
+			gate := hostNotificationGate{
+				rec:       func() auditRecorder { return p.preSessionKillRecorder(route) },
+				subject:   claimedSession(r),
+				errOut:    p.errOut(),
+				checkKill: func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, "") },
+				leg:       legHTTPNotification,
+			}
+			if gate.admit(ctx, msg) {
+				// Unreachable: `initialize` is a swallowed notification and this arm handles no
+				// other method. Answered as the drop it must be anyway — there is no session
+				// here, so nothing to forward it on — rather than discarding the verdict and
+				// letting a future forwardable pre-session method be dropped in silence.
+				_, _ = fmt.Fprintf(p.errOut(),
+					"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
+					audit.SanitizeAuditField(msg.Method))
 			}
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -410,7 +416,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// would route by one table and record under another — and a refused message must not have
 	// written session state on its way to being refused (noteRequestAnchor latches a span for
 	// the session's life, which would outlive a request that was never dispatched).
-	rev, ok := p.negotiateHostRevision(w, r, route, sess, msg)
+	rev, ok := p.negotiateHostRevision(w, r, route, sess.leg(), msg)
 	if !ok {
 		return
 	}
@@ -439,11 +445,12 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
 		gate := hostNotificationGate{
-			rec:       asRecorder(route.sink),
-			sessionID: sessionID,
-			errOut:    p.errOut(),
-			checkKill: func() *capability.EnforceResponse { return kill },
-			leg:       legHTTPNotification,
+			rec:         func() auditRecorder { return asRecorder(route.sink) },
+			subject:     verifiedSession(sessionID),
+			established: true,
+			errOut:      p.errOut(),
+			checkKill:   func() *capability.EnforceResponse { return kill },
+			leg:         legHTTPNotification,
 		}
 		if gate.admit(ctx, msg) {
 			// Bound concurrent in-flight notification forwards on this session — its own
@@ -1030,27 +1037,56 @@ const (
 	killDimensionSession = "session"
 )
 
+// hostLeg is what revision negotiation needs to know about the connection a message arrived on.
+//
+// A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
+// and three bare arguments at those call sites read as an oversight rather than as the fact
+// they are: no session established, and no upstream leg their message could reach.
+type hostLeg struct {
+	contextRev  capability.Revision
+	upstreamRev capability.Revision
+	sessionID   string
+}
+
+// sessionlessLeg is the leg every pre-session arm negotiates against: `initialize` exists only
+// in the handshake-bearing revision, so that is the context, and nothing this arm answers
+// reaches an upstream.
+func sessionlessLeg() hostLeg { return hostLeg{contextRev: handshakeRevision} }
+
+// leg is the established session's answer to the same question.
+func (s *httpSession) leg() hostLeg {
+	return hostLeg{contextRev: s.hostRev, upstreamRev: s.upstreamRev, sessionID: s.id}
+}
+
 // negotiateHostRevision resolves the MCP protocol revision one host message is dispatched
-// under, checked against the revision the session's context was opened at. Its caller stamps
-// the result onto the request context immediately, and that context is the ONE carrier from
-// there down — nothing else threads the revision. ok=false means the refusal has already been
+// under, checked against the revision the leg's context was opened at. Its caller stamps the
+// result onto the request context immediately, and that context is the ONE carrier from there
+// down — nothing else threads the revision. ok=false means the refusal has already been
 // written: -32022 plus its record for a request, and for a notification a recorded drop with a
 // bodyless 202, since JSON-RPC forbids replying to one.
 //
 // This is the FIRST gate every host message passes — ahead of the kill check, deliberately;
 // see the gate order in dispatch.go for why, and for the one labelling exception it costs.
 //
-// Split out of handleSessionPost so that function stays within its complexity bound, and so
-// the refusal shape lives in one place rather than inline among the routing branches.
-func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg) (capability.Revision, bool) {
-	rev, err := resolveHostRevision(sess.hostRev, msg)
+// Every arm that DISPATCHES a host message calls it — the established session, the
+// session-creating `initialize`, and the id-less one — because the two sessionless arms
+// previously restated the same three lines each, and a restated gate is one that drifts: the
+// id-less arm did not negotiate at all until it was noticed, and recorded either the wrong
+// code or nothing while stdio recorded UNSUPPORTED_PROTOCOL_VERSION for the same bytes.
+//
+// handleSessionPost's unresolved-session arm is the one refusal that does not: it answers a
+// session id this proxy never established, so there is no context to negotiate against and it
+// records KILL_SWITCH with no revision. Named here rather than left for a reader to discover,
+// since the AST guard cannot see an arm that calls nothing.
+func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, leg hostLeg, msg mcp.RPCMsg) (capability.Revision, bool) {
+	rev, err := resolveHostRevision(leg.contextRev, leg.upstreamRev, msg)
 	if err == nil {
 		return rev, true
 	}
 	// Rate-limited like every other caller-driven refusal: a suppressed record still gets its
 	// -32022 on the wire, so the peer is refused either way — what the bucket bounds is the
 	// tape write, which is the part a flood turns into an availability problem.
-	resp := refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), sess.id, msg, err)
+	resp := refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), leg.sessionID, msg, err)
 	if msg.IsRequest() {
 		writeJSONMsg(w, resp)
 	} else {
@@ -1083,29 +1119,6 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] WARNING: dropped host response to a server-initiated request: no upstream writer in remote-upstream mode\n")
 	}
-}
-
-// negotiateCreatingInitialize applies revision negotiation to the session-CREATING
-// `initialize`, the one host message that has no session to resolve a context from.
-//
-// `initialize` exists only in the handshake-bearing revision, so a declaration naming any
-// other revision — or one this build cannot speak — is refused -32022 and recorded, before a
-// subprocess is spawned or a remote upstream is contacted. Without this the declaration was
-// discarded, the session was pinned to the handshake revision anyway, and the peer's next
-// request was refused as a "mid-context flip" it had in fact declared consistently from its
-// first message.
-//
-// ok=false means the refusal has already been written; on ok the caller stamps the
-// resolved revision onto the request context, as the dispatched paths do.
-func (p *HTTPProxy) negotiateCreatingInitialize(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) (capability.Revision, bool) {
-	rev, err := resolveHostRevision(handshakeRevision, msg)
-	if err != nil {
-		// No session exists yet, so the record carries no session id — the same posture as
-		// the other pre-session refusals on this path.
-		writeJSONMsg(w, refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), "", msg, err))
-		return "", false
-	}
-	return rev, true
 }
 
 // revisionRefusalRecorder returns the route's sink when the revision-refusal bucket admits a

@@ -101,10 +101,12 @@ func TestMaxCallsBucket_SkipQuotaDoesNotBypassStructuralValidation(t *testing.T)
 		wantMsg  string
 	}{
 		{
-			name:     "nil counter",
-			engine:   New(),
-			req:      &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"},
-			wantCode: capability.ErrCodeConditionFailed,
+			name:   "nil counter",
+			engine: New(),
+			req:    &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"},
+			// A fault, not a verdict: an unwired counter is the engine's own state, and the
+			// budget it was asked about was never evaluated.
+			wantCode: capability.ErrCodeEnforcementError,
 			wantMsg:  "call counter not configured",
 		},
 		{

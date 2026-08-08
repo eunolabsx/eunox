@@ -578,24 +578,59 @@ func TestObserveDowngrade_EngineVerdictsFollowWillForwardDeny(t *testing.T) {
 		assert.True(t, called, "a wiretap route must not be turned into an outage by a plugin bug")
 		require.Len(t, rec.records, 1)
 		assert.Equal(t, "allow", rec.records[0].decision)
-		assert.Equal(t, []string{capability.ConditionTypeMaxCalls}, rec.records[0].details[audit.HandlerFaultKey],
-			"absorbing the fault must not hide it: the operator learns from the record")
+		assert.Equal(t, []interface{}{map[string]interface{}{
+			"type":     capability.ConditionTypeMaxCalls,
+			"contract": string(capability.HandlerContractQuotaUnderSkip),
+		}}, rec.records[0].details[audit.HandlerFaultKey],
+			"absorbing the fault must not hide it: the record names the handler AND the contract it broke")
 		assert.True(t, audit.IsReservedDetailKey(audit.HandlerFaultKey),
 			"an unreserved key would be mined by `eunox suggest` as a caller-supplied tool argument")
 	})
+
+	t.Run("an unevaluable condition is not downgraded", func(t *testing.T) {
+		// The third unevaluable-condition refusal, and the one that used to be forwarded: it
+		// was built as a policy verdict while its two siblings set the flag, so an observing
+		// route delivered the call with the restriction never evaluated once, and reported
+		// "would be allowed" for a call enforce mode denies. It carries the fault code now, and
+		// what blocks it is the class rather than a bool a fourth refusal might forget.
+		eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+		dec := eng.ValidateAction(context.Background(), &capability.EnforceRequest{SessionID: "s", TargetName: "tool"},
+			[]capability.Constraint{{
+				Target:      "tool",
+				Actions:     []string{"*"},
+				Enforcement: capability.EnforcementAudit,
+				Conditions:  []capability.Condition{unmodelledCondition{}},
+			}})
+		require.Equal(t, capability.DecisionDeny, dec.Decision)
+		require.NotNil(t, dec.Denial)
+		require.Equal(t, capability.ErrCodeEnforcementError, dec.Denial.Code)
+
+		rec, called := forward(t, dec, true)
+		assert.False(t, called, "a condition nothing could evaluate must not be forwarded as though it had passed")
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, "deny", rec.records[0].decision)
+		assert.False(t, rec.records[0].auditOnly)
+	})
 }
 
-// TestIsObserveDeny_NilDenialPanics documents that isObserveDeny deliberately
-// has no nil guard: both callers (enforcedForwardCore's manifest leg and
-// forwardServerRequest's sampling leg) always normalize the denial via
-// normalizeDenial before calling this function. A prior version silently
-// treated a nil denial as "safe to downgrade to an observed forward" in audit
-// mode, which would fail-open. Panicking instead makes a future caller that
-// skips normalization fail loudly rather than silently fail-open.
-func TestIsObserveDeny_NilDenialPanics(t *testing.T) {
-	assert.Panics(t, func() {
-		isObserveDeny(nil, true, false)
-	})
+// unmodelledCondition carries a discriminator no build models — the shape a programmatically
+// built constraint, or a prototype-registry entry whose handler registration was forgotten,
+// presents to the engine.
+type unmodelledCondition struct{}
+
+// ConditionType implements capability.Condition.
+func (unmodelledCondition) ConditionType() string { return "definitely-not-a-real-condition" }
+
+// TestIsObserveDeny_NilDenialIsNotDowngradable pins the direction a missing reason must fail
+// in. Both callers (enforcedForwardCore's manifest leg and forwardServerRequest's sampling
+// leg) normalize via normalizeDenial first, so nil is unreachable in-tree; the property is
+// what happens if one ever stops. An early version treated nil as "safe to downgrade to an
+// observed forward", a fail-open; a later one dereferenced it, which is loud but takes the
+// proxy down from the enforcement goroutine. Answering false is both: the call is blocked, and
+// nothing is forwarded on the strength of a reason nobody supplied.
+func TestIsObserveDeny_NilDenialIsNotDowngradable(t *testing.T) {
+	assert.False(t, isObserveDeny(nil, true, false),
+		"a denial with no reason must not be downgraded to a forward on an observing route")
 }
 
 // TestEnforcedForwardCore_StrictAudit_DegradedDeniesAndSkipsUpstream pins the
@@ -1518,8 +1553,9 @@ func TestAuditOnly_NoManifest_ForwardsAll(t *testing.T) {
 // kill is active the proxy returns a KILL_SWITCH JSON-RPC error to the host and
 // never contacts the upstream. The PDP- and BuildRoutes-level tests stop at the
 // decision; this one exercises the load-bearing forward.go observe gate
-// (!IsKillSwitchDenial && audit), which must hard-block rather than log-and-forward
-// the kill-switch denial even though the route is in audit mode.
+// (Downgradable() && audit — a revocation is not a policy verdict, so its class refuses the
+// downgrade), which must hard-block rather than log-and-forward the kill-switch denial even
+// though the route is in audit mode.
 func TestAuditOnly_WiretapRoute_Kill_HardBlocks(t *testing.T) {
 	t.Parallel()
 
@@ -2550,4 +2586,36 @@ func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
 		"a claimed id must not be forgeable into the signed session_id field")
 	assert.Equal(t, string(legHTTPNotification), claimedRec.records[0].details["transport"])
 	assert.Equal(t, "victim-real-session-id", claimedRec.records[0].details["claimed_session_id"])
+}
+
+// TestHandlerFaultDetail_KeysMatchTheTypesOwnTags pins the two spellings of one shape
+// together. handlerFaultDetail renders capability.HandlerFault into the plain map the audit
+// layer's value bounder recurses into, which means the field names exist twice: as json tags
+// on the type, and as string literals in the renderer. Nothing else ties them, so renaming a
+// tag would leave the tape emitting the old key with every test still green.
+func TestHandlerFaultDetail_KeysMatchTheTypesOwnTags(t *testing.T) {
+	t.Parallel()
+	rendered := handlerFaultDetail(capability.EnforceResponse{
+		HandlerFaults: []capability.HandlerFault{{
+			Type:     capability.ConditionTypeMaxCalls,
+			Contract: capability.HandlerContractQuotaUnderSkip,
+		}},
+	})
+	faults, ok := rendered[audit.HandlerFaultKey].([]interface{})
+	require.True(t, ok, "the detail value must be a plain slice the audit bounder recurses into")
+	require.Len(t, faults, 1)
+	got, ok := faults[0].(map[string]interface{})
+	require.True(t, ok, "each fault must be a plain map")
+
+	// Marshalling the type is what the json tags govern; the renderer must produce the same
+	// keys, or the tape and every other JSON path describe the fault differently.
+	raw, err := json.Marshal(capability.HandlerFault{
+		Type:     capability.ConditionTypeMaxCalls,
+		Contract: capability.HandlerContractQuotaUnderSkip,
+	})
+	require.NoError(t, err)
+	var viaTags map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &viaTags))
+	assert.Equal(t, viaTags, got,
+		"the audit render and capability.HandlerFault's own json tags must agree on every key")
 }

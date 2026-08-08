@@ -12,9 +12,13 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -247,7 +251,7 @@ func TestGateOrder_NotificationGateAppliesTheCanonicalOrder(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			gate := hostNotificationGate{
-				rec: rec, sessionID: "sess", errOut: io.Discard, leg: legStdioNotification,
+				rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
 				checkKill: func() *capability.EnforceResponse {
 					if tc.revoked {
 						return killed
@@ -394,11 +398,11 @@ func TestGateOrder_CreatingInitializeAppliesTheCanonicalOrder(t *testing.T) {
 }
 
 // TestGateOrder_InitializeNotificationAppliesTheCanonicalOrder covers the third sessionless
-// entry point: an id-less `initialize`. It reaches neither hostNotificationGate.admit nor
-// dispatchRequest, so the canonical order is hand-placed there and nothing but this test
-// holds it. Before it, an unhonorable declaration on this arm recorded KILL_SWITCH under a
-// kill and NOTHING at all without one, while stdio recorded UNSUPPORTED_PROTOCOL_VERSION
-// for the identical bytes.
+// entry point: an id-less `initialize`. It now reaches both shared helpers rather than
+// restating them — negotiateHostRevision, then hostNotificationGate.admit — and this pins the
+// outcome that placement produces. Before it, an unhonorable declaration on this arm recorded
+// KILL_SWITCH under a kill and NOTHING at all without one, while stdio recorded
+// UNSUPPORTED_PROTOCOL_VERSION for the identical bytes.
 func TestGateOrder_InitializeNotificationAppliesTheCanonicalOrder(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -480,5 +484,183 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 	}
 	if got, _ := rec["protocol_revision"].(string); got != string(handshakeRevision) {
 		t.Errorf("protocol_revision = %q, want %q — a refusal after negotiation must name the revision it decided under", got, string(handshakeRevision))
+	}
+}
+
+// staticRecorder adapts a test recorder to the gate's rec THUNK. Production supplies a thunk
+// because a pre-session recorder costs a rate-limit token to resolve; a test recorder costs
+// nothing, so it is handed over as a constant.
+func staticRecorder(rec auditRecorder) func() auditRecorder {
+	return func() auditRecorder { return rec }
+}
+
+// negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and
+// the one function allowed to call them. Every host message must reach revision negotiation
+// through a transport's negotiateHostRevision — the shared prologue — rather than through a
+// hand-placed copy.
+var negotiationPrimitives = map[string]string{
+	"resolveHostRevision": "negotiateHostRevision",
+	"refuseHostRevision":  "negotiateHostRevision",
+}
+
+// TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue is the derivation-style guard
+// the entry points had no equivalent of.
+//
+// The order itself is declared once and applied by two shared helpers, but nothing stopped a
+// new entry point from calling the primitives directly and getting the sequence subtly wrong —
+// which is what happened: an id-less `initialize` with no session reached neither helper, so
+// it negotiated nothing at all and recorded either the wrong code or no record while stdio
+// recorded UNSUPPORTED_PROTOCOL_VERSION for identical bytes. Each such arm was then covered by
+// a TestGateOrder_* someone had to remember to write.
+//
+// This turns the next one into a build failure instead. An AST walk for the reason
+// TestGuardedCompositeLiterals is one: the rule is "which FUNCTION may call this", which no
+// enabled linter expresses.
+func TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue(t *testing.T) {
+	t.Parallel()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("listing package sources: %v", err)
+	}
+	fset := token.NewFileSet()
+	calls := 0
+	for _, e := range entries {
+		name := e.Name()
+		// Non-test sources only: a test legitimately drives the primitives directly to pin
+		// the negotiation rule itself.
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parsing %s: %v", name, perr)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			ast.Inspect(fn, func(n ast.Node) bool {
+				call, isCall := n.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				ident, isIdent := call.Fun.(*ast.Ident)
+				if !isIdent {
+					return true
+				}
+				caller, guarded := negotiationPrimitives[ident.Name]
+				if !guarded {
+					return true
+				}
+				calls++
+				if fn.Name.Name != caller {
+					t.Errorf("%s: %s calls %s directly; every entry point must reach negotiation through %s, or the gate order is hand-placed again",
+						name, fn.Name.Name, ident.Name, caller)
+				}
+				return true
+			})
+		}
+	}
+	// Not vacuous: a rename that leaves the guard matching nothing would otherwise pass while
+	// guarding nothing.
+	if calls < len(negotiationPrimitives) {
+		t.Errorf("found %d guarded call(s); expected at least one per primitive (%d) — has one been renamed?", calls, len(negotiationPrimitives))
+	}
+}
+
+// TestGateOrder_SessionlessNotificationInheritsTheSharedGate pins the one thing the
+// sessionless arm answers differently, and that it is a FACT rather than a reordering.
+//
+// The swallowed set is what the proxy has ALREADY handled. On an established leg an id-less
+// `initialize` announces a handshake that happened, so it is dropped before revocation is even
+// asked (that is the canonical order, and stdio does the same). Pre-session nothing has been
+// handled, so the same bytes still reach revocation and an emergency stop RECORDS the attempt
+// instead of returning a silent readiness ack. Both arms answer 202 with no body; what differs
+// is the tape, which is the whole point.
+func TestGateOrder_SessionlessNotificationInheritsTheSharedGate(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+	if err := ks.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
+	}
+	sink, logPath := newTempAuditSink(t)
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink, upstream: "up1"},
+	}
+	proxy := newTestHTTPProxy()
+
+	// NO session header: that absence is what selects this arm. With one set, handleMCPPost
+	// routes to handleSessionPost's unknown-session branch instead, which produces an
+	// identically shaped record — so every assertion below would pass while testing the wrong
+	// code path (it did).
+	req := httptest.NewRequest(http.MethodPost, "/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
+	req.Header.Set("Content-Type", CTJSON)
+	w := httptest.NewRecorder()
+	proxy.handleMCPPost(w, req, route)
+	_ = sink.Close()
+
+	if w.Code != http.StatusAccepted || w.Body.Len() != 0 {
+		t.Fatalf("status = %d body = %q, want a bodyless 202: a notification takes no JSON-RPC response", w.Code, w.Body.String())
+	}
+	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), mcp.MethodInitialize, "deny")
+	if rec == nil {
+		t.Fatal("a pre-session initialize notification under a global kill must be recorded; the proxy has handled no handshake, so there is nothing for the swallowed set to stand for")
+	}
+	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeKillSwitch {
+		t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeKillSwitch)
+	}
+	// The gate's own subject rule, inherited rather than re-implemented: this arm resolved no
+	// session, so nothing may be signed into session_id as fact.
+	if got, _ := rec["session_id"].(string); got != "" {
+		t.Errorf("session_id = %q, want empty — a pre-session record must not vouch for a session", got)
+	}
+	// The discriminator between this arm and handleSessionPost's: only this one negotiates
+	// before recording, so only its record names the revision it decided under.
+	if got, _ := rec["protocol_revision"].(string); got != string(handshakeRevision) {
+		t.Fatalf("protocol_revision = %q, want %q — the record came from an arm that never negotiated, so this test is not exercising the sessionless gate", got, string(handshakeRevision))
+	}
+}
+
+// TestGateOrder_SessionlessNotificationSpendsNoKillRecordBudget pins the direction the shared
+// gate must NOT change: resolving the recorder is not free on a pre-session leg.
+//
+// preSessionKillRecorder draws from the catKill token bucket, which exists so an
+// unauthenticated flood cannot make the tape unbounded. Building the gate with the recorder
+// already resolved spent a token on every id-less `initialize` — a message that is 202-acked,
+// allocates nothing and records nothing — so a peer sending them faster than the bucket
+// refills could empty it and silence the pre-session KILL_SWITCH records an emergency stop
+// depends on. The recorder is a thunk for that reason, and this is what says so.
+func TestGateOrder_SessionlessNotificationSpendsNoKillRecordBudget(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{sink: sink, upstream: "up1"},
+	}
+	proxy := newTestHTTPProxy()
+
+	// Comfortably more than the bucket's burst: if each one spends a token, nothing is left.
+	for range 25 {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
+		req.Header.Set("Content-Type", CTJSON)
+		w := httptest.NewRecorder()
+		proxy.handleMCPPost(w, req, route)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202", w.Code)
+		}
+	}
+	// The budget must be untouched, so a real refusal still records.
+	if rec := proxy.preSessionKillRecorder(route); rec == nil {
+		t.Fatal("the kill-record budget was spent by notifications that recorded nothing; an unauthenticated flood can now silence the emergency stop's own records")
+	}
+	_ = sink.Close()
+	if recs := readAuditRecords(t, logPath); len(recs) != 0 {
+		t.Errorf("no kill was active, so nothing should have been recorded; got %d record(s)", len(recs))
 	}
 }

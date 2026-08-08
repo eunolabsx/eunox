@@ -273,7 +273,7 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 		wf("\n  ATTENTION: %d record(s) name a condition handler that broke the engine's commit contract\n", s.handlerFaults)
 		wln("  (a registered handler derived a quota bucket on a request that authorizes no consumption; eunox dropped the")
 		wln("   bucket and decided the call as a conforming handler would, so nothing was charged and nothing was blocked —")
-		wf("   but the handler is buggy and its budget is NOT being predicted by this run. details.%s names each condition type.)\n", audit.HandlerFaultKey)
+		wf("   but the handler is buggy and its budget is NOT being predicted by this run. details.%s names each handler and the contract it broke.)\n", audit.HandlerFaultKey)
 	}
 	// FIRST among the declassification notes: means a session is not in the state the
 	// policy describes — the approved clear did not land, so taint remains.

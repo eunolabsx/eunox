@@ -202,18 +202,6 @@ func TestJWTPDP_CheckKill(t *testing.T) {
 }
 
 // -----------------------------------------------------------------
-// IsKillSwitchDenial
-// -----------------------------------------------------------------
-
-func TestIsKillSwitchDenial(t *testing.T) {
-	t.Parallel()
-	assert.True(t, IsKillSwitchDenial(&capability.DenialInfo{Code: capability.ErrCodeKillSwitch}))
-	assert.True(t, IsKillSwitchDenial(&capability.DenialInfo{Code: capability.ErrCodeKillSwitchError}))
-	assert.False(t, IsKillSwitchDenial(&capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed}))
-	assert.False(t, IsKillSwitchDenial(nil))
-}
-
-// -----------------------------------------------------------------
 // decideTarget deny paths (no-match, CAPABILITY_DENIED, INVALID_PARAMS,
 // audit-mode antecedent recording, targetOperationPhrase)
 // -----------------------------------------------------------------

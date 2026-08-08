@@ -382,7 +382,7 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 
 	res, runErr := admitAllScript.Run(ctx, r.client, redisKeys, argv...).Result()
 	if runErr != nil {
-		if strings.Contains(runErr.Error(), "CROSSSLOT") {
+		if isCrossSlot(runErr) {
 			// Self-diagnosing: the startup probe swallows an unanswerable INFO, so this is the
 			// only place a keyspace that shards can still announce itself. Still a deny.
 			return false, 0, 0, 0, fmt.Errorf("%w: %v", ErrClusterUnsupported, runErr)
@@ -390,6 +390,16 @@ func (r *Redis) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) 
 		return false, 0, 0, 0, fmt.Errorf("redis eval: %w", runErr)
 	}
 	return parseAdmitAllReply(res)
+}
+
+// isCrossSlot reports whether err is Redis refusing a multi-key command across hash slots.
+//
+// Two spellings because two producers: errors.Is catches the sentinel go-redis raises itself,
+// HasErrorPrefix the server's own reply. Both are type-checked rather than text-matched — a
+// strings.Contains is a contract with formatting, which reads an unrelated error mentioning the
+// word as a topology refusal and stops recognizing a prefixed one.
+func isCrossSlot(err error) bool {
+	return errors.Is(err, redis.ErrCrossSlot) || redis.HasErrorPrefix(err, "CROSSSLOT")
 }
 
 // parseAdmitAllReply decodes admitAllScript's reply, converting the 1-based deniedIndex to

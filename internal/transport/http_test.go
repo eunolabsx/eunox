@@ -6838,7 +6838,7 @@ func TestHTTPInitialize_AdmitsTheHandshakeRevisionDeclaration(t *testing.T) {
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize,
 		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}`),
 	}
-	if _, err := resolveHostRevision(capability.Revision20251125, msg); err != nil {
+	if _, err := resolveHostRevision(capability.Revision20251125, "", msg); err != nil {
 		t.Errorf("declaring the handshake revision on initialize must be admitted, got %v", err)
 	}
 }

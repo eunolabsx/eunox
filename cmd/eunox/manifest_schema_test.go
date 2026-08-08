@@ -662,8 +662,8 @@ func TestComputeAuditStats_HandlerFaultIsCountedAndCalledOut(t *testing.T) {
 	// Both records a fault can ride: the allow it was decided on, and the deny a route running
 	// --audit forwards anyway (where the deny record is the one an operator reads).
 	log := strings.Join([]string{
-		`{"decision":"allow","target":"read_file","details":{"` + audit.HandlerFaultKey + `":["maxCalls"]}}`,
-		`{"decision":"deny","audit_only":true,"target":"read_file","denial_code":"CONDITION_FAILED","details":{"` + audit.HandlerFaultKey + `":["maxCalls"]}}`,
+		`{"decision":"allow","target":"read_file","details":{"` + audit.HandlerFaultKey + `":[{"type":"maxCalls","contract":"quota_bucket_under_skip_quota"}]}}`,
+		`{"decision":"deny","audit_only":true,"target":"read_file","denial_code":"CONDITION_FAILED","details":{"` + audit.HandlerFaultKey + `":[{"type":"maxCalls","contract":"quota_bucket_under_skip_quota"}]}}`,
 		`{"decision":"allow","target":"read_file","details":{"path":"/tmp/x"}}`,
 	}, "\n")
 	got, err := computeAuditStats(strings.NewReader(log))
