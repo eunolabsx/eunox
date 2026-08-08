@@ -243,7 +243,7 @@ func encodeHostLines(t *testing.T, msgs []mcp.RPCMsg) []string {
 //
 // It shares newStdioProxy rather than building its own literal — the second parallel fixture is
 // how "a field added to StdioProxy is one edit" stopped being true the first time.
-func newTestStdioProxy(t *testing.T, cfg stdioServe) (*StdioProxy, <-chan mcp.RPCMsg) {
+func newTestStdioProxy(t *testing.T, cfg stdioServe) (proxy *StdioProxy, replies <-chan mcp.RPCMsg) {
 	t.Helper()
 	ch := make(chan mcp.RPCMsg, 8)
 	cfg.hostSink = &chanHostWriter{ch: ch}

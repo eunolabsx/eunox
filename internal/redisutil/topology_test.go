@@ -119,6 +119,9 @@ func TestIsNilClient_DoesNotSeeThroughADecorator(t *testing.T) {
 // guard written as a bare IsNil call would have become the crash it exists to prevent.
 func TestIsNilValue_CoversEveryNilableKind(t *testing.T) {
 	t.Parallel()
+	// Declared rather than converted inline: `(chan int)(nil)` is a parenthesized type gocritic
+	// asks to simplify, and the simplified spelling reads worse than a typed zero value.
+	var nilChan chan int
 	cases := []struct {
 		name string
 		v    any
@@ -128,7 +131,7 @@ func TestIsNilValue_CoversEveryNilableKind(t *testing.T) {
 		{"nil map", map[string]string(nil), true},
 		{"nil func", (func())(nil), true},
 		{"nil slice", []string(nil), true},
-		{"nil chan", (chan int)(nil), true},
+		{"nil chan", nilChan, true},
 		{"nil unsafe pointer", unsafe.Pointer(nil), true},
 		{"live pointer", redis.NewClient(&redis.Options{Addr: "127.0.0.1:7000"}), false},
 		{"non-empty map", map[string]string{"a": "b"}, false},
