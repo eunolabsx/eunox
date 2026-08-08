@@ -48,6 +48,16 @@ func TestMethodRegistry_EveryMethodDeclaresRevisionMembership(t *testing.T) {
 		if handler, _ := spec.handler(); handler == nil && spec.Notification == notifyUnmapped {
 			t.Errorf("method %q declares neither a handler nor a notification disposition, so it dispatches nowhere — delete the entry rather than leaving a no-op", method)
 		}
+		// A PDP-decided call IS the forward, so the declaration cannot disagree with the
+		// handler field. Left undeclared, the host's `_meta` revision declaration would be
+		// forwarded beside a header naming the leg's own revision with nothing refusing the
+		// pair — silently, since the method still dispatches.
+		if spec.Decide != nil && !spec.ForwardsHostParams {
+			t.Errorf("method %q is PDP-decided but does not declare ForwardsHostParams; an allow forwards the host's own params", method)
+		}
+		if spec.Notification == notifyForward && !forwardsHostParams(method) {
+			t.Errorf("method %q forwards its notification framing verbatim but forwardsHostParams says otherwise", method)
+		}
 	}
 }
 

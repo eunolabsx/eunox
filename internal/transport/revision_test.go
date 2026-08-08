@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -21,9 +24,11 @@ func TestResolveHostRevision(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name       string
+		method     string // "" = tools/call, whose params reach the upstream
 		contextRev capability.Revision
-		declared   any    // nil = no `_meta` block at all
-		rawParams  string // a params body written out verbatim, for shapes `declared` cannot express
+		legRev     capability.Revision // "" = no upstream leg established, so nothing to disagree with
+		declared   any                 // nil = no `_meta` block at all
+		rawParams  string              // a params body written out verbatim, for shapes `declared` cannot express
 		want       capability.Revision
 		wantErr    error
 	}{
@@ -41,18 +46,36 @@ func TestResolveHostRevision(t *testing.T) {
 		// JSON null needs its own case, since it takes a different path through the decoder.
 		{name: "explicit null revision inherits the context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, contextRev: capability.Revision20260728, want: capability.Revision20260728},
 		{name: "explicit null revision with no context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, want: capability.Revision20251125},
+		// The upstream leg. A declaration is forwarded VERBATIM beside a header naming the
+		// leg's own revision, so one the leg did not negotiate is refused rather than
+		// manufactured into a mismatched pair; an OMITTED one still inherits, since a body
+		// making no claim contradicts no header.
+		{name: "declared agreeing with the upstream leg", contextRev: capability.Revision20251125, legRev: capability.Revision20251125, declared: "2025-11-25", want: capability.Revision20251125},
+		{name: "declared disagreeing with the upstream leg", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", wantErr: errUnhonorableUpstreamDeclaration},
+		{name: "undeclared against a lagging upstream leg still inherits", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, want: capability.Revision20260728},
+		// A leg pinned newer than the opener: the MCP-Protocol-Version header still names the
+		// handshake revision, because eunox opens every leg with `initialize`. Honoring the pin
+		// alone would forward a body and a header naming different revisions.
+		{name: "declared matching a pin the opener cannot reach", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, declared: "2026-07-28", wantErr: errUnhonorableUpstreamDeclaration},
+		// A method answered without contacting the upstream carries its declaration nowhere, so
+		// the leg has nothing to be contradicted by and the message resolves normally.
+		{name: "declared on a locally answered method", method: methodPing, contextRev: capability.Revision20251125, legRev: capability.Revision20251125, declared: "2025-11-25", want: capability.Revision20251125},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall}
+			method := tc.method
+			if method == "" {
+				method = capability.MethodToolsCall
+			}
+			msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: method}
 			switch {
 			case tc.rawParams != "":
 				msg.Params = json.RawMessage(tc.rawParams)
 			case tc.declared != nil:
 				msg.Params = metaParams(t, tc.declared, map[string]any{"name": "read_file"})
 			}
-			got, err := resolveHostRevision(tc.contextRev, msg)
+			got, err := resolveHostRevision(tc.contextRev, tc.legRev, msg)
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("error = %v, want %v", err, tc.wantErr)
@@ -81,7 +104,7 @@ func TestResolveHostRevision_MalformedParamsAreNotAVersionFailure(t *testing.T) 
 		`{"_meta":[{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}]}`,          // wrong shape
 	} {
 		msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: json.RawMessage(params)}
-		got, err := resolveHostRevision(capability.Revision20251125, msg)
+		got, err := resolveHostRevision(capability.Revision20251125, "", msg)
 		if err != nil {
 			t.Errorf("params %s: got version error %v, want the request to fall through to its handler", params, err)
 		}
@@ -98,7 +121,7 @@ func TestRefuseHostRevision_EmitsSpecCodeAndRecords(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	msg := requestWithRevision(t, "abc", capability.MethodToolsCall, "1999-01-01")
-	_, err := resolveHostRevision("", msg)
+	_, err := resolveHostRevision("", "", msg)
 	if err == nil {
 		t.Fatal("an unknown declared revision must not resolve")
 	}
@@ -132,7 +155,7 @@ func TestRefuseHostRevision_NotificationGetsNoReply(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress, Params: metaParams(t, "1999-01-01", nil)}
-	_, err := resolveHostRevision("", notif)
+	_, err := resolveHostRevision("", "", notif)
 	if err == nil {
 		t.Fatal("an unknown declared revision must not resolve")
 	}
@@ -166,5 +189,48 @@ func TestResolveUpstreamRevision(t *testing.T) {
 		if got := resolveUpstreamRevision(tc.configured, tc.reported); got != tc.want {
 			t.Errorf("resolveUpstreamRevision(%q, %q) = %q, want %q", tc.configured, tc.reported, got, tc.want)
 		}
+	}
+}
+
+// TestUpstreamDeclaration_NeverContradictsTheHeaderEunoxStamps is the property the
+// upstream-leg check exists for, asserted against the header PRODUCER rather than against a
+// second copy of what it emits.
+//
+// Params are forwarded verbatim, so a host's `_meta` declaration reaches the upstream beside
+// eunox's own MCP-Protocol-Version. Every combination of declared revision and leg revision
+// this build can produce is driven through the gate, and any pair it ADMITS must be one whose
+// body and header name the same revision — otherwise the proxy is manufacturing exactly the
+// mismatch its host leg refuses, and a first-wins and a last-wins upstream resolve the same
+// request under different method sets.
+func TestUpstreamDeclaration_NeverContradictsTheHeaderEunoxStamps(t *testing.T) {
+	t.Parallel()
+	admitted := 0
+	for _, declared := range capability.PublishedRevisions() {
+		for _, legRev := range capability.PublishedRevisions() {
+			t.Run(fmt.Sprintf("declared=%s/leg=%s", declared, legRev), func(t *testing.T) {
+				msg := mcp.RPCMsg{
+					JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,
+					Params: json.RawMessage(fmt.Sprintf(
+						`{"name":"read_file","_meta":{"io.modelcontextprotocol/protocolVersion":%q}}`, declared)),
+				}
+				if _, err := resolveHostRevision(declared, legRev, msg); err != nil {
+					return // refused: nothing is forwarded, so no pair is manufactured
+				}
+				admitted++
+				// Admitted, so these bytes reach the upstream. Read the header off the real
+				// producer: a hand-written expectation here would keep passing the day
+				// setNegotiatedVersionHeader changes what it stamps.
+				req := httptest.NewRequest(http.MethodPost, "http://upstream.invalid/mcp", http.NoBody)
+				setNegotiatedVersionHeader(req, legRev)
+				if got := req.Header.Get("MCP-Protocol-Version"); got != declared.String() {
+					t.Errorf("a forwarded body declaring %s would carry MCP-Protocol-Version: %s — the gate admitted a pair that names two revisions", declared, got)
+				}
+			})
+		}
+	}
+	// Not vacuous: a gate that refused every declaration would satisfy the loop above while
+	// making the whole declaration surface unusable.
+	if admitted == 0 {
+		t.Error("no declaration was admitted on any leg; the property held only because nothing is ever forwarded")
 	}
 }

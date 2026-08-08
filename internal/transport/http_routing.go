@@ -293,7 +293,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// dispatchRequest, so dispatch.go's canonical order has to be applied by hand
 			// here or the identical notification records UNSUPPORTED_PROTOCOL_VERSION on
 			// stdio and either KILL_SWITCH or nothing at all here.
-			rev, rerr := resolveHostRevision(handshakeRevision, msg)
+			rev, rerr := resolveHostRevision(handshakeRevision, "", msg)
 			if rerr != nil {
 				// A notification MUST NOT receive a JSON-RPC response, so the refusal is
 				// recorded and acked bodyless — the same framing the kill arm below uses,
@@ -1043,7 +1043,7 @@ const (
 // Split out of handleSessionPost so that function stays within its complexity bound, and so
 // the refusal shape lives in one place rather than inline among the routing branches.
 func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg) (capability.Revision, bool) {
-	rev, err := resolveHostRevision(sess.hostRev, msg)
+	rev, err := resolveHostRevision(sess.hostRev, sess.upstreamRev, msg)
 	if err == nil {
 		return rev, true
 	}
@@ -1098,7 +1098,7 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 // ok=false means the refusal has already been written; on ok the caller stamps the
 // resolved revision onto the request context, as the dispatched paths do.
 func (p *HTTPProxy) negotiateCreatingInitialize(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) (capability.Revision, bool) {
-	rev, err := resolveHostRevision(handshakeRevision, msg)
+	rev, err := resolveHostRevision(handshakeRevision, "", msg)
 	if err != nil {
 		// No session exists yet, so the record carries no session id — the same posture as
 		// the other pre-session refusals on this path.

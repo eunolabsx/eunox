@@ -42,9 +42,9 @@ func benchRequest(args map[string]interface{}) *capability.EnforceRequest {
 // argument map that satisfies them. allowedValues is the cheapest pure predicate that still
 // reads a request argument, so what the loop measures is dispatch rather than one condition's
 // own work.
-func benchPureConditions(n int) ([]capability.Condition, map[string]interface{}) {
-	conds := make([]capability.Condition, 0, n)
-	args := make(map[string]interface{}, n)
+func benchPureConditions(n int) (conds []capability.Condition, args map[string]interface{}) {
+	conds = make([]capability.Condition, 0, n)
+	args = make(map[string]interface{}, n)
 	for i := range n {
 		arg := fmt.Sprintf("arg%d", i)
 		conds = append(conds, &capability.AllowedValuesCondition{Argument: arg, Values: []interface{}{"ok"}})

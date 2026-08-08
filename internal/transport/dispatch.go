@@ -157,6 +157,26 @@ type methodSpec struct {
 	Local methodHandler
 	// Notification is the disposition of this method's notification framing.
 	Notification notificationDisposition
+	// ForwardsHostParams declares that this method sends the HOST's own params to the
+	// upstream — the fact the `_meta` revision declaration's honorability turns on, since a
+	// declaration only manufactures a mismatched pair when it actually travels beside the
+	// MCP-Protocol-Version header this proxy stamps. True for every Decide method (a
+	// PDP-decided call IS the forward) and for the */list methods, whose local handler
+	// forwards the request and filters the reply; false for the methods answered without
+	// contacting the upstream at all. Its agreement with the two handler fields is asserted
+	// by TestMethodRegistry_EveryMethodDeclaresRevisionMembership.
+	ForwardsHostParams bool
+}
+
+// forwardsHostParams reports whether method's own params reach the upstream, in either
+// framing. Revision-independent on purpose: a method outside the peer's revision is denied
+// before it could forward anything, so the question is about the METHOD, not the table.
+func forwardsHostParams(method string) bool {
+	spec, known := methodRegistry[method]
+	if !known {
+		return false
+	}
+	return spec.ForwardsHostParams || spec.Notification == notifyForward
 }
 
 // handler returns the method's request handler and whether it is the enforced (Decide*) one.
@@ -186,24 +206,29 @@ var methodRegistry = map[string]methodSpec{
 	// Enforced (Decide*) methods. The resources/subscribe pair is 2025-11-25 only:
 	// 2026-07-28 replaces it with subscriptions/listen, which is not implemented yet.
 	capability.MethodToolsCall: {
-		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Decide: dispatchToolsCall,
+		In:                 []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide:             dispatchToolsCall,
+		ForwardsHostParams: true,
 	},
 	capability.MethodResourcesRead: {
-		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Decide: dispatchResourcesRead,
+		In:                 []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide:             dispatchResourcesRead,
+		ForwardsHostParams: true,
 	},
 	capability.MethodResourcesSubscribe: {
-		In:     []capability.Revision{capability.Revision20251125},
-		Decide: dispatchResourcesSubscribe,
+		In:                 []capability.Revision{capability.Revision20251125},
+		Decide:             dispatchResourcesSubscribe,
+		ForwardsHostParams: true,
 	},
 	capability.MethodResourcesUnsubscribe: {
-		In:     []capability.Revision{capability.Revision20251125},
-		Decide: dispatchResourcesUnsubscribe,
+		In:                 []capability.Revision{capability.Revision20251125},
+		Decide:             dispatchResourcesUnsubscribe,
+		ForwardsHostParams: true,
 	},
 	capability.MethodPromptsGet: {
-		In:     []capability.Revision{capability.Revision20251125, capability.Revision20260728},
-		Decide: dispatchPromptsGet,
+		In:                 []capability.Revision{capability.Revision20251125, capability.Revision20260728},
+		Decide:             dispatchPromptsGet,
+		ForwardsHostParams: true,
 	},
 
 	// Locally answered methods. initialize and ping are handshake/utility methods
@@ -227,18 +252,24 @@ var methodRegistry = map[string]methodSpec{
 		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterResourcesList)
 		},
+		// The local handler forwards the host's request and filters the reply.
+		ForwardsHostParams: true,
 	},
 	capability.MethodToolsList: {
 		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
 		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterToolsList)
 		},
+		// The local handler forwards the host's request and filters the reply.
+		ForwardsHostParams: true,
 	},
 	capability.MethodPromptsList: {
 		In: []capability.Revision{capability.Revision20251125, capability.Revision20260728},
 		Local: func(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 			return dispatchList(ctx, d, msg, pdp.ListFilterer.FilterPromptsList)
 		},
+		// The local handler forwards the host's request and filters the reply.
+		ForwardsHostParams: true,
 	},
 
 	// Notification-only methods. notifications/initialized closes a handshake 2026-07-28

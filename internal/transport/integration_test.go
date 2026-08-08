@@ -857,12 +857,17 @@ func TestStdioProxy_NewRevisionPeerLosesRemovedMethods(t *testing.T) {
 			ping.Error.Code, capability.JSONRPCCodeAuthorizationFailed)
 	}
 
+	// tools/call exists in both revisions, so the peer's own tables admit it — and it is
+	// refused anyway, one gate earlier: its params travel to an upstream leg speaking
+	// 2025-11-25, and forwarding a body declaring 2026-07-28 beside the MCP-Protocol-Version
+	// header this proxy stamps would MANUFACTURE the mismatched pair the host leg refuses.
+	// The refusal names the leg rather than the method, which is the difference from ping's.
 	call := h.roundTrip(t, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/etc/hosts"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
 	})
-	if call.Error != nil {
-		t.Fatalf("tools/call exists in both revisions and must serve, got %+v", call.Error)
+	if call.Error == nil || call.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Fatalf("a forwarded call declaring a revision the upstream leg does not speak must be refused -32022, got %+v (result %s)", call.Error, call.Result)
 	}
 
 	if err := h.shutdown(t); err != nil {
@@ -891,11 +896,15 @@ func TestStdioProxy_ContextPinsFromItsFirstMessage(t *testing.T) {
 	})
 
 	// First message declares the newer revision and never handshakes: that IS the negotiation.
-	if resp := h.roundTrip(t, mcp.RPCMsg{
-		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call",
-		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/etc/hosts"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
-	}); resp.Error != nil {
-		t.Fatalf("a first message declaring a revision must be served under it, got %+v", resp.Error)
+	// A locally-answered method, so the pin is what is under test rather than the upstream
+	// leg's ability to honor the declaration — ping is denied here because 2026-07-28 removed
+	// it, which is the peer's own table answering and proof the pin landed.
+	first := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "ping",
+		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if first.Error == nil || first.Error.Code != capability.JSONRPCCodeAuthorizationFailed {
+		t.Fatalf("the first message must resolve under the revision it declares, whose tables have no ping; got %+v (result %s)", first.Error, first.Result)
 	}
 	if got := h.proxy.hostRevision(); got != capability.Revision20260728 {
 		t.Fatalf("context revision = %q, want %q — the pin must land on the FIRST resolved message, not only on initialize", got, capability.Revision20260728)

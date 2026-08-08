@@ -1197,7 +1197,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
 // serveHost, the single goroutine that owns the pin.
 func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (context.Context, bool) {
-	rev, err := resolveHostRevision(p.hostRevision(), msg)
+	rev, err := resolveHostRevision(p.hostRevision(), p.upstreamRev, msg)
 	if err != nil {
 		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, msg, err)
 		if msg.IsRequest() {
