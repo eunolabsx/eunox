@@ -386,7 +386,7 @@ func TestHonorabilityGate_CoversTheHostResponseFraming(t *testing.T) {
 
 			// Exactly one message reaches the upstream, and it is eunox's own: the refused
 			// response is never relayed, but the request it would have answered is unblocked
-			// rather than left hanging (see takeRefusedServerReply).
+			// rather than left hanging (see server_request_unblock.go).
 			assertUnblockedNotRelayed(t, up.messages(), mcp.RawJSON(`5`))
 			if got := p.hostRevision(); got != "" {
 				t.Errorf("pinned revision = %q, want unpinned — a response is dispatched by neither table", got)

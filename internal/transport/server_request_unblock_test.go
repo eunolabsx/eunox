@@ -42,13 +42,13 @@ func upstreamReplies(t *testing.T, raw string) []mcp.RPCMsg {
 }
 
 // fillServerReqTracker tracks maxTrackedServerReqs distinct ids through u, so the next track()
-// must evict one. The victim of that eviction is arbitrary (a map-order pick), which is exactly
-// why the test asserts on the SHAPE of the answer rather than on which id was chosen.
+// must displace one. WHICH one is asserted separately (see the longest-waiting test); here the
+// point is only that the set is at its cap.
 func fillServerReqTracker(t *testing.T, u serverRequestUnblocker) {
 	t.Helper()
 	for i := range maxTrackedServerReqs {
-		_, evicted := u.reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(jsonNumber(i)), Method: "roots/list"}, io.Discard)
-		require.False(t, evicted, "filling to the cap must not evict")
+		_, displaced := u.reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(jsonNumber(i)), Method: "roots/list"}, io.Discard)
+		require.False(t, displaced, "filling to the cap must displace nothing")
 	}
 }
 
@@ -62,19 +62,19 @@ func mustJSON(v any) []byte {
 	return b
 }
 
-// TestServerRequestEviction_AnswersAndRecordsTheEvictedInitiator is the regression for a
+// TestServerRequestDisplacement_AnswersAndRecordsTheDisplacedInitiator is the regression for a
 // server-initiated request the bounded tracker dropped on the floor.
 //
-// Past the cap an arbitrary tracked request is evicted to keep the set bounded. The eviction
-// itself is the safe half; what was missing is that nothing then answered the request it evicted.
-// Its id is gone, so both transports' routing arms drop even a CORRECT host reply to it as
-// untracked — the upstream stays blocked on a request nothing could ever complete, on stdio until
-// the host disconnects, and nothing on the tape said which request it cost.
+// Past the cap a tracked request is displaced to keep the set bounded. The displacement itself is
+// the safe half; what was missing is that nothing then answered the request it removed. Its entry
+// is gone, so both transports' routing arms drop even a CORRECT host reply to it as untracked —
+// the upstream stays blocked on a request nothing could ever complete, on stdio until the host
+// disconnects, and nothing on the tape said which request it cost.
 //
-// An eviction is neither of the leg's exceptions: not a refusal of the peer, not an emergency
+// A displacement is neither of the leg's exceptions: not a refusal of the peer, not an emergency
 // stop, but eunox running out of bookkeeping space — the case where it most clearly owes the
 // upstream an answer it can produce entirely on its own.
-func TestServerRequestEviction_AnswersAndRecordsTheEvictedInitiator(t *testing.T) {
+func TestServerRequestDisplacement_AnswersAndRecordsTheDisplacedInitiator(t *testing.T) {
 	t.Parallel()
 	var up bytes.Buffer
 	var reqs serverReqTracker
@@ -86,28 +86,49 @@ func TestServerRequestEviction_AnswersAndRecordsTheEvictedInitiator(t *testing.T
 	fillServerReqTracker(t, u)
 
 	rec := &fwdRecorder{}
-	trackServerRequest(context.Background(), u, rec, "sess-evict", dropStdioEvicted,
+	trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("sess-evict"), dropStdioDisplaced,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`"the-newest"`), Method: "sampling/createMessage"})
 
 	replies := upstreamReplies(t, up.String())
-	require.Len(t, replies, 1, "the evicted request's initiator must be answered exactly once")
+	require.Len(t, replies, 1, "the displaced request's initiator must be answered exactly once")
 	require.NotNil(t, replies[0].Error, "the answer must be a JSON-RPC error; a result would claim the host performed something")
 	assert.Equal(t, capability.JSONRPCCodeEnforcementError, replies[0].Error.Code)
-	assert.Contains(t, replies[0].Error.Message, "evicted",
-		"the answer names the proxy's own limit: an eviction relays nothing the host said, so the text is eunox's own")
+	assert.Contains(t, replies[0].Error.Message, "displaced",
+		"the answer names the proxy's own bookkeeping: a displacement relays nothing the host said, so the text is eunox's own")
 
-	require.Len(t, rec.records, 1, "an evicted request is a call the proxy actively failed and must reach the tape")
+	require.Len(t, rec.records, 1, "a displaced request is a call the proxy actively failed and must reach the tape")
 	assert.Equal(t, "deny", rec.records[0].decision)
 	assert.Equal(t, capability.ErrCodeEnforcementError, rec.records[0].code)
-	assert.Equal(t, string(dropStdioEvicted), rec.records[0].details["transport"],
-		"the record must name the drop site, so an eviction is distinguishable from an undelivered broadcast")
+	assert.Equal(t, string(dropStdioDisplaced), rec.records[0].details["transport"],
+		"the record must name the drop site, so a displacement is distinguishable from an undelivered broadcast")
 	assert.Equal(t, "roots/list", rec.records[0].identifier,
-		"the record names the EVICTED request's method, which is why the tracker remembers more than an id")
+		"the record names the DISPLACED request's method, which is why the tracker remembers more than an id")
 }
 
-// TestServerRequestEviction_BelowTheCapAnswersNothing is the other half: the answer above must be
-// forced by an actual eviction, not written for every tracked request.
-func TestServerRequestEviction_BelowTheCapAnswersNothing(t *testing.T) {
+// TestServerRequestDisplacement_TakesTheLongestWaiting pins WHICH request an over-capacity track
+// sacrifices. An arbitrary map-order pick was tolerable while a displacement merely left a request
+// to hang; it is not once the displacement actively answers the initiator, because a random pick
+// is as likely to abort a request the host is about to answer correctly as one that is stuck.
+func TestServerRequestDisplacement_TakesTheLongestWaiting(t *testing.T) {
+	t.Parallel()
+	var reqs serverReqTracker
+	// The first id tracked is the one that has waited longest, so it is the one displaced.
+	_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`"oldest"`), Method: "roots/list"}, io.Discard)
+	for i := 1; i < maxTrackedServerReqs; i++ {
+		_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(jsonNumber(i)), Method: "roots/list"}, io.Discard)
+	}
+	displaced, ok := reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`"newest"`), Method: "roots/list"}, io.Discard)
+	require.True(t, ok)
+	assert.Equal(t, `"oldest"`, string(*displaced.id),
+		"the displaced request must be the longest-waiting one, not whichever the map's randomized range yielded")
+}
+
+// TestServerRequestTracking_AReusedIDDisplacesRatherThanVanishing closes the second way an entry
+// leaves the set. mcp.MsgKey canonicalizes by VALUE, so an upstream issuing `1` and then `1.0`
+// collides two distinct wire requests onto one entry — and while the map's value was a struct{}
+// the overwrite lost nothing, so nothing reported it. Now the entry carries what answering the
+// first initiator needs, and losing it silently is the same hang the cap path was fixed for.
+func TestServerRequestTracking_AReusedIDDisplacesRatherThanVanishing(t *testing.T) {
 	t.Parallel()
 	var up bytes.Buffer
 	var reqs serverReqTracker
@@ -117,38 +138,59 @@ func TestServerRequestEviction_BelowTheCapAnswersNothing(t *testing.T) {
 		writeUpstream: func(m mcp.RPCMsg) { _, _ = up.Write(append(mustJSON(m), '\n')) },
 		errOut:        io.Discard,
 	}
-	trackServerRequest(context.Background(), u, rec, "sess", dropStdioEvicted,
+	ctx, lim := context.Background(), newRefusalRecordLimiter()
+	trackServerRequest(ctx, u, rec, lim, verifiedSession("s"), dropStdioDisplaced,
+		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"})
+	require.Empty(t, up.String(), "the first track displaces nothing")
+
+	trackServerRequest(ctx, u, rec, lim, verifiedSession("s"), dropStdioDisplaced,
+		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1.0`), Method: "sampling/createMessage"})
+
+	replies := upstreamReplies(t, up.String())
+	require.Len(t, replies, 1, "the request whose entry was overwritten must be answered: nothing can route a reply to it afterwards")
+	assert.Equal(t, "n:1", mcp.MsgKey(replies[0].ID))
+	require.Len(t, rec.records, 1)
+	assert.Equal(t, "roots/list", rec.records[0].identifier, "the record names the DISPLACED request")
+}
+
+// TestServerRequestDisplacement_BelowTheCapAnswersNothing is the other half: the answer above must
+// be forced by an actual displacement, not written for every tracked request.
+func TestServerRequestDisplacement_BelowTheCapAnswersNothing(t *testing.T) {
+	t.Parallel()
+	var up bytes.Buffer
+	var reqs serverReqTracker
+	rec := &fwdRecorder{}
+	u := serverRequestUnblocker{
+		reqs:          &reqs,
+		writeUpstream: func(m mcp.RPCMsg) { _, _ = up.Write(append(mustJSON(m), '\n')) },
+		errOut:        io.Discard,
+	}
+	trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("sess"), dropStdioDisplaced,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "sampling/createMessage"})
-	assert.Empty(t, up.String(), "tracking below the cap evicts nothing, so nothing may be answered")
+	assert.Empty(t, up.String(), "tracking below the cap displaces nothing, so nothing may be answered")
 	assert.Empty(t, rec.records)
 	assert.True(t, reqs.tracked("n:1"), "the request just tracked must still be routable")
 }
 
-// TestUnblock_NoUpstreamWriterReportsAndLeavesTheIDRoutable pins the nil-writer disposition that
-// used to differ across the four hand-written copies of this sequence — two skipped silently, two
-// warned — for the identical condition.
-//
-// Two properties, and the second is why the writer is tested BEFORE the take: consuming the id is
-// what makes the reply unroutable by any later path, so consuming one with nothing to answer
-// through strands the initiator strictly worse than leaving it alone.
-func TestUnblock_NoUpstreamWriterReportsAndLeavesTheIDRoutable(t *testing.T) {
+// TestServerRequestDisplacement_RecordIsMetered pins the bound on a record source the UPSTREAM
+// drives. Once the set is full every further server-initiated request displaces one, so an
+// upstream that outruns a slow host would otherwise turn an unbounded audit-write rate loose — and
+// under --require-audit=strict enough dropped writes latch AuditDegraded and deny every route.
+func TestServerRequestDisplacement_RecordIsMetered(t *testing.T) {
 	t.Parallel()
-	var out bytes.Buffer
 	var reqs serverReqTracker
-	_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, io.Discard)
-	u := serverRequestUnblocker{reqs: &reqs, errOut: &out}
+	rec := &fwdRecorder{}
+	u := serverRequestUnblocker{reqs: &reqs, writeUpstream: func(mcp.RPCMsg) {}, errOut: io.Discard}
+	fillServerReqTracker(t, u)
 
-	assert.Equal(t, unblockNoUpstream, u.unblock(mcp.RawJSON(`7`), "because"))
-	assert.Contains(t, out.String(), "no upstream writer to answer it",
-		"a request left blocked must be reported, not dropped silently: the alternative is a wedged upstream with nothing anywhere saying why")
-	assert.True(t, reqs.tracked("n:7"),
-		"an unanswerable unblock must not consume the id; taking it is what makes a later, routable reply undeliverable")
-
-	// An id this proxy never issued is nothing that happened, on the writerless path too — so a
-	// peer cannot drive stderr by replying to ids at random.
-	out.Reset()
-	assert.Equal(t, unblockUntracked, u.unblock(mcp.RawJSON(`999`), "because"))
-	assert.Empty(t, out.String())
+	lim := newRefusalRecordLimiter()
+	for i := range 200 {
+		trackServerRequest(context.Background(), u, rec, lim, verifiedSession("s"), dropStdioDisplaced,
+			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(jsonNumber(maxTrackedServerReqs + i)), Method: "roots/list"})
+	}
+	assert.LessOrEqual(t, len(rec.records), int(perCategoryDenyBurst)+1,
+		"a sustained displacement flood must be bounded by its own bucket, not written once per request")
+	assert.NotEmpty(t, rec.records, "the leading edge of the flood must still reach the tape")
 }
 
 // TestUnblock_AnswersAndConsumesExactlyOnce pins the ordinary path: the id is consumed, so a
@@ -163,23 +205,54 @@ func TestUnblock_AnswersAndConsumesExactlyOnce(t *testing.T) {
 		writeUpstream: func(m mcp.RPCMsg) { _, _ = up.Write(append(mustJSON(m), '\n')) },
 		errOut:        io.Discard,
 	}
-	require.Equal(t, unblockAnswered, u.unblock(mcp.RawJSON(`7`), "refused"))
-	require.Equal(t, unblockUntracked, u.unblock(mcp.RawJSON(`7`), "refused"))
+	require.True(t, u.unblock(mcp.RawJSON(`7`), "refused"))
+	require.False(t, u.unblock(mcp.RawJSON(`7`), "refused"))
 	assert.Len(t, upstreamReplies(t, up.String()), 1, "one forwarded request is answered exactly once")
 }
 
-// TestSessionGateRefusedReply_AnswersTheOwnerAndNeverASecondIdentity settles the arm that had a
-// comment instead of a rule.
+// TestUnblock_NoUpstreamWriterReportsAndStillReclaims pins the nil-writer disposition that used to
+// differ across the four hand-written copies of this sequence — two skipped silently, two warned —
+// for the identical condition.
+//
+// The id is consumed even though nothing could be written. Leaving it was the tempting reading
+// ("some later path might route it"), but no host reply to a request that was never delivered ever
+// arrives, so the entry would sit in the bounded set for the session's life and eventually
+// displace a LIVE request — which now actively answers an initiator rather than failing silently.
+func TestUnblock_NoUpstreamWriterReportsAndStillReclaims(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	var reqs serverReqTracker
+	_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, io.Discard)
+	u := serverRequestUnblocker{reqs: &reqs, errOut: &out}
+
+	assert.True(t, u.unblock(mcp.RawJSON(`7`), "because"))
+	assert.Contains(t, out.String(), "no upstream writer to answer it",
+		"a request left blocked must be reported, not dropped silently: the alternative is a wedged upstream with nothing anywhere saying why")
+	assert.False(t, reqs.tracked("n:7"), "the slot must be reclaimed; nothing will ever arrive to reclaim it later")
+
+	// An id this proxy never issued is nothing that happened — so a peer cannot drive stderr by
+	// replying to ids at random.
+	out.Reset()
+	assert.False(t, u.unblock(mcp.RawJSON(`999`), "because"))
+	assert.Empty(t, out.String())
+}
+
+// TestSessionGateRefusedReply_AnswersOnlyAProvenOwner settles the arm that had a comment instead
+// of a rule, and pins the half that comment did not cover.
 //
 // A host reply refused by the session gates left its upstream blocked for the session's remaining
-// life. The fix is not "always unblock": this gate refuses the SENDER, and answering the initiator
+// life. The fix is not "always unblock": these gates refuse the SENDER, and answering the initiator
 // completes its request whether or not the tracked id is consumed — so answering on an
-// unauthorized sender's message hands any same-audience second identity that learned a session id
-// a way to abort the owner's pending reply, gated only on knowing the id.
+// unauthorized sender's message hands any second identity that learned a session id a way to abort
+// the owner's pending reply, gated only on knowing the id.
 //
-// So the disposition turns on WHO was refused: the session's own owner (or an unbound session,
-// where the primitive already exists) is answered; a second identity is not.
-func TestSessionGateRefusedReply_AnswersTheOwnerAndNeverASecondIdentity(t *testing.T) {
+// The disposition therefore turns on the sender being a PROVEN owner, not on the absence of a
+// mismatch. The two differ exactly where an earlier version of this arm was wrong: ownerMismatch
+// reports "no mismatch" for a session with no bound identity, which is right for a gate (nothing
+// to enforce) and wrong for a decision that acts on the sender's behalf — an unbound session
+// cannot tell its owner from anyone else, and the AUDIENCE gate refuses senders that binding never
+// examines.
+func TestSessionGateRefusedReply_AnswersOnlyAProvenOwner(t *testing.T) {
 	t.Parallel()
 	owner := &pdp.JWTClaims{Issuer: "https://idp.example", Subject: "alice"}
 	cases := []struct {
@@ -201,10 +274,22 @@ func TestSessionGateRefusedReply_AnswersTheOwnerAndNeverASecondIdentity(t *testi
 			sessClaims: owner, senderClaim: nil, wantAnswer: false,
 		},
 		{
-			// No creating identity to enforce: anyone who can reach the session id can already
-			// send a reply that consumes it outright, so answering adds no new primitive.
-			name:       "an unbound session is answered",
-			sessClaims: nil, senderClaim: nil, wantAnswer: true,
+			// The regression. This is the audience-pin path: the owner binding never ran, and on
+			// a session with nothing to bind it is vacuous anyway — so an earlier version read
+			// "no mismatch" as "this is the owner" and handed the attacker the abort. A reply the
+			// audience pin refuses would not otherwise reach the tracked id at all, so this was a
+			// primitive that did not previously exist.
+			name:        "a second identity on a session with no bound subject is not",
+			sessClaims:  &pdp.JWTClaims{Issuer: "https://idp.example", Subject: ""},
+			senderClaim: &pdp.JWTClaims{Issuer: "https://idp.example", Subject: "mallory"},
+			wantAnswer:  false,
+		},
+		{
+			// Nothing can be proven about a sender on a session with no creating identity, so
+			// nothing is answered — the conservative reading, at the cost of leaving the upstream
+			// blocked exactly where it was before.
+			name:       "an unbound session proves nothing and is not answered",
+			sessClaims: nil, senderClaim: nil, wantAnswer: false,
 		},
 	}
 	for _, tc := range cases {
@@ -267,8 +352,11 @@ func TestSessionGateRefusedReply_OnlyForAResponseFraming(t *testing.T) {
 func TestHandleSessionPost_GateRefusedOwnerReplyUnblocksThroughTheRealHandler(t *testing.T) {
 	t.Parallel()
 	var up bytes.Buffer
-	// A route whose audience pin refuses every caller: the gate fires on something OTHER than the
-	// sender's identity, which is the case an owner can reach on their own.
+	// A route whose audience pin refuses every caller: the gate fires without the owner binding
+	// running at all, which is the case an owner can reach on their own — and the case that made
+	// the earlier "no mismatch" reading exploitable. The session carries a bound owner, and the
+	// POST is made under that same identity.
+	owner := &pdp.JWTClaims{Issuer: "https://idp.example", Subject: "alice"}
 	rt := &UpstreamRoute{name: "r", pdp: audienceDenyingPDP{}, sink: &routeSink{}}
 	proxy := newTestHTTPProxy()
 	sess := newTestSession(&httpSession{
@@ -276,6 +364,7 @@ func TestHandleSessionPost_GateRefusedOwnerReplyUnblocksThroughTheRealHandler(t 
 		route:    rt,
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(&up),
+		claims:   owner,
 	})
 	_, _ = sess.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"}, io.Discard)
 	proxy.mu.Lock()
@@ -285,6 +374,7 @@ func TestHandleSessionPost_GateRefusedOwnerReplyUnblocksThroughTheRealHandler(t 
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":5,"result":{}}`))
 	req.Header.Set("Content-Type", CTJSON)
 	req.Header.Set(SessionHeader, sess.id)
+	req = req.WithContext(pdp.WithJWTClaims(req.Context(), owner))
 	w := httptest.NewRecorder()
 	proxy.handleMCPPost(w, req, rt)
 

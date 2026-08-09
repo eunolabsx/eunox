@@ -13,7 +13,9 @@ package transport
 
 import (
 	"go/ast"
+	"go/token"
 	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -48,14 +50,12 @@ func TestRefusalMetering_EveryCategoryDeclaresOne(t *testing.T) {
 			assert.Empty(t, decl.why, "category %q is metered but carries an exemption reason; a metered category needs none, and one here reads as a disagreement with its own disposition", cat)
 		}
 	}
-	// Every category CONSTANT must be declared. Checked against the constants themselves, so a
-	// new one that is never declared is caught rather than silently inheriting the unknown bucket.
-	for _, cat := range []refusalCategory{
-		catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType,
-		catSaturation, catKill, catAudience, catRevision, catUnroutable, catSmuggled,
-	} {
+	// Every category CONSTANT must be declared. Read off the source rather than hand-listed here,
+	// so a new constant that is never declared is caught by the guard instead of by whoever
+	// remembers to extend a second list beside the first.
+	for name, cat := range declaredCategoryConstants(t) {
 		_, declared := refusalDeclarations[cat]
-		assert.True(t, declared, "refusal category constant %q has no entry in refusalDeclarations", cat)
+		assert.True(t, declared, "refusal category constant %s (%q) has no entry in refusalDeclarations", name, cat)
 	}
 }
 
@@ -78,9 +78,9 @@ func TestRefusalMetering_DerivedListIsTheMeteredSubset(t *testing.T) {
 		"the derived list must be sorted: it is built by ranging a map, and an unsorted one makes the bucket table and every test reading it order-dependent")
 }
 
-// TestRefusalMetering_CallSitesAgreeWithTheDeclarations is the walk the issue asked for: every
-// site that resolves a refusal's recorder names its category, and the function it calls must
-// implement the disposition that category declares.
+// TestRefusalMetering_CallSitesAgreeWithTheDeclarations walks every site that resolves a refusal's
+// recorder: each names its category, and the function it calls must implement the disposition that
+// category declares.
 //
 // It also closes the two ways the old shape passed vacuously — a category declared with no call
 // site, and a limiter appearing at a site declared exempt.
@@ -124,7 +124,7 @@ func TestRefusalMetering_CallSitesAgreeWithTheDeclarations(t *testing.T) {
 				if ident, isIdent := arg.(*ast.Ident); isIdent && params[ident.Name] {
 					return true
 				}
-				cat, ok := categoryConstant(arg)
+				cat, ok := categoryConstant(t, arg)
 				if !ok {
 					t.Errorf("%s: %s is passed a category this walk cannot resolve (%s); pass one of the catXxx constants so its declared disposition can be checked",
 						name, fn.Name, exprText(src.fset, arg))
@@ -157,39 +157,29 @@ func TestRefusalMetering_CallSitesAgreeWithTheDeclarations(t *testing.T) {
 	}
 }
 
-// TestRefusalMetering_StdioChargesOnlyWhatItDeclares holds the transport's charged set to the one
-// it declares, which is what makes building buckets for that set alone safe: a category outside it
-// would fall to the shared `unknown` bucket, bounded but not its own.
-func TestRefusalMetering_StdioChargesOnlyWhatItDeclares(t *testing.T) {
+// TestRefusalMetering_StdioLimiterHasABucketPerDeclaredCategory is what makes building buckets for
+// a SUBSET safe: a category a transport charges but does not declare falls to the shared `unknown`
+// bucket — bounded, but at the floor rate and shared with every other unregistered category, so
+// identical bytes would be metered differently on the two transports.
+//
+// Asserted on the limiter rather than by scanning stdio.go for call sites, which was the earlier
+// shape and had a false premise: "which categories does stdio charge" is not answerable from one
+// FILENAME. catDisplaced is charged through trackServerRequest, a shared helper both transports
+// hand their own limiter to, and lives in neither transport's file.
+func TestRefusalMetering_StdioLimiterHasABucketPerDeclaredCategory(t *testing.T) {
 	t.Parallel()
-	charged := map[refusalCategory]bool{}
-	for _, src := range packageSources(t) {
-		if src.name != "stdio.go" {
-			continue
-		}
-		ast.Inspect(src.file, func(n ast.Node) bool {
-			call, isCall := n.(*ast.CallExpr)
-			if !isCall {
-				return true
-			}
-			fn, isIdent := call.Fun.(*ast.Ident)
-			if !isIdent || fn.Name != "admitRefusalRecord" || len(call.Args) < 3 {
-				return true
-			}
-			if cat, ok := categoryConstant(call.Args[2]); ok {
-				charged[cat] = true
-			}
-			return true
-		})
-	}
-	require.NotEmpty(t, charged, "no metered refusal found in stdio.go; this guard would pass vacuously")
-	for cat := range charged {
-		assert.Contains(t, stdioRefusalCategories, cat,
-			"stdio.go charges category %q, which stdioRefusalCategories does not declare — its limiter builds no bucket for it, so the refusal falls to the shared unknown bucket", cat)
-	}
+	lim := newRefusalRecordLimiterFor(stdioRefusalCategories...)
+	require.NotEmpty(t, stdioRefusalCategories)
 	for _, cat := range stdioRefusalCategories {
-		assert.True(t, charged[cat], "stdioRefusalCategories declares %q but stdio.go charges no such refusal; the bucket is retained for nothing", cat)
+		assert.Equal(t, meteringMetered, refusalDeclarations[cat].metering,
+			"stdio declares it charges %q, which is not a metered category", cat)
+		assert.NotEqual(t, lim.unknown, lim.bucket(cat),
+			"stdio charges %q but its limiter builds no bucket for it", cat)
 	}
+	// The one category that reaches stdio through a SHARED helper rather than its own file, which
+	// is why the filename-scoped predecessor of this test could not see it.
+	assert.Contains(t, stdioRefusalCategories, catDisplaced,
+		"trackServerRequest charges catDisplaced with whichever limiter its caller passes, and stdio passes its own")
 }
 
 // TestRefusalMetering_SizedLimiterKeepsTheAggregateShare pins that building buckets for a SUBSET
@@ -207,21 +197,55 @@ func TestRefusalMetering_SizedLimiterKeepsTheAggregateShare(t *testing.T) {
 	assert.Equal(t, one.unknown, one.bucket(catAuth))
 }
 
-// categoryConstant resolves a catXxx identifier to its value, matching by name against the
-// declared constants. Returns false for anything that is not one of them.
-func categoryConstant(e ast.Expr) (refusalCategory, bool) {
+// categoryConstant resolves a catXxx identifier to its value. The name→value table is DERIVED
+// from the package's own const declarations rather than hand-listed: a hand-listed one silently
+// stops resolving the day a category is added, which turns this guard's "cannot resolve" arm from
+// a real complaint into noise about the guard's own staleness.
+func categoryConstant(t *testing.T, e ast.Expr) (refusalCategory, bool) {
 	ident, ok := e.(*ast.Ident)
 	if !ok {
 		return "", false
 	}
-	byName := map[string]refusalCategory{
-		"catOrigin": catOrigin, "catJWT": catJWT, "catAuth": catAuth, "catControl": catControl,
-		"catLoopback": catLoopback, "catBody": catBody, "catContentType": catContentType,
-		"catSaturation": catSaturation, "catKill": catKill, "catAudience": catAudience,
-		"catRevision": catRevision, "catUnroutable": catUnroutable, "catSmuggled": catSmuggled,
-	}
-	cat, known := byName[ident.Name]
+	cat, known := declaredCategoryConstants(t)[ident.Name]
 	return cat, known
+}
+
+// declaredCategoryConstants reads every `catXxx refusalCategory = "..."` declaration out of the
+// package sources.
+func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
+	t.Helper()
+	out := map[string]refusalCategory{}
+	for _, src := range packageSources(t) {
+		for _, decl := range src.file.Decls {
+			gen, isGen := decl.(*ast.GenDecl)
+			if !isGen || gen.Tok != token.CONST {
+				continue
+			}
+			// A const block declares its type once, on the first spec; later specs inherit it.
+			typeName := ""
+			for _, spec := range gen.Specs {
+				vs, isValue := spec.(*ast.ValueSpec)
+				if !isValue {
+					continue
+				}
+				if id, isIdent := vs.Type.(*ast.Ident); isIdent {
+					typeName = id.Name
+				}
+				if typeName != "refusalCategory" || len(vs.Names) != 1 || len(vs.Values) != 1 {
+					continue
+				}
+				lit, isLit := vs.Values[0].(*ast.BasicLit)
+				if !isLit || lit.Kind != token.STRING {
+					continue
+				}
+				value, err := strconv.Unquote(lit.Value)
+				require.NoError(t, err)
+				out[vs.Names[0].Name] = refusalCategory(value)
+			}
+		}
+	}
+	require.NotEmpty(t, out, "no refusalCategory constants found; this guard would pass vacuously")
+	return out
 }
 
 // parameterNames returns the names bound by fn's parameter list, so the walk can tell a call that

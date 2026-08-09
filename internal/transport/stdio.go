@@ -1091,7 +1091,10 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
 					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), methodLabelServerResponse, methodLabelServerResponse, legStdioServerResponse)
 				} else {
-					_ = p.upWriter.Write(msg)
+					// Through the shared seam, like its HTTP twin: this is the fifth site of the
+					// take-then-write sequence, and leaving it bare is how the two transports came
+					// to disagree about the identical no-upstream-writer case.
+					p.unblocker().relay(msg)
 				}
 			}
 			continue
@@ -1129,6 +1132,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		subject:     verifiedSession(p.sessionID),
 		established: true,
 		audit:       p.audit,
+		strictAudit: p.strictAudit(),
 		errOut:      p.errOut(),
 		checkKill:   func() *capability.EnforceResponse { return p.pdp.CheckKill(ctx, p.sessionID) },
 		leg:         legStdioNotification,
@@ -1306,21 +1310,13 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	return resp
 }
 
-// trackServerRequest records a server-initiated request being forwarded to the host, so serveHost
-// can route the host's response back to the upstream. An eviction it forces is answered and
-// recorded rather than left to hang — see trackServerRequest (the shared one).
-func (p *StdioProxy) trackServerRequest(ctx context.Context, msg mcp.RPCMsg) {
-	if msg.ID == nil {
-		return
-	}
-	trackServerRequest(ctx, p.unblocker(), p.rec(), p.sessionID, dropStdioEvicted, msg)
-}
-
-// forwardServerRequestToHost tracks msg's ID and forwards the server-initiated
-// request to the host. The host's response (same ID) is later routed back to the
-// upstream by serveHost.
+// forwardServerRequestToHost tracks msg's ID and forwards the server-initiated request to the
+// host. The host's response (same ID) is later routed back to the upstream by serveHost, and a
+// request this one displaces from the bounded tracker is answered and recorded rather than left to
+// hang — see trackServerRequest, which also holds the no-id precondition both legs used to spell
+// for themselves.
 func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) {
-	p.trackServerRequest(ctx, msg)
+	trackServerRequest(ctx, p.unblocker(), p.rec(), p.refusalLimiter, verifiedSession(p.sessionID), dropStdioDisplaced, msg)
 	_ = p.hostWriter.Write(msg)
 }
 

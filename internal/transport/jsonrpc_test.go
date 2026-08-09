@@ -620,13 +620,17 @@ func TestTrackServerReqID(t *testing.T) {
 		t.Error("first insert must not report an eviction")
 	}
 
-	// Re-inserting an already-tracked ID is a no-op, not growth, and never evicts.
-	ids, _, evicted = trackServerReqID(ids, "a", entry("a"))
+	// Re-inserting an already-tracked ID is not growth — but it DISPLACES the entry that was
+	// there, which is a request that can no longer be answered by any later reply. It was invisible
+	// while the map's value was a struct{} (there was nothing to lose); now the entry carries what
+	// answering the initiator needs, so the displacement is reported like the cap's.
+	var displaced trackedServerRequest
+	ids, displaced, evicted = trackServerReqID(ids, "a", entry("a"))
 	if len(ids) != 1 {
 		t.Fatalf("duplicate insert: len = %d, want 1", len(ids))
 	}
-	if evicted {
-		t.Error("duplicate insert must not report an eviction")
+	if !evicted || displaced.id == nil {
+		t.Errorf("duplicate insert reported displaced=%v (%+v); an overwritten entry is a request nothing can route a reply to, so it must be handed back to be answered", evicted, displaced)
 	}
 
 	// Fill to the cap.
@@ -654,21 +658,22 @@ func TestTrackServerReqID(t *testing.T) {
 		t.Error("newest ID must be retained after eviction at the cap")
 	}
 
-	// Re-inserting a tracked ID at the cap must not evict (size unchanged).
+	// Re-inserting a tracked ID at the cap does not grow the set, and displaces only the entry it
+	// overwrote — never a second, unrelated one.
 	ids, _, evicted = trackServerReqID(ids, "overflow", entry("overflow"))
 	if len(ids) != maxTrackedServerReqs {
 		t.Fatalf("duplicate at cap: len = %d, want %d", len(ids), maxTrackedServerReqs)
 	}
-	if evicted {
-		t.Error("re-inserting a tracked ID at the cap must not report an eviction")
+	if !evicted {
+		t.Error("re-inserting a tracked ID must report the entry it overwrote")
 	}
 }
 
-// TestServerReqTracker_TalliesEvictions pins the CR-3 observability contract: the
-// warn line states that evictions past the first are "counted but not individually
-// logged", so serverReqTracker must actually tally every eviction (not just latch a
-// logged-once bool). Each distinct ID tracked past the cap forces exactly one
-// eviction; re-tracking an already-present ID evicts nothing.
+// TestServerReqTracker_TalliesEvictions pins the observability contract: the warn line states that
+// displacements past the first are "counted but not individually logged", so serverReqTracker must
+// actually tally every one (not just latch a logged-once bool). Each distinct ID tracked past the
+// cap forces exactly one; re-tracking an already-present ID displaces the entry it overwrites, and
+// is tallied too — that entry is equally unanswerable afterwards.
 func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 	t.Parallel()
 
@@ -691,11 +696,18 @@ func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 		t.Fatalf("evictions after %d overflow inserts = %d, want %d", overflow, tr.evictions, overflow)
 	}
 
-	// The most-recently-added ID is always retained, so re-tracking it evicts
-	// nothing and leaves the tally unchanged.
+	// Re-tracking a present ID overwrites its entry — the set does not grow, but the request that
+	// entry described can no longer be answered by any reply, so it is tallied like the rest.
 	tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(fmt.Sprintf("overflow-%d", overflow-1))), Method: "roots/list"}, io.Discard)
-	if tr.evictions != overflow {
-		t.Fatalf("re-tracking a present ID changed the tally to %d, want %d", tr.evictions, overflow)
+	if tr.evictions != overflow+1 {
+		t.Fatalf("re-tracking a present ID left the tally at %d, want %d — an overwritten entry is a displacement too", tr.evictions, overflow+1)
+	}
+
+	// A message with no id is not tracked at all: its key would be "", which no reply can match
+	// and no unblock can address, so the entry could only ever leave the set by displacing a real
+	// one. Both legs used to spell this precondition for themselves.
+	if _, displaced := tr.track(mcp.RPCMsg{Method: "roots/list"}, io.Discard); displaced {
+		t.Error("an id-less message must not be tracked, let alone displace a real request")
 	}
 }
 

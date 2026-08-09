@@ -147,7 +147,8 @@ func revisionRefusalReason(err error) string {
 // stamping the response with a null id would read as a reply to a different request. A host
 // RESPONSE — reachable since the honorability gate became framing-aware — gets the record and no
 // host-facing reply for the same reason, but its INITIATOR is answered separately by each
-// transport's negotiation arm; see takeRefusedServerReply. What the record may name is
+// transport's negotiation arm through the one serverRequestUnblocker (see
+// server_request_unblock.go for the leg's rule). What the record may name is
 // auditIdentity's.
 func refuseHostRevision(ctx context.Context, rec auditRecorder, sessionID string, contextRev capability.Revision, msg mcp.RPCMsg, err error) mcp.RPCMsg {
 	reason := revisionRefusalReason(err)

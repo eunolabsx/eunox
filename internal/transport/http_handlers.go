@@ -290,8 +290,10 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		// it a sampling decision on a fully negotiated session was indistinguishable on the
 		// tape from a pre-session refusal, the one case an absent field is supposed to mean.
 		// forwardServerRequest does the stamping; this supplies the fact.
-		revision:      sess.hostRev,
-		forward:       sess.broadcastServerRequest,
+		revision: sess.hostRev,
+		forward: func(ctx context.Context, m mcp.RPCMsg) bool {
+			return sess.broadcastServerRequest(ctx, p.preSessionDenies, m)
+		},
 		writeUpstream: func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
 		decideLock:    decideLock,
 		// A session that has spanned two state anchors cannot decide on this leg at all; see

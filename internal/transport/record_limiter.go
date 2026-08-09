@@ -37,9 +37,15 @@ import (
 const (
 	perCategoryDenyRatePerSec = 2
 	perCategoryDenyBurstSize  = 5
+)
 
-	preSessionDenyRatePerSec = perCategoryDenyRatePerSec * numRefusalCategories
-	preSessionDenyBurst      = perCategoryDenyBurstSize * numRefusalCategories
+// The aggregate budget, DERIVED from the metered set rather than a hand-typed count of it. A count
+// written out separately had to be reconciled by a test with a map literal sixty lines away, and
+// it moved for two different reasons — adding a category, and flipping an existing one's one-word
+// metering — only one of which the test's message named.
+var (
+	preSessionDenyRatePerSec = perCategoryDenyRatePerSec * len(refusalCategories)
+	preSessionDenyBurst      = perCategoryDenyBurstSize * len(refusalCategories)
 )
 
 // refusalCategory is a distinct type (not a bare string) because its values double as both
@@ -89,6 +95,12 @@ const (
 	// refusalDeclarations for the reason, which is the same for both.
 	catUnroutable refusalCategory = "unroutable"
 	catSmuggled   refusalCategory = "smuggled_notification"
+	// catDisplaced bounds the record for a server-initiated request the in-flight tracker
+	// displaced. Driven by the UPSTREAM rather than by a host peer — the one category here that
+	// is — because once the bounded set is full every further server-initiated request displaces
+	// one, so an upstream issuing them faster than the host answers turns an unbounded audit-write
+	// rate loose for as long as it likes.
+	catDisplaced refusalCategory = "displaced_server_request"
 )
 
 // refusalMetering is a refusal category's DECLARED disposition. The zero value is "undeclared",
@@ -139,6 +151,7 @@ var refusalDeclarations = map[refusalCategory]refusalDeclaration{
 	catKill:        {metering: meteringMetered},
 	catAudience:    {metering: meteringMetered},
 	catRevision:    {metering: meteringMetered},
+	catDisplaced:   {metering: meteringMetered},
 	// The fail-closed ROUTING refusal, on either transport and in either framing.
 	catUnroutable: {metering: meteringExempt, why: exemptBecausePolicyDenyCostsTheSame},
 	// The enforced-method-as-notification reject. It writes a record as cheap as the routing
@@ -165,10 +178,6 @@ func meteredRefusalCategories() []refusalCategory {
 	slices.Sort(out)
 	return out
 }
-
-// numRefusalCategories sizes the aggregate budget above. It is a const because the budget
-// constants are, and TestNumRefusalCategories_MatchesTheList holds it to len().
-const numRefusalCategories = 11
 
 // perCategoryFloor keeps every category's bucket alive even where plain division would
 // floor its share to 0 (possible past ~20 categories at today's rate) — a 0-rate bucket
@@ -226,7 +235,7 @@ func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter 
 // stdioRefusalCategories is the set the stdio transport charges. Declared rather than left implicit
 // in its call sites, so the limiter it builds and the categories it spends are one statement — and
 // so a metered refusal added to that transport is a deliberate edit here.
-var stdioRefusalCategories = []refusalCategory{catRevision}
+var stdioRefusalCategories = []refusalCategory{catRevision, catDisplaced}
 
 // unmeteredRecorder returns rec unchanged, for a refusal its category DECLARES exempt.
 //

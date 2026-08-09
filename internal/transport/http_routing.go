@@ -306,12 +306,13 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// message and a 202 during an emergency stop is recorded rather than being a
 			// silent readiness ack.
 			gate := hostNotificationGate{
-				rec:       func() auditRecorder { return p.preSessionKillRecorder(route) },
-				subject:   claimedSession(r),
-				audit:     route.audit,
-				errOut:    p.errOut(),
-				checkKill: func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, "") },
-				leg:       legHTTPNotification,
+				rec:         func() auditRecorder { return p.preSessionKillRecorder(route) },
+				subject:     claimedSession(r),
+				audit:       route.audit,
+				strictAudit: p.strictAudit(),
+				errOut:      p.errOut(),
+				checkKill:   func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, "") },
+				leg:         legHTTPNotification,
 			}
 			if gate.admit(ctx, msg) == notificationForward {
 				// Unreachable: `initialize` is a swallowed notification and this arm handles no
@@ -448,6 +449,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			subject:     verifiedSession(sessionID),
 			established: true,
 			audit:       route.audit,
+			strictAudit: p.strictAudit(),
 			errOut:      p.errOut(),
 			checkKill:   kill,
 			leg:         legHTTPNotification,

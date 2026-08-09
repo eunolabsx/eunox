@@ -346,29 +346,47 @@ func (s *httpSession) unblockRefusedServerReply(msg mcp.RPCMsg) {
 	s.unblocker().unblock(msg.ID, refusedReplyUpstreamError)
 }
 
-// unblockGateRefusedServerReply answers the upstream request a host reply the SESSION GATES
-// refused would have completed — but only when the sender is this session's own owner.
+// senderIsProvenOwner reports whether cur is the identity that CREATED this session — PROVEN,
+// not merely un-refused.
 //
-// Whether this arm may answer turns on WHO was refused, not on the fact of a refusal:
-//
-//   - Refused on the sender's IDENTITY (the session-owner binding): the real owner's reply may
-//     still be coming, and answering the initiator completes its request whether or not the
-//     tracked id is consumed — so "answer without untracking" does not separate the two. Doing it
-//     would hand any same-audience second identity that learned this session id a way to abort the
-//     owner's pending reply, gated only on knowing the id. Left blocked for the owner's reply, or
-//     for teardown.
-//   - Refused on anything else (the per-route audience pin) while the sender IS the owner: no
-//     second identity is involved and nobody else's reply is being consumed, so leaving it costs
-//     one wedged upstream request for the session's remaining life for no protection at all.
-//
-// An UNBOUND session (no creating identity to enforce) reads as "the sender is the owner", which
-// is the right reading: with no identity bound, anyone who can reach the session id can already
-// send a reply that consumes it outright, so this adds no primitive that was not already there.
-func (s *httpSession) unblockGateRefusedServerReply(ctx context.Context, msg mcp.RPCMsg) {
-	if !msg.IsResponse() {
-		return
+// Deliberately not ownerMismatch, whose negation is the weaker question. That check answers "no
+// mismatch" for a session with no bound identity, which is right for a GATE (there is nothing to
+// enforce, so nothing to refuse) and wrong for any decision that ACTS on the sender's behalf: an
+// unbound session cannot distinguish its owner from anyone else, so nobody is proven.
+func (s *httpSession) senderIsProvenOwner(cur *pdp.JWTClaims) bool {
+	if s.claims == nil || s.claims.Subject == "" || cur == nil {
+		return false
 	}
-	if _, mismatch := s.ownerMismatch(pdp.JWTClaimsPtr(ctx)); mismatch {
+	_, mismatch := s.ownerMismatch(cur)
+	return !mismatch
+}
+
+// unblockGateRefusedServerReply answers the upstream request a host reply the SESSION GATES
+// refused would have completed — but only when the sender is PROVABLY this session's own owner.
+//
+// Whether this arm may answer turns on WHO sent the reply, not on which gate refused it, and not
+// on the fact of a refusal:
+//
+//   - The sender is the session's own owner: no second identity is involved and nobody else's
+//     reply is being consumed. The refusal is one the owner caused themselves (their token no
+//     longer clears the route's audience pin), and leaving it costs one wedged upstream request
+//     for the session's remaining life for no protection at all.
+//   - Anyone else, including a sender nothing can place: the real owner's reply may still be
+//     coming, and answering the initiator completes its request whether or not the tracked id is
+//     consumed — so "answer without untracking" does not separate the two. Doing it would hand any
+//     second identity that learned this session id a way to abort the owner's pending reply, gated
+//     only on knowing the id. Left blocked for the owner's reply, or for teardown.
+//
+// The gate's two arms are NOT interchangeable evidence here, which is why this asks its own
+// question rather than reading the verdict. sessionGateVerdict short-circuits on the audience pin
+// and never runs the owner binding, so a refusal that is not "owner mismatch" says nothing about
+// whether the sender is the owner — an unbound session made that gap reachable, since the binding
+// is vacuous there and every sender read as the owner.
+//
+// Revocation is deliberately not consulted, for the reason unblockRefusedServerReply gives: what a
+// kill forbids is DELIVERING the host's reply, and this answer is eunox's own.
+func (s *httpSession) unblockGateRefusedServerReply(ctx context.Context, msg mcp.RPCMsg) {
+	if !msg.IsResponse() || !s.senderIsProvenOwner(pdp.JWTClaimsPtr(ctx)) {
 		return
 	}
 	s.unblocker().unblock(msg.ID, gateRefusedReplyUpstreamError)
@@ -1397,24 +1415,16 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // back by handleMCPPost). Such a request blocks the upstream until answered, so with no
 // subscriber able to receive it, fail closed: untrack the ID and reply an error so the upstream
 // unblocks, rather than let it hang until teardown.
-func (s *httpSession) broadcastServerRequest(ctx context.Context, msg mcp.RPCMsg) bool {
-	if msg.ID != nil {
-		trackServerRequest(ctx, s.unblocker(), asRecorder(s.routeSink()), s.id, dropHTTPEvicted, msg)
-	}
+// The refusal limiter is a PARAMETER rather than reached through s.proxy: this runs on a session,
+// and the proxy that holds the bucket is already in scope at the one site that wires this in.
+func (s *httpSession) broadcastServerRequest(ctx context.Context, limiter *categoryRecordLimiter, msg mcp.RPCMsg) bool {
+	u := s.unblocker()
+	trackServerRequest(ctx, u, asRecorder(s.route.sink), limiter, verifiedSession(s.id), dropHTTPDisplaced, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}
-	s.unblocker().unblock(msg.ID, "no client stream available to service server-initiated request")
+	u.unblock(msg.ID, "no client stream available to service server-initiated request")
 	return false
-}
-
-// routeSink returns this session's route audit sink, or nil for a session assembled without a
-// route (tests). Read through one accessor because two sites now need the same nil-tolerance.
-func (s *httpSession) routeSink() *routeSink {
-	if s.route == nil {
-		return nil
-	}
-	return s.route.sink
 }
 
 // deliverToOne delivers a message to exactly one active SSE subscriber, reporting whether one
@@ -1495,11 +1505,11 @@ func (s *httpSession) removeSubAndDrain(ctx context.Context, ch chan mcp.RPCMsg)
 // consumed from a subscriber channel cannot be relayed to the host. Untracks the ID and replies
 // an error so the upstream doesn't hang. Shared by the SSE write loop and the drain path.
 //
-// The audit correction is the only per-caller difference from the shared unblock, and it runs on
-// the writerless outcome too: what it reports is that the request never reached the host, which is
-// true whether or not there was an upstream sink to say so through.
+// The audit correction is the only per-caller difference from the shared unblock, and it is gated
+// on the unblock having actually CONSUMED the request. That is what makes it exactly-once: both
+// callers (the SSE write loop and the drain) can see the same message, and only one take succeeds.
 func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPCMsg, reason string) {
-	if s.unblocker().unblock(msg.ID, reason) == unblockUntracked {
+	if !s.unblocker().unblock(msg.ID, reason) {
 		return
 	}
 	// This request was recorded as an allow when deliverToOne buffered it, but it never
@@ -1508,5 +1518,5 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 	if s.claims != nil {
 		ctx = pdp.WithJWTClaims(ctx, s.claims)
 	}
-	recordServerRequestDropped(ctx, asRecorder(s.routeSink()), s.id, msg.Method, dropHTTPUndelivered)
+	recordServerRequestDropped(ctx, asRecorder(s.route.sink), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
 }

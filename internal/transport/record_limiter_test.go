@@ -326,15 +326,12 @@ func TestPreSessionLimiterAndSaturationGate_DoNotShareABucket(t *testing.T) {
 	}
 }
 
-// TestNumRefusalCategories_MatchesTheList keeps the aggregate budget sized to the set it
-// divides. numRefusalCategories must be a const (the budget constants are), so a category
-// added to refusalCategories without updating it would quietly shrink every category's share.
-func TestNumRefusalCategories_MatchesTheList(t *testing.T) {
+// TestPerCategoryShare_DividesTheAggregateEvenly keeps each category's bucket at the share the
+// design intends. The aggregate is derived from len(refusalCategories) now rather than mirrored in
+// a hand-typed count, so the failure this guards is no longer a stale constant but an uneven
+// division: the floor would silently round a category's share down.
+func TestPerCategoryShare_DividesTheAggregateEvenly(t *testing.T) {
 	t.Parallel()
-	if numRefusalCategories != len(refusalCategories) {
-		t.Fatalf("numRefusalCategories = %d, want %d — update it when adding a refusal category, or every existing category's rate share shrinks", numRefusalCategories, len(refusalCategories))
-	}
-	// The per-category share must divide evenly, or the floor silently rounds a category down.
 	if int(perCategoryDenyRate) != perCategoryDenyRatePerSec || int(perCategoryDenyBurst) != perCategoryDenyBurstSize {
 		t.Errorf("per-category share = %v/%v, want %d/%d", perCategoryDenyRate, perCategoryDenyBurst, perCategoryDenyRatePerSec, perCategoryDenyBurstSize)
 	}

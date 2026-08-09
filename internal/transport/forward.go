@@ -918,12 +918,18 @@ var errUnroutableNotForwarded = errors.New("eunox: a message no routing table ca
 // and auditSessionID is the one function that decides whether a leg's id may be claimed as fact or
 // must stay an unverified detail. A bare string parameter here is exactly the shape that lets a
 // raw Mcp-Session-Id header become a signed assertion.
-func refusalForwardParams(rec auditRecorder, subj killSubject, auditMode bool, errOut io.Writer) forwardParams {
+//
+// strict is threaded rather than left zero even though the routing refusal hard-denies above the
+// strict-audit gate today. The whole point of routing both framings through one producer is that
+// they cannot diverge; a params struct that silently drops the field re-introduces the divergence
+// one zero value at a time, and the request-framed twin carries the leg's real state.
+func refusalForwardParams(rec auditRecorder, subj killSubject, auditMode bool, strict strictAuditState, errOut io.Writer) forwardParams {
 	return forwardParams{
-		rec:       rec,
-		audit:     auditMode,
-		sessionID: subj.auditSessionID(),
-		errOut:    errOut,
+		rec:              rec,
+		audit:            auditMode,
+		sessionID:        subj.auditSessionID(),
+		strictAuditState: strict,
+		errOut:           errOut,
 	}
 }
 
@@ -956,7 +962,6 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, subj killSubject, m
 	// for both the stderr line and the host-facing denial. The structured audit field stays raw
 	// (JSON-encoding already escapes control runes).
 	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
-	rev := requestRevision(ctx)
 	identifier, method := auditIdentity(msg)
 	// Unmetered by DECLARATION (catUnroutable), not by omission — see refusalDeclarations.
 	fp.rec = unmeteredRecorder(fp.rec, catUnroutable)
@@ -965,13 +970,17 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, subj killSubject, m
 	}
 	dec := capability.EnforceResponse{
 		Decision: capability.DecisionDeny,
-		Denial: &capability.DenialInfo{
-			Code: capability.ErrCodeUnroutableMethod,
-			// The marker rides the denial rather than a call-site map so the core's own merge
-			// carries it, and subject.auditDetails folds in a claimed session id where the leg has
-			// one — the only difference the two framings ever had.
-			Details: subj.auditDetails(unroutableDetail(rev, unroutableReason(rev, msg.Method))),
-		},
+		Denial:   &capability.DenialInfo{Code: capability.ErrCodeUnroutableMethod},
+	}
+	// Everything the RECORD carries is built inside this guard: with no sink wired the marker is
+	// pure garbage, and this is the cheapest message an unauthenticated peer can drive — a
+	// registry lookup and two maps per frame, at the peer's send rate, for a record nobody writes.
+	if fp.rec != nil {
+		rev := requestRevision(ctx)
+		// The marker rides the denial rather than a call-site map so the core's own merge carries
+		// it, and subject.auditDetails folds in a claimed session id where the leg has one — the
+		// only difference the two framings ever had.
+		dec.Denial.Details = subj.auditDetails(unroutableDetail(rev, unroutableReason(rev, msg.Method)))
 	}
 	// Record-before-act: the core writes the audit record, then the stderr notice follows, so a
 	// crash between the two never leaves a SIEM alert with no corresponding audit trail entry.

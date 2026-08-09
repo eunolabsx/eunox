@@ -344,6 +344,20 @@ func WithSingleNodeKeyspace() RedisOption {
 	}
 }
 
+// RingFanOut returns the per-server iterator for a *redis.Ring WITH the completeness check
+// go-redis' own ForEachShard lacks — it skips a shard its heartbeat has voted down and returns
+// nil, which is a partial keyspace reported as the whole one.
+//
+// This is what a consumer passes to WithShardFanOut when their ring sits behind a decorator, which
+// is the case that option exists for. Without it the only iterator they have to hand is the
+// unchecked one, so the escape hatch that makes ErrUnknownTopology tolerable would reintroduce the
+// fail-open ErrIncompleteEnumeration exists to close.
+//
+// Passing the ring itself to NewRedis needs none of this: it is classified, and wrapped, there.
+func RingFanOut(ring *redis.Ring) ShardFanOut {
+	return ShardFanOut(redisutil.WholeRingFanOut(ring))
+}
+
 // WithShardFanOut declares that a client this package cannot classify SPREADS its keyspace over
 // several servers, and supplies the per-server iterator every full enumeration must use. Like
 // its sibling it fills an unknown topology and cannot override a known one.
@@ -355,8 +369,8 @@ func WithSingleNodeKeyspace() RedisOption {
 // The iterator must visit EVERY server, reporting an error when it cannot, rather than covering
 // the reachable ones and returning nil: this backend commits what a pass returns as the whole kill
 // set, so a short pass that reports success is the fail-open ErrIncompleteEnumeration exists to
-// stop. Declaring (*redis.Ring).ForEachShard here is precisely that — pass the ring itself, which
-// is classified and wrapped with the completeness check the library iterator lacks.
+// stop. Declaring (*redis.Ring).ForEachShard here is precisely that — wrap it in RingFanOut, which
+// is the same iterator carrying the completeness check the library's own lacks.
 func WithShardFanOut(fanOut ShardFanOut) RedisOption {
 	return func(r *Redis) {
 		if fanOut == nil {

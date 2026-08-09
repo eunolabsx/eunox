@@ -631,6 +631,39 @@ func TestIncompleteEnumeration_IsReportedRatherThanCommittedAsTheWholeKillSet(t 
 		"fail-closed must deny on an unconfirmable kill set rather than answer not-killed for a session whose kill lived on the shard the scan skipped")
 }
 
+// TestRingFanOut_IsReachableThroughTheDeclaringOption closes the hole the escape hatch opened.
+//
+// WithShardFanOut exists for the decorator case — a ring behind a metrics or tracing wrapper,
+// which ClassifyTopology cannot place — and a consumer there cannot "pass the ring itself". The
+// only iterator they have to hand is go-redis' own, which is precisely the one that skips a
+// down shard and reports success, so declaring it would put the backend straight back to serving a
+// partial kill set as complete, reached through the option added to make the refusal tolerable.
+// RingFanOut is the checked iterator they declare instead.
+func TestRingFanOut_IsReachableThroughTheDeclaringOption(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	shardA, shardB := miniredis.RunT(t), miniredis.RunT(t)
+	downAddr := shardB.Addr()
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:              map[string]string{"a": shardA.Addr(), "b": downAddr},
+		DialTimeout:        200 * time.Millisecond,
+		HeartbeatFrequency: time.Millisecond,
+		HeartbeatFn:        func(_ context.Context, client *redis.Client) bool { return client.Options().Addr != downAddr },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+	require.Eventually(t, func() bool { return ring.Len() == 1 }, 3*time.Second, time.Millisecond)
+
+	// The decorator shape the option exists for, with the iterator a consumer is told to declare.
+	r := NewRedis(hookedTestClient{Cmdable: ring}, WithShardFanOut(RingFanOut(ring)))
+	r.Start(ctx)
+	defer r.Stop()
+
+	assert.ErrorIs(t, r.HealthStatus(), ErrIncompleteEnumeration,
+		"a declared fan-out must carry the completeness check too, or the escape hatch is a way back to the fail-open")
+}
+
 // TestIncompleteEnumeration_HonoursFailOpen pins the half that distinguishes this refusal from its
 // latched siblings. ErrNilClient and ErrUnknownTopology override WithFailOpen because a wiring
 // fault never heals; a down shard does, and the next reconcile clears it — so the posture an

@@ -587,8 +587,13 @@ type hostNotificationGate struct {
 	// downgradable whoever asks — which is exactly why it must be the real value: a hardcoded
 	// false would make the notification-framed observe-mode regression pass by construction
 	// instead of by the property it exists to hold.
-	audit  bool
-	errOut io.Writer
+	audit bool
+	// strictAudit is the --require-audit=strict state this leg's transport holds, carried for the
+	// same reason `audit` is: the routing refusal reaches the shared deny path through this gate,
+	// and a zero value here would give the notification framing a different audit posture from the
+	// identical bytes in request framing.
+	strictAudit strictAuditState
+	errOut      io.Writer
 	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
 	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
 	// notification is dropped before revocation is even a question.
@@ -674,7 +679,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	// The denial message the core builds is discarded: JSON-RPC forbids replying to a
 	// notification, and the caller acks. What is not discarded is everything else the shared path
 	// owns — the observe gate, the strict-audit gate and the record shape.
-	refuseUnroutable(ctx, refusalForwardParams(g.rec(), g.subject, g.audit, g.errOut), g.subject, msg, unroutableFramingNotification)
+	refuseUnroutable(ctx, refusalForwardParams(g.rec(), g.subject, g.audit, g.strictAudit, g.errOut), g.subject, msg, unroutableFramingNotification)
 	return notificationRefused
 }
 
