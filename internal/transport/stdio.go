@@ -1281,7 +1281,7 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 // close. Building the unblocker itself allocates nothing, which is what makes it free for the
 // holders that only ever want the tracker.
 func (p *StdioProxy) unblocker() serverRequestUnblocker {
-	return serverRequestUnblocker{reqs: &p.serverReqs, sink: p.upWriter, errOut: p.errOut()}
+	return serverRequestUnblocker{reqs: &p.serverReqs, sink: p.upWriter, errOut: p.errOut(), notices: p.noticeLimiter}
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would have
@@ -1337,7 +1337,16 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 // hang — see trackServerRequest. A request whose id the tracker will not retain never reaches here:
 // admitServerRequestID refuses it at this leg's entry.
 func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) {
-	trackServerRequest(ctx, p.unblocker(), p.refusalRecorders(), verifiedSession(p.sessionID), dropStdioDisplaced, msg)
+	u, recs := p.unblocker(), p.refusalRecorders()
+	// The tracker refuses an id it will not retain, and that refusal must not degrade into a
+	// SILENT untracked forward: the host would answer, the routing arm would drop the answer as
+	// untracked, and the upstream would block with nothing on the tape. Asked here rather than
+	// inferred from track's return, which cannot distinguish "displaced nothing" from "tracked
+	// nothing". Normally the leg's entry gate has already refused it and this admits for free.
+	if !admitServerRequestID(ctx, u, recs, verifiedSession(p.sessionID), dropStdioUnroutableID, msg) {
+		return
+	}
+	trackServerRequest(ctx, u, recs, verifiedSession(p.sessionID), dropStdioDisplaced, msg)
 	_ = p.hostWriter.Write(msg)
 }
 
@@ -1356,8 +1365,6 @@ func (p *StdioProxy) refusalRecorders() refusalRecorders {
 // documented concurrency-safe. Host-initiated traffic's ordering guarantees (ticket
 // reservation, fwdHostWrites) are untouched by this path.
 func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
-	// One unblocker for both the entry gate and the pool's answer, rather than two builds of the
-	// identical value for one request.
 	u := p.unblocker()
 	// Refused at the ENTRY, above the pool and above any decision: a request whose reply could
 	// never be routed back must not consume a handler slot, a policy quota, or the host's attention.

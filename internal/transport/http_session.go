@@ -325,7 +325,7 @@ func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() 
 // disposition resolves at ANSWER time, so the tracker-only holders (every forwarded request) pay
 // nothing for a writer they never call.
 func (s *httpSession) unblocker() serverRequestUnblocker {
-	return serverRequestUnblocker{reqs: &s.serverReqs, sink: s.upWriter, errOut: s.errOut()}
+	return serverRequestUnblocker{reqs: &s.serverReqs, sink: s.upWriter, errOut: s.errOut(), notices: s.proxy.refusalNoticeLimiter()}
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would
@@ -1157,8 +1157,10 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 // session's only response-delivery/SSE-relay goroutine must not stall on it, which matters more
 // under task anchoring, where the turn holder can be a different session sharing the anchor.
 func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
-	// One unblocker for both the entry gate and the pool's answer, rather than two builds of the
-	// identical value for one request.
+	// readUpstream's context never carried the session's claims, so without this the refusals below
+	// — the entry gate's, the pool's saturation record, and a destroyed answer's — drop out of the
+	// per-agent grouping the sampling leg's own refusals appear in, for one transport leg value.
+	ctx = s.withSessionClaims(ctx)
 	u := s.unblocker()
 	// Refused at the ENTRY, above the pool and above any decision — see admitServerRequestID. The
 	// limiter is the proxy's, reached here because this leg has no request in scope to carry one.
@@ -1426,13 +1428,18 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // back by handleMCPPost). Such a request blocks the upstream until answered, so with no
 // subscriber able to receive it, fail closed: untrack the ID and reply an error so the upstream
 // unblocks, rather than let it hang until teardown.
-// The refusal limiter is a PARAMETER rather than reached through s.proxy: this runs on a session,
-// and the proxy that holds the bucket is already in scope at the one site that wires this in.
-func (s *httpSession) broadcastServerRequest(ctx context.Context, limiter *categoryRecordLimiter, msg mcp.RPCMsg) bool {
-	// The unblocker's writer is resolved lazily, so building one here for the TRACKER costs nothing
-	// on the healthy path that never displaces anything and never answers.
-	u := s.unblocker()
-	trackServerRequest(ctx, u, refusalLimits{records: limiter}.recorders(asRecorder(s.route.sink)), verifiedSession(s.id), dropHTTPDisplaced, msg)
+// The refusal limits are a PARAMETER rather than reached through s.proxy: this runs on a session,
+// and the proxy that holds the buckets is already in scope at the one site that wires this in. Both
+// halves travel, never the record bucket alone — a half-built refusalLimits is the wiring fault the
+// type exists to make unrepresentable, and it is the notice half that a leg silently loses.
+func (s *httpSession) broadcastServerRequest(ctx context.Context, limits refusalLimits, msg mcp.RPCMsg) bool {
+	u, recs := s.unblocker(), limits.recorders(asRecorder(s.route.sink))
+	// See forwardServerRequestToHost: an id the tracker will not retain must be REFUSED here, never
+	// delivered untracked to a host whose answer nothing could route back.
+	if !admitServerRequestID(ctx, u, recs, verifiedSession(s.id), dropHTTPUnroutableID, msg) {
+		return false
+	}
+	trackServerRequest(ctx, u, recs, verifiedSession(s.id), dropHTTPDisplaced, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}

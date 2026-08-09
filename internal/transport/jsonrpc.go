@@ -54,12 +54,9 @@ type trackedServerRequest struct {
 // it was kept for nor index the reply it was kept to match, and the key would still hold the full
 // bytes. Matches the audit envelope cap, since the same value is what the drop record names.
 //
-// Enforced BY THE TRACKER, in track, so the bound is a property of the thing retaining the bytes
-// rather than of where its callers happen to sit. It is asked AGAIN, earlier, at each transport's
-// ENTRY to this leg (admitServerRequestID) — and that is where the REFUSAL belongs, since the answer
-// decides whether the request runs at all and a refusal discovered after the decision has already
-// committed a quota slot for a call the host never sees. The entry gate keeps that role; this one
-// keeps the retention argument backed by the type it describes.
+// Enforced by the TRACKER, so the bound belongs to the thing retaining the bytes; the REFUSAL stays
+// at each transport's entry to this leg (admitServerRequestID), above the decision that would
+// otherwise commit a quota slot for a call the host never sees.
 const maxTrackedServerReqIDBytes = 8 << 10
 
 // trackableServerRequestID reports whether id is one the tracker will retain. Asked by
@@ -128,12 +125,9 @@ type serverReqTracker struct {
 // (each caller holds its proxy's or session's writer), never to os.Stderr directly.
 //
 // A message with no id is not tracked at all: its key would be "", which no reply can match and no
-// unblock can address, so the entry could only ever leave the set by displacing a real one. An id
-// LARGER than maxTrackedServerReqIDBytes is refused here for the same reason and one of its own —
-// what an entry holds for its whole lifetime is the exposure the bound exists to cap, so the bound
-// belongs to the thing holding the bytes. Both are unreachable through this leg's one caller, whose
-// entry gate refuses an over-cap id before the request runs at all; refusing here is what keeps
-// that a redundancy rather than the only enforcement.
+// unblock can address, so the entry could only ever leave the set by displacing a real one. An
+// over-cap id is refused here too — the exposure is what an entry HOLDS — and its callers must not
+// forward what this refuses, which is why both forward paths ask admitServerRequestID first.
 //
 // Reached ONLY through trackServerRequest, which disposes of what this returns. Go does not require
 // a return value to be consumed, so a second caller reaching for the obvious-looking method here

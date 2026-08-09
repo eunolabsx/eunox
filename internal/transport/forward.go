@@ -750,17 +750,10 @@ func refusalResponse(id *json.RawMessage, code, conditionType, target, argument 
 	return denialResult(id, code, conditionType, target, argument)
 }
 
-// refusalError is refusalResponse for the core's other two refusal exits, whose host-facing answer
-// is a plain JSON-RPC error rather than a denial envelope: the upstream-transport failure and the
-// fail-closed redaction failure. The rule is stated on refusalResponse; this applies it to the
-// shape those two build.
-//
-// They are unreachable for a no-id message today, but only because the one caller that passes one
-// also removes the upstream (see forwardParams.callUpstream) — two independent facts nothing
-// couples, and the natural next step of folding the smuggled-notification reject into this core
-// would arrive with a live upstream and reach both. The core's sixth host-facing exit, the ALLOW
-// tail, deliberately stays as it is: there a real upstream response exists to relay, and discarding
-// it is the caller's business rather than a refusal to withhold.
+// refusalError applies refusalResponse's rule (stated there) to the core's two plain-JSON-RPC-error
+// refusals. They are unreachable for a no-id message only because the one caller that passes one
+// also removes the upstream — two facts nothing couples. The ALLOW tail is deliberately uncovered:
+// a real response exists to relay there.
 func refusalError(id *json.RawMessage, code int, message string) mcp.RPCMsg {
 	if id == nil {
 		return mcp.RPCMsg{}
@@ -1053,6 +1046,10 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorde
 	// KILL_SWITCH before reaching here. msg.Method is attacker-controlled; sanitize once and reuse
 	// for both the stderr line and the host-facing denial. The structured audit field stays raw
 	// (JSON-encoding already escapes control runes).
+	// Bounded before the scan: sanitizing an unbounded attacker-controlled method is a full UTF-8
+	// walk (and a fresh 4 MiB string when it rewrites anything) per frame, above the gate that bounds
+	// the write it feeds. msg is this function's own copy.
+	msg.Method = audit.BoundEnvelopeField(msg.Method)
 	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
 	identifier, method := auditIdentity(msg)
 	fp.rec = recs.forCategory(catUnroutable)
@@ -1081,23 +1078,11 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorde
 	// pipe or a terminal), spent per frame at the peer's rate. Elided lines are counted into the
 	// next one rather than lost, so an operator watching stderr still sees the rate; the RECORD
 	// above is unbounded by declaration, so nothing a SIEM reads is elided either way.
-	if admitted, suppressed := recs.admitNotice(); admitted {
-		_, _ = fmt.Fprintf(fp.errOutOrStderr(),
-			"[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded%s\n",
-			framing, sanitizedMethod, suppressedNoticeSuffix(suppressed),
-		)
-	}
+	noticef(fp.errOutOrStderr(), recs.notices,
+		"[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded\n",
+		framing, sanitizedMethod,
+	)
 	return resp
-}
-
-// suppressedNoticeSuffix reports how many diagnostic lines were elided since the last one written,
-// or "" when none were — so a bounded notice reads exactly as the unbounded one did in the common
-// case and names the flood when there is one.
-func suppressedNoticeSuffix(suppressed uint64) string {
-	if suppressed == 0 {
-		return ""
-	}
-	return fmt.Sprintf(" (%d further such notices suppressed)", suppressed)
 }
 
 // hasRedactFieldsObligation reports whether obligs carries a redactFields directive with at
@@ -1185,9 +1170,8 @@ type serverRequestParams struct {
 	// rather than nil-called; each transport supplies its unblocker's writer, never a closure over
 	// a concrete one (a nil *mcp.MsgWriter panics on use). See writeToInitiator.
 	writeUpstream func(mcp.RPCMsg) error
-	// refusalLimits (embedded) is this leg's admission control over the record a DESTROYED answer
-	// writes. rec above is the sink for this leg's policy records and is never metered; these bound
-	// only the transport refusal beside them. See refusalAnswer.
+	// refusalLimits (embedded) bounds the record a DESTROYED answer writes; rec above stays the
+	// unmetered sink for this leg's policy records.
 	refusalLimits
 	// leg names this transport's refusal-answering site on that record. Zero on a params struct
 	// built by hand (tests), which records the drop with no leg named rather than not at all.
@@ -1235,8 +1219,7 @@ func (fp serverRequestParams) answerInitiator(ctx context.Context, reply mcp.RPC
 	fp.refusalAnswer().answer(ctx, reply, what, method)
 }
 
-// refusalAnswer is this leg's wiring for answering a refused initiator, shared in shape with the
-// pool's saturation arm so the two cannot report a destroyed answer differently.
+// refusalAnswer is this leg's wiring for answering a refused initiator.
 func (fp serverRequestParams) refusalAnswer() refusalAnswer {
 	return refusalAnswer{
 		write:  fp.writeUpstream,

@@ -247,8 +247,10 @@ func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
 	now = now.Add(time.Second)
 	errOut.Reset()
 	refuse()
-	assert.Contains(t, errOut.String(), "further such notices suppressed",
+	assert.Contains(t, errOut.String(), "further diagnostics suppressed",
 		"an elided notice folds into the next admitted one; losing the count would under-state the flood")
+	assert.NotContains(t, errOut.String(), "such",
+		"one bucket serves every bounded line on the proxy, so the count may not be claimed as a tally of the message it rides on")
 }
 
 // TestRoutingRefusal_NoNoticeBucketWritesEveryLine pins the other side of that bound: nil is the
@@ -692,6 +694,56 @@ func assertRefusalDropRecord(t *testing.T, got fwdCapturedRecord, leg transportL
 		"the record must name the answering site, so a destroyed refusal is distinguishable from an undelivered forward")
 	assert.Empty(t, got.identifier,
 		"sampling/createMessage resolves a policy target, so naming it here would stamp one onto a record no PDP produced")
+}
+
+// TestServerRequestAnswer_DiagnosticIsBoundedAtTheSeam is the other half of the destroyed answer.
+//
+// The record got a bucket; the stderr line beside it did not, on the very leg whose flood the bucket
+// was added for — an upstream that closes its stdin and keeps emitting requests fails every answer,
+// so an unbounded line there is one write syscall per frame at the upstream's rate. It is bounded at
+// writeToInitiator rather than at any one caller, because that is the seam all nine answering sites
+// funnel through and a bound on one caller is a bound the next site added does not inherit.
+func TestServerRequestAnswer_DiagnosticIsBoundedAtTheSeam(t *testing.T) {
+	t.Parallel()
+	var errOut strings.Builder
+	broken := func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") }
+	u := serverRequestUnblocker{
+		reqs: &serverReqTracker{}, sink: sinkFunc(broken), errOut: &errOut,
+		notices: newRefusalNoticeLimiter(),
+	}
+	for range 200 {
+		u.write(mcp.RPCMsg{}, "test probe")
+	}
+	lines := strings.Count(errOut.String(), "\n")
+	assert.LessOrEqual(t, lines, refusalNoticeBurst,
+		"a dead upstream sink fails every answer; unbounded, that is one write syscall per frame at the peer's rate")
+	assert.Positive(t, lines, "a bucket that never admits is not bounding the diagnostic, it is silencing it")
+}
+
+// TestServerRequestForward_UntrackableIDIsRefusedNotForwarded is the fail-closed half of the
+// tracker's own bound.
+//
+// track refuses an over-cap id, but its refusal shares the `false` that means "displaced nothing",
+// so trackServerRequest could not tell them apart and both forward paths delivered to the host
+// anyway — the host answers, both routing arms drop that answer as untracked, and the upstream
+// blocks with nothing on the tape. Strictly worse than the retention the bound exists to prevent.
+func TestServerRequestForward_UntrackableIDIsRefusedNotForwarded(t *testing.T) {
+	t.Parallel()
+	over := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: &over, Method: "roots/list"}
+
+	var delivered int
+	sess := newTestSession(&httpSession{
+		id: "s", route: &UpstreamRoute{name: "up1"}, proxy: newTestHTTPProxy(), done: make(chan struct{}),
+	})
+	sub := make(chan mcp.RPCMsg, 1)
+	require.True(t, sess.addSub(sub))
+	ok := sess.broadcastServerRequest(context.Background(), refusalLimits{}, msg)
+	delivered = len(sub)
+
+	assert.False(t, ok, "a request whose reply could never be routed must not be reported as delivered")
+	assert.Zero(t, delivered, "and must not reach the host at all: its answer would be dropped as untracked")
+	assert.False(t, sess.serverReqs.tracked(mcp.MsgKey(&over)))
 }
 
 // TestServerRequestRefusal_DestroyedAnswerRecordIsMetered bounds a record the UPSTREAM drives: an

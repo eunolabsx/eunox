@@ -293,7 +293,7 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		// forwardServerRequest does the stamping; this supplies the fact.
 		revision: sess.hostRev,
 		forward: func(ctx context.Context, m mcp.RPCMsg) bool {
-			return sess.broadcastServerRequest(ctx, p.preSessionDenies, m)
+			return sess.broadcastServerRequest(ctx, p.refusalLimits(), m)
 		},
 		// Through the seam, not a bare closure over the concrete writer: remote-upstream mode
 		// leaves upWriter nil, and every denial arm below answers the initiator AFTER its audit

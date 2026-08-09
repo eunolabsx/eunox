@@ -22,7 +22,10 @@
 package transport
 
 import (
+	"fmt"
+	"io"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -125,14 +128,10 @@ const (
 	// one, so an upstream issuing them faster than the host answers turns an unbounded audit-write
 	// rate loose for as long as it likes.
 	catDisplaced refusalCategory = "displaced_server_request"
-	// catRefusalUndeliverable bounds the record for a server-initiated request eunox REFUSED whose
-	// answer never reached the initiator (see refusalAnswer). Its own bucket rather than
-	// catServerRequestFailed's, for the reason catUnroutableID has one: the two are not equally
-	// cheap to reach. That record needs a TRACKED request and a host that stopped reading, while
-	// this one needs neither — an upstream that closes its stdin and keeps emitting requests on
-	// stdout drives one per request, refused and undeliverable at its own send rate — so sharing a
-	// bucket would let the cheaper flood suppress the record that says a live in-flight request was
-	// lost.
+	// catRefusalUndeliverable bounds the record for a REFUSED server-initiated request whose answer
+	// never reached its initiator (see refusalAnswer). Its own bucket for the reason catUnroutableID
+	// has one: this needs neither tracking nor a host — an upstream with a broken stdin drives one
+	// per request — so a shared bucket would let it suppress the record that a LIVE request was lost.
 	catRefusalUndeliverable refusalCategory = "undeliverable_server_refusal"
 )
 
@@ -320,8 +319,7 @@ type refusalLimits struct {
 	notices *recordRateLimiter
 }
 
-// recorders pairs these limits with the leg's audit sink, producing the wiring a refusal resolves
-// its recorder from. rec may be nil (the leg has no tape).
+// recorders pairs these limits with the leg's audit sink; rec may be nil (the leg has no tape).
 func (l refusalLimits) recorders(rec auditRecorder) refusalRecorders {
 	return refusalRecorders{rec: rec, refusalLimits: l}
 }
@@ -357,8 +355,8 @@ type refusalRecorders struct {
 // The map probe is per refusal record and deliberately kept: the disposition is read from the
 // declaration at resolution time rather than pre-resolved into a per-leg table, because a second
 // table is a second copy of the answer, and this runs only where a refusal is already writing to
-// the tape. Measured at tens of nanoseconds and no allocation
-// (BenchmarkRefusalRecorders_ForCategory), against a record's serialize-sign-write.
+// the tape. Tens of nanoseconds against a record's serialize-sign-write — ~29ns for an exempt
+// category (the probe alone) and ~58ns for an admitted metered one (BenchmarkRefusalRecorders_ForCategory).
 func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
 	if r.rec == nil || r.records == nil || refusalDeclarations[category].metering == meteringExempt {
 		return r.rec
@@ -366,18 +364,38 @@ func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
 	return admitRefusalRecord(r.rec, r.records, category)
 }
 
-// admitNotice reports whether this leg may write a refusal's stderr diagnostic now, and how many
-// were elided since the last admitted one — folded into that one's own text, so a bounded notice
-// never under-states the rate.
+// noticef writes one bounded diagnostic line, folding whatever the bucket elided since the last
+// admitted line into this one's own text.
 //
-// A leg with no notice bucket writes every line. That is the unbounded behaviour in production and
-// what a test proxy gets; the guard that keeps a real transport from resolving here is that both
-// build one at construction.
-func (r refusalRecorders) admitNotice() (ok bool, suppressed uint64) {
-	if r.notices == nil {
+// The rollup is applied HERE rather than returned for a caller to append, for the reason
+// admitRefusalRecord hides its own: a site that spends a token and forgets the count silently
+// under-states a flood, and nothing fails. A nil limiter writes every line — the unbounded
+// disposition a bare-struct-literal proxy in a test gets.
+//
+// "further diagnostics", not "further such notices": one bucket serves every bounded line on the
+// proxy, so the count is not a tally of the message it rides on. Which lines it spans is
+// deliberately not claimed by the text — see refusalNoticeRatePerSec for the scope, and the
+// per-line detail stays on the tape, which is the channel that keeps it.
+func noticef(w io.Writer, l *recordRateLimiter, format string, args ...interface{}) {
+	admitted, suppressed := admitNotice(l)
+	if !admitted {
+		return
+	}
+	if suppressed > 0 {
+		format = strings.TrimSuffix(format, "\n") + " (%d further diagnostics suppressed)\n"
+		args = append(args, suppressed)
+	}
+	_, _ = fmt.Fprintf(w, format, args...)
+}
+
+// admitNotice reports whether a diagnostic bounded by l may be written now, and how many were
+// elided since the last admitted one. Callers go through noticef; this is separate only for the one
+// site that must decide BEFORE building its arguments.
+func admitNotice(l *recordRateLimiter) (ok bool, suppressed uint64) {
+	if l == nil {
 		return true, 0
 	}
-	return r.notices.admit()
+	return l.admit()
 }
 
 // unmeteredRecorders is the wiring for a leg that meters no RECORD it can write, but still bounds

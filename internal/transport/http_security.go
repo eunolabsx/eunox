@@ -430,9 +430,12 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // catKill token anyway — emptying, during an emergency stop, the very bucket that bounds the
 // records an incident responder reads first.
 //
-// A nil limiter beside a live sink is a construction bug and panics inside admitRefusalRecord like
-// one, exactly as in recordRefusal: a "defensive" fallback here would write kill records with no
-// bound at all, which is the fail-open this wiring exists to close.
+// A nil limiter beside a live sink would write kill records with no bound at all — the fail-open
+// this wiring exists to close — but nothing here ENFORCES that: forCategory returns the plain sink
+// for a nil bucket, and this now resolves through an accessor that is deliberately nil-tolerant for
+// a bare-struct-literal proxy. What keeps it true is that every production constructor builds the
+// bucket; the earlier claim that it "panics inside admitRefusalRecord like one" was never reachable,
+// since forCategory returns before that call.
 func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
 	return p.refusalLimits().recorders(asRecorder(route.sink))
 }
