@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -162,7 +163,7 @@ func TestParameterizedDiagnostics_HonorTheCallersWriter(t *testing.T) {
 		var out syncBuffer
 		var tr serverReqTracker
 		for i := 0; i <= maxTrackedServerReqs; i++ {
-			tr.track(fmt.Sprintf("req-%d", i), &out)
+			tr.track(mcp.RPCMsg{ID: mcp.RawJSON(fmt.Sprintf("%d", i)), Method: "roots/list"}, &out)
 		}
 		assert.Contains(t, out.String(), "server-initiated request tracker reached its")
 	})

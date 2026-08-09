@@ -15,59 +15,109 @@ import (
 )
 
 // maxTrackedServerReqs bounds outstanding server-initiated request IDs so a host that never
-// answers can't grow the set unbounded; past the cap an arbitrary tracked ID is evicted
-// (its call may re-hang until teardown), which is a safer failure than unbounded growth.
+// answers can't grow the set unbounded; past the cap an arbitrary tracked request is evicted,
+// which is a safer failure than unbounded growth. The evicted initiator is answered by the
+// caller rather than abandoned — see trackServerRequest.
 const maxTrackedServerReqs = 1024
 
-// trackServerReqID adds key to ids (allocating on first use), keeping the set bounded, and
-// returns the map plus whether a tracked ID had to be evicted. Caller holds the set's mutex.
-func trackServerReqID(ids map[string]struct{}, key string) (map[string]struct{}, bool) {
-	if ids == nil {
-		ids = make(map[string]struct{})
-	}
-	evicted := false
-	if _, exists := ids[key]; !exists && len(ids) >= maxTrackedServerReqs {
-		for k := range ids {
-			delete(ids, k)
-			evicted = true
-			break
-		}
-	}
-	ids[key] = struct{}{}
-	return ids, evicted
+// trackedServerRequest is what the tracker remembers about one outstanding server-initiated
+// request: enough to ANSWER its initiator, not merely to recognize a reply to it.
+//
+// The id is kept verbatim because an answer must be stamped with the bytes the peer sent (MsgKey
+// canonicalizes by value and type, so it is not reversible), and the method because an evicted
+// request is reported on the tape, where a record naming none names nothing an operator can
+// correlate on.
+type trackedServerRequest struct {
+	id     *json.RawMessage
+	method string
+	// seq orders entries by when they were tracked, so an eviction can take the one that has
+	// waited longest rather than whichever the map's randomized range yields first.
+	seq uint64
 }
 
-// serverReqTracker records the JSON-RPC IDs of in-flight server-initiated
-// requests (e.g. sampling/createMessage, roots/list) forwarded to the host, so
-// the host's response (same ID) can be routed back to the upstream — and only
-// that response; an untracked ID is ignored. Bounded (see trackServerReqID) and
-// safe for concurrent use. Both transports hold one.
+// trackServerReqID adds req to ids (allocating on first use), keeping the set bounded, and returns
+// the map plus whatever req DISPLACED — an entry evicted to make room, or one this key overwrote.
+// Caller holds the set's mutex.
+//
+// Both are the same event to the caller: an outstanding request has left the set without a host
+// reply, so nothing can ever route one to it and its initiator has to be answered here or never.
+// The overwrite is the easier one to miss — mcp.MsgKey canonicalizes by VALUE, so an upstream
+// issuing ids `1` and `1.0` collides two distinct wire requests onto one entry — and it was
+// invisible while the map's value was a struct{}: there was nothing to lose.
+func trackServerReqID(ids map[string]trackedServerRequest, key string, req trackedServerRequest) (map[string]trackedServerRequest, trackedServerRequest, bool) {
+	if ids == nil {
+		ids = make(map[string]trackedServerRequest)
+	}
+	if displaced, exists := ids[key]; exists {
+		ids[key] = req
+		return ids, displaced, true
+	}
+	var displaced trackedServerRequest
+	found := false
+	if len(ids) >= maxTrackedServerReqs {
+		// The victim is the one that has waited LONGEST. Arbitrary choice was tolerable when an
+		// eviction merely left a request to hang; it is not once eviction actively answers the
+		// initiator, since a random pick is as likely to abort a request the host is about to
+		// answer correctly as one that is genuinely stuck.
+		oldestKey, oldest := "", trackedServerRequest{}
+		for k, v := range ids {
+			if oldestKey == "" || v.seq < oldest.seq {
+				oldestKey, oldest = k, v
+			}
+		}
+		delete(ids, oldestKey)
+		displaced, found = oldest, true
+	}
+	ids[key] = req
+	return ids, displaced, found
+}
+
+// serverReqTracker records the in-flight server-initiated requests (e.g.
+// sampling/createMessage, roots/list) forwarded to the host, so the host's response (same ID)
+// can be routed back to the upstream — and only that response; an untracked ID is ignored.
+// Bounded (see trackServerReqID) and safe for concurrent use. Both transports hold one.
 type serverReqTracker struct {
 	mu  sync.Mutex
-	ids map[string]struct{}
-	// evictions tallies every eviction; only the first is logged, so a sustained flood
+	ids map[string]trackedServerRequest
+	// nextSeq stamps each tracked entry's arrival order, for the oldest-first eviction.
+	nextSeq uint64
+	// evictions tallies every displacement; only the first is logged, so a sustained flood
 	// doesn't spam stderr. Guarded by mu.
 	evictions uint64
 }
 
-// track records key as an outstanding server-initiated request ID, evicting an arbitrary
-// tracked one if the bounded set is full. Only the first eviction is logged, to errOut (each
-// caller holds its proxy's or session's writer), never to os.Stderr directly.
-func (t *serverReqTracker) track(key string, errOut io.Writer) {
+// track records msg as an outstanding server-initiated request and RETURNS whatever it displaced —
+// the oldest entry if the bounded set was full, or one this id overwrote — so the caller can
+// answer that initiator: once the entry is gone even a correct host reply can no longer be routed
+// to it, and nothing else could ever answer it. Only the first displacement is logged, to errOut
+// (each caller holds its proxy's or session's writer), never to os.Stderr directly.
+//
+// A message with no id is not tracked at all: its key would be "", which no reply can match and no
+// unblock can address, so the entry could only ever leave the set by displacing a real one.
+func (t *serverReqTracker) track(msg mcp.RPCMsg, errOut io.Writer) (trackedServerRequest, bool) {
+	if msg.ID == nil {
+		return trackedServerRequest{}, false
+	}
+	key := mcp.MsgKey(msg.ID)
 	t.mu.Lock()
-	var evicted bool
-	t.ids, evicted = trackServerReqID(t.ids, key)
+	var (
+		displaced trackedServerRequest
+		found     bool
+	)
+	t.nextSeq++
+	t.ids, displaced, found = trackServerReqID(t.ids, key, trackedServerRequest{id: msg.ID, method: msg.Method, seq: t.nextSeq})
 	warn := false
-	if evicted {
+	if found {
 		t.evictions++
 		warn = t.evictions == 1
 	}
 	t.mu.Unlock()
 	if warn {
 		_, _ = fmt.Fprintf(resolvedErrOut(errOut),
-			"[eunox] WARNING: server-initiated request tracker reached its %d-entry cap; evicting an in-flight request ID to make room (the evicted request may hang until session teardown). Further evictions are counted but not individually logged.\n",
+			"[eunox] WARNING: server-initiated request tracker reached its %d-entry cap; the longest-waiting in-flight request is displaced to make room (its initiator is answered with an error, since nothing could route a reply to it afterwards). Further displacements are counted but not individually logged.\n",
 			maxTrackedServerReqs)
 	}
+	return displaced, found
 }
 
 // take reports whether key was a tracked server-initiated request ID, removing
@@ -78,6 +128,17 @@ func (t *serverReqTracker) take(key string) bool {
 	if ok {
 		delete(t.ids, key)
 	}
+	t.mu.Unlock()
+	return ok
+}
+
+// tracked reports whether key is an outstanding server-initiated request WITHOUT consuming it.
+// The peek exists for the one disposition that must not consume: a site with no upstream writer
+// to answer through, which reports the abandoned request rather than dropping it silently but
+// must leave the id routable by whatever path still can. See serverRequestUnblocker.unblock.
+func (t *serverReqTracker) tracked(key string) bool {
+	t.mu.Lock()
+	_, ok := t.ids[key]
 	t.mu.Unlock()
 	return ok
 }

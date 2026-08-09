@@ -21,7 +21,10 @@ package redisutil
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
+	"sync/atomic"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -29,7 +32,23 @@ import (
 // ShardFanOut visits every server a sharding client spreads its keyspace over, running fn
 // against each. It is what a KEYLESS command (SCAN) needs there: routed to one server it
 // enumerates one shard of several and reports success.
+//
+// EVERY server, not merely every reachable one: an iterator that quietly covers less than the
+// whole keyspace hands its caller a partial result indistinguishable from a complete one, which
+// for the kill switch is a partial kill set served as complete. An iterator that cannot cover
+// them all returns ErrIncompleteFanOut rather than nil.
 type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *redis.Client) error) error
+
+// ErrIncompleteFanOut reports an enumeration that covered FEWER servers than the client spreads
+// its keyspace over, so its result is a partial view rather than the whole one.
+//
+// It exists because go-redis' Ring iterator does not say so itself: (*redis.Ring).ForEachShard
+// skips a shard its heartbeat has voted down and returns nil, where (*ClusterClient).ForEachMaster
+// propagates both the state reload and the per-node error. A caller reading a keyless SCAN through
+// the silent version loads the surviving shards' keys, commits them as authoritative, and reports
+// healthy — the same fail-open TopologyUnknown exists to refuse, one layer down and reached after
+// the topology was correctly established.
+var ErrIncompleteFanOut = errors.New("redisutil: shard enumeration covered fewer servers than the client is configured with, so its result is a PARTIAL view of the keyspace")
 
 // Topology is what this package could establish about how a client spreads its keyspace.
 //
@@ -96,11 +115,90 @@ func ClassifyTopology(client redis.Cmdable) (Topology, ShardFanOut) {
 	case *redis.ClusterClient:
 		// Masters only: a replica holds the same keys, so scanning them would double the work
 		// and, mid-failover, disagree with its master about what is there.
+		//
+		// Handed over unwrapped because it already reports an incomplete pass: it fails on the
+		// state reload and propagates the first per-node error, so a master it could not visit is
+		// an error rather than a shorter loop.
 		return TopologySharded, c.ForEachMaster
 	case *redis.Ring:
-		return TopologySharded, c.ForEachShard
+		return TopologySharded, WholeRingFanOut(c)
 	}
 	return TopologyUnknown, nil
+}
+
+// WholeRingFanOut is (*redis.Ring).ForEachShard with the completeness ShardFanOut promises and
+// go-redis does not: the library's iterator `continue`s past a shard its heartbeat has voted down
+// and returns nil, so a keyless SCAN through the bare version enumerates the survivors and reports
+// success. Every consumer of a fan-out is running a command it needs the WHOLE keyspace for, so a
+// short pass is an error here rather than a caveat each of them re-derives.
+//
+// Exported because ClassifyTopology is not the only way a ring reaches a backend: a consumer whose
+// ring sits behind a decorator can only DECLARE an iterator, and the one they have to hand is the
+// unchecked ForEachShard — so without this the escape hatch reintroduces exactly the fail-open the
+// check exists to close. See pkg/killswitch's RingFanOut.
+//
+// How many servers a pass SHOULD have covered is deliberately not Ring.Len() ALONE, which counts
+// the LIVE shards — the same set ForEachShard visits, so comparing a pass against it would be a
+// tautology that agrees with itself while a shard is down. It is the ring's CONFIGURED count,
+// widened by the widest the ring has ever been observed to be, because (*Ring).SetAddrs reshapes a
+// ring WITHOUT writing back to the options: on a ring GROWN at runtime the configured count
+// under-counts, and under-counting is the fail-OPEN direction. The high-water mark makes the bound
+// monotone — once the ring has been seen at a size, a later pass covering less is short whatever
+// the options say.
+//
+// Two residuals, both stated rather than papered over:
+//
+//   - A deliberate SHRINK reads as short and is refused. That is the fail-closed direction and it
+//     is loud; a consumer who shrinks a ring at runtime is the one who can say what its shards are.
+//   - A ring GROWN while a shard is already down is not caught. go-redis rebalances a voted-down
+//     shard out of both Len() and the iterator and keeps no memory that it existed, and the
+//     configured count is stale by then — so no exported signal distinguishes "grown to 4 with one
+//     dead" from "grown to 3". What IS caught is the failure this exists for: a shard that goes
+//     down while the ring is in service, at any size the wrapper has already seen.
+func WholeRingFanOut(ring *redis.Ring) ShardFanOut {
+	// highWater is the widest this ring has been observed. Atomic because nothing serializes two
+	// passes: the kill switch's reconcile holds its own mutex, but a Reset enumerating for
+	// deletion does not take it.
+	var highWater atomic.Int64
+	return func(ctx context.Context, fn func(ctx context.Context, node *redis.Client) error) error {
+		// Sampled BEFORE the pass as well as after: a shard voted down between this read and the
+		// enumeration is exactly a short pass, and reading the live count only afterwards would
+		// take the narrowed ring's word for how wide it was supposed to be.
+		raiseHighWater(&highWater, int64(ring.Len()))
+		// Atomic because ForEachShard runs fn on one goroutine PER SHARD.
+		var visited atomic.Int64
+		err := ring.ForEachShard(ctx, func(ctx context.Context, node *redis.Client) error {
+			visited.Add(1)
+			return fn(ctx, node)
+		})
+		if err != nil {
+			return err
+		}
+		got := int(visited.Load())
+		want := max(len(ring.Options().Addrs), int(highWater.Load()))
+		switch {
+		case got == 0:
+			// A pass over NO servers is the degenerate total case of a partial view, and `got <
+			// want` accepts it whenever want is 0 too — a ring configured with no addresses
+			// classifies as sharded and would enumerate nothing, forever, reporting success.
+			return fmt.Errorf("%w: the ring enumerated no servers at all (it has no shards configured, or every shard is down)", ErrIncompleteFanOut)
+		case got < want:
+			return fmt.Errorf("%w: visited %d of the ring's %d shards (go-redis skips a shard it has voted down and reports no error)", ErrIncompleteFanOut, got, want)
+		}
+		raiseHighWater(&highWater, int64(got))
+		return nil
+	}
+}
+
+// raiseHighWater raises mark to n if n is larger, leaving it alone otherwise. A CAS loop rather
+// than a Store: two concurrent passes must not let the narrower one lower the bound.
+func raiseHighWater(mark *atomic.Int64, n int64) {
+	for {
+		cur := mark.Load()
+		if n <= cur || mark.CompareAndSwap(cur, n) {
+			return
+		}
+	}
 }
 
 // IsNilClient reports whether client IS nil — the interface itself, or a typed nil value inside

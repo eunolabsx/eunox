@@ -585,6 +585,116 @@ func TestScanPrefix_VisitsEveryShard(t *testing.T) {
 		"a keyless SCAN reached %v, not both shards; the kill set loaded from one server of several would report healthy while missing every kill on the others", found)
 }
 
+// TestIncompleteEnumeration_IsReportedRatherThanCommittedAsTheWholeKillSet is the regression for
+// the gap one layer below TestUnknownTopology: the topology was established CORRECTLY (a *redis.Ring
+// shards, and it has the iterator), and the enumeration still covered less than all of it, because
+// go-redis skips a shard its heartbeat has voted down and returns no error.
+//
+// The outcome without the check is the one the Manager contract forbids: the surviving shard's keys
+// commit as the authoritative kill set, lastRefreshErr stays nil, HealthStatus reports ready, and
+// ShouldBlock answers "not killed" for every session whose key lived on the missing shard — an
+// operator issues a kill, gets ok, and this instance never learns of it.
+//
+// Unlike the wiring faults it fails closed as a REFRESH error rather than a latched one: a down
+// shard heals, so WithFailOpen governs it like any other outage.
+func TestIncompleteEnumeration_IsReportedRatherThanCommittedAsTheWholeKillSet(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	shardA, shardB := miniredis.RunT(t), miniredis.RunT(t)
+	// The kill lives on the shard that goes down, which is exactly the session a partial scan
+	// would answer "not killed" for.
+	require.NoError(t, shardB.Set(redisSessionPfx+"sess-b", "1"))
+	downAddr := shardB.Addr()
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:              map[string]string{"a": shardA.Addr(), "b": downAddr},
+		DialTimeout:        200 * time.Millisecond,
+		HeartbeatFrequency: time.Millisecond,
+		// Injected rather than driven by closing the server: what is under test is the disposition
+		// of a skipped shard, not go-redis' liveness detection.
+		HeartbeatFn: func(_ context.Context, client *redis.Client) bool { return client.Options().Addr != downAddr },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+	require.Eventually(t, func() bool { return ring.Len() == 1 }, 3*time.Second, time.Millisecond,
+		"go-redis never voted the shard down, so the silent skip this test is about never happens")
+
+	r := NewRedis(ring)
+	r.Start(ctx)
+	defer r.Stop()
+
+	require.ErrorIs(t, r.HealthStatus(), ErrIncompleteEnumeration,
+		"a scan that reached one shard of two must report the cause; reporting ready is the fail-open a partial kill set is served through")
+	blocked, err := r.ShouldBlock(ctx, "", "sess-b")
+	assert.False(t, blocked)
+	assert.ErrorIs(t, err, ErrBackendUnreachable,
+		"fail-closed must deny on an unconfirmable kill set rather than answer not-killed for a session whose kill lived on the shard the scan skipped")
+}
+
+// TestRingFanOut_IsReachableThroughTheDeclaringOption closes the hole the escape hatch opened.
+//
+// WithShardFanOut exists for the decorator case — a ring behind a metrics or tracing wrapper,
+// which ClassifyTopology cannot place — and a consumer there cannot "pass the ring itself". The
+// only iterator they have to hand is go-redis' own, which is precisely the one that skips a
+// down shard and reports success, so declaring it would put the backend straight back to serving a
+// partial kill set as complete, reached through the option added to make the refusal tolerable.
+// RingFanOut is the checked iterator they declare instead.
+func TestRingFanOut_IsReachableThroughTheDeclaringOption(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	shardA, shardB := miniredis.RunT(t), miniredis.RunT(t)
+	downAddr := shardB.Addr()
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:              map[string]string{"a": shardA.Addr(), "b": downAddr},
+		DialTimeout:        200 * time.Millisecond,
+		HeartbeatFrequency: time.Millisecond,
+		HeartbeatFn:        func(_ context.Context, client *redis.Client) bool { return client.Options().Addr != downAddr },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+	require.Eventually(t, func() bool { return ring.Len() == 1 }, 3*time.Second, time.Millisecond)
+
+	// The decorator shape the option exists for, with the iterator a consumer is told to declare.
+	r := NewRedis(hookedTestClient{Cmdable: ring}, WithShardFanOut(RingFanOut(ring)))
+	r.Start(ctx)
+	defer r.Stop()
+
+	assert.ErrorIs(t, r.HealthStatus(), ErrIncompleteEnumeration,
+		"a declared fan-out must carry the completeness check too, or the escape hatch is a way back to the fail-open")
+}
+
+// TestIncompleteEnumeration_HonoursFailOpen pins the half that distinguishes this refusal from its
+// latched siblings. ErrNilClient and ErrUnknownTopology override WithFailOpen because a wiring
+// fault never heals; a down shard does, and the next reconcile clears it — so the posture an
+// operator chose for "Redis is unreachable" governs "part of Redis is unreachable" too.
+func TestIncompleteEnumeration_HonoursFailOpen(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	shardA, shardB := miniredis.RunT(t), miniredis.RunT(t)
+	downAddr := shardB.Addr()
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:              map[string]string{"a": shardA.Addr(), "b": downAddr},
+		DialTimeout:        200 * time.Millisecond,
+		HeartbeatFrequency: time.Millisecond,
+		HeartbeatFn:        func(_ context.Context, client *redis.Client) bool { return client.Options().Addr != downAddr },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+	require.Eventually(t, func() bool { return ring.Len() == 1 }, 3*time.Second, time.Millisecond)
+
+	r := NewRedis(ring, WithFailOpen(true))
+	r.Start(ctx)
+	defer r.Stop()
+
+	blocked, err := r.ShouldBlock(ctx, "", "sess-b")
+	assert.False(t, blocked)
+	assert.NoError(t, err, "fail-open trades revocation for availability during a transient outage, and a shard that is down is one")
+	assert.ErrorIs(t, r.HealthStatus(), ErrIncompleteEnumeration,
+		"the operator's channel reports the cause whichever posture the data plane takes")
+}
+
 // TestNilClient_EveryEntryPointFailsClosedRatherThanPanicking drives the REAL lifecycle, which
 // is the whole point: go-redis dereferences the receiver before it can build a reply, so every
 // command on a nil client panics rather than erroring — and the first two to run are Start's

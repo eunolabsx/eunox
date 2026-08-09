@@ -2466,7 +2466,7 @@ func TestHTTPSamplingRoundTrip_HostResponseRoutedToUpstream(t *testing.T) {
 	sess.addSub(ch)
 
 	// Upstream initiated a request with ID 5 that was broadcast to the host.
-	sess.broadcastServerRequest(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
+	sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
 
 	// Host POSTs its response (same ID) back to /mcp.
 	body := `{"jsonrpc":"2.0","id":5,"result":{"role":"assistant","content":{"type":"text","text":"hi"}}}`
@@ -2553,7 +2553,7 @@ func TestHTTPBroadcastServerRequest_NoSubscriberFailsClosed(t *testing.T) {
 		upWriter: mcp.NewMsgWriter(&up),
 	})
 
-	delivered := sess.broadcastServerRequest(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
+	delivered := sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
 	if delivered {
 		t.Fatalf("broadcastServerRequest reported delivered with no subscriber")
 	}
@@ -2633,7 +2633,7 @@ func TestHTTPHandleSessionPost_KilledServerResponseRecordsDeny(t *testing.T) {
 		upWriter: mcp.NewMsgWriter(&up),
 	})
 	// A tracked server-initiated request ID (as if one had been broadcast to the host).
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard)
+	sess.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"}, io.Discard)
 	proxy.mu.Lock()
 	proxy.sessions[sess.id] = sess
 	proxy.mu.Unlock()
@@ -2774,7 +2774,7 @@ func TestHTTPRemoveSubAndDrain_RepliesErrorForBufferedServerRequest(t *testing.T
 	// The upstream broadcasts a server-initiated request; deliverToOne buffers it in
 	// ch and the ID is tracked. The SSE loop never reads it (simulating a client that
 	// disconnected with the request still buffered).
-	if !sess.broadcastServerRequest(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}) {
+	if !sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}) {
 		t.Fatalf("broadcastServerRequest reported not delivered; want delivered to the buffered sub")
 	}
 
@@ -2818,7 +2818,7 @@ func TestHTTPFailServerRequestDelivery_RepliesErrorUpstream(t *testing.T) {
 	})
 	// Track the server-initiated request ID as broadcastServerRequest would, then
 	// simulate the SSE write loop failing to deliver it.
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`9`)), io.Discard)
+	sess.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}, io.Discard)
 	sess.failServerRequestDelivery(
 		context.Background(),
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"},
@@ -2862,7 +2862,7 @@ func TestHTTPFailServerRequestDelivery_WritesCorrectionRecord(t *testing.T) {
 		done:     make(chan struct{}),
 		upWriter: mcp.NewMsgWriter(&up),
 	})
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`9`)), io.Discard)
+	sess.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}, io.Discard)
 	sess.failServerRequestDelivery(
 		context.Background(),
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"},
@@ -2898,7 +2898,7 @@ func TestHTTPHandleMCPPost_RemoteModeServerResponseWarnsAndUntracks(t *testing.T
 		// upWriter intentionally nil: remote-upstream mode has no subprocess pipe.
 	})
 	// Simulate a tracked server-initiated request ID (as if one had been forwarded).
-	sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`42`)), io.Discard)
+	sess.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`42`), Method: "sampling/createMessage"}, io.Discard)
 	proxy.mu.Lock()
 	proxy.sessions[sess.id] = sess
 	proxy.mu.Unlock()
@@ -2929,7 +2929,9 @@ func TestHTTPHandleMCPPost_RemoteModeServerResponseWarnsAndUntracks(t *testing.T
 	if sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`42`))) {
 		t.Errorf("id 42 still tracked after a remote-mode drop; want untracked")
 	}
-	if logged := logbuf.String(); !strings.Contains(logged, "no upstream writer in remote-upstream mode") {
+	// The ONE nil-writer wording every site on this leg shares: "reported rather than dropped" is
+	// the rule for both transports and every drop site, not one wording per caller.
+	if logged := logbuf.String(); !strings.Contains(logged, "no upstream writer to answer it") {
 		t.Errorf("expected a stderr warning about the dropped remote-mode response; got %q", logged)
 	}
 }
@@ -4038,7 +4040,7 @@ func TestHTTPHandleGet_WriteErrorUnblocksInflightServerRequest(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if !sess.broadcastServerRequest(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}) {
+	if !sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}) {
 		t.Fatal("broadcastServerRequest reported not delivered; want delivered to the open stream")
 	}
 

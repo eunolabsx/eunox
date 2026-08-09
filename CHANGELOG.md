@@ -306,6 +306,44 @@ Section conventions:
 
 ### Changed
 
+- **The fail-closed routing refusal goes through the shared deny path, so its fault class is
+  load-bearing rather than decorative.** `UNROUTABLE_METHOD` was given a FAULT class so
+  `DenialInfo.Downgradable()` answers false for it wherever it is asked — but nothing asked:
+  the two hand-rolled producers (`dispatchUnmapped` and the notification gate's unmapped arm)
+  minted their own `RecordDeny`, their own stderr line and their own denial result, and never
+  reached the observe gate at all. Both framings now run through `enforcedForwardCore` like
+  every other refusal in the tree, which collapses the pair and removes the last refusal with a
+  bespoke record. The notification gate carries its leg's real audit posture rather than a
+  constant, so the notification-framed observe-mode regression holds by the code's class instead
+  of by construction, and the refusal's upstream sink is SUBSTITUTED with one that refuses —
+  "never forwarded" is structural now, not a consequence of a classification a later edit could
+  change. No behavior change: the record shape, the marker, the identifier rule and the
+  host-facing denial are the same.
+- **Which refusals are metered is a declaration, not prose.** Every refusal category now
+  declares `metered` or `deliberately exempt, because <reason>` in one table, `refusalCategories`
+  (the bucket table and the divisor for every category's share of the aggregate budget) is
+  derived from it, and a table test walks the recorder call sites — so a category with no
+  answer, an exemption with no reason, a declaration nothing reaches, or a limiter contradicting
+  its own declaration fails the build. The survey behind the old prose was incomplete: the
+  routing refusal's exemption was argued in a comment while the enforced-method-as-notification
+  reject beside it, equally cheap and on the same goroutine, had no recorded judgment either way.
+  It is now declared exempt for the same stated reason, and the displaced-server-request record is
+  declared METERED — the one category an UPSTREAM rather than a host peer can drive. The stdio
+  transport also builds buckets only for the categories it charges rather than retaining the full
+  table — on a proxy that may have no audit sink at all — with the per-bucket share still computed
+  from the whole declared set, so charging fewer categories does not buy a larger budget. The
+  aggregate budget is derived from the metered set rather than mirrored in a hand-typed count that
+  moved for two different reasons and was reconciled by a test naming only one of them.
+- **One seam owns "untrack the server request and answer the blocked upstream".** The sequence
+  existed at four sites with three different dispositions for the identical nil-upstream-writer
+  condition — two skipped silently, two printed a warning — so "reported rather than dropped"
+  was the rule on one transport and not the other. It is now one helper both transports build,
+  with one nil-writer disposition: reported, and the entry reclaimed — leaving it was the tempting
+  reading ("some later path might route it"), but no host reply to a request that was never
+  delivered ever arrives, so the entry would hold one of the bounded set's slots for the session's
+  life and eventually displace a live request. A fix to this leg is one call each rather than
+  four, and the stdio host-reply relay is on the seam too — it was the fifth copy, and leaving it
+  bare kept the very asymmetry the consolidation removes.
 - **The fail-closed routing refusal has its own denial code, `UNROUTABLE_METHOD`.** A method no
   routing table can route — unknown to this build, removed by the requesting peer's revision, or
   arrived in a framing that revision does not dispatch — recorded `AUTHORIZATION_FAILED`, a
@@ -1171,6 +1209,63 @@ Section conventions:
 
 ### Fixed
 
+- **A down `*redis.Ring` shard was skipped silently, so the kill set loaded partial and reported
+  healthy.** go-redis' `(*Ring).ForEachShard` `continue`s past a shard its heartbeat has voted
+  down and returns `nil` — unlike `(*ClusterClient).ForEachMaster`, which propagates both the
+  state reload and the per-node error. The kill switch's keyless SCAN therefore committed the
+  surviving shards' keys as the authoritative kill set, `lastRefreshErr` stayed nil,
+  `HealthStatus()` reported ready, and `ShouldBlock` answered "not killed" for every session
+  whose key lived on the missing shard: the same fail-open `ErrUnknownTopology` refuses, reached
+  one layer down and after the topology was established correctly. The Ring's fan-out is now
+  wrapped so a pass covering fewer servers than the ring is configured with is an error
+  (`killswitch.ErrIncompleteEnumeration`). Unlike its latched siblings it is a REFRESH error, not
+  a wiring fault — a down shard heals — so it honours `--killswitch-fail-open` like any other
+  outage. Reachable only by a library consumer wiring a Ring; the shipped binary is single-node.
+  Three things the check has to get right, each of which is a fail-open on its own: a pass that
+  visited NO servers is refused rather than accepted as a vacuously complete one (a ring configured
+  with no addresses classifies as sharded and would enumerate nothing, forever, reporting ready);
+  the expected count is the configured one WIDENED by the widest the ring has been observed to be,
+  because `(*Ring).SetAddrs` does not write back to the options, so on a ring GROWN at runtime the
+  configured count under-counts and a short pass would clear it; and `killswitch.RingFanOut`
+  exports the checked iterator, because `WithShardFanOut` exists for the decorator case and the
+  only iterator such a consumer has to hand is go-redis' unchecked one — declaring it would reach
+  the fail-open through the very option that makes the topology refusal tolerable. The residual is
+  documented, and there are two. A consumer that SHRINKS a ring at runtime reads as short and is
+  refused — the fail-closed direction. And a ring GROWN while a shard is ALREADY down is not caught
+  at all: go-redis rebalances a voted-down shard out of both `Len()` and the iterator and keeps no
+  memory that it existed, so no exported signal distinguishes "grown to 4 with one dead" from
+  "grown to 3". What is caught is the failure this exists for — a shard that goes down while the
+  ring is in service.
+- **A displaced server-initiated request left its upstream blocked with nothing on the tape.**
+  Past its 1024-entry cap the tracker drops an in-flight request to stay bounded, and nothing then
+  answered the one it dropped: the entry is gone, so both transports' routing arms discard even a
+  CORRECT host reply to it as untracked, and the upstream waited on a request nothing could ever
+  complete — on stdio, which has no idle reaper, until the host disconnects. Only a one-shot stderr
+  warning said a drop had happened at all, never which request it cost. A displacement is neither
+  of this leg's two exceptions — not a refusal of the peer and not an emergency stop, but eunox
+  running out of bookkeeping space — so its initiator is now answered with eunox's own `-32603` at
+  displacement time and recorded with a `server-request-displaced` transport detail. Three
+  properties come with that. The victim is the LONGEST-WAITING request rather than an arbitrary
+  one: a random pick was tolerable while the cost was a silent hang, but not once the drop actively
+  aborts a request the host may be about to answer. A reused request id counts as a displacement
+  too — `MsgKey` canonicalizes by value, so an upstream issuing `1` and then `1.0` collides two
+  distinct wire requests onto one entry, and the overwrite was invisible while the map's value was
+  a `struct{}`. And the record is METERED: once the set is full every further server-initiated
+  request displaces one, so an upstream outrunning a slow host would otherwise turn an unbounded
+  audit-write rate loose — enough dropped writes latch `AuditDegraded()` and, under
+  `--require-audit=strict`, deny every route.
+- **A host reply refused by the session gates left the upstream blocked for the session's life.**
+  The gates run before revision negotiation, and their denial arm acked a bodyless `202` while
+  the tracked id stayed held and the upstream stayed blocked on the `sampling/createMessage` that
+  reply would have answered. The arm now answers the initiator when the sender is PROVABLY the
+  session's own owner, and only then. Answering unconditionally is not safe and "answer without
+  untracking" does not make it so: the initiator's request is completed either way, so answering on
+  an unauthorized sender's message hands any second identity that learned a session id a way to
+  abort the owner's pending reply. "Proven" is the load-bearing word and is not the same as "not
+  refused": the owner binding reports no mismatch for a session with no bound identity, which is
+  right for a gate (nothing to enforce) and wrong for a decision that acts on the sender's behalf,
+  and the audience pin refuses senders that binding never examines. A session with nothing bound
+  therefore proves nothing and answers nobody.
 - **A host reply refused by revision negotiation left the upstream's request blocked.** Making
   the honorability gate framing-aware made a host RESPONSE refusable, and a refused one was
   recorded and dropped: nothing to the host (JSON-RPC forbids replying to a response) and
@@ -1178,10 +1273,8 @@ Section conventions:
   stayed held until teardown — on stdio, which has no idle reaper, until the host disconnects.
   Both transports now untrack it and answer the initiator with eunox's own `-32603`, relaying
   nothing the host said. The revocation drop on the same leg still does not answer, and the rule
-  separating them is stated once: a protocol refusal answers, an emergency stop leaves the
-  request to be reclaimed with the session. A reply refused by the session-owner/audience gate
-  does not answer either — that gate refused the SENDER, so consuming the tracked id on their
-  behalf would let a second identity abort the real owner's pending reply.
+  separating them is stated once: eunox answers wherever it can do so without acting on a second
+  identity's behalf, while an emergency stop leaves the request to be reclaimed with the session.
 - **One un-dispatchable frame permanently disabled sampling for an HTTP session.** On a
   task-anchored route the sticky task-anchor span was latched before the framing branches, so a
   POST that is neither request, notification nor response (no id and no method, which decodes
@@ -1195,9 +1288,10 @@ Section conventions:
   also the only one routing host replies back to a blocked upstream — while the HTTP proxy has
   metered the identical refusal under its `revision` category all along. A suppressed record
   folds into the next admitted one's `suppressed_refusal_count`, so the tally survives. The
-  routing refusal stays unmetered on both transports, now as a stated decision: reaching it
-  needs a peer whose ordinary traffic writes policy DENY records at the same one-per-message
-  cost, and a policy verdict may never be admission-controlled.
+  routing refusal stays unmetered on both transports, now as a DECLARED decision rather than a
+  stated one (see the metering declaration above): reaching it needs a peer whose ordinary
+  traffic writes policy DENY records at the same one-per-message cost, and a policy verdict may
+  never be admission-controlled.
 - **`transport.IsInfraDenialCode` answers for `ORIGIN_REJECTED` and `JWT_INVALID`.** The two
   pre-session refusal codes written as bare literals rather than constants were the family's
   only members the classifier did not cover, so an unauthenticated Origin probe and a rejected

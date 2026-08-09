@@ -5,11 +5,16 @@ package redisutil
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestClassifyTopology_IsOneList pins the definition both backends read: the iterator and the
@@ -112,6 +117,149 @@ func TestIsNilClient_CoversTheTypedNil(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRingFanOut_RefusesAPassThatSkippedAShard is the regression for a partial enumeration
+// reported as a complete one — the same fail-open TopologyUnknown refuses, reached one layer down
+// and AFTER the topology was established correctly.
+//
+// go-redis' own iterator `continue`s past a shard its heartbeat has voted down and returns nil, so
+// a keyless SCAN through the bare version loads the surviving shards' keys and its caller cannot
+// tell that from the whole keyspace. For the kill switch that is a partial kill set committed as
+// authoritative, with HealthStatus reporting ready.
+//
+// The heartbeat is injected rather than driven by closing a server: the shard's down-vote
+// threshold and the dial timeouts would otherwise make the test both slow and timing-dependent,
+// and what is under test is the disposition of a skipped shard, not go-redis' liveness detection.
+func TestRingFanOut_RefusesAPassThatSkippedAShard(t *testing.T) {
+	t.Parallel()
+	const downAddr = "127.0.0.1:7001"
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:              map[string]string{"a": "127.0.0.1:7000", "b": downAddr},
+		HeartbeatFrequency: time.Millisecond,
+		HeartbeatFn:        func(_ context.Context, client *redis.Client) bool { return client.Options().Addr != downAddr },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+
+	// Wait for go-redis to vote the shard down (three consecutive votes) and rebalance, which is
+	// the state in which ForEachShard silently visits one server of two.
+	require.Eventually(t, func() bool { return ring.Len() == 1 }, 2*time.Second, time.Millisecond,
+		"go-redis never voted the unreachable shard down, so the skip this test is about never happens")
+
+	topology, fanOut := ClassifyTopology(ring)
+	require.Equal(t, TopologySharded, topology)
+	require.NotNil(t, fanOut)
+
+	// Atomic because ForEachShard runs fn on one goroutine per shard.
+	var visited atomic.Int64
+	err := fanOut(context.Background(), func(context.Context, *redis.Client) error {
+		visited.Add(1)
+		return nil
+	})
+	assert.Equal(t, int64(1), visited.Load(), "the premise: go-redis skips the shard it voted down")
+	assert.ErrorIs(t, err, ErrIncompleteFanOut,
+		"a pass that covered one of two shards must report itself incomplete; returning nil is what lets a caller commit a partial view as the whole keyspace")
+}
+
+// TestRingFanOut_PassesWhenTheRingIsWhole is the other half: the refusal above must not fire on
+// an ordinary healthy ring, or the completeness check would trade a silent fail-open for a
+// permanent fail-closed.
+//
+// It also pins that fn's own error still propagates unchanged — the check is layered over
+// go-redis' error path, not in place of it.
+func TestRingFanOut_PassesWhenTheRingIsWhole(t *testing.T) {
+	t.Parallel()
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:       map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"},
+		HeartbeatFn: func(context.Context, *redis.Client) bool { return true },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+	_, fanOut := ClassifyTopology(ring)
+	require.NotNil(t, fanOut)
+
+	var visited atomic.Int64
+	require.NoError(t, fanOut(context.Background(), func(context.Context, *redis.Client) error {
+		visited.Add(1)
+		return nil
+	}))
+	assert.Equal(t, int64(2), visited.Load())
+
+	sentinel := errors.New("scan failed")
+	assert.ErrorIs(t, fanOut(context.Background(), func(context.Context, *redis.Client) error { return sentinel }), sentinel,
+		"the completeness check wraps go-redis' error path rather than replacing it")
+}
+
+// TestRingFanOut_RefusesAPassOverNoServers closes the degenerate total case of a partial view.
+// `got < want` accepts it whenever want is 0 too, so a ring configured with no addresses
+// classified as sharded and enumerated nothing, forever, reporting success — for the kill switch,
+// an EMPTY kill set committed as authoritative with HealthStatus reporting ready.
+func TestRingFanOut_RefusesAPassOverNoServers(t *testing.T) {
+	t.Parallel()
+	ring := redis.NewRing(&redis.RingOptions{Addrs: map[string]string{}})
+	t.Cleanup(func() { _ = ring.Close() })
+	topology, fanOut := ClassifyTopology(ring)
+	require.Equal(t, TopologySharded, topology)
+	require.NotNil(t, fanOut)
+
+	err := fanOut(context.Background(), func(context.Context, *redis.Client) error { return nil })
+	assert.ErrorIs(t, err, ErrIncompleteFanOut,
+		"a pass that visited no servers at all must not report a complete enumeration of the keyspace")
+}
+
+// TestRingFanOut_RefusesAShortPassOnAGrownRing is the direction the first version of this check
+// did not consider, and it is the fail-OPEN one.
+//
+// (*Ring).SetAddrs reshapes a ring without writing back to the options the configured count is
+// read from, so after a GROW that count under-counts: a pass covering fewer servers than the ring
+// actually has still clears it. The high-water mark closes that — once the ring has been seen at a
+// size, a later pass covering less is short whatever the options say.
+func TestRingFanOut_RefusesAShortPassOnAGrownRing(t *testing.T) {
+	t.Parallel()
+	var down atomic.Value
+	down.Store("")
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:              map[string]string{"a": "127.0.0.1:7001", "b": "127.0.0.1:7002"},
+		HeartbeatFrequency: time.Millisecond,
+		HeartbeatFn:        func(_ context.Context, c *redis.Client) bool { return c.Options().Addr != down.Load().(string) },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+	_, fanOut := ClassifyTopology(ring)
+	require.NotNil(t, fanOut)
+
+	// Grow the ring to four shards, all healthy, and take a complete pass — which is what
+	// establishes the high-water mark the stale configured count of 2 cannot supply.
+	const downAddr = "127.0.0.1:7004"
+	ring.SetAddrs(map[string]string{"a": "127.0.0.1:7001", "b": "127.0.0.1:7002", "c": "127.0.0.1:7003", "d": downAddr})
+	require.Eventually(t, func() bool { return ring.Len() == 4 }, 2*time.Second, time.Millisecond)
+	require.NoError(t, fanOut(context.Background(), func(context.Context, *redis.Client) error { return nil }),
+		"a complete pass over the grown ring must be accepted")
+	require.Equal(t, 2, len(ring.Options().Addrs), "the premise: go-redis leaves the configured count stale after SetAddrs")
+
+	// Now one of the new shards goes down. The configured count still says 2, so the count alone
+	// would accept a 3-shard pass as complete.
+	down.Store(downAddr)
+	require.Eventually(t, func() bool { return ring.Len() == 3 }, 2*time.Second, time.Millisecond)
+	assert.ErrorIs(t, fanOut(context.Background(), func(context.Context, *redis.Client) error { return nil }), ErrIncompleteFanOut,
+		"3 of 4 shards is a partial view; accepting it because the ring was CONFIGURED with 2 is the fail-open this check exists to close")
+}
+
+// TestRingForEachShard_MatchesWhatGoRedisActuallyDoes is the premise wholeRingFanOut rests on,
+// asserted rather than assumed: the library iterator reports NO error for a pass that skipped a
+// shard. If a go-redis release ever propagates one, the wrapper becomes redundant rather than
+// load-bearing, and this is what says so.
+func TestRingForEachShard_MatchesWhatGoRedisActuallyDoes(t *testing.T) {
+	t.Parallel()
+	const downAddr = "127.0.0.1:7001"
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:              map[string]string{"a": "127.0.0.1:7000", "b": downAddr},
+		HeartbeatFrequency: time.Millisecond,
+		HeartbeatFn:        func(_ context.Context, client *redis.Client) bool { return client.Options().Addr != downAddr },
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+	require.Eventually(t, func() bool { return ring.Len() == 1 }, 2*time.Second, time.Millisecond)
+
+	assert.NoError(t, ring.ForEachShard(context.Background(), func(context.Context, *redis.Client) error { return nil }),
+		"go-redis now reports a skipped shard; wholeRingFanOut's completeness check is no longer the only thing standing between a down shard and a silent partial enumeration")
 }
 
 // hookedClient is the decorator shape this package's docs name — "a decorator, or a consumer's

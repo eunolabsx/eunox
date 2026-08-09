@@ -581,6 +581,18 @@ type hostNotificationGate struct {
 	// swallowed set apply to it. Its zero value costs a revocation lookup on a message that
 	// would otherwise be dropped for free — the direction that records more, not less.
 	established bool
+	// audit is this leg's route posture (--audit / a route with no policy), carried so the
+	// routing refusal reaches the shared deny path with the real posture rather than a constant.
+	// It changes nothing today — that refusal's code classifies as a fault, so it is not
+	// downgradable whoever asks — which is exactly why it must be the real value: a hardcoded
+	// false would make the notification-framed observe-mode regression pass by construction
+	// instead of by the property it exists to hold.
+	audit bool
+	// strictAudit is the --require-audit=strict state this leg's transport holds, carried for the
+	// same reason `audit` is: the routing refusal reaches the shared deny path through this gate,
+	// and a zero value here would give the notification framing a different audit posture from the
+	// identical bytes in request framing.
+	strictAudit strictAuditState
 	errOut      io.Writer
 	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
 	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
@@ -647,7 +659,8 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	// An enforced method framed as a notification (no id) is a fail-closed reject: forwarding
 	// it verbatim would bypass both the PDP decision and the audit record.
 	if tables.enforces(msg.Method) {
-		if rec := g.rec(); rec != nil {
+		// Unmetered by DECLARATION (catSmuggled), not by omission — see refusalDeclarations.
+		if rec := unmeteredRecorder(g.rec(), catSmuggled); rec != nil {
 			// auditIdentity for the same reason its siblings use it: every enforced method
 			// resolves a target type, so naming one here fabricates a policy target for a
 			// message the PDP never saw.
@@ -659,18 +672,14 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	if disposition == notifyForward {
 		return notificationForward
 	}
-	// notifyUnmapped, the notification-framed analogue of dispatchUnmapped. Before this
-	// existed, an unrecognized notification-framed method reached the upstream invisibly while
-	// its request-framed twin was denied and logged.
-	if rec := g.rec(); rec != nil {
-		rev := requestRevision(ctx)
-		identifier, method := auditIdentity(msg)
-		rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, method, capability.ErrCodeUnroutableMethod, "",
-			g.subject.auditDetails(unroutableDetail(rev, unroutableReason(rev, msg.Method))), false)
-	}
-	_, _ = fmt.Fprintf(resolvedErrOut(g.errOut),
-		"[eunox] SECURITY: unmapped notification method %q denied (UNROUTABLE_METHOD) — not forwarded\n",
-		audit.SanitizeAuditField(msg.Method))
+	// notifyUnmapped, the notification-framed analogue of dispatchUnmapped — the SAME producer
+	// now, not an analogue of it. Before either existed, an unrecognized notification-framed
+	// method reached the upstream invisibly while its request-framed twin was denied and logged.
+	//
+	// The denial message the core builds is discarded: JSON-RPC forbids replying to a
+	// notification, and the caller acks. What is not discarded is everything else the shared path
+	// owns — the observe gate, the strict-audit gate and the record shape.
+	refuseUnroutable(ctx, refusalForwardParams(g.rec(), g.subject, g.audit, g.strictAudit, g.errOut), g.subject, msg, unroutableFramingNotification)
 	return notificationRefused
 }
 
@@ -1117,35 +1126,7 @@ func completeToolsListing(params, result json.RawMessage) bool {
 	return res.NextCursor == ""
 }
 
-// dispatchUnmapped is the fail-closed default: a method no routing table can route is denied
-// with UNROUTABLE_METHOD and never forwarded to the upstream. The method name is logged so
-// operators can detect protocol drift or novel MCP extensions.
-//
-// The code is what makes the refusal resist an observing route's downgrade: it classifies as a
-// FAULT, so [capability.DenialInfo.Downgradable] is false for it whoever asks. It used to be
-// AUTHORIZATION_FAILED, and the property held only because this path builds no DenialInfo and so
-// never reaches isObserveDeny. That bypass is now belt to the code's braces rather than the whole
-// belt: routing the default through enforcedForwardCore like every other refusal would leave the
-// property standing, which is what makes the cleanup safe to do — and what
-// assertRoutingRefusalCode pins so it stays safe.
+// dispatchUnmapped is the request-framed entry to the fail-closed routing default.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	// Kill-switch check runs at the dispatchRequest boundary, so a killed session is reported
-	// as KILL_SWITCH before reaching this handler. msg.Method is attacker-controlled; sanitize
-	// once and reuse for both the stderr line and the host-facing denial. The structured audit
-	// field stays raw (JSON-encoding already escapes control runes).
-	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
-	// Record-before-act: write the audit record before the stderr notice, so a crash between
-	// the two never leaves a SIEM alert with no corresponding audit trail entry. Everything the
-	// record carries is built INSIDE the guard: with no sink wired, the marker is pure garbage.
-	if d.rec != nil {
-		rev := requestRevision(ctx)
-		identifier, method := auditIdentity(msg)
-		d.rec.RecordDeny(ctx, d.sessionID, identifier, method, capability.ErrCodeUnroutableMethod, "",
-			unroutableDetail(rev, unroutableReason(rev, msg.Method)), false)
-	}
-	_, _ = fmt.Fprintf(d.errOutOrStderr(),
-		"[eunox] SECURITY: unmapped MCP method %q denied (UNROUTABLE_METHOD) — not forwarded\n",
-		sanitizedMethod,
-	)
-	return denialResult(msg.ID, capability.ErrCodeUnroutableMethod, "", sanitizedMethod, "")
+	return refuseUnroutable(ctx, d.forwardParams, verifiedSession(d.sessionID), msg, unroutableFramingRequest)
 }

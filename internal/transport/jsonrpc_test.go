@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -599,11 +600,19 @@ func TestTimeoutErrorDetection_ParentContextNotCanceled(t *testing.T) {
 // cap, re-inserting a tracked ID never evicts, and once at the cap the set stays
 // bounded while still admitting the newest ID. This guards against unbounded
 // growth when a host never answers a server-initiated request.
+//
+// It also pins that an eviction hands back the EVICTED REQUEST rather than a bare bool: the
+// caller has to answer that initiator, and after the eviction nothing else can — the id is gone,
+// so even a correct host reply is dropped as untracked by both transports' routing arms.
 func TestTrackServerReqID(t *testing.T) {
 	t.Parallel()
 
+	entry := func(name string) trackedServerRequest {
+		return trackedServerRequest{id: mcp.RawJSON(strconv.Quote(name)), method: "roots/list"}
+	}
+
 	// nil map is allocated on first use; no eviction below the cap.
-	ids, evicted := trackServerReqID(nil, "a")
+	ids, _, evicted := trackServerReqID(nil, "a", entry("a"))
 	if len(ids) != 1 {
 		t.Fatalf("first insert: len = %d, want 1", len(ids))
 	}
@@ -611,58 +620,67 @@ func TestTrackServerReqID(t *testing.T) {
 		t.Error("first insert must not report an eviction")
 	}
 
-	// Re-inserting an already-tracked ID is a no-op, not growth, and never evicts.
-	ids, evicted = trackServerReqID(ids, "a")
+	// Re-inserting an already-tracked ID is not growth — but it DISPLACES the entry that was
+	// there, which is a request that can no longer be answered by any later reply. It was invisible
+	// while the map's value was a struct{} (there was nothing to lose); now the entry carries what
+	// answering the initiator needs, so the displacement is reported like the cap's.
+	var displaced trackedServerRequest
+	ids, displaced, evicted = trackServerReqID(ids, "a", entry("a"))
 	if len(ids) != 1 {
 		t.Fatalf("duplicate insert: len = %d, want 1", len(ids))
 	}
-	if evicted {
-		t.Error("duplicate insert must not report an eviction")
+	if !evicted || displaced.id == nil {
+		t.Errorf("duplicate insert reported displaced=%v (%+v); an overwritten entry is a request nothing can route a reply to, so it must be handed back to be answered", evicted, displaced)
 	}
 
 	// Fill to the cap.
 	for i := 0; len(ids) < maxTrackedServerReqs; i++ {
-		ids, _ = trackServerReqID(ids, fmt.Sprintf("k%d", i))
+		key := fmt.Sprintf("k%d", i)
+		ids, _, _ = trackServerReqID(ids, key, entry(key))
 	}
 	if len(ids) != maxTrackedServerReqs {
 		t.Fatalf("after fill: len = %d, want %d", len(ids), maxTrackedServerReqs)
 	}
 
-	// A new ID at the cap evicts one entry rather than growing the set, reports the
-	// eviction so the caller can warn, and the newest ID is always present afterward.
-	ids, evicted = trackServerReqID(ids, "overflow")
+	// A new ID at the cap evicts one entry rather than growing the set, reports WHICH request it
+	// evicted so the caller can answer that initiator, and the newest ID is always present after.
+	ids, victim, evicted := trackServerReqID(ids, "overflow", entry("overflow"))
 	if len(ids) != maxTrackedServerReqs {
 		t.Fatalf("at cap: len = %d, want %d (must stay bounded)", len(ids), maxTrackedServerReqs)
 	}
 	if !evicted {
 		t.Error("inserting a new ID at the cap must report an eviction")
 	}
+	if victim.id == nil || victim.method == "" {
+		t.Errorf("eviction reported %+v; it must carry the evicted request's id and method — the id to answer its initiator with, the method for the record that says the proxy failed it", victim)
+	}
 	if _, ok := ids["overflow"]; !ok {
 		t.Error("newest ID must be retained after eviction at the cap")
 	}
 
-	// Re-inserting a tracked ID at the cap must not evict (size unchanged).
-	ids, evicted = trackServerReqID(ids, "overflow")
+	// Re-inserting a tracked ID at the cap does not grow the set, and displaces only the entry it
+	// overwrote — never a second, unrelated one.
+	ids, _, evicted = trackServerReqID(ids, "overflow", entry("overflow"))
 	if len(ids) != maxTrackedServerReqs {
 		t.Fatalf("duplicate at cap: len = %d, want %d", len(ids), maxTrackedServerReqs)
 	}
-	if evicted {
-		t.Error("re-inserting a tracked ID at the cap must not report an eviction")
+	if !evicted {
+		t.Error("re-inserting a tracked ID must report the entry it overwrote")
 	}
 }
 
-// TestServerReqTracker_TalliesEvictions pins the CR-3 observability contract: the
-// warn line states that evictions past the first are "counted but not individually
-// logged", so serverReqTracker must actually tally every eviction (not just latch a
-// logged-once bool). Each distinct ID tracked past the cap forces exactly one
-// eviction; re-tracking an already-present ID evicts nothing.
+// TestServerReqTracker_TalliesEvictions pins the observability contract: the warn line states that
+// displacements past the first are "counted but not individually logged", so serverReqTracker must
+// actually tally every one (not just latch a logged-once bool). Each distinct ID tracked past the
+// cap forces exactly one; re-tracking an already-present ID displaces the entry it overwrites, and
+// is tallied too — that entry is equally unanswerable afterwards.
 func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 	t.Parallel()
 
 	var tr serverReqTracker
 	// Fill exactly to the cap: every insert is new but none overflows yet.
 	for i := 0; i < maxTrackedServerReqs; i++ {
-		tr.track(fmt.Sprintf("fill-%d", i), io.Discard)
+		tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(fmt.Sprintf("fill-%d", i))), Method: "roots/list"}, io.Discard)
 	}
 	if tr.evictions != 0 {
 		t.Fatalf("evictions after filling to the cap = %d, want 0", tr.evictions)
@@ -672,17 +690,24 @@ func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 	// the first logged one).
 	const overflow = 5
 	for i := 0; i < overflow; i++ {
-		tr.track(fmt.Sprintf("overflow-%d", i), io.Discard)
+		tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(fmt.Sprintf("overflow-%d", i))), Method: "roots/list"}, io.Discard)
 	}
 	if tr.evictions != overflow {
 		t.Fatalf("evictions after %d overflow inserts = %d, want %d", overflow, tr.evictions, overflow)
 	}
 
-	// The most-recently-added ID is always retained, so re-tracking it evicts
-	// nothing and leaves the tally unchanged.
-	tr.track(fmt.Sprintf("overflow-%d", overflow-1), io.Discard)
-	if tr.evictions != overflow {
-		t.Fatalf("re-tracking a present ID changed the tally to %d, want %d", tr.evictions, overflow)
+	// Re-tracking a present ID overwrites its entry — the set does not grow, but the request that
+	// entry described can no longer be answered by any reply, so it is tallied like the rest.
+	tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(fmt.Sprintf("overflow-%d", overflow-1))), Method: "roots/list"}, io.Discard)
+	if tr.evictions != overflow+1 {
+		t.Fatalf("re-tracking a present ID left the tally at %d, want %d — an overwritten entry is a displacement too", tr.evictions, overflow+1)
+	}
+
+	// A message with no id is not tracked at all: its key would be "", which no reply can match
+	// and no unblock can address, so the entry could only ever leave the set by displacing a real
+	// one. Both legs used to spell this precondition for themselves.
+	if _, displaced := tr.track(mcp.RPCMsg{Method: "roots/list"}, io.Discard); displaced {
+		t.Error("an id-less message must not be tracked, let alone displace a real request")
 	}
 }
 

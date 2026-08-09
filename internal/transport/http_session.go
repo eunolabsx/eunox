@@ -320,23 +320,76 @@ func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 // server-initiated leg decides against; it is the predicate that leg refuses on.
 func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() }
 
+// unblocker is this session's wiring for every site that answers a blocked server-initiated
+// initiator. writeUpstream is nil in remote-upstream mode, which is what the seam's nil-writer
+// disposition tests for — never a nil *mcp.MsgWriter handed over as a live sink.
+func (s *httpSession) unblocker() serverRequestUnblocker {
+	var write func(mcp.RPCMsg)
+	if s.upWriter != nil {
+		write = func(m mcp.RPCMsg) { _ = s.upWriter.Write(m) }
+	}
+	return serverRequestUnblocker{reqs: &s.serverReqs, writeUpstream: write, errOut: s.errOut()}
+}
+
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would
 // have completed, so it does not stay blocked until this session's idle ceiling reclaims it.
-// See takeRefusedServerReply for which drops answer the initiator and which deliberately do not.
+//
+// A PROTOCOL refusal: eunox has nothing to relay, but it can say so at its own revision, and the
+// initiator learns its request failed instead of hanging. No revocation lookup is interposed, so a
+// revoked session's refused reply may still unblock its initiator — that costs nothing the kill
+// protects, since what a kill forbids is DELIVERING the host's reply and this answer is eunox's
+// own. See this file's package-level rule for the drops that deliberately do not answer.
 func (s *httpSession) unblockRefusedServerReply(msg mcp.RPCMsg) {
-	answer, ok := takeRefusedServerReply(&s.serverReqs, msg)
-	if !ok {
+	if !msg.IsResponse() {
 		return
 	}
-	if s.upWriter == nil {
-		// Remote-upstream mode has no writer to answer through. Unreachable today (remote
-		// sessions issue no server-initiated requests, so no id could have been tracked), and
-		// reported rather than dropped for the same reason routeHostServerResponse reports it.
-		_, _ = fmt.Fprintf(s.errOut(),
-			"[eunox] WARNING: a refused host reply left a server-initiated request unanswered: no upstream writer in remote-upstream mode\n")
+	s.unblocker().unblock(msg.ID, refusedReplyUpstreamError)
+}
+
+// senderIsProvenOwner reports whether cur is the identity that CREATED this session — PROVEN,
+// not merely un-refused.
+//
+// Deliberately not ownerMismatch, whose negation is the weaker question. That check answers "no
+// mismatch" for a session with no bound identity, which is right for a GATE (there is nothing to
+// enforce, so nothing to refuse) and wrong for any decision that ACTS on the sender's behalf: an
+// unbound session cannot distinguish its owner from anyone else, so nobody is proven.
+func (s *httpSession) senderIsProvenOwner(cur *pdp.JWTClaims) bool {
+	if s.claims == nil || s.claims.Subject == "" || cur == nil {
+		return false
+	}
+	_, mismatch := s.ownerMismatch(cur)
+	return !mismatch
+}
+
+// unblockGateRefusedServerReply answers the upstream request a host reply the SESSION GATES
+// refused would have completed — but only when the sender is PROVABLY this session's own owner.
+//
+// Whether this arm may answer turns on WHO sent the reply, not on which gate refused it, and not
+// on the fact of a refusal:
+//
+//   - The sender is the session's own owner: no second identity is involved and nobody else's
+//     reply is being consumed. The refusal is one the owner caused themselves (their token no
+//     longer clears the route's audience pin), and leaving it costs one wedged upstream request
+//     for the session's remaining life for no protection at all.
+//   - Anyone else, including a sender nothing can place: the real owner's reply may still be
+//     coming, and answering the initiator completes its request whether or not the tracked id is
+//     consumed — so "answer without untracking" does not separate the two. Doing it would hand any
+//     second identity that learned this session id a way to abort the owner's pending reply, gated
+//     only on knowing the id. Left blocked for the owner's reply, or for teardown.
+//
+// The gate's two arms are NOT interchangeable evidence here, which is why this asks its own
+// question rather than reading the verdict. sessionGateVerdict short-circuits on the audience pin
+// and never runs the owner binding, so a refusal that is not "owner mismatch" says nothing about
+// whether the sender is the owner — an unbound session made that gap reachable, since the binding
+// is vacuous there and every sender read as the owner.
+//
+// Revocation is deliberately not consulted, for the reason unblockRefusedServerReply gives: what a
+// kill forbids is DELIVERING the host's reply, and this answer is eunox's own.
+func (s *httpSession) unblockGateRefusedServerReply(ctx context.Context, msg mcp.RPCMsg) {
+	if !msg.IsResponse() || !s.senderIsProvenOwner(pdp.JWTClaimsPtr(ctx)) {
 		return
 	}
-	_ = s.upWriter.Write(answer)
+	s.unblocker().unblock(msg.ID, gateRefusedReplyUpstreamError)
 }
 
 // newSession spawns an upstream subprocess and performs the MCP initialize handshake. The
@@ -1362,20 +1415,15 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // back by handleMCPPost). Such a request blocks the upstream until answered, so with no
 // subscriber able to receive it, fail closed: untrack the ID and reply an error so the upstream
 // unblocks, rather than let it hang until teardown.
-func (s *httpSession) broadcastServerRequest(msg mcp.RPCMsg) bool {
-	if msg.ID != nil {
-		s.serverReqs.track(mcp.MsgKey(msg.ID), s.errOut())
-	}
+// The refusal limiter is a PARAMETER rather than reached through s.proxy: this runs on a session,
+// and the proxy that holds the bucket is already in scope at the one site that wires this in.
+func (s *httpSession) broadcastServerRequest(ctx context.Context, limiter *categoryRecordLimiter, msg mcp.RPCMsg) bool {
+	u := s.unblocker()
+	trackServerRequest(ctx, u, asRecorder(s.route.sink), limiter, verifiedSession(s.id), dropHTTPDisplaced, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}
-	if msg.ID != nil {
-		s.serverReqs.take(mcp.MsgKey(msg.ID))
-		if s.upWriter != nil {
-			_ = s.upWriter.Write(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError,
-				"no client stream available to service server-initiated request"))
-		}
-	}
+	u.unblock(msg.ID, "no client stream available to service server-initiated request")
 	return false
 }
 
@@ -1456,21 +1504,19 @@ func (s *httpSession) removeSubAndDrain(ctx context.Context, ch chan mcp.RPCMsg)
 // failServerRequestDelivery unblocks the upstream when a server-initiated request already
 // consumed from a subscriber channel cannot be relayed to the host. Untracks the ID and replies
 // an error so the upstream doesn't hang. Shared by the SSE write loop and the drain path.
+//
+// The audit correction is the only per-caller difference from the shared unblock, and it is gated
+// on the unblock having actually CONSUMED the request. That is what makes it exactly-once: both
+// callers (the SSE write loop and the drain) can see the same message, and only one take succeeds.
 func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPCMsg, reason string) {
-	if msg.ID == nil || !s.serverReqs.take(mcp.MsgKey(msg.ID)) {
+	if !s.unblocker().unblock(msg.ID, reason) {
 		return
-	}
-	if s.upWriter != nil {
-		_ = s.upWriter.Write(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, reason))
 	}
 	// This request was recorded as an allow when deliverToOne buffered it, but it never
 	// reached the host — append a correction so the tamper-evident tape doesn't stand as
 	// claiming delivery that didn't happen.
-	if s.route != nil {
-		if s.claims != nil {
-			ctx = pdp.WithJWTClaims(ctx, s.claims)
-		}
-		s.route.sink.RecordDeny(ctx, s.id, msg.Method, msg.Method, capability.ErrCodeEnforcementError, "",
-			map[string]interface{}{"transport": "http-server-request-undelivered"}, false)
+	if s.claims != nil {
+		ctx = pdp.WithJWTClaims(ctx, s.claims)
 	}
+	recordServerRequestDropped(ctx, asRecorder(s.route.sink), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
 }

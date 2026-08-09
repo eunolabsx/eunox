@@ -548,6 +548,15 @@ func TestEnforcedForwardCore_CommitsWithTheDecidingPDP(t *testing.T) {
 			if !isIdent || fn.Name != "enforcedForwardCore" || len(call.Args) < 3 {
 				return true
 			}
+			// A literal nil committer is "no decision point in hand", which cannot be the WRONG
+			// decision point: such a call ran no decision, so there is nothing to commit — the
+			// core's commit arm needs dec.Decision == DecisionAllow and a pending clear, and
+			// commitDeclassify returns early without touching the committer when there is none.
+			// The routing refusal is the site: it denies a message no table could route.
+			if isNilIdent(call.Args[2]) {
+				checked++
+				return true
+			}
 			checked++
 			params, committer := receiverOf(call.Args[1], "forwardParams"), receiverOf(call.Args[2], "pdp")
 			if params == "" || committer == "" || params != committer {
@@ -559,6 +568,12 @@ func TestEnforcedForwardCore_CommitsWithTheDecidingPDP(t *testing.T) {
 		})
 	}
 	require.Positive(t, checked, "no enforcedForwardCore call found in any non-test file; this guard would pass vacuously")
+}
+
+// isNilIdent reports whether e is the untyped nil literal.
+func isNilIdent(e ast.Expr) bool {
+	ident, ok := e.(*ast.Ident)
+	return ok && ident.Name == "nil"
 }
 
 // receiverOf returns the receiver identifier of `x.field` when field matches, or "" for any
@@ -1068,7 +1083,7 @@ func TestForwardServerRequest_RefusesADeclassifyingSamplingDecision(t *testing.T
 	fp := serverRequestParams{
 		rec:           rec,
 		sessionID:     "s",
-		forward:       func(mcp.RPCMsg) bool { forwarded = true; return true },
+		forward:       func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream: func(m mcp.RPCMsg) { toUpstream = append(toUpstream, m) },
 		pdp:           samplingPDP{dec: dec},
 	}
@@ -1096,7 +1111,7 @@ func TestForwardServerRequest_RefusesWhenTheTurnIsUnavailable(t *testing.T) {
 	fp := serverRequestParams{
 		rec:           rec,
 		sessionID:     "s",
-		forward:       func(mcp.RPCMsg) bool { forwarded = true; return true },
+		forward:       func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
 		writeUpstream: func(m mcp.RPCMsg) { toUpstream = append(toUpstream, m) },
 		decideLock:    func() (func(), bool) { return nil, false },
 		pdp:           samplingPDP{dec: capability.EnforceResponse{Decision: capability.DecisionAllow}},

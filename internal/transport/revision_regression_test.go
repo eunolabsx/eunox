@@ -378,13 +378,15 @@ func TestHonorabilityGate_CoversTheHostResponseFraming(t *testing.T) {
 			p, _ := serveHostLines(t, stdioServe{
 				sink:   sink,
 				upSink: up,
-				setup:  func(p *StdioProxy) { p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard) },
+				setup: func(p *StdioProxy) {
+					p.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"}, io.Discard)
+				},
 			}, tc.line)
 			_ = sink.Close()
 
 			// Exactly one message reaches the upstream, and it is eunox's own: the refused
 			// response is never relayed, but the request it would have answered is unblocked
-			// rather than left hanging (see takeRefusedServerReply).
+			// rather than left hanging (see server_request_unblock.go).
 			assertUnblockedNotRelayed(t, up.messages(), mcp.RawJSON(`5`))
 			if got := p.hostRevision(); got != "" {
 				t.Errorf("pinned revision = %q, want unpinned — a response is dispatched by neither table", got)
@@ -451,7 +453,9 @@ func TestRefusedHostReply_UnblocksTheUpstreamOnBothTransports(t *testing.T) {
 		close(up.gate)
 		p, _ := serveHostLines(t, stdioServe{
 			upSink: up,
-			setup:  func(p *StdioProxy) { p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard) },
+			setup: func(p *StdioProxy) {
+				p.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"}, io.Discard)
+			},
 		}, line)
 		assertUnblockedNotRelayed(t, up.messages(), mcp.RawJSON(`5`))
 		if p.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`5`))) {
@@ -469,7 +473,7 @@ func TestRefusedHostReply_UnblocksTheUpstreamOnBothTransports(t *testing.T) {
 			upWriter: mcp.NewMsgWriter(&upBuf), done: make(chan struct{}),
 		})
 		proxy.sessions[sess.id] = sess
-		sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard)
+		sess.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"}, io.Discard)
 
 		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(line))
 		req.Header.Set(SessionHeader, sess.id)
@@ -672,14 +676,19 @@ func TestObserveMode_DoesNotDowngradeARoutingRefusal(t *testing.T) {
 	}
 }
 
-// TestObserveMode_MarksTheNotificationFramedRefusalToo is the same property on the arm with its
-// own recorder call, which is where the identifier rule had to be hand-mirrored once already.
+// TestObserveMode_MarksTheNotificationFramedRefusalToo is the same property on the other framing.
+// It used to be the arm with its own recorder call — the one where the identifier rule had to be
+// hand-mirrored once already — and is now the same producer reached from the notification side.
+//
+// The gate carries the leg's real audit posture, so this exercises the observe gate rather than
+// skipping past it: with audit hardcoded false the assertion would hold by construction instead of
+// by UNROUTABLE_METHOD's class.
 func TestObserveMode_MarksTheNotificationFramedRefusalToo(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	gate := hostNotificationGate{
 		rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true,
-		errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
+		audit: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
 	}
 	// ping exists in this revision and is answered locally; it has no notification disposition
 	// at all, so its notification framing falls to the same fail-closed default.
@@ -693,14 +702,46 @@ func TestObserveMode_MarksTheNotificationFramedRefusalToo(t *testing.T) {
 	assertUnroutableDetail(t, rec.records[0].details, capability.Revision20251125, audit.UnroutableFramingUnmapped)
 }
 
-// assertRoutingRefusalCode holds the routing refusal's resistance to an observing route's
-// downgrade where it actually lives — in the code's CLASS — rather than only in the behavior the
-// two tests above drive.
+// TestRoutingRefusal_NeverForwardsEvenIfTheObserveGateAdmittedIt is the structural half of the
+// property the two tests above assert behaviorally.
 //
-// Both of those exercise the path as it is wired today, which builds no DenialInfo and so never
-// asks. Routing the fail-closed default through the shared deny path is the obvious cleanup, and
-// the moment someone does it, this is the assertion standing between --audit and a proxy
-// forwarding messages it has no route for.
+// Now that the refusal runs through the shared deny path, the arm that FORWARDS is real code one
+// branch away, reachable if UNROUTABLE_METHOD ever stopped classifying as a fault. So the sink
+// itself is substituted: the caller's live callUpstream is replaced with one that refuses, and
+// this drives the core with a params whose upstream call would be observable if it ran.
+//
+// It is deliberately not phrased as "the classification is right" — assertRoutingRefusalCode is
+// that. This one says the refusal does not forward even if the classification were wrong.
+func TestRoutingRefusal_NeverForwardsEvenIfTheObserveGateAdmittedIt(t *testing.T) {
+	t.Parallel()
+	forwarded := false
+	fp := forwardParams{
+		rec:    &fwdRecorder{},
+		audit:  true,
+		errOut: io.Discard,
+		callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+			forwarded = true
+			return mcp.RPCMsg{Result: json.RawMessage(`{}`)}, nil
+		},
+	}
+	resp := refuseUnroutable(revisionContext(capability.Revision20251125), fp, verifiedSession("sess"),
+		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "agents/delegate"}, unroutableFramingRequest)
+
+	if forwarded {
+		t.Error("the routing refusal reached the caller's upstream sink; a message no table can route must never be forwarded, whatever the observe gate decides")
+	}
+	if resp.Error == nil {
+		t.Fatalf("routing refusal returned no error; response %+v", resp)
+	}
+}
+
+// assertRoutingRefusalCode holds the routing refusal's resistance to an observing route's
+// downgrade where it actually lives — in the code's CLASS.
+//
+// It used to be belt beside braces: the path built no DenialInfo and so never reached
+// isObserveDeny at all, which made the behavior hold for a reason the code did not state. The
+// refusal goes through the shared deny path now, so this is the assertion standing between
+// --audit and a proxy forwarding messages it has no route for.
 func assertRoutingRefusalCode(t *testing.T, code string) {
 	t.Helper()
 	if code != capability.ErrCodeUnroutableMethod {
