@@ -308,7 +308,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		"Set with '=': --require-audit=off (a bare --require-audit means 'strict').")
 	f := &proxyCLIFlags{
 		configPath:           fs.String("config", "", "Path to the eunox config file (YAML). Declares the host transport,\nupstream(s), per-route policy, listen settings, and audit tape.\nSee schemas/eunox-gateway-config.schema.json."),
-		audit:                fs.Bool("audit", false, "Zero-config wiretap mode: bridge stdin/stdout to the upstream named after `--`\n(or to --upstream-url). Enforced-method calls (tools/call, resources/read,\nresources/subscribe, resources/unsubscribe, prompts/get, sampling/createMessage) are forwarded and recorded without applying policy.\n…/list calls forward the full upstream catalog unfiltered (no policy is applied) and\nare recorded as enumeration events. POLICY blocks nothing; three things still refuse:\nthe kill switch, a method eunox cannot dispatch under the revision the host\nnegotiated (AUTHORIZATION_FAILED, marked details."+audit.UnroutableKey+"), and a\nmessage whose revision cannot be established (UNSUPPORTED_PROTOCOL_VERSION).\nRecorded tool-call arguments may contain secrets; treat the audit log as sensitive.\nMutually exclusive with --config."),
+		audit:                fs.Bool("audit", false, "Zero-config wiretap mode: bridge stdin/stdout to the upstream named after `--`\n(or to --upstream-url). Enforced-method calls (tools/call, resources/read,\nresources/subscribe, resources/unsubscribe, prompts/get, sampling/createMessage) are forwarded and recorded without applying policy.\n…/list calls forward the full upstream catalog unfiltered (no policy is applied) and\nare recorded as enumeration events. POLICY blocks nothing; three things still refuse:\nthe kill switch, a method eunox cannot dispatch under the revision the host\nnegotiated (UNROUTABLE_METHOD, marked details."+audit.UnroutableKey+"), and a\nmessage whose revision cannot be established (UNSUPPORTED_PROTOCOL_VERSION).\nRecorded tool-call arguments may contain secrets; treat the audit log as sensitive.\nMutually exclusive with --config."),
 		wiretapURL:           fs.String("upstream-url", "", "HTTP upstream URL for --audit mode (alternative to a `--` subprocess)."),
 		wiretapAuthHeader:    fs.String("upstream-auth-header", "", `HTTP upstream auth header for --audit mode, "Name: Value".`),
 		wiretapTLSSkipVerify: fs.Bool("upstream-tls-skip-verify", false, "Skip TLS verification for --audit --upstream-url (development only)."),
@@ -379,9 +379,8 @@ the upstream you point it at, in audit (observe) mode — every request eunox ca
 route is forwarded and its verdict recorded, and policy blocks nothing. Observe
 mode downgrades a policy VERDICT, so three refusals stand, none of which has one:
 the kill switch; a method eunox cannot dispatch under the MCP revision your host
-negotiated (AUTHORIZATION_FAILED, whose record carries details.`+audit.UnroutableKey+` so a
-discovery tape shows it as eunox's own refusal rather than the upstream's
-behavior); and a message whose revision cannot be established
+negotiated (UNROUTABLE_METHOD, whose record carries details.`+audit.UnroutableKey+` naming
+which of the three ways it was unroutable); and a message whose revision cannot be established
 (UNSUPPORTED_PROTOCOL_VERSION). Point your MCP host (Claude Desktop, Cursor, …)
 at this command and inspect the audit tape with 'eunox stats' to see what an
 enforcement allowlist would need.
@@ -410,7 +409,7 @@ func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConf
 		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
 		// Named rather than left to be discovered on the tape: observe mode downgrades POLICY
 		// verdicts, and a message eunox cannot route has no verdict to downgrade.
-		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: policy blocks nothing, but three refusals stand — the kill switch, a method absent from the revision your host negotiated (marked details.%s), and a revision that cannot be established (UNSUPPORTED_PROTOCOL_VERSION).\n", audit.UnroutableKey)
+		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: policy blocks nothing, but three refusals stand — the kill switch, a method absent from the revision your host negotiated (UNROUTABLE_METHOD, marked details.%s), and a revision that cannot be established (UNSUPPORTED_PROTOCOL_VERSION).\n", audit.UnroutableKey)
 		return cfg, nil
 	case *f.configPath != "":
 		// The upstream command comes from the config in this mode; a trailing

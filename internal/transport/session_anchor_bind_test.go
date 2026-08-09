@@ -5,8 +5,12 @@ package transport
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -92,6 +96,96 @@ func TestNoteRequestAnchor_SpanIsStickyAndScoped(t *testing.T) {
 	plain := newTestSession(&httpSession{id: "sess-b", route: &UpstreamRoute{}, claims: t1})
 	plain.noteRequestAnchor(t2)
 	assert.False(t, plain.spansAnchors())
+}
+
+// TestNoteRequestAnchor_LatchesOnlyOnADispatchedRequest: the span disables this session's
+// sampling leg for its whole life, so only a message the leg actually DECIDES against an anchor
+// may set it.
+//
+// The latch used to sit above the framing branches, right after negotiation, where the comment
+// beside it said the opposite ("a refused message must not have written session state on its way
+// to being refused"). Everything past negotiation was uncovered: one POST of a frame that is
+// neither request, notification nor response — no id AND no method, which decodes fine because
+// mcp.MsgReader does no framing validation — travelled to the bottom of the handler, was answered
+// 202 as un-dispatchable, and had permanently disabled sampling on the way. So did a reply whose
+// id this proxy never issued.
+func TestNoteRequestAnchor_LatchesOnlyOnADispatchedRequest(t *testing.T) {
+	t.Parallel()
+	sessionTask := &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-1"}
+	otherTask := &pdp.JWTClaims{Issuer: "iss-a", Subject: "sub-a", TaskID: "task-2"}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+		// fill saturates the session's request pool first, so the POST below is refused by the
+		// in-flight cap rather than dispatched.
+		fill  bool
+		notes string
+	}{
+		{
+			name:  "a frame that is neither request, notification nor response",
+			body:  `{"jsonrpc":"2.0","params":{"task":"other"}}`,
+			notes: "discarded un-dispatched; one of these must not cost the connection its sampling leg",
+		},
+		{
+			name:  "a reply whose id this proxy never issued",
+			body:  `{"jsonrpc":"2.0","id":"never-issued","result":{}}`,
+			notes: "routeHostServerResponse discards it unread, so it resolves no anchor",
+		},
+		{
+			name:  "a refused notification",
+			body:  `{"jsonrpc":"2.0","method":"agents/delegate"}`,
+			notes: "a notification carries a token but is never decided against an anchor and commits no anchored state, so there is nothing for the sampling leg to peek past",
+		},
+		{
+			name:  "a locally-answered request",
+			body:  `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+			notes: "the re-initialize echo is answered from state captured at session start; it decides nothing against an anchor, so it must not cost the session its sampling leg",
+		},
+		{
+			name:  "a request the in-flight cap refuses",
+			body:  `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"x","arguments":{}}}`,
+			fill:  true,
+			notes: "server-busy is retryable and decided nothing; latching here would let one saturating burst permanently disable sampling",
+		},
+		{
+			name: "an enforced request",
+			// Params the dispatcher refuses before the PDP, so the case needs no upstream: the
+			// latch is about which requests are KEYED on an anchor, and this one is — it takes
+			// the decision turn on the same predicate.
+			body:  `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}`,
+			want:  true,
+			notes: "the case the latch exists for: an enforced method, admitted, keyed on an anchor that is not the session's",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			route := &UpstreamRoute{name: "up1", pdp: pdp.AlwaysAllowPDP{}, taskAnchored: true}
+			proxy := newTestHTTPProxy()
+			sess := newTestSession(&httpSession{
+				id: "live-sess", route: route, claims: sessionTask, hostRev: handshakeRevision, done: make(chan struct{}),
+			})
+			proxy.sessions[sess.id] = sess
+			if tc.fill {
+				for sess.tryAcquireRequestSlot() { //nolint:revive // drain the pool: the next POST must meet a full one
+				}
+			}
+
+			var msg mcp.RPCMsg
+			if err := mcp.DecodeParams([]byte(tc.body), &msg); err != nil {
+				t.Fatalf("decoding the test message: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(tc.body)).
+				WithContext(pdp.WithJWTClaims(context.Background(), otherTask))
+			req.Header.Set(SessionHeader, sess.id)
+			proxy.handleSessionPost(httptest.NewRecorder(), req, route, sess.id, msg)
+
+			if got := sess.spansAnchors(); got != tc.want {
+				t.Errorf("spansAnchors() = %v, want %v — %s", got, tc.want, tc.notes)
+			}
+		})
+	}
 }
 
 // TestTaskAnchoredSession_SourceTaintIsVisibleToTheSamplingSink is the acceptance test for the

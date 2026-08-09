@@ -786,13 +786,13 @@ eunox cannot **route** has no verdict to downgrade, so it is still refused — i
 | Still refused in observe mode | Code | Why it is not downgraded |
 | --- | --- | --- |
 | The kill switch | `KILL_SWITCH` | An emergency stop that a mode flag could soften would not be one. |
-| A method absent from the MCP revision the host negotiated | `AUTHORIZATION_FAILED` | The revision's routing table holds no handler for it; forwarding it would be inventing a route, not observing one. |
-| A method this build dispatches under no revision | `AUTHORIZATION_FAILED` | Same — the fail-closed default, unchanged since before revision scoping. Covers a method nobody has heard of and one the negotiated revision mandates that eunox has not implemented yet. |
-| A method sent in a framing its revision does not dispatch | `AUTHORIZATION_FAILED` | A notification-only method sent as a request, or a locally-answered one sent as a notification. |
+| A method absent from the MCP revision the host negotiated | `UNROUTABLE_METHOD` | The revision's routing table holds no handler for it; forwarding it would be inventing a route, not observing one. |
+| A method this build dispatches under no revision | `UNROUTABLE_METHOD` | Same — the fail-closed default, unchanged since before revision scoping. Covers a method nobody has heard of and one the negotiated revision mandates that eunox has not implemented yet. |
+| A method sent in a framing its revision does not dispatch | `UNROUTABLE_METHOD` | A notification-only method sent as a request, or a locally-answered one sent as a notification. |
 | An *enforced* method sent in notification framing | `INVALID_REQUEST` | Forwarding it verbatim would bypass both the decision and the record. Refused separately, and it carries no marker. |
 | A protocol revision that cannot be established, or that disagrees with the context it arrived in | `UNSUPPORTED_PROTOCOL_VERSION` | There is no revision to route by; picking one would be a guess, and each way of guessing contradicts either the declaration or the leg eunox already opened. |
 
-The routing refusals — the three `AUTHORIZATION_FAILED` rows above, and only
+The routing refusals — the three `UNROUTABLE_METHOD` rows above, and only
 those — carry a `details._eunox_unroutable` object naming `reason` and the
 `revision` whose tables were consulted:
 
@@ -802,10 +802,12 @@ those — carry a `details._eunox_unroutable` object naming `reason` and the
 | `removed_in_revision` | The build dispatches it under some revision, but not the one the host negotiated. |
 | `framing_unmapped` | The method exists in the host's revision, but not in the framing it arrived in (a notification-only method sent as a request, or the reverse). |
 
-That marker is what keeps a discovery run honest: `AUTHORIZATION_FAILED` is a
-genuine policy code, and on a wiretap route no policy ran at all, so without it
-a tape of eunox's own refusals reads as the upstream's behavior. These records
-also name no policy target (`target` is left empty whenever the method resolves
+`UNROUTABLE_METHOD` is a code of its own rather than the `AUTHORIZATION_FAILED`
+these refusals used to record — a genuine policy code for a message no policy
+evaluated — so the tape distinguishes eunox's own routing from a policy block,
+and the class it carries is what keeps an observing route from downgrading it.
+The wire code stays `-32001`. The marker adds which of the three ways applied.
+These records also name no policy target (`target` is left empty whenever the method resolves
 a target type), so `eunox suggest` proposes nothing from them rather than
 drafting a capability for a resource named after the method.
 

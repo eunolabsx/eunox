@@ -217,7 +217,7 @@ func TestHTTPHandleKill_NonPOST(t *testing.T) {
 func TestHTTPHandleKill_NonPOST_NoToken(t *testing.T) {
 	t.Parallel()
 	sink, logPath := newTempAuditSink(t)
-	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken, sink: sink, preSessionDenies: newPreSessionDenyLimiter()}
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), controlToken: testControlToken, sink: sink, preSessionDenies: newRefusalRecordLimiter()}
 	req := httptest.NewRequest(http.MethodGet, "/control/kill", http.NoBody)
 	req.RemoteAddr = "127.0.0.1:9999"
 	req.Host = "127.0.0.1:9999" // loopback Host so loopbackOnly's DNS-rebinding guard passes
@@ -4557,8 +4557,8 @@ func TestHTTPHandleSessionPost_UnmappedNotificationDeniedAndRecorded(t *testing.
 	if rec == nil {
 		t.Fatalf("no deny record for the unmapped notification %q; records: %+v", method, recs)
 	}
-	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeAuthorizationFailed {
-		t.Errorf("denial_code = %q, want %q; record: %+v", code, capability.ErrCodeAuthorizationFailed, rec)
+	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnroutableMethod {
+		t.Errorf("denial_code = %q, want %q; record: %+v", code, capability.ErrCodeUnroutableMethod, rec)
 	}
 }
 
@@ -6461,7 +6461,7 @@ func killStatusForTest(t *testing.T, p *HTTPProxy) *killswitch.Status {
 func newTestHTTPProxy() *HTTPProxy {
 	return &HTTPProxy{
 		sessions:         make(map[string]*httpSession),
-		preSessionDenies: newPreSessionDenyLimiter(),
+		preSessionDenies: newRefusalRecordLimiter(),
 	}
 }
 

@@ -518,8 +518,8 @@ func TestAdv5_NewMethod_AuditRecordWritten(t *testing.T) {
 	if rec == nil {
 		t.Fatal("no audit record found for tools/execute")
 	}
-	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeAuthorizationFailed {
-		t.Errorf("audit record denial_code=%q, want %q", code, capability.ErrCodeAuthorizationFailed)
+	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnroutableMethod {
+		t.Errorf("audit record denial_code=%q, want %q", code, capability.ErrCodeUnroutableMethod)
 	}
 
 	if method, _ := rec["method"].(string); method != "tools/execute" {
@@ -542,8 +542,8 @@ func TestAdv5_NewMethod_Stdio_AuditRecordWritten(t *testing.T) {
 	if rec == nil {
 		t.Fatal("no stdio audit record found for tools/execute")
 	}
-	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeAuthorizationFailed {
-		t.Errorf("stdio audit record denial_code=%q, want %q", code, capability.ErrCodeAuthorizationFailed)
+	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnroutableMethod {
+		t.Errorf("stdio audit record denial_code=%q, want %q", code, capability.ErrCodeUnroutableMethod)
 	}
 	if method, _ := rec["method"].(string); method != "tools/execute" {
 		t.Errorf("stdio audit record method=%q, want %q", method, "tools/execute")
@@ -838,8 +838,8 @@ func TestUnmappedMethod_HTTP_Denied(t *testing.T) {
 
 	require.NotNil(t, result.Error, "expected JSON-RPC error for unmapped method")
 	assert.Equal(t, capability.JSONRPCCodeAuthorizationFailed, result.Error.Code,
-		"unmapped method must return -32001 (AUTHORIZATION_FAILED)")
-	assert.True(t, strings.HasPrefix(result.Error.Message, capability.ErrCodeAuthorizationFailed),
+		"unmapped method keeps the -32001 wire code its symbolic code split off from")
+	assert.True(t, strings.HasPrefix(result.Error.Message, capability.ErrCodeUnroutableMethod),
 		"error.message must begin with the symbolic code")
 	assert.Contains(t, result.Error.Message, "agents/delegate",
 		"error.message must name the denied method")
@@ -922,8 +922,8 @@ func TestUnmappedMethod_HTTP_LogsMethodName(t *testing.T) {
 	logged := buf.String()
 	assert.True(t, strings.Contains(logged, "agents/delegate"),
 		"method name must appear in log; got: %q", logged)
-	assert.True(t, strings.Contains(logged, "AUTHORIZATION_FAILED"),
-		"AUTHORIZATION_FAILED must appear in log; got: %q", logged)
+	assert.True(t, strings.Contains(logged, capability.ErrCodeUnroutableMethod),
+		"the routing refusal's own code must appear in the log; got: %q", logged)
 }
 
 // TestUnmappedMethod_HTTP_KnownMethodsUnaffected verifies that the known MCP methods
@@ -964,7 +964,7 @@ func TestUnmappedMethod_Stdio_Denied(t *testing.T) {
 	require.NotNil(t, result.Error, "expected JSON-RPC error for unmapped method in stdio mode")
 	assert.Equal(t, capability.JSONRPCCodeAuthorizationFailed, result.Error.Code,
 		"stdio: unmapped method must return -32001")
-	assert.True(t, strings.HasPrefix(result.Error.Message, capability.ErrCodeAuthorizationFailed),
+	assert.True(t, strings.HasPrefix(result.Error.Message, capability.ErrCodeUnroutableMethod),
 		"error.message must begin with the symbolic code")
 	assert.Contains(t, result.Error.Message, "agents/delegate",
 		"error.message must name the denied method")
@@ -990,8 +990,8 @@ func TestUnmappedMethod_Stdio_LogsMethodName(t *testing.T) {
 	logged := buf.String()
 	assert.True(t, strings.Contains(logged, "future/extension"),
 		"method name must appear in log; got: %q", logged)
-	assert.True(t, strings.Contains(logged, "AUTHORIZATION_FAILED"),
-		"AUTHORIZATION_FAILED must appear in log; got: %q", logged)
+	assert.True(t, strings.Contains(logged, capability.ErrCodeUnroutableMethod),
+		"the routing refusal's own code must appear in the log; got: %q", logged)
 }
 
 // TestDispatchList_NoPolicyUsesDenyAll covers the non-nil-PDP invariant: a route

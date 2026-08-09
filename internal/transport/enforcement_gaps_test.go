@@ -913,8 +913,8 @@ func TestStdioForwardHostNotification_UnmappedNotificationDeniedAndRecorded(t *t
 	if rec == nil {
 		t.Fatalf("expected a deny record for the unmapped notification %q", method)
 	}
-	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeAuthorizationFailed {
-		t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeAuthorizationFailed)
+	if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnroutableMethod {
+		t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeUnroutableMethod)
 	}
 }
 
@@ -2856,8 +2856,8 @@ func TestGapRevision_DispatchRequestPerRevisionUnmappedDenials(t *testing.T) {
 			if out.Error == nil {
 				t.Fatalf("%s under %s must be denied, got result %s", tc.method, tc.rev, out.Result)
 			}
-			if len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeAuthorizationFailed {
-				t.Fatalf("records = %+v, want one AUTHORIZATION_FAILED deny", rec.records)
+			if len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeUnroutableMethod {
+				t.Fatalf("records = %+v, want one UNROUTABLE_METHOD deny", rec.records)
 			}
 		})
 	}
@@ -2888,7 +2888,7 @@ func TestGapRevision_NotificationTablesPerRevision(t *testing.T) {
 		if denied != tc.wantDenied {
 			t.Errorf("%s under %s: denied = %v, want %v", tc.method, tc.rev, denied, tc.wantDenied)
 		}
-		if tc.wantDenied && (len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeAuthorizationFailed) {
+		if tc.wantDenied && (len(rec.records) != 1 || rec.records[0].code != capability.ErrCodeUnroutableMethod) {
 			t.Errorf("%s under %s: records = %+v, want the drop recorded", tc.method, tc.rev, rec.records)
 		}
 	}

@@ -77,6 +77,19 @@ on those paths already denies.
   until the next successful refresh, not until Redis itself recovers), so
   fail-closed deployments can shorten it with `--killswitch-reconcile-interval`
   to trade Redis load for a tighter post-recovery window.
+- **A client whose keyspace topology cannot be established is refused at
+  construction, and fail-open does not soften it.** The kill set is loaded by a
+  keyless `SCAN`, which reaches one server: a client that spreads the keyspace
+  must be enumerated per server or the reconciled cache holds a PARTIAL kill set
+  while `HealthStatus()` reports ready. `killswitch.NewRedis` classifies the
+  client by concrete type, so a decorator (a metrics or tracing wrapper) or a
+  custom `redis.Cmdable` proves nothing about what it fronts and latches
+  `ErrUnknownTopology`, which every reader and writer reports. A consumer that
+  knows what its wrapper wraps declares it with `WithSingleNodeKeyspace()` or
+  `WithShardFanOut(...)`. Fail-open is deliberately no escape: it trades
+  revocation for availability during a **transient** outage a reconcile heals,
+  and a wiring fault never does. Reachable only by a library consumer wiring the
+  backend directly — the shipped binary passes the `*redis.Client` it builds.
 - **Operators must still observe Redis health.** The kill switch exposes its last
   refresh error via `HealthStatus()`; the HTTP transport surfaces it on the
   loopback `/healthz` (`killSwitchHealthy`, `status: degraded`) and `/metrics`

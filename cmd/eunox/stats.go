@@ -120,8 +120,9 @@ type auditStatsSummary struct {
 	// it is the silent tolerance the report exists to prevent.
 	handlerFaults int
 	// unroutable counts eunox's OWN routing refusals per reason, and unroutableTotal their sum.
-	// Kept apart from the denial buckets because they carry a policy code for a message no
-	// policy evaluated — see addUnroutableDetails.
+	// Their code already says they are routing rather than policy; what this adds is the
+	// per-REASON split (which of the three ways) that a denial bucket keyed on the code alone
+	// cannot carry — see addUnroutableDetails.
 	unroutable      map[string]int
 	unroutableTotal int
 	other           int // records with a decision outside "allow" | "deny" | "escalate"
@@ -258,10 +259,10 @@ var unroutableProbe = []byte(audit.UnroutableKey)
 
 // addUnroutableDetails tallies refusals eunox's own routing produced, per reason.
 //
-// They record AUTHORIZATION_FAILED — a policy code — so on this summary they are otherwise
-// indistinguishable from a policy block, and on a wiretap route (where policy blocks nothing)
-// every one of them is one. Without this, the tool the --audit banner points an operator at
-// reports a discovery run's routing refusals as if the upstream or a policy had produced them.
+// Their code (UNROUTABLE_METHOD) says they are eunox's own routing rather than a policy block;
+// this breaks them down by REASON, which is the part that tells an operator whether a discovery
+// run met a method the peer's revision removed or one nobody has heard of. Without it, the tool
+// the --audit banner points an operator at reports them as an undifferentiated block count.
 func (s *auditStatsSummary) addUnroutableDetails(line []byte) {
 	if !bytes.Contains(line, unroutableProbe) {
 		return

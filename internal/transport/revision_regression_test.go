@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -381,9 +382,10 @@ func TestHonorabilityGate_CoversTheHostResponseFraming(t *testing.T) {
 			}, tc.line)
 			_ = sink.Close()
 
-			if got := up.messages(); len(got) != 0 {
-				t.Errorf("the response reached the upstream carrying a revision declaration the leg is not addressed as; got %+v", got)
-			}
+			// Exactly one message reaches the upstream, and it is eunox's own: the refused
+			// response is never relayed, but the request it would have answered is unblocked
+			// rather than left hanging (see takeRefusedServerReply).
+			assertUnblockedNotRelayed(t, up.messages(), mcp.RawJSON(`5`))
 			if got := p.hostRevision(); got != "" {
 				t.Errorf("pinned revision = %q, want unpinned — a response is dispatched by neither table", got)
 			}
@@ -395,6 +397,106 @@ func TestHonorabilityGate_CoversTheHostResponseFraming(t *testing.T) {
 				t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeUnsupportedProtocolVersion)
 			}
 		})
+	}
+}
+
+// assertUnblockedNotRelayed checks the two halves of what a refused host reply does to the
+// upstream leg: the reply itself is NOT relayed, and the request it would have answered is
+// answered by eunox instead of left blocked.
+func assertUnblockedNotRelayed(t *testing.T, up []mcp.RPCMsg, id *json.RawMessage) {
+	t.Helper()
+	if len(up) != 1 {
+		t.Fatalf("upstream messages = %+v, want exactly one — eunox's own answer, and never the refused reply", up)
+	}
+	answer := up[0]
+	if answer.Error == nil {
+		t.Fatalf("the upstream got %+v, want an error: a refused reply carries nothing eunox may relay", answer)
+	}
+	if answer.Result != nil || answer.Params != nil {
+		t.Errorf("the answer carries the host's own members (%+v); nothing the refused reply said may travel", answer)
+	}
+	if answer.Error.Code != capability.JSONRPCCodeEnforcementError {
+		t.Errorf("answer code = %d, want %d", answer.Error.Code, capability.JSONRPCCodeEnforcementError)
+	}
+	if got, want := string(*answer.ID), string(*id); got != want {
+		t.Errorf("answer id = %s, want %s — an answer on another id unblocks nothing", got, want)
+	}
+}
+
+// TestRefusedHostReply_UnblocksTheUpstreamOnBothTransports is the regression for a refused reply
+// leaving its initiator hanging.
+//
+// A host reply refused by negotiation is recorded and dropped: nothing goes to the host (JSON-RPC
+// forbids replying to a response) and, before this, nothing went to the upstream either — so the
+// server-initiated request it was answering stayed blocked, and its id stayed tracked, until
+// teardown. On stdio "until teardown" means until the host disconnects: that transport has no
+// idle reaper at all.
+//
+// Both transports are driven, because the two negotiation arms are separate code and the drop
+// they share is where the two conventions on this leg (answer the initiator, or leave it for the
+// kill's teardown) had to be told apart.
+func TestRefusedHostReply_UnblocksTheUpstreamOnBothTransports(t *testing.T) {
+	t.Parallel()
+	// A reply to a tracked server-initiated request, declaring a revision the upstream leg is not
+	// addressed as — the refusal the honorability gate makes reachable for this framing.
+	const line = `{"jsonrpc":"2.0","id":5,"result":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
+	var reply mcp.RPCMsg
+	if err := mcp.DecodeParams([]byte(line), &reply); err != nil {
+		t.Fatalf("decoding the reply: %v", err)
+	}
+
+	t.Run("stdio", func(t *testing.T) {
+		t.Parallel()
+		up := &blockingUpWriter{gate: make(chan struct{})}
+		close(up.gate)
+		p, _ := serveHostLines(t, stdioServe{
+			upSink: up,
+			setup:  func(p *StdioProxy) { p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard) },
+		}, line)
+		assertUnblockedNotRelayed(t, up.messages(), mcp.RawJSON(`5`))
+		if p.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`5`))) {
+			t.Error("the tracked id survived the refusal; it would sit in the tracker until the host disconnects")
+		}
+	})
+
+	t.Run("http", func(t *testing.T) {
+		t.Parallel()
+		var upBuf bytes.Buffer
+		route := &UpstreamRoute{name: "up1", pdp: pdp.AlwaysAllowPDP{}}
+		proxy := newTestHTTPProxy()
+		sess := newTestSession(&httpSession{
+			id: "live-sess", route: route, hostRev: handshakeRevision,
+			upWriter: mcp.NewMsgWriter(&upBuf), done: make(chan struct{}),
+		})
+		proxy.sessions[sess.id] = sess
+		sess.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard)
+
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(line))
+		req.Header.Set(SessionHeader, sess.id)
+		proxy.handleSessionPost(httptest.NewRecorder(), req, route, sess.id, reply)
+
+		var got mcp.RPCMsg
+		if err := mcp.DecodeParams(bytes.TrimSpace(upBuf.Bytes()), &got); err != nil {
+			t.Fatalf("the upstream got %q, which does not decode: %v", upBuf.String(), err)
+		}
+		assertUnblockedNotRelayed(t, []mcp.RPCMsg{got}, mcp.RawJSON(`5`))
+		if sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`5`))) {
+			t.Error("the tracked id survived the refusal")
+		}
+	})
+}
+
+// TestRefusedHostReply_LeavesAnUntrackedIdAlone: only a reply to a request THIS proxy issued
+// unblocks anything. A response naming an id the proxy never tracked is a stray message, and
+// answering the upstream on it would invent a failure for a request that is not there.
+func TestRefusedHostReply_LeavesAnUntrackedIdAlone(t *testing.T) {
+	t.Parallel()
+	up := &blockingUpWriter{gate: make(chan struct{})}
+	close(up.gate)
+	serveHostLines(t, stdioServe{upSink: up},
+		`{"jsonrpc":"2.0","id":404,"result":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`)
+	if got := up.messages(); len(got) != 0 {
+		t.Errorf("upstream messages = %+v, want none", got)
 	}
 }
 
@@ -513,10 +615,11 @@ func TestStdioNegotiation_PinIsWrittenOnce(t *testing.T) {
 // resolution the upstream leg cannot honor is the one case where the revision IS known — and
 // forwarding it is precisely the manufactured mismatched pair the refusal exists to prevent.
 //
-// What changes instead is that the refusal is LEGIBLE. Its code is AUTHORIZATION_FAILED, a
-// genuine policy code, on a route where policy denied nothing — so a discovery run's tape read
-// as the upstream's behavior. The marker says whose refusal it is, and which of the two ways it
-// was unroutable.
+// What changes instead is that the refusal is LEGIBLE and its resistance to the downgrade is
+// ENCODED. Its code (UNROUTABLE_METHOD) classifies as a fault, so Downgradable answers false for
+// it wherever it is asked — asserted below beside the behavior, because the behavior alone held
+// only while this path built no DenialInfo and so never reached isObserveDeny. The marker adds
+// which of the three ways the message was unroutable.
 func TestObserveMode_DoesNotDowngradeARoutingRefusal(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -563,6 +666,7 @@ func TestObserveMode_DoesNotDowngradeARoutingRefusal(t *testing.T) {
 			if got.auditOnly {
 				t.Error("the refusal was recorded as an OBSERVED denial; there was no policy verdict to observe")
 			}
+			assertRoutingRefusalCode(t, got.code)
 			assertUnroutableDetail(t, got.details, tc.rev, tc.wantReason)
 		})
 	}
@@ -585,7 +689,29 @@ func TestObserveMode_MarksTheNotificationFramedRefusalToo(t *testing.T) {
 	if len(rec.records) != 1 {
 		t.Fatalf("records = %+v, want exactly one", rec.records)
 	}
+	assertRoutingRefusalCode(t, rec.records[0].code)
 	assertUnroutableDetail(t, rec.records[0].details, capability.Revision20251125, audit.UnroutableFramingUnmapped)
+}
+
+// assertRoutingRefusalCode holds the routing refusal's resistance to an observing route's
+// downgrade where it actually lives — in the code's CLASS — rather than only in the behavior the
+// two tests above drive.
+//
+// Both of those exercise the path as it is wired today, which builds no DenialInfo and so never
+// asks. Routing the fail-closed default through the shared deny path is the obvious cleanup, and
+// the moment someone does it, this is the assertion standing between --audit and a proxy
+// forwarding messages it has no route for.
+func assertRoutingRefusalCode(t *testing.T, code string) {
+	t.Helper()
+	if code != capability.ErrCodeUnroutableMethod {
+		t.Errorf("denial code = %q, want %q", code, capability.ErrCodeUnroutableMethod)
+	}
+	if (&capability.DenialInfo{Code: code}).Downgradable() {
+		t.Errorf("a denial coded %q reports itself downgradable; an observing route would forward a message nothing could route", code)
+	}
+	if !IsInfraDenialCode(code) {
+		t.Errorf("code %q is not infrastructure, so `eunox suggest` would mine a routing refusal as a policy signal", code)
+	}
 }
 
 // assertUnroutableDetail checks the routing-refusal marker's shape, since a SIEM rule matches

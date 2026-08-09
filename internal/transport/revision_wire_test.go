@@ -59,9 +59,13 @@ func TestOldRevisionWire_ProxyAnsweredResponsesAreByteStable(t *testing.T) {
 			want: `{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"read_file","description":"d"}]}}`,
 		},
 		{
+			// The one line here that has moved since revision scoping: the routing refusal's
+			// symbolic code split off from AUTHORIZATION_FAILED, which it used to borrow, so
+			// that its CLASS could say no policy evaluated the message. The JSON-RPC integer a
+			// host branches on is deliberately unchanged.
 			name: "unmapped method",
 			msg:  mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "agents/delegate"},
-			want: `{"jsonrpc":"2.0","id":4,"error":{"code":-32001,"message":"AUTHORIZATION_FAILED: target \"agents/delegate\"","data":{"code":"AUTHORIZATION_FAILED","target":"agents/delegate"}}}`,
+			want: `{"jsonrpc":"2.0","id":4,"error":{"code":-32001,"message":"UNROUTABLE_METHOD: target \"agents/delegate\"","data":{"code":"UNROUTABLE_METHOD","target":"agents/delegate"}}}`,
 		},
 	}
 	for _, tc := range cases {

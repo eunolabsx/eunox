@@ -170,6 +170,11 @@ type StdioProxy struct {
 	// episode into one record carrying the elided-refusal count. Zero value usable.
 	hostSaturation saturationGate
 
+	// refusalLimiter bounds the refusal records this transport's host can drive directly —
+	// today catRevision alone, the one refusal HTTP already meters. nil (a proxy assembled by a
+	// bare struct literal) records unbounded, as the HTTP sibling's nil does.
+	refusalLimiter *categoryRecordLimiter
+
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
 	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
 	// server-initiated request to it rather than running the handler inline — see
@@ -349,6 +354,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
+		refusalLimiter:        newRefusalRecordLimiter(),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -1221,10 +1227,11 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 	pinned := p.hostRevision()
 	rev, err := resolveHostRevision(pinned, p.upstreamRev, msg)
 	if err != nil {
-		resp := refuseHostRevision(ctx, p.rec(), p.sessionID, pinned, msg, err)
+		resp := refuseHostRevision(ctx, p.revisionRefusalRecorder(), p.sessionID, pinned, msg, err)
 		if msg.IsRequest() {
 			_ = p.hostWriter.Write(resp)
 		}
+		p.unblockRefusedServerReply(msg)
 		return ctx, false
 	}
 	// Guarded on the pin being UNSET. It is write-once by construction — resolveHostRevision
@@ -1234,6 +1241,44 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 		p.hostRev.Store(rev)
 	}
 	return capability.WithProtocolRevision(ctx, rev), true
+}
+
+// unblockRefusedServerReply answers the upstream request a revision-refused host reply would have
+// completed, so it does not stay blocked until the host disconnects — this transport has no idle
+// reaper to reclaim it. See takeRefusedServerReply for which drops answer the initiator.
+//
+// The writer is tested BEFORE the tracked id is consumed: taking it is what makes the reply
+// unroutable by any later path, so consuming one there is nothing to answer with strands the
+// initiator worse than leaving it alone.
+func (p *StdioProxy) unblockRefusedServerReply(msg mcp.RPCMsg) {
+	if p.upWriter == nil {
+		// Unreachable today (connectUpstream runs before serveHost on this goroutine), and
+		// reported rather than dropped for the reason its HTTP sibling reports it.
+		if msg.IsResponse() {
+			_, _ = fmt.Fprintf(p.errOut(),
+				"[eunox] WARNING: a refused host reply left a server-initiated request unanswered: no upstream writer\n")
+		}
+		return
+	}
+	if answer, unblocked := takeRefusedServerReply(&p.serverReqs, msg); unblocked {
+		_ = p.upWriter.Write(answer)
+	}
+}
+
+// revisionRefusalRecorder returns the recorder the -32022 refusal writes through, or nil when
+// the catRevision bucket suppressed this one — refuseHostRevision writes nothing for a nil
+// recorder, so the peer is refused either way and only the tape write is bounded.
+//
+// Bounded here at all because this transport has no bucket of its own otherwise; why THIS
+// refusal and not the routing one is argued once, on catRevision. The one fact local to stdio:
+// both the recorder and the limiter are nil in a bare-struct-literal proxy, which records
+// unbounded rather than not at all.
+func (p *StdioProxy) revisionRefusalRecorder() auditRecorder {
+	rec := p.rec()
+	if rec == nil || p.refusalLimiter == nil {
+		return rec
+	}
+	return admitRefusalRecord(rec, p.refusalLimiter, catRevision)
 }
 
 // hostRevision returns the revision this connection's context resolved, or "" before a message

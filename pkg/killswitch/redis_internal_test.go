@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/eunolabs/eunox/internal/redisutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -575,8 +576,11 @@ func TestScanPrefix_VisitsEveryShard(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = ring.Close() })
 
+	// Through NewRedis, not a bare literal: the topology is resolved once at construction, so
+	// the constructor is where a Ring becomes a fan-out and driving the internals around it
+	// would assert against a state production never builds.
 	found := map[string]bool{}
-	require.NoError(t, (&Redis{client: ring}).scanPrefix(context.Background(), redisSessionPfx, found))
+	require.NoError(t, NewRedis(ring).scanPrefix(context.Background(), redisSessionPfx, found))
 	assert.True(t, found["sess-a"] && found["sess-b"],
 		"a keyless SCAN reached %v, not both shards; the kill set loaded from one server of several would report healthy while missing every kill on the others", found)
 }
@@ -622,6 +626,182 @@ func TestNilClient_EveryEntryPointFailsClosedRatherThanPanicking(t *testing.T) {
 			assert.ErrorIs(t, statusErr, ErrNilClient)
 		})
 	}
+}
+
+// TestUnknownTopology_FailsClosedRatherThanServingAPartialKillSet is the regression for a
+// backend that could not know it was answering from one shard of several.
+//
+// A decorator (a metrics or tracing wrapper) around a CLUSTER client is invisible to a
+// concrete-type match: nilness said "not nil", the topology said "no iterator", and the keyless
+// SCAN that loads the kill set therefore ran against one server. Sessions whose keys hashed
+// elsewhere were absent from the reconciled cache, ShouldBlock answered "not killed" for every
+// one of them, and HealthStatus reported ready — an operator issuing `eunox kill` got `{"ok":true}`
+// while this instance never learned of it. Fail-open, on the emergency stop, silently.
+//
+// Every reader reports the cause now, which is the Manager contract: a backend that cannot
+// confirm its kill set does not serve an all-clear. Fail-OPEN does not soften it, for
+// ErrNilClient's reason — it trades revocation for availability during a transient outage, and a
+// wiring fault never heals.
+func TestUnknownTopology_FailsClosedRatherThanServingAPartialKillSet(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	inner, mr := newRawTestClient(t)
+	require.NoError(t, mr.Set(redisSessionPfx+"sess-1", "1"))
+
+	r := NewRedis(hookedTestClient{Cmdable: inner}, WithFailOpen(true))
+	r.Start(ctx)
+	defer r.Stop()
+
+	blocked, err := r.ShouldBlock(ctx, "agent", "sess-1")
+	assert.False(t, blocked)
+	assert.ErrorIs(t, err, ErrUnknownTopology,
+		"a backend that cannot establish which servers hold its keyspace must report that from every reader rather than answering not-killed")
+	assert.ErrorIs(t, r.HealthStatus(), ErrUnknownTopology)
+	assert.ErrorIs(t, r.ActivateGlobal(ctx), ErrUnknownTopology)
+	assert.ErrorIs(t, r.KillSession(ctx, "sess"), ErrUnknownTopology)
+	assert.ErrorIs(t, r.Reset(ctx), ErrUnknownTopology)
+	_, statusErr := r.Status(ctx)
+	assert.ErrorIs(t, statusErr, ErrUnknownTopology)
+}
+
+// TestDeclaredTopology_IsTheEscapeHatchTheRefusalNeeds: the refusal above is only tolerable
+// because a consumer that knows what its wrapper wraps can say so. Both declarations are
+// exercised, since a wrapper may front either shape.
+func TestDeclaredTopology_IsTheEscapeHatchTheRefusalNeeds(t *testing.T) {
+	t.Parallel()
+	t.Run("single node", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		inner, mr := newRawTestClient(t)
+		require.NoError(t, mr.Set(redisSessionPfx+"sess-1", "1"))
+
+		r := NewRedis(hookedTestClient{Cmdable: inner}, WithSingleNodeKeyspace())
+		r.Start(ctx)
+		defer r.Stop()
+		require.NoError(t, r.HealthStatus(), "a declared topology must leave the backend usable")
+
+		blocked, err := r.ShouldBlock(ctx, "", "sess-1")
+		require.NoError(t, err)
+		assert.True(t, blocked, "the declared single-node SCAN must load the kill set")
+	})
+
+	t.Run("sharded", func(t *testing.T) {
+		t.Parallel()
+		shardA, shardB := miniredis.RunT(t), miniredis.RunT(t)
+		require.NoError(t, shardB.Set(redisSessionPfx+"sess-b", "1"))
+		ring := redis.NewRing(&redis.RingOptions{
+			Addrs:       map[string]string{"a": shardA.Addr(), "b": shardB.Addr()},
+			DialTimeout: 200 * time.Millisecond,
+		})
+		t.Cleanup(func() { _ = ring.Close() })
+
+		// The declared iterator is the Ring's own, which is what a consumer wrapping one would
+		// hand over — the kill on the second shard is invisible without it.
+		r := NewRedis(hookedTestClient{Cmdable: ring}, WithShardFanOut(ring.ForEachShard))
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		r.Start(ctx)
+		defer r.Stop()
+
+		blocked, err := r.ShouldBlock(ctx, "", "sess-b")
+		require.NoError(t, err)
+		assert.True(t, blocked, "the declared fan-out must visit every shard, not whichever one a keyless SCAN reached")
+	})
+
+	// A nil iterator is not a way to spell "single node": that declaration has its own name, and
+	// adopting the single-node path here would be the silent assumption the refusal exists to
+	// prevent, reached by an argument a caller got wrong.
+	t.Run("a nil fan-out declares nothing", func(t *testing.T) {
+		t.Parallel()
+		inner, _ := newRawTestClient(t)
+		r := NewRedis(hookedTestClient{Cmdable: inner}, WithShardFanOut(nil))
+		assert.ErrorIs(t, r.HealthStatus(), ErrUnknownTopology)
+	})
+}
+
+// TestNilClient_OutranksTheTopologyRefusal: a nil client has no topology, so reporting the
+// derived cause would send an operator looking for a wrapper that is not there.
+func TestNilClient_OutranksTheTopologyRefusal(t *testing.T) {
+	t.Parallel()
+	r := NewRedis(nil, WithSingleNodeKeyspace())
+	assert.ErrorIs(t, r.HealthStatus(), ErrNilClient)
+}
+
+// TestDeclaredTopology_CannotOverrideWhatTheClientItselfEstablishes is the regression for the
+// escape hatch becoming the fail-open it was added to close.
+//
+// A declaration applied unconditionally would discard a classified client's real fan-out and
+// latch nothing: `NewRedis(clusterClient, WithSingleNodeKeyspace())` — the obvious reaction to
+// meeting ErrUnknownTopology somewhere else — would scan one master, commit that as the whole
+// kill set, answer "not killed" for every session hashed elsewhere, and report HealthStatus ready.
+// A declaration therefore fills an UNKNOWN topology and is refused when it contradicts a known
+// one; agreeing with it is accepted and changes nothing.
+func TestDeclaredTopology_CannotOverrideWhatTheClientItselfEstablishes(t *testing.T) {
+	t.Parallel()
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}})
+	t.Cleanup(func() { _ = cluster.Close() })
+	single, _ := newRawTestClient(t)
+
+	t.Run("single-node declared over a sharded client", func(t *testing.T) {
+		t.Parallel()
+		r := NewRedis(cluster, WithSingleNodeKeyspace())
+		assert.ErrorIs(t, r.HealthStatus(), ErrTopologyContradicted,
+			"a declaration that discards a real fan-out must refuse, not win: obeying it serves one shard's kill set as complete")
+		assert.NotNil(t, r.shardFanOut, "the classified iterator must survive a refused declaration")
+	})
+
+	t.Run("sharded declared over a single-node client", func(t *testing.T) {
+		t.Parallel()
+		r := NewRedis(single, WithShardFanOut(cluster.ForEachMaster))
+		assert.ErrorIs(t, r.HealthStatus(), ErrTopologyContradicted, "the mirror case refuses too")
+	})
+
+	t.Run("a declaration agreeing with the client is accepted", func(t *testing.T) {
+		t.Parallel()
+		r := NewRedis(single, WithSingleNodeKeyspace())
+		markStarted(t, r)
+		assert.NoError(t, r.HealthStatus(), "restating what the type already says is redundant, not a conflict")
+		assert.Nil(t, r.shardFanOut)
+	})
+}
+
+// TestResolvedTopology_AgreesWithItsIterator: whatever settles the topology — the client's type
+// or a declaration — must leave the pair consistent, since forEachNode reads the iterator while
+// every refusal reads the topology.
+func TestResolvedTopology_AgreesWithItsIterator(t *testing.T) {
+	t.Parallel()
+	single, _ := newRawTestClient(t)
+	ring := redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000"}})
+	t.Cleanup(func() { _ = ring.Close() })
+
+	for name, r := range map[string]*Redis{
+		"classified single node": NewRedis(single),
+		"classified sharded":     NewRedis(ring),
+		"declared single node":   NewRedis(hookedTestClient{Cmdable: single}, WithSingleNodeKeyspace()),
+		"declared sharded":       NewRedis(hookedTestClient{Cmdable: ring}, WithShardFanOut(ring.ForEachShard)),
+		"unresolved":             NewRedis(hookedTestClient{Cmdable: single}),
+	} {
+		if got := r.shardFanOut != nil; got != (r.topology == redisutil.TopologySharded) {
+			t.Errorf("%s: topology = %s with an iterator = %v; a sharded backend without a fan-out (or the reverse) enumerates the wrong set of servers",
+				name, r.topology, got)
+		}
+	}
+}
+
+// hookedTestClient is the production shape the topology refusal is about: a decorator with
+// nothing overridden, so every command is the embedded client's and only the TYPE differs.
+type hookedTestClient struct{ redis.Cmdable }
+
+// newRawTestClient returns a live client against a fresh miniredis, plus the server, for a test
+// that must wrap the client rather than take newTestRedis's assembled *Redis.
+func newRawTestClient(t *testing.T) (*redis.Client, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), DialTimeout: 200 * time.Millisecond})
+	t.Cleanup(func() { _ = client.Close() })
+	return client, mr
 }
 
 func TestRedis_KillAndReviveAgent(t *testing.T) {
@@ -1234,6 +1414,17 @@ func TestRedis_HandlePubSubMessage_AllKnownPayloads(t *testing.T) {
 
 var errBoom = errors.New("boom")
 
+// newDoubleRedis wires a TEST DOUBLE — a fake Cmdable, or a decorator wrapping a real client —
+// as a single-node backend.
+//
+// NewRedis classifies by concrete type and refuses what it cannot place (ErrUnknownTopology),
+// and a double is exactly that shape: the same shape as the production decorator the refusal
+// exists for. Every double here stands in for ONE server, so each declares it rather than being
+// exempted — which also keeps the escape hatch itself exercised by the whole suite.
+func newDoubleRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
+	return NewRedis(client, append([]RedisOption{WithSingleNodeKeyspace()}, opts...)...)
+}
+
 // fakeCmdable implements just enough of redis.Cmdable for refreshState, Reset,
 // and deleteByPrefix. The embedded nil interface satisfies the rest of the
 // (large) Cmdable surface; any unexpected call would panic, which keeps the
@@ -1304,7 +1495,7 @@ func (f *publishFailFake) Publish(_ context.Context, _ string, _ interface{}) *r
 // cache still reflects the kill (fail-closed on the issuing instance).
 func TestRedis_KillSession_PublishErrorPropagates(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&publishFailFake{pubErr: errBoom})
+	r := newDoubleRedis(&publishFailFake{pubErr: errBoom})
 
 	err := r.KillSession(context.Background(), "sess-1")
 	if !errors.Is(err, errBoom) {
@@ -1325,7 +1516,7 @@ func TestRedis_KillSession_PublishErrorPropagates(t *testing.T) {
 // whatever publish returns.
 func TestRedis_ActivateGlobal_PublishErrorPropagates(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&publishFailFake{pubErr: errBoom})
+	r := newDoubleRedis(&publishFailFake{pubErr: errBoom})
 
 	err := r.ActivateGlobal(context.Background())
 	if !errors.Is(err, errBoom) {
@@ -1344,7 +1535,7 @@ func TestRedis_ActivateGlobal_PublishErrorPropagates(t *testing.T) {
 // the same write-then-publish pattern.
 func TestRedis_DeactivateGlobal_PublishErrorPropagates(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&publishFailFake{pubErr: errBoom})
+	r := newDoubleRedis(&publishFailFake{pubErr: errBoom})
 	r.mu.Lock()
 	r.globalActive = true
 	r.mu.Unlock()
@@ -1367,7 +1558,7 @@ func TestRedis_DeactivateGlobal_PublishErrorPropagates(t *testing.T) {
 // unexercised for revive until now.
 func TestRedis_ReviveSession_PublishErrorPropagates(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&publishFailFake{pubErr: errBoom})
+	r := newDoubleRedis(&publishFailFake{pubErr: errBoom})
 	r.mu.Lock()
 	r.killedSessions["sess-1"] = true
 	r.mu.Unlock()
@@ -1386,7 +1577,7 @@ func TestRedis_ReviveSession_PublishErrorPropagates(t *testing.T) {
 
 func TestRedis_RefreshState_GetError(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&fakeCmdable{getErr: errBoom})
+	r := newDoubleRedis(&fakeCmdable{getErr: errBoom})
 	if err := r.refreshState(context.Background()); !errors.Is(err, errBoom) {
 		t.Errorf("expected Get error to propagate, got %v", err)
 	}
@@ -1398,7 +1589,7 @@ func TestRedis_RefreshState_GetError(t *testing.T) {
 func TestRedis_RefreshState_AgentScanError(t *testing.T) {
 	t.Parallel()
 	// Get succeeds (global active); the agent-prefix SCAN fails.
-	r := NewRedis(&fakeCmdable{getVal: "1", scanErrFor: redisAgentPrefix})
+	r := newDoubleRedis(&fakeCmdable{getVal: "1", scanErrFor: redisAgentPrefix})
 	if err := r.refreshState(context.Background()); !errors.Is(err, errBoom) {
 		t.Errorf("expected agent SCAN error to propagate, got %v", err)
 	}
@@ -1407,7 +1598,7 @@ func TestRedis_RefreshState_AgentScanError(t *testing.T) {
 func TestRedis_RefreshState_SessionScanError(t *testing.T) {
 	t.Parallel()
 	// Get + agent SCAN succeed; the session-prefix SCAN fails.
-	r := NewRedis(&fakeCmdable{getVal: "1", scanErrFor: redisSessionPfx})
+	r := newDoubleRedis(&fakeCmdable{getVal: "1", scanErrFor: redisSessionPfx})
 	if err := r.refreshState(context.Background()); !errors.Is(err, errBoom) {
 		t.Errorf("expected session SCAN error to propagate, got %v", err)
 	}
@@ -1415,7 +1606,7 @@ func TestRedis_RefreshState_SessionScanError(t *testing.T) {
 
 func TestRedis_RefreshState_Success(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&fakeCmdable{
+	r := newDoubleRedis(&fakeCmdable{
 		getVal:   "1",
 		scanKeys: []string{redisAgentPrefix + "a1"},
 	})
@@ -1435,7 +1626,7 @@ func TestRedis_RefreshState_Success(t *testing.T) {
 func TestRedis_Reset_AgentDeleteScanError(t *testing.T) {
 	t.Parallel()
 	// Global DEL succeeds; the agent-prefix SCAN inside deleteByPrefix fails.
-	r := NewRedis(&fakeCmdable{scanErrFor: redisAgentPrefix})
+	r := newDoubleRedis(&fakeCmdable{scanErrFor: redisAgentPrefix})
 	if err := r.Reset(context.Background()); !errors.Is(err, errBoom) {
 		t.Errorf("expected agent deleteByPrefix error, got %v", err)
 	}
@@ -1444,7 +1635,7 @@ func TestRedis_Reset_AgentDeleteScanError(t *testing.T) {
 func TestRedis_Reset_SessionDeleteScanError(t *testing.T) {
 	t.Parallel()
 	// Global DEL + agent deleteByPrefix succeed; session-prefix SCAN fails.
-	r := NewRedis(&fakeCmdable{scanErrFor: redisSessionPfx})
+	r := newDoubleRedis(&fakeCmdable{scanErrFor: redisSessionPfx})
 	if err := r.Reset(context.Background()); !errors.Is(err, errBoom) {
 		t.Errorf("expected session deleteByPrefix error, got %v", err)
 	}
@@ -1453,7 +1644,7 @@ func TestRedis_Reset_SessionDeleteScanError(t *testing.T) {
 func TestRedis_DeleteByPrefix_DelError(t *testing.T) {
 	t.Parallel()
 	// SCAN returns a key so DEL is attempted; DEL fails.
-	r := NewRedis(&fakeCmdable{
+	r := newDoubleRedis(&fakeCmdable{
 		scanKeys: []string{redisAgentPrefix + "a1"},
 		delErr:   errBoom,
 	})
@@ -1465,7 +1656,7 @@ func TestRedis_DeleteByPrefix_DelError(t *testing.T) {
 func TestRedis_Reset_Success(t *testing.T) {
 	t.Parallel()
 	// Everything succeeds: DEL global, both prefix scans return a key + DEL ok.
-	r := NewRedis(&fakeCmdable{scanKeys: []string{redisAgentPrefix + "a1"}})
+	r := newDoubleRedis(&fakeCmdable{scanKeys: []string{redisAgentPrefix + "a1"}})
 	// Seed some in-memory state so we can confirm Reset clears it.
 	r.mu.Lock()
 	r.globalActive = true
@@ -1638,7 +1829,7 @@ func (f *resetRaceFake) Publish(_ context.Context, _ string, _ interface{}) *red
 // trailing refreshState re-reads Redis and re-seeds it.
 func TestRedis_Reset_ReseedsRacedKill(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&resetRaceFake{agentID: "victim"})
+	r := newDoubleRedis(&resetRaceFake{agentID: "victim"})
 	markStarted(t, r) // Reset is an admin op on an already-started switch
 
 	if err := r.Reset(context.Background()); err != nil {
@@ -1704,7 +1895,7 @@ func TestRedis_Reset_TrailingReseedIgnoresCanceledCallerContext(t *testing.T) {
 	callCtx, callCancel := context.WithCancel(context.Background())
 	defer callCancel()
 
-	r := NewRedis(&cancelDuringResetFake{cancelFn: callCancel})
+	r := newDoubleRedis(&cancelDuringResetFake{cancelFn: callCancel})
 	r.Start(context.Background()) // seeds runCtx, independent of callCtx
 	defer r.Stop()
 
@@ -1756,7 +1947,7 @@ func (f *pubsubResetFake) Scan(_ context.Context, _ uint64, match string, _ int6
 // until the next reconcile tick.
 func TestRedis_HandlePubSubMessage_Reset_RefreshesFromRedis(t *testing.T) {
 	t.Parallel()
-	r := NewRedis(&pubsubResetFake{agentID: "victim"})
+	r := newDoubleRedis(&pubsubResetFake{agentID: "victim"})
 	// Start launches the drainRefreshTrigger goroutine that now runs the
 	// reset-triggered SCAN asynchronously. Stop tears it down.
 	r.Start(context.Background())
@@ -1943,7 +2134,7 @@ func TestRedis_RefreshState_DoesNotEraseConcurrentKill(t *testing.T) {
 	t.Cleanup(func() { _ = base.Close() })
 
 	hc := &genRaceClient{Cmdable: base}
-	r := NewRedis(hc)
+	r := newDoubleRedis(hc)
 	markStarted(t, r) // refreshState's gen-race logic on a started switch
 
 	hc.hook = func() {
@@ -2002,7 +2193,7 @@ func TestRedis_RefreshState_Serialized(t *testing.T) {
 	t.Cleanup(func() { _ = base.Close() })
 
 	sc := &serialScanClient{Cmdable: base}
-	r := NewRedis(sc)
+	r := newDoubleRedis(sc)
 	markStarted(t, r)
 
 	const n = 6
@@ -2060,7 +2251,7 @@ func TestRedis_Stop_WaitsForConcurrentStart(t *testing.T) {
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	r := NewRedis(bc)
+	r := newDoubleRedis(bc)
 
 	go r.Start(context.Background())
 
@@ -2171,7 +2362,7 @@ func TestRedis_Start_KillDuringSnapshotWindowIsObserved(t *testing.T) {
 
 	// A long reconcile interval ensures the kill can only be observed via the
 	// pub/sub path established before the snapshot, not by a periodic re-read.
-	ks := NewRedis(wc, WithReconcileInterval(time.Hour))
+	ks := newDoubleRedis(wc, WithReconcileInterval(time.Hour))
 	ks.Start(context.Background())
 	defer ks.Stop()
 

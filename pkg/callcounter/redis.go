@@ -98,8 +98,9 @@ type ServerInfoReader interface {
 }
 
 // CheckServerNotClustered refuses a single-node client aimed at a node of a Redis Cluster.
-// It is the SERVER-side half of the refusal redisutil.ShardIterator makes client-side: an
-// ordinary *redis.Client passes every type check and still cannot run AdmitAll's multi-key EVAL.
+// It is the SERVER-side half of the refusal redisutil.ClassifyTopology makes client-side: an
+// ordinary *redis.Client is classified single-node and still cannot run AdmitAll's multi-key
+// EVAL when the server behind it is a cluster node.
 //
 // It reads `INFO cluster` — not `CLUSTER INFO`, whose reply carries no cluster_enabled field
 // at all (that lives only in INFO's Cluster section), and which a standalone server refuses
@@ -131,9 +132,12 @@ func NewRedis(client redis.Cmdable, opts ...redisOption) (*Redis, error) {
 	if redisutil.IsNilClient(client) {
 		return nil, fmt.Errorf("callcounter: nil Redis client (got %T)", client)
 	}
-	// "Spreads the keyspace" IS "there is a per-server iterator for it": one list, below both
-	// backends, so this refusal and pkg/killswitch's fan-out cannot disagree about a client shape.
-	if redisutil.ShardIterator(client) != nil {
+	// One classification, below both backends, so this refusal and pkg/killswitch's fan-out
+	// cannot disagree about a client shape. An UNRECOGNIZED type (a decorator, a consumer's own
+	// Cmdable) is admitted here, unlike in the kill switch: this counter's failure on a sharding
+	// client is a CROSSSLOT at the first multi-bucket admission, which fails closed and is mapped
+	// back to this same error, so the residual is loud rather than a silent over-admission.
+	if topology, _ := redisutil.ClassifyTopology(client); topology == redisutil.TopologySharded {
 		return nil, fmt.Errorf("%w (got %T)", ErrClusterUnsupported, client)
 	}
 	var b [8]byte

@@ -302,7 +302,7 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
 	// resolution — see recordPreSessionDeny. The stderr line is gated on the SAME admission
 	// verdict as the record, for the reason given on requireJSONContentType's stderr gate above.
-	if admitted := p.recordPreSessionDeny(r, "ORIGIN_REJECTED", catOrigin, details); admitted {
+	if admitted := p.recordPreSessionDeny(r, codeOriginRejected, catOrigin, details); admitted {
 		if multiple {
 			_, _ = fmt.Fprintf(p.errOut(),
 				"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
@@ -422,17 +422,11 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 		// that has a tape. (Unlike recordRefusal, no stderr line rides on this verdict.)
 		return nil
 	}
-	// A nil limiter beside a live sink is a construction bug and panics like one, exactly
-	// as in recordRefusal: a "defensive" fallback here would write kill records with no
-	// bound at all, which is the fail-open this function exists to close.
-	admitted, suppressed := p.preSessionDenies.admit(catKill)
-	if !admitted {
-		return nil
-	}
-	if suppressed == 0 {
-		return rec
-	}
-	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+	// A nil limiter beside a live sink is a construction bug and panics inside
+	// admitRefusalRecord like one, exactly as in recordRefusal: a "defensive" fallback here
+	// would write kill records with no bound at all, which is the fail-open this function
+	// exists to close.
+	return admitRefusalRecord(rec, p.preSessionDenies, catKill)
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's
@@ -447,14 +441,7 @@ func (p *HTTPProxy) preSessionAudienceRecorder(route *UpstreamRoute) auditRecord
 	if rec == nil {
 		return nil
 	}
-	admitted, suppressed := p.preSessionDenies.admit(catAudience)
-	if !admitted {
-		return nil
-	}
-	if suppressed == 0 {
-		return rec
-	}
-	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+	return admitRefusalRecord(rec, p.preSessionDenies, catAudience)
 }
 
 // rolledUpRecorder folds a suppressed-refusal rollup into the details of the one record it

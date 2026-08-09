@@ -50,7 +50,7 @@ Section conventions:
   prototype-registry pattern `pkg/capability`'s `TokenSince` established. Removal
   across revisions is expressed by **absence**: a method outside the requesting
   peer's table falls to the same fail-closed default (`dispatchUnmapped`,
-  `AUTHORIZATION_FAILED`, recorded) that already covers unknown methods, so there
+  `UNROUTABLE_METHOD`, recorded) that already covers unknown methods, so there
   is no second removal mechanism to keep in step with the first. A method declared
   without revision membership fails the build. Concretely, for a peer on
   2026-07-28: `initialize`, `ping`, `resources/subscribe`, `resources/unsubscribe`
@@ -306,6 +306,37 @@ Section conventions:
 
 ### Changed
 
+- **The fail-closed routing refusal has its own denial code, `UNROUTABLE_METHOD`.** A method no
+  routing table can route — unknown to this build, removed by the requesting peer's revision, or
+  arrived in a framing that revision does not dispatch — recorded `AUTHORIZATION_FAILED`, a
+  genuine POLICY code for a message no policy evaluated. So `ClassifyDenialCode` called it a
+  policy verdict and `DenialInfo.Downgradable()` answered yes for it; what actually kept
+  `--audit` from forwarding a message it has no route for was that this path builds no
+  `DenialInfo` and so never asks. The new code classifies as a FAULT, which makes the refusal
+  resist an observing route's downgrade wherever it is asked, and makes
+  `transport.IsInfraDenialCode` answer true rather than `eunox suggest` skipping these records
+  only because their `target` happens to be blank. **BREAKING (audit tape + wire data):** the
+  symbolic code changes for every unmapped-method denial in both framings — on the record's
+  `denial_code`, in `error.data.code`, and in the `error.message` prefix. A SIEM rule matching
+  `AUTHORIZATION_FAILED` for unmapped-method probes must add `UNROUTABLE_METHOD`; rules keyed on
+  the JSON-RPC integer need no change, since it stays `-32001`. `details._eunox_unroutable`
+  (`{reason, revision}`) is unchanged and still names which of the three ways applied.
+- **`killswitch.NewRedis` refuses a Redis client whose keyspace topology it cannot establish.**
+  The kill set is loaded by a keyless `SCAN`, which reaches ONE server, so a client that spreads
+  the keyspace must be enumerated per server. Topology was matched on the concrete type, and
+  "recognized single node" and "not recognized" were the same answer — so a decorator (a metrics
+  or tracing wrapper) around a cluster client scanned one shard, `ShouldBlock` answered
+  "not killed" for every session whose key hashed elsewhere, and `HealthStatus` reported ready.
+  Fail-open, silent, on the emergency stop. The classification is three-valued now, and an
+  unclassifiable client latches `ErrUnknownTopology` — reported by every reader and writer, and
+  fail-closed regardless of `--killswitch-fail-open`, since a wiring fault never heals.
+  `WithSingleNodeKeyspace()` / `WithShardFanOut(...)` are the declaration a consumer that knows
+  what its wrapper wraps supplies; a declaration that CONTRADICTS a client whose own type is
+  recognized is refused (`ErrTopologyContradicted`) rather than honored, so the escape hatch
+  cannot reintroduce the partial kill set. `pkg/callcounter` deliberately keeps admitting an
+  unrecognized client: its failure on a sharding one is a loud, fail-closed `CROSSSLOT`.
+  **BREAKING for a library consumer** wiring the Redis kill switch behind a decorator; the
+  shipped binary passes the `*redis.Client` it builds and is unaffected.
 - **Two JWT capability-claim refusals are reclassified from policy verdicts to faults.** The
   claim-condition path has SEVEN arms that refuse without ever evaluating the condition — no
   request to check against, a handler that cannot be run ahead of the decision (it commits
@@ -322,15 +353,16 @@ Section conventions:
   decided whether an observing route forwarded. **Operator-visible twice:** the wire code moves
   from `-32003` to `-32603` and the symbolic code a SIEM rule matches changes with it, and an
   observing deployment starts BLOCKING these where it forwarded.
-- **The go-redis topology helpers moved to `internal/redisutil`.** `ShardFanOut` and
-  `ShardIterator` answer a pure go-redis question that both Redis backends ask, and hosting them
-  in `pkg/callcounter` made `pkg/killswitch`'s backend link that package's EVAL scripts and
-  instance-id machinery for a twelve-line type switch — and put the next topology question in a
-  package with no reason to know a keyless SCAN exists. They now live below both consumers, with
-  the invariant verbatim: one list, `ShardIterator(c) != nil` IS "does it shard", so "shards but
-  has no iterator" stays unrepresentable. `ErrClusterUnsupported` stays in `callcounter`, where
-  the reason for the refusal lives. Affects importers of `pkg/callcounter.ShardIterator` /
-  `ShardFanOut` only; nothing in the binary's behavior changes.
+- **The go-redis topology helpers moved to `internal/redisutil`.** `ShardFanOut` and the
+  topology classification answer a pure go-redis question that both Redis backends ask, and
+  hosting them in `pkg/callcounter` made `pkg/killswitch`'s backend link that package's EVAL
+  scripts and instance-id machinery for a twelve-line type switch — and put the next topology
+  question in a package with no reason to know a keyless SCAN exists. They now live below both
+  consumers as one call — `ClassifyTopology` returns the topology and, for a sharding client,
+  the per-server iterator together, so "shards but has no iterator" stays unrepresentable.
+  `ErrClusterUnsupported` stays in `callcounter`, where the reason for the refusal lives.
+  Affects importers of `pkg/callcounter.ShardIterator` / `ShardFanOut` only; nothing in the
+  binary's behavior changes.
 - **A refusal's CLASS is derived from its code, and engine faults stop being labelled as
   policy verdicts.** Whether a deny blocks or is downgraded to an audit-mode forward was
   decided by three independent things: the denial's code (for the kill switch), a hand-set
@@ -1139,6 +1171,39 @@ Section conventions:
 
 ### Fixed
 
+- **A host reply refused by revision negotiation left the upstream's request blocked.** Making
+  the honorability gate framing-aware made a host RESPONSE refusable, and a refused one was
+  recorded and dropped: nothing to the host (JSON-RPC forbids replying to a response) and
+  nothing to the upstream, whose `sampling/createMessage` stayed blocked and whose tracked id
+  stayed held until teardown — on stdio, which has no idle reaper, until the host disconnects.
+  Both transports now untrack it and answer the initiator with eunox's own `-32603`, relaying
+  nothing the host said. The revocation drop on the same leg still does not answer, and the rule
+  separating them is stated once: a protocol refusal answers, an emergency stop leaves the
+  request to be reclaimed with the session. A reply refused by the session-owner/audience gate
+  does not answer either — that gate refused the SENDER, so consuming the tracked id on their
+  behalf would let a second identity abort the real owner's pending reply.
+- **One un-dispatchable frame permanently disabled sampling for an HTTP session.** On a
+  task-anchored route the sticky task-anchor span was latched before the framing branches, so a
+  POST that is neither request, notification nor response (no id and no method, which decodes
+  fine) — or a reply whose id the proxy never issued — set it on the way to being answered
+  `202`, and `spansAnchors` then refused every later `sampling/createMessage` on that connection
+  for the session's life. The latch now runs only for an ENFORCED request past every gate that
+  could still refuse it, which is the same predicate the decision turn takes: nothing else
+  commits anchored state for the sampling leg to peek past.
+- **The stdio transport meters its protocol-revision refusal records.** The `-32022` refusal was
+  the only record stdio's serve loop wrote with no bound of any kind — on the goroutine that is
+  also the only one routing host replies back to a blocked upstream — while the HTTP proxy has
+  metered the identical refusal under its `revision` category all along. A suppressed record
+  folds into the next admitted one's `suppressed_refusal_count`, so the tally survives. The
+  routing refusal stays unmetered on both transports, now as a stated decision: reaching it
+  needs a peer whose ordinary traffic writes policy DENY records at the same one-per-message
+  cost, and a policy verdict may never be admission-controlled.
+- **`transport.IsInfraDenialCode` answers for `ORIGIN_REJECTED` and `JWT_INVALID`.** The two
+  pre-session refusal codes written as bare literals rather than constants were the family's
+  only members the classifier did not cover, so an unauthenticated Origin probe and a rejected
+  bearer token were reported as POLICY denials on the exported seam. `eunox suggest` skipped
+  them anyway because their target is blank — the same accident the routing refusal's own code
+  was split off to remove — so no mining behavior changes.
 - **The stdio revision pin reads the dispatch tables, so the wedge CLASS is closed and not just
   one instance of it.** The pin latched from a message whose METHOD the resolved revision has,
   which is not the same question as "is this a message the proxy will act on" — revision

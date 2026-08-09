@@ -47,7 +47,7 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 			// Record a stable error_type CATEGORY, never the raw err.Error(): the go-jose
 			// message can disclose claim values, the accepted algorithm, or key-rotation
 			// state, and audit logs are commonly forwarded to third-party SIEMs.
-			p.recordPreSessionDeny(r, "JWT_INVALID", catJWT, map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
+			p.recordPreSessionDeny(r, codeJWTInvalid, catJWT, map[string]interface{}{"error_type": pdp.ClassifyJWTError(err)})
 			w.Header().Set("WWW-Authenticate", buildWWWAuthenticate(authHeader != "", p.oauthMetaURL))
 			// Do not echo the validation error to the caller for the same fingerprinting
 			// reason; the category is preserved in the JWT_INVALID record above instead.
@@ -372,25 +372,26 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// 202, matching the kill-switch notification path — the host cannot act on a body,
 			// and a JSON-RPC error body would omit the id (RPCMsg.ID is json:"id,omitempty")
 			// under an implicit 200, indistinguishable from success to a status-only client.
+			//
+			// A dropped RESPONSE deliberately does NOT unblock its initiator here, unlike the
+			// revision refusal below (takeRefusedServerReply): this gate refused the SENDER, not
+			// the message, so consuming the tracked id on their behalf would let a second
+			// identity that learned this session id abort the real owner's pending reply. The
+			// upstream waits for the owner's, or for teardown.
 			w.WriteHeader(http.StatusAccepted)
 		}
 		return
 	}
-	// Note which state anchor this request resolved. On a task-anchored route a session may
-	// legitimately span tasks, and every host request is decided, keyed and serialized on
-	// its OWN anchor — but the server-initiated leg has no host request in scope, so the
-	// session records the span here and that leg refuses for the rest of its life. See
-	// httpSession.noteRequestAnchor. Placed here (a write) rather than in the check-only
-	// session-gate verdict, one of whose callers runs under the session-registry lock.
 	// Negotiate FIRST: every table below is revision-scoped, so resolving after the lookup
-	// would route by one table and record under another — and a refused message must not have
-	// written session state on its way to being refused (noteRequestAnchor latches a span for
-	// the session's life, which would outlive a request that was never dispatched).
+	// would route by one table and record under another.
 	rev, ok := p.negotiateHostRevision(w, r, route, sess.leg(), msg)
 	if !ok {
+		// A refused host RESPONSE would have answered a request the upstream is blocked on.
+		// Unblock it rather than let it hang: a protocol refusal is not an emergency stop, and
+		// eunox answers with its own error at its own revision — see unblockRefusedServerReply.
+		sess.unblockRefusedServerReply(msg)
 		return
 	}
-	sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
 	// The stamped context is the ONE carrier of the decided revision from here down: the
 	// tables route by it and the tape records it, so neither can name a revision the other
 	// did not. Stamped inline rather than returned already-stamped because contextcheck
@@ -547,6 +548,16 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// whose Add(1) the drain missed observes the deletion here and fails closed instead.
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: session torn down; retry"))
 			return
+		}
+		// Note the state anchor this request resolves, on the same predicate the turn below
+		// takes: an ENFORCED method is the only one that commits anchored state for the
+		// server-initiated leg to peek past, and this is the last point before the decision
+		// where the request can still be refused without one. See httpSession.noteRequestAnchor
+		// — the latch is sticky for the session's life, so every gate that can still refuse
+		// must sit above it. It is a write, which is why it is not in the check-only
+		// session-gate verdict, one of whose callers runs under the session-registry lock.
+		if isEnforcedMethod(ctx, msg.Method) {
+			sess.noteRequestAnchor(pdp.JWTClaimsPtr(r.Context()))
 		}
 		d := p.dispatchParams(sess, p.sourceIP(r))
 		// Serialize the decision phase for a flow-/sequenceBlock-relevant route, so a
@@ -1119,7 +1130,7 @@ type hostLeg struct {
 // answer `initialize`, so a declaration naming any other revision contradicts the context and
 // is refused UNSUPPORTED_PROTOCOL_VERSION. stdio has no such arm — its first message may
 // legitimately declare any revision, since a peer there need never handshake — so the identical
-// line resolves, is dropped by the fail-closed routing default as AUTHORIZATION_FAILED, and
+// line resolves, is dropped by the fail-closed routing default as UNROUTABLE_METHOD, and
 // (see StdioProxy.negotiateHostRevision) does not pin the connection on its way out.
 func sessionlessLeg() hostLeg { return hostLeg{contextRev: handshakeRevision} }
 
@@ -1221,12 +1232,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	if p.preSessionDenies == nil {
 		return rec
 	}
-	admitted, suppressed := p.preSessionDenies.admit(catRevision)
-	if !admitted {
-		return nil
-	}
-	if suppressed == 0 {
-		return rec
-	}
-	return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+	return admitRefusalRecord(rec, p.preSessionDenies, catRevision)
 }

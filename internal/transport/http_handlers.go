@@ -84,6 +84,13 @@ const (
 	// codeUnsupportedMediaType marks a POST body refused because its Content-Type was absent,
 	// duplicated, or not application/json — a content-type sweep is attack signal.
 	codeUnsupportedMediaType = "UNSUPPORTED_MEDIA_TYPE"
+	// codeOriginRejected marks a request refused by the Origin allowlist (DNS-rebinding gate),
+	// and codeJWTInvalid a request whose bearer token failed validation. Both were bare literals
+	// at their one call site each, which is how they came to be the two members of this family
+	// IsInfraDenialCode did not answer for: `eunox suggest` skips them only because their target
+	// is blank, the same accident the routing refusal's own code was split off to remove.
+	codeOriginRejected = "ORIGIN_REJECTED"
+	codeJWTInvalid     = "JWT_INVALID"
 )
 
 // MethodControlKill is the audit `method` stamped on a successful /control/kill activation.
@@ -102,11 +109,12 @@ const (
 // policy decision. Consumers mining the audit tape for policy signals skip these.
 func IsInfraDenialCode(code string) bool {
 	// The codes the DENIAL VOCABULARY itself classifies as non-policy — an emergency stop, the
-	// strict-audit gate, a revision that could not be established, an engine/backend fault —
-	// are asked of it rather than listed again here. Three of those four were listed by hand,
-	// which is how the fourth came to be missing: an engine fault names the target of a call
-	// policy never decided, and mining it fabricates a deny-only suggestion for a capability
-	// nothing refused.
+	// strict-audit gate, a revision that could not be established, a message nothing could
+	// route, an engine/backend fault — are asked of it rather than listed again here. Several
+	// were listed by hand, which is how one came to be missing: an engine fault names the target
+	// of a call policy never decided, and mining it fabricates a deny-only suggestion for a
+	// capability nothing refused. The routing refusal was the mirror case, skipped only because
+	// its target happens to be blank rather than because any code said it was non-policy.
 	if capability.ClassifyDenialCode(code) != capability.DenialClassPolicy {
 		return true
 	}
@@ -116,7 +124,8 @@ func IsInfraDenialCode(code string) bool {
 		// would fabricate a phantom target like "tool:tools/call". Deliberately NOT keyed on
 		// capability.ErrCodeInvalidParams, which is a real policy denial suggest must keep seeing.
 		return true
-	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType:
+	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType,
+		codeOriginRejected, codeJWTInvalid:
 		// Non-policy refusals recorded before/independent of a PDP decision. None names a
 		// policy target, so mining them would fabricate a phantom-target suggestion.
 		return true

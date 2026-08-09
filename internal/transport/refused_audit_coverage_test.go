@@ -386,7 +386,7 @@ func (failingKillSwitch) Status(context.Context) (*killswitch.Status, error) {
 // denial code with two shapes depending on which cap the flood happened to hit.
 func TestSessionCapDeny_CarriesRouteStamp(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
-	proxy := &HTTPProxy{sink: sink, preSessionDenies: newPreSessionDenyLimiter()}
+	proxy := &HTTPProxy{sink: sink, preSessionDenies: newRefusalRecordLimiter()}
 	route := &UpstreamRoute{
 		name: "github",
 		sink: &routeSink{sink: sink, upstream: "github", policyVersion: "1.2.3", policySHA256: "sha256:abc"},
@@ -778,7 +778,7 @@ func TestDecodeStrictJSON_RouteStampedWhenRouteIsKnown(t *testing.T) {
 	proxy := &HTTPProxy{
 		sessions:           make(map[string]*httpSession),
 		sink:               sink,
-		preSessionDenies:   newPreSessionDenyLimiter(),
+		preSessionDenies:   newRefusalRecordLimiter(),
 		allowedOriginHosts: buildAllowedOriginHosts(""),
 		routes:             map[string]*UpstreamRoute{"github": route},
 	}
