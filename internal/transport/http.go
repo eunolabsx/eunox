@@ -247,7 +247,12 @@ type HTTPProxy struct {
 	// preSessionDenies bounds the rate of transport-level refusal records — the only audit
 	// writes an unauthenticated caller can trigger, else a lever on --require-audit=strict.
 	preSessionDenies *categoryRecordLimiter
-	trustFwdFor      bool
+	// noticeLimiter bounds the stderr DIAGNOSTIC a refusal writes beside its record. Proxy-wide
+	// rather than per leg, and separate from the record buckets above, because a leg that meters no
+	// record (an established session's kill records are deliberately unbounded) still owes a bound
+	// on a write syscall per refused frame. See refusalNoticeRatePerSec.
+	noticeLimiter *recordRateLimiter
+	trustFwdFor   bool
 	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under trustFwdFor,
 	// the immediate TCP peer must match one before X-Forwarded-For is honored — see sourceIP.
 	trustedProxyNets []*net.IPNet
@@ -426,6 +431,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		afterListen:        opts.AfterListen,
 		authTimingKey:      newAuthTimingKey(),
 		preSessionDenies:   newRefusalRecordLimiter(),
+		noticeLimiter:      newRefusalNoticeLimiter(),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
 		trustedProxyHops:   opts.TrustedProxyHops,
@@ -750,4 +756,20 @@ func (p *HTTPProxy) refusalRecordLimiter() *categoryRecordLimiter {
 		return nil
 	}
 	return p.preSessionDenies
+}
+
+// refusalNoticeLimiter is this proxy's stderr-notice admission control, nil-safe for the same
+// bare-struct-literal session refusalRecordLimiter is.
+func (p *HTTPProxy) refusalNoticeLimiter() *recordRateLimiter {
+	if p == nil {
+		return nil
+	}
+	return p.noticeLimiter
+}
+
+// refusalLimits pairs this proxy's two admission controls for a leg whose refusal RECORDS are
+// bounded — the pre-session arm and the established session's own. The leg that meters no record
+// (routeRefusalRecorders) takes the notice bucket alone.
+func (p *HTTPProxy) refusalLimits() refusalLimits {
+	return refusalLimits{records: p.refusalRecordLimiter(), notices: p.refusalNoticeLimiter()}
 }

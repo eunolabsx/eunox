@@ -1052,3 +1052,45 @@ func benchmarkDecisionTurn(b *testing.B, tier turnTier) {
 		}
 	})
 }
+
+// BenchmarkRefusalRecorders_ForCategory is the number behind forCategory's map probe, which is on
+// every refusal record's recorder resolution and was worth measuring rather than removing: the
+// disposition is read from refusalDeclarations at resolution time, and a pre-resolved per-leg table
+// would be a second copy of the answer this package exists to have one of. The exempt arm is the
+// probe alone; the metered arm adds the bucket the probe selects.
+func BenchmarkRefusalRecorders_ForCategory(b *testing.B) {
+	recs := refusalLimits{records: newRefusalRecordLimiter()}.recorders(&fwdRecorder{})
+	for name, cat := range map[string]refusalCategory{"exempt": catUnroutable, "metered": catKill} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = recs.forCategory(cat)
+			}
+		})
+	}
+}
+
+// BenchmarkServerRequestUnblocker_Build is the per-request wiring cost on the server-initiated leg.
+//
+// The leg is not hot — a server-initiated request implies a human-facing round trip (an LLM
+// completion, a roots prompt) — so the numbers are here to be read rather than defended. What this
+// pins is the shape: an unblocker is built by every site that wants the TRACKER (once per forwarded
+// request) and by every site that wants to ANSWER, and the writer it hands out is a method value
+// bound through initiatorWriter's reflection. Resolving that writer lazily is what keeps the
+// tracker-only holders — the common case, since a healthy session displaces nothing — from paying
+// for a writer nothing calls.
+func BenchmarkServerRequestUnblocker_Build(b *testing.B) {
+	p := &StdioProxy{upWriter: mcp.NewMsgWriter(io.Discard)}
+	b.Run("tracker only", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = p.unblocker().reqs
+		}
+	})
+	b.Run("with writer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = p.unblocker().writeUpstream()
+		}
+	})
+}

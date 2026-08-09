@@ -445,7 +445,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
 		gate := hostNotificationGate{
-			recorders:   routeRefusalRecorders(route),
+			recorders:   p.routeRefusalRecorders(route),
 			subject:     verifiedSession(sessionID),
 			established: true,
 			audit:       route.audit,
@@ -1241,5 +1241,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	return refusalRecorders{rec: rec, limiter: p.preSessionDenies}.forCategory(catRevision)
+	return p.refusalLimits().recorders(rec).forCategory(catRevision)
 }

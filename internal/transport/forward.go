@@ -409,7 +409,7 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 			fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, code, "", detail, false)
 		}
 	})
-	return mcp.ErrorResponse(msg.ID, rpcCode, reason)
+	return refusalError(msg.ID, rpcCode, reason)
 }
 
 // declassifyRefusalDetail reports, for a call refused BELOW the decision, that an approved
@@ -750,6 +750,24 @@ func refusalResponse(id *json.RawMessage, code, conditionType, target, argument 
 	return denialResult(id, code, conditionType, target, argument)
 }
 
+// refusalError is refusalResponse for the core's other two refusal exits, whose host-facing answer
+// is a plain JSON-RPC error rather than a denial envelope: the upstream-transport failure and the
+// fail-closed redaction failure. The rule is stated on refusalResponse; this applies it to the
+// shape those two build.
+//
+// They are unreachable for a no-id message today, but only because the one caller that passes one
+// also removes the upstream (see forwardParams.callUpstream) — two independent facts nothing
+// couples, and the natural next step of folding the smuggled-notification reject into this core
+// would arrive with a live upstream and reach both. The core's sixth host-facing exit, the ALLOW
+// tail, deliberately stays as it is: there a real upstream response exists to relay, and discarding
+// it is the caller's business rather than a refusal to withhold.
+func refusalError(id *json.RawMessage, code int, message string) mcp.RPCMsg {
+	if id == nil {
+		return mcp.RPCMsg{}
+	}
+	return mcp.ErrorResponse(id, code, message)
+}
+
 // normalizeDenial returns a non-nil DenialInfo for a deny decision. A third-party PDP could
 // implement PolicyDecisionPoint with a nil Denial; dereferencing it would panic the request
 // goroutine (fail-open-via-crash), so substitute a generic AUTHORIZATION_FAILED denial.
@@ -888,7 +906,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
 				}
 			})
-			return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "internal error: response redaction failed")
+			return refusalError(msg.ID, jsonRPCCodeInternalError, "internal error: response redaction failed")
 		}
 		upResp.Result = redacted
 	}
@@ -979,13 +997,15 @@ const (
 // must stay an unverified detail. A bare string parameter here is exactly the shape that lets a
 // raw Mcp-Session-Id header become a signed assertion.
 //
+// It carries no recorder: refuseUnroutable resolves its own from the refusalRecorders it is handed,
+// which is what keeps one producer from having two provenances for one record.
+//
 // strict is threaded rather than left zero even though the routing refusal hard-denies above the
 // strict-audit gate today. The whole point of routing both framings through one producer is that
 // they cannot diverge; a params struct that silently drops the field re-introduces the divergence
 // one zero value at a time, and the request-framed twin carries the leg's real state.
-func refusalForwardParams(rec auditRecorder, subj killSubject, auditMode bool, strict strictAuditState, errOut io.Writer) forwardParams {
+func refusalForwardParams(subj killSubject, auditMode bool, strict strictAuditState, errOut io.Writer) forwardParams {
 	return forwardParams{
-		rec:              rec,
 		audit:            auditMode,
 		sessionID:        subj.auditSessionID(),
 		strictAuditState: strict,
@@ -1020,17 +1040,22 @@ func refusalForwardParams(rec auditRecorder, subj killSubject, auditMode bool, s
 //
 // The committer is nil: this refusal runs no decision, so there is none to commit and no decision
 // point that could be the wrong one.
-func refuseUnroutable(ctx context.Context, fp forwardParams, subj killSubject, msg mcp.RPCMsg, framing string) mcp.RPCMsg {
+//
+// recs is the leg's refusal wiring, and BOTH halves of this refusal come out of it: the record's
+// recorder (resolved against catUnroutable's declaration) and the admission verdict on the stderr
+// notice. The two used to be reasoned about with one standard — the record's exemption, argued from
+// a policy verdict never being metered, was read as covering a diagnostic line that is not a verdict
+// and that no policy DENY writes. fp's own rec is REPLACED rather than read, because this producer
+// has two entry points and letting each supply an already-resolved sink is what left the
+// request-framed one ungoverned by refusalDeclarations entirely.
+func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorders, subj killSubject, msg mcp.RPCMsg, framing string) mcp.RPCMsg {
 	// Kill-switch checks run at each caller's boundary, so a killed session is reported as
 	// KILL_SWITCH before reaching here. msg.Method is attacker-controlled; sanitize once and reuse
 	// for both the stderr line and the host-facing denial. The structured audit field stays raw
 	// (JSON-encoding already escapes control runes).
 	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
 	identifier, method := auditIdentity(msg)
-	// Unmetered by DECLARATION (catUnroutable), not by omission — see refusalDeclarations. The
-	// notification gate resolves its own recorder against that declaration; this is the
-	// request-framed site, which is handed one already resolved.
-	fp.rec = unmeteredRecorder(fp.rec, catUnroutable)
+	fp.rec = recs.forCategory(catUnroutable)
 	fp.callUpstream = nil
 	dec := capability.EnforceResponse{
 		Decision: capability.DecisionDeny,
@@ -1049,11 +1074,30 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, subj killSubject, m
 	// Record-before-act: the core writes the audit record, then the stderr notice follows, so a
 	// crash between the two never leaves a SIEM alert with no corresponding audit trail entry.
 	resp := enforcedForwardCore(ctx, fp, nil, msg, dec, method, identifier, sanitizedMethod, "method", false, nil)
-	_, _ = fmt.Fprintf(fp.errOutOrStderr(),
-		"[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded\n",
-		framing, sanitizedMethod,
-	)
+	// The BOUNDED half. An unbuffered write syscall per refused frame is what a peer looping
+	// `{"jsonrpc":"2.0","method":"x/bogus"}` drives at its full send rate — no id, no handler slot,
+	// no upstream round trip — and nothing bounded it: it is the same order of cost as the whole
+	// denial envelope this path stopped building for that framing (~600ns to /dev/null, more to a
+	// pipe or a terminal), spent per frame at the peer's rate. Elided lines are counted into the
+	// next one rather than lost, so an operator watching stderr still sees the rate; the RECORD
+	// above is unbounded by declaration, so nothing a SIEM reads is elided either way.
+	if admitted, suppressed := recs.admitNotice(); admitted {
+		_, _ = fmt.Fprintf(fp.errOutOrStderr(),
+			"[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded%s\n",
+			framing, sanitizedMethod, suppressedNoticeSuffix(suppressed),
+		)
+	}
 	return resp
+}
+
+// suppressedNoticeSuffix reports how many diagnostic lines were elided since the last one written,
+// or "" when none were — so a bounded notice reads exactly as the unbounded one did in the common
+// case and names the flood when there is one.
+func suppressedNoticeSuffix(suppressed uint64) string {
+	if suppressed == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d further such notices suppressed)", suppressed)
 }
 
 // hasRedactFieldsObligation reports whether obligs carries a redactFields directive with at
@@ -1141,6 +1185,13 @@ type serverRequestParams struct {
 	// rather than nil-called; each transport supplies its unblocker's writer, never a closure over
 	// a concrete one (a nil *mcp.MsgWriter panics on use). See writeToInitiator.
 	writeUpstream func(mcp.RPCMsg) error
+	// refusalLimits (embedded) is this leg's admission control over the record a DESTROYED answer
+	// writes. rec above is the sink for this leg's policy records and is never metered; these bound
+	// only the transport refusal beside them. See refusalAnswer.
+	refusalLimits
+	// leg names this transport's refusal-answering site on that record. Zero on a params struct
+	// built by hand (tests), which records the drop with no leg named rather than not at all.
+	leg transportLeg
 	// decideLock serializes the sampling decision against host-path decisions on the same
 	// anchor when the policy is flow-relevant, since this path runs on the upstream-reader
 	// goroutine outside the host decision turn and could otherwise peek the flow set
@@ -1173,12 +1224,27 @@ func (fp serverRequestParams) errOutOrStderr() io.Writer {
 	return resolvedErrOut(fp.errOut)
 }
 
-// answerInitiator sends reply to the blocked upstream initiator through the shared nil-writer
-// disposition. Every denial arm below answers AFTER its audit record, which is what makes a
-// nil-receiver panic here worse than a lost answer: it leaves a tape recording a denial the process
-// died delivering.
-func (fp serverRequestParams) answerInitiator(reply mcp.RPCMsg, what string) {
-	writeToInitiator(fp.writeUpstream, fp.errOut, reply, what)
+// answerInitiator sends reply to the blocked upstream initiator through the shared refusal-answer
+// seam, which reports a destroyed answer to the tape as well as to stderr. Every denial arm below
+// answers AFTER its audit record, which is what makes a nil-receiver panic here worse than a lost
+// answer: it leaves a tape recording a denial the process died delivering.
+//
+// method rides along because the drop record names the request rather than the refusal — see
+// refusalAnswer for why the refusal's own record is not that account.
+func (fp serverRequestParams) answerInitiator(ctx context.Context, reply mcp.RPCMsg, what, method string) {
+	fp.refusalAnswer().answer(ctx, reply, what, method)
+}
+
+// refusalAnswer is this leg's wiring for answering a refused initiator, shared in shape with the
+// pool's saturation arm so the two cannot report a destroyed answer differently.
+func (fp serverRequestParams) refusalAnswer() refusalAnswer {
+	return refusalAnswer{
+		write:  fp.writeUpstream,
+		recs:   fp.recorders(fp.rec),
+		subj:   verifiedSession(fp.sessionID),
+		leg:    fp.leg,
+		errOut: fp.errOut,
+	}
 }
 
 // samplingTurnWait bounds how long the server-initiated leg waits for the decision turn. BOTH
@@ -1302,7 +1368,7 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 	// a crash between the two can't leave the upstream answered with no matching record.
 	fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeAuditUnavailable, "",
 		mergeAuditDetails(detail, decisionDetail(dec)), false)
-	fp.answerInitiator(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, capability.ErrCodeAuditUnavailable), answerStrictAuditRefusal)
+	fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, capability.ErrCodeAuditUnavailable), answerStrictAuditRefusal, method)
 	warnStrictAuditOnce(fp.errOutOrStderr(), fp.strictAuditWarned, reason)
 	return true
 }
@@ -1368,7 +1434,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			if fp.rec != nil {
 				fp.rec.RecordDeny(ctx, fp.sessionID, msg.Method, msg.Method, denial.Code, denial.ConditionType, nil, false)
 			}
-			fp.answerInitiator(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerRevokedServerRequest)
+			fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerRevokedServerRequest, msg.Method)
 			return
 		}
 		// --require-audit=strict gates non-sampling server-initiated requests too: a degraded
@@ -1429,7 +1495,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 				mergeAuditDetails(denial.Details, decisionDetail(dec)), false)
 		}
-		fp.answerInitiator(mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerPolicyRefusal)
+		fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerPolicyRefusal, samplingMethod)
 		return
 	}
 	// Strict mode gates the audit-mode observe forward too — an unrecorded observation has no

@@ -31,16 +31,17 @@ var meteringCallSites = map[string]struct {
 	// readsDeclaration marks a resolver that applies whichever disposition the category DECLARES
 	// (refusalRecorders.forCategory) rather than a fixed one. Such a site cannot contradict a
 	// declaration — that is the whole point of it — so only the naming half is checked and
-	// implements is ignored. It is the shape that closes the gap unmeteredRecorder structurally
-	// could not: a leg that resolved one recorder for every arm handed the metered kill recorder
-	// to two arms whose categories declare themselves exempt, and a no-op marker function has no
-	// way to notice.
+	// implements is ignored. It is the shape that closed the gap the retired unmeteredRecorder
+	// marker structurally could not: a leg that resolved one recorder for every arm handed the
+	// metered kill recorder to two arms whose categories declare themselves exempt, and a no-op
+	// marker that returns what it is handed has no way to notice — an auditRecorder carries no
+	// provenance. With the routing refusal's request framing resolving through forCategory too,
+	// nothing is left for the marker to mark.
 	readsDeclaration bool
 }{
 	"admitRefusalRecord":   {categoryArg: 2, implements: meteringMetered},
 	"recordRefusal":        {categoryArg: 4, implements: meteringMetered},
 	"recordPreSessionDeny": {categoryArg: 2, implements: meteringMetered},
-	"unmeteredRecorder":    {categoryArg: 1, implements: meteringExempt},
 	"forCategory":          {categoryArg: 0, readsDeclaration: true},
 }
 

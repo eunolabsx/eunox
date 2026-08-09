@@ -1,10 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// Admission control over refusal records whose write rate a caller (not the policy) sets:
-// transport refusals taken before or beside a policy decision (recordRateLimiter) and
-// pool-saturation refusals (saturationGate). No policy ALLOW/DENY record is ever
-// admission-controlled.
+// Admission control over the writes a refusal makes at a rate a caller (not the policy) sets:
+// the RECORDS of transport refusals taken before or beside a policy decision (recordRateLimiter)
+// and of pool-saturation refusals (saturationGate), and the stderr NOTICE a refusal writes beside
+// its record. No policy ALLOW/DENY record is ever admission-controlled.
 //
 // Which refusals are metered and which are deliberately not is a DECLARATION, not prose: every
 // category carries one in refusalDeclarations, an exempt one carries its reason, and a table test
@@ -12,6 +12,12 @@
 // survey behind it was incomplete — the routing refusal's exemption was argued in a comment while
 // the smuggling refusal beside it, equally unmetered and equally cheap, had no recorded judgment
 // either way.
+//
+// The two halves of one refusal are bounded SEPARATELY and for different reasons: a record may be
+// exempt because it is a verdict, and a stderr line is never a verdict (see
+// exemptBecausePolicyDenyCostsTheSame and refusalNoticeRatePerSec). They were reasoned about with
+// one standard applied to both, which left the cheapest refusal in the tree writing an unbuffered
+// syscall per frame while its record was argued exempt.
 
 package transport
 
@@ -119,6 +125,15 @@ const (
 	// one, so an upstream issuing them faster than the host answers turns an unbounded audit-write
 	// rate loose for as long as it likes.
 	catDisplaced refusalCategory = "displaced_server_request"
+	// catRefusalUndeliverable bounds the record for a server-initiated request eunox REFUSED whose
+	// answer never reached the initiator (see refusalAnswer). Its own bucket rather than
+	// catServerRequestFailed's, for the reason catUnroutableID has one: the two are not equally
+	// cheap to reach. That record needs a TRACKED request and a host that stopped reading, while
+	// this one needs neither — an upstream that closes its stdin and keeps emitting requests on
+	// stdout drives one per request, refused and undeliverable at its own send rate — so sharing a
+	// bucket would let the cheaper flood suppress the record that says a live in-flight request was
+	// lost.
+	catRefusalUndeliverable refusalCategory = "undeliverable_server_refusal"
 )
 
 // refusalMetering is a refusal category's DECLARED disposition. The zero value is "undeclared",
@@ -151,27 +166,51 @@ type refusalDeclaration struct {
 // a verdict elided is a verdict an incident responder does not have. Metering these would lower no
 // ceiling; it would only make the cheapest way to fill the queue the one that leaves the better
 // tape.
+//
+// SCOPE, because the argument was read wider than it holds: it covers the RECORD. The second clause
+// is what carries it, and a stderr line is not a verdict — nor does a policy DENY write one, so the
+// first clause does not carry it either. The routing refusal's own diagnostic is therefore bounded
+// on refusalNoticeRatePerSec rather than inheriting this, which is how it came to be the one place
+// in the tree where an unauthenticated peer drives an unbuffered write syscall per frame.
 const exemptBecausePolicyDenyCostsTheSame = "reaching it needs a peer whose ordinary traffic writes policy DENY records at the same one-per-message cost, and a policy verdict may never be metered"
+
+// The stderr NOTICE budget, on its own rather than a share of the record aggregate above: a notice
+// is not a record, so it neither spends that budget nor may it divide it. Sized for an operator
+// watching a terminal — a couple of lines a second names the drift or the flood, and every line
+// this elides is counted into the next one rather than lost, so the notice never under-states what
+// is happening.
+const (
+	refusalNoticeRatePerSec = 2
+	refusalNoticeBurst      = 10
+)
+
+// newRefusalNoticeLimiter builds a leg's stderr-notice bucket. One per transport instance (not per
+// category): one site writes a bounded notice today, and a shared bucket is what makes "how many
+// diagnostic syscalls can a peer drive" one number rather than a sum over sites.
+func newRefusalNoticeLimiter() *recordRateLimiter {
+	return newRecordRateLimiter(refusalNoticeRatePerSec, refusalNoticeBurst)
+}
 
 // refusalDeclarations is authoritative for BOTH questions: which categories exist, and what each
 // one's metering disposition is. refusalCategories (the bucket table, and the divisor for every
 // category's share of the aggregate budget) is derived from it, so declaring a category exempt
 // does not silently shrink the metered ones' shares.
 var refusalDeclarations = map[refusalCategory]refusalDeclaration{
-	catOrigin:              {metering: meteringMetered},
-	catJWT:                 {metering: meteringMetered},
-	catAuth:                {metering: meteringMetered},
-	catControl:             {metering: meteringMetered},
-	catLoopback:            {metering: meteringMetered},
-	catBody:                {metering: meteringMetered},
-	catContentType:         {metering: meteringMetered},
-	catSaturation:          {metering: meteringMetered},
-	catKill:                {metering: meteringMetered},
-	catAudience:            {metering: meteringMetered},
-	catRevision:            {metering: meteringMetered},
-	catDisplaced:           {metering: meteringMetered},
-	catUnroutableID:        {metering: meteringMetered},
-	catServerRequestFailed: {metering: meteringMetered},
+	catOrigin:               {metering: meteringMetered},
+	catJWT:                  {metering: meteringMetered},
+	catAuth:                 {metering: meteringMetered},
+	catControl:              {metering: meteringMetered},
+	catLoopback:             {metering: meteringMetered},
+	catBody:                 {metering: meteringMetered},
+	catContentType:          {metering: meteringMetered},
+	catSaturation:           {metering: meteringMetered},
+	catKill:                 {metering: meteringMetered},
+	catAudience:             {metering: meteringMetered},
+	catRevision:             {metering: meteringMetered},
+	catDisplaced:            {metering: meteringMetered},
+	catUnroutableID:         {metering: meteringMetered},
+	catServerRequestFailed:  {metering: meteringMetered},
+	catRefusalUndeliverable: {metering: meteringMetered},
 	// The fail-closed ROUTING refusal, on either transport and in either framing.
 	catUnroutable: {metering: meteringExempt, why: exemptBecausePolicyDenyCostsTheSame},
 	// The enforced-method-as-notification reject. It writes a record as cheap as the routing
@@ -255,24 +294,41 @@ func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter 
 // stdioRefusalCategories is the set the stdio transport charges. Declared rather than left implicit
 // in its call sites, so the limiter it builds and the categories it spends are one statement — and
 // so a metered refusal added to that transport is a deliberate edit here.
-var stdioRefusalCategories = []refusalCategory{catRevision, catDisplaced, catUnroutableID, catServerRequestFailed}
+var stdioRefusalCategories = []refusalCategory{
+	catRevision, catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
+}
 
-// unmeteredRecorder returns rec unchanged, for a refusal its category DECLARES exempt.
+// refusalLimits is a transport leg's admission control over the writes a REFUSAL makes: the
+// per-category buckets bounding its audit records, and the bucket bounding its stderr notice.
 //
-// It exists so an exemption is a call that NAMES the category rather than the absence of one: the
-// table test walks these sites, so a refusal that ships with no answer, or with an answer
-// contradicting its declaration, fails the build. That is the whole difference from writing the
-// record directly — there is no runtime behavior here to get wrong.
+// Held APART from the audit sink, which every params struct on the refusal path already carries for
+// its policy records: a second copy of that sink beside the limits is a wiring fault nothing would
+// catch, since the two would be silently free to name different tapes. recorders() is where the two
+// are put back together, at the one site that resolves a refusal's recorder.
 //
-// It is the marker for a site that already HOLDS a resolved recorder. It cannot check that what it
-// was handed is unmetered — an auditRecorder carries no provenance, and by the time one reaches
-// here a bucket has already been charged and may have suppressed the record to nil. A site that
-// resolves its recorder names its category to refusalRecorders.forCategory instead, which applies
-// the declaration rather than trusting a caller to have picked the matching helper.
-func unmeteredRecorder(rec auditRecorder, _ refusalCategory) auditRecorder { return rec }
+// A zero value meters nothing and bounds no notice — what a bare-struct-literal proxy in a test
+// gets, and the behaviour every leg had before either bucket existed.
+type refusalLimits struct {
+	// records bounds the refusal RECORDS this leg's categories declare metered. nil on a leg that
+	// meters none of them: stdio's notification gate, and the established-session HTTP arm, whose
+	// kill records describe an already-admitted caller and are deliberately unbounded.
+	records *categoryRecordLimiter
+	// notices bounds this leg's refusal DIAGNOSTICS. Separate from records because the two answer
+	// to different arguments and a leg can legitimately want one without the other — the
+	// established-session arm above meters no record it writes and still owes a bound on a
+	// per-frame syscall. See refusalNoticeRatePerSec.
+	notices *recordRateLimiter
+}
+
+// recorders pairs these limits with the leg's audit sink, producing the wiring a refusal resolves
+// its recorder from. rec may be nil (the leg has no tape).
+func (l refusalLimits) recorders(rec auditRecorder) refusalRecorders {
+	return refusalRecorders{rec: rec, refusalLimits: l}
+}
 
 // refusalRecorders is a transport leg's wiring for the recorder a refusal writes its record
-// through, resolved per CATEGORY rather than once per leg.
+// through, resolved per CATEGORY rather than once per leg, plus the admission control over the
+// stderr notice it writes beside that record.
 //
 // Per category because one leg's arms disagree: the HTTP pre-session arm bounds its kill record
 // (catKill — an unauthenticated caller drives it) while the smuggling and routing refusals beside
@@ -287,28 +343,51 @@ func unmeteredRecorder(rec auditRecorder, _ refusalCategory) auditRecorder { ret
 type refusalRecorders struct {
 	// rec is the leg's audit sink, or nil when it has none.
 	rec auditRecorder
-	// limiter is the leg's admission control. nil on a leg that meters none of the categories it
-	// can refuse under: stdio's notification gate, and the established-session HTTP arm, whose kill
-	// records describe an already-admitted caller and are deliberately unbounded.
-	limiter *categoryRecordLimiter
+	refusalLimits
 }
 
 // forCategory applies the disposition the CATEGORY declares rather than the leg's own default,
-// which is what makes "declared exempt" and "charges no bucket" one fact.
+// which is what makes "declared exempt" and "charges no bucket" one fact. It is the ONE resolver:
+// every refusal record's recorder comes from here, so no producer has an entry point the
+// declaration does not govern.
 //
 // An UNDECLARED category is metered, not exempt: the zero refusalDeclaration means nobody has
 // answered the question, and the safe answer to that is the bounded one.
+//
+// The map probe is per refusal record and deliberately kept: the disposition is read from the
+// declaration at resolution time rather than pre-resolved into a per-leg table, because a second
+// table is a second copy of the answer, and this runs only where a refusal is already writing to
+// the tape. Measured at tens of nanoseconds and no allocation
+// (BenchmarkRefusalRecorders_ForCategory), against a record's serialize-sign-write.
 func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
-	if r.rec == nil || r.limiter == nil || refusalDeclarations[category].metering == meteringExempt {
+	if r.rec == nil || r.records == nil || refusalDeclarations[category].metering == meteringExempt {
 		return r.rec
 	}
-	return admitRefusalRecord(r.rec, r.limiter, category)
+	return admitRefusalRecord(r.rec, r.records, category)
 }
 
-// unmeteredRecorders is the wiring for a leg that meters nothing it can refuse. Named rather than
-// spelled as a bare literal at each, so "this leg charges no bucket" is one statement a reader can
-// find beside the legs that do.
-func unmeteredRecorders(rec auditRecorder) refusalRecorders { return refusalRecorders{rec: rec} }
+// admitNotice reports whether this leg may write a refusal's stderr diagnostic now, and how many
+// were elided since the last admitted one — folded into that one's own text, so a bounded notice
+// never under-states the rate.
+//
+// A leg with no notice bucket writes every line. That is the unbounded behaviour in production and
+// what a test proxy gets; the guard that keeps a real transport from resolving here is that both
+// build one at construction.
+func (r refusalRecorders) admitNotice() (ok bool, suppressed uint64) {
+	if r.notices == nil {
+		return true, 0
+	}
+	return r.notices.admit()
+}
+
+// unmeteredRecorders is the wiring for a leg that meters no RECORD it can write, but still bounds
+// its notices. Named rather than spelled as a bare literal at each, so "this leg charges no bucket"
+// is one statement a reader can find beside the legs that do — and takes the notice bucket
+// explicitly, because "no record is metered here" is an argument about verdicts and says nothing
+// about a per-frame syscall.
+func unmeteredRecorders(rec auditRecorder, notices *recordRateLimiter) refusalRecorders {
+	return refusalLimits{notices: notices}.recorders(rec)
+}
 
 // categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
 // cheap refusals in one category cannot suppress another's records.

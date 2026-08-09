@@ -213,6 +213,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 		buildInit:        sess.buildInitResponse,
 		receipts:         rt.receipts,
 		honorAttribution: rt.honorAttribution,
+		refusalLimits:    p.refusalLimits(),
 	}
 }
 
@@ -298,7 +299,9 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		// leaves upWriter nil, and every denial arm below answers the initiator AFTER its audit
 		// record — a nil-receiver panic there leaves a tape recording a denial the process died
 		// delivering. See writeToInitiator.
-		writeUpstream: sess.unblocker().writeUpstream,
+		writeUpstream: sess.unblocker().writeUpstream(),
+		refusalLimits: p.refusalLimits(),
+		leg:           dropHTTPRefusalUndeliverable,
 		decideLock:    decideLock,
 		// A session that has spanned two state anchors cannot decide on this leg at all; see
 		// samplingAnchorSplitDenial. Always wired: the session answers false unless it

@@ -321,10 +321,11 @@ func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() }
 
 // unblocker is this session's wiring for every site that answers a blocked server-initiated
-// initiator. writeUpstream is nil in remote-upstream mode, which is what the seam's nil-writer
-// disposition tests for — never a nil *mcp.MsgWriter handed over as a live sink.
+// initiator. The sink is a nil *mcp.MsgWriter in remote-upstream mode — the typed nil the seam's
+// disposition resolves at ANSWER time, so the tracker-only holders (every forwarded request) pay
+// nothing for a writer they never call.
 func (s *httpSession) unblocker() serverRequestUnblocker {
-	return serverRequestUnblocker{reqs: &s.serverReqs, writeUpstream: initiatorWriter(s.upWriter), errOut: s.errOut()}
+	return serverRequestUnblocker{reqs: &s.serverReqs, sink: s.upWriter, errOut: s.errOut()}
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would
@@ -1156,9 +1157,12 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 // session's only response-delivery/SSE-relay goroutine must not stall on it, which matters more
 // under task anchoring, where the turn holder can be a different session sharing the anchor.
 func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
+	// One unblocker for both the entry gate and the pool's answer, rather than two builds of the
+	// identical value for one request.
+	u := s.unblocker()
 	// Refused at the ENTRY, above the pool and above any decision — see admitServerRequestID. The
 	// limiter is the proxy's, reached here because this leg has no request in scope to carry one.
-	if !admitServerRequestID(ctx, s.unblocker(), s.refusalRecorders(), verifiedSession(s.id), dropHTTPUnroutableID, msg) {
+	if !admitServerRequestID(ctx, u, s.refusalRecorders(), verifiedSession(s.id), dropHTTPUnroutableID, msg) {
 		return
 	}
 	s.serverPool.dispatch(ctx, msg, serverRequestDispatch{
@@ -1167,7 +1171,9 @@ func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMs
 		// Through the seam rather than a closure over the concrete writer: remote-upstream mode
 		// leaves upWriter nil, and (*mcp.MsgWriter).Write locks its mutex on a nil receiver — so
 		// the saturation path would panic after its record rather than report. See writeToInitiator.
-		writeUpstream: s.unblocker().writeUpstream,
+		writeUpstream: u.writeUpstream(),
+		refusalLimits: s.proxy.refusalLimits(),
+		leg:           dropHTTPRefusalUndeliverable,
 		errOut:        s.errOut(),
 		handle:        func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
 		revision:      s.hostRev,
@@ -1423,8 +1429,10 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // The refusal limiter is a PARAMETER rather than reached through s.proxy: this runs on a session,
 // and the proxy that holds the bucket is already in scope at the one site that wires this in.
 func (s *httpSession) broadcastServerRequest(ctx context.Context, limiter *categoryRecordLimiter, msg mcp.RPCMsg) bool {
+	// The unblocker's writer is resolved lazily, so building one here for the TRACKER costs nothing
+	// on the healthy path that never displaces anything and never answers.
 	u := s.unblocker()
-	trackServerRequest(ctx, u, refusalRecorders{rec: asRecorder(s.route.sink), limiter: limiter}, verifiedSession(s.id), dropHTTPDisplaced, msg)
+	trackServerRequest(ctx, u, refusalLimits{records: limiter}.recorders(asRecorder(s.route.sink)), verifiedSession(s.id), dropHTTPDisplaced, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}
@@ -1526,7 +1534,7 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 // refusalRecorders is this session's wiring for a refusal record's recorder: the route's sink and
 // the proxy's admission control, with forCategory applying each category's own declaration.
 func (s *httpSession) refusalRecorders() refusalRecorders {
-	return refusalRecorders{rec: asRecorder(s.route.sink), limiter: s.proxy.refusalRecordLimiter()}
+	return s.proxy.refusalLimits().recorders(asRecorder(s.route.sink))
 }
 
 // withSessionClaims stamps this session's captured JWT identity onto ctx, for a record written on a
