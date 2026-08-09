@@ -5,7 +5,6 @@ package transport
 
 import (
 	"context"
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,8 +84,6 @@ type serverRequestDispatch struct {
 	// obligation, and a sixth thing this leg needs is then declared once instead of at both
 	// transports' literals, where a keyed literal zero-fills whichever is missed.
 	unblocker serverRequestUnblocker
-	// errOut is where the seam writes that report; nil means os.Stderr.
-	errOut io.Writer
 	// handle is the server-initiated request's handler, run on its own goroutine.
 	handle func(context.Context, mcp.RPCMsg)
 	// revision is the session's negotiated host revision, stamped onto ctx BEFORE the admission
@@ -104,6 +101,11 @@ type serverRequestDispatch struct {
 // edit twice the last two times this leg changed, and the per-transport delta is now the dispatch
 // struct alone.
 func dispatchServerRequest(ctx context.Context, pool *serverRequestPool, msg mcp.RPCMsg, d serverRequestDispatch) {
+	// Stamped BEFORE the entry gate, not just before the handler: the gate's own refusal writes a
+	// record, and an absent protocol_revision on this tape means "written before one could be
+	// resolved" — which is false for a request refused on an established session. The pool stamps
+	// it too, for a caller that dispatches directly.
+	ctx = capability.WithProtocolRevision(ctx, resolveRevision(d.revision))
 	// Refused at the ENTRY, above the pool and above any decision: a request whose reply could
 	// never be routed back must not consume a handler slot, a policy quota, or the host's
 	// attention. See admitServerRequestID.

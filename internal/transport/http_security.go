@@ -472,6 +472,12 @@ func (p *HTTPProxy) preSessionAudienceRecorder(route *UpstreamRoute) auditRecord
 type rolledUpRecorder struct {
 	auditRecorder
 	suppressed uint64
+	// scope is what the count SPANS, taken from the table that produced it. A parameter rather
+	// than the constant it used to be: the upstream-driven categories are bucketed per SESSION
+	// now, and stamping those tallies proxy_category would tell a reader a count describing one
+	// session's upstream spans every route. Empty falls back to the proxy-wide value, which is
+	// what a hand-built wrapper in a test gets.
+	scope string
 }
 
 // RecordDeny stamps the rollup into this record's details and delegates. Only RecordDeny
@@ -489,7 +495,11 @@ func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier,
 	// Always paired: a count whose scope a reader has to infer from the stamp beside it
 	// is a count that gets misread.
 	details[detailSuppressedRefusalCount] = r.suppressed
-	details[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
+	scope := r.scope
+	if scope == "" {
+		scope = suppressedScopeProxyCategory
+	}
+	details[detailSuppressedRefusalScope] = scope
 	r.auditRecorder.RecordDeny(ctx, sessionID, identifier, method, denialCode, condType, details, observe)
 }
 

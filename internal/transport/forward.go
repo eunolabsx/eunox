@@ -287,7 +287,13 @@ type forwardParams struct {
 	// only these params, and a second copy of the notice bucket beside it is exactly the wiring
 	// fault refusalLimits' own doc argues against. Zero on a leg that meters nothing (the
 	// notification gate's, which resolves both halves from the refusalRecorders it is handed).
-	refusalLimits
+	//
+	// NAMED, not embedded, for the reason refusalRecorders holds its own that way: this struct
+	// carries the sink (rec) too, and embedding would promote recorders() onto it — so
+	// `fp.recorders(someOtherSink)` would compile and mint a wiring keeping this leg's buckets
+	// while pointing at a different tape, beside call sites that idiomatically write
+	// `.recorders(...)` already.
+	limits refusalLimits
 	// errOut is where this forward's diagnostic (SECURITY/AUDIT) lines are written. Nil (the
 	// default, and what every construction that doesn't set it gets — including every test
 	// literal) means os.Stderr, mirroring StdioProxyOptions.Stderr/HTTPGatewayOptions.Stderr:
@@ -411,7 +417,7 @@ func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, 
 // byte-identical records for the same physical outage. dispatchList passes the method as
 // both auditID and method (no sub-target); the forward core passes the per-target audit id.
 func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string, detail map[string]interface{}) mcp.RPCMsg {
-	code, reason, rpcCode := upstreamErrInfo(fp.errOutOrStderr(), fp.notices, err, fp.upstreamTimeMs)
+	code, reason, rpcCode := upstreamErrInfo(fp.errOutOrStderr(), fp.limits.notices, err, fp.upstreamTimeMs)
 	// This deny records a call already forwarded to (and answered, however badly, by)
 	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
 	// for, so it gets the same immediate diagnostic under strict mode.
@@ -713,7 +719,7 @@ func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, 
 		fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "",
 			decisionDetail(dec), false)
 	}
-	noticef(fp.errOutOrStderr(), fp.notices,
+	noticef(fp.errOutOrStderr(), fp.limits.notices,
 		"[eunox] SECURITY: %q was authorized but this path has no upstream to forward it to; refused (ENFORCEMENT_ERROR) — a proxy wiring fault, not an upstream failure\n",
 		audit.SanitizeAuditField(method))
 	return refusalResponse(msg.ID, capability.ErrCodeEnforcementError, "", denialTarget, "")
@@ -763,8 +769,8 @@ func refusalResponse(id *json.RawMessage, code, conditionType, target, argument 
 
 // refusalError applies refusalResponse's rule (stated there) to the core's two plain-JSON-RPC-error
 // refusals. They are unreachable for a no-id message only because the one caller that passes one
-// also removes the upstream — two facts nothing couples. The ALLOW tail is deliberately uncovered:
-// a real response exists to relay there.
+// also removes the upstream — two facts nothing couples. The ALLOW tail builds no envelope of its
+// own and so has neither helper; enforcedForwardCore's boundary is what covers it.
 func refusalError(id *json.RawMessage, code int, message string) mcp.RPCMsg {
 	if id == nil {
 		return mcp.RPCMsg{}
@@ -875,7 +881,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, observeDetail, true)
 			}
 		})
-		noticef(fp.errOutOrStderr(), fp.notices,
+		noticef(fp.errOutOrStderr(), fp.limits.notices,
 			"[eunox] AUDIT: %s %q would be denied (%s) — forwarding (audit mode)\n",
 			kind, denialTarget, denial.Code,
 		)
@@ -910,7 +916,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	if len(dec.Obligations) > 0 && upResp.Result != nil {
 		redacted, redactErr := pdp.ApplyRedactObligs(upResp.Result, dec.Obligations)
 		if redactErr != nil {
-			noticef(fp.errOutOrStderr(), fp.notices, "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
+			noticef(fp.errOutOrStderr(), fp.limits.notices, "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
 			// Record a deny so the call stays visible on the tape — otherwise an adversarial
 			// upstream could return a redaction-failing response to make every redactFields-
 			// guarded call vanish from the audit trail.
@@ -932,7 +938,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// upstream returning BOTH a result and an error (which JSON-RPC forbids) must not forward
 	// a redactable value through error.data, a free-form channel the redact paths can't verify.
 	if upResp.Error != nil && upResp.Error.Data != nil && hasRedactFieldsObligation(dec.Obligations) {
-		noticef(fp.errOutOrStderr(), fp.notices, "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
+		noticef(fp.errOutOrStderr(), fp.limits.notices, "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
 		upResp.Error.Data = nil
 	}
 
@@ -956,7 +962,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// was a DENY, and a downgraded deny must never untaint a session (defense in depth against
 	// a PDP that stamps a handle on a deny).
 	if dec.Decision == capability.DecisionAllow && declassifyCommitted(upResp) {
-		labelsCleared, declDetail = commitDeclassify(ctx, fp.errOutOrStderr(), fp.notices, committer, fp.sessionID, dec, kind, denialTarget)
+		labelsCleared, declDetail = commitDeclassify(ctx, fp.errOutOrStderr(), fp.limits.notices, committer, fp.sessionID, dec, kind, denialTarget)
 		declDetail = mergeAuditDetails(declDetail, handlerFaultDetail(dec))
 	} else {
 		declDetail = decisionDetail(dec)
@@ -1082,7 +1088,7 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorde
 	// below charges the same bucket the notice at the bottom of this function does. The
 	// notification gate's params carry none of their own (refusalForwardParams), which is exactly
 	// how one producer with two entry points ends up bounded on one of them.
-	fp.refusalLimits = recs.limits
+	fp.limits = recs.limits
 	fp.callUpstream = nil
 	dec := capability.EnforceResponse{
 		Decision: capability.DecisionDeny,
@@ -1409,7 +1415,7 @@ func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method s
 // sampling/createMessage is deny-by-default (pdp.DecideSampling checks the kill switch and the
 // manifest opt-in); a denial returns the denial code unless route-level audit mode
 // observes-and-forwards it (kill-switch always hard-blocks). Transports differ only in
-// fp.forward, fp.writeUpstream, and fp.claims.
+// fp.forward, fp.unblocker, and fp.claims.
 //
 // Caller contract: msg is a REQUEST (mcp.RPCMsg.IsRequest) — every denial below answers the
 // initiator unconditionally, with no notification arm to skip.

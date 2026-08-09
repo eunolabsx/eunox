@@ -913,7 +913,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: the server's own signed
 		// account contradicts the contract policy was written against.
-		noticef(d.errOutOrStderr(), d.notices,
+		noticef(d.errOutOrStderr(), d.limits.notices,
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
 	}
@@ -1142,5 +1142,5 @@ func completeToolsListing(params, result json.RawMessage) bool {
 // refusalDeclarations exactly as the notification framing is — it used to be handed an
 // already-resolved recorder that never met the declaration at all.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	return refuseUnroutable(ctx, d.forwardParams, d.recorders(d.rec), verifiedSession(d.sessionID), msg, unroutableFramingRequest)
+	return refuseUnroutable(ctx, d.forwardParams, d.limits.recorders(d.rec), verifiedSession(d.sessionID), msg, unroutableFramingRequest)
 }

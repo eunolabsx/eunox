@@ -627,7 +627,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 			})
 		}
 		pool.dispatch(context.Background(), samplingReq, serverRequestDispatch{
-			rec: rec, sessionID: "s", errOut: io.Discard,
+			rec: rec, sessionID: "s",
 			unblocker: answeringSeam(broken, rec, httpServerRequestLegs, io.Discard),
 		})
 		require.Len(t, rec.records, 2, "the saturation refusal has the same shape and the same gap")

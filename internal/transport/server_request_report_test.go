@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,7 +125,7 @@ func TestBroadcastServerRequest_NoSubscriberRecordsADestroyedAnswer(t *testing.T
 		route:          &UpstreamRoute{name: "up1", sink: nil},
 		proxy:          newTestHTTPProxy(),
 		done:           make(chan struct{}),
-		upstreamDenies: newUpstreamRefusalLimiter(),
+		upstreamDenies: newUpstreamRefusalLimiter(nil),
 	})
 	// The route's own sink is what a session's refusal records resolve through; substitute the
 	// capture recorder by driving the seam the session builds.
@@ -169,16 +170,66 @@ func TestUpstreamRefusalBuckets_ArePerSession(t *testing.T) {
 	}
 
 	// Session A empties its own bucket many times over.
-	a, aLim := &fwdRecorder{}, newUpstreamRefusalLimiter()
+	a, aLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil)
 	drain(a, aLim, 200)
 	require.NotEmpty(t, a.records)
 	assert.LessOrEqual(t, len(a.records), int(perCategoryDenyBurst)+1, "A's own flood is still bounded by A's bucket")
 
 	// Session B, with one lost in-flight refusal, must still be recorded.
-	b, bLim := &fwdRecorder{}, newUpstreamRefusalLimiter()
+	b, bLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil)
 	drain(b, bLim, 1)
 	assert.Len(t, b.records, 1,
 		"a sibling session's flood must not elide the record that says THIS session lost a live in-flight request")
+}
+
+// TestUpstreamRefusalBuckets_StillChargeTheAggregate is the other half, and the reason the split is
+// not simply "a full share each".
+//
+// Per-session buckets alone multiply the sustained write rate into the ONE shared audit queue by the
+// session count — at the default maxSessions that is 4096/s sustained against a 4096-deep queue,
+// and --require-audit defaults to strict, so overflowing it latches AuditDegraded and denies every
+// route. The session tier decides fairness; the proxy-wide parent keeps the total bounded.
+func TestUpstreamRefusalBuckets_StillChargeTheAggregate(t *testing.T) {
+	t.Parallel()
+	aggregate := newRefusalRecordLimiter()
+	admitted := 0
+	// Many sessions, each with its own full-share table, all flooding the same category.
+	for range 50 {
+		lim := newUpstreamRefusalLimiter(aggregate)
+		for range 20 {
+			if ok, _ := lim.admit(catDisplaced); ok {
+				admitted++
+			}
+		}
+	}
+	assert.LessOrEqual(t, admitted, int(perCategoryDenyBurst)+1,
+		"N sessions must not multiply the aggregate audit-write rate by N; the per-session tier bounds fairness, the parent bounds the total")
+	assert.Positive(t, admitted, "the leading edge must still reach the tape")
+}
+
+// TestUpstreamRefusalBuckets_RollupNamesItsOwnScope is the regression for a per-session tally
+// claiming proxy-wide reach on the signed tape.
+//
+// The scope value is what tells a reader whether a count of 5000 spans every route or one session's
+// upstream; a per-session table stamping the proxy-wide value is the same misreading the route stamp
+// caused before the scope was recorded at all.
+func TestUpstreamRefusalBuckets_RollupNamesItsOwnScope(t *testing.T) {
+	t.Parallel()
+	rec := &fwdRecorder{}
+	lim := newUpstreamRefusalLimiter(nil)
+	// Exhaust the burst so the next admitted record carries a rollup.
+	for range int(perCategoryDenyBurst) + 20 {
+		_ = admitRefusalRecord(rec, lim, catDisplaced)
+	}
+	lim.setNow(func() time.Time { return time.Now().Add(time.Hour) })
+	rolled := admitRefusalRecord(rec, lim, catDisplaced)
+	require.NotNil(t, rolled)
+	rolled.RecordDeny(context.Background(), "s", "", "roots/list", capability.ErrCodeEnforcementError, "", nil, false)
+
+	last := rec.records[len(rec.records)-1]
+	assert.Equal(t, suppressedScopeSessionCategory, last.details[detailSuppressedRefusalScope],
+		"a per-session tally stamped proxy_category tells a reader it spans every route")
+	assert.Positive(t, last.details[detailSuppressedRefusalCount])
 }
 
 // TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory keeps the per-session table honest: a
@@ -186,7 +237,7 @@ func TestUpstreamRefusalBuckets_ArePerSession(t *testing.T) {
 // the floor rate and shared with every other unregistered category.
 func TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory(t *testing.T) {
 	t.Parallel()
-	lim := newUpstreamRefusalLimiter()
+	lim := newUpstreamRefusalLimiter(nil)
 	require.NotEmpty(t, upstreamRefusalCategories)
 	for _, cat := range upstreamRefusalCategories {
 		assert.Equal(t, meteringMetered, refusalDeclarations[cat].metering,
@@ -198,34 +249,44 @@ func TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory(t *testing.T) {
 	assert.Equal(t, perCategoryDenyRate, lim.bucket(catDisplaced).ratePerSec)
 }
 
-// TestInitiatorWriter_AcceptsACallableValueReceiverSink is the regression for a false refusal that
-// became a false RECORD.
-//
-// nilSink reported true for any nil-able kind, so a func/map/slice-backed sink with a VALUE
-// receiver — the ordinary Go adapter idiom, and what this package's own sinkFunc helper is — read
-// as absent even where calling it would succeed. That used to cost a lost answer plus a stderr
-// line; since a destroyed answer reaches the tape it also writes an ENFORCEMENT_ERROR deny
-// asserting a server-initiated request was left blocked, for a delivery that would have worked.
-func TestInitiatorWriter_AcceptsACallableValueReceiverSink(t *testing.T) {
+// TestInitiatorWriter_AnswersTheConcreteWriterByName pins the half of issue 335's nil-writer note
+// that is safe to act on: the sink both transports hold is resolved by NAME, above the reflection,
+// so the relay path — every answered initiator — no longer reaches reflect at all.
+func TestInitiatorWriter_AnswersTheConcreteWriterByName(t *testing.T) {
 	t.Parallel()
-	// A nil MAP with a value receiver: nil-able, and its Write is callable.
-	var sink mcp.MsgSink = mapSink(nil)
-	write := initiatorWriter(sink)
-	require.NotNil(t, write, "a nil-able VALUE receiver whose Write is callable is not an absent sink")
-	assert.NoError(t, write(mcp.RPCMsg{}))
-
-	// The typed nil this seam exists for still answers absent — by NAME now, above the reflection,
-	// which is also what takes reflect off the relay path.
-	assert.Nil(t, initiatorWriter((*mcp.MsgWriter)(nil)), "a nil *mcp.MsgWriter locks a mutex on a nil receiver; it is genuinely absent")
-	assert.Nil(t, initiatorWriter(nil))
 	assert.NotNil(t, initiatorWriter(mcp.NewMsgWriter(io.Discard)))
+	assert.Nil(t, initiatorWriter((*mcp.MsgWriter)(nil)),
+		"a nil *mcp.MsgWriter locks a mutex on a nil receiver; it is genuinely absent")
+	assert.Nil(t, initiatorWriter(nil))
 }
 
-// mapSink is a nil-able VALUE receiver whose Write is callable — the adapter shape the old
-// reflection refused.
+// TestInitiatorWriter_RefusesEveryNilAbleSink is the half that must NOT be narrowed.
+//
+// The tempting reading is that a nil-able VALUE receiver is a false refusal because its Write is
+// "callable". It dispatches, but for the ordinary func adapter — this package's own sinkFunc — the
+// body then calls a nil func and panics, and a nil chan-backed one blocks forever. Both land AFTER
+// the refusal's audit record, which is the tape-records-a-denial-the-process-died-delivering outcome
+// the seam exists to replace, so the refusal is worth its residual false positive.
+func TestInitiatorWriter_RefusesEveryNilAbleSink(t *testing.T) {
+	t.Parallel()
+	assert.Nil(t, initiatorWriter(sinkFunc(nil)),
+		"a nil func adapter dispatches Write and then panics calling the nil func — worse than a refused answer")
+	assert.Nil(t, initiatorWriter(chanSink(nil)),
+		"a nil chan adapter blocks forever, wedging the goroutine that was answering")
+	assert.Nil(t, initiatorWriter(mapSink(nil)))
+	// The control: a non-nil value-receiver adapter is not refused.
+	assert.NotNil(t, initiatorWriter(mapSink{}))
+}
+
+// mapSink and chanSink are nil-able VALUE receivers, the adapter shapes the narrowing would have
+// admitted. chanSink's Write is the one whose nil value hangs rather than panics.
 type mapSink map[string]string
 
 func (mapSink) Write(mcp.RPCMsg) error { return nil }
+
+type chanSink chan mcp.RPCMsg
+
+func (c chanSink) Write(m mcp.RPCMsg) error { c <- m; return nil }
 
 // TestRefusalRecorders_CannotRePointItsOwnTape is the structural half of holding the limits apart
 // from the sink.

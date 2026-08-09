@@ -200,7 +200,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		// upstreamDenies is NOT: a remote upstream issues no server-initiated requests, but its
 		// session still reaches the leg's refusal arms through a host reply it cannot relay (there
 		// is no upstream writer at all here), which is the one drop this mode actually produces.
-		upstreamDenies: newUpstreamRefusalLimiter(),
+		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,

@@ -15,6 +15,7 @@ package transport
 
 import (
 	"go/ast"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -43,6 +44,10 @@ var noticeDeclarations = map[string]noticeDeclaration{
 	"handleSessionPost":    {bound: noticeMetered},
 	"forwardNotification":  {bound: noticeMetered},
 	"post":                 {bound: noticeMetered},
+	// stdio's, whose line is per `initialize` REQUEST: re-initialize is answered LOCALLY, so it
+	// creates no session and contacts no upstream — the exemption it used to carry was reasoned
+	// from a session's cost and did not apply.
+	"buildInitResponse": {bound: noticeMetered},
 
 	// (2) Gated on the RECORD's admission verdict, which spends that category's own bucket.
 	"checkOrigin":            {bound: noticeRecordGated},
@@ -72,7 +77,6 @@ var noticeDeclarations = map[string]noticeDeclaration{
 	"waitBounded":               {bound: noticeExempt, why: exemptNotPeerDriven},
 	"Start":                     {bound: noticeExempt, why: exemptNotPeerDriven},
 	"writeSessionCreateError":   {bound: noticeExempt, why: exemptCostsASession},
-	"buildInitResponse":         {bound: noticeExempt, why: exemptCostsASession},
 	"newSession":                {bound: noticeExempt, why: exemptCostsASession},
 	"newRemoteSession":          {bound: noticeExempt, why: exemptCostsASession},
 	"reapOnce":                  {bound: noticeExempt, why: exemptCostsASession},
@@ -111,6 +115,8 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 	t.Parallel()
 	seen, checked := map[string]bool{}, 0
+	// name -> the distinct declaration sites that write a diagnostic under it.
+	writers := map[string][]string{}
 	for _, src := range packageSources(t) {
 		for _, decl := range src.file.Decls {
 			fnDecl, isFunc := decl.(*ast.FuncDecl)
@@ -156,6 +162,7 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 				}
 				checked++
 				seen[name] = true
+				noteWriter(writers, name, src.name, fnDecl)
 				declared, isDeclared := noticeDeclarations[name]
 				switch {
 				case !isDeclared:
@@ -170,9 +177,42 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 		}
 	}
 	require.Positive(t, checked, "no diagnostic write was found in any non-test file; this guard would pass vacuously")
+	// The key is a bare function name, which this package has duplicates of (readUpstream,
+	// buildInitResponse, take, …). One declaration covering two writing twins would let the second
+	// inherit the first's answer silently, so an ambiguous key is an error rather than a
+	// coincidence to rely on.
+	for name, files := range writers {
+		assert.Len(t, files, 1,
+			"%q writes a diagnostic in more than one type's method (%v); the declaration is keyed by bare name, so one answer would cover both — rename one, or key this table by receiver",
+			name, files)
+	}
 	for site := range noticeDeclarations {
 		assert.True(t, seen[site], "diagnostic site %q is declared but writes no line; a declaration nothing reaches is an answer to a question nobody asks", site)
 	}
+}
+
+// noteWriter records that name writes a diagnostic in this receiver's method, so an ambiguous
+// declaration key is detectable. Keyed by receiver type (or the file, for a package function),
+// deduplicated so several lines in one function count once.
+func noteWriter(writers map[string][]string, name, file string, fn *ast.FuncDecl) {
+	site := file
+	if fn.Recv != nil && len(fn.Recv.List) > 0 {
+		site = exprString(fn.Recv.List[0].Type)
+	}
+	if !slices.Contains(writers[name], site) {
+		writers[name] = append(writers[name], site)
+	}
+}
+
+// exprString renders a receiver type as `*T` or `T`.
+func exprString(e ast.Expr) string {
+	if star, isStar := e.(*ast.StarExpr); isStar {
+		return "*" + exprString(star.X)
+	}
+	if ident, isIdent := e.(*ast.Ident); isIdent {
+		return ident.Name
+	}
+	return "?"
 }
 
 func noticeBoundName(b noticeBound) string {

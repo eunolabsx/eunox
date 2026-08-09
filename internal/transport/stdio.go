@@ -1221,7 +1221,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			callUpstream:     p.callUpstream,
 			strictAuditState: p.strictAudit(),
 			errOut:           p.errOut(),
-			refusalLimits:    p.refusalLimits(),
+			limits:           p.refusalLimits(),
 		},
 		pdp:              p.pdp,
 		sourceIP:         "", // stdio has no per-request client address
@@ -1343,7 +1343,10 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	resp := buildInitializeResponse(msg.ID, p.upstreamCaps, p.upstreamInstructions)
 	// The context pin is serveHost's, not this handler's — see StdioProxy.hostRev. Reaching
 	// this method at all means the request resolved to the revision that defines initialize.
-	_, _ = fmt.Fprintf(p.errOut(),
+	// Bounded: a host may re-initialize as often as it likes and this answer is LOCAL — no session
+	// created, no upstream contacted — so an unbounded line here is one write syscall per frame at
+	// the host's send rate, the same shape the routing refusal's notice was bounded for.
+	noticef(p.errOut(), p.noticeLimiter,
 		"[eunox] Session %s: host initialized (protocol %s).\n",
 		p.sessionID, handshakeRevision,
 	)
@@ -1391,7 +1394,6 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 		// the initiator after recording, and a bare closure over a nil concrete writer panics there
 		// rather than reporting. See writeToInitiator.
 		unblocker: p.unblocker(),
-		errOut:    p.errOut(),
 		handle:    p.handleUpstreamRequest,
 		revision:  p.hostRevision(),
 	})

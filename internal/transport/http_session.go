@@ -416,13 +416,12 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// this handshake returns.
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	sess := &httpSession{
-		id:           uuid.New().String(),
-		proxy:        p,
-		route:        route,
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostToUp:     make(map[string]*json.RawMessage),
-		// This session's own buckets for what its upstream can drive; see the field.
-		upstreamDenies: newUpstreamRefusalLimiter(),
+		id:             uuid.New().String(),
+		proxy:          p,
+		route:          route,
+		byUpstreamID:   make(map[string]chan upstreamResult),
+		hostToUp:       make(map[string]*json.RawMessage),
+		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,
@@ -1187,7 +1186,6 @@ func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMs
 		// leaves upWriter nil, and (*mcp.MsgWriter).Write locks its mutex on a nil receiver — so
 		// the saturation path would panic after its record rather than report. See writeToInitiator.
 		unblocker: s.unblocker(),
-		errOut:    s.errOut(),
 		handle:    func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
 		revision:  s.hostRev,
 	})
@@ -1547,7 +1545,7 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 	// This request was recorded as an allow when deliverToOne buffered it, but it never
 	// reached the host — append a correction so the tamper-evident tape doesn't stand as
 	// claiming delivery that didn't happen.
-	recordServerRequestDropped(ctx, s.refusalRecorders().forCategory(catServerRequestFailed), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
+	s.unblocker().report.recordDrop(ctx, catServerRequestFailed, dropHTTPUndelivered, msg.Method)
 }
 
 // refusalRecorders is this session's wiring for a refusal record's recorder: the route's sink and
@@ -1558,8 +1556,15 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 // driven by this session's upstream, and a shared table let one dead subprocess suppress another
 // session's record that a live in-flight request was lost. See newUpstreamRefusalLimiter.
 func (s *httpSession) refusalRecorders() refusalRecorders {
-	return refusalLimits{records: s.upstreamDenies, notices: s.proxy.refusalNoticeLimiter()}.
-		recorders(asRecorder(s.route.sink))
+	// Nil-route tolerant like every other accessor a bare-struct-literal session reaches
+	// (refusalNoticeLimiter, upstreamDenies): every unblocker() now resolves this, including the
+	// tracker-only holders, so a routeless test session must degrade to recording nothing rather
+	// than crash a leg that used to touch no route at all.
+	var rec auditRecorder
+	if s.route != nil {
+		rec = asRecorder(s.route.sink)
+	}
+	return refusalLimits{records: s.upstreamDenies, notices: s.proxy.refusalNoticeLimiter()}.recorders(rec)
 }
 
 // withSessionClaims stamps this session's captured JWT identity onto ctx, for a record written on a

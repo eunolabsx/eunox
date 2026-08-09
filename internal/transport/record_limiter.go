@@ -128,13 +128,13 @@ const (
 	// LIVE in-flight request was evicted.
 	catUnroutableID refusalCategory = "unroutable_server_request_id"
 	// catDisplaced bounds the record for a server-initiated request the in-flight tracker
-	// displaced. Driven by the UPSTREAM rather than by a host peer — the one category here that
-	// is — because once the bounded set is full every further server-initiated request displaces
+	// displaced. Driven by the UPSTREAM rather than by a host peer (see upstreamRefusalCategories
+	// for that whole set) because once the bounded set is full every further request displaces
 	// one, so an upstream issuing them faster than the host answers turns an unbounded audit-write
 	// rate loose for as long as it likes.
 	catDisplaced refusalCategory = "displaced_server_request"
 	// catRefusalUndeliverable bounds the record for a REFUSED server-initiated request whose answer
-	// never reached its initiator (see refusalAnswer). Its own bucket for the reason catUnroutableID
+	// never reached its initiator (see serverRequestUnblocker.answer). Its own bucket for the reason catUnroutableID
 	// has one: this needs neither tracking nor a host — an upstream with a broken stdin drives one
 	// per request — so a shared bucket would let it suppress the record that a LIVE request was lost.
 	catRefusalUndeliverable refusalCategory = "undeliverable_server_refusal"
@@ -348,6 +348,7 @@ func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter 
 	c := &categoryRecordLimiter{
 		buckets: make(map[refusalCategory]*recordRateLimiter, len(cats)),
 		unknown: newRecordRateLimiter(perCategoryFloor, perCategoryFloor),
+		scope:   suppressedScopeProxyCategory,
 	}
 	for _, cat := range cats {
 		c.buckets[cat] = newRecordRateLimiter(perCategoryDenyRate, perCategoryDenyBurst)
@@ -379,11 +380,18 @@ var upstreamRefusalCategories = []refusalCategory{
 // suppressed_refusal_count on a record stamped with A's route. Each category's own bucket exists to
 // stop exactly that between categories; the session is the same argument one dimension out.
 //
-// The aggregate ceiling this raises is bounded by maxSessions rather than by the proxy, and every
-// session here costs the attacker an upstream the operator configured — see docs/threat-model-mcp.md
-// §3.7, which holds the proxy-wide argument this qualifies.
-func newUpstreamRefusalLimiter() *categoryRecordLimiter {
-	return newRefusalRecordLimiterFor(upstreamRefusalCategories...)
+// The split alone would trade the elision bug for an availability one: at the default
+// maxSessions (512) four categories at a per-session share is 4096 records/s sustained and 10240
+// burst, against an audit queue of 4096 — and --require-audit defaults to STRICT, so overflowing
+// it latches AuditDegraded and denies every route. So the per-session table charges the proxy's
+// own table as its AGGREGATE parent: this session's buckets decide fairness, the parent keeps the
+// total at the pre-split ceiling. aggregate may be nil (a bare-struct-literal proxy in a test),
+// which bounds the session alone. See docs/threat-model-mcp.md §3.7.
+func newUpstreamRefusalLimiter(aggregate *categoryRecordLimiter) *categoryRecordLimiter {
+	c := newRefusalRecordLimiterFor(upstreamRefusalCategories...)
+	c.parent = aggregate
+	c.scope = suppressedScopeSessionCategory
+	return c
 }
 
 // refusalLimits is a transport leg's admission control over the writes a REFUSAL makes: the
@@ -505,15 +513,54 @@ func admitNotice(l *recordRateLimiter) (ok bool, suppressed uint64) {
 // cheap under attack.
 type categoryRecordLimiter struct {
 	buckets map[refusalCategory]*recordRateLimiter
-	// unknown serves an unregistered category. Unreachable from call sites (all pass
-	// constants), but keeps a future typo bounded rather than unbounded.
+	// unknown serves an unregistered category on a table with no parent. Unreachable from call
+	// sites (all pass constants), but keeps a future typo bounded rather than unbounded.
 	unknown *recordRateLimiter
+	// parent is the proxy-wide AGGREGATE this table's records also charge, or nil when this
+	// table IS that aggregate. A per-session table has one: its own buckets stop one session's
+	// flood eliding another's record, and the parent stops N sessions multiplying the sustained
+	// write rate into the single shared audit queue by N. Without it a per-session split trades
+	// the elision bug for an availability one — see newUpstreamRefusalLimiter.
+	parent *categoryRecordLimiter
+	// scope names what a rollup from this table SPANS, stamped into the record beside the count.
+	// Held here rather than passed per call because it is a property of the table, and a count
+	// whose scope a reader has to infer from the stamp beside it is a count that gets misread.
+	scope string
 }
 
 // admit reports whether a refusal record in category may be written now, and how many
 // records IN THAT CATEGORY were suppressed since the last admitted one.
+//
+// A table with a PARENT charges both tiers, own bucket first: this table bounds one session's
+// share, the parent bounds the aggregate. A record the parent refuses is pushed BACK onto this
+// table's own count rather than lost, so the rollup stays complete whichever tier elided it.
+//
+// A category this table holds no bucket for is delegated WHOLLY to the parent — it is simply not
+// session-scoped, so it charges the proxy-wide table as it did before the split. That is what
+// keeps a subset table from silently routing an unlisted category to the floor-rate `unknown`
+// bucket, which no test could have caught (the metering walk cannot answer "which categories does
+// this leg charge" from source).
 func (c *categoryRecordLimiter) admit(category refusalCategory) (ok bool, suppressed uint64) {
-	return c.bucket(category).admit()
+	own, registered := c.buckets[category]
+	if c.parent != nil && !registered {
+		return c.parent.admit(category)
+	}
+	if !registered {
+		own = c.unknown
+	}
+	ok, suppressed = own.admit()
+	if !ok || c.parent == nil {
+		return ok, suppressed
+	}
+	if parentOK, _ := c.parent.admit(category); !parentOK {
+		// The aggregate refused, so this record is not written; give this table back the token's
+		// worth of tally (this record plus everything it had accumulated) so the next admitted
+		// one still states the true count. The parent's own tally is deliberately discarded: the
+		// same records are already counted here, and counting them twice would over-state a flood.
+		own.suppressN(suppressed + 1)
+		return false, 0
+	}
+	return true, suppressed
 }
 
 // bucket returns category's token bucket. No lock: the table is immutable after
@@ -560,7 +607,7 @@ func admitRefusalRecord(rec auditRecorder, limiter *categoryRecordLimiter, categ
 	case suppressed == 0:
 		return rec
 	default:
-		return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed}
+		return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed, scope: limiter.scope}
 	}
 }
 
@@ -582,6 +629,12 @@ const (
 	// but only this record's own refusal category. Changed from the earlier "proxy" when
 	// the bucket split by category — the old value would now under-state its precision.
 	suppressedScopeProxyCategory = "proxy_category"
+	// suppressedScopeSessionCategory qualifies a rollup from a table held PER SESSION (the
+	// upstream-driven categories): this session, this category. A per-session tally stamped
+	// with the proxy-wide value would tell a reader that a count of 5000 spans every route
+	// when it describes one session's upstream — the same misreading the route stamp caused
+	// before the scope was recorded at all, one dimension out.
+	suppressedScopeSessionCategory = "session_category"
 )
 
 // recordRateLimiter is a token bucket over one CLASS of caller-driven audit refusal
@@ -638,6 +691,16 @@ func (l *recordRateLimiter) suppress() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.suppressed++
+}
+
+// suppressN returns n refusals to this bucket's tally, for a record this bucket ADMITTED that an
+// outer tier then refused. The token it spent is deliberately not returned: the outer tier's
+// refusal is what bounds the rate, and refunding here would let a saturated aggregate hand this
+// bucket unlimited retries.
+func (l *recordRateLimiter) suppressN(n uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.suppressed += n
 }
 
 // A saturation refusal needs a far smaller sustained rate than a pre-session one: it's

@@ -132,9 +132,9 @@ type serverRequestUnblocker struct {
 func (u serverRequestUnblocker) notices() *recordRateLimiter { return u.report.recs.notices() }
 
 // writeUpstream resolves this unblocker's sink into the writer the answering seam takes, or nil when
-// there is genuinely nothing to answer through. Callers that hold a `writeUpstream func(...)` field
-// (the sampling leg's params, the pool's dispatch) take it from here so the nil answer is decided
-// once — see initiatorWriter.
+// there is genuinely nothing to answer through. Nothing outside this file holds a raw writer any
+// more — the two shapes that used to (the sampling leg's params, the pool's dispatch) carry the whole
+// unblocker — so the nil answer is decided here and only here; see initiatorWriter.
 func (u serverRequestUnblocker) writeUpstream() func(mcp.RPCMsg) error {
 	return initiatorWriter(u.sink)
 }
@@ -168,12 +168,13 @@ func (u serverRequestUnblocker) unblock(ctx context.Context, id *json.RawMessage
 	return true
 }
 
-// relay writes the host's OWN reply to the blocked initiator and records a reply it destroyed. It consumes nothing: a caller that routes a genuine
-// reply has already taken the id it matched, and the take is what decided the reply was routable at
-// all.
+// relay writes the host's OWN reply to the blocked initiator and records a reply it destroyed.
 //
-// A false is the one drop on this leg that destroys a reply the host actually PRODUCED — the take
-// above it is what makes that reply unroutable by any later path — so it carries its own category
+// It consumes nothing: a caller that routes a genuine reply has already taken the id it matched, and
+// the take is what decided the reply was routable at all.
+//
+// A failed write is the one drop on this leg that destroys a reply the host actually PRODUCED — the
+// take above it is what makes that reply unroutable by any later path — so it carries its own category
 // (catServerRequestFailed) and its own leg, which is why one leg field on the unblocker cannot
 // serve this and a refused answer alike.
 //
@@ -204,8 +205,10 @@ func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
 
 // answer sends an error of eunox's OWN making to a blocked initiator and records one that did not
 // land. It reports nothing: the tape entry IS the report, and a bool for a caller to forget is how
-// three of unblock's callers came to discard it. Record-AFTER-act, unlike every refusal arm that calls it: the fact recorded is the write's
-// own outcome.
+// three of unblock's callers came to discard it.
+//
+// Record-AFTER-act, unlike every refusal arm that calls it: the fact recorded is the write's own
+// outcome.
 //
 // The earlier reading — that every caller has already recorded the refusal that brought it here, so
 // a destroyed answer is not the only thing on the tape — is the one this rejects: that record
@@ -255,21 +258,26 @@ func initiatorWriter(sink mcp.MsgSink) func(mcp.RPCMsg) error {
 	return sink.Write
 }
 
-// nilSink reports whether sink is an interface holding a nil value whose Write could NOT be called
-// on it. Kind-checked before IsNil, which panics for a non-nilable kind.
+// nilSink reports whether sink is an interface holding a nil value. Kind-checked before IsNil,
+// which panics for a non-nilable kind — a sink implemented on a struct VALUE is legitimate and must
+// answer false rather than crash the check that exists to prevent a crash.
 //
-// Only POINTER and INTERFACE answer true. Those are the shapes where the nil is the receiver a
-// method dereferences — mcp.MsgWriter takes a mutex on it, and a nil interface has no method to
-// dispatch to at all. A nil-able VALUE receiver (func/map/slice/chan, the ordinary Go adapter idiom
-// and what this package's own sinkFunc test helper is) answers false: its Write is callable, and
-// refusing it destroys an answer that would have landed AND writes an ENFORCEMENT_ERROR deny to the
-// signed tape asserting a server-initiated request was left blocked — for a delivery that would
-// have worked. Being wrong toward the write is the recoverable direction now that being wrong the
-// other way puts an unbackable fact on the tape.
+// EVERY nil-able kind answers true, deliberately, including the value-receiver kinds. The tempting
+// narrowing — refuse only the kinds whose nil IS a dereferenced receiver — reads as closing a false
+// refusal and instead reopens the crash this seam exists to report: for the ordinary func adapter
+// (`type sinkFunc func(mcp.RPCMsg) error; func (f sinkFunc) Write(m) error { return f(m) }`, this
+// package's own test helper) a nil value dispatches the method and then panics calling the nil func,
+// and a nil chan-backed one blocks forever. Both land AFTER the refusal's audit record, which is the
+// tape-records-a-denial-the-process-died-delivering outcome writeToInitiator was written to replace.
+//
+// So the two errors are not symmetric: refusing a usable sink costs one lost answer plus a record
+// saying so, and calling an unusable one costs the process. The residual false refusal is a nil map
+// or slice whose Write happens to work on a nil receiver — a shape no in-tree sink has, and one an
+// out-of-tree consumer resolves by not holding a nil sink.
 func nilSink(sink mcp.MsgSink) bool {
 	v := reflect.ValueOf(sink)
 	switch v.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.UnsafePointer:
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
 		return v.IsNil()
 	default:
 		return false
@@ -355,7 +363,7 @@ const (
 	// dropHTTPRefusalUndeliverable / dropStdioRefusalUndeliverable: eunox REFUSED a
 	// server-initiated request (revoked session, degraded trail under --require-audit=strict, a
 	// policy deny, or a saturated pool) and the answer saying so never reached the initiator. See
-	// refusalAnswer for why the refusal's own record does not cover this.
+	// serverRequestUnblocker.answer for why the refusal's own record does not cover this.
 	dropHTTPRefusalUndeliverable  transportLeg = "http-server-refusal-undeliverable"
 	dropStdioRefusalUndeliverable transportLeg = "stdio-server-refusal-undeliverable"
 )
