@@ -48,8 +48,13 @@ var (
 	preSessionDenyBurst      = perCategoryDenyBurstSize * len(refusalCategories)
 )
 
-// refusalCategory is a distinct type (not a bare string) because its values double as both
-// the rate-limit bucket key and the audit record's structured condition_type field.
+// refusalCategory is a distinct type (not a bare string) because a METERED category's value
+// doubles as both the rate-limit bucket key and the audit record's structured condition_type
+// field.
+//
+// A category declared EXEMPT is neither of those: it names a refusal so the declaration has
+// something to attach to and the call-site walk has something to find. That asymmetry is the
+// price of making an exemption a decision on the record rather than the absence of a call.
 type refusalCategory string
 
 // The refusal categories. Every recordPreSessionDeny / recordSessionCapDeny call site
