@@ -18,6 +18,11 @@
 // exemptBecausePolicyDenyCostsTheSame and refusalNoticeRatePerSec). They were reasoned about with
 // one standard applied to both, which left the cheapest refusal in the tree writing an unbuffered
 // syscall per frame while its record was argued exempt.
+//
+// The NOTICE half now carries the same treatment (noticeBound, and the per-site declarations the
+// walk in notice_bounding_test.go enforces): four different mechanisms bound a diagnostic line here
+// and only one of them was written down, so "how many diagnostic syscalls can a peer drive" was a
+// sum over sites nobody had surveyed rather than the one number this file's bucket claims.
 
 package transport
 
@@ -184,11 +189,71 @@ const (
 )
 
 // newRefusalNoticeLimiter builds a leg's stderr-notice bucket. One per transport instance (not per
-// category): one site writes a bounded notice today, and a shared bucket is what makes "how many
-// diagnostic syscalls can a peer drive" one number rather than a sum over sites.
+// category), which is what makes "how many diagnostic syscalls can a peer drive" one number rather
+// than a sum over sites — a claim noticeDeclarations is what keeps true, since a site that writes
+// its line with a bare Fprintf spends nothing here and adds to that sum unseen.
 func newRefusalNoticeLimiter() *recordRateLimiter {
 	return newRecordRateLimiter(refusalNoticeRatePerSec, refusalNoticeBurst)
 }
+
+// noticeBound is how ONE diagnostic site is bounded. The zero value is "undeclared", so a site
+// added with no entry fails the call-site walk rather than inheriting an answer — the same shape
+// refusalDeclarations uses for the RECORD half of a refusal.
+//
+// Four mechanisms bound a line in this package and only the first was ever written down. The
+// declaration exists because the survey behind "how many syscalls can a peer drive" was re-derived
+// by hand each time, which is how the routing refusal's line came to be unbounded while its
+// record's exemption was being argued in prose.
+type noticeBound int
+
+const (
+	noticeUndeclared noticeBound = iota
+	// noticeMetered: the line goes through noticef, charging the shared notice bucket. What a
+	// peer-drivable per-frame diagnostic must be.
+	noticeMetered
+	// noticeRecordGated: the line is written only when the refusal's own RECORD was admitted, so
+	// it is bounded at that category's rate (recordRefusal returns its verdict for exactly this).
+	// A second mechanism rather than a redundancy: these sites describe the record they ride on.
+	noticeRecordGated
+	// noticeOnce: a latch — at most one line per process or per session — so a peer's rate cannot
+	// drive it however cheap the message is.
+	noticeOnce
+	// noticeExempt: not drivable at a per-frame rate, for the reason declared. Startup, teardown,
+	// configuration, and session-lifecycle lines.
+	noticeExempt
+)
+
+// noticeDeclaration is what every diagnostic site declares. why is required for an exemption and
+// must be empty otherwise, mirroring refusalDeclaration: the reason IS the exemption.
+//
+// The TABLE of declarations lives beside its call-site walk (noticeDeclarations, in
+// notice_bounding_test.go) rather than here, because unlike refusalDeclarations nothing reads it at
+// runtime — the bound is applied by which mechanism a site uses, and the declaration exists to make
+// that a decision on the record. The vocabulary stays here, beside the record half's, since the two
+// halves of one refusal are bounded for different reasons and are best read together.
+type noticeDeclaration struct {
+	bound noticeBound
+	why   string
+}
+
+// The reasons an exemption can rest on, stated once each because they are shared arguments rather
+// than per-site prose.
+const (
+	// exemptNotPeerDriven covers startup, shutdown, configuration and operator-command lines: the
+	// number written over a process's life is fixed by how the operator ran it, not by traffic.
+	exemptNotPeerDriven = "written from startup, teardown or operator-command paths, so a peer's send rate cannot drive it"
+	// exemptCostsASession covers the per-session lifecycle lines. A peer CAN drive them, but only
+	// by opening and closing sessions — each of which spawns or contacts an upstream, so the line
+	// is many orders of magnitude cheaper than what it reports and bounding it would hide churn
+	// that is itself the signal.
+	exemptCostsASession = "one line per session lifecycle event, and a session costs an upstream spawn or handshake — the line is not the expensive part"
+	// exemptOncePerConnection covers a line written at most once per host connection or upstream,
+	// on a path that then ends it.
+	exemptOncePerConnection = "written at most once per connection, on a path that ends it"
+	// exemptNotADiagnostic covers a site that writes a RESPONSE BODY with the same fmt call the
+	// walk looks for. Bounding it would corrupt what it serves.
+	exemptNotADiagnostic = "not a diagnostic: it writes a response body, which bounding would truncate"
+)
 
 // refusalDeclarations is authoritative for BOTH questions: which categories exist, and what each
 // one's metering disposition is. refusalCategories (the bucket table, and the divisor for every
@@ -297,6 +362,30 @@ var stdioRefusalCategories = []refusalCategory{
 	catRevision, catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
 }
 
+// upstreamRefusalCategories is the set driven by an UPSTREAM rather than by a host peer, and the
+// set whose buckets are held PER SESSION on the HTTP transport (see newUpstreamRefusalLimiter).
+// Declared here beside the transports' own sets so "which refusals does a session's own upstream
+// drive" is one statement rather than a property re-derived from four category docs.
+var upstreamRefusalCategories = []refusalCategory{
+	catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
+}
+
+// newUpstreamRefusalLimiter builds ONE HTTP session's buckets for the upstream-driven categories.
+//
+// Per session, not proxy-wide, for the reason saturationGate states for its own records: one
+// session's flood must not elide another's. These four are driven by a session's OWN upstream, so a
+// dead subprocess on session A used to drain the shared bucket at its ~2/s share and suppress
+// session B's record that a LIVE in-flight request was lost — folded instead into a
+// suppressed_refusal_count on a record stamped with A's route. Each category's own bucket exists to
+// stop exactly that between categories; the session is the same argument one dimension out.
+//
+// The aggregate ceiling this raises is bounded by maxSessions rather than by the proxy, and every
+// session here costs the attacker an upstream the operator configured — see docs/threat-model-mcp.md
+// §3.7, which holds the proxy-wide argument this qualifies.
+func newUpstreamRefusalLimiter() *categoryRecordLimiter {
+	return newRefusalRecordLimiterFor(upstreamRefusalCategories...)
+}
+
 // refusalLimits is a transport leg's admission control over the writes a REFUSAL makes: the
 // per-category buckets bounding its audit records, and the bucket bounding its stderr notice.
 //
@@ -321,7 +410,7 @@ type refusalLimits struct {
 
 // recorders pairs these limits with the leg's audit sink; rec may be nil (the leg has no tape).
 func (l refusalLimits) recorders(rec auditRecorder) refusalRecorders {
-	return refusalRecorders{rec: rec, refusalLimits: l}
+	return refusalRecorders{rec: rec, limits: l}
 }
 
 // refusalRecorders is a transport leg's wiring for the recorder a refusal writes its record
@@ -341,7 +430,13 @@ func (l refusalLimits) recorders(rec auditRecorder) refusalRecorders {
 type refusalRecorders struct {
 	// rec is the leg's audit sink, or nil when it has none.
 	rec auditRecorder
-	refusalLimits
+	// limits is a NAMED field rather than an embedded one. Embedding promoted recorders() onto
+	// this type, so `recs.recorders(otherSink)` compiled on an already-resolved wiring and minted
+	// one keeping this leg's buckets while pointing at a DIFFERENT tape — verbatim the hazard
+	// refusalLimits' own doc says holding the sink apart was meant to prevent, and one the
+	// surrounding code invites by writing `.recorders()` idiomatically at four sites. forCategory
+	// being the one resolver governs which bucket a record charges, never which tape it lands on.
+	limits refusalLimits
 }
 
 // forCategory applies the disposition the CATEGORY declares rather than the leg's own default,
@@ -358,11 +453,15 @@ type refusalRecorders struct {
 // the tape. Tens of nanoseconds against a record's serialize-sign-write — ~29ns for an exempt
 // category (the probe alone) and ~58ns for an admitted metered one (BenchmarkRefusalRecorders_ForCategory).
 func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
-	if r.rec == nil || r.records == nil || refusalDeclarations[category].metering == meteringExempt {
+	if r.rec == nil || r.limits.records == nil || refusalDeclarations[category].metering == meteringExempt {
 		return r.rec
 	}
-	return admitRefusalRecord(r.rec, r.records, category)
+	return admitRefusalRecord(r.rec, r.limits.records, category)
 }
+
+// notices is this wiring's stderr-diagnostic bucket, reached through the named limits field so a
+// caller needs no second vocabulary for the half of a refusal that is not a record.
+func (r refusalRecorders) notices() *recordRateLimiter { return r.limits.notices }
 
 // noticef writes one bounded diagnostic line, folding whatever the bucket elided since the last
 // admitted line into this one's own text.
@@ -396,15 +495,6 @@ func admitNotice(l *recordRateLimiter) (ok bool, suppressed uint64) {
 		return true, 0
 	}
 	return l.admit()
-}
-
-// unmeteredRecorders is the wiring for a leg that meters no RECORD it can write, but still bounds
-// its notices. Named rather than spelled as a bare literal at each, so "this leg charges no bucket"
-// is one statement a reader can find beside the legs that do — and takes the notice bucket
-// explicitly, because "no record is metered here" is an argument about verdicts and says nothing
-// about a per-frame syscall.
-func unmeteredRecorders(rec auditRecorder, notices *recordRateLimiter) refusalRecorders {
-	return refusalLimits{notices: notices}.recorders(rec)
 }
 
 // categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of

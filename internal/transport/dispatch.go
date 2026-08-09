@@ -41,7 +41,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"slices"
 	"sort"
@@ -80,12 +79,6 @@ type dispatchParams struct {
 	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
 	// ignored (union-only, so falling back to the session join is the stricter reading).
 	honorAttribution bool
-
-	// refusalLimits (embedded) is this leg's admission control over the writes the fail-closed
-	// ROUTING refusal makes. The sink is forwardParams.rec, above: a refusal resolves its recorder
-	// by pairing the two (see refusalLimits), rather than carrying a second copy of the sink that
-	// could name a different tape.
-	refusalLimits
 }
 
 // finishDecision closes the decision critical section (if open) right after the PDP decision
@@ -920,7 +913,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: the server's own signed
 		// account contradicts the contract policy was written against.
-		_, _ = fmt.Fprintf(d.errOutOrStderr(),
+		noticef(d.errOutOrStderr(), d.notices,
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
 	}

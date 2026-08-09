@@ -31,6 +31,21 @@ func writeJSONMsg(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeDispatchResult writes the shared dispatcher's reply, or acks with 202 when it produced none.
+//
+// The enforced-forward core returns the ZERO message for a request with no reply channel (see
+// refusalResponse), and RPCMsg.JSONRPC has no omitempty — so writing it unconditionally would send
+// the malformed frame `{"jsonrpc":""}` where nothing should have been sent. 202 is what this
+// transport already answers a POST carrying nothing to reply to. Unreachable while the POST arm
+// gates on IsRequest before dispatching; the guard is what keeps that from being the only reason.
+func writeDispatchResult(w http.ResponseWriter, resp mcp.RPCMsg) {
+	if resp.IsZero() {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	writeJSONMsg(w, resp)
+}
+
 // handleMCP dispatches POST / GET / DELETE requests to /mcp.
 func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if !p.checkAuth(w, r) {
@@ -319,7 +334,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				// other method. Answered as the drop it must be anyway — there is no session
 				// here, so nothing to forward it on — rather than discarding the verdict and
 				// letting a future forwardable pre-session method be dropped in silence.
-				_, _ = fmt.Fprintf(p.errOut(),
+				noticef(p.errOut(), p.refusalNoticeLimiter(),
 					"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
 					audit.SanitizeAuditField(msg.Method))
 			}
@@ -391,7 +406,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		// A refused host RESPONSE would have answered a request the upstream is blocked on.
 		// Unblock it rather than let it hang: a protocol refusal is not an emergency stop, and
 		// eunox answers with its own error at its own revision — see unblockRefusedServerReply.
-		sess.unblockRefusedServerReply(msg)
+		sess.unblockRefusedServerReply(r.Context(), msg)
 		return
 	}
 	// The stamped context is the ONE carrier of the decided revision from here down: the
@@ -593,7 +608,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// already-executed response. A fresh window here bounds only the client-facing flush, so
 	// a client that stops reading can't block json.Encode (and the deferred cleanup) indefinitely.
 	rearmWriteDeadline(w, 0)
-	writeJSONMsg(w, resp)
+	writeDispatchResult(w, resp)
 }
 
 // SSE frame byte fragments, hoisted so the hot delivery path allocates no
@@ -1201,7 +1216,10 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 // defer idle reaping nor pay a revocation lookup for it: kill is taken as the caller's THUNK
 // for that reason, and is resolved only past the take below.
 func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *UpstreamRoute, sess *httpSession, kill func() *capability.EnforceResponse, msg mcp.RPCMsg) bool {
-	if !msg.IsResponse() || !sess.serverReqs.take(mcp.MsgKey(msg.ID)) {
+	if !msg.IsResponse() {
+		return false
+	}
+	if _, held := sess.serverReqs.take(mcp.MsgKey(msg.ID)); !held {
 		return false
 	}
 	if deny := kill(); deny != nil {
@@ -1218,15 +1236,13 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 	// second one is coming — so it destroys a reply the host actually produced. That is the one
 	// disposition on this leg whose entire account used to be a stderr line; the take stays above
 	// the writer check for the reason unblock's does (an entry nothing can reclaim eventually
-	// displaces a live request), so the debt is paid on the tape instead.
-	if !sess.unblocker().relay(msg) {
-		// The session's claims, as failServerRequestDelivery attaches them: the sink reads agent /
-		// task / user identity off the context, and this POST's context never carried them — so
-		// without this the destroyed-reply records drop out of any per-agent grouping their
-		// undelivered siblings appear in.
-		recordServerRequestDropped(sess.withSessionClaims(ctx), sess.refusalRecorders().forCategory(catServerRequestFailed),
-			verifiedSession(sess.id), methodLabelServerResponse, dropHTTPReplyUndeliverable)
-	}
+	// displaces a live request), so the debt is paid on the tape instead — by the seam itself.
+	//
+	// The session's claims, as failServerRequestDelivery attaches them: the sink reads agent / task
+	// / user identity off the context, and this POST's context never carried them — so without this
+	// the destroyed-reply records drop out of any per-agent grouping their undelivered siblings
+	// appear in.
+	sess.unblocker().relay(sess.withSessionClaims(ctx), msg)
 	return true
 }
 

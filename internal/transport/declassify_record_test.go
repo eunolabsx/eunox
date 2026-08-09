@@ -1081,11 +1081,11 @@ func TestForwardServerRequest_RefusesADeclassifyingSamplingDecision(t *testing.T
 		Declassification: capability.NewDeclassification([]string{capability.FlowLabelPII}, "alice@example.com", "apr-9", true),
 	}
 	fp := serverRequestParams{
-		rec:           rec,
-		sessionID:     "s",
-		forward:       func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream: func(m mcp.RPCMsg) error { toUpstream = append(toUpstream, m); return nil },
-		pdp:           samplingPDP{dec: dec},
+		rec:       rec,
+		sessionID: "s",
+		forward:   func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
+		unblocker: writingSeam(func(m mcp.RPCMsg) error { toUpstream = append(toUpstream, m); return nil }),
+		pdp:       samplingPDP{dec: dec},
 	}
 
 	forwardServerRequest(context.Background(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: capability.MethodSamplingCreateMessage}, fp)
@@ -1109,12 +1109,12 @@ func TestForwardServerRequest_RefusesWhenTheTurnIsUnavailable(t *testing.T) {
 	var forwarded bool
 	var toUpstream []mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:           rec,
-		sessionID:     "s",
-		forward:       func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream: func(m mcp.RPCMsg) error { toUpstream = append(toUpstream, m); return nil },
-		decideLock:    func() (func(), bool) { return nil, false },
-		pdp:           samplingPDP{dec: capability.EnforceResponse{Decision: capability.DecisionAllow}},
+		rec:        rec,
+		sessionID:  "s",
+		forward:    func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
+		unblocker:  writingSeam(func(m mcp.RPCMsg) error { toUpstream = append(toUpstream, m); return nil }),
+		decideLock: func() (func(), bool) { return nil, false },
+		pdp:        samplingPDP{dec: capability.EnforceResponse{Decision: capability.DecisionAllow}},
 	}
 
 	forwardServerRequest(context.Background(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: capability.MethodSamplingCreateMessage}, fp)

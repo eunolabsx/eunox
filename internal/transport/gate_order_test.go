@@ -158,13 +158,13 @@ func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 	t.Parallel()
 	sink, logPath := newTempAuditSink(t)
 	fp := serverRequestParams{
-		rec:           &routeSink{sink: sink, upstream: "up1"},
-		sessionID:     "sess",
-		pdp:           pdp.AlwaysAllowPDP{},
-		revision:      capability.Revision20260728,
-		forward:       func(context.Context, mcp.RPCMsg) bool { return true },
-		writeUpstream: func(mcp.RPCMsg) error { return nil },
-		errOut:        io.Discard,
+		rec:       &routeSink{sink: sink, upstream: "up1"},
+		sessionID: "sess",
+		pdp:       pdp.AlwaysAllowPDP{},
+		revision:  capability.Revision20260728,
+		forward:   func(context.Context, mcp.RPCMsg) bool { return true },
+		unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
+		errOut:    io.Discard,
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"}, fp)
 	_ = sink.Close()
@@ -466,7 +466,7 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 // staticRecorder adapts a test recorder to the gate's per-category recorder wiring: a test recorder
 // meters nothing, so every category resolves to it.
 func staticRecorder(rec auditRecorder) refusalRecorders {
-	return unmeteredRecorders(rec, nil)
+	return refusalLimits{}.recorders(rec)
 }
 
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and

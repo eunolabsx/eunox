@@ -196,13 +196,18 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		route: route,
 		// byUpstreamID and hostToUp are left nil: they never apply on the remote-HTTP
 		// path, which is plain request/response through doRemoteHTTP.
-		done:         make(chan struct{}),
-		evicted:      make(chan struct{}),
-		sessCtx:      sessCtx,
-		sessCancel:   sessCancel,
-		upHTTPClient: client,
-		claims:       pdp.JWTClaimsPtr(ctx),
-		clientIP:     clientIP,
+		//
+		// upstreamDenies is NOT: a remote upstream issues no server-initiated requests, but its
+		// session still reaches the leg's refusal arms through a host reply it cannot relay (there
+		// is no upstream writer at all here), which is the one drop this mode actually produces.
+		upstreamDenies: newUpstreamRefusalLimiter(),
+		done:           make(chan struct{}),
+		evicted:        make(chan struct{}),
+		sessCtx:        sessCtx,
+		sessCancel:     sessCancel,
+		upHTTPClient:   client,
+		claims:         pdp.JWTClaimsPtr(ctx),
+		clientIP:       clientIP,
 		// See newSession: a session is minted by `initialize`, which is the older revision's
 		// method, so opening one negotiates that revision for the context's life.
 		hostRev:        handshakeRevision,

@@ -449,7 +449,7 @@ func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalReco
 // cost, and the routing refusal's stderr line is not one — this leg can be driven at a refused
 // frame per POST, and the notice is the only unbuffered syscall in that loop.
 func (p *HTTPProxy) routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return unmeteredRecorders(asRecorder(route.sink), p.refusalNoticeLimiter())
+	return refusalLimits{notices: p.refusalNoticeLimiter()}.recorders(asRecorder(route.sink))
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's

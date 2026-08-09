@@ -166,16 +166,20 @@ func (t *serverReqTracker) track(msg mcp.RPCMsg, errOut io.Writer) (trackedServe
 	return displaced, found
 }
 
-// take reports whether key was a tracked server-initiated request ID, removing
-// it so each forwarded request is matched to exactly one host response.
-func (t *serverReqTracker) take(key string) bool {
+// take reports whether key was a tracked server-initiated request ID, removing it so each forwarded
+// request is matched to exactly one host response, and RETURNS the entry it removed.
+//
+// The entry travels because the sites that take an id hold a host RESPONSE, which carries no method
+// of its own: without it, a record naming the request this take just made unanswerable had nothing
+// but the empty string to name it with. See serverRequestUnblocker.unblock.
+func (t *serverReqTracker) take(key string) (trackedServerRequest, bool) {
 	t.mu.Lock()
-	_, ok := t.ids[key]
+	req, ok := t.ids[key]
 	if ok {
 		delete(t.ids, key)
 	}
 	t.mu.Unlock()
-	return ok
+	return req, ok
 }
 
 // tracked reports whether key is an outstanding server-initiated request WITHOUT consuming it.

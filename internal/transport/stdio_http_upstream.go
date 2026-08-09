@@ -22,13 +22,13 @@ package transport
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -86,6 +86,10 @@ type httpUpstream struct {
 	// errOutOrStderr(), never directly, so a nil value (the zero value, and every
 	// pre-existing test call site) still falls back to os.Stderr.
 	errOut io.Writer
+	// notices bounds the one per-frame diagnostic this bridge writes — a notification POST
+	// failure, which an unreachable upstream produces once per notification a host sends. nil
+	// (the zero value, and every test call site) writes every line.
+	notices *recordRateLimiter
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -226,7 +230,8 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		// Notification: no response to deliver. Log POST failures so dropped
 		// notifications/initialized and notifications/cancelled are not silent.
 		if err != nil {
-			_, _ = fmt.Fprintf(h.errOutOrStderr(), "[eunox] upstream notification %q POST failed: %v\n", msg.Method, err)
+			noticef(h.errOutOrStderr(), h.notices,
+				"[eunox] upstream notification %q POST failed: %v\n", audit.BoundEnvelopeField(msg.Method), err)
 		}
 		return
 	}
@@ -250,7 +255,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		if h.reportErr != nil && h.reportErr(mcp.MsgKey(msg.ID), err) {
 			return
 		}
-		_, reason, rpcCode := upstreamErrInfo(h.errOutOrStderr(), err, 0)
+		_, reason, rpcCode := upstreamErrInfo(h.errOutOrStderr(), h.notices, err, 0)
 		resp = mcp.ErrorResponse(msg.ID, rpcCode, reason)
 	case resp.JSONRPC == "" && resp.Result == nil && resp.Error == nil:
 		// An empty/zero RPCMsg here is a 200 OK whose body is {}, null, or any JSON

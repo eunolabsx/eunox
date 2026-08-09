@@ -38,6 +38,18 @@ type RPCMsg struct {
 	Error   *RPCError        `json:"error,omitempty"`
 }
 
+// IsZero reports whether m is the zero message — the value a proxy layer hands back to mean "there
+// is nothing to send at all", as distinct from a message it built badly.
+//
+// Every field is tested rather than JSONRPC alone: that field has no `omitempty`, so a zero message
+// marshals to the malformed frame `{"jsonrpc":""}` and a writer must be able to tell it from a
+// message a peer sent without a version. A caller that writes without asking puts that frame on the
+// wire where nothing should have been sent.
+func (m RPCMsg) IsZero() bool {
+	return m.JSONRPC == "" && m.ID == nil && m.Method == "" &&
+		m.Params == nil && m.Result == nil && m.Error == nil
+}
+
 // UnmarshalJSON decodes a JSON-RPC message while distinguishing an absent id (a
 // notification) from an explicit `"id": null` (a valid identifier), which plain struct
 // decoding would collapse to nil.
