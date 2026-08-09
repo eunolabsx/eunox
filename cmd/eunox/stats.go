@@ -120,8 +120,9 @@ type auditStatsSummary struct {
 	// it is the silent tolerance the report exists to prevent.
 	handlerFaults int
 	// unroutable counts eunox's OWN routing refusals per reason, and unroutableTotal their sum.
-	// Kept apart from the denial buckets because they carry a policy code for a message no
-	// policy evaluated — see addUnroutableDetails.
+	// Their code already says they are routing rather than policy; what this adds is the
+	// per-REASON split (which of the three ways) that a denial bucket keyed on the code alone
+	// cannot carry — see addUnroutableDetails.
 	unroutable      map[string]int
 	unroutableTotal int
 	other           int // records with a decision outside "allow" | "deny" | "escalate"

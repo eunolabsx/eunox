@@ -483,7 +483,7 @@ func runStdioFull(c *stdioConn, s *suite) {
 
 	// resources/templates/list is not an enforced/forwarded method -> denied by default.
 	m, e = c.call("resources/templates/list", map[string]interface{}{})
-	s.expectDeny("resources/templates/list -> DENY (unmapped method, fail closed)", "AUTHORIZATION_FAILED", "", m, e)
+	s.expectDeny("resources/templates/list -> DENY (unmapped method, fail closed)", "UNROUTABLE_METHOD", "", m, e)
 
 	// ── prompts ──
 	m, e = c.call("prompts/get", map[string]interface{}{"name": "code_review"})
@@ -511,9 +511,9 @@ func runStdioFull(c *stdioConn, s *suite) {
 
 	// ── unmapped / pass-through methods are denied by default ──
 	m, e = c.call("completion/complete", map[string]interface{}{"ref": map[string]interface{}{}})
-	s.expectDeny("completion/complete -> DENY (unmapped method)", "AUTHORIZATION_FAILED", "", m, e)
+	s.expectDeny("completion/complete -> DENY (unmapped method)", "UNROUTABLE_METHOD", "", m, e)
 	m, e = c.call("foo/bar", map[string]interface{}{})
-	s.expectDeny("foo/bar -> DENY (unknown method)", "AUTHORIZATION_FAILED", "", m, e)
+	s.expectDeny("foo/bar -> DENY (unknown method)", "UNROUTABLE_METHOD", "", m, e)
 
 	// ── id-type preservation ──
 	m, e = c.callRawID(`"abc-123"`, "tools/call", map[string]interface{}{"name": "read_file", "arguments": map[string]interface{}{"path": "/reports/q3.pdf"}})

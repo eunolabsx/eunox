@@ -46,7 +46,7 @@ the MCP method surfaces it understands — `tools/call`, `tools/list`, `resource
 `resources/subscribe`, `resources/unsubscribe`, `resources/list`, `prompts/get`,
 `prompts/list`, and
 `sampling/createMessage` — and **fails closed on any MCP method it does not map to a
-decision** (the message is denied with `AUTHORIZATION_FAILED` rather than blindly
+decision** (the message is denied with `UNROUTABLE_METHOD` rather than blindly
 forwarded). The `…/list` surfaces are filtered **in enforce mode**: entries the caller is
 not permitted to invoke are removed from the listing before it reaches the host. Methods
 outside the mapped set — notably `resources/templates/list` and `completion/complete` —

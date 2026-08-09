@@ -57,8 +57,9 @@ your IdP) and enforces a fine-grained YAML policy on top of it.
 
 In the default `enforcement: enforce` posture, **when a policy is configured
 for the route**, every enforced method requires an explicit `allow` decision
-from the manifest. A missing manifest entry or an unmapped method produces a
-JSON-RPC `AUTHORIZATION_FAILED` error — the upstream is never called.
+from the manifest. A missing manifest entry produces a JSON-RPC
+`AUTHORIZATION_FAILED` error, and a method no routing table can route produces
+`UNROUTABLE_METHOD` — the upstream is never called for either.
 
 **No-policy routes:** In gateway mode (`transport: http`), a route with no
 `policy` configured and not in audit mode is a misconfiguration: the gateway

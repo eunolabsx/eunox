@@ -295,12 +295,17 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
 // otherwise a session spanning two task anchors could let a source tag one task's taint while
 // sampling peeks the other, clean. See spansAnchors for the refusal this feeds.
 //
-// Called for a REQUEST only, and only once the leg has committed to dispatching it: the latch is
-// sticky for the session's life, so a message that resolves no anchor because it is never
-// decided against one must not set it. cur is the request's own validated claims, which is the
-// same input the engine's key builder resolves its anchor from — so for a request that reaches
-// dispatch, "the claims present at POST time" and "the anchor the request resolved" are one
-// answer, not two that could disagree.
+// Called for an ENFORCED request only, past every gate that could still refuse it: the latch is
+// sticky for the session's life, so only a message that actually commits anchored state under an
+// anchor may set it. Anything else — a framing the leg discards, a notification forwarded with no
+// decision, a locally-answered ping or re-initialize, a request the in-flight cap refuses — writes
+// no anchored state, so latching for one costs the session its sampling leg on the strength of a
+// decision that never happened. It is the same predicate the decision turn takes, so "which
+// requests are keyed on an anchor" is one answer rather than two.
+//
+// cur is the request's own validated claims, the same input the engine's key builder resolves its
+// anchor from — so for a request that reaches dispatch, "the claims present at POST time" and
+// "the anchor the request resolved" are one answer, not two that could disagree.
 func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 	rt := s.route
 	if rt == nil || !rt.taskAnchored {

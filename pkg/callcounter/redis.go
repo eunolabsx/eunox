@@ -98,8 +98,9 @@ type ServerInfoReader interface {
 }
 
 // CheckServerNotClustered refuses a single-node client aimed at a node of a Redis Cluster.
-// It is the SERVER-side half of the refusal redisutil.ShardIterator makes client-side: an
-// ordinary *redis.Client passes every type check and still cannot run AdmitAll's multi-key EVAL.
+// It is the SERVER-side half of the refusal redisutil.ClassifyTopology makes client-side: an
+// ordinary *redis.Client is classified single-node and still cannot run AdmitAll's multi-key
+// EVAL when the server behind it is a cluster node.
 //
 // It reads `INFO cluster` — not `CLUSTER INFO`, whose reply carries no cluster_enabled field
 // at all (that lives only in INFO's Cluster section), and which a standalone server refuses

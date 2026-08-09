@@ -1231,12 +1231,7 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 		if msg.IsRequest() {
 			_ = p.hostWriter.Write(resp)
 		}
-		// A refused RESPONSE never reaches the serve loop's IsResponse arm, so the upstream it
-		// would have answered would otherwise stay blocked until the host disconnects — this
-		// transport has no idle reaper to reclaim it. See takeRefusedServerReply.
-		if answer, unblocked := takeRefusedServerReply(&p.serverReqs, msg); unblocked && p.upWriter != nil {
-			_ = p.upWriter.Write(answer)
-		}
+		p.unblockRefusedServerReply(msg)
 		return ctx, false
 	}
 	// Guarded on the pin being UNSET. It is write-once by construction — resolveHostRevision
@@ -1248,17 +1243,36 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 	return capability.WithProtocolRevision(ctx, rev), true
 }
 
+// unblockRefusedServerReply answers the upstream request a revision-refused host reply would have
+// completed, so it does not stay blocked until the host disconnects — this transport has no idle
+// reaper to reclaim it. See takeRefusedServerReply for which drops answer the initiator.
+//
+// The writer is tested BEFORE the tracked id is consumed: taking it is what makes the reply
+// unroutable by any later path, so consuming one there is nothing to answer with strands the
+// initiator worse than leaving it alone.
+func (p *StdioProxy) unblockRefusedServerReply(msg mcp.RPCMsg) {
+	if p.upWriter == nil {
+		// Unreachable today (connectUpstream runs before serveHost on this goroutine), and
+		// reported rather than dropped for the reason its HTTP sibling reports it.
+		if msg.IsResponse() {
+			_, _ = fmt.Fprintf(p.errOut(),
+				"[eunox] WARNING: a refused host reply left a server-initiated request unanswered: no upstream writer\n")
+		}
+		return
+	}
+	if answer, unblocked := takeRefusedServerReply(&p.serverReqs, msg); unblocked {
+		_ = p.upWriter.Write(answer)
+	}
+}
+
 // revisionRefusalRecorder returns the recorder the -32022 refusal writes through, or nil when
 // the catRevision bucket suppressed this one — refuseHostRevision writes nothing for a nil
 // recorder, so the peer is refused either way and only the tape write is bounded.
 //
-// The HTTP proxy meters this refusal because an unauthenticated peer can force it for free.
-// stdio has no such peer — its host is the process that launched the proxy — so the argument
-// here is a different one: this is the only record the serve loop writes with no bound of any
-// kind (hostSem bounds concurrency for requests, and the saturation gate collapses the record
-// that pool writes), on the goroutine that is also the only one routing host replies back to a
-// blocked upstream. Metering it elides nothing, since a suppressed refusal folds into the next
-// admitted record's rollup — and it keeps the same bytes treated the same way on both transports.
+// Bounded here at all because this transport has no bucket of its own otherwise; why THIS
+// refusal and not the routing one is argued once, on catRevision. The one fact local to stdio:
+// both the recorder and the limiter are nil in a bare-struct-literal proxy, which records
+// unbounded rather than not at all.
 func (p *StdioProxy) revisionRefusalRecorder() auditRecorder {
 	rec := p.rec()
 	if rec == nil || p.refusalLimiter == nil {

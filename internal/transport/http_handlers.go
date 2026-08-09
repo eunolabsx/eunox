@@ -84,6 +84,13 @@ const (
 	// codeUnsupportedMediaType marks a POST body refused because its Content-Type was absent,
 	// duplicated, or not application/json — a content-type sweep is attack signal.
 	codeUnsupportedMediaType = "UNSUPPORTED_MEDIA_TYPE"
+	// codeOriginRejected marks a request refused by the Origin allowlist (DNS-rebinding gate),
+	// and codeJWTInvalid a request whose bearer token failed validation. Both were bare literals
+	// at their one call site each, which is how they came to be the two members of this family
+	// IsInfraDenialCode did not answer for: `eunox suggest` skips them only because their target
+	// is blank, the same accident the routing refusal's own code was split off to remove.
+	codeOriginRejected = "ORIGIN_REJECTED"
+	codeJWTInvalid     = "JWT_INVALID"
 )
 
 // MethodControlKill is the audit `method` stamped on a successful /control/kill activation.
@@ -117,7 +124,8 @@ func IsInfraDenialCode(code string) bool {
 		// would fabricate a phantom target like "tool:tools/call". Deliberately NOT keyed on
 		// capability.ErrCodeInvalidParams, which is a real policy denial suggest must keep seeing.
 		return true
-	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType:
+	case codeAuthFailed, codeControlAuthFailed, codeResourceExhausted, codeDriftRefused, codeLoopbackRejected, codeUnsupportedMediaType,
+		codeOriginRejected, codeJWTInvalid:
 		// Non-policy refusals recorded before/independent of a PDP decision. None names a
 		// policy target, so mining them would fabricate a phantom-target suggestion.
 		return true

@@ -242,7 +242,7 @@ jobs:
       #   - conditions/directives split + redactFields obligations and recursion
       #   - argumentSchema structural validation ordering (INVALID_PARAMS first)
       #   - JSON-RPC denial codes: exact integers, symbolic message, no raw args
-      #   - unmapped methods denied AUTHORIZATION_FAILED and never forwarded
+      #   - unmapped methods denied UNROUTABLE_METHOD and never forwarded
       #   - JWT &-chains, exhaustive allowlist, OR-list, and list filtering
       #   - Rego input contract: arguments{} / directives[] always populated
       #   - namespace isolation + manifest load-time validation

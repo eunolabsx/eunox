@@ -114,6 +114,17 @@ var ErrNilClient = errors.New("killswitch: redis kill switch wired with a nil cl
 // or WithShardFanOut, which is the escape hatch this refusal is only tolerable with.
 var ErrUnknownTopology = errors.New("killswitch: redis kill switch wired with a client whose keyspace topology cannot be determined (a decorator or a custom Cmdable); failing closed, since a keyless SCAN over a sharded keyspace loads a PARTIAL kill set and reports it as complete. Pass the client itself, or declare the topology with killswitch.WithSingleNodeKeyspace()/WithShardFanOut()")
 
+// ErrTopologyContradicted refuses a topology DECLARATION that disagrees with what the client's
+// own concrete type establishes — WithSingleNodeKeyspace() beside a *redis.ClusterClient, say.
+//
+// Refused rather than obeyed, because obeying is the fail-open. The declaring options exist to
+// fill what a concrete-type match cannot answer; letting one override an answer it CAN give
+// would discard a working per-shard iterator and put the backend back to loading one shard's
+// kill set and serving it as complete — with nothing latched and HealthStatus reporting ready,
+// which is precisely what ErrUnknownTopology was added to stop. Latched and fail-closed like its
+// siblings: a declaration that contradicts the client is a wiring bug, and it never heals.
+var ErrTopologyContradicted = errors.New("killswitch: the declared keyspace topology contradicts the Redis client's own type; failing closed (drop the declaration, or pass the client the declaration describes)")
+
 // Redis is a Redis-backed kill-switch manager with pub/sub propagation and local cache.
 type Redis struct {
 	client redis.Cmdable
@@ -122,16 +133,25 @@ type Redis struct {
 	// entry point that would touch the client checks it FIRST, which is what makes the refusal
 	// cover the write and pub/sub paths rather than only the node enumeration.
 	wiringErr error
-	// shardFanOut visits every server this client spreads its keyspace over, or nil when the
-	// whole keyspace lives on one. Resolved ONCE at construction, from the client's type or from
-	// the consumer's own declaration, so no enumeration re-asks a question whose answer cannot
-	// change and the two keyless-command sites cannot be handed different topologies.
+	// topology is how this client spreads its keyspace, and shardFanOut is the iterator that
+	// visits every server it spreads over (nil when the whole keyspace lives on one). Resolved
+	// ONCE at construction, from the client's type or from the consumer's declaration, so no
+	// enumeration re-asks a question whose answer cannot change and the two keyless-command
+	// sites cannot be handed different topologies.
+	//
+	// The topology is kept as redisutil's own three-valued answer rather than collapsed to a
+	// "known" bool: the bool made "known single-node, with a live cluster fan-out discarded"
+	// representable, which is exactly the state a declaration overriding a classification would
+	// leave behind. resolveTopology holds the pair in agreement.
+	topology    redisutil.Topology
 	shardFanOut redisutil.ShardFanOut
-	// topologyKnown says the answer above is established rather than merely absent — the
-	// distinction ErrUnknownTopology exists for. Set by the classification or by a declaring
-	// option; false latches the wiring error.
-	topologyKnown bool
-	logger        *slog.Logger
+	// declared/declaredFanOut hold a consumer's topology DECLARATION, kept apart from the
+	// classification until resolveTopology settles the two: a declaration fills what the client's
+	// type could not establish and never overrides what it did. TopologyUnknown means "nothing
+	// declared", which is why the options never set it.
+	declared       redisutil.Topology
+	declaredFanOut redisutil.ShardFanOut
+	logger         *slog.Logger
 
 	// observers receive a Revocation the moment this instance's local view gains one,
 	// including a kill issued ELSEWHERE that this instance learns of via pub/sub or the
@@ -295,18 +315,19 @@ type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *re
 //
 // The escape hatch for the ordinary decorator: a metrics or tracing wrapper around a plain
 // *redis.Client is invisible to a concrete-type match, and without this it latches
-// ErrUnknownTopology. Declaring it wrongly — for a wrapper that in fact fronts a cluster — puts
-// the backend back in the silent partial-kill-set state the refusal exists to prevent, so it is
-// a statement about a client the caller built, not a way to quiet a startup error.
+// ErrUnknownTopology. It FILLS an unknown topology and cannot override a known one — declared
+// beside a client whose own type says "sharded", it is refused (ErrTopologyContradicted) rather
+// than honored, because honoring it would discard a working fan-out and serve one shard's kill
+// set as the whole thing, which is the failure ErrUnknownTopology exists to prevent.
 func WithSingleNodeKeyspace() RedisOption {
 	return func(r *Redis) {
-		r.shardFanOut = nil
-		r.topologyKnown = true
+		r.declared, r.declaredFanOut = redisutil.TopologySingleNode, nil
 	}
 }
 
 // WithShardFanOut declares that a client this package cannot classify SPREADS its keyspace over
-// several servers, and supplies the per-server iterator every full enumeration must use.
+// several servers, and supplies the per-server iterator every full enumeration must use. Like
+// its sibling it fills an unknown topology and cannot override a known one.
 //
 // A nil iterator is not a way to say "single node" — that is WithSingleNodeKeyspace, whose name
 // says so — so it leaves the topology undeclared and the backend refuses as before rather than
@@ -316,8 +337,7 @@ func WithShardFanOut(fanOut ShardFanOut) RedisOption {
 		if fanOut == nil {
 			return
 		}
-		r.shardFanOut = redisutil.ShardFanOut(fanOut)
-		r.topologyKnown = true
+		r.declared, r.declaredFanOut = redisutil.TopologySharded, redisutil.ShardFanOut(fanOut)
 	}
 }
 
@@ -355,30 +375,51 @@ func WithFailOpen(failOpen bool) RedisOption {
 // perfectly ordinary single-node client until its consumer says so, in exchange for never serving
 // a partial kill set as complete. See ErrUnknownTopology.
 func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
-	topology, fanOut := redisutil.ClassifyTopology(client)
 	r := &Redis{
 		client:            client,
-		shardFanOut:       fanOut,
-		topologyKnown:     topology != redisutil.TopologyUnknown,
 		killedAgents:      make(map[string]bool),
 		killedSessions:    make(map[string]bool),
 		reconcileInterval: defaultReconcileInterval,
 		sessionKillTTL:    defaultSessionKillTTL,
 	}
-	// Options run BEFORE the latch below: declaring the topology is precisely how a consumer
-	// answers a question the type could not.
+	r.topology, r.shardFanOut = redisutil.ClassifyTopology(client)
+	// Options run before the topology is settled: a declaration is one of the two inputs
+	// resolveTopology weighs, not an override applied after the fact.
 	for _, opt := range opts {
 		opt(r)
 	}
-	switch {
-	case redisutil.IsNilClient(client):
-		// Ahead of the topology: a nil client has none, and reporting the derived cause would
-		// send an operator looking for a wrapper that is not there.
-		r.wiringErr = ErrNilClient
-	case !r.topologyKnown:
-		r.wiringErr = ErrUnknownTopology
-	}
+	r.wiringErr = r.resolveTopology(redisutil.IsNilClient(client))
 	return r
+}
+
+// resolveTopology settles the client's keyspace topology from what its concrete type established
+// and what the consumer declared, returning the wiring fault to latch when the two cannot be
+// settled into one answer.
+//
+// A declaration FILLS an unknown topology and never OVERRIDES an established one. That asymmetry
+// is the whole point: applied unconditionally, WithSingleNodeKeyspace() beside a real cluster
+// client would throw away a working fan-out, leave nothing latched, and put the backend back to
+// scanning one shard and reporting the result as the whole kill set — reachable through the very
+// option added to prevent it. A contradiction is therefore a wiring error rather than a winner.
+//
+// nilClient is passed rather than re-derived: ClassifyTopology already asked, and a nil client is
+// reported ahead of any topology because it has none and the derived cause would send an operator
+// looking for a wrapper that is not there.
+func (r *Redis) resolveTopology(nilClient bool) error {
+	switch {
+	case nilClient:
+		return ErrNilClient
+	case r.declared == redisutil.TopologyUnknown:
+		if r.topology == redisutil.TopologyUnknown {
+			return ErrUnknownTopology
+		}
+	case r.topology == redisutil.TopologyUnknown:
+		// The case the options exist for: the type established nothing, the consumer knows.
+		r.topology, r.shardFanOut = r.declared, r.declaredFanOut
+	case r.declared != r.topology:
+		return fmt.Errorf("%w: declared %s, but the client's own type is %s", ErrTopologyContradicted, r.declared, r.topology)
+	}
+	return nil
 }
 
 // Start begins the pub/sub subscription for state synchronization. Call once at startup.
@@ -395,12 +436,15 @@ func (r *Redis) Start(ctx context.Context) {
 	if r.startedOnce || r.stopped {
 		return
 	}
-	// A latched wiring fault means every command below would panic rather than error, so
-	// nothing is subscribed and no goroutine is launched. started stays false, and every
-	// reader reports ErrNilClient (fail closed) instead of a cache nobody can refresh.
+	// A latched wiring fault means this backend can never confirm its kill set — the client
+	// would panic on every command, or the servers holding the keyspace cannot be enumerated —
+	// so nothing is subscribed and no goroutine is launched. started stays false and every
+	// reader reports the cause (fail closed) instead of a cache nobody can refresh. The message
+	// names no specific cause: there is more than one, and the one that applies rides the error
+	// attribute rather than being restated (wrongly) in prose.
 	if r.wiringErr != nil {
 		if r.logger != nil {
-			r.logger.Error("kill switch: wired with no redis client; the switch is permanently degraded and every check fails closed",
+			r.logger.Error("kill switch: wiring fault; the switch is permanently degraded and every check fails closed",
 				slog.String("error", r.wiringErr.Error()))
 		}
 		return

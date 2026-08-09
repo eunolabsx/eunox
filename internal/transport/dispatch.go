@@ -1123,10 +1123,11 @@ func completeToolsListing(params, result json.RawMessage) bool {
 //
 // The code is what makes the refusal resist an observing route's downgrade: it classifies as a
 // FAULT, so [capability.DenialInfo.Downgradable] is false for it whoever asks. It used to be
-// AUTHORIZATION_FAILED, and the property held only because this path builds no DenialInfo and
-// so never reaches isObserveDeny — a bypass, which the obvious cleanup (routing the default
-// through enforcedForwardCore like every other refusal) would have removed along with the
-// property, leaving --audit forwarding a message it has no route for.
+// AUTHORIZATION_FAILED, and the property held only because this path builds no DenialInfo and so
+// never reaches isObserveDeny. That bypass is now belt to the code's braces rather than the whole
+// belt: routing the default through enforcedForwardCore like every other refusal would leave the
+// property standing, which is what makes the cleanup safe to do — and what
+// assertRoutingRefusalCode pins so it stays safe.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	// Kill-switch check runs at the dispatchRequest boundary, so a killed session is reported
 	// as KILL_SWITCH before reaching this handler. msg.Method is attacker-controlled; sanitize

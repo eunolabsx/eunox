@@ -302,7 +302,7 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
 	// resolution — see recordPreSessionDeny. The stderr line is gated on the SAME admission
 	// verdict as the record, for the reason given on requireJSONContentType's stderr gate above.
-	if admitted := p.recordPreSessionDeny(r, "ORIGIN_REJECTED", catOrigin, details); admitted {
+	if admitted := p.recordPreSessionDeny(r, codeOriginRejected, catOrigin, details); admitted {
 		if multiple {
 			_, _ = fmt.Fprintf(p.errOut(),
 				"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/eunolabs/eunox/internal/redisutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -726,6 +727,67 @@ func TestNilClient_OutranksTheTopologyRefusal(t *testing.T) {
 	t.Parallel()
 	r := NewRedis(nil, WithSingleNodeKeyspace())
 	assert.ErrorIs(t, r.HealthStatus(), ErrNilClient)
+}
+
+// TestDeclaredTopology_CannotOverrideWhatTheClientItselfEstablishes is the regression for the
+// escape hatch becoming the fail-open it was added to close.
+//
+// A declaration applied unconditionally would discard a classified client's real fan-out and
+// latch nothing: `NewRedis(clusterClient, WithSingleNodeKeyspace())` — the obvious reaction to
+// meeting ErrUnknownTopology somewhere else — would scan one master, commit that as the whole
+// kill set, answer "not killed" for every session hashed elsewhere, and report HealthStatus ready.
+// A declaration therefore fills an UNKNOWN topology and is refused when it contradicts a known
+// one; agreeing with it is accepted and changes nothing.
+func TestDeclaredTopology_CannotOverrideWhatTheClientItselfEstablishes(t *testing.T) {
+	t.Parallel()
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000"}})
+	t.Cleanup(func() { _ = cluster.Close() })
+	single, _ := newRawTestClient(t)
+
+	t.Run("single-node declared over a sharded client", func(t *testing.T) {
+		t.Parallel()
+		r := NewRedis(cluster, WithSingleNodeKeyspace())
+		assert.ErrorIs(t, r.HealthStatus(), ErrTopologyContradicted,
+			"a declaration that discards a real fan-out must refuse, not win: obeying it serves one shard's kill set as complete")
+		assert.NotNil(t, r.shardFanOut, "the classified iterator must survive a refused declaration")
+	})
+
+	t.Run("sharded declared over a single-node client", func(t *testing.T) {
+		t.Parallel()
+		r := NewRedis(single, WithShardFanOut(cluster.ForEachMaster))
+		assert.ErrorIs(t, r.HealthStatus(), ErrTopologyContradicted, "the mirror case refuses too")
+	})
+
+	t.Run("a declaration agreeing with the client is accepted", func(t *testing.T) {
+		t.Parallel()
+		r := NewRedis(single, WithSingleNodeKeyspace())
+		markStarted(t, r)
+		assert.NoError(t, r.HealthStatus(), "restating what the type already says is redundant, not a conflict")
+		assert.Nil(t, r.shardFanOut)
+	})
+}
+
+// TestResolvedTopology_AgreesWithItsIterator: whatever settles the topology — the client's type
+// or a declaration — must leave the pair consistent, since forEachNode reads the iterator while
+// every refusal reads the topology.
+func TestResolvedTopology_AgreesWithItsIterator(t *testing.T) {
+	t.Parallel()
+	single, _ := newRawTestClient(t)
+	ring := redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000"}})
+	t.Cleanup(func() { _ = ring.Close() })
+
+	for name, r := range map[string]*Redis{
+		"classified single node": NewRedis(single),
+		"classified sharded":     NewRedis(ring),
+		"declared single node":   NewRedis(hookedTestClient{Cmdable: single}, WithSingleNodeKeyspace()),
+		"declared sharded":       NewRedis(hookedTestClient{Cmdable: ring}, WithShardFanOut(ring.ForEachShard)),
+		"unresolved":             NewRedis(hookedTestClient{Cmdable: single}),
+	} {
+		if got := r.shardFanOut != nil; got != (r.topology == redisutil.TopologySharded) {
+			t.Errorf("%s: topology = %s with an iterator = %v; a sharded backend without a fan-out (or the reverse) enumerates the wrong set of servers",
+				name, r.topology, got)
+		}
+	}
 }
 
 // hookedTestClient is the production shape the topology refusal is about: a decorator with
