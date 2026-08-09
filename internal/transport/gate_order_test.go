@@ -163,7 +163,7 @@ func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 		pdp:           pdp.AlwaysAllowPDP{},
 		revision:      capability.Revision20260728,
 		forward:       func(context.Context, mcp.RPCMsg) bool { return true },
-		writeUpstream: func(mcp.RPCMsg) {},
+		writeUpstream: func(mcp.RPCMsg) error { return nil },
 		errOut:        io.Discard,
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"}, fp)
@@ -227,7 +227,7 @@ func TestGateOrder_NotificationGateAppliesTheCanonicalOrder(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			gate := hostNotificationGate{
-				rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
+				recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
 				checkKill: func() *capability.EnforceResponse {
 					if tc.revoked {
 						return killed
@@ -463,11 +463,10 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 	}
 }
 
-// staticRecorder adapts a test recorder to the gate's rec THUNK. Production supplies a thunk
-// because a pre-session recorder costs a rate-limit token to resolve; a test recorder costs
-// nothing, so it is handed over as a constant.
-func staticRecorder(rec auditRecorder) func() auditRecorder {
-	return func() auditRecorder { return rec }
+// staticRecorder adapts a test recorder to the gate's per-category recorder wiring: a test recorder
+// meters nothing, so every category resolves to it.
+func staticRecorder(rec auditRecorder) refusalRecorders {
+	return unmeteredRecorders(rec)
 }
 
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and

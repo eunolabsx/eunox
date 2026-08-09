@@ -100,6 +100,19 @@ const (
 	// refusalDeclarations for the reason, which is the same for both.
 	catUnroutable refusalCategory = "unroutable"
 	catSmuggled   refusalCategory = "smuggled_notification"
+	// catServerRequestFailed bounds the two records for a server-initiated request this proxy had
+	// already TRACKED and then failed: a delivery that never reached the host, and a host reply
+	// destroyed because there was no upstream sink to relay it through. Driven by the upstream like
+	// catDisplaced, and metered for the same reason — nothing caps how many such requests an
+	// upstream issues over a session's life.
+	catServerRequestFailed refusalCategory = "failed_server_request"
+	// catUnroutableID bounds the record for a server-initiated request eunox refuses because its
+	// own JSON-RPC id is larger than the in-flight tracker retains. Its own bucket, not
+	// catDisplaced's: the two refusals are answered identically but are not equally cheap to
+	// reach — a displacement needs the bounded set full or an id collision, an over-cap id needs
+	// neither — so sharing one bucket would let the cheaper flood suppress the record that says a
+	// LIVE in-flight request was evicted.
+	catUnroutableID refusalCategory = "unroutable_server_request_id"
 	// catDisplaced bounds the record for a server-initiated request the in-flight tracker
 	// displaced. Driven by the UPSTREAM rather than by a host peer — the one category here that
 	// is — because once the bounded set is full every further server-initiated request displaces
@@ -145,18 +158,20 @@ const exemptBecausePolicyDenyCostsTheSame = "reaching it needs a peer whose ordi
 // category's share of the aggregate budget) is derived from it, so declaring a category exempt
 // does not silently shrink the metered ones' shares.
 var refusalDeclarations = map[refusalCategory]refusalDeclaration{
-	catOrigin:      {metering: meteringMetered},
-	catJWT:         {metering: meteringMetered},
-	catAuth:        {metering: meteringMetered},
-	catControl:     {metering: meteringMetered},
-	catLoopback:    {metering: meteringMetered},
-	catBody:        {metering: meteringMetered},
-	catContentType: {metering: meteringMetered},
-	catSaturation:  {metering: meteringMetered},
-	catKill:        {metering: meteringMetered},
-	catAudience:    {metering: meteringMetered},
-	catRevision:    {metering: meteringMetered},
-	catDisplaced:   {metering: meteringMetered},
+	catOrigin:              {metering: meteringMetered},
+	catJWT:                 {metering: meteringMetered},
+	catAuth:                {metering: meteringMetered},
+	catControl:             {metering: meteringMetered},
+	catLoopback:            {metering: meteringMetered},
+	catBody:                {metering: meteringMetered},
+	catContentType:         {metering: meteringMetered},
+	catSaturation:          {metering: meteringMetered},
+	catKill:                {metering: meteringMetered},
+	catAudience:            {metering: meteringMetered},
+	catRevision:            {metering: meteringMetered},
+	catDisplaced:           {metering: meteringMetered},
+	catUnroutableID:        {metering: meteringMetered},
+	catServerRequestFailed: {metering: meteringMetered},
 	// The fail-closed ROUTING refusal, on either transport and in either framing.
 	catUnroutable: {metering: meteringExempt, why: exemptBecausePolicyDenyCostsTheSame},
 	// The enforced-method-as-notification reject. It writes a record as cheap as the routing
@@ -240,7 +255,7 @@ func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter 
 // stdioRefusalCategories is the set the stdio transport charges. Declared rather than left implicit
 // in its call sites, so the limiter it builds and the categories it spends are one statement — and
 // so a metered refusal added to that transport is a deliberate edit here.
-var stdioRefusalCategories = []refusalCategory{catRevision, catDisplaced}
+var stdioRefusalCategories = []refusalCategory{catRevision, catDisplaced, catUnroutableID, catServerRequestFailed}
 
 // unmeteredRecorder returns rec unchanged, for a refusal its category DECLARES exempt.
 //
@@ -248,7 +263,52 @@ var stdioRefusalCategories = []refusalCategory{catRevision, catDisplaced}
 // table test walks these sites, so a refusal that ships with no answer, or with an answer
 // contradicting its declaration, fails the build. That is the whole difference from writing the
 // record directly — there is no runtime behavior here to get wrong.
+//
+// It is the marker for a site that already HOLDS a resolved recorder. It cannot check that what it
+// was handed is unmetered — an auditRecorder carries no provenance, and by the time one reaches
+// here a bucket has already been charged and may have suppressed the record to nil. A site that
+// resolves its recorder names its category to refusalRecorders.forCategory instead, which applies
+// the declaration rather than trusting a caller to have picked the matching helper.
 func unmeteredRecorder(rec auditRecorder, _ refusalCategory) auditRecorder { return rec }
+
+// refusalRecorders is a transport leg's wiring for the recorder a refusal writes its record
+// through, resolved per CATEGORY rather than once per leg.
+//
+// Per category because one leg's arms disagree: the HTTP pre-session arm bounds its kill record
+// (catKill — an unauthenticated caller drives it) while the smuggling and routing refusals beside
+// it are DECLARED exempt, and a single per-leg recorder handed all three the metered one — so an
+// exemption on the record spent a catKill token anyway, draining the bucket that bounds the records
+// an incident responder reads first during an emergency stop.
+//
+// Plain values, not thunks: resolving the sink costs a nil-compare and an interface conversion,
+// while the TOKEN is spent inside forCategory and only for a record actually being written — so
+// laziness is preserved where it mattered, without a closure per message on the leg an
+// unauthenticated peer drives at its send rate.
+type refusalRecorders struct {
+	// rec is the leg's audit sink, or nil when it has none.
+	rec auditRecorder
+	// limiter is the leg's admission control. nil on a leg that meters none of the categories it
+	// can refuse under: stdio's notification gate, and the established-session HTTP arm, whose kill
+	// records describe an already-admitted caller and are deliberately unbounded.
+	limiter *categoryRecordLimiter
+}
+
+// forCategory applies the disposition the CATEGORY declares rather than the leg's own default,
+// which is what makes "declared exempt" and "charges no bucket" one fact.
+//
+// An UNDECLARED category is metered, not exempt: the zero refusalDeclaration means nobody has
+// answered the question, and the safe answer to that is the bounded one.
+func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
+	if r.rec == nil || r.limiter == nil || refusalDeclarations[category].metering == meteringExempt {
+		return r.rec
+	}
+	return admitRefusalRecord(r.rec, r.limiter, category)
+}
+
+// unmeteredRecorders is the wiring for a leg that meters nothing it can refuse. Named rather than
+// spelled as a bare literal at each, so "this leg charges no bucket" is one statement a reader can
+// find beside the legs that do.
+func unmeteredRecorders(rec auditRecorder) refusalRecorders { return refusalRecorders{rec: rec} }
 
 // categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
 // cheap refusals in one category cannot suppress another's records.
@@ -299,6 +359,13 @@ func (c *categoryRecordLimiter) setNow(now func() time.Time) {
 // unbounded records the bucket exists to prevent. A caller that legitimately has none (a proxy
 // assembled by a bare struct literal in a test) tests for it and does not call.
 func admitRefusalRecord(rec auditRecorder, limiter *categoryRecordLimiter, category refusalCategory) auditRecorder {
+	if rec == nil {
+		// Nothing to write, so nothing to bound: leave the bucket's tokens for a site that has a
+		// tape. Also the only guard against wrapping a nil recorder in rolledUpRecorder, which is a
+		// NON-nil interface — every `rec != nil` test downstream would pass and the rollup's
+		// delegation would nil-deref on a goroutine nothing recovers.
+		return nil
+	}
 	admitted, suppressed := limiter.admit(category)
 	switch {
 	case !admitted:

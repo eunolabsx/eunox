@@ -28,11 +28,20 @@ import (
 var meteringCallSites = map[string]struct {
 	categoryArg int
 	implements  refusalMetering
+	// readsDeclaration marks a resolver that applies whichever disposition the category DECLARES
+	// (refusalRecorders.forCategory) rather than a fixed one. Such a site cannot contradict a
+	// declaration — that is the whole point of it — so only the naming half is checked and
+	// implements is ignored. It is the shape that closes the gap unmeteredRecorder structurally
+	// could not: a leg that resolved one recorder for every arm handed the metered kill recorder
+	// to two arms whose categories declare themselves exempt, and a no-op marker function has no
+	// way to notice.
+	readsDeclaration bool
 }{
 	"admitRefusalRecord":   {categoryArg: 2, implements: meteringMetered},
 	"recordRefusal":        {categoryArg: 4, implements: meteringMetered},
 	"recordPreSessionDeny": {categoryArg: 2, implements: meteringMetered},
 	"unmeteredRecorder":    {categoryArg: 1, implements: meteringExempt},
+	"forCategory":          {categoryArg: 0, readsDeclaration: true},
 }
 
 // TestRefusalMetering_EveryCategoryDeclaresOne is the build-time half: an entry missing its
@@ -137,6 +146,11 @@ func TestRefusalMetering_CallSitesAgreeWithTheDeclarations(t *testing.T) {
 					t.Errorf("%s: %s names category %q, which declares no metering disposition", name, fn.Name, cat)
 					return true
 				}
+				if site.readsDeclaration {
+					// It applies whatever the category declares, so there is no disposition to
+					// disagree with — only the naming, checked above.
+					return true
+				}
 				if declared.metering != site.implements {
 					t.Errorf("%s: %s implements %s metering but category %q declares the opposite. "+
 						"A refusal's disposition is a decision on the record, not a property of which helper a call site reached for.",
@@ -215,6 +229,20 @@ func categoryConstant(t *testing.T, e ast.Expr) (refusalCategory, bool) {
 func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 	t.Helper()
 	out := map[string]refusalCategory{}
+	for name, value := range declaredStringConstants(t, "refusalCategory") {
+		out[name] = refusalCategory(value)
+	}
+	require.NotEmpty(t, out, "no refusalCategory constants found; this guard would pass vacuously")
+	return out
+}
+
+// declaredStringConstants reads every `name typeName = "..."` declaration out of the package's
+// non-test sources. ONE scanner for the two guards that each keep a closed vocabulary honest: two
+// copies meant a fix to one — handling a multi-name spec, say, which both currently skip — left the
+// other blind, and the blind one would be whichever guard nobody was editing.
+func declaredStringConstants(t *testing.T, typeName string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
 	for _, src := range packageSources(t) {
 		for _, decl := range src.file.Decls {
 			gen, isGen := decl.(*ast.GenDecl)
@@ -222,16 +250,16 @@ func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 				continue
 			}
 			// A const block declares its type once, on the first spec; later specs inherit it.
-			typeName := ""
+			declared := ""
 			for _, spec := range gen.Specs {
 				vs, isValue := spec.(*ast.ValueSpec)
 				if !isValue {
 					continue
 				}
 				if id, isIdent := vs.Type.(*ast.Ident); isIdent {
-					typeName = id.Name
+					declared = id.Name
 				}
-				if typeName != "refusalCategory" || len(vs.Names) != 1 || len(vs.Values) != 1 {
+				if declared != typeName || len(vs.Names) != 1 || len(vs.Values) != 1 {
 					continue
 				}
 				lit, isLit := vs.Values[0].(*ast.BasicLit)
@@ -240,11 +268,10 @@ func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 				}
 				value, err := strconv.Unquote(lit.Value)
 				require.NoError(t, err)
-				out[vs.Names[0].Name] = refusalCategory(value)
+				out[vs.Names[0].Name] = value
 			}
 		}
 	}
-	require.NotEmpty(t, out, "no refusalCategory constants found; this guard would pass vacuously")
 	return out
 }
 

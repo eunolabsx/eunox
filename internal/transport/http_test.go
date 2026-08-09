@@ -2873,9 +2873,15 @@ func TestHTTPFailServerRequestDelivery_WritesCorrectionRecord(t *testing.T) {
 	}
 
 	recs := readAuditRecords(t, logPath)
-	rec := findAuditRecord(recs, "sampling/createMessage", "deny")
+	// By METHOD, not by target: this refusal ran no policy decision, so auditIdentity drops the
+	// identifier for a method that resolves a target type — recording one would stamp a policy
+	// target onto the signed tape for a request the PDP never saw.
+	rec := findAuditRecordByMethod(recs, "sampling/createMessage", "deny")
 	if rec == nil {
 		t.Fatalf("no correction deny record for the undelivered server-initiated request; records: %+v", recs)
+	}
+	if target, present := rec["target"]; present {
+		t.Errorf("correction record names a policy target %v for a request no policy decided", target)
 	}
 	details, _ := rec["details"].(map[string]interface{})
 	if got, _ := details["transport"].(string); got != "http-server-request-undelivered" {

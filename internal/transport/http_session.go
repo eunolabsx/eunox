@@ -324,11 +324,7 @@ func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() 
 // initiator. writeUpstream is nil in remote-upstream mode, which is what the seam's nil-writer
 // disposition tests for — never a nil *mcp.MsgWriter handed over as a live sink.
 func (s *httpSession) unblocker() serverRequestUnblocker {
-	var write func(mcp.RPCMsg)
-	if s.upWriter != nil {
-		write = func(m mcp.RPCMsg) { _ = s.upWriter.Write(m) }
-	}
-	return serverRequestUnblocker{reqs: &s.serverReqs, writeUpstream: write, errOut: s.errOut()}
+	return serverRequestUnblocker{reqs: &s.serverReqs, writeUpstream: initiatorWriter(s.upWriter), errOut: s.errOut()}
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would
@@ -1160,10 +1156,19 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 // session's only response-delivery/SSE-relay goroutine must not stall on it, which matters more
 // under task anchoring, where the turn holder can be a different session sharing the anchor.
 func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
+	// Refused at the ENTRY, above the pool and above any decision — see admitServerRequestID. The
+	// limiter is the proxy's, reached here because this leg has no request in scope to carry one.
+	if !admitServerRequestID(ctx, s.unblocker(), s.refusalRecorders(), verifiedSession(s.id), dropHTTPUnroutableID, msg) {
+		return
+	}
 	s.serverPool.dispatch(ctx, msg, serverRequestDispatch{
-		rec:           asRecorder(s.route.sink),
-		sessionID:     s.id,
-		writeUpstream: func(m mcp.RPCMsg) { _ = s.upWriter.Write(m) },
+		rec:       asRecorder(s.route.sink),
+		sessionID: s.id,
+		// Through the seam rather than a closure over the concrete writer: remote-upstream mode
+		// leaves upWriter nil, and (*mcp.MsgWriter).Write locks its mutex on a nil receiver — so
+		// the saturation path would panic after its record rather than report. See writeToInitiator.
+		writeUpstream: s.unblocker().writeUpstream,
+		errOut:        s.errOut(),
 		handle:        func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
 		revision:      s.hostRev,
 	})
@@ -1419,7 +1424,7 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // and the proxy that holds the bucket is already in scope at the one site that wires this in.
 func (s *httpSession) broadcastServerRequest(ctx context.Context, limiter *categoryRecordLimiter, msg mcp.RPCMsg) bool {
 	u := s.unblocker()
-	trackServerRequest(ctx, u, asRecorder(s.route.sink), limiter, verifiedSession(s.id), dropHTTPDisplaced, msg)
+	trackServerRequest(ctx, u, refusalRecorders{rec: asRecorder(s.route.sink), limiter: limiter}, verifiedSession(s.id), dropHTTPDisplaced, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}
@@ -1515,8 +1520,21 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 	// This request was recorded as an allow when deliverToOne buffered it, but it never
 	// reached the host — append a correction so the tamper-evident tape doesn't stand as
 	// claiming delivery that didn't happen.
-	if s.claims != nil {
-		ctx = pdp.WithJWTClaims(ctx, s.claims)
+	recordServerRequestDropped(s.withSessionClaims(ctx), s.refusalRecorders().forCategory(catServerRequestFailed), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
+}
+
+// refusalRecorders is this session's wiring for a refusal record's recorder: the route's sink and
+// the proxy's admission control, with forCategory applying each category's own declaration.
+func (s *httpSession) refusalRecorders() refusalRecorders {
+	return refusalRecorders{rec: asRecorder(s.route.sink), limiter: s.proxy.refusalRecordLimiter()}
+}
+
+// withSessionClaims stamps this session's captured JWT identity onto ctx, for a record written on a
+// leg that has no request of its own to carry one. The sink reads agent / task / user off the
+// context, so a record written without it is attributable to the session id alone.
+func (s *httpSession) withSessionClaims(ctx context.Context) context.Context {
+	if s.claims == nil {
+		return ctx
 	}
-	recordServerRequestDropped(ctx, asRecorder(s.route.sink), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
+	return pdp.WithJWTClaims(ctx, s.claims)
 }

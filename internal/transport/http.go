@@ -742,3 +742,12 @@ func (p *HTTPProxy) serveCtx() context.Context {
 	}
 	return context.Background()
 }
+
+// refusalRecordLimiter is this proxy's refusal-record admission control, nil-safe so a session
+// assembled by a bare struct literal (as tests build) records unbounded rather than panicking.
+func (p *HTTPProxy) refusalRecordLimiter() *categoryRecordLimiter {
+	if p == nil {
+		return nil
+	}
+	return p.preSessionDenies
+}

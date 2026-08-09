@@ -294,7 +294,11 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		forward: func(ctx context.Context, m mcp.RPCMsg) bool {
 			return sess.broadcastServerRequest(ctx, p.preSessionDenies, m)
 		},
-		writeUpstream: func(m mcp.RPCMsg) { _ = sess.upWriter.Write(m) },
+		// Through the seam, not a bare closure over the concrete writer: remote-upstream mode
+		// leaves upWriter nil, and every denial arm below answers the initiator AFTER its audit
+		// record — a nil-receiver panic there leaves a tape recording a denial the process died
+		// delivering. See writeToInitiator.
+		writeUpstream: sess.unblocker().writeUpstream,
 		decideLock:    decideLock,
 		// A session that has spanned two state anchors cannot decide on this leg at all; see
 		// samplingAnchorSplitDenial. Always wired: the session answers false unless it

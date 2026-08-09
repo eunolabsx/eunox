@@ -95,7 +95,7 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetWhenTheMethodResolvesOne(
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
-			gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+			gate := hostNotificationGate{recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
 			if gate.admit(revisionContext(tc.rev), mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}) == notificationForward {
 				t.Fatalf("%s must be denied in notification framing", tc.method)
 			}
@@ -280,7 +280,7 @@ func TestDispatchesMessage_MatchesWhatTheDispatcherActuallyDoes(t *testing.T) {
 
 				notification := mcp.RPCMsg{JSONRPC: "2.0", Method: method}
 				gate := hostNotificationGate{
-					rec: staticRecorder(&fwdRecorder{}), subject: verifiedSession("sess"),
+					recorders: staticRecorder(&fwdRecorder{}), subject: verifiedSession("sess"),
 					established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
 				}
 				admitted := gate.admit(ctx, notification) != notificationRefused
@@ -680,14 +680,16 @@ func TestObserveMode_DoesNotDowngradeARoutingRefusal(t *testing.T) {
 // It used to be the arm with its own recorder call — the one where the identifier rule had to be
 // hand-mirrored once already — and is now the same producer reached from the notification side.
 //
-// The gate carries the leg's real audit posture, so this exercises the observe gate rather than
-// skipping past it: with audit hardcoded false the assertion would hold by construction instead of
-// by UNROUTABLE_METHOD's class.
+// The gate carries the leg's real audit posture, so the refusal reaches the observe gate rather
+// than skipping past it — with audit hardcoded false the assertion would hold by construction.
+// What makes it survive the gate is now BOTH the code's fault class and the absence of an upstream
+// to downgrade into; assertRoutingRefusalCode is what holds the class on its own, and
+// TestUpstreamlessLeg_ObserveCannotDowngradeIntoAFabricatedOutage the mode.
 func TestObserveMode_MarksTheNotificationFramedRefusalToo(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	gate := hostNotificationGate{
-		rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true,
+		recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true,
 		audit: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
 	}
 	// ping exists in this revision and is answered locally; it has no notification disposition
@@ -819,7 +821,7 @@ func TestServerRequestPool_SaturationRefusalNamesTheSessionsRevision(t *testing.
 	t.Cleanup(func() { close(release) })
 	held := make(chan struct{}, maxConcurrentServerRequests)
 	dispatch := serverRequestDispatch{
-		rec: rec, sessionID: "sess", writeUpstream: func(mcp.RPCMsg) {},
+		rec: rec, sessionID: "sess", writeUpstream: func(mcp.RPCMsg) error { return nil },
 		handle:   func(context.Context, mcp.RPCMsg) { held <- struct{}{}; <-release },
 		revision: capability.Revision20260728,
 	}

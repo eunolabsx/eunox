@@ -1209,6 +1209,73 @@ Section conventions:
 
 ### Fixed
 
+- **A refusal DECLARED exempt from metering charged the kill switch's bucket.**
+  `refusalDeclarations` declares the fail-closed routing refusal and the
+  enforced-method-as-notification reject unmetered, and both arms named their category — but the
+  recorder they were handed was the LEG's, and the HTTP pre-session leg's is drawn from the `kill`
+  bucket, so each exemption spent a `catKill` token anyway. `unmeteredRecorder` structurally could
+  not notice: it returns what it is handed, and an `auditRecorder` carries no provenance. It was
+  unreachable only by an accident of control flow — that arm handles `initialize` alone, whose
+  notification framing is swallowed first — so one forwardable pre-session method away, an
+  unauthenticated peer spraying unmapped notifications could elide the pre-session `KILL_SWITCH`
+  records an incident responder reads first, during an emergency stop. The notification gate now
+  resolves its recorder per CATEGORY through a resolver that READS the declaration, so "declared
+  exempt" and "charges no bucket" are one fact rather than two that can disagree, and an
+  UNDECLARED category resolves METERED — the bounded direction — rather than exempt.
+
+- **A refusal record with no audit sink crashed the proxy.** A metered site resolved its recorder
+  against a live rate-limit bucket without first testing for a nil sink, which a proxy started with
+  `--require-audit=off` (or an unopenable audit path) has. Past the bucket's burst, the next
+  admitted record came back as a rollup wrapper around a nil recorder — a NON-nil interface, so
+  every `rec != nil` guard below it passed and the delegation nil-dereferenced, on a
+  server-request goroutine nothing recovers. Reachable by an upstream reusing one JSON-RPC id for
+  its server-initiated requests.
+
+- **An observing route could report a fabricated upstream outage for a message no upstream was
+  sent.** The routing refusal made "never forwarded" structural by substituting a stub upstream
+  sink that fails on use — but the core's only consumer of that stub is the observe arm, where a
+  failure is not "nothing happened": it is classified as a transport error and written as an
+  `UPSTREAM_ERROR` deny, plus `-32603` to the host in place of the routing denial. "No upstream to
+  forward to" is now a MODE the core understands (a nil upstream call): the observe downgrade IS a
+  forward, so a leg without one cannot take it, and the refusal stays hard with the code naming the
+  real cause. An authorized call on such a leg is refused `ENFORCEMENT_ERROR` naming the wiring
+  fault rather than nil-calling.
+
+- **A host reply destroyed on the server-initiated leg left nothing on the tape.** Both transports
+  consume the tracked id before knowing whether they can relay — deliberately, since an entry
+  nothing can reclaim eventually displaces a live request — so a relay that then fails destroys a
+  reply the host actually produced. Its whole account was a stderr line, which no SIEM sees. It is
+  now recorded on both transports (`transport: {http,stdio}-server-reply-undeliverable`), and the
+  relay reports a FAILED write as well as an absent sink, so the record is reachable for the case
+  that actually happens (a dead upstream subprocess) rather than only for the one the code calls
+  unreachable.
+
+- **Three closures answered a blocked upstream initiator outside the nil-writer seam.** A nil
+  concrete writer takes its mutex on a nil receiver, so those sites panicked where the seam
+  reports — and on the denial arms the panic lands AFTER the audit record, leaving a tape
+  recording a denial the process died delivering. All four sites now take the seam's writer.
+
+- **A server-initiated request whose JSON-RPC id the proxy will not retain is refused up front.**
+  Each of the in-flight tracker's 1024 entries retained the raw id, its canonical key and the
+  method, all off a reader capped at 4 MiB per message and released only by a host reply or
+  teardown. The method is now bounded through the same audit envelope cap every other envelope
+  field takes; an id larger than 8 KiB makes the request unroutable — answered, recorded
+  (`transport: {http,stdio}-server-request-id-unroutable`) and not forwarded — since a truncated id
+  could neither answer the initiator nor index the reply. The refusal runs at each transport's
+  ENTRY to that leg, above the policy decision, so it costs one record and no quota slot.
+
+### Changed
+
+- **`details.transport` is one closed vocabulary.** The audit detail was written from three
+  unrelated sources — two typed enums and a bare string parameter — so each kept its own spelling
+  honest and none kept the FIELD honest; `sse-get` was already spelled twice for the same leg. All
+  three families are now values of one `transportLeg` type behind one key constant. No existing
+  value changed; four are added (see above).
+
+- **Records for a server-initiated request the proxy accepted and then failed are rate-limited.**
+  The undelivered-broadcast and destroyed-reply records are driven by the upstream and were
+  unbounded; both now charge a declared per-category bucket, as the displacement record already did.
+
 - **A down `*redis.Ring` shard was skipped silently, so the kill set loaded partial and reported
   healthy.** go-redis' `(*Ring).ForEachShard` `continue`s past a shard its heartbeat has voted
   down and returns `nil` — unlike `(*ClusterClient).ForEachMaster`, which propagates both the

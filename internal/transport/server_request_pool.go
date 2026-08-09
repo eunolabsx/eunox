@@ -5,6 +5,7 @@ package transport
 
 import (
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,8 +80,13 @@ type serverRequestDispatch struct {
 	// sessionID identifies the session on that record.
 	sessionID string
 	// writeUpstream answers the upstream initiator. Called on the CALLER's goroutine
-	// (the reader) for a refusal, since no handler is spawned.
-	writeUpstream func(mcp.RPCMsg)
+	// (the reader) for a refusal, since no handler is spawned. nil means this transport has no
+	// upstream sink to answer through — a case the shared seam REPORTS (see writeToInitiator);
+	// each transport supplies its unblocker's writer rather than a closure over a concrete one,
+	// which would panic here instead.
+	writeUpstream func(mcp.RPCMsg) error
+	// errOut is where the seam writes that report; nil means os.Stderr.
+	errOut io.Writer
 	// handle is the server-initiated request's handler, run on its own goroutine.
 	handle func(context.Context, mcp.RPCMsg)
 	// revision is the session's negotiated host revision, stamped onto ctx BEFORE the admission
@@ -106,8 +112,11 @@ func (p *serverRequestPool) dispatch(ctx context.Context, msg mcp.RPCMsg, d serv
 		p.saturation.clear()
 	default:
 		recordResourceExhausted(ctx, d.rec, &p.saturation, d.sessionID, msg.Method)
-		d.writeUpstream(mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy,
-			"eunox: too many concurrent server-initiated requests in flight; retry"))
+		// Record-before-act, so the answer below is the one that may be lost rather than the
+		// record. Through the shared seam because it runs AFTER that record: a nil concrete writer
+		// would panic here and leave a tape reporting a refusal the process died delivering.
+		writeToInitiator(d.writeUpstream, d.errOut, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy,
+			"eunox: too many concurrent server-initiated requests in flight; retry"), answerPoolSaturated)
 		return
 	}
 	// Counted before the goroutine starts, so teardown's drain cannot observe zero for a
