@@ -567,12 +567,15 @@ func isEnforcedMethod(ctx context.Context, method string) bool {
 // gate itself — which checks run, and in what order — is not per-transport; see the package
 // gate order at the top of this file.
 type hostNotificationGate struct {
-	// rec is a THUNK, not a recorder, for the same reason checkKill is one and then some: a
-	// pre-session leg's recorder is drawn from a rate-limit bucket, so resolving it for a
-	// message that records nothing spends a token on nothing — and an unauthenticated peer can
-	// send those at will, emptying the bucket that bounds the kill records an emergency stop
-	// depends on. Resolved only where a record is actually written.
-	rec func() auditRecorder
+	// recorders resolves the recorder for a refusal in ONE category, lazily — for the reason a
+	// thunk was needed at all (a pre-session leg's recorder is drawn from a rate-limit bucket, so
+	// resolving it for a message that records nothing spends a token on nothing, and an
+	// unauthenticated peer sends those at will), and per CATEGORY because this gate's three
+	// recording arms disagree about metering. A single per-leg thunk handed the metered kill
+	// recorder to the two arms whose categories are DECLARED exempt, so an exemption on the record
+	// charged a bucket anyway — and charged catKill, the one bounding the records an emergency
+	// stop depends on. See refusalRecorders.
+	recorders refusalRecorders
 	// subject names WHOSE session a record describes and whether this proxy can vouch for the
 	// name: a leg with a session supplies the id it established, a pre-session one the id the
 	// client claimed. See killSubject.
@@ -605,7 +608,7 @@ type hostNotificationGate struct {
 	// claim to the comment. Never nil: every gate below calls it unconditionally.
 	checkKill func() *capability.EnforceResponse
 	// leg names this transport's notification leg in a kill-drop record.
-	leg killDropLeg
+	leg transportLeg
 }
 
 // notificationOutcome is what the shared gate DID with a notification. Three outcomes, not a
@@ -648,7 +651,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 		return notificationSwallowed
 	}
 	if kill := g.checkKill(); kill != nil {
-		recordKillDrop(ctx, g.rec(), kill, g.subject, msg.Method, msg.Method, g.leg)
+		recordKillDrop(ctx, g.recorders.forCategory(catKill), kill, g.subject, msg.Method, msg.Method, g.leg)
 		return notificationRefused
 	}
 	if swallowed {
@@ -659,8 +662,10 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	// An enforced method framed as a notification (no id) is a fail-closed reject: forwarding
 	// it verbatim would bypass both the PDP decision and the audit record.
 	if tables.enforces(msg.Method) {
-		// Unmetered by DECLARATION (catSmuggled), not by omission — see refusalDeclarations.
-		if rec := unmeteredRecorder(g.rec(), catSmuggled); rec != nil {
+		// Unmetered by DECLARATION (catSmuggled), not by omission — and named to the resolver, so
+		// the declaration is what decides rather than whichever recorder this leg happened to
+		// build. See refusalDeclarations and refusalRecorders.
+		if rec := g.recorders.forCategory(catSmuggled); rec != nil {
 			// auditIdentity for the same reason its siblings use it: every enforced method
 			// resolves a target type, so naming one here fabricates a policy target for a
 			// message the PDP never saw.
@@ -676,10 +681,11 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	// now, not an analogue of it. Before either existed, an unrecognized notification-framed
 	// method reached the upstream invisibly while its request-framed twin was denied and logged.
 	//
-	// The denial message the core builds is discarded: JSON-RPC forbids replying to a
-	// notification, and the caller acks. What is not discarded is everything else the shared path
-	// owns — the observe gate, the strict-audit gate and the record shape.
-	refuseUnroutable(ctx, refusalForwardParams(g.rec(), g.subject, g.audit, g.strictAudit, g.errOut), g.subject, msg, unroutableFramingNotification)
+	// The framing carries the fact that there is no reply channel here, so the core builds no
+	// denial message to throw away (JSON-RPC forbids replying to a notification, and the caller
+	// acks). What is not skipped is everything else the shared path owns — the observe gate, the
+	// strict-audit gate and the record shape.
+	refuseUnroutable(ctx, refusalForwardParams(g.recorders.forCategory(catUnroutable), g.subject, g.audit, g.strictAudit, g.errOut), g.subject, msg, unroutableFramingNotification)
 	return notificationRefused
 }
 

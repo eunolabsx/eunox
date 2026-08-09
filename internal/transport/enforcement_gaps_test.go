@@ -2883,7 +2883,7 @@ func TestGapRevision_NotificationTablesPerRevision(t *testing.T) {
 	for _, tc := range cases {
 		rec := &fwdRecorder{}
 		msg := mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}
-		gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+		gate := hostNotificationGate{recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
 		denied := gate.admit(revisionContext(tc.rev), msg) != notificationForward
 		if denied != tc.wantDenied {
 			t.Errorf("%s under %s: denied = %v, want %v", tc.method, tc.rev, denied, tc.wantDenied)
@@ -2895,7 +2895,7 @@ func TestGapRevision_NotificationTablesPerRevision(t *testing.T) {
 	// The swallowed set is the one disposition that writes NO record, so it is asserted
 	// separately: silently dropping a method the revision does not have would hide it.
 	rec := &fwdRecorder{}
-	gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+	gate := hostNotificationGate{recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
 	initialized := mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized}
 	if gate.admit(revisionContext(capability.Revision20251125), initialized) != notificationSwallowed || len(rec.records) != 0 {
 		t.Errorf("notifications/initialized must stay swallowed (dropped, unrecorded) for an old-revision peer; records = %+v", rec.records)

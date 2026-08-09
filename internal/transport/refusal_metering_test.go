@@ -28,11 +28,20 @@ import (
 var meteringCallSites = map[string]struct {
 	categoryArg int
 	implements  refusalMetering
+	// readsDeclaration marks a resolver that applies whichever disposition the category DECLARES
+	// (refusalRecorders.forCategory) rather than a fixed one. Such a site cannot contradict a
+	// declaration — that is the whole point of it — so only the naming half is checked and
+	// implements is ignored. It is the shape that closes the gap unmeteredRecorder structurally
+	// could not: a leg that resolved one recorder for every arm handed the metered kill recorder
+	// to two arms whose categories declare themselves exempt, and a no-op marker function has no
+	// way to notice.
+	readsDeclaration bool
 }{
 	"admitRefusalRecord":   {categoryArg: 2, implements: meteringMetered},
 	"recordRefusal":        {categoryArg: 4, implements: meteringMetered},
 	"recordPreSessionDeny": {categoryArg: 2, implements: meteringMetered},
 	"unmeteredRecorder":    {categoryArg: 1, implements: meteringExempt},
+	"forCategory":          {categoryArg: 0, readsDeclaration: true},
 }
 
 // TestRefusalMetering_EveryCategoryDeclaresOne is the build-time half: an entry missing its
@@ -135,6 +144,11 @@ func TestRefusalMetering_CallSitesAgreeWithTheDeclarations(t *testing.T) {
 				declared, isDeclared := refusalDeclarations[cat]
 				if !isDeclared {
 					t.Errorf("%s: %s names category %q, which declares no metering disposition", name, fn.Name, cat)
+					return true
+				}
+				if site.readsDeclaration {
+					// It applies whatever the category declares, so there is no disposition to
+					// disagree with — only the naming, checked above.
 					return true
 				}
 				if declared.metering != site.implements {
@@ -248,17 +262,33 @@ func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 	return out
 }
 
-// parameterNames returns the names bound by fn's parameter list, so the walk can tell a call that
-// THREADS a category through from one that names it.
+// parameterNames returns the names bound as parameters anywhere in fn — its own list and any
+// function literal inside it — so the walk can tell a call that THREADS a category through from one
+// that names it.
+//
+// The literals matter: a leg supplies its admission control as a closure taking the category
+// (refusalRecorders.meter), which threads exactly as a named helper does. Reading only fn's own
+// list turned that into a "cannot resolve" complaint about the guard rather than about the code.
 func parameterNames(fn *ast.FuncDecl) map[string]bool {
 	names := map[string]bool{}
-	if fn.Type.Params == nil {
-		return names
-	}
-	for _, field := range fn.Type.Params.List {
-		for _, ident := range field.Names {
-			names[ident.Name] = true
+	collect := func(params *ast.FieldList) {
+		if params == nil {
+			return
 		}
+		for _, field := range params.List {
+			for _, ident := range field.Names {
+				names[ident.Name] = true
+			}
+		}
+	}
+	collect(fn.Type.Params)
+	if fn.Body != nil {
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if lit, isLit := n.(*ast.FuncLit); isLit {
+				collect(lit.Type.Params)
+			}
+			return true
+		})
 	}
 	return names
 }

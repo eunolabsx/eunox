@@ -27,12 +27,42 @@ const maxTrackedServerReqs = 1024
 // canonicalizes by value and type, so it is not reversible), and the method because an evicted
 // request is reported on the tape, where a record naming none names nothing an operator can
 // correlate on.
+//
+// Both are BOUNDED, because both come off the upstream's mcp.MsgReader at up to 4 MiB per message
+// and the set holds maxTrackedServerReqs of them, released only by a host reply or teardown. The
+// two are bounded differently because they are load-bearing differently: the method is read by the
+// drop record alone, so it is truncated; the id is what an answer is stamped with and what the
+// canonical map key is derived from, so a truncated one would be useless for both — an over-cap id
+// makes the request unroutable instead (see trackableServerRequestID).
 type trackedServerRequest struct {
 	id     *json.RawMessage
 	method string
 	// seq orders entries by when they were tracked, so an eviction can take the one that has
 	// waited longest rather than whichever the map's randomized range yields first.
 	seq uint64
+}
+
+// maxTrackedServerReqIDBytes bounds the JSON-RPC id one tracked entry retains, and with it the
+// canonical key the map is indexed by — the two together being most of what an entry holds.
+//
+// 8 KiB is far past any real JSON-RPC id (a number, a uuid) and keeps the whole set's retention in
+// the tens of megabytes rather than the gigabytes an upstream issuing 4 MiB ids could pin.
+//
+// Enforced by REFUSING to track, not by truncating: a truncated id can neither answer the initiator
+// it was kept for nor index the reply it was kept to match, and the key would still hold the full
+// bytes. Matches the audit envelope cap, since the same value is what the drop record names.
+const maxTrackedServerReqIDBytes = 8 << 10
+
+// maxTrackedServerReqMethodBytes bounds the method one entry retains. Truncated rather than refused:
+// the method is read by the drop record alone, and the sink bounds what it writes anyway — this
+// bounds what the tracker HOLDS, which nothing else did.
+const maxTrackedServerReqMethodBytes = 8 << 10
+
+// trackableServerRequestID reports whether id is one the tracker will retain. Asked by
+// trackServerRequest before the entry is made, so a request whose reply could never be routed is
+// refused to its initiator rather than forwarded to a host whose answer would be dropped.
+func trackableServerRequestID(id *json.RawMessage) bool {
+	return id != nil && len(*id) <= maxTrackedServerReqIDBytes
 }
 
 // trackServerReqID adds req to ids (allocating on first use), keeping the set bounded, and returns
@@ -94,6 +124,12 @@ type serverReqTracker struct {
 //
 // A message with no id is not tracked at all: its key would be "", which no reply can match and no
 // unblock can address, so the entry could only ever leave the set by displacing a real one.
+//
+// Reached ONLY through trackServerRequest, which disposes of what this returns. Go does not require
+// a return value to be consumed, so a second caller reaching for the obvious-looking method here
+// would silently abandon a displaced initiator — the exact hang the displacement answer exists to
+// close, with no compiler error and no test. TestServerReqTracker_TrackIsOnlyReachedThroughTheDisposingWrapper
+// is what makes that a build failure instead.
 func (t *serverReqTracker) track(msg mcp.RPCMsg, errOut io.Writer) (trackedServerRequest, bool) {
 	if msg.ID == nil {
 		return trackedServerRequest{}, false
@@ -105,7 +141,10 @@ func (t *serverReqTracker) track(msg mcp.RPCMsg, errOut io.Writer) (trackedServe
 		found     bool
 	)
 	t.nextSeq++
-	t.ids, displaced, found = trackServerReqID(t.ids, key, trackedServerRequest{id: msg.ID, method: msg.Method, seq: t.nextSeq})
+	// The method is bounded on the way IN rather than at the drop record: what an entry holds for
+	// its whole lifetime is the exposure, and the record's own bound would arrive far too late.
+	entry := trackedServerRequest{id: msg.ID, method: capability.BoundString(msg.Method, maxTrackedServerReqMethodBytes), seq: t.nextSeq}
+	t.ids, displaced, found = trackServerReqID(t.ids, key, entry)
 	warn := false
 	if found {
 		t.evictions++

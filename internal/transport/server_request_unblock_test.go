@@ -86,7 +86,7 @@ func TestServerRequestDisplacement_AnswersAndRecordsTheDisplacedInitiator(t *tes
 	fillServerReqTracker(t, u)
 
 	rec := &fwdRecorder{}
-	trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("sess-evict"), dropStdioDisplaced,
+	trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("sess-evict"), stdioServerRequestDrops,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`"the-newest"`), Method: "sampling/createMessage"})
 
 	replies := upstreamReplies(t, up.String())
@@ -139,11 +139,11 @@ func TestServerRequestTracking_AReusedIDDisplacesRatherThanVanishing(t *testing.
 		errOut:        io.Discard,
 	}
 	ctx, lim := context.Background(), newRefusalRecordLimiter()
-	trackServerRequest(ctx, u, rec, lim, verifiedSession("s"), dropStdioDisplaced,
+	trackServerRequest(ctx, u, rec, lim, verifiedSession("s"), stdioServerRequestDrops,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"})
 	require.Empty(t, up.String(), "the first track displaces nothing")
 
-	trackServerRequest(ctx, u, rec, lim, verifiedSession("s"), dropStdioDisplaced,
+	trackServerRequest(ctx, u, rec, lim, verifiedSession("s"), stdioServerRequestDrops,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1.0`), Method: "sampling/createMessage"})
 
 	replies := upstreamReplies(t, up.String())
@@ -165,7 +165,7 @@ func TestServerRequestDisplacement_BelowTheCapAnswersNothing(t *testing.T) {
 		writeUpstream: func(m mcp.RPCMsg) { _, _ = up.Write(append(mustJSON(m), '\n')) },
 		errOut:        io.Discard,
 	}
-	trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("sess"), dropStdioDisplaced,
+	trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("sess"), stdioServerRequestDrops,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "sampling/createMessage"})
 	assert.Empty(t, up.String(), "tracking below the cap displaces nothing, so nothing may be answered")
 	assert.Empty(t, rec.records)
@@ -185,7 +185,7 @@ func TestServerRequestDisplacement_RecordIsMetered(t *testing.T) {
 
 	lim := newRefusalRecordLimiter()
 	for i := range 200 {
-		trackServerRequest(context.Background(), u, rec, lim, verifiedSession("s"), dropStdioDisplaced,
+		trackServerRequest(context.Background(), u, rec, lim, verifiedSession("s"), stdioServerRequestDrops,
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(jsonNumber(maxTrackedServerReqs + i)), Method: "roots/list"})
 	}
 	assert.LessOrEqual(t, len(rec.records), int(perCategoryDenyBurst)+1,

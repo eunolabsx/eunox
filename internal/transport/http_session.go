@@ -1161,9 +1161,13 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 // under task anchoring, where the turn holder can be a different session sharing the anchor.
 func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
 	s.serverPool.dispatch(ctx, msg, serverRequestDispatch{
-		rec:           asRecorder(s.route.sink),
-		sessionID:     s.id,
-		writeUpstream: func(m mcp.RPCMsg) { _ = s.upWriter.Write(m) },
+		rec:       asRecorder(s.route.sink),
+		sessionID: s.id,
+		// Through the seam rather than a closure over the concrete writer: remote-upstream mode
+		// leaves upWriter nil, and (*mcp.MsgWriter).Write locks its mutex on a nil receiver — so
+		// the saturation path would panic after its record rather than report. See writeToInitiator.
+		writeUpstream: s.unblocker().writeUpstream,
+		errOut:        s.errOut(),
 		handle:        func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
 		revision:      s.hostRev,
 	})
@@ -1419,7 +1423,12 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // and the proxy that holds the bucket is already in scope at the one site that wires this in.
 func (s *httpSession) broadcastServerRequest(ctx context.Context, limiter *categoryRecordLimiter, msg mcp.RPCMsg) bool {
 	u := s.unblocker()
-	trackServerRequest(ctx, u, asRecorder(s.route.sink), limiter, verifiedSession(s.id), dropHTTPDisplaced, msg)
+	// A request the tracker will not keep routable is answered and recorded there and must not be
+	// delivered: an SSE subscriber would do the work of answering a request whose reply this proxy
+	// would then drop as untracked.
+	if !trackServerRequest(ctx, u, asRecorder(s.route.sink), limiter, verifiedSession(s.id), httpServerRequestDrops, msg) {
+		return false
+	}
 	if s.deliverToOne(msg) {
 		return true
 	}

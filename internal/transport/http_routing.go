@@ -306,7 +306,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// message and a 202 during an emergency stop is recorded rather than being a
 			// silent readiness ack.
 			gate := hostNotificationGate{
-				rec:         func() auditRecorder { return p.preSessionKillRecorder(route) },
+				recorders:   p.preSessionRefusalRecorders(route),
 				subject:     claimedSession(r),
 				audit:       route.audit,
 				strictAudit: p.strictAudit(),
@@ -365,7 +365,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// session's id could otherwise reach the forwarded notification, response routing, the
 	// re-initialize echo, or an enforced request against a victim's upstream. Runs before
 	// touchRequest so a refused request doesn't defer the victim session's idle reaping.
-	if gate, denied := route.enforceSessionGates(r.Context(), sess, sessionID, msg.Method, "http-post"); denied {
+	if gate, denied := route.enforceSessionGates(r.Context(), sess, sessionID, msg.Method, legHTTPPost); denied {
 		if msg.IsRequest() {
 			writeJSONMsg(w, denialResult(msg.ID, gate.code, gate.conditionType, msg.Method, ""))
 		} else {
@@ -445,7 +445,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
 		gate := hostNotificationGate{
-			rec:         func() auditRecorder { return asRecorder(route.sink) },
+			recorders:   routeRefusalRecorders(route),
 			subject:     verifiedSession(sessionID),
 			established: true,
 			audit:       route.audit,
@@ -718,9 +718,13 @@ func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate
 	return sessionGate{}, false
 }
 
-// recordSessionGateDeny writes the fail-closed deny record for a failed session gate,
-// tagged transportTag. Shared by enforceSessionGates and handleMCPDelete so the record
-// shape lives once alongside the shared verdict.
+// recordSessionGateDeny writes the fail-closed deny record for a failed session gate, tagged with
+// the leg it was taken on. Shared by enforceSessionGates and handleMCPDelete so the record shape
+// lives once alongside the shared verdict.
+//
+// The leg is a transportLeg, not the bare string it used to be: it lands in the same `transport`
+// detail two typed enums already wrote to, and a bare parameter is what let one leg be spelled
+// twice for what an operator filters as one value.
 //
 // Deliberately NOT rate-limited like initAudienceDenial's pre-session twin: every call
 // site is reached only after p.getSession(sessionID) resolves a REAL, already-established
@@ -729,8 +733,8 @@ func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate
 // therefore needs a live victim session id, not merely a valid bearer token for some other
 // route's audience — a materially higher bar than the zero-session-required flood
 // catAudience closes, so it is not the same cheap-flood primitive.
-func (route *UpstreamRoute) recordSessionGateDeny(ctx context.Context, sessionID, method, transportTag string, gate sessionGate) {
-	details := map[string]interface{}{"transport": transportTag}
+func (route *UpstreamRoute) recordSessionGateDeny(ctx context.Context, sessionID, method string, leg transportLeg, gate sessionGate) {
+	details := map[string]interface{}{detailTransport: string(leg)}
 	if gate.reason != "" {
 		details["reason"] = gate.reason
 	}
@@ -746,10 +750,10 @@ func (route *UpstreamRoute) recordSessionGateDeny(ctx context.Context, sessionID
 // dispatch.go's gate order and in gate_order_test.go's dispositionPrologue). Negotiating first
 // would read and refuse against the VICTIM session's revision for a caller who has not cleared
 // the binding — an oracle for that revision, recorded under that session's id as fact.
-func (route *UpstreamRoute) enforceSessionGates(ctx context.Context, sess *httpSession, sessionID, method, transportTag string) (sessionGate, bool) {
+func (route *UpstreamRoute) enforceSessionGates(ctx context.Context, sess *httpSession, sessionID, method string, leg transportLeg) (sessionGate, bool) {
 	gate, denied := route.sessionGateVerdict(ctx, sess)
 	if denied {
-		route.recordSessionGateDeny(ctx, sessionID, method, transportTag, gate)
+		route.recordSessionGateDeny(ctx, sessionID, method, leg, gate)
 	}
 	return gate, denied
 }
@@ -776,7 +780,7 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	// route is dereferenced unconditionally: handleMCP 404s an unknown route before
 	// dispatch, so a defensive nil guard here would be a fail-OPEN branch silently skipping
 	// the security gates for whatever construction reached this point without a route.
-	if _, denied := route.enforceSessionGates(r.Context(), sess, sessionID, "", "sse-get"); denied {
+	if _, denied := route.enforceSessionGates(r.Context(), sess, sessionID, "", legSSEGet); denied {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -951,7 +955,7 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		}
 		if denied {
 			p.mu.Unlock()
-			route.recordSessionGateDeny(r.Context(), sessionID, "", "http-delete", gate)
+			route.recordSessionGateDeny(r.Context(), sessionID, "", legHTTPDelete, gate)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -1206,7 +1210,15 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 	}
 	// Through the shared seam for the nil-writer disposition alone: this relays the host's OWN
 	// reply, having already taken the id that made it routable.
-	sess.unblocker().relay(msg)
+	//
+	// The take is also what makes a FAILED relay final — no later path can route this reply, and no
+	// second one is coming — so it destroys a reply the host actually produced. That is the one
+	// disposition on this leg whose entire account used to be a stderr line; the take stays above
+	// the writer check for the reason unblock's does (an entry nothing can reclaim eventually
+	// displaces a live request), so the debt is paid on the tape instead.
+	if !sess.unblocker().relay(msg) {
+		recordServerRequestDropped(ctx, asRecorder(route.sink), verifiedSession(sess.id), methodLabelServerResponse, dropHTTPReplyUndeliverable)
+	}
 	return true
 }
 

@@ -95,7 +95,7 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetWhenTheMethodResolvesOne(
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
-			gate := hostNotificationGate{rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+			gate := hostNotificationGate{recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
 			if gate.admit(revisionContext(tc.rev), mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}) == notificationForward {
 				t.Fatalf("%s must be denied in notification framing", tc.method)
 			}
@@ -280,7 +280,7 @@ func TestDispatchesMessage_MatchesWhatTheDispatcherActuallyDoes(t *testing.T) {
 
 				notification := mcp.RPCMsg{JSONRPC: "2.0", Method: method}
 				gate := hostNotificationGate{
-					rec: staticRecorder(&fwdRecorder{}), subject: verifiedSession("sess"),
+					recorders: staticRecorder(&fwdRecorder{}), subject: verifiedSession("sess"),
 					established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
 				}
 				admitted := gate.admit(ctx, notification) != notificationRefused
@@ -687,7 +687,7 @@ func TestObserveMode_MarksTheNotificationFramedRefusalToo(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	gate := hostNotificationGate{
-		rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true,
+		recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true,
 		audit: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
 	}
 	// ping exists in this revision and is answered locally; it has no notification disposition

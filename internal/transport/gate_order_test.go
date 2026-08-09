@@ -227,7 +227,7 @@ func TestGateOrder_NotificationGateAppliesTheCanonicalOrder(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			gate := hostNotificationGate{
-				rec: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
+				recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
 				checkKill: func() *capability.EnforceResponse {
 					if tc.revoked {
 						return killed
@@ -463,11 +463,12 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 	}
 }
 
-// staticRecorder adapts a test recorder to the gate's rec THUNK. Production supplies a thunk
-// because a pre-session recorder costs a rate-limit token to resolve; a test recorder costs
-// nothing, so it is handed over as a constant.
-func staticRecorder(rec auditRecorder) func() auditRecorder {
-	return func() auditRecorder { return rec }
+// staticRecorder adapts a test recorder to the gate's per-category recorder wiring. Production
+// resolves lazily and per category (a pre-session kill recorder costs a rate-limit token, and its
+// exempt neighbours must not spend one); a test recorder costs nothing and meters nothing, so it is
+// handed over as the same constant for every category.
+func staticRecorder(rec auditRecorder) refusalRecorders {
+	return unmeteredRecorders(func() auditRecorder { return rec })
 }
 
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and

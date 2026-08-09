@@ -416,17 +416,38 @@ func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category 
 // emergency stop into an outage that outlives it. It does NOT bound kill records for an
 // established session (see catKill): those describe an already-admitted caller.
 func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
-	rec := asRecorder(route.sink)
-	if rec == nil {
-		// Nothing to write, so nothing to bound: leave the bucket's tokens for a site
-		// that has a tape. (Unlike recordRefusal, no stderr line rides on this verdict.)
-		return nil
+	return p.preSessionRefusalRecorders(route).forCategory(catKill)
+}
+
+// preSessionRefusalRecorders is the PRE-SESSION leg's recorder wiring for the shared notification
+// gate and for the two named recorders above: a category refusalDeclarations calls metered charges
+// its bucket, one declared exempt gets the plain sink.
+//
+// Per CATEGORY rather than per leg because this leg's refusals disagree. Its kill and audience
+// records are bounded (an unauthenticated caller, or one holding a sibling route's token, drives
+// them for free), while the smuggling and routing refusals the same gate can take are declared
+// exempt. A single per-leg thunk handed all of them the kill recorder, so those exemptions spent a
+// catKill token anyway — emptying, during an emergency stop, the very bucket that bounds the
+// records an incident responder reads first.
+//
+// A nil limiter beside a live sink is a construction bug and panics inside admitRefusalRecord like
+// one, exactly as in recordRefusal: a "defensive" fallback here would write kill records with no
+// bound at all, which is the fail-open this wiring exists to close.
+func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
+	return refusalRecorders{
+		sink: func() auditRecorder { return asRecorder(route.sink) },
+		meter: func(rec auditRecorder, category refusalCategory) auditRecorder {
+			return admitRefusalRecord(rec, p.preSessionDenies, category)
+		},
 	}
-	// A nil limiter beside a live sink is a construction bug and panics inside
-	// admitRefusalRecord like one, exactly as in recordRefusal: a "defensive" fallback here
-	// would write kill records with no bound at all, which is the fail-open this function
-	// exists to close.
-	return admitRefusalRecord(rec, p.preSessionDenies, catKill)
+}
+
+// routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering
+// nothing. A kill record for a session this proxy already established is written unlimited — it
+// describes an already-admitted caller and is the record an operator most needs during an
+// emergency stop (see catKill) — and the two refusals beside it are declared exempt.
+func routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
+	return unmeteredRecorders(func() auditRecorder { return asRecorder(route.sink) })
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's
@@ -437,11 +458,7 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // audience — reachable with one valid token for any sibling route, before any session or
 // upstream exists, so it is bounded the same way the pre-session kill records are.
 func (p *HTTPProxy) preSessionAudienceRecorder(route *UpstreamRoute) auditRecorder {
-	rec := asRecorder(route.sink)
-	if rec == nil {
-		return nil
-	}
-	return admitRefusalRecord(rec, p.preSessionDenies, catAudience)
+	return p.preSessionRefusalRecorders(route).forCategory(catAudience)
 }
 
 // rolledUpRecorder folds a suppressed-refusal rollup into the details of the one record it
@@ -457,7 +474,13 @@ type rolledUpRecorder struct {
 
 // RecordDeny stamps the rollup into this record's details and delegates. Only RecordDeny
 // is overridden: a rollup describes SUPPRESSED REFUSALS, and refusals are denies.
+//
+// Into a map this wrapper OWNS, never the caller's: a details map reaching a recorder may be one
+// the record is supposed to describe rather than one built for it (the engine's own denial.Details
+// now travels here directly when there is nothing to fold in — see foldDecisionDetail), and writing
+// two proxy annotations into that would corrupt what the tape says the engine decided.
 func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
+	details = mergeAuditDetails(details, nil)
 	if details == nil {
 		details = make(map[string]interface{}, 2)
 	}

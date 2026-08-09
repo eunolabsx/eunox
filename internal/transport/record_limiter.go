@@ -248,7 +248,55 @@ var stdioRefusalCategories = []refusalCategory{catRevision, catDisplaced}
 // table test walks these sites, so a refusal that ships with no answer, or with an answer
 // contradicting its declaration, fails the build. That is the whole difference from writing the
 // record directly — there is no runtime behavior here to get wrong.
+//
+// It is the marker for a site that already HOLDS a resolved recorder. It cannot check that what it
+// was handed is unmetered — an auditRecorder carries no provenance, and by the time one reaches
+// here a bucket has already been charged and may have suppressed the record to nil. A site that
+// resolves its recorder names its category to refusalRecorders.forCategory instead, which applies
+// the declaration rather than trusting a caller to have picked the matching helper.
 func unmeteredRecorder(rec auditRecorder, _ refusalCategory) auditRecorder { return rec }
+
+// refusalRecorders is a transport leg's wiring for the recorder a refusal writes its record
+// through, resolved per CATEGORY rather than once per leg.
+//
+// Per category because one leg's arms disagree about metering. The HTTP pre-session arm bounds its
+// kill record (catKill — an unauthenticated caller drives it) while the smuggling and routing
+// refusals beside it are DECLARED exempt; a single per-leg thunk handed all three the metered
+// recorder, so an exemption on the record spent a catKill token anyway — and spent the one bucket
+// bounding the records an incident responder reads first during an emergency stop.
+//
+// Which of the two a category gets is READ off refusalDeclarations here rather than restated by
+// each leg, so "declared exempt" and "charges no bucket" are one fact — for a category added later
+// as much as for the two that exist.
+type refusalRecorders struct {
+	// sink resolves the leg's audit sink. A THUNK for the reason the notification gate's whole
+	// recorder was one: resolving a recorder for a message that records nothing is work an
+	// unauthenticated peer drives at its send rate, and on a metered leg it also spends a token on
+	// nothing. Never nil — forCategory calls it unconditionally.
+	sink func() auditRecorder
+	// meter applies a metered category's admission control. nil on a leg that meters none of the
+	// categories it can refuse under: stdio, and the established-session HTTP arm, whose kill
+	// records describe an already-admitted caller and are deliberately unbounded.
+	meter func(auditRecorder, refusalCategory) auditRecorder
+}
+
+// forCategory resolves the recorder a refusal in category writes through: nil when the leg has no
+// sink (nothing to write, so nothing to bound) or the category's bucket suppressed this record, the
+// plain sink for a category declared exempt, and the metered recorder otherwise.
+func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
+	rec := r.sink()
+	if rec == nil || r.meter == nil || refusalDeclarations[category].metering != meteringMetered {
+		return rec
+	}
+	return r.meter(rec, category)
+}
+
+// unmeteredRecorders is the wiring for a leg that meters nothing it can refuse — stdio, and the
+// established-session HTTP arm. Named rather than spelled as a bare literal at each so "this leg
+// charges no bucket" is one statement a reader can find, beside the legs that do.
+func unmeteredRecorders(sink func() auditRecorder) refusalRecorders {
+	return refusalRecorders{sink: sink}
+}
 
 // categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
 // cheap refusals in one category cannot suppress another's records.
