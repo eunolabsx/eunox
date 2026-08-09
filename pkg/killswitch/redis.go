@@ -1169,8 +1169,9 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 	// full enumeration must visit each and merge the scans — otherwise refreshState loads a
 	// partial kill set and reports healthy, a fail-open on the emergency stop.
 	//
-	// The mutex is taken unconditionally: on the single-node path it is uncontended, and
-	// making it conditional is what would put a second copy of the topology decision here.
+	// The mutex is taken unconditionally: on the single-node path it is uncontended, and the
+	// fan-out below is the only thing that can call fn concurrently, so gating it on the stored
+	// topology would buy one atomic on a background loop for a second read of that field.
 	var mu sync.Mutex
 	return r.forEachNode(ctx, func(ctx context.Context, node redis.Cmdable) error {
 		return scanNode(ctx, node, prefix, target, &mu)

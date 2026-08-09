@@ -176,8 +176,10 @@ func (c *categoryRecordLimiter) setNow(now func() time.Time) {
 // suppressed (the refusal itself still stands — only the tape write is bounded), rec when nothing
 // was elided since the last admitted one, and a rollup-stamping wrapper when something was.
 //
-// The tail every limited-recorder site shares, so a new one cannot forget the rollup and silently
-// under-count a flood. A nil limiter panics here exactly as it did at each of those sites: a live
+// The tail every site that RESOLVES a limited recorder shares, so a new one cannot forget the
+// rollup and silently under-count a flood. (recordRefusal writes its record directly and folds
+// the rollup into its own details, so it charges the bucket itself rather than through this.)
+// A nil limiter panics here exactly as it did at each of those sites: a live
 // sink with no bucket beside it is a construction bug, and a "defensive" fallback would write the
 // unbounded records the bucket exists to prevent. A caller that legitimately has none (a proxy
 // assembled by a bare struct literal in a test) tests for it and does not call.
