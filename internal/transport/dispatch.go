@@ -80,6 +80,12 @@ type dispatchParams struct {
 	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
 	// ignored (union-only, so falling back to the session join is the stricter reading).
 	honorAttribution bool
+
+	// refusalLimits (embedded) is this leg's admission control over the writes the fail-closed
+	// ROUTING refusal makes. The sink is forwardParams.rec, above: a refusal resolves its recorder
+	// by pairing the two (see refusalLimits), rather than carrying a second copy of the sink that
+	// could name a different tape.
+	refusalLimits
 }
 
 // finishDecision closes the decision critical section (if open) right after the PDP decision
@@ -685,7 +691,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	// denial message to throw away (JSON-RPC forbids replying to a notification, and the caller
 	// acks). What is not skipped is everything else the shared path owns — the observe gate, the
 	// strict-audit gate and the record shape.
-	refuseUnroutable(ctx, refusalForwardParams(g.recorders.forCategory(catUnroutable), g.subject, g.audit, g.strictAudit, g.errOut), g.subject, msg, unroutableFramingNotification)
+	refuseUnroutable(ctx, refusalForwardParams(g.subject, g.audit, g.strictAudit, g.errOut), g.recorders, g.subject, msg, unroutableFramingNotification)
 	return notificationRefused
 }
 
@@ -1138,7 +1144,10 @@ func completeToolsListing(params, result json.RawMessage) bool {
 	return res.NextCursor == ""
 }
 
-// dispatchUnmapped is the request-framed entry to the fail-closed routing default.
+// dispatchUnmapped is the request-framed entry to the fail-closed routing default. Its refusal
+// wiring is this leg's sink paired with this leg's limits, so the request framing is governed by
+// refusalDeclarations exactly as the notification framing is — it used to be handed an
+// already-resolved recorder that never met the declaration at all.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	return refuseUnroutable(ctx, d.forwardParams, verifiedSession(d.sessionID), msg, unroutableFramingRequest)
+	return refuseUnroutable(ctx, d.forwardParams, d.recorders(d.rec), verifiedSession(d.sessionID), msg, unroutableFramingRequest)
 }

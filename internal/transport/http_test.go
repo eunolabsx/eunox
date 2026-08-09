@@ -2466,7 +2466,7 @@ func TestHTTPSamplingRoundTrip_HostResponseRoutedToUpstream(t *testing.T) {
 	sess.addSub(ch)
 
 	// Upstream initiated a request with ID 5 that was broadcast to the host.
-	sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
+	sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
 
 	// Host POSTs its response (same ID) back to /mcp.
 	body := `{"jsonrpc":"2.0","id":5,"result":{"role":"assistant","content":{"type":"text","text":"hi"}}}`
@@ -2553,7 +2553,7 @@ func TestHTTPBroadcastServerRequest_NoSubscriberFailsClosed(t *testing.T) {
 		upWriter: mcp.NewMsgWriter(&up),
 	})
 
-	delivered := sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
+	delivered := sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
 	if delivered {
 		t.Fatalf("broadcastServerRequest reported delivered with no subscriber")
 	}
@@ -2774,7 +2774,7 @@ func TestHTTPRemoveSubAndDrain_RepliesErrorForBufferedServerRequest(t *testing.T
 	// The upstream broadcasts a server-initiated request; deliverToOne buffers it in
 	// ch and the ID is tracked. The SSE loop never reads it (simulating a client that
 	// disconnected with the request still buffered).
-	if !sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}) {
+	if !sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}) {
 		t.Fatalf("broadcastServerRequest reported not delivered; want delivered to the buffered sub")
 	}
 
@@ -4046,7 +4046,7 @@ func TestHTTPHandleGet_WriteErrorUnblocksInflightServerRequest(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if !sess.broadcastServerRequest(context.Background(), nil, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}) {
+	if !sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}) {
 		t.Fatal("broadcastServerRequest reported not delivered; want delivered to the open stream")
 	}
 

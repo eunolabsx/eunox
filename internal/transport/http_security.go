@@ -430,19 +430,26 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // catKill token anyway — emptying, during an emergency stop, the very bucket that bounds the
 // records an incident responder reads first.
 //
-// A nil limiter beside a live sink is a construction bug and panics inside admitRefusalRecord like
-// one, exactly as in recordRefusal: a "defensive" fallback here would write kill records with no
-// bound at all, which is the fail-open this wiring exists to close.
+// A nil limiter beside a live sink would write kill records with no bound at all — the fail-open
+// this wiring exists to close — but nothing here ENFORCES that: forCategory returns the plain sink
+// for a nil bucket, and this now resolves through an accessor that is deliberately nil-tolerant for
+// a bare-struct-literal proxy. What keeps it true is that every production constructor builds the
+// bucket; the earlier claim that it "panics inside admitRefusalRecord like one" was never reachable,
+// since forCategory returns before that call.
 func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return refusalRecorders{rec: asRecorder(route.sink), limiter: p.preSessionDenies}
+	return p.refusalLimits().recorders(asRecorder(route.sink))
 }
 
-// routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering
-// nothing. A kill record for a session this proxy already established is written unlimited — it
+// routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering no
+// RECORD. A kill record for a session this proxy already established is written unlimited — it
 // describes an already-admitted caller and is the record an operator most needs during an
 // emergency stop (see catKill) — and the two refusals beside it are declared exempt.
-func routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return unmeteredRecorders(asRecorder(route.sink))
+//
+// It takes the proxy's notice bucket all the same: every argument above is about what a VERDICT may
+// cost, and the routing refusal's stderr line is not one — this leg can be driven at a refused
+// frame per POST, and the notice is the only unbuffered syscall in that loop.
+func (p *HTTPProxy) routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
+	return unmeteredRecorders(asRecorder(route.sink), p.refusalNoticeLimiter())
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's

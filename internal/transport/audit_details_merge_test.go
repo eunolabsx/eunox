@@ -224,6 +224,19 @@ func TestDispatchToolsCall_NoInlineDetailsMergeSurvives(t *testing.T) {
 		"dispatchToolsCall must fold its annotations through the shared merge, not a private copy loop")
 }
 
+// detailKeyScanDirs is the reach EVERY guard over a reserved audit-details key uses: every package
+// that builds a denial- or record-details map. One list rather than one per guard, because the two
+// that exist protect the same class of field and had drifted to different reaches — the newer one
+// walked this package alone, so a key respelled in pkg/enforcement (whose denial.Details the
+// transport stamps onto a record) was invisible to it while its sibling would have caught it.
+var detailKeyScanDirs = []string{
+	".",
+	filepath.Join("..", "..", "pkg", "enforcement"),
+	filepath.Join("..", "pdp"),
+	filepath.Join("..", "audit"),
+	filepath.Join("..", "..", "cmd", "eunox"),
+}
+
 // findFuncDecl returns the named top-level function (or method) declaration, or nil.
 func findFuncDecl(file *ast.File, name string) *ast.FuncDecl {
 	for _, d := range file.Decls {
@@ -264,13 +277,7 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 	// funnel) or internal/audit would otherwise be invisible to the guard, and the whole
 	// point of the constant is that such a divergence fails nothing at runtime.
 	scanned := 0
-	for _, dir := range []string{
-		".",
-		filepath.Join("..", "..", "pkg", "enforcement"),
-		filepath.Join("..", "pdp"),
-		filepath.Join("..", "audit"),
-		filepath.Join("..", "..", "cmd", "eunox"),
-	} {
+	for _, dir := range detailKeyScanDirs {
 		// The shared enumeration, not a hand-rolled ReadDir loop: this guard fails OPEN too, and
 		// the per-file parse (rather than a directory parse) is what keeps build-tagged files in
 		// the walk — the reasoning packageSourcesIn carries once for every guard that needs it.

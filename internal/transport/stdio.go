@@ -176,6 +176,13 @@ type StdioProxy struct {
 	// HTTP sibling's nil does.
 	refusalLimiter *categoryRecordLimiter
 
+	// noticeLimiter bounds the stderr DIAGNOSTIC a refusal writes beside its record. Separate from
+	// the record buckets above because this transport meters almost no record its host drives (an
+	// established session's are deliberately unbounded) and still owes a bound on a write syscall
+	// per frame — the cheapest thing a peer pipelining `{"jsonrpc":"2.0","method":"x/bogus"}` down
+	// one pipe can make this process do. See refusalNoticeRatePerSec.
+	noticeLimiter *recordRateLimiter
+
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
 	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
 	// server-initiated request to it rather than running the handler inline — see
@@ -356,6 +363,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostReader:            mcp.NewMsgReader(os.Stdin),
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories...),
+		noticeLimiter:         newRefusalNoticeLimiter(),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -1135,8 +1143,10 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 	gate := hostNotificationGate{
 		// This transport meters neither the kill record (an established session's, deliberately
 		// unbounded) nor the two declared-exempt refusals, so every arm resolves the same sink —
-		// stated through the named constructor rather than as a bare literal.
-		recorders:   unmeteredRecorders(p.rec()),
+		// stated through the named constructor rather than as a bare literal. The notice bucket is
+		// supplied all the same: metering no RECORD here is an argument about verdicts, and the
+		// routing refusal's stderr line is not one.
+		recorders:   unmeteredRecorders(p.rec(), p.noticeLimiter),
 		subject:     verifiedSession(p.sessionID),
 		established: true,
 		audit:       p.audit,
@@ -1207,7 +1217,14 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 		buildInit:        p.buildInitResponse,
 		receipts:         p.receipts,
 		honorAttribution: p.honorAttribution,
+		refusalLimits:    p.refusalLimits(),
 	}
+}
+
+// refusalLimits is this transport's admission control over the writes a refusal makes: the record
+// buckets for the categories stdioRefusalCategories declares, and the stderr-notice bucket.
+func (p *StdioProxy) refusalLimits() refusalLimits {
+	return refusalLimits{records: p.refusalLimiter, notices: p.noticeLimiter}
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its
@@ -1258,11 +1275,13 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 }
 
 // unblocker is this proxy's wiring for every site that answers a blocked server-initiated
-// initiator. writeUpstream is nil only before connectUpstream has run, which is the case the
-// seam's nil-writer disposition tests for — resolved through initiatorWriter, since upWriter is an
-// INTERFACE here and a bare `!= nil` on one is the typed-nil trap the seam exists to close.
+// initiator. The sink is nil only before connectUpstream has run, which is the case the seam's
+// nil-writer disposition tests for — resolved through initiatorWriter at ANSWER time, since
+// upWriter is an INTERFACE here and a bare `!= nil` on one is the typed-nil trap the seam exists to
+// close. Building the unblocker itself allocates nothing, which is what makes it free for the
+// holders that only ever want the tracker.
 func (p *StdioProxy) unblocker() serverRequestUnblocker {
-	return serverRequestUnblocker{reqs: &p.serverReqs, writeUpstream: initiatorWriter(p.upWriter), errOut: p.errOut()}
+	return serverRequestUnblocker{reqs: &p.serverReqs, sink: p.upWriter, errOut: p.errOut(), notices: p.noticeLimiter}
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would have
@@ -1318,7 +1337,16 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 // hang — see trackServerRequest. A request whose id the tracker will not retain never reaches here:
 // admitServerRequestID refuses it at this leg's entry.
 func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) {
-	trackServerRequest(ctx, p.unblocker(), p.refusalRecorders(), verifiedSession(p.sessionID), dropStdioDisplaced, msg)
+	u, recs := p.unblocker(), p.refusalRecorders()
+	// The tracker refuses an id it will not retain, and that refusal must not degrade into a
+	// SILENT untracked forward: the host would answer, the routing arm would drop the answer as
+	// untracked, and the upstream would block with nothing on the tape. Asked here rather than
+	// inferred from track's return, which cannot distinguish "displaced nothing" from "tracked
+	// nothing". Normally the leg's entry gate has already refused it and this admits for free.
+	if !admitServerRequestID(ctx, u, recs, verifiedSession(p.sessionID), dropStdioUnroutableID, msg) {
+		return
+	}
+	trackServerRequest(ctx, u, recs, verifiedSession(p.sessionID), dropStdioDisplaced, msg)
 	_ = p.hostWriter.Write(msg)
 }
 
@@ -1326,7 +1354,7 @@ func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPC
 // categories stdioRefusalCategories declares; forCategory reads each category's own declaration, so
 // the ones this leg does not charge cost nothing to name.
 func (p *StdioProxy) refusalRecorders() refusalRecorders {
-	return refusalRecorders{rec: p.rec(), limiter: p.refusalLimiter}
+	return p.refusalLimits().recorders(p.rec())
 }
 
 // dispatchUpstreamRequest hands one server-initiated request to the proxy's serverRequestPool,
@@ -1337,9 +1365,10 @@ func (p *StdioProxy) refusalRecorders() refusalRecorders {
 // documented concurrency-safe. Host-initiated traffic's ordering guarantees (ticket
 // reservation, fwdHostWrites) are untouched by this path.
 func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
+	u := p.unblocker()
 	// Refused at the ENTRY, above the pool and above any decision: a request whose reply could
 	// never be routed back must not consume a handler slot, a policy quota, or the host's attention.
-	if !admitServerRequestID(ctx, p.unblocker(), p.refusalRecorders(), verifiedSession(p.sessionID), dropStdioUnroutableID, msg) {
+	if !admitServerRequestID(ctx, u, p.refusalRecorders(), verifiedSession(p.sessionID), dropStdioUnroutableID, msg) {
 		return
 	}
 	p.serverPool.dispatch(ctx, msg, serverRequestDispatch{
@@ -1348,7 +1377,9 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 		// Through the seam for the reason handleUpstreamRequest's is: the saturation path answers
 		// the initiator after recording, and a bare closure over a nil concrete writer panics there
 		// rather than reporting. See writeToInitiator.
-		writeUpstream: p.unblocker().writeUpstream,
+		writeUpstream: u.writeUpstream(),
+		refusalLimits: p.refusalLimits(),
+		leg:           dropStdioRefusalUndeliverable,
 		errOut:        p.errOut(),
 		handle:        p.handleUpstreamRequest,
 		revision:      p.hostRevision(),
@@ -1383,7 +1414,9 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		// Through the seam, not a bare closure over the concrete writer: a nil *mcp.MsgWriter locks
 		// its mutex on a nil receiver, so the four denial arms below would panic where the seam
 		// reports — after their audit record. See writeToInitiator.
-		writeUpstream:    p.unblocker().writeUpstream,
+		writeUpstream:    p.unblocker().writeUpstream(),
+		refusalLimits:    p.refusalLimits(),
+		leg:              dropStdioRefusalUndeliverable,
 		decideLock:       p.samplingDecideLock(),
 		strictAuditState: p.strictAudit(),
 		pdp:              p.pdp,

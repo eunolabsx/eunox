@@ -15,6 +15,7 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/token"
 	"io"
@@ -50,8 +51,9 @@ func preSessionGateFor(p *HTTPProxy, route *UpstreamRoute) hostNotificationGate 
 // catUnroutable and catSmuggled are declared EXEMPT, and both arms named their category — but the
 // recorder they were handed was the LEG's, and the pre-session leg's is drawn from the catKill
 // bucket. So an exemption on the record spent a catKill token anyway, and spent the one bucket that
-// bounds the pre-session KILL_SWITCH records an incident responder reads first. unmeteredRecorder
-// could not see it: it returns what it is handed, and an auditRecorder carries no provenance.
+// bounds the pre-session KILL_SWITCH records an incident responder reads first. The marker function
+// that used to stand in for the resolver could not see it: it returned what it was handed, and an
+// auditRecorder carries no provenance.
 //
 // It held only because that arm structurally handles `initialize` alone, whose notification
 // disposition is swallowed — a coincidence nothing enforced. Driven here through the gate itself,
@@ -119,7 +121,7 @@ func TestRouteRefusalRecorders_EstablishedSessionKillIsUnbounded(t *testing.T) {
 	t.Parallel()
 	sink, _ := newTempAuditSink(t)
 	defer func() { _ = sink.Close() }()
-	recs := routeRefusalRecorders(&UpstreamRoute{name: "up1", sink: &routeSink{sink: sink, upstream: "up1"}})
+	recs := newTestHTTPProxy().routeRefusalRecorders(&UpstreamRoute{name: "up1", sink: &routeSink{sink: sink, upstream: "up1"}})
 	for i := range int(perCategoryDenyBurst) + 50 {
 		require.NotNil(t, recs.forCategory(catKill),
 			"kill record %d was suppressed on an ESTABLISHED session; that record is the one an operator most needs during an emergency stop", i)
@@ -138,8 +140,8 @@ func TestRoutingRefusal_NotificationFramingBuildsNoResponse(t *testing.T) {
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "x/bogus"}
 
 	notifRec := &fwdRecorder{}
-	resp := refuseUnroutable(ctx, refusalForwardParams(notifRec, verifiedSession("s"), false, strictAuditState{}, io.Discard),
-		verifiedSession("s"), msg, unroutableFramingNotification)
+	resp := refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, io.Discard),
+		unmeteredRecorders(notifRec, nil), verifiedSession("s"), msg, unroutableFramingNotification)
 	assert.Nil(t, resp.Error, "the notification framing has no reply channel, so no denial envelope may be built for it")
 	assert.Nil(t, resp.ID)
 	require.Len(t, notifRec.records, 1, "skipping the response must not skip the record the refusal legitimately writes")
@@ -148,12 +150,123 @@ func TestRoutingRefusal_NotificationFramingBuildsNoResponse(t *testing.T) {
 	// The request framing is the control: same refusal, same record, and an envelope to send.
 	reqRec := &fwdRecorder{}
 	reqMsg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "x/bogus"}
-	resp = refuseUnroutable(ctx, refusalForwardParams(reqRec, verifiedSession("s"), false, strictAuditState{}, io.Discard),
-		verifiedSession("s"), reqMsg, unroutableFramingRequest)
+	resp = refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, io.Discard),
+		unmeteredRecorders(reqRec, nil), verifiedSession("s"), reqMsg, unroutableFramingRequest)
 	require.NotNil(t, resp.Error, "the request framing must still be answered")
 	require.Len(t, reqRec.records, 1)
 	assert.Equal(t, notifRec.records[0].code, reqRec.records[0].code,
 		"the two framings are one refusal for one reason; only the reply channel differs")
+}
+
+// TestEnforcedForwardCore_NoIDRefusalsBuildNoEnvelope extends the id-keyed rule above from three of
+// the core's six host-facing exits to five.
+//
+// The upstream-transport failure and the fail-closed redaction failure are refusals too, and both
+// built a complete JSON-RPC error for a message JSON-RPC forbids answering. They are unreachable for
+// a no-id message today only because the one caller that passes one also removes the upstream — two
+// independent facts nothing couples, and the natural next step (folding the smuggled-notification
+// reject into this core) arrives with a live upstream and reaches both. The RECORD is what must not
+// be skipped, so both halves are asserted together.
+func TestEnforcedForwardCore_NoIDRefusalsBuildNoEnvelope(t *testing.T) {
+	t.Parallel()
+	allow := capability.EnforceResponse{Decision: capability.DecisionAllow}
+	notification := mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodToolsCall}
+
+	t.Run("upstream failure", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		fp := forwardParams{rec: rec, sessionID: "s", errOut: io.Discard,
+			callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+				return mcp.RPCMsg{}, errors.New("upstream exited (test probe)")
+			}}
+		resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil, notification, allow,
+			capability.MethodToolsCall, "tool:x", "tool:x", "tool", false, nil)
+		assert.Nil(t, resp.Error, "a message with no id has no reply channel, so no error envelope may be built for it")
+		assert.Nil(t, resp.ID)
+		require.Len(t, rec.records, 1, "skipping the envelope must not skip the record the refusal legitimately writes")
+	})
+
+	t.Run("redaction failure", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		redacting := allow
+		redacting.Obligations = []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"secret"}}}
+		fp := forwardParams{rec: rec, sessionID: "s", errOut: io.Discard,
+			callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
+				// "content" present but not an array: ApplyRedactObligs fails closed on it.
+				return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"content":{}}`)}, nil
+			}}
+		resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil, notification, redacting,
+			capability.MethodToolsCall, "tool:x", "tool:x", "tool", false, nil)
+		assert.Nil(t, resp.Error)
+		assert.Nil(t, resp.ID)
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, capability.ErrCodeEnforcementError, rec.records[0].code,
+			"an adversarial upstream must not be able to make a redactFields-guarded call vanish from the tape")
+	})
+}
+
+// TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot settles the two halves of the cheapest
+// refusal in the tree, which were reasoned about with one standard applied to both.
+//
+// The RECORD is declared exempt because a policy verdict may never be admission-controlled. That
+// argument does not reach the stderr NOTICE — no policy DENY writes one, and a diagnostic line is
+// not a verdict — so the notice was the one place an unauthenticated peer drove an unbuffered write
+// syscall per frame, at its full send rate, on a message with no id, no handler slot and no upstream
+// round trip.
+func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
+	t.Parallel()
+	ctx := revisionContext(handshakeRevision)
+	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "x/bogus"}
+	const frames = 200
+
+	now := time.Now()
+	notices := newRefusalNoticeLimiter()
+	notices.now = func() time.Time { return now }
+
+	var errOut strings.Builder
+	rec := &fwdRecorder{}
+	recs := refusalLimits{notices: notices}.recorders(rec)
+	refuse := func() {
+		refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, &errOut),
+			recs, verifiedSession("s"), msg, unroutableFramingNotification)
+	}
+	for range frames {
+		refuse()
+	}
+
+	assert.Len(t, rec.records, frames,
+		"the RECORD is exempt by declaration: a verdict elided is a verdict an incident responder does not have, so every refused frame still reaches the tape")
+	lines := strings.Count(errOut.String(), "\n")
+	assert.LessOrEqual(t, lines, refusalNoticeBurst,
+		"the notice must be bounded: one write syscall per refused frame is what a peer looping an unmapped method drives for free")
+	assert.Positive(t, lines, "a bucket that never admits is not bounding the notice, it is silencing it")
+
+	// A refill: the next admitted line must name what it stood in for, so an operator watching
+	// stderr sees the RATE rather than a handful of lines and no sign of a flood.
+	now = now.Add(time.Second)
+	errOut.Reset()
+	refuse()
+	assert.Contains(t, errOut.String(), "further diagnostics suppressed",
+		"an elided notice folds into the next admitted one; losing the count would under-state the flood")
+	assert.NotContains(t, errOut.String(), "such",
+		"one bucket serves every bounded line on the proxy, so the count may not be claimed as a tally of the message it rides on")
+}
+
+// TestRoutingRefusal_NoNoticeBucketWritesEveryLine pins the other side of that bound: nil is the
+// UNBOUNDED disposition, which is what a proxy assembled by a bare struct literal gets and what
+// every leg had before the bucket existed. A nil that silently suppressed instead would hide the
+// refusal from an operator running a test proxy.
+func TestRoutingRefusal_NoNoticeBucketWritesEveryLine(t *testing.T) {
+	t.Parallel()
+	var errOut strings.Builder
+	recs := unmeteredRecorders(&fwdRecorder{}, nil)
+	for range 20 {
+		refuseUnroutable(revisionContext(handshakeRevision),
+			refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, &errOut),
+			recs, verifiedSession("s"), mcp.RPCMsg{JSONRPC: "2.0", Method: "x/bogus"}, unroutableFramingNotification)
+	}
+	assert.Equal(t, 20, strings.Count(errOut.String(), "\n"))
 }
 
 // TestUpstreamlessLeg_ObserveCannotDowngradeIntoAFabricatedOutage is the regression for the
@@ -273,28 +386,46 @@ func TestTransportLeg_IsOneClosedVocabulary(t *testing.T) {
 		seen[leg] = name
 	}
 
-	for _, src := range packageSources(t) {
-		declPos := detailTransportDeclPos(src)
-		ast.Inspect(src.file, func(n ast.Node) bool {
-			lit, isLit := n.(*ast.BasicLit)
-			if !isLit || lit.Kind != token.STRING {
+	// Every package that builds a details map reaching an audit record, not just this one. The
+	// engine's denial.Details is stamped onto a record by the transport, so a `transport` key
+	// written in pkg/enforcement would land in the same field with a vocabulary of its own and be
+	// invisible to a walk scoped here — the reach its sibling guard (the flow discriminator's) has
+	// had all along, on the same class of field.
+	//
+	// Matched only in KEY position, which is what makes the wider walk possible at all: `transport`
+	// is an ordinary word in the config layer (the gateway's own `transport: http`), and a
+	// bare-literal walk over five packages would report those. A struct tag is a literal in neither
+	// position, so it is not a false positive either.
+	scanned := 0
+	for _, dir := range detailKeyScanDirs {
+		for _, src := range packageSourcesIn(t, dir) {
+			scanned++
+			ast.Inspect(src.file, func(n ast.Node) bool {
+				var key ast.Expr
+				switch node := n.(type) {
+				case *ast.KeyValueExpr:
+					key = node.Key
+				case *ast.IndexExpr:
+					key = node.Index
+				default:
+					return true
+				}
+				lit, isLit := key.(*ast.BasicLit)
+				if !isLit || lit.Kind != token.STRING {
+					return true
+				}
+				if value, err := strconv.Unquote(lit.Value); err != nil || value != detailTransport {
+					return true
+				}
+				t.Errorf("%s:%d writes the %q details key as a literal; use the transport package's detailTransport constant so the field and its transportLeg vocabulary stay edited together",
+					src.path, src.fset.Position(lit.Pos()).Line, detailTransport)
 				return true
-			}
-			value, err := strconv.Unquote(lit.Value)
-			if err != nil || value != detailTransport {
-				return true
-			}
-			// The one legitimate occurrence is the constant's own declaration. Matched by POSITION,
-			// not by filename: forward.go is where every record helper lives, so exempting the file
-			// exempts precisely where a fourth producer would land.
-			if declPos != token.NoPos && lit.Pos() == declPos {
-				return true
-			}
-			t.Errorf("%s:%d writes the %q details key as a literal; use the detailTransport constant so the field and its transportLeg vocabulary stay edited together",
-				src.name, src.fset.Position(lit.Pos()).Line, detailTransport)
-			return true
-		})
+			})
+		}
 	}
+	// Without this the guard degrades silently to covering nothing if a scanned package moves —
+	// the same quiet, nothing-fails failure the closed vocabulary exists to prevent.
+	require.Greater(t, scanned, 40, "the transport-vocabulary scan covered too few files to be meaningful")
 }
 
 // TestServerReqTracker_TrackIsOnlyReachedThroughTheDisposingWrapper pins an invariant the compiler
@@ -347,44 +478,111 @@ func TestServerReqTracker_TrackIsOnlyReachedThroughTheDisposingWrapper(t *testin
 // denial arms that panic lands AFTER the audit record, leaving a tape recording a denial the
 // process died delivering.
 //
-// Every writeUpstream must therefore come from an unblocker, which decides the nil answer once.
+// Every writeUpstream must therefore come from an unblocker, which decides the nil answer once —
+// now at ANSWER time rather than at wiring time, so the guard is on PROVENANCE rather than on a
+// spelling: a hoisted `u := p.unblocker()` reused for two fields of one request is the same
+// decision, and a suffix match on the old spelling would have called it a violation.
 func TestServerRequestLegs_AnswerThroughTheNilWriterSeam(t *testing.T) {
 	t.Parallel()
-	// The two unblocker constructors are the exception, and the only one: they are where the nil
-	// answer is DECIDED (each tests its own concrete writer before wrapping it), which is exactly
-	// the decision every other site must inherit rather than re-make.
-	const decider = "unblocker"
-	found, exempt := 0, 0
+	// serverRequestUnblocker.writeUpstream is where the nil answer is DECIDED — it is the only
+	// caller of initiatorWriter, which sees through the typed-nil trap. Every other site inherits
+	// that decision rather than re-making it, which is what the two halves below check.
+	const resolver = "writeUpstream"
+	wirings, resolvers := 0, 0
 	for _, src := range packageSources(t) {
 		for _, decl := range src.file.Decls {
 			fnDecl, isFunc := decl.(*ast.FuncDecl)
 			if !isFunc || fnDecl.Body == nil {
 				continue
 			}
+			locals := unblockerLocals(fnDecl)
 			// Struct-literal keys AND assignments: `d.writeUpstream = func(...){...}` reintroduces
 			// the same bare closure without ever appearing as a KeyValueExpr.
 			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
+				if isCallTo(n, "initiatorWriter") {
+					resolvers++
+					if fnDecl.Name.Name != resolver {
+						t.Errorf("%s:%d: %s resolves the upstream sink itself; the nil answer is decided once, in the unblocker's %s, and every other site takes it from there",
+							src.name, src.fset.Position(n.Pos()).Line, fnDecl.Name.Name, resolver)
+					}
+					return true
+				}
 				pos, value := writeUpstreamWiring(n)
 				if value == nil {
 					return true
 				}
-				if fnDecl.Name.Name == decider {
-					exempt++
-					return true
-				}
-				found++
-				// The one admissible shape elsewhere: <transport>.unblocker().writeUpstream, which
-				// is nil exactly when there is genuinely no upstream sink.
-				if text := exprText(src.fset, value); !strings.HasSuffix(text, "unblocker().writeUpstream") {
-					t.Errorf("%s:%d: %s wires writeUpstream as %s; take it from the unblocker so a missing upstream sink is REPORTED once rather than panicking at each site",
-						src.name, src.fset.Position(pos).Line, fnDecl.Name.Name, text)
+				wirings++
+				if !fromUnblocker(value, locals) {
+					t.Errorf("%s:%d: %s wires writeUpstream as %s; take it from an unblocker so a missing upstream sink is REPORTED once rather than panicking at each site",
+						src.name, src.fset.Position(pos).Line, fnDecl.Name.Name, exprText(src.fset, value))
 				}
 				return true
 			})
 		}
 	}
-	require.Positive(t, found, "no writeUpstream wiring was found outside the unblocker constructors; this guard would pass vacuously")
-	require.Positive(t, exempt, "no unblocker constructor was found; the exemption above is matching on a name nothing declares")
+	require.Positive(t, wirings, "no writeUpstream wiring was found in any non-test file; this guard would pass vacuously")
+	require.Positive(t, resolvers, "no initiatorWriter call was found; the single-decider half is matching on a name nothing calls")
+}
+
+// isCallTo reports whether n is a call of the named package-level function.
+func isCallTo(n ast.Node, name string) bool {
+	call, isCall := n.(*ast.CallExpr)
+	if !isCall {
+		return false
+	}
+	fn, isIdent := call.Fun.(*ast.Ident)
+	return isIdent && fn.Name == name
+}
+
+// unblockerLocals returns the names fn binds to an unblocker() call, so a writer taken from a
+// hoisted unblocker is recognized as having the same provenance as one taken inline. Hoisting is
+// the point — one unblocker per request rather than one per field that wants a writer.
+func unblockerLocals(fn *ast.FuncDecl) map[string]bool {
+	locals := map[string]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		assign, isAssign := n.(*ast.AssignStmt)
+		if !isAssign {
+			return true
+		}
+		for i, rhs := range assign.Rhs {
+			if !isUnblockerCall(rhs) || i >= len(assign.Lhs) {
+				continue
+			}
+			if ident, isIdent := assign.Lhs[i].(*ast.Ident); isIdent {
+				locals[ident.Name] = true
+			}
+		}
+		return true
+	})
+	return locals
+}
+
+// isUnblockerCall reports whether e is `<transport>.unblocker()`.
+func isUnblockerCall(e ast.Expr) bool {
+	call, isCall := e.(*ast.CallExpr)
+	if !isCall {
+		return false
+	}
+	sel, isSel := call.Fun.(*ast.SelectorExpr)
+	return isSel && sel.Sel.Name == "unblocker"
+}
+
+// fromUnblocker reports whether e is a `writeUpstream()` call on an unblocker — built inline or
+// bound to one of locals.
+func fromUnblocker(e ast.Expr, locals map[string]bool) bool {
+	call, isCall := e.(*ast.CallExpr)
+	if !isCall {
+		return false
+	}
+	sel, isSel := call.Fun.(*ast.SelectorExpr)
+	if !isSel || sel.Sel.Name != "writeUpstream" {
+		return false
+	}
+	if isUnblockerCall(sel.X) {
+		return true
+	}
+	ident, isIdent := sel.X.(*ast.Ident)
+	return isIdent && locals[ident.Name]
 }
 
 // TestServerRequestLegs_NilWriterReportsRatherThanPanics is the behavioral half, on the two shapes
@@ -419,6 +617,158 @@ func TestServerRequestLegs_NilWriterReportsRatherThanPanics(t *testing.T) {
 			serverRequestParams{rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: &errOut})
 	}, "a denial that answers its initiator must report a missing upstream sink, not panic after writing its record")
 	assert.Contains(t, errOut.String(), "no upstream writer to answer it")
+}
+
+// TestServerRequestRefusal_DestroyedAnswerReachesTheTape is the regression for the four denial arms
+// that answered a blocked initiator and threw the delivery report away.
+//
+// The refusal record each of them writes describes the REFUSAL, not the delivery — so an operator
+// reconstructing a wedged upstream could not tell "denied and told so" from "denied and the upstream
+// never heard". The reachable failure is not the unreachable absent sink: an upstream subprocess
+// that dies mid-denial EPIPEs the write, which poisons no writer and tears nothing down, so there is
+// no other trace at all.
+//
+// Driven with a FAILING writer (not a nil one) for exactly that reason, and asserted on both shapes
+// that take such a refusal: the sampling leg's policy deny and the pool's saturation refusal.
+func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
+	t.Parallel()
+	broken := func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") }
+	samplingReq := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: capability.MethodSamplingCreateMessage}
+
+	t.Run("policy deny", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
+			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+			writeUpstream: broken,
+			refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
+			leg:           dropStdioRefusalUndeliverable,
+		})
+		require.Len(t, rec.records, 2, "a destroyed answer is a second fact about the request, and the refusal's own record does not carry it")
+		assertRefusalDropRecord(t, rec.records[1], dropStdioRefusalUndeliverable)
+	})
+
+	t.Run("pool saturation", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		pool, block := &serverRequestPool{}, make(chan struct{})
+		defer close(block)
+		for range maxConcurrentServerRequests {
+			pool.dispatch(context.Background(), samplingReq, serverRequestDispatch{
+				handle: func(context.Context, mcp.RPCMsg) { <-block },
+			})
+		}
+		pool.dispatch(context.Background(), samplingReq, serverRequestDispatch{
+			rec: rec, sessionID: "s", errOut: io.Discard,
+			writeUpstream: broken,
+			refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
+			leg:           dropHTTPRefusalUndeliverable,
+		})
+		require.Len(t, rec.records, 2, "the saturation refusal has the same shape and the same gap")
+		assert.Equal(t, codeResourceExhausted, rec.records[0].code)
+		assertRefusalDropRecord(t, rec.records[1], dropHTTPRefusalUndeliverable)
+	})
+
+	// The control: an answer that LANDS writes one record, so the drop is reported on the outcome
+	// of the write rather than on every refusal.
+	t.Run("delivered", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
+			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+			writeUpstream: func(mcp.RPCMsg) error { return nil },
+			refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
+			leg:           dropStdioRefusalUndeliverable,
+		})
+		assert.Len(t, rec.records, 1, "a refusal the initiator received is one event, not two")
+	})
+}
+
+// assertRefusalDropRecord checks the shape of the tape's account of an answer that never landed.
+func assertRefusalDropRecord(t *testing.T, got fwdCapturedRecord, leg transportLeg) {
+	t.Helper()
+	assert.Equal(t, "deny", got.decision)
+	assert.Equal(t, capability.ErrCodeEnforcementError, got.code,
+		"the record states the proxy failed the request, which is what an append-only tape can say about it")
+	assert.Equal(t, string(leg), got.details[detailTransport],
+		"the record must name the answering site, so a destroyed refusal is distinguishable from an undelivered forward")
+	assert.Empty(t, got.identifier,
+		"sampling/createMessage resolves a policy target, so naming it here would stamp one onto a record no PDP produced")
+}
+
+// TestServerRequestAnswer_DiagnosticIsBoundedAtTheSeam is the other half of the destroyed answer.
+//
+// The record got a bucket; the stderr line beside it did not, on the very leg whose flood the bucket
+// was added for — an upstream that closes its stdin and keeps emitting requests fails every answer,
+// so an unbounded line there is one write syscall per frame at the upstream's rate. It is bounded at
+// writeToInitiator rather than at any one caller, because that is the seam all nine answering sites
+// funnel through and a bound on one caller is a bound the next site added does not inherit.
+func TestServerRequestAnswer_DiagnosticIsBoundedAtTheSeam(t *testing.T) {
+	t.Parallel()
+	var errOut strings.Builder
+	broken := func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") }
+	u := serverRequestUnblocker{
+		reqs: &serverReqTracker{}, sink: sinkFunc(broken), errOut: &errOut,
+		notices: newRefusalNoticeLimiter(),
+	}
+	for range 200 {
+		u.write(mcp.RPCMsg{}, "test probe")
+	}
+	lines := strings.Count(errOut.String(), "\n")
+	assert.LessOrEqual(t, lines, refusalNoticeBurst,
+		"a dead upstream sink fails every answer; unbounded, that is one write syscall per frame at the peer's rate")
+	assert.Positive(t, lines, "a bucket that never admits is not bounding the diagnostic, it is silencing it")
+}
+
+// TestServerRequestForward_UntrackableIDIsRefusedNotForwarded is the fail-closed half of the
+// tracker's own bound.
+//
+// track refuses an over-cap id, but its refusal shares the `false` that means "displaced nothing",
+// so trackServerRequest could not tell them apart and both forward paths delivered to the host
+// anyway — the host answers, both routing arms drop that answer as untracked, and the upstream
+// blocks with nothing on the tape. Strictly worse than the retention the bound exists to prevent.
+func TestServerRequestForward_UntrackableIDIsRefusedNotForwarded(t *testing.T) {
+	t.Parallel()
+	over := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: &over, Method: "roots/list"}
+
+	var delivered int
+	sess := newTestSession(&httpSession{
+		id: "s", route: &UpstreamRoute{name: "up1"}, proxy: newTestHTTPProxy(), done: make(chan struct{}),
+	})
+	sub := make(chan mcp.RPCMsg, 1)
+	require.True(t, sess.addSub(sub))
+	ok := sess.broadcastServerRequest(context.Background(), refusalLimits{}, msg)
+	delivered = len(sub)
+
+	assert.False(t, ok, "a request whose reply could never be routed must not be reported as delivered")
+	assert.Zero(t, delivered, "and must not reach the host at all: its answer would be dropped as untracked")
+	assert.False(t, sess.serverReqs.tracked(mcp.MsgKey(&over)))
+}
+
+// TestServerRequestRefusal_DestroyedAnswerRecordIsMetered bounds a record the UPSTREAM drives: an
+// upstream that closes its stdin and keeps emitting requests on stdout has every one of them
+// refused and every answer destroyed, at its own send rate, with no host and no tracking involved.
+func TestServerRequestRefusal_DestroyedAnswerRecordIsMetered(t *testing.T) {
+	t.Parallel()
+	rec := &fwdRecorder{}
+	fp := serverRequestParams{
+		rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+		writeUpstream: func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") },
+		refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
+		leg:           dropStdioRefusalUndeliverable,
+	}
+	drops := 0
+	for range 200 {
+		rec.records = nil
+		forwardServerRequest(revisionContext(handshakeRevision),
+			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: capability.MethodSamplingCreateMessage}, fp)
+		require.NotEmpty(t, rec.records, "the policy DENY is a verdict and is never metered")
+		drops += len(rec.records) - 1
+	}
+	assert.LessOrEqual(t, drops, int(perCategoryDenyBurst)+1,
+		"a sustained flood of destroyed answers must be bounded by its own bucket")
+	assert.Positive(t, drops, "the leading edge of the flood must still reach the tape")
 }
 
 // TestHostServerReply_DestroyedWithNoUpstreamWriterReachesTheTape is the regression for the one
@@ -499,13 +849,13 @@ func TestServerRequestAdmission_RefusesAnIDLargerThanTheTrackerRetains(t *testin
 	var reqs serverReqTracker
 	var written []mcp.RPCMsg
 	u := serverRequestUnblocker{
-		reqs:          &reqs,
-		writeUpstream: func(m mcp.RPCMsg) error { written = append(written, m); return nil },
-		errOut:        io.Discard,
+		reqs:   &reqs,
+		sink:   sinkFunc(func(m mcp.RPCMsg) error { written = append(written, m); return nil }),
+		errOut: io.Discard,
 	}
 	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
 	rec := &fwdRecorder{}
-	recs := refusalRecorders{rec: rec, limiter: newRefusalRecordLimiter()}
+	recs := refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec)
 
 	admitted := admitServerRequestID(context.Background(), u, recs, verifiedSession("s"), dropStdioUnroutableID,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: &huge, Method: capability.MethodSamplingCreateMessage})
@@ -528,6 +878,30 @@ func TestServerRequestAdmission_RefusesAnIDLargerThanTheTrackerRetains(t *testin
 	assert.True(t, reqs.tracked(mcp.MsgKey(&ok)))
 }
 
+// TestServerReqTracker_RefusesAnOverCapIDItself is the same bound asked of the thing that holds the
+// bytes.
+//
+// maxTrackedServerReqIDBytes is argued from what an ENTRY retains for its whole lifetime, and was
+// enforced one layer up, at each transport's entry gate. That placement is right for the REFUSAL —
+// it must precede the pool and the decision — but it left track happy to retain a 4 MiB id, so the
+// retention argument in the constant's own doc was not backed by the type it describes. The gate
+// keeps its early-refusal role; this is the property behind it.
+func TestServerReqTracker_RefusesAnOverCapIDItself(t *testing.T) {
+	t.Parallel()
+	var reqs serverReqTracker
+	over := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
+
+	displaced, ok := reqs.track(mcp.RPCMsg{ID: &over, Method: capability.MethodSamplingCreateMessage}, io.Discard)
+	assert.False(t, ok, "an over-cap id displaces nothing: it was never admitted to the set")
+	assert.Zero(t, displaced)
+	assert.False(t, reqs.tracked(mcp.MsgKey(&over)), "retaining the id is the whole exposure the bound exists to cap")
+
+	// At the cap exactly, which is what keeps the refusal from being an off-by-one on every id.
+	atCap := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes-2) + `"`)
+	_, _ = reqs.track(mcp.RPCMsg{ID: &atCap, Method: "roots/list"}, io.Discard)
+	assert.True(t, reqs.tracked(mcp.MsgKey(&atCap)))
+}
+
 // TestServerReqTracker_BoundsTheRetainedMethod is the other retained field. The method is read by
 // the drop record alone and the sink bounds what it writes, so it is truncated rather than refused —
 // what was missing is a bound on what the TRACKER holds for an entry's whole lifetime, through the
@@ -545,25 +919,6 @@ func TestServerReqTracker_BoundsTheRetainedMethod(t *testing.T) {
 		"the tracker must bound the method it retains: %d entries times an unbounded 4 MiB field is the exposure", maxTrackedServerReqs)
 	assert.Equal(t, audit.BoundEnvelopeField(huge), entry.method,
 		"bounded through the audit envelope cap, so the tracker and the record it feeds cannot disagree about the limit")
-}
-
-// detailTransportDeclPos returns the position of the detailTransport constant's own string literal
-// in src, or token.NoPos when this file does not declare it — so the vocabulary guard exempts one
-// DECLARATION rather than a whole file. forward.go is where every record helper lives, so exempting
-// the file exempts precisely where a fourth producer would land.
-func detailTransportDeclPos(src packageSource) token.Pos {
-	pos := token.NoPos
-	ast.Inspect(src.file, func(n ast.Node) bool {
-		vs, isValue := n.(*ast.ValueSpec)
-		if !isValue || len(vs.Names) != 1 || vs.Names[0].Name != "detailTransport" || len(vs.Values) != 1 {
-			return true
-		}
-		if lit, isLit := vs.Values[0].(*ast.BasicLit); isLit {
-			pos = lit.Pos()
-		}
-		return true
-	})
-	return pos
 }
 
 // writeUpstreamWiring reports the value a node binds to a writeUpstream field, in either shape a
@@ -623,8 +978,8 @@ func TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota(t *testing.T) {
 	var reqs serverReqTracker
 	rec := &fwdRecorder{}
 	decided := 0
-	u := serverRequestUnblocker{reqs: &reqs, writeUpstream: func(mcp.RPCMsg) error { return nil }, errOut: io.Discard}
-	recs := refusalRecorders{rec: rec, limiter: newRefusalRecordLimiter()}
+	u := serverRequestUnblocker{reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), errOut: io.Discard}
+	recs := refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec)
 	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes+1) + `"`)
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: &huge, Method: capability.MethodSamplingCreateMessage}
 

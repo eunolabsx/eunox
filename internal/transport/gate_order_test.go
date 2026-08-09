@@ -466,7 +466,7 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 // staticRecorder adapts a test recorder to the gate's per-category recorder wiring: a test recorder
 // meters nothing, so every category resolves to it.
 func staticRecorder(rec auditRecorder) refusalRecorders {
-	return unmeteredRecorders(rec)
+	return unmeteredRecorders(rec, nil)
 }
 
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and

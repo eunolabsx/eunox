@@ -85,6 +85,11 @@ type serverRequestDispatch struct {
 	// each transport supplies its unblocker's writer rather than a closure over a concrete one,
 	// which would panic here instead.
 	writeUpstream func(mcp.RPCMsg) error
+	// refusalLimits (embedded) bounds the record a DESTROYED saturation answer writes; rec above
+	// stays the unmetered sink for the saturation refusal itself. See refusalAnswer.
+	refusalLimits
+	// leg names this transport's refusal-answering site on that record.
+	leg transportLeg
 	// errOut is where the seam writes that report; nil means os.Stderr.
 	errOut io.Writer
 	// handle is the server-initiated request's handler, run on its own goroutine.
@@ -94,6 +99,18 @@ type serverRequestDispatch struct {
 	// so without this an established session's refusals recorded no revision at all — which on
 	// this tape means "written before one could be resolved".
 	revision capability.Revision
+}
+
+// refusalAnswer is this dispatch's wiring for answering a saturation-refused initiator, the same
+// shape the sampling leg builds so the two cannot report a destroyed answer differently.
+func (d serverRequestDispatch) refusalAnswer() refusalAnswer {
+	return refusalAnswer{
+		write:  d.writeUpstream,
+		recs:   d.recorders(d.rec),
+		subj:   verifiedSession(d.sessionID),
+		leg:    d.leg,
+		errOut: d.errOut,
+	}
 }
 
 // dispatch runs d.handle for msg on its own goroutine, or refuses msg when the pool is at
@@ -114,9 +131,11 @@ func (p *serverRequestPool) dispatch(ctx context.Context, msg mcp.RPCMsg, d serv
 		recordResourceExhausted(ctx, d.rec, &p.saturation, d.sessionID, msg.Method)
 		// Record-before-act, so the answer below is the one that may be lost rather than the
 		// record. Through the shared seam because it runs AFTER that record: a nil concrete writer
-		// would panic here and leave a tape reporting a refusal the process died delivering.
-		writeToInitiator(d.writeUpstream, d.errOut, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy,
-			"eunox: too many concurrent server-initiated requests in flight; retry"), answerPoolSaturated)
+		// would panic here and leave a tape reporting a refusal the process died delivering — and
+		// an answer that is merely DESTROYED leaves the initiator blocked with the saturation
+		// record describing the refusal but not the delivery, which is why the seam appends its own.
+		d.refusalAnswer().answer(ctx, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy,
+			"eunox: too many concurrent server-initiated requests in flight; retry"), answerPoolSaturated, msg.Method)
 		return
 	}
 	// Counted before the goroutine starts, so teardown's drain cannot observe zero for a

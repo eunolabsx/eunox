@@ -26,6 +26,13 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
+// sinkFunc adapts a function to mcp.MsgSink, which is what serverRequestUnblocker holds now that
+// the writer is resolved at answer time rather than at wiring time. A test that wants to observe
+// (or fail) the answer supplies one of these instead of a live *mcp.MsgWriter.
+type sinkFunc func(mcp.RPCMsg) error
+
+func (f sinkFunc) Write(msg mcp.RPCMsg) error { return f(msg) }
+
 // upstreamReplies decodes every JSON-RPC message a test's upstream sink received.
 func upstreamReplies(t *testing.T, raw string) []mcp.RPCMsg {
 	t.Helper()
@@ -79,14 +86,14 @@ func TestServerRequestDisplacement_AnswersAndRecordsTheDisplacedInitiator(t *tes
 	var up bytes.Buffer
 	var reqs serverReqTracker
 	u := serverRequestUnblocker{
-		reqs:          &reqs,
-		writeUpstream: func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil },
-		errOut:        io.Discard,
+		reqs:   &reqs,
+		sink:   sinkFunc(func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil }),
+		errOut: io.Discard,
 	}
 	fillServerReqTracker(t, u)
 
 	rec := &fwdRecorder{}
-	trackServerRequest(context.Background(), u, refusalRecorders{rec: rec, limiter: newRefusalRecordLimiter()}, verifiedSession("sess-evict"), dropStdioDisplaced,
+	trackServerRequest(context.Background(), u, refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec), verifiedSession("sess-evict"), dropStdioDisplaced,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`"the-newest"`), Method: "sampling/createMessage"})
 
 	replies := upstreamReplies(t, up.String())
@@ -134,16 +141,16 @@ func TestServerRequestTracking_AReusedIDDisplacesRatherThanVanishing(t *testing.
 	var reqs serverReqTracker
 	rec := &fwdRecorder{}
 	u := serverRequestUnblocker{
-		reqs:          &reqs,
-		writeUpstream: func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil },
-		errOut:        io.Discard,
+		reqs:   &reqs,
+		sink:   sinkFunc(func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil }),
+		errOut: io.Discard,
 	}
 	ctx, lim := context.Background(), newRefusalRecordLimiter()
-	trackServerRequest(ctx, u, refusalRecorders{rec: rec, limiter: lim}, verifiedSession("s"), dropStdioDisplaced,
+	trackServerRequest(ctx, u, refusalLimits{records: lim}.recorders(rec), verifiedSession("s"), dropStdioDisplaced,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"})
 	require.Empty(t, up.String(), "the first track displaces nothing")
 
-	trackServerRequest(ctx, u, refusalRecorders{rec: rec, limiter: lim}, verifiedSession("s"), dropStdioDisplaced,
+	trackServerRequest(ctx, u, refusalLimits{records: lim}.recorders(rec), verifiedSession("s"), dropStdioDisplaced,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1.0`), Method: "sampling/createMessage"})
 
 	replies := upstreamReplies(t, up.String())
@@ -161,11 +168,11 @@ func TestServerRequestDisplacement_BelowTheCapAnswersNothing(t *testing.T) {
 	var reqs serverReqTracker
 	rec := &fwdRecorder{}
 	u := serverRequestUnblocker{
-		reqs:          &reqs,
-		writeUpstream: func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil },
-		errOut:        io.Discard,
+		reqs:   &reqs,
+		sink:   sinkFunc(func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil }),
+		errOut: io.Discard,
 	}
-	trackServerRequest(context.Background(), u, refusalRecorders{rec: rec, limiter: newRefusalRecordLimiter()}, verifiedSession("sess"), dropStdioDisplaced,
+	trackServerRequest(context.Background(), u, refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec), verifiedSession("sess"), dropStdioDisplaced,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "sampling/createMessage"})
 	assert.Empty(t, up.String(), "tracking below the cap displaces nothing, so nothing may be answered")
 	assert.Empty(t, rec.records)
@@ -180,12 +187,12 @@ func TestServerRequestDisplacement_RecordIsMetered(t *testing.T) {
 	t.Parallel()
 	var reqs serverReqTracker
 	rec := &fwdRecorder{}
-	u := serverRequestUnblocker{reqs: &reqs, writeUpstream: func(mcp.RPCMsg) error { return nil }, errOut: io.Discard}
+	u := serverRequestUnblocker{reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), errOut: io.Discard}
 	fillServerReqTracker(t, u)
 
 	lim := newRefusalRecordLimiter()
 	for i := range 200 {
-		trackServerRequest(context.Background(), u, refusalRecorders{rec: rec, limiter: lim}, verifiedSession("s"), dropStdioDisplaced,
+		trackServerRequest(context.Background(), u, refusalLimits{records: lim}.recorders(rec), verifiedSession("s"), dropStdioDisplaced,
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(jsonNumber(maxTrackedServerReqs + i)), Method: "roots/list"})
 	}
 	assert.LessOrEqual(t, len(rec.records), int(perCategoryDenyBurst)+1,
@@ -201,9 +208,9 @@ func TestUnblock_AnswersAndConsumesExactlyOnce(t *testing.T) {
 	var reqs serverReqTracker
 	_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, io.Discard)
 	u := serverRequestUnblocker{
-		reqs:          &reqs,
-		writeUpstream: func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil },
-		errOut:        io.Discard,
+		reqs:   &reqs,
+		sink:   sinkFunc(func(m mcp.RPCMsg) error { _, _ = up.Write(append(mustJSON(m), '\n')); return nil }),
+		errOut: io.Discard,
 	}
 	require.True(t, u.unblock(mcp.RawJSON(`7`), "refused"))
 	require.False(t, u.unblock(mcp.RawJSON(`7`), "refused"))

@@ -50,18 +50,19 @@ type trackedServerRequest struct {
 // 8 KiB is far past any real JSON-RPC id (a number, a uuid) and keeps the whole set's retention in
 // the tens of megabytes rather than the gigabytes an upstream issuing 4 MiB ids could pin.
 //
-// Asked at each transport's ENTRY to this leg (admitServerRequestID) rather than inside track: the
-// answer decides whether the request runs at all, and a refusal discovered after the decision has
-// already committed a quota slot for a call the host never sees.
-//
 // Enforced by REFUSING to track, not by truncating: a truncated id can neither answer the initiator
 // it was kept for nor index the reply it was kept to match, and the key would still hold the full
 // bytes. Matches the audit envelope cap, since the same value is what the drop record names.
+//
+// Enforced by the TRACKER, so the bound belongs to the thing retaining the bytes; the REFUSAL stays
+// at each transport's entry to this leg (admitServerRequestID), above the decision that would
+// otherwise commit a quota slot for a call the host never sees.
 const maxTrackedServerReqIDBytes = 8 << 10
 
 // trackableServerRequestID reports whether id is one the tracker will retain. Asked by
-// trackServerRequest before the entry is made, so a request whose reply could never be routed is
-// refused to its initiator rather than forwarded to a host whose answer would be dropped.
+// admitServerRequestID before the request is admitted at all, so a request whose reply could never
+// be routed is refused to its initiator rather than forwarded to a host whose answer would be
+// dropped — and by track itself, which is what makes it the tracker's own bound.
 func trackableServerRequestID(id *json.RawMessage) bool {
 	return id != nil && len(*id) <= maxTrackedServerReqIDBytes
 }
@@ -124,7 +125,9 @@ type serverReqTracker struct {
 // (each caller holds its proxy's or session's writer), never to os.Stderr directly.
 //
 // A message with no id is not tracked at all: its key would be "", which no reply can match and no
-// unblock can address, so the entry could only ever leave the set by displacing a real one.
+// unblock can address, so the entry could only ever leave the set by displacing a real one. An
+// over-cap id is refused here too — the exposure is what an entry HOLDS — and its callers must not
+// forward what this refuses, which is why both forward paths ask admitServerRequestID first.
 //
 // Reached ONLY through trackServerRequest, which disposes of what this returns. Go does not require
 // a return value to be consumed, so a second caller reaching for the obvious-looking method here
@@ -132,7 +135,7 @@ type serverReqTracker struct {
 // close, with no compiler error and no test. TestServerReqTracker_TrackIsOnlyReachedThroughTheDisposingWrapper
 // is what makes that a build failure instead.
 func (t *serverReqTracker) track(msg mcp.RPCMsg, errOut io.Writer) (trackedServerRequest, bool) {
-	if msg.ID == nil {
+	if !trackableServerRequestID(msg.ID) {
 		return trackedServerRequest{}, false
 	}
 	key := mcp.MsgKey(msg.ID)

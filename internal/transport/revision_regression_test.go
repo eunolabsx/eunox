@@ -726,7 +726,7 @@ func TestRoutingRefusal_NeverForwardsEvenIfTheObserveGateAdmittedIt(t *testing.T
 			return mcp.RPCMsg{Result: json.RawMessage(`{}`)}, nil
 		},
 	}
-	resp := refuseUnroutable(revisionContext(capability.Revision20251125), fp, verifiedSession("sess"),
+	resp := refuseUnroutable(revisionContext(capability.Revision20251125), fp, unmeteredRecorders(fp.rec, nil), verifiedSession("sess"),
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "agents/delegate"}, unroutableFramingRequest)
 
 	if forwarded {

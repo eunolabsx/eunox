@@ -35,7 +35,6 @@ package transport
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"reflect"
 
@@ -46,15 +45,33 @@ import (
 // serverRequestUnblocker is the per-transport wiring every site that answers a blocked
 // server-initiated initiator needs.
 //
-// writeUpstream is a func rather than an mcp.MsgSink because the two transports' upstream sinks
-// differ in type, and a nil CONCRETE writer handed to a shared interface parameter is a non-nil
-// interface that panics on use rather than the "no upstream to answer" case each caller tests
-// for. Both transports already build this shape for serverRequestDispatch, so the seam is one
-// they have rather than one this adds; nil means there is genuinely nothing to answer through.
+// The sink is resolved into a writer LAZILY, at the moment something is answered: most holders want
+// only the tracker (every forwarded request), and resolving eagerly cost them a method-value closure
+// plus initiatorWriter's reflection for a writer nothing called.
+//
+// writeUpstream() hands out a func rather than the interface because a nil CONCRETE writer in a
+// shared interface parameter is a non-nil interface that panics on use; initiatorWriter decides that
+// once.
 type serverRequestUnblocker struct {
-	reqs          *serverReqTracker
-	writeUpstream func(mcp.RPCMsg) error
-	errOut        io.Writer
+	reqs *serverReqTracker
+	// sink is the upstream's message sink, possibly a typed nil (HTTP holds a concrete
+	// *mcp.MsgWriter) — which is exactly what initiatorWriter resolves and why nothing here may
+	// test it with a bare != nil.
+	sink   mcp.MsgSink
+	errOut io.Writer
+	// notices bounds the diagnostic every answering site here writes when a reply does not land.
+	// Held on the unblocker rather than passed per call because the seam below is what every one of
+	// those sites funnels through, and a bound placed on one caller is a bound the next answering
+	// site added does not inherit. nil writes every line.
+	notices *recordRateLimiter
+}
+
+// writeUpstream resolves this unblocker's sink into the writer the answering seam takes, or nil when
+// there is genuinely nothing to answer through. Callers that hold a `writeUpstream func(...)` field
+// (the sampling leg's params, the pool's dispatch) take it from here so the nil answer is decided
+// once — see initiatorWriter.
+func (u serverRequestUnblocker) writeUpstream() func(mcp.RPCMsg) error {
+	return initiatorWriter(u.sink)
 }
 
 // unblock consumes id from the tracker and answers its blocked initiator with eunox's own error
@@ -104,7 +121,7 @@ func (u serverRequestUnblocker) relay(reply mcp.RPCMsg) bool {
 // the three answers genuinely differ — unblock takes it, relay's caller already did, and an
 // eviction removed it as the very act that created the debt.
 func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
-	return writeToInitiator(u.writeUpstream, u.errOut, reply, what)
+	return writeToInitiator(u.writeUpstream(), u.errOut, u.notices, reply, what)
 }
 
 // answerUntracked sends eunox's own error to an initiator whose request this proxy never tracked,
@@ -112,11 +129,14 @@ func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
 // displacement) or was never stored (an id the tracker refuses), so there is nothing to consume and
 // a take-first path would answer nothing at all.
 //
-// It returns nothing either. Every caller has already written, or is about to write, a record for
-// the refusal that brought it here, so a destroyed answer is not the ONLY thing the tape would have
-// on the event — which is the property that makes relay report its delivery and this not.
-func (u serverRequestUnblocker) answerUntracked(id *json.RawMessage, reason string) {
-	u.write(mcp.ErrorResponse(id, capability.JSONRPCCodeEnforcementError, reason), reason)
+// It REPORTS its delivery. The earlier reading — that every caller has already recorded the refusal
+// that brought it here, so a destroyed answer is not the only thing on the tape — is the one
+// refusalAnswer rejects: that record describes the refusal, not the delivery, and an operator
+// reconstructing a wedged upstream cannot tell "refused and told so" from "refused and the upstream
+// never heard" from it. The two callers holding their own refusal wiring append that second fact;
+// unblock's callers do not yet, which is the remaining half of this rule.
+func (u serverRequestUnblocker) answerUntracked(id *json.RawMessage, reason string) bool {
+	return u.write(mcp.ErrorResponse(id, capability.JSONRPCCodeEnforcementError, reason), reason)
 }
 
 // initiatorWriter turns an upstream sink into the writer this leg answers through, or nil when
@@ -167,14 +187,21 @@ func nilSink(sink mcp.MsgSink) bool {
 // without a sink and those sessions issue no server-initiated requests, so no id could have been
 // tracked, and stdio's writer is nil only before connectUpstream runs. Reported rather than dropped
 // because the alternative is an upstream wedged with nothing on stderr or the tape saying why.
-func writeToInitiator(write func(mcp.RPCMsg) error, errOut io.Writer, reply mcp.RPCMsg, what string) bool {
+//
+// The report is BOUNDED here rather than at any one caller, because this is the seam every answering
+// site funnels through and a dead sink fails every one of them at the peer's rate: an upstream that
+// closes its stdin and keeps emitting requests takes a refusal arm per request, and an unbounded
+// line here is one write syscall per frame — the record beside it metered while the syscall was not.
+// Residual: a blocked stderr (a pipe to a stalled collector) still blocks the writer; the bound
+// lowers the rate, it does not make the write non-blocking.
+func writeToInitiator(write func(mcp.RPCMsg) error, errOut io.Writer, notices *recordRateLimiter, reply mcp.RPCMsg, what string) bool {
 	if write == nil {
-		_, _ = fmt.Fprintf(resolvedErrOut(errOut),
+		noticef(resolvedErrOut(errOut), notices,
 			"[eunox] WARNING: a server-initiated request was left blocked: no upstream writer to answer it (%s)\n", what)
 		return false
 	}
 	if err := write(reply); err != nil {
-		_, _ = fmt.Fprintf(resolvedErrOut(errOut),
+		noticef(resolvedErrOut(errOut), notices,
 			"[eunox] WARNING: a server-initiated request was left blocked: answering its initiator failed (%s): %v\n", what, err)
 		return false
 	}
@@ -215,7 +242,43 @@ const (
 	// produced.
 	dropHTTPReplyUndeliverable  transportLeg = "http-server-reply-undeliverable"
 	dropStdioReplyUndeliverable transportLeg = "stdio-server-reply-undeliverable"
+	// dropHTTPRefusalUndeliverable / dropStdioRefusalUndeliverable: eunox REFUSED a
+	// server-initiated request (revoked session, degraded trail under --require-audit=strict, a
+	// policy deny, or a saturated pool) and the answer saying so never reached the initiator. See
+	// refusalAnswer for why the refusal's own record does not cover this.
+	dropHTTPRefusalUndeliverable  transportLeg = "http-server-refusal-undeliverable"
+	dropStdioRefusalUndeliverable transportLeg = "stdio-server-refusal-undeliverable"
 )
+
+// refusalAnswer is the wiring for answering the initiator of a server-initiated request eunox
+// REFUSED, and for reporting the answer that did not land.
+//
+// ONE type for the two shapes that take such a refusal (the sampling leg's params, the pool's
+// dispatch), because the refusal record they already write describes the REFUSAL and not the
+// delivery — an operator reconstructing a wedged upstream cannot tell "refused and told so" from
+// "refused and the upstream never heard" from it. The reachable failure is a subprocess that dies
+// mid-denial and EPIPEs the write, which poisons no writer and tears nothing down.
+type refusalAnswer struct {
+	// write is the resolved upstream writer (serverRequestUnblocker.writeUpstream), nil when there
+	// is nothing to answer through.
+	write func(mcp.RPCMsg) error
+	// recs resolves the drop record's recorder; catRefusalUndeliverable meters it.
+	recs refusalRecorders
+	// subj names whose session the drop record describes. See killSubject.
+	subj killSubject
+	// leg names this transport's refusal-answering site on that record.
+	leg    transportLeg
+	errOut io.Writer
+}
+
+// answer sends reply to the blocked initiator and records a destroyed one. Record-AFTER-act, unlike
+// every refusal arm that calls it: the fact recorded is the write's own outcome.
+func (a refusalAnswer) answer(ctx context.Context, reply mcp.RPCMsg, what, method string) {
+	if writeToInitiator(a.write, a.errOut, a.recs.notices, reply, what) {
+		return
+	}
+	recordServerRequestDropped(ctx, a.recs.forCategory(catRefusalUndeliverable), a.subj, method, a.leg)
+}
 
 // displacedServerRequestError is what eunox answers a displaced request's initiator with. It names
 // the proxy's own bookkeeping rather than anything about the host: a displacement is eunox running
@@ -247,8 +310,16 @@ func recordServerRequestDropped(ctx context.Context, rec auditRecorder, subj kil
 	// would stamp a policy target onto the signed tape for a request the PDP never saw — and
 	// sampling/createMessage, the method most likely to be dropped on this leg, resolves one.
 	identifier, name := auditIdentity(mcp.RPCMsg{Method: method})
+	details := subj.auditDetails(nil)
+	// An UNSET leg names no site, and an empty member of a closed vocabulary is worse on a signed
+	// tape than an absent key: it matches no SIEM filter and reads like a record written before the
+	// vocabulary existed. Every production caller passes a constant; this is what keeps a future one
+	// that forgets from stamping a blank.
+	if drop != "" {
+		details = subj.auditDetails(map[string]interface{}{detailTransport: string(drop)})
+	}
 	rec.RecordDeny(ctx, subj.auditSessionID(), identifier, name, capability.ErrCodeEnforcementError, "",
-		subj.auditDetails(map[string]interface{}{detailTransport: string(drop)}), false)
+		details, false)
 }
 
 // trackServerRequest records msg as an outstanding server-initiated request on this leg and
@@ -282,13 +353,21 @@ func trackServerRequest(ctx context.Context, u serverRequestUnblocker, recs refu
 		return
 	}
 	recordServerRequestDropped(ctx, recs.forCategory(catDisplaced), subj, displaced.method, drop)
-	u.answerUntracked(displaced.id, displacedServerRequestError)
+	if !u.answerUntracked(displaced.id, displacedServerRequestError) {
+		// The displacement record above says the request was dropped; this second one says its
+		// initiator was never told, which is what an operator needs to tell a wedged upstream from a
+		// merely evicted one. See refusalAnswer.
+		recordServerRequestDropped(ctx, recs.forCategory(catRefusalUndeliverable), subj, displaced.method, drop)
+	}
 }
 
 // admitServerRequestID refuses a server-initiated request whose own JSON-RPC id is larger than the
 // tracker will retain (maxTrackedServerReqIDBytes), reporting whether the request may proceed.
 //
-// It runs at each transport's ENTRY to this leg — before the pool, before any decision — because
+// The REFUSAL is this gate's; the BOUND is the tracker's own (track refuses such an id too, so the
+// retention argument is backed by the type that does the retaining). What is here rather than there
+// is the answer to the peer, and it runs at each transport's ENTRY to this leg — before the pool,
+// before any decision — because
 // everything below it would be work spent on a request whose reply could never be routed back: the
 // host would answer it and both routing arms would drop that answer as untracked, and on the
 // sampling path the decision would have committed a maxCalls slot for a call the host never saw.
@@ -305,8 +384,8 @@ func admitServerRequestID(ctx context.Context, u serverRequestUnblocker, recs re
 	recordServerRequestDropped(ctx, recs.forCategory(catUnroutableID), subj, msg.Method, drop)
 	// A nil id is not answerable — there is nothing to stamp a response with — but it is still
 	// refused, and mcp.RPCMsg.IsRequest makes it unreachable from either transport's entry.
-	if msg.ID != nil {
-		u.answerUntracked(msg.ID, unroutableIDServerRequestError)
+	if msg.ID != nil && !u.answerUntracked(msg.ID, unroutableIDServerRequestError) {
+		recordServerRequestDropped(ctx, recs.forCategory(catRefusalUndeliverable), subj, msg.Method, drop)
 	}
 	return false
 }

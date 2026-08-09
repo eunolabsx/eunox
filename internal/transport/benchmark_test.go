@@ -1052,3 +1052,80 @@ func benchmarkDecisionTurn(b *testing.B, tier turnTier) {
 		}
 	})
 }
+
+// BenchmarkRefusalRecorders_ForCategory is the number behind forCategory's map probe, which is on
+// every refusal record's recorder resolution and was worth measuring rather than removing: the
+// disposition is read from refusalDeclarations at resolution time, and a pre-resolved per-leg table
+// would be a second copy of the answer this package exists to have one of.
+//
+// The metered arm holds its bucket FULL by advancing an injected clock each iteration. Sharing one
+// bucket across the run measured the opposite of the intended path: perCategoryDenyBurst is 5, so
+// after five iterations admit() refuses and forCategory returns nil for the rest — reporting the
+// drained path's cost and never once allocating the rolledUpRecorder the admitted path boxes when
+// something was suppressed. The three arms are the probe alone, the admitted path, and the admitted
+// path carrying a rollup.
+func BenchmarkRefusalRecorders_ForCategory(b *testing.B) {
+	b.Run("exempt", func(b *testing.B) {
+		recs := refusalLimits{records: newRefusalRecordLimiter()}.recorders(&fwdRecorder{})
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = recs.forCategory(catUnroutable)
+		}
+	})
+	b.Run("metered", func(b *testing.B) {
+		lim := newRefusalRecordLimiter()
+		now := time.Now()
+		lim.setNow(func() time.Time { return now })
+		recs := refusalLimits{records: lim}.recorders(&fwdRecorder{})
+		b.ReportAllocs()
+		for b.Loop() {
+			// A second of refill per iteration keeps the bucket admitting, so this measures the
+			// path that actually resolves a recorder rather than the one that returns nil.
+			now = now.Add(time.Second)
+			if got := recs.forCategory(catKill); got == nil {
+				b.Fatal("the bucket refused; this arm must measure the ADMITTED path")
+			}
+		}
+	})
+	b.Run("metered with rollup", func(b *testing.B) {
+		lim := newRefusalRecordLimiter()
+		recs := refusalLimits{records: lim}.recorders(&fwdRecorder{})
+		b.ReportAllocs()
+		for b.Loop() {
+			// Drained, then refilled: the admitted record carries a suppressed count, which is the
+			// one shape that boxes a rolledUpRecorder.
+			lim.bucket(catKill).suppress()
+			_ = recs.forCategory(catKill)
+		}
+	})
+}
+
+// benchSink escapes the resolved writer so the "with writer" arm below measures the production
+// shape. Discarding the result instead let escape analysis stack-allocate the bound method value,
+// which reported 0 allocs for a call that heap-allocates one at every real wiring site.
+var benchSink func(mcp.RPCMsg) error
+
+// BenchmarkServerRequestUnblocker_Build is the per-request wiring cost on the server-initiated leg.
+//
+// The leg is not hot — a server-initiated request implies a human-facing round trip (an LLM
+// completion, a roots prompt) — so the numbers are here to be read rather than defended. What this
+// pins is the shape: an unblocker is built by every site that wants the TRACKER (once per forwarded
+// request) and by every site that wants to ANSWER, and the writer it hands out is a method value
+// bound through initiatorWriter's reflection. Resolving that writer lazily is what keeps the
+// tracker-only holders — the common case, since a healthy session displaces nothing — from paying
+// for a writer nothing calls, which is the ratio between these two arms.
+func BenchmarkServerRequestUnblocker_Build(b *testing.B) {
+	p := &StdioProxy{upWriter: mcp.NewMsgWriter(io.Discard)}
+	b.Run("tracker only", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = p.unblocker().reqs
+		}
+	})
+	b.Run("with writer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchSink = p.unblocker().writeUpstream()
+		}
+	})
+}

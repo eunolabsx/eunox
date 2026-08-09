@@ -445,7 +445,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
 		gate := hostNotificationGate{
-			recorders:   routeRefusalRecorders(route),
+			recorders:   p.routeRefusalRecorders(route),
 			subject:     verifiedSession(sessionID),
 			established: true,
 			audit:       route.audit,
@@ -479,7 +479,10 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// upstream round trip, a 202 identical to success) and enough records latch
 				// AuditDegraded(), which under --require-audit=strict denies every route.
 				recordResourceExhausted(ctx, asRecorder(route.sink), &sess.notifySaturation, sessionID, msg.Method)
-				_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, msg.Method)
+				// Bounded for the reason the routing refusal's notice is: the record above is
+				// collapsed to one per saturation EPISODE while this line ran once per refused
+				// frame, so the diagnostic was the cheaper flood of the two.
+				noticef(p.errOut(), p.refusalNoticeLimiter(), "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, audit.BoundEnvelopeField(msg.Method))
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -1241,5 +1244,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	return refusalRecorders{rec: rec, limiter: p.preSessionDenies}.forCategory(catRevision)
+	return p.refusalLimits().recorders(rec).forCategory(catRevision)
 }
