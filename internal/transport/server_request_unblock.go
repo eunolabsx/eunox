@@ -111,8 +111,12 @@ func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
 // or removed before the reply could be matched. It takes nothing: the id is already gone (a
 // displacement) or was never stored (an id the tracker refuses), so there is nothing to consume and
 // a take-first path would answer nothing at all.
-func (u serverRequestUnblocker) answerUntracked(id *json.RawMessage, reason string) bool {
-	return u.write(mcp.ErrorResponse(id, capability.JSONRPCCodeEnforcementError, reason), reason)
+//
+// It returns nothing either. Every caller has already written, or is about to write, a record for
+// the refusal that brought it here, so a destroyed answer is not the ONLY thing the tape would have
+// on the event — which is the property that makes relay report its delivery and this not.
+func (u serverRequestUnblocker) answerUntracked(id *json.RawMessage, reason string) {
+	u.write(mcp.ErrorResponse(id, capability.JSONRPCCodeEnforcementError, reason), reason)
 }
 
 // initiatorWriter turns an upstream sink into the writer this leg answers through, or nil when
@@ -135,7 +139,7 @@ func initiatorWriter(sink mcp.MsgSink) func(mcp.RPCMsg) error {
 func nilSink(sink mcp.MsgSink) bool {
 	v := reflect.ValueOf(sink)
 	switch v.Kind() {
-	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
 		return v.IsNil()
 	default:
 		return false
