@@ -898,6 +898,91 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	return upResp
 }
 
+// The two framings' wording for the fail-closed routing refusal's stderr notice. Only the noun
+// differs: a request-framed refusal and a notification-framed one are the same refusal for the
+// same reason, which is why they share one producer.
+const (
+	unroutableFramingRequest      = "MCP method"
+	unroutableFramingNotification = "notification method"
+)
+
+// errUnroutableNotForwarded is what the routing refusal's substituted upstream call returns. See
+// refuseUnroutable for why the sink is substituted rather than inherited.
+var errUnroutableNotForwarded = errors.New("eunox: a message no routing table can route is never forwarded")
+
+// refusalForwardParams builds the forward params for a refusal that has no dispatchParams behind
+// it — the notification gate's, which runs before any dispatcher.
+//
+// It takes a killSubject rather than a session id for the reason the dispatchParams constructors
+// do: forwardParams.sessionID is signed into the record as the session that PERFORMED an action,
+// and auditSessionID is the one function that decides whether a leg's id may be claimed as fact or
+// must stay an unverified detail. A bare string parameter here is exactly the shape that lets a
+// raw Mcp-Session-Id header become a signed assertion.
+func refusalForwardParams(rec auditRecorder, subj killSubject, auditMode bool, errOut io.Writer) forwardParams {
+	return forwardParams{
+		rec:       rec,
+		audit:     auditMode,
+		sessionID: subj.auditSessionID(),
+		errOut:    errOut,
+	}
+}
+
+// refuseUnroutable is the fail-closed routing default for BOTH framings: a message no routing
+// table can route is denied UNROUTABLE_METHOD and never forwarded to the upstream. The method name
+// is logged so operators can detect protocol drift or novel MCP extensions.
+//
+// It goes through the shared deny path like every other refusal in the tree, which is where the
+// observe gate, the strict-audit gate and the record shape live once. The pair of hand-rolled
+// records this replaced differed only in the subject's audit details — carried here on the
+// denial's own Details, the one input the core does not derive.
+//
+// The code is what makes the refusal resist an observing route's downgrade: it classifies as a
+// FAULT, so [capability.DenialInfo.Downgradable] is false for it whoever asks, and the core's
+// hard-deny arm is the only one reachable. That is the load-bearing encoding now rather than a
+// decoration beside a bypass — the property used to hold only because this path built no
+// DenialInfo and so never reached isObserveDeny at all.
+//
+// callUpstream is REPLACED rather than inherited: a request-framed caller's is a live sink, and
+// this path exists precisely because nothing can route the message, so the one arm of the core
+// that would forward it must have nowhere to forward to. That makes "never forwarded" structural
+// rather than a consequence of a classification a later edit could change; assertRoutingRefusalCode
+// pins the classification itself.
+//
+// The committer is nil: this refusal runs no decision, so there is none to commit and no decision
+// point that could be the wrong one.
+func refuseUnroutable(ctx context.Context, fp forwardParams, subj killSubject, msg mcp.RPCMsg, framing string) mcp.RPCMsg {
+	// Kill-switch checks run at each caller's boundary, so a killed session is reported as
+	// KILL_SWITCH before reaching here. msg.Method is attacker-controlled; sanitize once and reuse
+	// for both the stderr line and the host-facing denial. The structured audit field stays raw
+	// (JSON-encoding already escapes control runes).
+	sanitizedMethod := audit.SanitizeAuditField(msg.Method)
+	rev := requestRevision(ctx)
+	identifier, method := auditIdentity(msg)
+	// Unmetered by DECLARATION (catUnroutable), not by omission — see refusalDeclarations.
+	fp.rec = unmeteredRecorder(fp.rec, catUnroutable)
+	fp.callUpstream = func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+		return mcp.RPCMsg{}, errUnroutableNotForwarded
+	}
+	dec := capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial: &capability.DenialInfo{
+			Code: capability.ErrCodeUnroutableMethod,
+			// The marker rides the denial rather than a call-site map so the core's own merge
+			// carries it, and subject.auditDetails folds in a claimed session id where the leg has
+			// one — the only difference the two framings ever had.
+			Details: subj.auditDetails(unroutableDetail(rev, unroutableReason(rev, msg.Method))),
+		},
+	}
+	// Record-before-act: the core writes the audit record, then the stderr notice follows, so a
+	// crash between the two never leaves a SIEM alert with no corresponding audit trail entry.
+	resp := enforcedForwardCore(ctx, fp, nil, msg, dec, method, identifier, sanitizedMethod, "method", false, nil)
+	_, _ = fmt.Fprintf(fp.errOutOrStderr(),
+		"[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded\n",
+		framing, sanitizedMethod,
+	)
+	return resp
+}
+
 // hasRedactFieldsObligation reports whether obligs carries a redactFields directive with at
 // least one path — gates the fail-closed error.data strip against an upstream error carrying
 // free-form data eunox cannot verify.
@@ -953,9 +1038,11 @@ func upstreamErrorDetail(upResp mcp.RPCMsg) map[string]interface{} {
 }
 
 // serverRequestParams bundles the per-transport bits the shared server-initiated request core
-// needs. forward delivers msg to the host and reports whether a client received it;
-// writeUpstream sends a response back to the upstream initiator; claims carries the session's
-// JWT identity (HTTP only). The rest mirror forwardParams.
+// needs. forward delivers msg to the host and reports whether a client received it — taking the
+// ctx this core has already stamped with the session's claims and revision, since tracking the
+// request can force an eviction whose own record has to carry both; writeUpstream sends a
+// response back to the upstream initiator; claims carries the session's JWT identity (HTTP only).
+// The rest mirror forwardParams.
 type serverRequestParams struct {
 	rec       auditRecorder
 	audit     bool
@@ -975,7 +1062,7 @@ type serverRequestParams struct {
 	// message can resolve a revision, be recorded under it, and still not pin because the proxy
 	// discarded it. So it is resolved through resolveRevision rather than left absent.
 	revision      capability.Revision
-	forward       func(mcp.RPCMsg) bool
+	forward       func(context.Context, mcp.RPCMsg) bool
 	writeUpstream func(mcp.RPCMsg)
 	// decideLock serializes the sampling decision against host-path decisions on the same
 	// anchor when the policy is flow-relevant, since this path runs on the upstream-reader
@@ -1204,7 +1291,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		if fp.strictServerRequestAuditDenial(ctx, msg, msg.Method, capability.EnforceResponse{}) {
 			return
 		}
-		delivered := fp.forward(msg)
+		delivered := fp.forward(ctx, msg)
 		// Non-sampling methods are not policy-enforced, so there is no flow decision to record.
 		fp.recordForwardOutcome(ctx, msg.Method, delivered, fp.audit, capability.EnforceResponse{}, nil, nil)
 		return
@@ -1234,7 +1321,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, dec) {
 			return
 		}
-		delivered := fp.forward(msg)
+		delivered := fp.forward(ctx, msg)
 		// Carry the sampling decision's flow labels onto the tape, or the tape and state
 		// disagree for the sampling leg. declassifyRefusalDetail names a burned grant if one
 		// ever reaches this leg, at no cost otherwise.
@@ -1278,7 +1365,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		"[eunox] AUDIT: sampling/createMessage would be denied (%s) — forwarding (audit mode)\n",
 		denial.Code,
 	)
-	delivered := fp.forward(msg)
+	delivered := fp.forward(ctx, msg)
 	// audit=true: the observe path. dec (the downgraded deny) still carries carried_labels, so
 	// the record shows the flow that was let through.
 	//

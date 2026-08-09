@@ -41,11 +41,15 @@ var guardedStructs = map[string]struct {
 			"asserting a session this proxy never established",
 	},
 	"forwardParams": {
-		files:       []string{"stdio.go", "http_handlers.go"},
-		constructor: "(*HTTPProxy).dispatchParams or (*StdioProxy).dispatchParams",
+		files:       []string{"stdio.go", "http_handlers.go", "forward.go"},
+		constructor: "(*HTTPProxy).dispatchParams, (*StdioProxy).dispatchParams, or refusalForwardParams",
 		why: "forwardParams.sessionID is recorded as the session that PERFORMED an action. " +
-			"Both constructors take resolved session state (an *httpSession, or the stdio " +
-			"proxy's own id) and so cannot be handed a raw Mcp-Session-Id header; a literal can",
+			"Every constructor takes resolved session state (an *httpSession, the stdio proxy's " +
+			"own id, or a killSubject) and so cannot be handed a raw Mcp-Session-Id header; a " +
+			"literal can. forward.go is allowlisted for refusalForwardParams alone — the " +
+			"constructor the notification gate's routing refusal uses, which has no " +
+			"dispatchParams behind it and takes a killSubject precisely so auditSessionID, not " +
+			"the call site, decides whether the leg's id may be signed as fact",
 	},
 	"dispatchParams": {
 		files:       []string{"stdio.go", "http_handlers.go"},

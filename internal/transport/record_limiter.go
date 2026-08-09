@@ -6,16 +6,17 @@
 // pool-saturation refusals (saturationGate). No policy ALLOW/DENY record is ever
 // admission-controlled.
 //
-// What is NOT metered, deliberately: the fail-closed ROUTING refusal (dispatchUnmapped and the
-// notification gate's unmapped arm), on either transport. Reaching it means a peer whose other
-// traffic writes policy DENY records at the same one-record-per-message cost — and those may
-// never be admission-controlled, since a policy verdict elided is a policy verdict an incident
-// responder does not have. Metering the routing refusal alone would lower no ceiling; it would
-// only make the cheapest way to fill the queue the one that leaves the better tape.
+// Which refusals are metered and which are deliberately not is a DECLARATION, not prose: every
+// category carries one in refusalDeclarations, an exempt one carries its reason, and a table test
+// walks the recorder call sites so a refusal cannot ship without an answer. It was prose, and the
+// survey behind it was incomplete — the routing refusal's exemption was argued in a comment while
+// the smuggling refusal beside it, equally unmetered and equally cheap, had no recorded judgment
+// either way.
 
 package transport
 
 import (
+	"slices"
 	"sync"
 	"time"
 )
@@ -83,17 +84,90 @@ const (
 	// suppressed_refusal_count) and keeps identical bytes treated identically on the two
 	// transports, which is the property that stops the pair drifting.
 	catRevision refusalCategory = "revision"
+	// catUnroutable and catSmuggled are the two DECLARED-EXEMPT categories: they name a
+	// refusal so its non-metering is an answer on the record rather than an absent call. See
+	// refusalDeclarations for the reason, which is the same for both.
+	catUnroutable refusalCategory = "unroutable"
+	catSmuggled   refusalCategory = "smuggled_notification"
 )
 
-// refusalCategories is authoritative: a category added above but omitted here falls to the
-// shared unknown bucket instead of getting its own (see
-// TestRefusalCategories_AllHaveTheirOwnBucket).
-var refusalCategories = []refusalCategory{
-	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation, catKill, catAudience, catRevision,
+// refusalMetering is a refusal category's DECLARED disposition. The zero value is "undeclared",
+// so a category added with no entry fails the table test rather than silently inheriting either
+// answer — the shape pkg/capability's prototype registry uses for Since/State/Uses.
+type refusalMetering int
+
+const (
+	meteringUndeclared refusalMetering = iota
+	// meteringMetered: the category charges its own per-category bucket, and a suppressed
+	// record folds into the next admitted one's suppressed_refusal_count.
+	meteringMetered
+	// meteringExempt: deliberately unbounded, for the reason the declaration states.
+	meteringExempt
+)
+
+// refusalDeclaration is what every refusal category declares. why is required for an exemption
+// and must be empty for a metered category: the reason is the whole content of an exemption, and
+// a metered one needs none.
+type refusalDeclaration struct {
+	metering refusalMetering
+	why      string
+}
+
+// exemptBecausePolicyDenyCostsTheSame is the reason BOTH exempt categories carry, stated once
+// because it is one argument rather than two that happen to agree.
+//
+// Reaching either refusal takes a peer whose ordinary traffic writes policy DENY records at the
+// same one-record-per-message cost — and a policy verdict may NEVER be admission-controlled, since
+// a verdict elided is a verdict an incident responder does not have. Metering these would lower no
+// ceiling; it would only make the cheapest way to fill the queue the one that leaves the better
+// tape.
+const exemptBecausePolicyDenyCostsTheSame = "reaching it needs a peer whose ordinary traffic writes policy DENY records at the same one-per-message cost, and a policy verdict may never be metered"
+
+// refusalDeclarations is authoritative for BOTH questions: which categories exist, and what each
+// one's metering disposition is. refusalCategories (the bucket table, and the divisor for every
+// category's share of the aggregate budget) is derived from it, so declaring a category exempt
+// does not silently shrink the metered ones' shares.
+var refusalDeclarations = map[refusalCategory]refusalDeclaration{
+	catOrigin:      {metering: meteringMetered},
+	catJWT:         {metering: meteringMetered},
+	catAuth:        {metering: meteringMetered},
+	catControl:     {metering: meteringMetered},
+	catLoopback:    {metering: meteringMetered},
+	catBody:        {metering: meteringMetered},
+	catContentType: {metering: meteringMetered},
+	catSaturation:  {metering: meteringMetered},
+	catKill:        {metering: meteringMetered},
+	catAudience:    {metering: meteringMetered},
+	catRevision:    {metering: meteringMetered},
+	// The fail-closed ROUTING refusal, on either transport and in either framing.
+	catUnroutable: {metering: meteringExempt, why: exemptBecausePolicyDenyCostsTheSame},
+	// The enforced-method-as-notification reject. It writes a record as cheap as the routing
+	// refusal's on the same goroutine — `{"jsonrpc":"2.0","method":"tools/call"}` costs no id, no
+	// host-handler slot and no upstream round trip — and it is exempt for the same reason: an
+	// established peer sending the REQUEST framing of the same method drives a policy DENY per
+	// message anyway. Recorded here as a judgment rather than left as the absence of a call,
+	// which is how it went unsurveyed while its neighbour's exemption was argued in prose.
+	catSmuggled: {metering: meteringExempt, why: exemptBecausePolicyDenyCostsTheSame},
+}
+
+// refusalCategories is the METERED subset, sorted so the derived bucket table and every test
+// reading it are deterministic. A category declared exempt is deliberately absent: it charges no
+// bucket, and counting it would divide the aggregate budget by a share nothing spends.
+var refusalCategories = meteredRefusalCategories()
+
+func meteredRefusalCategories() []refusalCategory {
+	out := make([]refusalCategory, 0, len(refusalDeclarations))
+	for cat, decl := range refusalDeclarations {
+		if decl.metering == meteringMetered {
+			out = append(out, cat)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // numRefusalCategories sizes the aggregate budget above. It is a const because the budget
-// constants are, and TestRefusalCategories_AllHaveTheirOwnBucket holds it to len().
+// constants are, and TestNumRefusalCategories_MatchesTheList holds it to len().
 const numRefusalCategories = 11
 
 // perCategoryFloor keeps every category's bucket alive even where plain division would
@@ -121,19 +195,46 @@ var (
 	perCategoryDenyBurst = perCategoryShare(preSessionDenyBurst, len(refusalCategories))
 )
 
-// newRefusalRecordLimiter builds the per-category buckets, each holding an equal share of
-// the aggregate rate/burst (see perCategoryDenyRate/perCategoryDenyBurst). Held per PROXY —
-// the HTTP proxy for its pre-session refusals, the stdio proxy for catRevision.
+// newRefusalRecordLimiter builds a bucket for every METERED category, each holding an equal
+// share of the aggregate rate/burst (see perCategoryDenyRate/perCategoryDenyBurst). The HTTP
+// proxy's, since that transport charges nearly all of them.
 func newRefusalRecordLimiter() *categoryRecordLimiter {
+	return newRefusalRecordLimiterFor(refusalCategories...)
+}
+
+// newRefusalRecordLimiterFor builds buckets for the categories ONE transport actually charges.
+//
+// stdio charges exactly one (catRevision), so the full table left it holding ten buckets it can
+// never spend — on a proxy that may have no audit sink at all. The per-bucket SHARE is still
+// computed from the whole declared set, never from len(cats): a transport's budget is its share of
+// the aggregate, not the aggregate.
+//
+// A category outside cats falls to the shared `unknown` bucket, which is bounded rather than
+// unbounded — the safe direction — and each transport's charged set is held to what it declares,
+// so the fallback stays unreachable.
+func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter {
 	c := &categoryRecordLimiter{
-		buckets: make(map[refusalCategory]*recordRateLimiter, len(refusalCategories)),
+		buckets: make(map[refusalCategory]*recordRateLimiter, len(cats)),
 		unknown: newRecordRateLimiter(perCategoryFloor, perCategoryFloor),
 	}
-	for _, cat := range refusalCategories {
+	for _, cat := range cats {
 		c.buckets[cat] = newRecordRateLimiter(perCategoryDenyRate, perCategoryDenyBurst)
 	}
 	return c
 }
+
+// stdioRefusalCategories is the set the stdio transport charges. Declared rather than left implicit
+// in its call sites, so the limiter it builds and the categories it spends are one statement — and
+// so a metered refusal added to that transport is a deliberate edit here.
+var stdioRefusalCategories = []refusalCategory{catRevision}
+
+// unmeteredRecorder returns rec unchanged, for a refusal its category DECLARES exempt.
+//
+// It exists so an exemption is a call that NAMES the category rather than the absence of one: the
+// table test walks these sites, so a refusal that ships with no answer, or with an answer
+// contradicting its declaration, fails the build. That is the whole difference from writing the
+// record directly — there is no runtime behavior here to get wrong.
+func unmeteredRecorder(rec auditRecorder, _ refusalCategory) auditRecorder { return rec }
 
 // categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
 // cheap refusals in one category cannot suppress another's records.

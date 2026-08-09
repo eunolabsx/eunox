@@ -199,10 +199,12 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 	}
 }
 
-// TestRefusalCategories_AllHaveTheirOwnBucket pins the enumerated table against the
-// declared constants: a category constant added without being registered in
-// refusalCategories would silently share the unknown bucket with every other unregistered
-// one, quietly re-creating the cross-category suppression the split exists to remove.
+// TestRefusalCategories_AllHaveTheirOwnBucket pins that every METERED category gets a bucket of
+// its own: one falling through to the shared unknown bucket would share it with every other
+// unregistered category, quietly re-creating the cross-category suppression the split removed.
+//
+// Which categories exist, and which are metered at all, is refusalDeclarations' question now — see
+// refusal_metering_test.go. This is the half about the table built from that answer.
 func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
 	t.Parallel()
 	lim := newRefusalRecordLimiter()
@@ -218,11 +220,13 @@ func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
 		}
 		seen[b] = cat
 	}
-	// Every constant declared in this package must be in the list the table is built
-	// from. Checked by value so a new constant that is never registered is caught.
-	for _, cat := range []refusalCategory{catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType, catSaturation} {
+	// Every metered declaration must reach the table the limiter is built from.
+	for cat, decl := range refusalDeclarations {
+		if decl.metering != meteringMetered {
+			continue
+		}
 		if _, registered := lim.buckets[cat]; !registered {
-			t.Errorf("category constant %q is not in refusalCategories", cat)
+			t.Errorf("category %q is declared metered but has no bucket", cat)
 		}
 	}
 }

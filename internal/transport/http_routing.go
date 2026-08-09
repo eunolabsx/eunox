@@ -308,6 +308,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			gate := hostNotificationGate{
 				rec:       func() auditRecorder { return p.preSessionKillRecorder(route) },
 				subject:   claimedSession(r),
+				audit:     route.audit,
 				errOut:    p.errOut(),
 				checkKill: func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, "") },
 				leg:       legHTTPNotification,
@@ -373,11 +374,11 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// and a JSON-RPC error body would omit the id (RPCMsg.ID is json:"id,omitempty")
 			// under an implicit 200, indistinguishable from success to a status-only client.
 			//
-			// A dropped RESPONSE deliberately does NOT unblock its initiator here, unlike the
-			// revision refusal below (takeRefusedServerReply): this gate refused the SENDER, not
-			// the message, so consuming the tracked id on their behalf would let a second
-			// identity that learned this session id abort the real owner's pending reply. The
-			// upstream waits for the owner's, or for teardown.
+			// A dropped RESPONSE unblocks its initiator only when the sender is this session's
+			// own owner: this gate refuses the SENDER, and answering on an unauthorized one's
+			// message would abort the real owner's pending reply. See
+			// unblockGateRefusedServerReply for both halves of that rule.
+			sess.unblockGateRefusedServerReply(r.Context(), msg)
 			w.WriteHeader(http.StatusAccepted)
 		}
 		return
@@ -446,6 +447,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			rec:         func() auditRecorder { return asRecorder(route.sink) },
 			subject:     verifiedSession(sessionID),
 			established: true,
+			audit:       route.audit,
 			errOut:      p.errOut(),
 			checkKill:   kill,
 			leg:         legHTTPNotification,
@@ -1193,20 +1195,16 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 	if !msg.IsResponse() || !sess.serverReqs.take(mcp.MsgKey(msg.ID)) {
 		return false
 	}
-	switch deny := kill(); {
-	case deny != nil:
+	if deny := kill(); deny != nil {
 		// A kill doesn't tear the upstream down; its blocked server-initiated request is
 		// intentionally left unanswered and reclaimed later by the idle reaper's hard
 		// ceiling. Record the dropped reply so it's visible on the tape.
 		recordKillDrop(ctx, asRecorder(route.sink), deny, verifiedSession(sess.id), methodLabelServerResponse, methodLabelServerResponse, legHTTPServerResponse)
-	case sess.upWriter != nil:
-		_ = sess.upWriter.Write(msg)
-	default:
-		// Remote-upstream mode has no upWriter to route the response back. Unreachable
-		// today (remote sessions issue no server-initiated requests), pending a fix.
-		_, _ = fmt.Fprintf(p.errOut(),
-			"[eunox] WARNING: dropped host response to a server-initiated request: no upstream writer in remote-upstream mode\n")
+		return true
 	}
+	// Through the shared seam for the nil-writer disposition alone: this relays the host's OWN
+	// reply, having already taken the id that made it routable.
+	sess.unblocker().relay(msg)
 	return true
 }
 

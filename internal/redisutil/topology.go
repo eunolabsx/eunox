@@ -21,7 +21,10 @@ package redisutil
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
+	"sync/atomic"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -29,7 +32,23 @@ import (
 // ShardFanOut visits every server a sharding client spreads its keyspace over, running fn
 // against each. It is what a KEYLESS command (SCAN) needs there: routed to one server it
 // enumerates one shard of several and reports success.
+//
+// EVERY server, not merely every reachable one: an iterator that quietly covers less than the
+// whole keyspace hands its caller a partial result indistinguishable from a complete one, which
+// for the kill switch is a partial kill set served as complete. An iterator that cannot cover
+// them all returns ErrIncompleteFanOut rather than nil.
 type ShardFanOut func(ctx context.Context, fn func(ctx context.Context, node *redis.Client) error) error
+
+// ErrIncompleteFanOut reports an enumeration that covered FEWER servers than the client spreads
+// its keyspace over, so its result is a partial view rather than the whole one.
+//
+// It exists because go-redis' Ring iterator does not say so itself: (*redis.Ring).ForEachShard
+// skips a shard its heartbeat has voted down and returns nil, where (*ClusterClient).ForEachMaster
+// propagates both the state reload and the per-node error. A caller reading a keyless SCAN through
+// the silent version loads the surviving shards' keys, commits them as authoritative, and reports
+// healthy — the same fail-open TopologyUnknown exists to refuse, one layer down and reached after
+// the topology was correctly established.
+var ErrIncompleteFanOut = errors.New("redisutil: shard enumeration covered fewer servers than the client is configured with, so its result is a PARTIAL view of the keyspace")
 
 // Topology is what this package could establish about how a client spreads its keyspace.
 //
@@ -96,11 +115,47 @@ func ClassifyTopology(client redis.Cmdable) (Topology, ShardFanOut) {
 	case *redis.ClusterClient:
 		// Masters only: a replica holds the same keys, so scanning them would double the work
 		// and, mid-failover, disagree with its master about what is there.
+		//
+		// Handed over unwrapped because it already reports an incomplete pass: it fails on the
+		// state reload and propagates the first per-node error, so a master it could not visit is
+		// an error rather than a shorter loop.
 		return TopologySharded, c.ForEachMaster
 	case *redis.Ring:
-		return TopologySharded, c.ForEachShard
+		return TopologySharded, wholeRingFanOut(c)
 	}
 	return TopologyUnknown, nil
+}
+
+// wholeRingFanOut is (*redis.Ring).ForEachShard with the completeness ShardFanOut promises and
+// go-redis does not: the library's iterator `continue`s past a shard its heartbeat has voted down
+// and returns nil, so a keyless SCAN through the bare version enumerates the survivors and reports
+// success. Every consumer of a fan-out is running a command it needs the WHOLE keyspace for, so a
+// short pass is an error here rather than a caveat each of them re-derives.
+//
+// The shard count is read from the ring's CONFIGURED addresses rather than from Ring.Len(), which
+// counts the live shards — the same set ForEachShard visits, so comparing against it would be a
+// tautology that agrees with itself while a shard is down. The residual is (*Ring).SetAddrs, which
+// reshapes the ring WITHOUT writing back to the options this reads: after one that shrinks the
+// ring, a complete pass reads as short and this refuses it. That is the fail-closed direction and
+// it is loud, and a consumer reshaping a ring at runtime is the one who can say what its shards
+// are — see the topology-declaring options on pkg/killswitch's Redis.
+func wholeRingFanOut(ring *redis.Ring) ShardFanOut {
+	return func(ctx context.Context, fn func(ctx context.Context, node *redis.Client) error) error {
+		want := len(ring.Options().Addrs)
+		// Atomic because ForEachShard runs fn on one goroutine PER SHARD.
+		var visited atomic.Int64
+		err := ring.ForEachShard(ctx, func(ctx context.Context, node *redis.Client) error {
+			visited.Add(1)
+			return fn(ctx, node)
+		})
+		if err != nil {
+			return err
+		}
+		if got := int(visited.Load()); got < want {
+			return fmt.Errorf("%w: visited %d of the ring's %d configured shards (go-redis skips a shard it has voted down and reports no error)", ErrIncompleteFanOut, got, want)
+		}
+		return nil
+	}
 }
 
 // IsNilClient reports whether client IS nil — the interface itself, or a typed nil value inside

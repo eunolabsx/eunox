@@ -162,7 +162,7 @@ func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 		sessionID:     "sess",
 		pdp:           pdp.AlwaysAllowPDP{},
 		revision:      capability.Revision20260728,
-		forward:       func(mcp.RPCMsg) bool { return true },
+		forward:       func(context.Context, mcp.RPCMsg) bool { return true },
 		writeUpstream: func(mcp.RPCMsg) {},
 		errOut:        io.Discard,
 	}

@@ -513,7 +513,9 @@ func TestServeHost_KilledServerResponseRecordsDeny(t *testing.T) {
 	// A host response (id 5) to a server-initiated request the proxy had forwarded.
 	serveHostLines(t, stdioServe{
 		pdp: policy, sessionID: "kill-sess", sink: sink, upSink: up,
-		setup: func(p *StdioProxy) { p.serverReqs.track(mcp.MsgKey(mcp.RawJSON(`5`)), io.Discard) },
+		setup: func(p *StdioProxy) {
+			p.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"}, io.Discard)
+		},
 	},
 		`{"jsonrpc":"2.0","id":5,"result":{}}`,
 	)

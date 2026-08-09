@@ -114,6 +114,25 @@ var ErrNilClient = errors.New("killswitch: redis kill switch wired with a nil cl
 // or WithShardFanOut, which is the escape hatch this refusal is only tolerable with.
 var ErrUnknownTopology = errors.New("killswitch: redis kill switch wired with a client whose keyspace topology cannot be determined (a decorator or a custom Cmdable); failing closed, since a keyless SCAN over a sharded keyspace loads a PARTIAL kill set and reports it as complete. Pass the client itself, or declare the topology with killswitch.WithSingleNodeKeyspace()/WithShardFanOut()")
 
+// ErrIncompleteEnumeration is what a full-keyspace SCAN reports when it covered fewer servers
+// than the client spreads its keyspace over — today, a *redis.Ring shard go-redis has voted down,
+// which its own iterator skips with no error at all.
+//
+// It is the same fail-open ErrUnknownTopology refuses, reached one layer down: the topology was
+// established correctly and the ENUMERATION still came back short, so without this the surviving
+// shards' keys commit as the authoritative kill set, lastRefreshErr stays nil, HealthStatus
+// reports ready, and ShouldBlock answers "not killed" for every session whose key lived on the
+// missing shard.
+//
+// Unlike its latched siblings this is a REFRESH error, not a wiring fault: a shard that is down
+// comes back, and the next reconcile clears it. So it honours WithFailOpen like any other outage
+// rather than overriding it — the posture an operator chose for "Redis is unreachable" is the
+// posture for "part of Redis is unreachable" too.
+//
+// Exported as this package's own name for an error defined below it, so a consumer outside this
+// module can errors.Is against the refusal it will actually be handed.
+var ErrIncompleteEnumeration = redisutil.ErrIncompleteFanOut
+
 // ErrTopologyContradicted refuses a topology DECLARATION that disagrees with what the client's
 // own concrete type establishes — WithSingleNodeKeyspace() beside a *redis.ClusterClient, say.
 //
@@ -332,6 +351,12 @@ func WithSingleNodeKeyspace() RedisOption {
 // A nil iterator is not a way to say "single node" — that is WithSingleNodeKeyspace, whose name
 // says so — so it leaves the topology undeclared and the backend refuses as before rather than
 // silently adopting the single-node path.
+//
+// The iterator must visit EVERY server, reporting an error when it cannot, rather than covering
+// the reachable ones and returning nil: this backend commits what a pass returns as the whole kill
+// set, so a short pass that reports success is the fail-open ErrIncompleteEnumeration exists to
+// stop. Declaring (*redis.Ring).ForEachShard here is precisely that — pass the ring itself, which
+// is classified and wrapped with the completeness check the library iterator lacks.
 func WithShardFanOut(fanOut ShardFanOut) RedisOption {
 	return func(r *Redis) {
 		if fanOut == nil {
@@ -1187,6 +1212,11 @@ func (r *Redis) scanPrefix(ctx context.Context, prefix string, target map[string
 // declaration) and a client whose topology could not be established never reaches here: it
 // latches ErrUnknownTopology, which every entry point above refuses on. So a nil iterator here
 // means "the whole keyspace is on one server", established, rather than "nothing is known".
+//
+// That is a fact about the CLIENT, and it says nothing about any one pass over it. Whether the
+// enumeration actually reached every server is the iterator's own answer, per call — the
+// distinction a *redis.Ring lives in, whose library iterator skips a shard it has voted down and
+// returns nil. See ErrIncompleteEnumeration for the error that closes it and where it surfaces.
 //
 // Reachable only by a LIBRARY consumer wiring this backend on its own: the shipped binary is
 // single-node, and callcounter.NewRedis refuses a sharding client outright.
