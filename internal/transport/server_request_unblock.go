@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -112,6 +113,33 @@ func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
 // a take-first path would answer nothing at all.
 func (u serverRequestUnblocker) answerUntracked(id *json.RawMessage, reason string) bool {
 	return u.write(mcp.ErrorResponse(id, capability.JSONRPCCodeEnforcementError, reason), reason)
+}
+
+// initiatorWriter turns an upstream sink into the writer this leg answers through, or nil when
+// there is genuinely nothing to answer through.
+//
+// It exists because one transport holds its sink as an INTERFACE (mcp.MsgSink) and the other as a
+// concrete pointer: a bare `!= nil` on the interface is the typed-nil trap asRecorder documents —
+// an interface holding a nil *mcp.MsgWriter is non-nil, builds a writer, and panics inside a mutex
+// take on the nil receiver, which is exactly what this seam was added to report instead.
+func initiatorWriter(sink mcp.MsgSink) func(mcp.RPCMsg) error {
+	if sink == nil || nilSink(sink) {
+		return nil
+	}
+	return sink.Write
+}
+
+// nilSink reports whether sink is an interface holding a nil value. Kind-checked before IsNil,
+// which panics for a non-nilable kind — a sink implemented on a struct VALUE is legitimate and must
+// answer false rather than crash the check that exists to prevent a crash.
+func nilSink(sink mcp.MsgSink) bool {
+	v := reflect.ValueOf(sink)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 // writeToInitiator is the ONE nil-writer disposition every site that answers a blocked

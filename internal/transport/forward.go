@@ -164,17 +164,9 @@ func auditIdentity(msg mcp.RPCMsg) (identifier, method string) {
 // transportLeg names, in a record's `transport` audit detail, WHICH leg of which transport produced
 // it, so an operator can tell drop sites apart during an incident.
 //
-// ONE type for the field, not one enum per producer beside a bare string parameter. A typed enum
-// makes a typo'd leg a compile error rather than a silently corrupted detail, but three vocabularies
-// landing in one key gave that guarantee only WITHIN each producer: nothing stopped two of them
-// minting the same value for different legs, and an operator's SIEM filter on `transport` had no
-// single closed set to match against. "sse-get" was already spelled twice — once as an enum
-// constant, once as a bare argument — for what is the same leg.
-//
-// Three families share the type, distinguished by prefix rather than by type: the kill drops
-// (recordKillDrop), the server-request drops (recordServerRequestDropped, declared in
-// server_request_unblock.go beside the sites that produce them), and the session-gate refusals
-// (recordSessionGateDeny).
+// ONE type for the field, not one enum per producer beside a bare string parameter: three
+// vocabularies in one key kept each producer's spelling honest and none kept the FIELD honest, so
+// "sse-get" was already spelled twice for the same leg and a SIEM filter had no closed set to match.
 type transportLeg string
 
 // detailTransport is the details key every transportLeg is written under. One constant so the field
@@ -269,20 +261,10 @@ type forwardParams struct {
 	audit          bool
 	sessionID      string
 	upstreamTimeMs int
-	// callUpstream forwards the decided message. nil is a MODE, not an oversight: this leg has NO
-	// upstream to forward to, so the observe downgrade (which is a forward) is unavailable to it
-	// and the refusal stays hard, keeping the code that names the real cause. The fail-closed
-	// routing refusal is the one caller — a message no routing table can route must never reach an
-	// upstream, and expressing that as the absence of a sink makes it structural rather than a
-	// consequence of a classification a later edit could change.
-	//
-	// A stub that FAILED on use is what this replaced, and the two are not equivalent: the stub's
-	// error reached recordUpstreamFailure, which classified it through upstreamErrInfo's default
-	// arm and wrote an UPSTREAM_ERROR deny for an upstream that was never contacted — a fabricated
-	// outage on the tamper-evident tape, on a posture whose whole contract is to observe and report
-	// accurately. It also makes this leg's unset upstreamTimeMs and endDecision inert BY THE MODE:
-	// the core cannot reach either field's reader without an upstream, rather than merely returning
-	// above them today.
+	// callUpstream forwards the decided message. nil is a MODE: this leg has NO upstream, so the
+	// observe downgrade (which IS a forward) is unavailable and the refusal stays hard with the code
+	// naming the real cause. A stub that FAILED on use is not equivalent — its error reached
+	// recordUpstreamFailure, writing an UPSTREAM_ERROR deny for an upstream never contacted.
 	callUpstream func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)
 	// endDecision closes the decision critical section a serialize-relevant transport opened
 	// around this enforced request, idempotent. Decide* handlers call it immediately after the
@@ -1192,12 +1174,9 @@ func (fp serverRequestParams) errOutOrStderr() io.Writer {
 }
 
 // answerInitiator sends reply to the blocked upstream initiator through the shared nil-writer
-// disposition, so this leg reports where it used to panic. what names the situation for that report.
-//
-// Every denial arm below answers unconditionally — the caller contract is a REQUEST, so there is no
-// notification arm to skip — and each of those calls sits AFTER its audit record, which is what
-// makes a nil-receiver panic here worse than a lost answer: it leaves a tamper-evident tape
-// recording a denial the process died delivering.
+// disposition. Every denial arm below answers AFTER its audit record, which is what makes a
+// nil-receiver panic here worse than a lost answer: it leaves a tape recording a denial the process
+// died delivering.
 func (fp serverRequestParams) answerInitiator(reply mcp.RPCMsg, what string) {
 	writeToInitiator(fp.writeUpstream, fp.errOut, reply, what)
 }

@@ -293,13 +293,11 @@ type refusalRecorders struct {
 	limiter *categoryRecordLimiter
 }
 
-// forCategory resolves the recorder a refusal in category writes through, applying the disposition
-// that category DECLARES rather than the leg's own default — which is what makes "declared exempt"
-// and "charges no bucket" one fact for a category added later as much as for the two that exist.
+// forCategory applies the disposition the CATEGORY declares rather than the leg's own default,
+// which is what makes "declared exempt" and "charges no bucket" one fact.
 //
-// An UNDECLARED category is metered, not exempt: the zero refusalDeclaration means "nobody has
-// answered this question", and the safe answer to that is the bounded one — the same direction
-// categoryRecordLimiter's `unknown` bucket takes for an unregistered category.
+// An UNDECLARED category is metered, not exempt: the zero refusalDeclaration means nobody has
+// answered the question, and the safe answer to that is the bounded one.
 func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
 	if r.rec == nil || r.limiter == nil || refusalDeclarations[category].metering == meteringExempt {
 		return r.rec

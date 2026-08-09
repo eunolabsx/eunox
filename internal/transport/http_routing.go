@@ -1217,7 +1217,12 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 	// the writer check for the reason unblock's does (an entry nothing can reclaim eventually
 	// displaces a live request), so the debt is paid on the tape instead.
 	if !sess.unblocker().relay(msg) {
-		recordServerRequestDropped(ctx, sess.refusalRecorders().forCategory(catServerRequestFailed), verifiedSession(sess.id), methodLabelServerResponse, dropHTTPReplyUndeliverable)
+		// The session's claims, as failServerRequestDelivery attaches them: the sink reads agent /
+		// task / user identity off the context, and this POST's context never carried them — so
+		// without this the destroyed-reply records drop out of any per-agent grouping their
+		// undelivered siblings appear in.
+		recordServerRequestDropped(sess.withSessionClaims(ctx), sess.refusalRecorders().forCategory(catServerRequestFailed),
+			verifiedSession(sess.id), methodLabelServerResponse, dropHTTPReplyUndeliverable)
 	}
 	return true
 }
@@ -1236,13 +1241,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	if rec == nil {
-		// Nothing to write, so nothing to bound: leave the bucket's tokens for a site
-		// that has a tape.
-		return nil
-	}
-	if p.preSessionDenies == nil {
-		return rec
-	}
-	return admitRefusalRecord(rec, p.preSessionDenies, catRevision)
+	return refusalRecorders{rec: rec, limiter: p.preSessionDenies}.forCategory(catRevision)
 }

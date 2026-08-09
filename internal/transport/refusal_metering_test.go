@@ -229,6 +229,20 @@ func categoryConstant(t *testing.T, e ast.Expr) (refusalCategory, bool) {
 func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 	t.Helper()
 	out := map[string]refusalCategory{}
+	for name, value := range declaredStringConstants(t, "refusalCategory") {
+		out[name] = refusalCategory(value)
+	}
+	require.NotEmpty(t, out, "no refusalCategory constants found; this guard would pass vacuously")
+	return out
+}
+
+// declaredStringConstants reads every `name typeName = "..."` declaration out of the package's
+// non-test sources. ONE scanner for the two guards that each keep a closed vocabulary honest: two
+// copies meant a fix to one — handling a multi-name spec, say, which both currently skip — left the
+// other blind, and the blind one would be whichever guard nobody was editing.
+func declaredStringConstants(t *testing.T, typeName string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
 	for _, src := range packageSources(t) {
 		for _, decl := range src.file.Decls {
 			gen, isGen := decl.(*ast.GenDecl)
@@ -236,16 +250,16 @@ func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 				continue
 			}
 			// A const block declares its type once, on the first spec; later specs inherit it.
-			typeName := ""
+			declared := ""
 			for _, spec := range gen.Specs {
 				vs, isValue := spec.(*ast.ValueSpec)
 				if !isValue {
 					continue
 				}
 				if id, isIdent := vs.Type.(*ast.Ident); isIdent {
-					typeName = id.Name
+					declared = id.Name
 				}
-				if typeName != "refusalCategory" || len(vs.Names) != 1 || len(vs.Values) != 1 {
+				if declared != typeName || len(vs.Names) != 1 || len(vs.Values) != 1 {
 					continue
 				}
 				lit, isLit := vs.Values[0].(*ast.BasicLit)
@@ -254,11 +268,10 @@ func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 				}
 				value, err := strconv.Unquote(lit.Value)
 				require.NoError(t, err)
-				out[vs.Names[0].Name] = refusalCategory(value)
+				out[vs.Names[0].Name] = value
 			}
 		}
 	}
-	require.NotEmpty(t, out, "no refusalCategory constants found; this guard would pass vacuously")
 	return out
 }
 

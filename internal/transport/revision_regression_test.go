@@ -680,9 +680,11 @@ func TestObserveMode_DoesNotDowngradeARoutingRefusal(t *testing.T) {
 // It used to be the arm with its own recorder call — the one where the identifier rule had to be
 // hand-mirrored once already — and is now the same producer reached from the notification side.
 //
-// The gate carries the leg's real audit posture, so this exercises the observe gate rather than
-// skipping past it: with audit hardcoded false the assertion would hold by construction instead of
-// by UNROUTABLE_METHOD's class.
+// The gate carries the leg's real audit posture, so the refusal reaches the observe gate rather
+// than skipping past it — with audit hardcoded false the assertion would hold by construction.
+// What makes it survive the gate is now BOTH the code's fault class and the absence of an upstream
+// to downgrade into; assertRoutingRefusalCode is what holds the class on its own, and
+// TestUpstreamlessLeg_ObserveCannotDowngradeIntoAFabricatedOutage the mode.
 func TestObserveMode_MarksTheNotificationFramedRefusalToo(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}

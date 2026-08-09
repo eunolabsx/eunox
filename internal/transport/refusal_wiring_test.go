@@ -245,34 +245,8 @@ func TestFoldDecisionDetail_HandsOverAMapNoRecorderWillMutate(t *testing.T) {
 func transportLegConstants(t *testing.T) map[string]transportLeg {
 	t.Helper()
 	out := map[string]transportLeg{}
-	for _, src := range packageSources(t) {
-		for _, decl := range src.file.Decls {
-			gen, isGen := decl.(*ast.GenDecl)
-			if !isGen || gen.Tok != token.CONST {
-				continue
-			}
-			// A const block declares its type once, on the first spec; later specs inherit it.
-			typeName := ""
-			for _, spec := range gen.Specs {
-				vs, isValue := spec.(*ast.ValueSpec)
-				if !isValue {
-					continue
-				}
-				if id, isIdent := vs.Type.(*ast.Ident); isIdent {
-					typeName = id.Name
-				}
-				if typeName != "transportLeg" || len(vs.Names) != 1 || len(vs.Values) != 1 {
-					continue
-				}
-				lit, isLit := vs.Values[0].(*ast.BasicLit)
-				if !isLit || lit.Kind != token.STRING {
-					continue
-				}
-				value, err := strconv.Unquote(lit.Value)
-				require.NoError(t, err)
-				out[vs.Names[0].Name] = transportLeg(value)
-			}
-		}
+	for name, value := range declaredStringConstants(t, "transportLeg") {
+		out[name] = transportLeg(value)
 	}
 	require.NotEmpty(t, out, "no transportLeg constants found; this guard would pass vacuously")
 	return out

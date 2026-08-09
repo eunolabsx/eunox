@@ -1259,13 +1259,10 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 
 // unblocker is this proxy's wiring for every site that answers a blocked server-initiated
 // initiator. writeUpstream is nil only before connectUpstream has run, which is the case the
-// seam's nil-writer disposition tests for.
+// seam's nil-writer disposition tests for — resolved through initiatorWriter, since upWriter is an
+// INTERFACE here and a bare `!= nil` on one is the typed-nil trap the seam exists to close.
 func (p *StdioProxy) unblocker() serverRequestUnblocker {
-	var write func(mcp.RPCMsg) error
-	if p.upWriter != nil {
-		write = p.upWriter.Write
-	}
-	return serverRequestUnblocker{reqs: &p.serverReqs, writeUpstream: write, errOut: p.errOut()}
+	return serverRequestUnblocker{reqs: &p.serverReqs, writeUpstream: initiatorWriter(p.upWriter), errOut: p.errOut()}
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would have
@@ -1283,15 +1280,12 @@ func (p *StdioProxy) unblockRefusedServerReply(msg mcp.RPCMsg) {
 // recorder, so the peer is refused either way and only the tape write is bounded.
 //
 // Bounded here at all because this transport has no bucket of its own otherwise; why THIS
-// refusal and not the routing one is argued once, on catRevision. The one fact local to stdio:
-// both the recorder and the limiter are nil in a bare-struct-literal proxy, which records
-// unbounded rather than not at all.
+// refusal and not the routing one is argued once, on catRevision. Through the same resolver every
+// other refusal takes, so a category's declaration is what decides here too — the one fact local to
+// stdio is that both the recorder and the limiter are nil in a bare-struct-literal proxy, which
+// records unbounded rather than not at all.
 func (p *StdioProxy) revisionRefusalRecorder() auditRecorder {
-	rec := p.rec()
-	if rec == nil || p.refusalLimiter == nil {
-		return rec
-	}
-	return admitRefusalRecord(rec, p.refusalLimiter, catRevision)
+	return p.refusalRecorders().forCategory(catRevision)
 }
 
 // hostRevision returns the revision this connection's context resolved, or "" before a message
