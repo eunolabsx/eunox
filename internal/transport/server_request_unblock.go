@@ -447,6 +447,22 @@ func trackServerRequest(ctx context.Context, u serverRequestUnblocker, msg mcp.R
 	u.answerUntracked(ctx, displaced.id, displacedServerRequestError, displaced.method)
 }
 
+// admitAndTrackServerRequest is the prologue BOTH forward paths share: refuse an id no reply could
+// be routed back to, then record the request as outstanding and dispose of whatever that displaced.
+// It reports whether the caller may deliver msg.
+//
+// One function for the reason dispatchServerRequest is one: the pair was hand-mirrored, and the two
+// halves are not independent — the refusal must not degrade into a silent untracked forward, so a
+// caller that ran the second without the first would hand the host a request whose answer both
+// routing arms drop.
+func admitAndTrackServerRequest(ctx context.Context, u serverRequestUnblocker, msg mcp.RPCMsg) bool {
+	if !admitServerRequestID(ctx, u, msg) {
+		return false
+	}
+	trackServerRequest(ctx, u, msg)
+	return true
+}
+
 // admitServerRequestID refuses a server-initiated request whose own JSON-RPC id is larger than the
 // tracker will retain (maxTrackedServerReqIDBytes), reporting whether the request may proceed.
 //

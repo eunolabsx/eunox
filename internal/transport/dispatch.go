@@ -697,7 +697,18 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 // shares one simple gate applied here, so a new locally-answered method inherits revocation by
 // construction rather than needing killDenied re-placed inside its handler. Its position
 // relative to revision negotiation is the package gate order at the top of this file.
-func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) (reply mcp.RPCMsg) {
+	// The same no-reply-channel rule enforcedForwardCore applies at its own boundary, applied at
+	// THIS one too, because the two boundaries cover different exits: the core is also reached from
+	// the notification gate (refuseUnroutable), which never passes through here, while the
+	// locally-answered set below never passes through the core — and `ID` carries `omitempty`, so
+	// an id-less ping or re-initialize returns `{"jsonrpc":"2.0","result":{}}`, a response to a
+	// message JSON-RPC forbids answering. Unreachable while both transports gate on IsRequest.
+	defer func() {
+		if msg.ID == nil {
+			reply = mcp.RPCMsg{}
+		}
+	}()
 	handler, enforced := tablesFromContext(ctx).request(msg.Method)
 	if enforced {
 		return handler(ctx, d, msg)

@@ -85,10 +85,20 @@ var noticeDeclarations = map[string]noticeDeclaration{
 	"serveHost":                 {bound: noticeExempt, why: exemptOncePerConnection},
 }
 
-// noticeWriters are the fmt functions that put a diagnostic line on this package's error writer.
-// noticef is deliberately absent: it IS the bucket, so a call to it is the metered mechanism
-// rather than a site needing one.
-var noticeWriters = map[string]bool{"Fprintf": true, "Fprintln": true, "Fprint": true}
+// noticeWriters maps a package qualifier to the calls through it that put a diagnostic line on this
+// package's error writer. noticef is deliberately absent: it IS the bucket, so a call to it is the
+// metered mechanism rather than a site needing one.
+//
+// RESIDUAL, stated rather than implied: a line written through a shape not listed here — a raw
+// w.Write([]byte(...)), a locally aliased fmt, a helper of one's own — is invisible to this walk,
+// because "is this write a diagnostic" is not answerable from the callee alone. What the walk buys
+// is that the shapes this package actually uses cannot ship undeclared; it does not make the
+// package's diagnostic surface closed.
+var noticeWriters = map[string]map[string]bool{
+	"fmt": {"Fprintf": true, "Fprintln": true, "Fprint": true},
+	"log": {"Printf": true, "Println": true, "Print": true},
+	"io":  {"WriteString": true},
+}
 
 // TestNoticeBounding_EveryDeclarationIsWellFormed is the build-time half: an entry with no
 // disposition, or an exemption with no reason, fails here rather than shipping as a default.
@@ -134,11 +144,11 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 					return true
 				}
 				sel, isSel := call.Fun.(*ast.SelectorExpr)
-				if !isSel || !noticeWriters[sel.Sel.Name] {
+				if !isSel {
 					return true
 				}
 				pkg, isIdent := sel.X.(*ast.Ident)
-				if !isIdent || pkg.Name != "fmt" {
+				if !isIdent || !noticeWriters[pkg.Name][sel.Sel.Name] {
 					return true
 				}
 				checked++
@@ -150,8 +160,8 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 					return true
 				}
 				if declared.bound == noticeMetered {
-					t.Errorf("%s:%d: %s is declared metered but writes its line with a bare fmt.%s, which charges no bucket; go through noticef",
-						src.name, src.fset.Position(call.Pos()).Line, name, sel.Sel.Name)
+					t.Errorf("%s:%d: %s is declared metered but writes its line with a bare %s.%s, which charges no bucket; go through noticef",
+						src.name, src.fset.Position(call.Pos()).Line, name, pkg.Name, sel.Sel.Name)
 				}
 				return true
 			})
@@ -159,6 +169,16 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
 				if !isCallTo(n, "noticef") {
 					return true
+				}
+				// A nil limiter writes every line by design (that is what a bare-struct-literal
+				// proxy in a test gets), so a production site passing the literal is declared
+				// metered and charges nothing — syntactically indistinguishable from the real
+				// thing without this.
+				if args := n.(*ast.CallExpr).Args; len(args) > 1 {
+					if ident, isIdent := args[1].(*ast.Ident); isIdent && ident.Name == "nil" {
+						t.Errorf("%s:%d: %s passes a literal nil limiter to noticef, which writes every line; pass the leg's notice bucket",
+							src.name, src.fset.Position(n.Pos()).Line, name)
+					}
 				}
 				checked++
 				seen[name] = true

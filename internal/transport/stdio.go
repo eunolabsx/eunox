@@ -1359,16 +1359,14 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 // hang — see trackServerRequest. A request whose id the tracker will not retain never reaches here:
 // admitServerRequestID refuses it at this leg's entry.
 func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) {
-	u := p.unblocker()
 	// The tracker refuses an id it will not retain, and that refusal must not degrade into a
 	// SILENT untracked forward: the host would answer, the routing arm would drop the answer as
 	// untracked, and the upstream would block with nothing on the tape. Asked here rather than
 	// inferred from track's return, which cannot distinguish "displaced nothing" from "tracked
 	// nothing". Normally the leg's entry gate has already refused it and this admits for free.
-	if !admitServerRequestID(ctx, u, msg) {
+	if !admitAndTrackServerRequest(ctx, p.unblocker(), msg) {
 		return
 	}
-	trackServerRequest(ctx, u, msg)
 	_ = p.hostWriter.Write(msg)
 }
 

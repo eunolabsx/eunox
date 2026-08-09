@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,6 +288,38 @@ func (mapSink) Write(mcp.RPCMsg) error { return nil }
 type chanSink chan mcp.RPCMsg
 
 func (c chanSink) Write(m mcp.RPCMsg) error { c <- m; return nil }
+
+// TestServerRequestLegs_EachTableNamesItsOwnTransport closes the one hazard a struct of four
+// same-typed fields has: `httpServerRequestLegs{reply: dropHTTPRefusalUndeliverable}` — a
+// copy-paste from the field above it — compiles, passes every other test, and labels every
+// destroyed HOST REPLY on the tape as a refusal drop. That distinction is the whole reason the
+// report is per disposition, and `transport` is the only thing an operator has to tell a wedged
+// upstream from a merely refused one.
+func TestServerRequestLegs_EachTableNamesItsOwnTransport(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		legs   serverRequestLegs
+		prefix string
+	}{
+		{"http", httpServerRequestLegs, "http-"},
+		{"stdio", stdioServerRequestLegs, "stdio-"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			seen := map[transportLeg]bool{}
+			for field, leg := range map[string]transportLeg{
+				"displaced": tc.legs.displaced, "unroutableID": tc.legs.unroutableID,
+				"refusal": tc.legs.refusal, "reply": tc.legs.reply,
+			} {
+				assert.True(t, strings.HasPrefix(string(leg), tc.prefix),
+					"%s.%s is %q, which belongs to the other transport; a SIEM filter on this key would attribute the drop to the wrong leg", tc.name, field, leg)
+				assert.False(t, seen[leg], "%s.%s repeats %q; two dispositions sharing one leg value make them indistinguishable on the tape", tc.name, field, leg)
+				seen[leg] = true
+			}
+		})
+	}
+}
 
 // TestRefusalRecorders_CannotRePointItsOwnTape is the structural half of holding the limits apart
 // from the sink.

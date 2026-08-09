@@ -258,6 +258,11 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		_, reason, rpcCode := upstreamErrInfo(h.errOutOrStderr(), h.notices, err, 0)
 		resp = mcp.ErrorResponse(msg.ID, rpcCode, reason)
 	case resp.JSONRPC == "" && resp.Result == nil && resp.Error == nil:
+		// Deliberately LOOSER than mcp.RPCMsg.IsZero, which also requires id/method/params empty:
+		// a 200 OK body of `{"id":1}` carries nothing to deliver and must be caught here, while
+		// IsZero answers "this message was never built" for a proxy layer deciding whether to send.
+		// Two questions, two predicates.
+		//
 		// An empty/zero RPCMsg here is a 200 OK whose body is {}, null, or any JSON
 		// object lacking jsonrpc/result/error: DoMCPHTTP's plain-JSON path decodes such
 		// a body to a zero-value RPCMsg with a nil error. (A real 202 Accepted to a

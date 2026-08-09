@@ -1445,10 +1445,9 @@ func (s *httpSession) broadcastServerRequest(ctx context.Context, msg mcp.RPCMsg
 	u := s.unblocker()
 	// See forwardServerRequestToHost: an id the tracker will not retain must be REFUSED here, never
 	// delivered untracked to a host whose answer nothing could route back.
-	if !admitServerRequestID(ctx, u, msg) {
+	if !admitAndTrackServerRequest(ctx, u, msg) {
 		return false
 	}
-	trackServerRequest(ctx, u, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}
