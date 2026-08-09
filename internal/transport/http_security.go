@@ -434,12 +434,7 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // one, exactly as in recordRefusal: a "defensive" fallback here would write kill records with no
 // bound at all, which is the fail-open this wiring exists to close.
 func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return refusalRecorders{
-		sink: func() auditRecorder { return asRecorder(route.sink) },
-		meter: func(rec auditRecorder, category refusalCategory) auditRecorder {
-			return admitRefusalRecord(rec, p.preSessionDenies, category)
-		},
-	}
+	return refusalRecorders{rec: asRecorder(route.sink), limiter: p.preSessionDenies}
 }
 
 // routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering
@@ -447,7 +442,7 @@ func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalReco
 // describes an already-admitted caller and is the record an operator most needs during an
 // emergency stop (see catKill) — and the two refusals beside it are declared exempt.
 func routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return unmeteredRecorders(func() auditRecorder { return asRecorder(route.sink) })
+	return unmeteredRecorders(asRecorder(route.sink))
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's

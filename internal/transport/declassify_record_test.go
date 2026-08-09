@@ -1084,7 +1084,7 @@ func TestForwardServerRequest_RefusesADeclassifyingSamplingDecision(t *testing.T
 		rec:           rec,
 		sessionID:     "s",
 		forward:       func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream: func(m mcp.RPCMsg) { toUpstream = append(toUpstream, m) },
+		writeUpstream: func(m mcp.RPCMsg) error { toUpstream = append(toUpstream, m); return nil },
 		pdp:           samplingPDP{dec: dec},
 	}
 
@@ -1112,7 +1112,7 @@ func TestForwardServerRequest_RefusesWhenTheTurnIsUnavailable(t *testing.T) {
 		rec:           rec,
 		sessionID:     "s",
 		forward:       func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream: func(m mcp.RPCMsg) { toUpstream = append(toUpstream, m) },
+		writeUpstream: func(m mcp.RPCMsg) error { toUpstream = append(toUpstream, m); return nil },
 		decideLock:    func() (func(), bool) { return nil, false },
 		pdp:           samplingPDP{dec: capability.EnforceResponse{Decision: capability.DecisionAllow}},
 	}

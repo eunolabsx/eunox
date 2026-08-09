@@ -52,14 +52,17 @@ import (
 // they have rather than one this adds; nil means there is genuinely nothing to answer through.
 type serverRequestUnblocker struct {
 	reqs          *serverReqTracker
-	writeUpstream func(mcp.RPCMsg)
+	writeUpstream func(mcp.RPCMsg) error
 	errOut        io.Writer
 }
 
 // unblock consumes id from the tracker and answers its blocked initiator with eunox's own error
 // carrying reason, so the upstream is not left waiting on a request nothing will ever complete.
-// It reports whether the id was one this proxy still held — which is also the question a caller's
-// own tail turns on, since only a request that was actually consumed here was failed here.
+// It reports whether the id was one this proxy still HELD, not whether the answer landed:
+// failServerRequestDelivery's correction record is exactly-once precisely because only one take
+// succeeds, so consumption is the question its caller turns on. A destroyed answer matters where
+// nothing else records the failure, which is relay's case and not this one — every caller here is
+// already writing, or has already written, a record for the refusal that brought it.
 //
 // The id is consumed even when there is no upstream sink to answer through. That case is
 // unreachable today (see writeToInitiator) and the alternative is worse: leaving the entry means it
@@ -70,7 +73,7 @@ func (u serverRequestUnblocker) unblock(id *json.RawMessage, reason string) bool
 	if id == nil || !u.reqs.take(mcp.MsgKey(id)) {
 		return false
 	}
-	u.write(mcp.ErrorResponse(id, capability.JSONRPCCodeEnforcementError, reason), reason)
+	u.answerUntracked(id, reason)
 	return true
 }
 
@@ -83,6 +86,10 @@ func (u serverRequestUnblocker) unblock(id *json.RawMessage, reason string) bool
 // record (recordServerRequestDropped, tagged dropHTTPReplyUndeliverable / dropStdioReplyUndeliverable).
 // Every sibling disposition here appends one; this was the only one whose entire account was a
 // stderr line, which no SIEM sees.
+//
+// It covers a FAILED write as well as an absent sink, which is what makes the record reachable at
+// all: the absent sink is unreachable today on both transports, while a dead subprocess EPIPE-ing
+// mid-reply is the case that actually happens.
 func (u serverRequestUnblocker) relay(reply mcp.RPCMsg) bool {
 	// The reply WAS routable — the caller's take proved it — so what failed is the sink, not the
 	// routing. Naming remote-upstream mode is the one operational fact that sends an operator to
@@ -99,6 +106,14 @@ func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
 	return writeToInitiator(u.writeUpstream, u.errOut, reply, what)
 }
 
+// answerUntracked sends eunox's own error to an initiator whose request this proxy never tracked,
+// or removed before the reply could be matched. It takes nothing: the id is already gone (a
+// displacement) or was never stored (an id the tracker refuses), so there is nothing to consume and
+// a take-first path would answer nothing at all.
+func (u serverRequestUnblocker) answerUntracked(id *json.RawMessage, reason string) bool {
+	return u.write(mcp.ErrorResponse(id, capability.JSONRPCCodeEnforcementError, reason), reason)
+}
+
 // writeToInitiator is the ONE nil-writer disposition every site that answers a blocked
 // server-initiated initiator shares: send reply through write, or report that there was no upstream
 // sink to send it through. what names the situation for that report; it reports whether the reply
@@ -111,17 +126,26 @@ func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
 // receiver, so those sites PANIC where this reports, and on the denial arms the panic lands AFTER
 // the audit record — leaving a tape recording a denial the process died delivering.
 //
+// It reports a FAILED write as well as an absent sink, because to every caller they are the same
+// event — the initiator is blocked and eunox could not say so — and only the failed write is
+// reachable in a running deployment. A sink that swallowed its own error made the absent-sink branch
+// the only one a caller could ever observe, which is the branch this doc calls unreachable.
+//
 // The writerless case is unreachable today on every caller: remote-upstream mode is the only shape
 // without a sink and those sessions issue no server-initiated requests, so no id could have been
 // tracked, and stdio's writer is nil only before connectUpstream runs. Reported rather than dropped
 // because the alternative is an upstream wedged with nothing on stderr or the tape saying why.
-func writeToInitiator(write func(mcp.RPCMsg), errOut io.Writer, reply mcp.RPCMsg, what string) bool {
+func writeToInitiator(write func(mcp.RPCMsg) error, errOut io.Writer, reply mcp.RPCMsg, what string) bool {
 	if write == nil {
 		_, _ = fmt.Fprintf(resolvedErrOut(errOut),
 			"[eunox] WARNING: a server-initiated request was left blocked: no upstream writer to answer it (%s)\n", what)
 		return false
 	}
-	write(reply)
+	if err := write(reply); err != nil {
+		_, _ = fmt.Fprintf(resolvedErrOut(errOut),
+			"[eunox] WARNING: a server-initiated request was left blocked: answering its initiator failed (%s): %v\n", what, err)
+		return false
+	}
 	return true
 }
 
@@ -161,21 +185,6 @@ const (
 	dropStdioReplyUndeliverable transportLeg = "stdio-server-reply-undeliverable"
 )
 
-// serverRequestDrops is ONE leg's pair of tags for the two ways the tracker refuses to keep a
-// server-initiated request routable: it displaced an entry to make room, or the request's own id is
-// larger than the tracker retains. Both are the same event to the initiator — nothing can route a
-// reply to it — and differ only in which leg and which cause the tape names, so they travel
-// together rather than as two parameters a caller could pair wrongly.
-type serverRequestDrops struct {
-	displaced    transportLeg
-	unroutableID transportLeg
-}
-
-var (
-	httpServerRequestDrops  = serverRequestDrops{displaced: dropHTTPDisplaced, unroutableID: dropHTTPUnroutableID}
-	stdioServerRequestDrops = serverRequestDrops{displaced: dropStdioDisplaced, unroutableID: dropStdioUnroutableID}
-)
-
 // displacedServerRequestError is what eunox answers a displaced request's initiator with. It names
 // the proxy's own bookkeeping rather than anything about the host: a displacement is eunox running
 // out of room (or an upstream reusing an id), which is exactly the case where it owes the upstream
@@ -201,30 +210,31 @@ func recordServerRequestDropped(ctx context.Context, rec auditRecorder, subj kil
 	if rec == nil {
 		return
 	}
-	rec.RecordDeny(ctx, subj.auditSessionID(), method, method, capability.ErrCodeEnforcementError, "",
+	// Through auditIdentity, the rule EVERY refusal with no policy decision behind it shares: the
+	// sink derives target_type/target from the identifier, so naming a target-resolving method here
+	// would stamp a policy target onto the signed tape for a request the PDP never saw — and
+	// sampling/createMessage, the method most likely to be dropped on this leg, resolves one.
+	identifier, name := auditIdentity(mcp.RPCMsg{Method: method})
+	rec.RecordDeny(ctx, subj.auditSessionID(), identifier, name, capability.ErrCodeEnforcementError, "",
 		subj.auditDetails(map[string]interface{}{detailTransport: string(drop)}), false)
 }
 
-// trackServerRequest records msg as an outstanding server-initiated request on this leg, disposes
-// of whatever the tracker DISPLACED to make room for it, and reports whether the request is
-// ROUTABLE — whether a host reply to it could be routed back at all. A false means the caller must
-// not forward it: the initiator has already been answered and the tape already carries the refusal.
+// trackServerRequest records msg as an outstanding server-initiated request on this leg and
+// disposes of whatever the tracker DISPLACED to make room for it.
 //
 // A displacement is neither of the leg's two exceptions: it is not a refusal of the peer and not
 // an emergency stop, but eunox running out of bookkeeping space — the case where it most clearly
 // owes the upstream an answer it can produce on its own. Answering has to happen HERE rather than
 // when a reply eventually arrives, because by then the entry is gone and the reply is dropped as
-// untracked by both transports' routing arms. An id the tracker will not retain
-// (maxTrackedServerReqIDBytes) is the same debt one step earlier, and is refused up front rather
-// than after the host has done the work of answering it.
+// untracked by both transports' routing arms.
 //
-// Recorded as well as answered: a displaced request is a call the proxy actively failed, and
-// nothing on the tape said so — only a one-shot stderr warning that says a displacement happened,
-// not which request it cost. The record is METERED (catDisplaced): once the bounded set is full,
-// every further server-initiated request displaces one, so an upstream that outruns a slow host
-// turns an unbounded audit-write rate loose on the tape — under --require-audit=strict, enough
-// dropped writes latch AuditDegraded and deny every route. The refusal itself is never suppressed;
-// only the tape write is bounded, and a suppressed one folds into the next admitted record.
+// Recorded as well as answered, and recorded FIRST: a displaced request is a call the proxy
+// actively failed, and a crash between the two must lose the answer rather than the tape entry —
+// the rule every denial arm on this leg follows. The record is METERED (catDisplaced): once the
+// bounded set is full, every further server-initiated request displaces one, so an upstream that
+// outruns a slow host turns an unbounded audit-write rate loose on the tape — under
+// --require-audit=strict, enough dropped writes latch AuditDegraded and deny every route. The
+// refusal itself is never suppressed; only the tape write is bounded.
 //
 // The context is the DISPLACING request's, while the record names the DISPLACED request's method.
 // Sound because everything the sink derives from it is per-SESSION rather than per-request — the
@@ -234,35 +244,37 @@ func recordServerRequestDropped(ctx context.Context, rec auditRecorder, subj kil
 // It is the ONLY caller of serverReqTracker.track, which is the invariant that keeps an entry from
 // leaving the tracker with its initiator unanswered — asserted by a source guard, since Go does not
 // require a return value to be consumed.
-func trackServerRequest(ctx context.Context, u serverRequestUnblocker, rec auditRecorder, limiter *categoryRecordLimiter, subj killSubject, drops serverRequestDrops, msg mcp.RPCMsg) bool {
-	if msg.ID == nil {
-		// Unreachable: forwardServerRequest's caller contract is a REQUEST, which by
-		// mcp.RPCMsg.IsRequest carries an id. There is nothing to key and nothing to answer with,
-		// so the caller simply does not forward it.
-		return false
-	}
-	if !trackableServerRequestID(msg.ID) {
-		u.write(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, unroutableIDServerRequestError), unroutableIDServerRequestError)
-		recordServerRequestDropped(ctx, meteredDropRecorder(rec, limiter), subj, msg.Method, drops.unroutableID)
-		return false
-	}
+func trackServerRequest(ctx context.Context, u serverRequestUnblocker, recs refusalRecorders, subj killSubject, drop transportLeg, msg mcp.RPCMsg) {
 	displaced, ok := u.reqs.track(msg, u.errOut)
 	if !ok {
-		return true
+		return
 	}
-	// Written directly rather than through unblock: the displacement has already removed the
-	// entry — that removal IS what leaves the initiator with nothing to answer it — so there is no
-	// id left to take and a take-first path would answer nothing at all.
-	u.write(mcp.ErrorResponse(displaced.id, capability.JSONRPCCodeEnforcementError, displacedServerRequestError), displacedServerRequestError)
-	recordServerRequestDropped(ctx, meteredDropRecorder(rec, limiter), subj, displaced.method, drops.displaced)
-	return true
+	recordServerRequestDropped(ctx, recs.forCategory(catDisplaced), subj, displaced.method, drop)
+	u.answerUntracked(displaced.id, displacedServerRequestError)
 }
 
-// meteredDropRecorder charges catDisplaced for one tracker-refusal record, or returns rec unchanged
-// for a caller that holds no limiter (a proxy assembled by a bare struct literal in a test).
-func meteredDropRecorder(rec auditRecorder, limiter *categoryRecordLimiter) auditRecorder {
-	if limiter == nil {
-		return rec
+// admitServerRequestID refuses a server-initiated request whose own JSON-RPC id is larger than the
+// tracker will retain (maxTrackedServerReqIDBytes), reporting whether the request may proceed.
+//
+// It runs at each transport's ENTRY to this leg — before the pool, before any decision — because
+// everything below it would be work spent on a request whose reply could never be routed back: the
+// host would answer it and both routing arms would drop that answer as untracked, and on the
+// sampling path the decision would have committed a maxCalls slot for a call the host never saw.
+// The bound is enforced by refusing rather than truncating, since a truncated id can neither answer
+// the initiator it was kept for nor index the reply it was kept to match.
+//
+// Record-before-act, and exactly ONE record: the leg below writes its own not-delivered deny for a
+// request it was asked to forward, so refusing here rather than there is also what keeps a single
+// refusal from producing two contradictory entries.
+func admitServerRequestID(ctx context.Context, u serverRequestUnblocker, recs refusalRecorders, subj killSubject, drop transportLeg, msg mcp.RPCMsg) bool {
+	if trackableServerRequestID(msg.ID) {
+		return true
 	}
-	return admitRefusalRecord(rec, limiter, catDisplaced)
+	recordServerRequestDropped(ctx, recs.forCategory(catUnroutableID), subj, msg.Method, drop)
+	// A nil id is not answerable — there is nothing to stamp a response with — but it is still
+	// refused, and mcp.RPCMsg.IsRequest makes it unreachable from either transport's entry.
+	if msg.ID != nil {
+		u.answerUntracked(msg.ID, unroutableIDServerRequestError)
+	}
+	return false
 }

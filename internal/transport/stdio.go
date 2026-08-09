@@ -1099,7 +1099,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 					// failed relay DESTROYS a reply the host actually produced. Recorded rather
 					// than left to a stderr line: every sibling disposition on this leg appends
 					// one, and this is the one an operator is least likely to guess at.
-					recordServerRequestDropped(ctx, p.rec(), verifiedSession(p.sessionID), methodLabelServerResponse, dropStdioReplyUndeliverable)
+					recordServerRequestDropped(ctx, p.refusalRecorders().forCategory(catServerRequestFailed), verifiedSession(p.sessionID), methodLabelServerResponse, dropStdioReplyUndeliverable)
 				}
 			}
 			continue
@@ -1136,7 +1136,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		// This transport meters neither the kill record (an established session's, deliberately
 		// unbounded) nor the two declared-exempt refusals, so every arm resolves the same sink —
 		// stated through the named constructor rather than as a bare literal.
-		recorders:   unmeteredRecorders(p.rec),
+		recorders:   unmeteredRecorders(p.rec()),
 		subject:     verifiedSession(p.sessionID),
 		established: true,
 		audit:       p.audit,
@@ -1261,9 +1261,9 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 // initiator. writeUpstream is nil only before connectUpstream has run, which is the case the
 // seam's nil-writer disposition tests for.
 func (p *StdioProxy) unblocker() serverRequestUnblocker {
-	var write func(mcp.RPCMsg)
+	var write func(mcp.RPCMsg) error
 	if p.upWriter != nil {
-		write = func(m mcp.RPCMsg) { _ = p.upWriter.Write(m) }
+		write = p.upWriter.Write
 	}
 	return serverRequestUnblocker{reqs: &p.serverReqs, writeUpstream: write, errOut: p.errOut()}
 }
@@ -1319,19 +1319,20 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 }
 
 // forwardServerRequestToHost tracks msg's ID and forwards the server-initiated request to the
-// host, reporting whether the host got it. The host's response (same ID) is later routed back to
-// the upstream by serveHost, and a request this one displaces from the bounded tracker is answered
-// and recorded rather than left to hang — see trackServerRequest, which also holds the no-id
-// precondition both legs used to spell for themselves.
-//
-// A request the tracker will not keep routable is NOT forwarded: its initiator has already been
-// answered, so troubling the host with work whose answer this proxy would drop buys nothing.
-func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) bool {
-	if !trackServerRequest(ctx, p.unblocker(), p.rec(), p.refusalLimiter, verifiedSession(p.sessionID), stdioServerRequestDrops, msg) {
-		return false
-	}
+// host. The host's response (same ID) is later routed back to the upstream by serveHost, and a
+// request this one displaces from the bounded tracker is answered and recorded rather than left to
+// hang — see trackServerRequest. A request whose id the tracker will not retain never reaches here:
+// admitServerRequestID refuses it at this leg's entry.
+func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) {
+	trackServerRequest(ctx, p.unblocker(), p.refusalRecorders(), verifiedSession(p.sessionID), dropStdioDisplaced, msg)
 	_ = p.hostWriter.Write(msg)
-	return true
+}
+
+// refusalRecorders is this proxy's wiring for a refusal record's recorder. stdio meters only the
+// categories stdioRefusalCategories declares; forCategory reads each category's own declaration, so
+// the ones this leg does not charge cost nothing to name.
+func (p *StdioProxy) refusalRecorders() refusalRecorders {
+	return refusalRecorders{rec: p.rec(), limiter: p.refusalLimiter}
 }
 
 // dispatchUpstreamRequest hands one server-initiated request to the proxy's serverRequestPool,
@@ -1342,6 +1343,11 @@ func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPC
 // documented concurrency-safe. Host-initiated traffic's ordering guarantees (ticket
 // reservation, fwdHostWrites) are untouched by this path.
 func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
+	// Refused at the ENTRY, above the pool and above any decision: a request whose reply could
+	// never be routed back must not consume a handler slot, a policy quota, or the host's attention.
+	if !admitServerRequestID(ctx, p.unblocker(), p.refusalRecorders(), verifiedSession(p.sessionID), dropStdioUnroutableID, msg) {
+		return
+	}
 	p.serverPool.dispatch(ctx, msg, serverRequestDispatch{
 		rec:       p.rec(),
 		sessionID: p.sessionID,
@@ -1366,12 +1372,10 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
 	// No network client on this transport: no source IP to gate sampling on, no JWT identity.
 	//
-	// forward reports true for anything it actually wrote — an honest inaccuracy, not a guarantee:
-	// host writes are fire-and-forget, so a poisoned stdout discards the request while the audit
-	// record still says delivered=true. The writer's poison hook (armed in Start) bounds the
-	// window: the FIRST desync tears the upstream down, so at most frames already in flight are
-	// misrecorded. The one false it does report is a request the tracker refused to keep routable,
-	// which is never written at all.
+	// forward always reports true — an honest inaccuracy, not a guarantee: host writes are
+	// fire-and-forget, so a poisoned stdout discards the request while the audit record still
+	// says delivered=true. The writer's poison hook (armed in Start) bounds the window: the
+	// FIRST desync tears the upstream down, so at most frames already in flight are misrecorded.
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:       p.rec(),
 		audit:     p.audit,
@@ -1381,7 +1385,7 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		// pinned one (a message the proxy discarded) records the surface it is routed by rather
 		// than claiming nothing was ever negotiated. This supplies the fact; that leg stamps it.
 		revision: p.hostRevision(),
-		forward:  p.forwardServerRequestToHost,
+		forward:  func(ctx context.Context, m mcp.RPCMsg) bool { p.forwardServerRequestToHost(ctx, m); return true },
 		// Through the seam, not a bare closure over the concrete writer: a nil *mcp.MsgWriter locks
 		// its mutex on a nil receiver, so the four denial arms below would panic where the seam
 		// reports — after their audit record. See writeToInitiator.

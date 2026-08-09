@@ -1014,6 +1014,12 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// session id rides the context (the per-session Tier-2 baseline needs it).
 	ctx = pdp.WithSessionID(ctx, d.sessionID)
 
+	if d.callUpstream == nil {
+		// The same mode enforcedForwardCore reads (see forwardParams.callUpstream): a leg with no
+		// upstream cannot enumerate one, and a nil call here would be a crash where the honest
+		// answer is a fail-closed refusal naming the wiring fault.
+		return d.refuseUpstreamless(ctx, msg, msg.Method, msg.Method, msg.Method, capability.EnforceResponse{})
+	}
 	upResp, err := d.callUpstream(ctx, msg)
 	if err != nil {
 		return d.recordUpstreamFailure(ctx, msg, err, msg.Method, msg.Method, nil)

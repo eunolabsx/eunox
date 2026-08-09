@@ -324,9 +324,9 @@ func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() 
 // initiator. writeUpstream is nil in remote-upstream mode, which is what the seam's nil-writer
 // disposition tests for — never a nil *mcp.MsgWriter handed over as a live sink.
 func (s *httpSession) unblocker() serverRequestUnblocker {
-	var write func(mcp.RPCMsg)
+	var write func(mcp.RPCMsg) error
 	if s.upWriter != nil {
-		write = func(m mcp.RPCMsg) { _ = s.upWriter.Write(m) }
+		write = s.upWriter.Write
 	}
 	return serverRequestUnblocker{reqs: &s.serverReqs, writeUpstream: write, errOut: s.errOut()}
 }
@@ -1160,6 +1160,11 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 // session's only response-delivery/SSE-relay goroutine must not stall on it, which matters more
 // under task anchoring, where the turn holder can be a different session sharing the anchor.
 func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
+	// Refused at the ENTRY, above the pool and above any decision — see admitServerRequestID. The
+	// limiter is the proxy's, reached here because this leg has no request in scope to carry one.
+	if !admitServerRequestID(ctx, s.unblocker(), s.refusalRecorders(), verifiedSession(s.id), dropHTTPUnroutableID, msg) {
+		return
+	}
 	s.serverPool.dispatch(ctx, msg, serverRequestDispatch{
 		rec:       asRecorder(s.route.sink),
 		sessionID: s.id,
@@ -1423,12 +1428,7 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // and the proxy that holds the bucket is already in scope at the one site that wires this in.
 func (s *httpSession) broadcastServerRequest(ctx context.Context, limiter *categoryRecordLimiter, msg mcp.RPCMsg) bool {
 	u := s.unblocker()
-	// A request the tracker will not keep routable is answered and recorded there and must not be
-	// delivered: an SSE subscriber would do the work of answering a request whose reply this proxy
-	// would then drop as untracked.
-	if !trackServerRequest(ctx, u, asRecorder(s.route.sink), limiter, verifiedSession(s.id), httpServerRequestDrops, msg) {
-		return false
-	}
+	trackServerRequest(ctx, u, refusalRecorders{rec: asRecorder(s.route.sink), limiter: limiter}, verifiedSession(s.id), dropHTTPDisplaced, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}
@@ -1527,5 +1527,11 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 	if s.claims != nil {
 		ctx = pdp.WithJWTClaims(ctx, s.claims)
 	}
-	recordServerRequestDropped(ctx, asRecorder(s.route.sink), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
+	recordServerRequestDropped(ctx, s.refusalRecorders().forCategory(catServerRequestFailed), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
+}
+
+// refusalRecorders is this session's wiring for a refusal record's recorder: the route's sink and
+// the proxy's admission control, with forCategory applying each category's own declaration.
+func (s *httpSession) refusalRecorders() refusalRecorders {
+	return refusalRecorders{rec: asRecorder(s.route.sink), limiter: s.proxy.refusalRecordLimiter()}
 }

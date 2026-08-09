@@ -163,7 +163,7 @@ func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 		pdp:           pdp.AlwaysAllowPDP{},
 		revision:      capability.Revision20260728,
 		forward:       func(context.Context, mcp.RPCMsg) bool { return true },
-		writeUpstream: func(mcp.RPCMsg) {},
+		writeUpstream: func(mcp.RPCMsg) error { return nil },
 		errOut:        io.Discard,
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"}, fp)
@@ -463,12 +463,10 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 	}
 }
 
-// staticRecorder adapts a test recorder to the gate's per-category recorder wiring. Production
-// resolves lazily and per category (a pre-session kill recorder costs a rate-limit token, and its
-// exempt neighbours must not spend one); a test recorder costs nothing and meters nothing, so it is
-// handed over as the same constant for every category.
+// staticRecorder adapts a test recorder to the gate's per-category recorder wiring: a test recorder
+// meters nothing, so every category resolves to it.
 func staticRecorder(rec auditRecorder) refusalRecorders {
-	return unmeteredRecorders(func() auditRecorder { return rec })
+	return unmeteredRecorders(rec)
 }
 
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and

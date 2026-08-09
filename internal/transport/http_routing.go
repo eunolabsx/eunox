@@ -1217,7 +1217,7 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 	// the writer check for the reason unblock's does (an entry nothing can reclaim eventually
 	// displaces a live request), so the debt is paid on the tape instead.
 	if !sess.unblocker().relay(msg) {
-		recordServerRequestDropped(ctx, asRecorder(route.sink), verifiedSession(sess.id), methodLabelServerResponse, dropHTTPReplyUndeliverable)
+		recordServerRequestDropped(ctx, sess.refusalRecorders().forCategory(catServerRequestFailed), verifiedSession(sess.id), methodLabelServerResponse, dropHTTPReplyUndeliverable)
 	}
 	return true
 }

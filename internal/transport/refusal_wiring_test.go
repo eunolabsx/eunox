@@ -21,10 +21,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -103,7 +105,9 @@ func TestRefusalRecorders_ApplyTheDeclarationNotTheLegsDefault(t *testing.T) {
 			continue
 		}
 		assert.LessOrEqual(t, charged, int(perCategoryDenyBurst)+1,
-			"category %q is declared metered but the pre-session leg charged no bucket for it", cat)
+			"category %q is declared metered but its resolved recorder was never suppressed; the wiring is exempting what the declaration meters", cat)
+		assert.Positive(t, charged,
+			"category %q resolved to nil for EVERY record; a bucket that never admits is not metering, it is silence", cat)
 	}
 }
 
@@ -296,6 +300,7 @@ func TestTransportLeg_IsOneClosedVocabulary(t *testing.T) {
 	}
 
 	for _, src := range packageSources(t) {
+		declPos := detailTransportDeclPos(src)
 		ast.Inspect(src.file, func(n ast.Node) bool {
 			lit, isLit := n.(*ast.BasicLit)
 			if !isLit || lit.Kind != token.STRING {
@@ -305,8 +310,10 @@ func TestTransportLeg_IsOneClosedVocabulary(t *testing.T) {
 			if err != nil || value != detailTransport {
 				return true
 			}
-			// The one legitimate occurrence is the constant's own declaration.
-			if src.name == "forward.go" {
+			// The one legitimate occurrence is the constant's own declaration. Matched by POSITION,
+			// not by filename: forward.go is where every record helper lives, so exempting the file
+			// exempts precisely where a fourth producer would land.
+			if declPos != token.NoPos && lit.Pos() == declPos {
 				return true
 			}
 			t.Errorf("%s:%d writes the %q details key as a literal; use the detailTransport constant so the field and its transportLeg vocabulary stay edited together",
@@ -337,19 +344,18 @@ func TestServerReqTracker_TrackIsOnlyReachedThroughTheDisposingWrapper(t *testin
 			if !isFunc || fnDecl.Body == nil {
 				continue
 			}
+			// Every SELECTOR named track, not only one in call position: `f := reqs.track` followed
+			// by `f(msg, errOut)` is an assignment over a selector and a call over an identifier, so
+			// a call-shaped guard sees neither half and the displaced entry is dropped on the floor.
 			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
-				call, isCall := n.(*ast.CallExpr)
-				if !isCall {
-					return true
-				}
-				sel, isSel := call.Fun.(*ast.SelectorExpr)
+				sel, isSel := n.(*ast.SelectorExpr)
 				if !isSel || sel.Sel.Name != "track" {
 					return true
 				}
 				found++
 				if fnDecl.Name.Name != disposer {
-					t.Errorf("%s:%d: %s calls %s, but only %s disposes of what it returns — a displaced entry dropped here strands its initiator with the upstream blocked on it forever",
-						src.name, src.fset.Position(call.Pos()).Line, fnDecl.Name.Name, exprText(src.fset, call.Fun), disposer)
+					t.Errorf("%s:%d: %s reaches %s, but only %s disposes of what it returns — a displaced entry dropped here strands its initiator with the upstream blocked on it forever",
+						src.name, src.fset.Position(sel.Pos()).Line, fnDecl.Name.Name, exprText(src.fset, sel), disposer)
 				}
 				return true
 			})
@@ -381,13 +387,11 @@ func TestServerRequestLegs_AnswerThroughTheNilWriterSeam(t *testing.T) {
 			if !isFunc || fnDecl.Body == nil {
 				continue
 			}
+			// Struct-literal keys AND assignments: `d.writeUpstream = func(...){...}` reintroduces
+			// the same bare closure without ever appearing as a KeyValueExpr.
 			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
-				kv, isKV := n.(*ast.KeyValueExpr)
-				if !isKV {
-					return true
-				}
-				key, isIdent := kv.Key.(*ast.Ident)
-				if !isIdent || key.Name != "writeUpstream" {
+				pos, value := writeUpstreamWiring(n)
+				if value == nil {
 					return true
 				}
 				if fnDecl.Name.Name == decider {
@@ -397,9 +401,9 @@ func TestServerRequestLegs_AnswerThroughTheNilWriterSeam(t *testing.T) {
 				found++
 				// The one admissible shape elsewhere: <transport>.unblocker().writeUpstream, which
 				// is nil exactly when there is genuinely no upstream sink.
-				if text := exprText(src.fset, kv.Value); !strings.HasSuffix(text, "unblocker().writeUpstream") {
+				if text := exprText(src.fset, value); !strings.HasSuffix(text, "unblocker().writeUpstream") {
 					t.Errorf("%s:%d: %s wires writeUpstream as %s; take it from the unblocker so a missing upstream sink is REPORTED once rather than panicking at each site",
-						src.name, src.fset.Position(kv.Pos()).Line, fnDecl.Name.Name, text)
+						src.name, src.fset.Position(pos).Line, fnDecl.Name.Name, text)
 				}
 				return true
 			})
@@ -504,54 +508,163 @@ func assertDroppedReplyRecord(t *testing.T, rec map[string]interface{}, leg tran
 		"the record must name the drop site, so a destroyed reply is distinguishable from an undelivered broadcast")
 }
 
-// TestServerRequestTracking_RefusesAnIDLargerThanTheTrackerRetains bounds what the tracker HOLDS.
+// TestServerRequestAdmission_RefusesAnIDLargerThanTheTrackerRetains bounds what the tracker HOLDS.
 //
 // Each entry retains the raw id bytes plus the canonical key derived from them, both off the
 // upstream's 4 MiB-per-message reader, and the set holds maxTrackedServerReqs of them until a host
 // reply or teardown. Truncating the id would leave it unable to answer the initiator it was kept
-// for, so an over-cap id makes the request unroutable instead — answered, recorded, and not
-// forwarded, rather than delivered to a host whose reply this proxy would then drop as untracked.
-func TestServerRequestTracking_RefusesAnIDLargerThanTheTrackerRetains(t *testing.T) {
+// for or to index the reply it was kept to match, so an over-cap id makes the request unroutable
+// instead — answered and recorded ONCE, at this leg's entry.
+//
+// At the ENTRY rather than at the tracker, which is what keeps it to one record and one decision:
+// refusing further down let the leg below write its own not-delivered deny for the same request
+// (unmetered, and naming a cause that never happened), and on the sampling path it burned a
+// maxCalls slot on a decision for a call the host never saw.
+func TestServerRequestAdmission_RefusesAnIDLargerThanTheTrackerRetains(t *testing.T) {
 	t.Parallel()
 	var reqs serverReqTracker
 	var written []mcp.RPCMsg
 	u := serverRequestUnblocker{
 		reqs:          &reqs,
-		writeUpstream: func(m mcp.RPCMsg) { written = append(written, m) },
+		writeUpstream: func(m mcp.RPCMsg) error { written = append(written, m); return nil },
 		errOut:        io.Discard,
 	}
 	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
 	rec := &fwdRecorder{}
+	recs := refusalRecorders{rec: rec, limiter: newRefusalRecordLimiter()}
 
-	routable := trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("s"),
-		stdioServerRequestDrops, mcp.RPCMsg{JSONRPC: "2.0", ID: &huge, Method: "roots/list"})
+	admitted := admitServerRequestID(context.Background(), u, recs, verifiedSession("s"), dropStdioUnroutableID,
+		mcp.RPCMsg{JSONRPC: "2.0", ID: &huge, Method: capability.MethodSamplingCreateMessage})
 
-	assert.False(t, routable, "a request whose reply could never be routed must not be forwarded to the host")
+	assert.False(t, admitted, "a request whose reply could never be routed must not reach the pool, the decision, or the host")
 	assert.False(t, reqs.tracked(mcp.MsgKey(&huge)), "the over-cap id must not be retained; retaining it is the whole exposure")
 	require.Len(t, written, 1, "the initiator must be answered rather than left blocked on a request eunox will not track")
 	require.NotNil(t, written[0].Error)
 	assert.Contains(t, written[0].Error.Message, "larger than the proxy's in-flight tracker retains")
-	require.Len(t, rec.records, 1, "the refusal is a call the proxy actively failed, so it reaches the tape")
+	require.Len(t, rec.records, 1, "the refusal is a call the proxy actively failed, so it reaches the tape — exactly once")
 	assert.Equal(t, string(dropStdioUnroutableID), rec.records[0].details[detailTransport])
+	assert.Empty(t, rec.records[0].identifier,
+		"sampling/createMessage resolves a policy target, so naming it here would stamp one onto the signed tape for a request no PDP saw")
 
-	// The control: one byte under the cap is tracked and forwarded as before.
+	// The control: one byte under the cap is admitted and tracked as before.
 	ok := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes-3) + `"`)
-	assert.True(t, trackServerRequest(context.Background(), u, rec, newRefusalRecordLimiter(), verifiedSession("s"),
-		stdioServerRequestDrops, mcp.RPCMsg{JSONRPC: "2.0", ID: &ok, Method: "roots/list"}))
+	okMsg := mcp.RPCMsg{JSONRPC: "2.0", ID: &ok, Method: "roots/list"}
+	assert.True(t, admitServerRequestID(context.Background(), u, recs, verifiedSession("s"), dropStdioUnroutableID, okMsg))
+	trackServerRequest(context.Background(), u, recs, verifiedSession("s"), dropStdioDisplaced, okMsg)
 	assert.True(t, reqs.tracked(mcp.MsgKey(&ok)))
 }
 
 // TestServerReqTracker_BoundsTheRetainedMethod is the other retained field. The method is read by
 // the drop record alone and the sink bounds what it writes, so it is truncated rather than refused —
-// what was missing is a bound on what the TRACKER holds for an entry's whole lifetime.
+// what was missing is a bound on what the TRACKER holds for an entry's whole lifetime, through the
+// same audit.BoundEnvelopeField every other envelope field takes.
 func TestServerReqTracker_BoundsTheRetainedMethod(t *testing.T) {
 	t.Parallel()
 	var reqs serverReqTracker
-	displaced, _ := reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: strings.Repeat("m", maxTrackedServerReqMethodBytes*2)}, io.Discard)
+	huge := strings.Repeat("m", 1<<20)
+	displaced, _ := reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: huge}, io.Discard)
 	assert.Zero(t, displaced.method)
 
 	entry, ok := reqs.ids[mcp.MsgKey(mcp.RawJSON(`1`))]
 	require.True(t, ok)
-	assert.LessOrEqual(t, len(entry.method), maxTrackedServerReqMethodBytes,
+	assert.Less(t, len(entry.method), len(huge),
 		"the tracker must bound the method it retains: %d entries times an unbounded 4 MiB field is the exposure", maxTrackedServerReqs)
+	assert.Equal(t, audit.BoundEnvelopeField(huge), entry.method,
+		"bounded through the audit envelope cap, so the tracker and the record it feeds cannot disagree about the limit")
+}
+
+// detailTransportDeclPos returns the position of the detailTransport constant's own string literal
+// in src, or token.NoPos when this file does not declare it — so the vocabulary guard exempts one
+// DECLARATION rather than a whole file. forward.go is where every record helper lives, so exempting
+// the file exempts precisely where a fourth producer would land.
+func detailTransportDeclPos(src packageSource) token.Pos {
+	pos := token.NoPos
+	ast.Inspect(src.file, func(n ast.Node) bool {
+		vs, isValue := n.(*ast.ValueSpec)
+		if !isValue || len(vs.Names) != 1 || vs.Names[0].Name != "detailTransport" || len(vs.Values) != 1 {
+			return true
+		}
+		if lit, isLit := vs.Values[0].(*ast.BasicLit); isLit {
+			pos = lit.Pos()
+		}
+		return true
+	})
+	return pos
+}
+
+// writeUpstreamWiring reports the value a node binds to a writeUpstream field, in either shape a
+// binding can take: a composite-literal key, or an assignment to the field. An assignment is the
+// shape that reintroduces the bare closure without ever appearing as a composite literal.
+func writeUpstreamWiring(n ast.Node) (token.Pos, ast.Expr) {
+	switch node := n.(type) {
+	case *ast.KeyValueExpr:
+		if key, isIdent := node.Key.(*ast.Ident); isIdent && key.Name == "writeUpstream" {
+			return node.Pos(), node.Value
+		}
+	case *ast.AssignStmt:
+		for i, lhs := range node.Lhs {
+			sel, isSel := lhs.(*ast.SelectorExpr)
+			if isSel && sel.Sel.Name == "writeUpstream" && i < len(node.Rhs) {
+				return node.Pos(), node.Rhs[i]
+			}
+		}
+	}
+	return token.NoPos, nil
+}
+
+// TestAdmitRefusalRecord_NeverWrapsANilRecorder is the regression for a crash, not a record.
+//
+// A proxy with no audit sink (--require-audit=off, or an unopenable path — a shape recordRefusal
+// itself calls reachable in production) still builds its limiter, so a metered site resolved a nil
+// recorder against a live bucket. Past the burst, the next admitted record came back as
+// rolledUpRecorder{nil}: a NON-nil interface, so every `rec != nil` guard downstream passed and the
+// rollup's delegation nil-dereferenced — on a serverRequestPool goroutine, which nothing recovers,
+// so the whole proxy exited.
+func TestAdmitRefusalRecord_NeverWrapsANilRecorder(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	lim := newRefusalRecordLimiter()
+	lim.setNow(func() time.Time { return now })
+	for i := range int(perCategoryDenyBurst) + 5 {
+		require.Nil(t, admitRefusalRecord(nil, lim, catDisplaced),
+			"resolution %d wrapped a nil recorder; the wrapper is a non-nil interface, so every nil guard below it passes and the delegation panics", i)
+		if i == int(perCategoryDenyBurst) {
+			now = now.Add(10 * time.Second) // refill, so the next admit carries suppressed > 0
+		}
+	}
+	// The whole point of the guard: a site with no tape must also spend no tokens.
+	require.NotNil(t, admitRefusalRecord(&fwdRecorder{}, lim, catDisplaced),
+		"a sink-less site drained the bucket it was supposed to leave for a site that has a tape")
+}
+
+// TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota pins WHERE the id refusal runs.
+//
+// Below the decision it produced two contradictory records — its own metered one naming the real
+// cause, and the leg's unmetered not-delivered deny claiming no client accepted a request no client
+// was ever offered — and it ran after the sampling decision had already committed a maxCalls slot
+// for a call the host never saw, so an upstream could exhaust a session's sampling budget with
+// requests it knew would be refused.
+func TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota(t *testing.T) {
+	t.Parallel()
+	var reqs serverReqTracker
+	rec := &fwdRecorder{}
+	decided := 0
+	u := serverRequestUnblocker{reqs: &reqs, writeUpstream: func(mcp.RPCMsg) error { return nil }, errOut: io.Discard}
+	recs := refusalRecorders{rec: rec, limiter: newRefusalRecordLimiter()}
+	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes+1) + `"`)
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: &huge, Method: capability.MethodSamplingCreateMessage}
+
+	if admitServerRequestID(context.Background(), u, recs, verifiedSession("s"), dropStdioUnroutableID, msg) {
+		// Only reached if the gate admits; the decision below is what the gate exists to precede.
+		decided++
+		forwardServerRequest(revisionContext(handshakeRevision), msg, serverRequestParams{
+			rec: rec, sessionID: "s", pdp: pdp.AlwaysAllowPDP{}, errOut: io.Discard,
+			forward:       func(context.Context, mcp.RPCMsg) bool { return false },
+			writeUpstream: func(mcp.RPCMsg) error { return nil },
+		})
+	}
+
+	assert.Zero(t, decided, "the refusal must run above the decision: deciding first commits a quota slot for a call the host never sees")
+	require.Len(t, rec.records, 1, "one refusal, one record — the leg below must not also file a not-delivered deny naming a cause that never happened")
+	assert.Equal(t, string(dropStdioUnroutableID), rec.records[0].details[detailTransport])
 }

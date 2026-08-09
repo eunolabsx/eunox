@@ -84,7 +84,7 @@ type serverRequestDispatch struct {
 	// upstream sink to answer through — a case the shared seam REPORTS (see writeToInitiator);
 	// each transport supplies its unblocker's writer rather than a closure over a concrete one,
 	// which would panic here instead.
-	writeUpstream func(mcp.RPCMsg)
+	writeUpstream func(mcp.RPCMsg) error
 	// errOut is where the seam writes that report; nil means os.Stderr.
 	errOut io.Writer
 	// handle is the server-initiated request's handler, run on its own goroutine.

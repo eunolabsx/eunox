@@ -262,33 +262,17 @@ func declaredCategoryConstants(t *testing.T) map[string]refusalCategory {
 	return out
 }
 
-// parameterNames returns the names bound as parameters anywhere in fn — its own list and any
-// function literal inside it — so the walk can tell a call that THREADS a category through from one
-// that names it.
-//
-// The literals matter: a leg supplies its admission control as a closure taking the category
-// (refusalRecorders.meter), which threads exactly as a named helper does. Reading only fn's own
-// list turned that into a "cannot resolve" complaint about the guard rather than about the code.
+// parameterNames returns the names bound by fn's parameter list, so the walk can tell a call that
+// THREADS a category through from one that names it.
 func parameterNames(fn *ast.FuncDecl) map[string]bool {
 	names := map[string]bool{}
-	collect := func(params *ast.FieldList) {
-		if params == nil {
-			return
-		}
-		for _, field := range params.List {
-			for _, ident := range field.Names {
-				names[ident.Name] = true
-			}
-		}
+	if fn.Type.Params == nil {
+		return names
 	}
-	collect(fn.Type.Params)
-	if fn.Body != nil {
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if lit, isLit := n.(*ast.FuncLit); isLit {
-				collect(lit.Type.Params)
-			}
-			return true
-		})
+	for _, field := range fn.Type.Params.List {
+		for _, ident := range field.Names {
+			names[ident.Name] = true
+		}
 	}
 	return names
 }

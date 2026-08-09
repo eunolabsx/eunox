@@ -10,6 +10,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -31,9 +32,10 @@ const maxTrackedServerReqs = 1024
 // Both are BOUNDED, because both come off the upstream's mcp.MsgReader at up to 4 MiB per message
 // and the set holds maxTrackedServerReqs of them, released only by a host reply or teardown. The
 // two are bounded differently because they are load-bearing differently: the method is read by the
-// drop record alone, so it is truncated; the id is what an answer is stamped with and what the
-// canonical map key is derived from, so a truncated one would be useless for both — an over-cap id
-// makes the request unroutable instead (see trackableServerRequestID).
+// drop record alone, so it is truncated through the same audit.BoundEnvelopeField every other
+// envelope field takes; the id is what an answer is stamped with and what the canonical map key is
+// derived from, so a truncated one would be useless for both — an over-cap id makes the request
+// unroutable instead (see trackableServerRequestID).
 type trackedServerRequest struct {
 	id     *json.RawMessage
 	method string
@@ -48,15 +50,14 @@ type trackedServerRequest struct {
 // 8 KiB is far past any real JSON-RPC id (a number, a uuid) and keeps the whole set's retention in
 // the tens of megabytes rather than the gigabytes an upstream issuing 4 MiB ids could pin.
 //
+// Asked at each transport's ENTRY to this leg (admitServerRequestID) rather than inside track: the
+// answer decides whether the request runs at all, and a refusal discovered after the decision has
+// already committed a quota slot for a call the host never sees.
+//
 // Enforced by REFUSING to track, not by truncating: a truncated id can neither answer the initiator
 // it was kept for nor index the reply it was kept to match, and the key would still hold the full
 // bytes. Matches the audit envelope cap, since the same value is what the drop record names.
 const maxTrackedServerReqIDBytes = 8 << 10
-
-// maxTrackedServerReqMethodBytes bounds the method one entry retains. Truncated rather than refused:
-// the method is read by the drop record alone, and the sink bounds what it writes anyway — this
-// bounds what the tracker HOLDS, which nothing else did.
-const maxTrackedServerReqMethodBytes = 8 << 10
 
 // trackableServerRequestID reports whether id is one the tracker will retain. Asked by
 // trackServerRequest before the entry is made, so a request whose reply could never be routed is
@@ -135,15 +136,18 @@ func (t *serverReqTracker) track(msg mcp.RPCMsg, errOut io.Writer) (trackedServe
 		return trackedServerRequest{}, false
 	}
 	key := mcp.MsgKey(msg.ID)
+	// Bounded on the way IN — what an entry holds for its whole lifetime is the exposure, and the
+	// drop record's own bound would arrive far too late — and ABOVE the lock, like the key: this is
+	// a full UTF-8 scan of an upstream-controlled string, and t.mu is also taken by the take() that
+	// routes every host reply back to a blocked upstream.
+	method := audit.BoundEnvelopeField(msg.Method)
 	t.mu.Lock()
 	var (
 		displaced trackedServerRequest
 		found     bool
 	)
 	t.nextSeq++
-	// The method is bounded on the way IN rather than at the drop record: what an entry holds for
-	// its whole lifetime is the exposure, and the record's own bound would arrive far too late.
-	entry := trackedServerRequest{id: msg.ID, method: capability.BoundString(msg.Method, maxTrackedServerReqMethodBytes), seq: t.nextSeq}
+	entry := trackedServerRequest{id: msg.ID, method: method, seq: t.nextSeq}
 	t.ids, displaced, found = trackServerReqID(t.ids, key, entry)
 	warn := false
 	if found {
