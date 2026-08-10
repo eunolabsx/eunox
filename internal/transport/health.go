@@ -21,20 +21,24 @@ import (
 //
 // It is the RULE, not one subsystem's precedent. Every degradable subsystem answers the verdict
 // through this seam, from the package that owns its state machine, and the transport only folds
-// verdicts and renders whatever DETAIL that subsystem hands over separately (jwksHealth is one).
-// Splitting verdict from detail is what lets one seam serve subsystems whose details have
-// nothing in common: an `error` has no room for a breaker state plus two counters, and the
-// alternative — reaching through concrete types for one subsystem while asserting an interface
-// for the next — is two precedents eight lines apart that a third subsystem would pick between
-// arbitrarily. The degradation PREDICATE never lives here either: a transport encoding "which
-// breaker states are impeded" got the half-open case wrong and could only be fixed and tested by
-// standing up an HTTPProxy.
+// verdicts — it never encodes a degradation predicate of its own, which is how the copy of "which
+// breaker states are impeded" that lived here got the half-open case wrong and could only be fixed
+// and tested by standing up an HTTPProxy.
 //
-// Every killswitch.Manager answers it (in-memory always nil: an in-process kill set is always
-// confirmable), but the proxy holds killActivator — narrow to keep the kill's UNDO path shut —
-// which carries no reader at all, so that one arrives through a type assertion. A value
-// satisfying killActivator without HealthStatus is reported healthy, which is why the one the
-// binary wires is a full Manager.
+// A subsystem with DETAIL to report answers with a SAMPLE that implements this seam
+// (capability.KeyFetchHealth is one), rather than with a live queryable. That is the second half of
+// the rule and it is what stops one /healthz body contradicting itself: the transport renders the
+// sample's fields and folds that same sample's verdict, where re-asking the subsystem takes an
+// independent reading and can report a servable key set beside a verdict saying every token fails
+// closed. Splitting verdict from detail this way is also what lets ONE seam serve subsystems whose
+// details have nothing in common — an `error` has no room for a breaker state plus two counters.
+//
+// What differs per subsystem is only how the proxy REACHES it, which is a property of what it
+// holds rather than a second pattern: every killswitch.Manager answers the seam live (in-memory
+// always nil — an in-process kill set is always confirmable), but the proxy holds killActivator,
+// narrowed to keep the kill's UNDO path shut, which carries no reader at all, so that one arrives
+// through a type assertion. A value satisfying killActivator without HealthStatus is reported
+// healthy, which is why the one the binary wires is a full Manager.
 type healthReporter interface {
 	HealthStatus() error
 }
@@ -79,15 +83,6 @@ type jwksHealth struct {
 	// Healthy: this layer can still validate tokens. False is what flips the summary, and it is
 	// the verdict pkg/capability reached, never one recomputed from the two fields above.
 	Healthy bool `json:"healthy"`
-}
-
-// keyFetchImpeded reports whether key REFRESHES are being refused, which is the alert signal
-// eunox_jwks_fetch_healthy carries — not the readiness verdict, which is Healthy.
-//
-// The predicate is circuitbreaker's own: what its states mean belongs beside the state machine,
-// and a copy here read only StateOpen and so went quiet through most of a sustained outage.
-func (j *jwksHealth) keyFetchImpeded() bool {
-	return j != nil && j.BreakerState.Impeded()
 }
 
 // fold applies one subsystem's verdict to the snapshot: healthy is its own field (a scraper
@@ -152,7 +147,10 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 				KeysServable:   h.KeysServable,
 				Healthy:        true,
 			}
-			snap.fold(p.jwtPDP, &snap.JWKS.Healthy)
+			// The SAMPLE is folded, not the validator: re-asking it would read the breaker and the
+			// cache's freshness a second time, and a TTL lapsing between the two reads is enough to
+			// emit a servable key set beside a verdict saying every token fails closed.
+			snap.fold(h, &snap.JWKS.Healthy)
 		}
 	}
 	// Audit-integrity loss also flips status to "degraded": no sink, dropped records, or
@@ -211,7 +209,7 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// a proxy that fetches no keys is indistinguishable from healthy key fetching, and an
 	// absent series is what a scraper already knows how to read.
 	if snap.JWKS != nil {
-		m.gauge("eunox_jwks_fetch_healthy", "IdP key fetching is unimpeded (1 = breaker closed). 0 means refreshes are refused or the breaker has tripped and not yet proved recovery: key rotation is blocked and a token whose kid the cached key set does not carry fails closed now. Alert on it; it does NOT by itself flip /healthz status, since a warm cache keeps validating -- pair it with eunox_jwks_keys_servable for that.", gaugeBool(!snap.JWKS.keyFetchImpeded()))
+		m.gauge("eunox_jwks_fetch_healthy", "IdP key fetching is unimpeded (1 = breaker closed). 0 means refreshes are refused or the breaker has tripped and not yet proved recovery: key rotation is blocked and a token whose kid the cached key set does not carry fails closed now. Alert on it; it does NOT by itself flip /healthz status, since a warm cache keeps validating -- pair it with eunox_jwks_keys_servable for that.", gaugeBool(!snap.JWKS.BreakerState.Impeded()))
 		// The second half of the readiness question, and the reason the gauge above is an alert
 		// rather than a drain signal: 0 on BOTH is the window in which every token fails closed.
 		m.gauge("eunox_jwks_keys_servable", "A fetched key set is installed and still within its cache TTL (1 = tokens carrying a kid it holds keep validating). 0 alongside eunox_jwks_fetch_healthy 0 is the window in which every token fails closed, and is what flips /healthz status to degraded.", gaugeBool(snap.JWKS.KeysServable))

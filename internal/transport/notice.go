@@ -460,15 +460,19 @@ type noticeReserve struct {
 	bySite  *keyReserve[noticeSite]
 }
 
-// newSessionNoticeReserve builds the floors of a leg that IS a holder among peers: both axes.
-func newSessionNoticeReserve() *noticeReserve {
-	return &noticeReserve{byClass: newKeyReserve(noticeClasses), bySite: newKeyReserve(floorProtectedSites)}
-}
-
-// newSiteNoticeReserve builds the floors of a leg that is not a holder among peers — a whole
-// stdio proxy, which has no sibling to be starved by — so it reserves on the site axis alone.
-func newSiteNoticeReserve() *noticeReserve {
-	return &noticeReserve{bySite: newKeyReserve(floorProtectedSites)}
+// newNoticeReserve builds a leg's floors. classes is what the leg reserves on the HOLDER axis —
+// noticeClasses for a session, nil for a leg that is not a holder among peers (a whole stdio proxy
+// has no sibling to be starved by) — while the site axis is unconditional, being about which line a
+// class-mate's flood must not elide rather than about holders.
+//
+// One constructor taking the axis that varies, rather than a named pair differing by one field: the
+// pair made a reader open both to learn which, and a third leg kind needed a third name.
+func newNoticeReserve(classes []noticeClass) *noticeReserve {
+	r := &noticeReserve{bySite: newKeyReserve(floorProtectedSites)}
+	if len(classes) > 0 {
+		r.byClass = newKeyReserve(classes)
+	}
+	return r
 }
 
 // forSite is the floor a line from site (of class) may fall back on: its own where it has one,
@@ -602,15 +606,21 @@ func noticeTail(v bucketVerdict, class noticeClass) string {
 // walk, a join, or simply the variadic boxing every one of them pays. Measured on the suppressed
 // path of a SESSION channel, floor included, which is the shape that ships
 // (BenchmarkNotice_SuppressedPath): the admission is ~110ns and allocation-free, while building and
-// boxing the arguments for a line then discarded costs ~120ns more and two heap allocations. The
+// boxing the arguments for a line then discarded costs ~110ns more and two heap allocations. The
 // boxing is most of it, which is why this is a CALL-SITE ordering and no lazier signature here would
 // remove it — and why the alternative, a convenience wrapper taking the format eagerly, is gone
 // rather than kept for the sites whose arguments happen to be cheap: judged per site it left eight
 // of fourteen paying for lines they discard, several of them per-frame drivable, and every one of
-// them a fresh judgment for the next reader to re-derive. The declaration lookup is ~13ns of the
-// admission, which is why it stays a map probe rather than an integer site indexing a dense array:
-// it is not the part that dominates, and the constants' readable values are what the call-site walk
-// resolves and what its failures name.
+// them a fresh judgment for the next reader to re-derive.
+//
+// Where that ~110ns goes, since two of the three parts are decisions rather than givens: the
+// declaration lookup is ~11ns, the floor resolution two map probes at ~9ns, and an already-spent
+// slot's claim ~13ns (BenchmarkNoticeReserve_Claim). The lookup stays a map probe rather than an
+// integer site indexing a dense array because it is not the part that dominates, and the constants'
+// readable values are what the call-site walk resolves and what its failures name. None of the
+// three reads a clock: the admission's own sample is handed to the floor, which is what keeps a
+// refused frame — the path this whole budget exists for — off a vDSO call it would otherwise pay
+// per frame per session.
 //
 // It returns a LINE rather than a bool. A bool is a peek the mechanism never hears about again, so
 // a site pre-gating on one would either write its line through a second admission (spending two

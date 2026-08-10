@@ -435,7 +435,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		byUpstreamID:   make(map[string]chan upstreamResult),
 		hostToUp:       make(map[string]*json.RawMessage),
 		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, upstreamRefusalCategories),
-		noticeFloor:    newSessionNoticeReserve(),
+		noticeFloor:    newNoticeReserve(noticeClasses),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,

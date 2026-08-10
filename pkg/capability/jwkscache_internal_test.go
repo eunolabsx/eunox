@@ -1203,7 +1203,7 @@ func TestJWKSCacheKeyFetchHealth(t *testing.T) {
 		require.EqualValues(t, 1, h.Breaker.TotalSuccesses)
 		require.EqualValues(t, 0, h.Breaker.TotalFailures)
 		require.True(t, h.KeysServable, "the fetch just installed a set inside its TTL")
-		require.NoError(t, h.Status())
+		require.NoError(t, h.HealthStatus())
 
 		fail.Store(true)
 		_, _, err = cache.refresh(context.Background(), true)
@@ -1217,7 +1217,7 @@ func TestJWKSCacheKeyFetchHealth(t *testing.T) {
 		// The cached set from the first fetch is still inside its hour-long TTL, so the layer
 		// keeps validating: the trip is an alert, not a readiness regression.
 		require.True(t, h.KeysServable)
-		require.NoError(t, h.Status(),
+		require.NoError(t, h.HealthStatus(),
 			"an impeded breaker over a warm cache must not report unreadiness -- every token still validates")
 
 		// Reading must not advance the breaker. Comparing two reported snapshots cannot show
@@ -1247,8 +1247,8 @@ func TestJWKSCacheKeyFetchHealth(t *testing.T) {
 		h := mustKeyFetchHealth(t, cache)
 		require.True(t, h.FetchImpeded())
 		require.False(t, h.KeysServable, "no fetch ever succeeded, so there is no set to serve")
-		require.ErrorIs(t, h.Status(), ErrKeysUnservable)
-		require.ErrorIs(t, h.Status(), ErrJWKSUnavailable,
+		require.ErrorIs(t, h.HealthStatus(), ErrKeysUnservable)
+		require.ErrorIs(t, h.HealthStatus(), ErrJWKSUnavailable,
 			"the verdict must classify as a key-infrastructure outage, which is what a token arriving now meets")
 	})
 }

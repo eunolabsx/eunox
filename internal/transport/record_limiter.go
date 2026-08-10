@@ -233,8 +233,10 @@ const perBucketFloor = 1
 // Integer division (not float) keeps each share a whole token count and lands the sum at
 // or slightly UNDER the aggregate when it doesn't divide evenly — the safe direction.
 //
-// Shared by both divided tables in this package (refusal categories, notice classes): the
-// derivation is the same one, and a second copy is a second place for the floor to be forgotten.
+// One consumer today, the refusal categories: the notice classes were the second and now multiply a
+// per-key budget UP instead, on measured grounds stated at their sizing constants. Kept as a
+// function rather than inlined because the floor is the part worth not re-deriving — a share that
+// divides to zero never refills and silently stops a key's writes for good.
 func perBucketShare(total, keys int) float64 {
 	share := total / keys
 	if share < perBucketFloor {
@@ -343,7 +345,12 @@ func newUpstreamRefusalLimiter(aggregate *categoryRecordLimiter, cats []refusalC
 		tieredBuckets: newTieredBuckets(
 			perCategoryDenyRate, perCategoryDenyBurst, cats, parent, suppressedScopeSessionCategory,
 			floorParentBucket),
-		floor: newKeyReserve(cats),
+		// Over the whole upstream-driven set rather than over cats, which is what makes the
+		// aggregate's own floorOwnBucket reachable: a category this table holds no bucket for is
+		// DELEGATED wholly upward, and for such a category the session contends with its peers at
+		// that tier — so it needs a slot there or the delegation carries no floor at all, which is
+		// the elision this constructor exists to close, surviving for exactly the narrowed table.
+		floor: newKeyReserve(upstreamRefusalCategories),
 	}
 }
 
@@ -526,53 +533,69 @@ type bucketVerdict struct {
 // whichever refused write of that key comes FIRST, so a long-lived session that hits one transient
 // failure during an unrelated flood has spent the arrival it needs hours later when its own
 // upstream dies — the exact elision the floor exists to close, deferred rather than removed. Any
-// finite interval fixes that, and a longer one is strictly better for the process-wide bound,
-// because the interval does not delay the arrival: it only stops ONE holder claiming repeatedly.
+// finite interval fixes that, and a longer one is strictly better for the bound, because the
+// interval does not delay an arrival: it only stops ONE holder claiming repeatedly.
 //
-// A minute is the trade. It bounds the floored write rate at holders x keys / minute (at the
-// default maxSessions of 512: ~34 records/s and ~25 lines/s worst case, against an audit queue
-// 4096 deep), while still giving a holder several arrivals across an incident an operator is
-// watching in real time.
+// What it costs, stated as the mechanism actually behaves rather than as a rate. Nothing staggers
+// the holders — every slot starts armed — so the leading edge of an incident that trips all of them
+// at once delivers `holders x keys` writes in ONE burst, and the steady state after that is
+// `holders x keys` per interval for as long as the incident lasts. At a minute and the default
+// maxSessions of 512: a burst of 512x4 = 2048 refusal records against an audit queue 4096 deep,
+// then ~34/s sustained; and 512x4 = 2048 stderr lines (3 notice classes plus the site axis), then
+// ~34/s. Both are what a fleet-wide upstream or IdP failure looks like, which is the incident the
+// arrival exists for — but they are NOT bounded by "a session costs an upstream spawn", the bound
+// the lifetime bit had: a session created once keeps claiming, so the ceiling is the number of LIVE
+// holders, and `maxSessions: 0` (a supported unlimited setting) removes it entirely.
 const reserveInterval = time.Minute
 
-// reserveSlot is ONE holder's floor for ONE key: the instant it was last spent. The zero value is
-// an unclaimed reserve, and a nil slot is no reserve at all — what a leg with no holder gets, and
-// what a key nobody reserved for resolves to.
+// reserveSlot is ONE holder's floor for ONE key: the instant it was last spent, or nil when it
+// never has been. A nil SLOT is no reserve at all — what a leg with no holder gets, and what a key
+// nobody reserved for resolves to.
 //
 // Bound to its key by whoever hands it out (see keyReserve), rather than being an interface the
 // table asks about its own key: the two key spaces are not always the same one. The notice half
 // reserves per CLASS for a session and per SITE for the one line a class-mate flood must not
 // elide, while the table underneath both is keyed by class.
 type reserveSlot struct {
-	// last is the unix-nano instant this slot was last claimed, 0 when never. Atomic because a
-	// session writes from its request goroutine and its own upstream reader concurrently.
-	last atomic.Int64
+	// last is when this slot was last claimed. A time.Time behind a pointer rather than a
+	// unix-nano int64 for two reasons that both bite: UnixNano STRIPS the monotonic reading, so an
+	// NTP step or a VM resume would move this interval while every bucket in the same table kept
+	// refilling on the monotonic clock (a backwards step would refuse every floored write for the
+	// length of the step — the exact elision the floor exists to close); and an int64 has no value
+	// outside the clock's range to mean "never claimed", so the epoch read as unclaimed forever.
+	// Atomic because a session writes from its request goroutine and its own upstream reader
+	// concurrently.
+	last atomic.Pointer[time.Time]
 }
 
-// claim takes this reserve if it has re-armed, reporting whether the write may happen. A nil slot
-// answers for itself, which is what makes "this leg has no floor" need no branch at the call site.
+// claim takes this reserve if it has re-armed as of at, reporting whether the write may happen. A
+// nil slot answers for itself, which is what makes "this leg has no floor" need no branch at the
+// call site.
 //
-// now is the clock of the BUCKET that refused, so a test freezing a tier freezes its floor too and
-// the two cannot disagree about whether the interval elapsed. The nil check precedes it: a leg with
-// no floor must not pay a clock read per refused frame on the flood path the bucket exists for.
+// at is the instant the ADMISSION was decided — sampled once, by the bucket the caller admitted
+// through (recordRateLimiter.admit hands it back), and used for every tier that admission touches.
+// One reading rather than one clock: a floor that re-sampled would measure its interval against a
+// different instant than the refill that refused it, and threading each tier's own clock would make
+// the answer depend on which tier a two-tier admission happened to be entered at. The consequence
+// for a test is worth stating: freeze the tier you admit THROUGH and the floor is frozen with it,
+// whatever the tiers above it are running on.
 //
 // A CAS loop rather than a plain store, so two goroutines racing the same re-armed slot yield
 // exactly one write: the loser reloads the instant the winner just stored and finds it unelapsed.
-func (s *reserveSlot) claim(now func() time.Time) bool {
+// The stamp is allocated only past the early return, so a spent slot — the flood path's answer —
+// costs one atomic load and a comparison.
+func (s *reserveSlot) claim(at time.Time) bool {
 	if s == nil {
 		return false
 	}
-	at := now().UnixNano()
 	for {
 		prev := s.last.Load()
-		// prev == 0 means never claimed. A clock reading exactly the Unix epoch therefore re-arms
-		// once; no production clock does, and the alternative is a second word per slot. A
-		// BACKWARDS step yields a negative difference and so refuses until the clock catches up,
-		// which is the safe direction and the one admit() takes for its own refill.
-		if prev != 0 && at-prev < int64(reserveInterval) {
+		// Sub over two time.Time values, so the monotonic readings decide when both carry one.
+		if prev != nil && at.Sub(*prev) < reserveInterval {
 			return false
 		}
-		if s.last.CompareAndSwap(prev, at) {
+		stamp := at
+		if s.last.CompareAndSwap(prev, &stamp) {
 			return true
 		}
 	}
@@ -589,10 +612,15 @@ type keyReserve[K comparable] struct {
 
 // newKeyReserve builds a holder's floors for keys. Slots are allocated up front: the alternative
 // is a lock or a sync.Map on a path whose whole point is being cheap under a flood.
+//
+// One backing array rather than a slot per key, because this runs per SESSION: at the default
+// maxSessions that is one allocation per reserve instead of one per key, held live for the
+// session's whole life.
 func newKeyReserve[K comparable](keys []K) *keyReserve[K] {
 	r := &keyReserve[K]{slots: make(map[K]*reserveSlot, len(keys))}
-	for _, k := range keys {
-		r.slots[k] = &reserveSlot{}
+	backing := make([]reserveSlot, len(keys))
+	for i, k := range keys {
+		r.slots[k] = &backing[i]
 	}
 	return r
 }
@@ -626,12 +654,15 @@ func (t *tieredBuckets[K]) admit(key K) bucketVerdict {
 // other refusal is either the holder's own doing or a ceiling an operator configured, and a
 // guaranteed arrival is the wrong answer to both.
 //
-// A floored write is a bypass of the GATE, not of the ACCOUNTING. The bucket that refused is
-// DEBITED for it (borrow), so the tier's long-run rate is unchanged: a floored arrival displaces
-// the flooder's next line rather than adding to the process-wide total. The debit is clamped at one
-// burst of debt, past which floors are free — the residual, bounded by holders x keys per
-// reserveInterval — because an unbounded debt would let enough holders starve a tier's ordinary
-// writes permanently, which is worse than the excess it prevents.
+// A floored write is a bypass of the GATE, not of the ACCOUNTING. The bucket that REFUSED is
+// debited for it (borrow), so that tier's long-run rate is unchanged: a floored arrival displaces
+// the flooder's next write rather than adding to the tier's total. Only that tier, deliberately —
+// on the floorOwnBucket arm the parent is neither consulted nor debited, because this tier's own
+// budget is what bounds every write that leaves it and the aggregate's ceiling therefore holds
+// transitively; charging both would make the aggregate under-serve by counting one write twice.
+// The debit is clamped at one burst of debt, past which floors are free — the residual, bounded by
+// holders x keys per reserveInterval — because an unbounded debt would let enough holders starve a
+// tier's ordinary writes permanently, which is worse than the excess it prevents.
 //
 // A floored write also takes the accumulated tally WITH it (deliveredAnyway) rather than leaving it
 // for the next admitted write: under a sustained flood the floored line is the next line the reader
@@ -644,9 +675,9 @@ func (t *tieredBuckets[K]) admitWithFloor(key K, floor *reserveSlot) bucketVerdi
 	if !registered {
 		own = t.unknown
 	}
-	ok, suppressed := own.admit()
+	ok, suppressed, at := own.admit()
 	if !ok {
-		if t.floorAt != floorOwnBucket || !floor.claim(own.now) {
+		if t.floorAt != floorOwnBucket || !floor.claim(at) {
 			return bucketVerdict{scope: t.scope}
 		}
 		return bucketVerdict{ok: true, suppressed: own.deliveredAnyway(), scope: t.scope, reserved: true}
@@ -655,7 +686,7 @@ func (t *tieredBuckets[K]) admitWithFloor(key K, floor *reserveSlot) bucketVerdi
 		return bucketVerdict{ok: true, suppressed: suppressed, scope: t.scope}
 	}
 	if parent := t.parent.admitWithFloor(key, nil); !parent.ok {
-		if t.floorAt == floorParentBucket && floor.claim(own.now) {
+		if t.floorAt == floorParentBucket && floor.claim(at) {
 			// This table's own token was already spent on a write that now happens, so its tally
 			// is reported rather than pushed back; the PARENT is the tier that refused, so the
 			// debit and the un-suppression land there. The scope stays this table's: the count
@@ -733,13 +764,13 @@ func admitRefusalRecord(rec auditRecorder, limiter *categoryRecordLimiter, categ
 	switch {
 	case !verdict.ok:
 		return nil
-	case verdict.suppressed == 0:
+	case verdict.suppressed == 0 && !verdict.reserved:
 		return rec
 	default:
 		// scope comes from the verdict rather than from limiter, because the two disagree for
 		// exactly the delegated category: the count is the PARENT's and a table's own label would
 		// stamp a proxy-wide tally as spanning one session.
-		return rolledUpRecorder{auditRecorder: rec, suppressed: verdict.suppressed, scope: verdict.scope}
+		return rolledUpRecorder{auditRecorder: rec, floored: verdict.reserved, suppressed: verdict.suppressed, scope: verdict.scope}
 	}
 }
 
@@ -767,6 +798,11 @@ const (
 	// when it describes one session's upstream — the same misreading the route stamp caused
 	// before the scope was recorded at all, one dimension out.
 	suppressedScopeSessionCategory = "session_category"
+	// detailRefusalFloored marks a record that exists only because its holder's reserve delivered
+	// it. Distinct from the count beside it: the count says how many writes the reader did not
+	// see under this key, while this says the tier had room for none of them and this one is the
+	// holder's guaranteed arrival.
+	detailRefusalFloored = "refusal_record_floored"
 )
 
 // recordRateLimiter is a token bucket over one CLASS of caller-driven audit refusal
@@ -790,9 +826,14 @@ func newRecordRateLimiter(ratePerSec, burst float64) *recordRateLimiter {
 	return &recordRateLimiter{tokens: burst, ratePerSec: ratePerSec, burst: burst, now: time.Now}
 }
 
-// admit reports whether a refusal record may be written now, and if so how many records
-// were suppressed since the last admitted one (0 when none were).
-func (l *recordRateLimiter) admit() (ok bool, suppressed uint64) {
+// admit reports whether a refusal record may be written now, how many records were suppressed
+// since the last admitted one (0 when none were), and the instant it sampled.
+//
+// The instant is returned rather than re-read by a caller that needs one: a holder's floor is
+// consulted on exactly the refusals this decides (see reserveSlot.claim), and re-sampling would
+// both add a clock read per refused frame on the flood path this bucket exists for and let the
+// floor's interval be measured against a different instant than the refill that refused it.
+func (l *recordRateLimiter) admit() (ok bool, suppressed uint64, at time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
@@ -810,11 +851,11 @@ func (l *recordRateLimiter) admit() (ok bool, suppressed uint64) {
 	}
 	if l.tokens < 1 {
 		l.suppressed++
-		return false, 0
+		return false, 0, now
 	}
 	l.tokens--
 	suppressed, l.suppressed = l.suppressed, 0
-	return true, suppressed
+	return true, suppressed, now
 }
 
 // suppress counts a refusal elided by an OUTER gate that never reached admit (spends no
@@ -853,7 +894,10 @@ func (l *recordRateLimiter) borrow() {
 }
 
 func (l *recordRateLimiter) borrowLocked() {
-	if l.tokens > -l.burst {
+	// The POST-decrement balance is what the clamp is about: testing the pre-decrement one admits a
+	// bucket sitting just above the floor and lands it a whole token below, so the tier needs
+	// (burst+1)/rate rather than burst/rate seconds to resume ordinary writes.
+	if l.tokens-1 >= -l.burst {
 		l.tokens--
 	}
 	if l.suppressed > 0 {
@@ -936,7 +980,7 @@ func (g *saturationGate) admit() (ok bool, suppressed uint64) {
 	}
 	// Leading edge of a (possibly new) episode: latch only once the bucket actually
 	// admits a record for it (see point 1 above).
-	ok, suppressed = bucket.admit()
+	ok, suppressed, _ = bucket.admit()
 	if ok {
 		g.recorded = true
 	}

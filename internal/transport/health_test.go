@@ -304,7 +304,7 @@ func TestHealthSnapshot_JWKSBreaker(t *testing.T) {
 		}
 	})
 
-	// The regression #347 fixed, kept pinned: a breaker whose cooldown lapsed reports half-open
+	// The regression this case exists for: a breaker whose cooldown lapsed reports half-open
 	// forever until some fetch drives it, and at HalfOpenMaxProbes=1 a probe in flight refuses
 	// every other fetch. Reading only StateOpen made a sustained outage report "ok" for most of
 	// its duration, so the page the feature exists to enable never fired.
@@ -374,7 +374,9 @@ func TestHealthSnapshot_JWKSBreaker(t *testing.T) {
 // interface and one reaching through concrete types across three packages, with nothing failing
 // when a third subsystem picked between them arbitrarily.
 var (
-	_ healthReporter = (*pdp.JWTPDP)(nil)
+	// The JWT layer answers with a SAMPLE rather than live, which is the half of the rule that
+	// keeps a rendered field and the verdict beside it from being two independent readings.
+	_ healthReporter = capability.KeyFetchHealth{}
 	_ healthReporter = (*killswitch.InMemory)(nil)
 )
 
@@ -455,5 +457,44 @@ func TestHealthSnapshot_JWKSReportsTheCacheEveryRouteFetchesThrough(t *testing.T
 	}
 	if p.snapshot().JWKS == nil {
 		t.Error("a wrapped gateway must report a jwks block: absence is documented to mean no JWT layer")
+	}
+}
+
+// TestHealthSnapshot_JWKSBlockIsOneSample pins the fold's second rule: the fields and the verdict
+// beside them come from the SAME reading.
+//
+// Folding the validator instead of the sample takes an independent one — a fresh breaker projection
+// and a fresh freshAt(now) — and the two are separated by however long the snapshot takes. A cached
+// set crossing its TTL in that gap is enough, with no concurrency at all, to emit
+// {"keysServable":true,"healthy":false} or its inverse, which is precisely the pair the
+// eunox_jwks_keys_servable HELP text tells an operator to alert on.
+func TestHealthSnapshot_JWKSBlockIsOneSample(t *testing.T) {
+	clk := newTestClock()
+	br := newHealthBreaker(clk, time.Hour)
+	// A clock that advances past the TTL on every read, so any two readings of the cache's
+	// freshness inside one snapshot() necessarily disagree.
+	ticking := func() time.Time {
+		clk.advance(2 * time.Minute)
+		return clk.Now()
+	}
+	sink, _ := newTempAuditSink(t)
+	p := newHTTPProxy(httpProxyOptions{
+		Sink:   sink,
+		JWTPDP: newJWKSHealthPDP(t, br, warmCache, time.Minute, ticking),
+	})
+	tripBreaker(t, br)
+
+	snap := p.snapshot()
+	if snap.JWKS == nil {
+		t.Fatal("jwks block must be present")
+	}
+	// Whichever reading won, the block must be self-consistent: healthy is false exactly when the
+	// breaker is impeded and no set is servable.
+	wantHealthy := !snap.JWKS.BreakerState.Impeded() || snap.JWKS.KeysServable
+	if snap.JWKS.Healthy != wantHealthy {
+		t.Errorf("jwks = %+v: healthy contradicts the fields rendered beside it, so the verdict came from a second reading", snap.JWKS)
+	}
+	if degraded := snap.Status == statusDegraded; degraded == snap.JWKS.Healthy {
+		t.Errorf("status = %q with jwks.healthy = %v: the summary must fold the same verdict the block reports", snap.Status, snap.JWKS.Healthy)
 	}
 }

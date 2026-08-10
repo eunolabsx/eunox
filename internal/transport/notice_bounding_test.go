@@ -59,7 +59,10 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 	for site, class := range meteredNotices {
 		assert.Greater(t, class, classUnclassified,
 			"site %q is metered but names no notice class; an unclassified one charges the floor-rate fallback rather than its own share, and registering it as a bucket key would move every genuinely undeclared site off that fallback too", site)
-		assert.Contains(t, []string{"traffic", "failure", "obligation"}, class.label(),
+		// Through label()'s own default arm rather than a list of the class names, which would be
+		// the second hand-typed list this file's header argues against: every out-of-range value
+		// labels itself "unclassified", so one comparison covers both ways a class can be undeclared.
+		assert.NotEqual(t, classUnclassified.label(), class.label(),
 			"site %q names a class outside the declared set, so its lines would roll up under the label an unclassified line carries", site)
 	}
 	for fn, decl := range unmeteredNotices {

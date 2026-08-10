@@ -368,7 +368,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories...),
 		notices:               newNoticeLimiter(1),
-		noticeFloor:           newSiteNoticeReserve(),
+		noticeFloor:           newNoticeReserve(nil),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()

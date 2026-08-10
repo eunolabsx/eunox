@@ -194,15 +194,25 @@ func (h KeyFetchHealth) FetchImpeded() bool { //nolint:gocritic // hugeParam: a 
 	return h.Breaker.State.Impeded()
 }
 
-// Status is the readiness verdict: nil while this layer can still validate tokens, and
-// [ErrKeysUnservable] once it cannot.
+// HealthStatus is the readiness verdict for THIS sample: nil while the layer it describes can
+// still validate tokens, and [ErrKeysUnservable] once it cannot.
 //
 // The verdict is impact rather than impediment. An impeded breaker over a warm cache is
 // worth an ALERT (rotation is blocked, an unknown `kid` fails now) and is reported as
 // FetchImpeded for exactly that, but it is not a readiness regression: draining a replica on
 // it takes the whole fleet out of rotation on a blip the cache absorbs, and every replica
 // shares the IdP, so they all trip inside the same window.
-func (h KeyFetchHealth) Status() error { //nolint:gocritic // hugeParam: see FetchImpeded
+//
+// On the SAMPLE rather than on the cache, and named to satisfy a consumer's readiness seam, so a
+// consumer that also renders this sample's fields folds the verdict OF THE FIELDS IT RENDERED. Re-
+// asking the cache takes a second, independent reading: one /healthz body could then report a
+// servable key set beside a verdict that says every token fails closed, purely because the TTL
+// lapsed between the two reads.
+//
+// The zero value is not a sample and reports an outage — [KeyFetchHealth]'s zero State is unknown,
+// which [circuitbreaker.State.Impeded] answers true for, fail-safe. A caller must honour the ok
+// result of [JWKSCache.KeyFetchHealth] rather than verdict on an unpopulated value.
+func (h KeyFetchHealth) HealthStatus() error { //nolint:gocritic // hugeParam: see FetchImpeded
 	if h.FetchImpeded() && !h.KeysServable {
 		return ErrKeysUnservable
 	}
