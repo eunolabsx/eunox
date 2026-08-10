@@ -772,9 +772,12 @@ func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 		return noticeWriter{}
 	}
 	if route == nil || route.notices == nil {
+		// No episode gates on this arm, deliberately: the faults they collapse are a route's own
+		// (its upstream's receipt pin, its policy engine's flow store), and a leg with no route has
+		// no source to attribute one to. Nothing on this arm writes a collapsed line.
 		return noticeWriter{out: p.errOut(), limits: p.notices}
 	}
-	return noticeWriter{out: p.errOut(), limits: route.notices}
+	return noticeWriter{out: p.errOut(), limits: route.notices, episodes: route.episodes}
 }
 
 // sessionNoticeWriter is routeNoticeWriter for a leg holding the SESSION: the same route table,

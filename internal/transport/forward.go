@@ -614,7 +614,10 @@ func commitDeclassify(ctx context.Context, notices noticeWriter, committer decla
 		// folding this into the fault arm below would tell an operator to reissue an
 		// approval for work that already landed — the unsafe direction for an alert to be
 		// wrong in. Nothing is cleared HERE, so the record carries only the spent grant.
-		if line, ok := notices.admitNotice(siteDeclassifyCommit); ok {
+		// Its OWN site, not the store fault's beside it: that one is collapsed per episode against
+		// the flow store, and a wiring fault folded into a store-fault episode would be reported
+		// nowhere for as long as the store stayed down — two different faults, so two sites.
+		if line, ok := notices.admitNotice(siteDeclassifyDoubleCommit); ok {
 			line.writef(
 				"[eunox] WARN declassify %s %q: the authorized clear was committed twice; the first commit applied it and this one changed nothing (proxy wiring fault, not a flow-store failure — the session is NOT over-tainted)\n",
 				kind, target)
@@ -637,6 +640,10 @@ func commitDeclassify(ctx context.Context, notices noticeWriter, committer decla
 		// gone, which an uncertain set cannot back.
 		return nil, detail
 	}
+	// A commit that landed is the flow store working, which is what ends an episode the fault above
+	// opened. Not on the PendingClear early return: that path attempts no commit, so it is no
+	// evidence either way.
+	notices.endEpisode(siteDeclassifyCommit)
 	return cleared, detail
 }
 

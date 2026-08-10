@@ -186,6 +186,10 @@ type StdioProxy struct {
 	// starved by, so it needs no per-class floor, but the line a class-mate's flood must not elide
 	// is written here exactly as it is on the HTTP transport. nil on a bare-struct-literal proxy.
 	noticeFloor *noticeReserve
+	// noticeEpisodes collapses this proxy's repeating obligation faults to one report per episode
+	// (see episodeCollapsedSites). One per proxy because this transport serves ONE upstream, which
+	// is the scope those faults are per — the same reason the gateway holds them per route.
+	noticeEpisodes *episodeGates
 
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
 	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
@@ -369,6 +373,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories...),
 		notices:               newNoticeLimiter(1),
 		noticeFloor:           newNoticeReserve(nil),
+		noticeEpisodes:        newEpisodeGates(),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -1247,7 +1252,7 @@ func (p *StdioProxy) refusalLimits() refusalLimits {
 // noticeWriter is this transport's diagnostic channel: the configured stderr writer and the class
 // table that bounds it, as one value — so a leg cannot carry the writer without the bound.
 func (p *StdioProxy) noticeWriter() noticeWriter {
-	return noticeWriter{out: p.errOut(), limits: p.notices, reserve: p.noticeFloor}
+	return noticeWriter{out: p.errOut(), limits: p.notices, reserve: p.noticeFloor, episodes: p.noticeEpisodes}
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its

@@ -200,7 +200,7 @@ func TestUpstreamRefusalBuckets_StillChargeTheAggregate(t *testing.T) {
 	for range 50 {
 		lim := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
 		for range 20 {
-			if lim.admit(catDisplaced).ok {
+			if lim.admitWithFloor(catDisplaced, nil).ok {
 				admitted++
 			}
 		}

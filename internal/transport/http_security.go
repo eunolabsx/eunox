@@ -553,7 +553,13 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 	if rec == nil && p.preSessionDenies == nil {
 		return true
 	}
-	verdict := p.preSessionDenies.admit(category)
+	// Through the record half's ONE admission, which resolves whatever floor the table holds,
+	// rather than reaching for the buckets directly: this path serves every pre-session category
+	// — the whole set an unauthenticated caller can drive — and it charged the same table the
+	// per-session tables delegate INTO, so the day that table gains a holder (a per-tenant or
+	// per-source-IP floor is exactly what it would want) these ten would have skipped it in
+	// silence while the four upstream-driven ones did not.
+	verdict := p.preSessionDenies.admitRefusal(category)
 	if !verdict.ok {
 		return false
 	}
@@ -562,9 +568,17 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 		// (and rate-limited) as the refusal's only surviving signal.
 		return true
 	}
-	if verdict.suppressed > 0 {
+	// The same stamping rolledUpRecorder applies to a record written through the other spelling,
+	// applied here inline because this path is already building the details map. A FLOORED record
+	// says so for the reason that wrapper states: without the marker it is byte-identical to one
+	// the tier had room for, and an auditor reading the tape during a flood sees clean records with
+	// no sign that writes are being reserved past a drained bucket.
+	if verdict.suppressed > 0 || verdict.reserved {
 		if extra == nil {
-			extra = make(map[string]interface{}, 2)
+			extra = make(map[string]interface{}, 3)
+		}
+		if verdict.reserved {
+			extra[detailRefusalFloored] = true
 		}
 		extra[detailSuppressedRefusalCount] = verdict.suppressed
 		extra[detailSuppressedRefusalScope] = verdict.scope

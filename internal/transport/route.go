@@ -74,6 +74,14 @@ type UpstreamRoute struct {
 	// on a gateway means one route holding the budget sized for all of them.
 	notices *noticeLimiter
 
+	// episodes collapses this UPSTREAM's repeating obligation faults to one report per episode
+	// (see episodeCollapsedSites). Per route rather than per session or per proxy because that is
+	// what the two faults are per: this route has one receipt verifier and one policy engine behind
+	// it, so "the pin is stale" and "the flow store is down" are facts about it rather than about
+	// whoever happened to call. Unlike notices it needs no re-parenting — an episode has no
+	// aggregate tier, only a source. Read-only after BuildRoutes.
+	episodes *episodeGates
+
 	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route: the
 	// transport needs it to pick which key a request's decision turn is taken on, since
 	// under task anchoring that isn't the session. Read-only after BuildRoutes.
@@ -342,6 +350,10 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			// hands to something other than a proxy is bounded rather than holding a nil table
 			// that falls back to whatever aggregate it is later asked about.
 			notices: newRouteNoticeLimiter(nil),
+			// Built here and never re-parented: the gates are this upstream's own, so a route
+			// this exported constructor hands to something other than a proxy collapses its
+			// faults exactly as one inside a gateway does.
+			episodes: newEpisodeGates(),
 		}
 
 		// The upstream's own receipt-signing key domain, loaded ONCE at startup from a
