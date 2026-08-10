@@ -32,6 +32,7 @@ package transport
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 )
 
@@ -94,10 +95,25 @@ const (
 	classFailure
 )
 
-// noticeClasses is the metered set, in bucket-table order. The divisor for each class's share of
-// the aggregate, so adding a class costs one class's worth of aggregate rather than silently
-// halving every existing class's share — the derivation refusalCategories uses.
-var noticeClasses = []noticeClass{classTraffic, classFailure}
+// noticeClasses is the set the bucket tables are keyed by, DERIVED from the declarations rather
+// than typed out beside them — the shape refusalCategories uses. A hand-typed list is two lists that
+// must agree: one naming a class no declaration reaches builds a bucket nothing spends, and one
+// missing a class a declaration names leaves that class delegated or floored.
+var noticeClasses = meteredNoticeClasses()
+
+func meteredNoticeClasses() []noticeClass {
+	seen := map[noticeClass]bool{}
+	out := make([]noticeClass, 0, 2)
+	for _, decl := range noticeDeclarations {
+		if decl.bound != noticeMetered || seen[decl.class] {
+			continue
+		}
+		seen[decl.class] = true
+		out = append(out, decl.class)
+	}
+	slices.Sort(out)
+	return out
+}
 
 // label names a class in the suppression rollup. A count that spans one class must say which,
 // since the reader cannot infer it from the line the count rides on.
@@ -168,6 +184,12 @@ const (
 	// exemptNotADiagnostic covers a site that writes a RESPONSE BODY with the same fmt call the
 	// walk looks for. Bounding it would corrupt what it serves.
 	exemptNotADiagnostic = "not a diagnostic: it writes a response body, which bounding would truncate"
+	// exemptOncePerDegradation covers a line written on a health TRANSITION: the audit trail
+	// degrades once and stays degraded, so a peer's send rate cannot drive it however hard it
+	// tries. Not a latch — requests in flight at the transition instant may each observe it, so
+	// the count is bounded by concurrency rather than by one — which is why it cannot be declared
+	// one-shot and have that declaration be true.
+	exemptOncePerDegradation = "written on the audit trail's healthy-to-degraded transition, which happens once, so a peer's send rate cannot drive it"
 )
 
 // noticeDeclarations answers, for every diagnostic line in this package, how it is bounded — and
@@ -212,10 +234,13 @@ var noticeDeclarations = map[noticeSite]noticeDeclaration{
 	"*HTTPProxy.requireJSONContentType": {bound: noticeRecordGated},
 
 	// (4) One-shot latches: at most one line however hard the source is driven.
-	"warnStrictAuditOnce":           {bound: noticeOnce},
-	"warnIfStrictAuditJustDegraded": {bound: noticeOnce},
-	"*serverReqTracker.track":       {bound: noticeOnce},
-	"*httpSession.broadcast":        {bound: noticeOnce},
+	"warnStrictAuditOnce":     {bound: noticeOnce},
+	"*serverReqTracker.track": {bound: noticeOnce},
+	"*httpSession.broadcast":  {bound: noticeOnce},
+
+	// Bounded by a state TRANSITION rather than a latch, which is why it is not one-shot: it
+	// compares the trail's health across one record and writes only when that record degraded it.
+	"warnIfStrictAuditJustDegraded": {bound: noticeExempt, why: exemptOncePerDegradation},
 
 	// (5) Deliberately unbounded, each carrying the reason it cannot be driven per frame.
 	"*HTTPProxy.handleMetrics":           {bound: noticeExempt, why: exemptNotADiagnostic},
@@ -246,25 +271,38 @@ var noticeDeclarations = map[noticeSite]noticeDeclaration{
 
 // The stderr NOTICE budget, on its own rather than a share of the record aggregate: a notice is not
 // a record, so it neither spends that budget nor may it divide it. Sized for an operator watching a
-// terminal — a couple of lines a second per class names the drift or the flood, and every line
-// elided is counted into the next one of its class rather than lost, so the notice never
+// terminal — a couple of lines a second per class per tenant names the drift or the flood, and every
+// line elided is counted into the next one of its class rather than lost, so the notice never
 // under-states what is happening.
 //
-// Stated PER CLASS and multiplied up, so adding a class costs one class's worth of aggregate rather
-// than halving every existing class's share (20/10 = 2/s, 20/11 = 1/s is what plain division does
-// at the integer boundary). The aggregate is still what bounds the reachable syscall rate; it just
-// grows with the set it divides.
+// Stated PER CLASS PER TENANT, with the aggregate DERIVED by multiplying up, which is the treatment
+// the refusal categories already had: adding a key costs one key's worth of aggregate rather than
+// eroding every existing key's share (20/10 = 2/s, 20/11 = 1/s is what plain division does at the
+// integer boundary).
+//
+// Dividing a FIXED aggregate by the route count was the other candidate and is rejected on measured
+// grounds: integer division floors a route's share to 1/s and its burst to 1 from three routes up,
+// so on a ten-route gateway a lone failing upstream — no flood anywhere — yields one line and then
+// 1/s where the unsplit bucket delivered ten immediately. That is worse than not splitting at all
+// for exactly the incident this budget's class split exists to keep legible, and past two routes the
+// shares sum beyond the aggregate anyway, which restores the first-come starvation the split was for.
+//
+// What multiplying up costs is that the process-wide diagnostic syscall rate grows with the route
+// count. That is a bound an OPERATOR sets in configuration, not one a peer can drive: a peer on one
+// route still drives at most this per-class rate, and "one tenant must not silence another"
+// necessarily means the tenants' budgets add. Ten routes is 40 stderr lines a second at worst.
 const (
 	perClassNoticeRatePerSec = 2
 	perClassNoticeBurst      = 10
 )
 
-var (
-	noticeRatePerSec = perClassNoticeRatePerSec * len(noticeClasses)
-	noticeBurst      = perClassNoticeBurst * len(noticeClasses)
-
-	perClassNoticeRate      = perBucketShare(noticeRatePerSec, len(noticeClasses))
-	perClassNoticeBurstSize = perBucketShare(noticeBurst, len(noticeClasses))
+// The rollup scopes: what a suppression count on a given tier SPANS. Named for the reason the
+// record half names its own — a count whose scope a reader has to infer from the line it rides on
+// is a count that gets misread, and after the route split the same sentence would otherwise mean
+// one tenant on a gateway and the whole process on stdio.
+const (
+	noticeScopeRoute = "route"
+	noticeScopeProxy = "proxy"
 )
 
 // noticeLimiter is one leg's stderr-diagnostic admission control: a bucket per notice CLASS, and
@@ -274,15 +312,20 @@ type noticeLimiter struct {
 	tieredBuckets[noticeClass]
 }
 
-// newNoticeLimiter builds a proxy's AGGREGATE notice table: one bucket per class, no parent.
-// Every route's table charges this one, so it is what holds the whole process's diagnostic syscall
-// rate where it was before the split.
-func newNoticeLimiter() *noticeLimiter {
-	return &noticeLimiter{tieredBuckets: newTieredBuckets(perClassNoticeRate, perClassNoticeBurstSize, noticeClasses)}
+// newNoticeLimiter builds a proxy's AGGREGATE notice table: one bucket per class, no parent, sized
+// for tenants tenants (routes on a gateway; 1 for stdio, which has no route tier at all).
+//
+// This is what holds the whole process's diagnostic syscall rate, and it is what every route table
+// below it charges — so it must have room for each tenant's own share, or the parent becomes the
+// binding constraint and the split under it stops meaning anything.
+func newNoticeLimiter(tenants int) *noticeLimiter {
+	tenants = max(tenants, 1)
+	return &noticeLimiter{tieredBuckets: newTieredBuckets(
+		float64(perClassNoticeRatePerSec*tenants), float64(perClassNoticeBurst*tenants),
+		noticeClasses, nil, noticeScopeProxy)}
 }
 
-// newRouteNoticeLimiter builds ONE of routes gateway routes' notice tables, charging aggregate as
-// its parent.
+// newRouteNoticeLimiter builds ONE gateway route's notice table, charging aggregate as its parent.
 //
 // Per route for the reason saturationGate states for its own records and newUpstreamRefusalLimiter
 // for a session's: one tenant's flood must not elide another's. A peer looping an unmapped method
@@ -293,29 +336,20 @@ func newNoticeLimiter() *noticeLimiter {
 // Per route rather than per SESSION because a route is an operator-configured tenant boundary with a
 // small, known count, while sessions are unbounded by anything but maxSessions — a per-session split
 // would put thousands of buckets under one aggregate for a channel whose whole budget is a few lines
-// a second.
+// a second. The residual is stated rather than hidden: within one route, one session's dead upstream
+// can still elide a sibling session's failure line.
 //
-// Each route gets a SHARE of the aggregate rather than a full budget, which is what makes the split
-// mean anything: a parent alone bounds the total but is drained first-come, so a child holding the
-// parent's whole rate can still empty it and starve its siblings — the bug this exists to fix,
-// reintroduced one tier down. A single-route gateway (and stdio, which has no route tier at all)
-// therefore sees exactly the pre-split numbers. The floor keeps a many-route gateway's per-route
-// bucket alive at the cost of the shares summing past the aggregate, which the parent then throttles
-// first-come — the residual, and the same one perBucketFloor carries on the record side.
-//
-// aggregate may be nil (a bare-struct-literal proxy in a test), which bounds the route alone.
-func newRouteNoticeLimiter(aggregate *noticeLimiter, routes int) *noticeLimiter {
-	if routes < 1 {
-		routes = 1
-	}
-	l := &noticeLimiter{tieredBuckets: newTieredBuckets(
-		perBucketShare(perClassNoticeRatePerSec, routes),
-		perBucketShare(perClassNoticeBurst, routes),
-		noticeClasses)}
+// A route takes the FULL per-class budget and the aggregate is sized to cover every route's, rather
+// than each route taking a share of a fixed one — see the sizing constants for why the division was
+// measured and rejected. aggregate may be nil (a route built by BuildRoutes for a proxy that never
+// stood), which bounds the route alone at the same rate.
+func newRouteNoticeLimiter(aggregate *noticeLimiter) *noticeLimiter {
+	var parent *tieredBuckets[noticeClass]
 	if aggregate != nil {
-		l.parent = &aggregate.tieredBuckets
+		parent = &aggregate.tieredBuckets
 	}
-	return l
+	return &noticeLimiter{tieredBuckets: newTieredBuckets(
+		perClassNoticeRatePerSec, perClassNoticeBurst, noticeClasses, parent, noticeScopeRoute)}
 }
 
 // noticeWriter is a leg's diagnostic CHANNEL: where a line goes AND what bounds it, as one value.
@@ -354,27 +388,27 @@ func noticesTo(w io.Writer) noticeWriter { return noticeWriter{out: w} }
 //
 // The rollup is applied HERE rather than returned for a caller to append, for the reason
 // admitRefusalRecord hides its own: a site that spends a token and forgets the count silently
-// under-states a flood, and nothing fails. Its text names the CLASS the count spans, since one
-// bucket now serves several sites and the reader cannot infer the scope from the line it rides on.
+// under-states a flood, and nothing fails. Its text names BOTH what the count spans — the class,
+// since one bucket serves several sites, and the tier, since after the route split the same
+// sentence would otherwise mean one tenant on a gateway and the whole process on stdio. That is
+// the record half's suppressed_refusal_scope, said in a line rather than a field.
+//
+// The nil guard is here rather than on a second admit method, because nil is the state a zero
+// noticeWriter carries and this is the one place that can produce one: an admit-with-a-guard beside
+// the table's own promoted admit is two entry points with opposite nil semantics, and the promoted
+// one is the spelling a later site reaches for.
 func noticef(n noticeWriter, site noticeSite, format string, args ...interface{}) {
+	admitted, suppressed, scope := true, uint64(0), ""
 	class := noticeDeclarations[site].class
-	admitted, suppressed := n.limits.admitNotice(class)
+	if n.limits != nil {
+		admitted, suppressed, scope = n.limits.admit(class)
+	}
 	if !admitted {
 		return
 	}
 	if suppressed > 0 {
-		format = strings.TrimSuffix(format, "\n") + " (%d further " + class.label() + " diagnostics suppressed)\n"
+		format = strings.TrimSuffix(format, "\n") + " (%d further " + class.label() + " diagnostics suppressed, " + scope + "-wide)\n"
 		args = append(args, suppressed)
 	}
 	_, _ = fmt.Fprintf(n.errOut(), format, args...)
-}
-
-// admitNotice reports whether a diagnostic of this class may be written now, and how many of that
-// class were elided since the last admitted one. A nil limiter admits everything — the unbounded
-// disposition a zero noticeWriter carries.
-func (l *noticeLimiter) admitNotice(class noticeClass) (ok bool, suppressed uint64) {
-	if l == nil {
-		return true, 0
-	}
-	return l.admit(class)
 }

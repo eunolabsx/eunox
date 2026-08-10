@@ -98,11 +98,13 @@ type httpUpstream struct {
 // response-header wait (0 = disabled). The bridge POSTs under a context derived
 // from parent that close() cancels.
 //
-// errOut is an optional trailing arg (at most one is read) carrying the caller's
-// configured diagnostic writer, e.g. StdioProxy.errOut(); omitting it falls back to
-// os.Stderr. Variadic rather than a plain parameter so the ~15 existing test call
-// sites don't need updating for a field only production wiring sets.
-func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkipVerify bool, upstreamTimeoutMs int, errOut ...io.Writer) *httpUpstream {
+// The bridge's diagnostic CHANNEL is NOT a parameter: it is set by the caller as one whole
+// noticeWriter afterwards (see StdioProxy.connectUpstream). A writer parameter here built half of
+// one — destination set, bucket nil, i.e. unbounded — which production only survived because the
+// single call site overwrote the whole field on the next line. Half a channel is exactly what
+// noticeWriter exists to make unrepresentable; leaving the zero value writes to os.Stderr
+// unbounded, which is the disposition every test call site already had.
+func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkipVerify bool, upstreamTimeoutMs int) *httpUpstream {
 	ctx, cancel := context.WithCancel(parent)
 	h := &httpUpstream{
 		endpoint:   UpstreamMCPEndpoint(baseURL),
@@ -114,17 +116,7 @@ func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkip
 		sem:        make(chan struct{}, maxInflightPosts),
 		done:       make(chan struct{}),
 	}
-	if len(errOut) > 0 {
-		h.notices.out = errOut[0]
-	}
 	return h
-}
-
-// errOutOrStderr returns h.errOut when set, else os.Stderr — mirrors
-// forwardParams.errOutOrStderr so this bridge's diagnostic lines resolve through the
-// same configured-writer-with-fallback rule as the rest of the transport layer.
-func (h *httpUpstream) errOutOrStderr() io.Writer {
-	return h.notices.errOut()
 }
 
 // notifyPostTimeout bounds a fire-and-forget POST (the Write path) so a stalling
@@ -343,7 +335,7 @@ func (h *httpUpstream) close() {
 		h.mu.Lock()
 		sid, rev := h.sessID, h.rev
 		h.mu.Unlock()
-		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader, rev, h.errOutOrStderr())
+		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader, rev, h.notices.errOut())
 		close(h.done)
 		h.cancel()
 	})

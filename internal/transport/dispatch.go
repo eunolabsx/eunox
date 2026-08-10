@@ -41,7 +41,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"slices"
 	"sort"
 	"strings"
@@ -595,7 +594,6 @@ type hostNotificationGate struct {
 	// and a zero value here would give the notification framing a different audit posture from the
 	// identical bytes in request framing.
 	strictAudit strictAuditState
-	errOut      io.Writer
 	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
 	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
 	// notification is dropped before revocation is even a question.

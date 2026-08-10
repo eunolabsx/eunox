@@ -197,11 +197,11 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		// byUpstreamID and hostToUp are left nil: they never apply on the remote-HTTP
 		// path, which is plain request/response through doRemoteHTTP.
 		//
-		// upstreamDenies is NOT: a remote upstream issues no server-initiated requests, but its
-		// session still reaches the leg's refusal arms through a host reply it cannot relay (there
-		// is no upstream writer at all here), which is the one drop this mode actually produces —
-		// and the one category this table therefore holds. See remoteUpstreamRefusalCategories.
-		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, remoteUpstreamRefusalCategories...),
+		// upstreamDenies is NOT, but it is narrowed: a remote upstream issues no server-initiated
+		// requests through this proxy, so the three categories a server-initiated request drives
+		// are unreachable here and their buckets would bound nothing. See
+		// remoteUpstreamRefusalCategories for what is kept and on what grounds.
+		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, remoteUpstreamRefusalCategories),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,

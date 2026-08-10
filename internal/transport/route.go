@@ -65,8 +65,13 @@ type UpstreamRoute struct {
 	// notices is this route's stderr-diagnostic table: one bucket per notice CLASS, charging the
 	// proxy's aggregate as its parent. Per route so one tenant's flood of the cheapest peer-driven
 	// line cannot suppress another tenant's — the rule saturationGate states for its own records,
-	// one axis out. Attached by NewHTTPProxyGateway (the aggregate is the proxy's, and BuildRoutes
-	// runs before there is one); nil until then, which falls back to the aggregate directly.
+	// one axis out.
+	//
+	// BuildRoutes builds it PARENTLESS and NewHTTPProxyGateway re-parents it, because the aggregate
+	// belongs to a proxy that does not exist yet at build time. Built at both points rather than
+	// only the second, so a route from this exported constructor that never reaches a proxy is
+	// bounded on its own rather than nil — a nil table falls back to the aggregate DIRECTLY, which
+	// on a gateway means one route holding the budget sized for all of them.
 	notices *noticeLimiter
 
 	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route: the
@@ -332,6 +337,11 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			// package's no-policy-default posture; an AlwaysAllowPDP placeholder would
 			// silently allow everything if a future change left it unreplaced.
 			pdp: pdp.DenyAllPDP{},
+			// Parentless here and re-parented by NewHTTPProxyGateway, which is where the
+			// aggregate exists. Built HERE all the same, so a route this exported constructor
+			// hands to something other than a proxy is bounded rather than holding a nil table
+			// that falls back to whatever aggregate it is later asked about.
+			notices: newRouteNoticeLimiter(nil),
 		}
 
 		// The upstream's own receipt-signing key domain, loaded ONCE at startup from a

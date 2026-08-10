@@ -325,7 +325,6 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				subject:     claimedSession(r),
 				audit:       route.audit,
 				strictAudit: p.strictAudit(),
-				errOut:      p.errOut(),
 				checkKill:   func() *capability.EnforceResponse { return route.pdp.CheckKill(ctx, "") },
 				leg:         legHTTPNotification,
 			}
@@ -465,7 +464,6 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			established: true,
 			audit:       route.audit,
 			strictAudit: p.strictAudit(),
-			errOut:      p.errOut(),
 			checkKill:   kill,
 			leg:         legHTTPNotification,
 		}
@@ -1260,5 +1258,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	return p.refusalLimits().recorders(rec).forCategory(catRevision)
+	return p.routeRefusalLimits(route).recorders(rec).forCategory(catRevision)
 }

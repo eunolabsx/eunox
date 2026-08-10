@@ -364,7 +364,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostReader:            mcp.NewMsgReader(os.Stdin),
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories...),
-		notices:               newNoticeLimiter(),
+		notices:               newNoticeLimiter(1),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -565,9 +565,11 @@ func awaitDrained(counter *atomic.Int64, timeout time.Duration) {
 // a remote HTTP bridge when upstreamURL is set, otherwise a local subprocess.
 func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 	if p.upstreamURL != "" {
-		up := newHTTPUpstream(ctx, p.upstreamURL, p.upstreamAuthHeader, p.upstreamTLSSkipVerify, p.upstreamTimeMs, p.errOut())
-		// The bridge's notification-POST failure line is per frame and driven by the host's send
-		// rate against an unreachable upstream, so it shares this proxy's notice bucket.
+		up := newHTTPUpstream(ctx, p.upstreamURL, p.upstreamAuthHeader, p.upstreamTLSSkipVerify, p.upstreamTimeMs)
+		// The bridge's diagnostic channel — writer AND bucket — in ONE assignment: its
+		// notification-POST failure line is per frame, driven by the host's send rate against an
+		// unreachable upstream, so a channel wired half at construction and half here is one
+		// reorder away from unbounded.
 		up.notices = p.noticeWriter()
 		// A transport-level POST failure is reported back through upErr so the waiting
 		// caller records a deny/UPSTREAM_ERROR (matching the gateway) rather than an allow.
@@ -1296,12 +1298,14 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 // close. Building the unblocker itself allocates nothing, which is what makes it free for the
 // holders that only ever want the tracker.
 func (p *StdioProxy) unblocker() serverRequestUnblocker {
+	// See httpSession.unblocker: one resolution feeds both fields.
+	recs := p.refusalRecorders()
 	return serverRequestUnblocker{
 		reqs:    &p.serverReqs,
 		sink:    p.upWriter,
-		notices: p.noticeWriter(),
+		notices: recs.notices(),
 		report: dropReport{
-			recs: p.refusalRecorders(),
+			recs: recs,
 			subj: verifiedSession(p.sessionID),
 			legs: stdioServerRequestLegs,
 		},

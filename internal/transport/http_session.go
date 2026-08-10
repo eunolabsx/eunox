@@ -333,12 +333,16 @@ func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() 
 // disposition resolves at ANSWER time, so the tracker-only holders (every forwarded request) pay
 // nothing for a writer they never call.
 func (s *httpSession) unblocker() serverRequestUnblocker {
+	// One resolution feeding both fields, rather than two: they must name the same channel, and
+	// asking twice both costs a second resolution on a per-request leg and makes disagreement
+	// representable.
+	recs := s.refusalRecorders()
 	return serverRequestUnblocker{
 		reqs:    &s.serverReqs,
 		sink:    s.upWriter,
-		notices: s.noticeWriter(),
+		notices: recs.notices(),
 		report: dropReport{
-			recs: s.refusalRecorders(),
+			recs: recs,
 			subj: verifiedSession(s.id),
 			legs: httpServerRequestLegs,
 		},
@@ -421,7 +425,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		route:          route,
 		byUpstreamID:   make(map[string]chan upstreamResult),
 		hostToUp:       make(map[string]*json.RawMessage),
-		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, upstreamRefusalCategories...),
+		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, upstreamRefusalCategories),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,
@@ -1563,7 +1567,7 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 // session's record that a live in-flight request was lost. See newUpstreamRefusalLimiter.
 func (s *httpSession) refusalRecorders() refusalRecorders {
 	// Nil-route tolerant like every other accessor a bare-struct-literal session reaches
-	// (refusalNoticeLimiter, upstreamDenies): every unblocker() now resolves this, including the
+	// (noticeWriter, upstreamDenies): every unblocker() now resolves this, including the
 	// tracker-only holders, so a routeless test session must degrade to recording nothing rather
 	// than crash a leg that used to touch no route at all.
 	var rec auditRecorder

@@ -39,7 +39,6 @@ func preSessionGateFor(p *HTTPProxy, route *UpstreamRoute) hostNotificationGate 
 	return hostNotificationGate{
 		recorders: p.preSessionRefusalRecorders(route),
 		subject:   verifiedSession(""),
-
 		checkKill: noKill,
 		leg:       legHTTPNotification,
 	}
@@ -221,7 +220,7 @@ func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
 	const frames = 200
 
 	now := time.Now()
-	notices := newNoticeLimiter()
+	notices := newNoticeLimiter(1)
 	notices.setNow(func() time.Time { return now })
 
 	var errOut strings.Builder
@@ -673,7 +672,7 @@ func TestServerRequestAnswer_DiagnosticIsBoundedAtTheSeam(t *testing.T) {
 	broken := func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") }
 	u := serverRequestUnblocker{
 		reqs: &serverReqTracker{}, sink: sinkFunc(broken),
-		notices: noticeWriter{out: &errOut, limits: newNoticeLimiter()},
+		notices: noticeWriter{out: &errOut, limits: newNoticeLimiter(1)},
 		report:  dropReport{recs: refusalLimits{}.recorders(nil)},
 	}
 	for range 200 {

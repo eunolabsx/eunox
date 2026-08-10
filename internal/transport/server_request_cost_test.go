@@ -90,7 +90,7 @@ func findMethod(t *testing.T, recv, name string) *ast.FuncDecl {
 func TestRemoteSession_RefusalTableHoldsOnlyWhatItCanReach(t *testing.T) {
 	t.Parallel()
 	aggregate := newRefusalRecordLimiter()
-	remote := newUpstreamRefusalLimiter(aggregate, remoteUpstreamRefusalCategories...)
+	remote := newUpstreamRefusalLimiter(aggregate, remoteUpstreamRefusalCategories)
 
 	assert.Len(t, remote.buckets, 1, "a remote session must not retain buckets for categories its mode cannot reach")
 	_, held := remote.buckets[catServerRequestFailed]
@@ -100,10 +100,10 @@ func TestRemoteSession_RefusalTableHoldsOnlyWhatItCanReach(t *testing.T) {
 	// bound those records had before the per-session split existed — never the floor-rate `unknown`
 	// bucket, which would silently make an unlisted category the most suppressed one on the proxy.
 	for range int(perCategoryDenyBurst) {
-		ok, _ := remote.admit(catDisplaced)
+		ok, _, _ := remote.admit(catDisplaced)
 		require.True(t, ok)
 	}
-	ok, _ := remote.admit(catDisplaced)
+	ok, _, _ := remote.admit(catDisplaced)
 	assert.False(t, ok, "an unlisted category charges the aggregate's bucket for that category, so it is bounded at the pre-split rate")
 	assert.Greater(t, aggregate.bucket(catDisplaced).burst, float64(perBucketFloor),
 		"and the bucket it charged is the aggregate's real one, not the floor-rate fallback")
@@ -113,7 +113,7 @@ func TestRemoteSession_RefusalTableHoldsOnlyWhatItCanReach(t *testing.T) {
 // set must not narrow the subprocess one, whose upstream genuinely drives all four.
 func TestUpstreamRefusalCategories_LocalSessionKeepsTheWholeSet(t *testing.T) {
 	t.Parallel()
-	local := newUpstreamRefusalLimiter(newRefusalRecordLimiter(), upstreamRefusalCategories...)
+	local := newUpstreamRefusalLimiter(newRefusalRecordLimiter(), upstreamRefusalCategories)
 	assert.Len(t, local.buckets, len(upstreamRefusalCategories))
 	for _, cat := range upstreamRefusalCategories {
 		_, held := local.buckets[cat]

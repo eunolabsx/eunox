@@ -541,7 +541,7 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 	if rec == nil && p.preSessionDenies == nil {
 		return true
 	}
-	ok, suppressed := p.preSessionDenies.admit(category)
+	ok, suppressed, scope := p.preSessionDenies.admit(category)
 	if !ok {
 		return false
 	}
@@ -555,7 +555,7 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 			extra = make(map[string]interface{}, 2)
 		}
 		extra[detailSuppressedRefusalCount] = suppressed
-		extra[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
+		extra[detailSuppressedRefusalScope] = scope
 	}
 	rec.RecordDeny(ctx, "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
 	return true

@@ -18,8 +18,7 @@ package transport
 
 import (
 	"go/ast"
-	"go/token"
-	"strconv"
+	"go/types"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -76,7 +75,7 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 	t.Parallel()
 	sources := packageSources(t)
-	consts := noticeSiteConstants(t, sources)
+	consts := noticeSiteConstants(t)
 	seen, checked := map[noticeSite]bool{}, 0
 	for _, src := range sources {
 		for _, decl := range src.file.Decls {
@@ -177,33 +176,16 @@ func TestNoticeBounding_UnboundedChannelIsTestOnly(t *testing.T) {
 // noticeSiteConstants collects notice.go's `noticeSite` constants as name -> value, so the walk can
 // resolve the identifier a call passes to the key the declaration table is read by. Without it the
 // walk sees an identifier and the table sees a string, and nothing checks that they meet.
-func noticeSiteConstants(t *testing.T, sources []packageSource) map[string]noticeSite {
+//
+// Through the shared const walk rather than a second copy of it: a copy re-derived the "a const
+// block declares its type once and later specs inherit it" rule and got it wrong, so a site
+// constant continuing an existing block would drop out of this map and the walk would then reject a
+// perfectly valid constant as undeclared.
+func noticeSiteConstants(t *testing.T) map[string]noticeSite {
 	t.Helper()
 	out := map[string]noticeSite{}
-	for _, src := range sources {
-		for _, decl := range src.file.Decls {
-			gen, isGen := decl.(*ast.GenDecl)
-			if !isGen || gen.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range gen.Specs {
-				vs, isValue := spec.(*ast.ValueSpec)
-				if !isValue || len(vs.Names) != len(vs.Values) {
-					continue
-				}
-				ident, isIdent := vs.Type.(*ast.Ident)
-				if !isIdent || ident.Name != "noticeSite" {
-					continue
-				}
-				for i, nameIdent := range vs.Names {
-					lit, isLit := vs.Values[i].(*ast.BasicLit)
-					require.True(t, isLit, "noticeSite constant %s is not a string literal", nameIdent.Name)
-					value, err := strconv.Unquote(lit.Value)
-					require.NoError(t, err)
-					out[nameIdent.Name] = noticeSite(value)
-				}
-			}
-		}
+	for name, value := range declaredStringConstants(t, "noticeSite") {
+		out[name] = noticeSite(value)
 	}
 	require.NotEmpty(t, out, "no noticeSite constants found; the site half of this guard would pass vacuously")
 	return out
@@ -223,16 +205,13 @@ func qualifiedFuncName(fn *ast.FuncDecl) noticeSite {
 	return noticeSite(fn.Name.Name)
 }
 
-// exprString renders a receiver type as `*T` or `T`.
-func exprString(e ast.Expr) string {
-	if star, isStar := e.(*ast.StarExpr); isStar {
-		return "*" + exprString(star.X)
-	}
-	if ident, isIdent := e.(*ast.Ident); isIdent {
-		return ident.Name
-	}
-	return "?"
-}
+// exprString renders a receiver type as Go source: `*T`, `T`, or `*T[K]` for a generic one.
+//
+// go/types rather than a hand-rolled switch: the hand-rolled one answered "?" for anything that was
+// not an Ident or a StarExpr, so every method on a GENERIC receiver — this package now has
+// tieredBuckets[K] — keyed as `*?.name` and collided with every other generic type's same-named
+// method. That is the silent inheritance the qualified key exists to make unrepresentable.
+func exprString(e ast.Expr) string { return types.ExprString(e) }
 
 func noticeBoundName(b noticeBound) string {
 	switch b {

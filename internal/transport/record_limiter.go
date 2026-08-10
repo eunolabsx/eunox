@@ -244,7 +244,7 @@ func perBucketShare(total, keys int) float64 {
 
 // perCategoryDenyRate and perCategoryDenyBurst are each registered category's even share
 // of the aggregate budget. The unreachable-in-production "unknown" fallback bucket is
-// deliberately NOT sized from these — it gets perCategoryFloor instead, so it doesn't
+// deliberately NOT sized from these — it gets perBucketFloor instead, so it doesn't
 // dilute every real category's share for a bucket no call site actually uses.
 var (
 	perCategoryDenyRate  = perBucketShare(preSessionDenyRatePerSec, len(refusalCategories))
@@ -269,10 +269,8 @@ func newRefusalRecordLimiter() *categoryRecordLimiter {
 // unbounded — the safe direction — and each transport's charged set is held to what it declares,
 // so the fallback stays unreachable.
 func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter {
-	return &categoryRecordLimiter{
-		tieredBuckets: newTieredBuckets(perCategoryDenyRate, perCategoryDenyBurst, cats),
-		scope:         suppressedScopeProxyCategory,
-	}
+	return &categoryRecordLimiter{tieredBuckets: newTieredBuckets(
+		perCategoryDenyRate, perCategoryDenyBurst, cats, nil, suppressedScopeProxyCategory)}
 }
 
 // stdioRefusalCategories is the set the stdio transport charges. Declared rather than left implicit
@@ -290,15 +288,24 @@ var upstreamRefusalCategories = []refusalCategory{
 	catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
 }
 
-// remoteUpstreamRefusalCategories is the subset a REMOTE-upstream session can actually reach.
-// Three of the four are driven by a server-initiated request, and a remote upstream issues none
-// through this proxy — there is no upstream reader to receive one and no sink to answer one
-// through — so a table holding their buckets is four rate limiters and four map entries per
-// session for records nothing can write. What remains is the host reply this mode cannot relay.
+// remoteUpstreamRefusalCategories is the subset a REMOTE-upstream session holds buckets for.
 //
-// Safe to narrow rather than merely wasteful to keep: a category this table has no bucket for is
-// delegated WHOLLY to the aggregate parent (see categoryRecordLimiter.admit), which is the
-// proxy-wide bound those records had before the per-session split existed.
+// Three of the four are driven by a server-initiated request the proxy TRACKED, and this mode
+// tracks none: there is no upstream reader to receive one, so nothing ever enters the in-flight
+// tracker and no displacement, over-cap id, or undeliverable refusal can arise. Their buckets
+// would bound nothing.
+//
+// catServerRequestFailed is kept as the one whose writers are gated on a tracker entry this mode
+// merely cannot produce TODAY, rather than on machinery it does not have: a remote leg that ever
+// gains an inbound channel reaches it first. Keeping one bucket that a live mode may need beats
+// re-deriving this list from a comment when it does — and the cost of being wrong in this
+// direction is one idle rate limiter, against a category delegated to the shared aggregate in the
+// other.
+//
+// Narrowing is safe rather than merely cheap because a category this table has no bucket for is
+// delegated WHOLLY to the aggregate parent (see tieredBuckets.admit) — the proxy-wide bound those
+// records had before the per-session split existed, and now labelled with the aggregate's own
+// scope rather than this table's.
 var remoteUpstreamRefusalCategories = []refusalCategory{catServerRequestFailed}
 
 // newUpstreamRefusalLimiter builds ONE HTTP session's buckets for the upstream-driven categories.
@@ -319,14 +326,17 @@ var remoteUpstreamRefusalCategories = []refusalCategory{catServerRequestFailed}
 // which bounds the session alone. See docs/threat-model-mcp.md §3.7.
 //
 // cats is the session's own reachable set rather than a constant, since a remote-upstream session
-// reaches one of the four — see remoteUpstreamRefusalCategories.
-func newUpstreamRefusalLimiter(aggregate *categoryRecordLimiter, cats ...refusalCategory) *categoryRecordLimiter {
-	c := newRefusalRecordLimiterFor(cats...)
+// reaches at most one of the four — see remoteUpstreamRefusalCategories. A SLICE rather than a
+// variadic tail: the variadic form let `newUpstreamRefusalLimiter(aggregate)` compile into a table
+// with no buckets at all, which delegates every upstream-driven category to the parent and silently
+// undoes the per-session split this constructor exists for.
+func newUpstreamRefusalLimiter(aggregate *categoryRecordLimiter, cats []refusalCategory) *categoryRecordLimiter {
+	var parent *tieredBuckets[refusalCategory]
 	if aggregate != nil {
-		c.parent = &aggregate.tieredBuckets
+		parent = &aggregate.tieredBuckets
 	}
-	c.scope = suppressedScopeSessionCategory
-	return c
+	return &categoryRecordLimiter{tieredBuckets: newTieredBuckets(
+		perCategoryDenyRate, perCategoryDenyBurst, cats, parent, suppressedScopeSessionCategory)}
 }
 
 // refusalLimits is a transport leg's admission control over the writes a REFUSAL makes: the
@@ -417,9 +427,10 @@ func (r refusalRecorders) notices() noticeWriter { return r.limits.notices }
 // cheap under attack.
 type tieredBuckets[K comparable] struct {
 	buckets map[K]*recordRateLimiter
-	// unknown serves an unregistered key on a table with no parent. Unreachable from call
-	// sites that pass constants, but keeps a future typo (or a site with no declaration behind
-	// it) bounded rather than unbounded.
+	// unknown serves an unregistered key, and exists ONLY on a table with no parent: a table that
+	// has one delegates such a key wholly upward, so a fallback bucket beside it would be an
+	// allocation admit can never reach — and worse, one bucket() would hand out for a key admit
+	// charges elsewhere.
 	unknown *recordRateLimiter
 	// parent is the proxy-wide AGGREGATE this table's writes also charge, or nil when this
 	// table IS that aggregate. A per-session (or per-route) table has one: its own buckets stop
@@ -427,14 +438,27 @@ type tieredBuckets[K comparable] struct {
 	// sustained rate by N. Without it a split trades the elision bug for an availability one —
 	// see newUpstreamRefusalLimiter.
 	parent *tieredBuckets[K]
+	// scope names what a rollup from THIS tier spans. Held here rather than on the embedder
+	// because admit is what decides which tier answered, and a scope resolved by the caller from
+	// the table it happens to hold is wrong for exactly the delegated key: the count comes from
+	// the parent and the label from the child, which stamps a proxy-wide tally as session-scoped.
+	scope string
 }
 
-// newTieredBuckets builds one bucket per key at the given share of the aggregate, plus the
-// floor-rate fallback for a key the table does not hold.
-func newTieredBuckets[K comparable](ratePerSec, burst float64, keys []K) tieredBuckets[K] {
+// newTieredBuckets builds one bucket per key at the given rate/burst, under parent (nil for an
+// aggregate), labelling its own rollups with scope.
+//
+// parent is a constructor parameter rather than a field a caller sets afterwards, because whether
+// this table needs the floor-rate fallback is decided by it: a parented table delegates an
+// unregistered key upward and can never reach one.
+func newTieredBuckets[K comparable](ratePerSec, burst float64, keys []K, parent *tieredBuckets[K], scope string) tieredBuckets[K] {
 	t := tieredBuckets[K]{
 		buckets: make(map[K]*recordRateLimiter, len(keys)),
-		unknown: newRecordRateLimiter(perBucketFloor, perBucketFloor),
+		parent:  parent,
+		scope:   scope,
+	}
+	if parent == nil {
+		t.unknown = newRecordRateLimiter(perBucketFloor, perBucketFloor)
 	}
 	for _, k := range keys {
 		t.buckets[k] = newRecordRateLimiter(ratePerSec, burst)
@@ -442,19 +466,19 @@ func newTieredBuckets[K comparable](ratePerSec, burst float64, keys []K) tieredB
 	return t
 }
 
-// admit reports whether a write under key may happen now, and how many writes UNDER THAT KEY
-// were suppressed since the last admitted one.
+// admit reports whether a write under key may happen now, how many writes UNDER THAT KEY were
+// suppressed since the last admitted one, and which tier's scope that count spans.
 //
 // A table with a PARENT charges both tiers, own bucket first: this table bounds one tenant's
 // share, the parent bounds the aggregate. A write the parent refuses is pushed BACK onto this
 // table's own count rather than lost, so the rollup stays complete whichever tier elided it.
 //
 // A key this table holds no bucket for is delegated WHOLLY to the parent — it is simply not
-// scoped to this tier, so it charges the aggregate as it did before the split. That is what
-// keeps a subset table from silently routing an unlisted key to the floor-rate `unknown`
-// bucket, which no test could have caught (the metering walk cannot answer "which categories does
-// this leg charge" from source).
-func (t *tieredBuckets[K]) admit(key K) (ok bool, suppressed uint64) {
+// scoped to this tier, so it charges the aggregate as it did before the split, AND is labelled
+// with the aggregate's scope. That is what keeps a subset table from silently routing an
+// unlisted key to a floor-rate fallback, which no test could have caught (the metering walk
+// cannot answer "which categories does this leg charge" from source).
+func (t *tieredBuckets[K]) admit(key K) (ok bool, suppressed uint64, scope string) {
 	own, registered := t.buckets[key]
 	if t.parent != nil && !registered {
 		return t.parent.admit(key)
@@ -464,45 +488,48 @@ func (t *tieredBuckets[K]) admit(key K) (ok bool, suppressed uint64) {
 	}
 	ok, suppressed = own.admit()
 	if !ok || t.parent == nil {
-		return ok, suppressed
+		return ok, suppressed, t.scope
 	}
-	if parentOK, _ := t.parent.admit(key); !parentOK {
+	if parentOK, _, _ := t.parent.admit(key); !parentOK {
 		// The aggregate refused, so this write does not happen; give this table back the token's
 		// worth of tally (this one plus everything it had accumulated) so the next admitted
 		// one still states the true count. The parent's own tally is deliberately discarded: the
 		// same writes are already counted here, and counting them twice would over-state a flood.
 		own.suppressN(suppressed + 1)
-		return false, 0
+		return false, 0, t.scope
 	}
-	return true, suppressed
+	return true, suppressed, t.scope
 }
 
-// bucket returns key's token bucket. No lock: the table is immutable after
-// construction.
+// bucket returns the token bucket key actually charges — this table's own, or the parent's for a
+// key delegated wholly upward. No lock: the table is immutable after construction.
 func (t *tieredBuckets[K]) bucket(key K) *recordRateLimiter {
 	if b, exists := t.buckets[key]; exists {
 		return b
+	}
+	if t.parent != nil {
+		return t.parent.bucket(key)
 	}
 	return t.unknown
 }
 
 // setNow points every bucket at an injectable clock (test-only). A method rather than a
-// field because an assignment to a parent field would miss the per-bucket clocks.
+// field because an assignment to a parent field would miss the per-bucket clocks. It does NOT
+// descend to the parent: a test freezing both tiers says so explicitly, which is what keeps a
+// two-tier assertion from passing on one tier's clock.
 func (t *tieredBuckets[K]) setNow(now func() time.Time) {
 	for _, b := range t.buckets {
 		b.now = now
 	}
-	t.unknown.now = now
+	if t.unknown != nil {
+		t.unknown.now = now
+	}
 }
 
 // categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
 // cheap refusals in one category cannot suppress another's records.
 type categoryRecordLimiter struct {
 	tieredBuckets[refusalCategory]
-	// scope names what a rollup from this table SPANS, stamped into the record beside the count.
-	// Held here rather than passed per call because it is a property of the table, and a count
-	// whose scope a reader has to infer from the stamp beside it is a count that gets misread.
-	scope string
 }
 
 // admitRefusalRecord applies limiter's verdict for category to rec: nil when this record is
@@ -524,14 +551,17 @@ func admitRefusalRecord(rec auditRecorder, limiter *categoryRecordLimiter, categ
 		// delegation would nil-deref on a goroutine nothing recovers.
 		return nil
 	}
-	admitted, suppressed := limiter.admit(category)
+	admitted, suppressed, scope := limiter.admit(category)
 	switch {
 	case !admitted:
 		return nil
 	case suppressed == 0:
 		return rec
 	default:
-		return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed, scope: limiter.scope}
+		// scope comes from admit rather than from limiter, because the two disagree for exactly
+		// the delegated category: the count is the PARENT's and a table's own label would stamp a
+		// proxy-wide tally as spanning one session.
+		return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed, scope: scope}
 	}
 }
 

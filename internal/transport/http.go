@@ -432,7 +432,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		afterListen:        opts.AfterListen,
 		authTimingKey:      newAuthTimingKey(),
 		preSessionDenies:   newRefusalRecordLimiter(),
-		notices:            newNoticeLimiter(),
+		notices:            newNoticeLimiter(len(opts.Routes)),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
 		trustedProxyHops:   opts.TrustedProxyHops,
@@ -447,13 +447,12 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		sessions:           make(map[string]*httpSession),
 		revoked:            make(chan struct{}, 1),
 	}
-	// Each route gets its own diagnostic table under this proxy's aggregate, so a peer looping an
-	// unmapped method against one route cannot silence another's lines. Attached HERE rather than
-	// in BuildRoutes because the aggregate a route charges is the PROXY's, and BuildRoutes runs
-	// before there is one — a route built for a proxy that never stood would otherwise hold a
-	// parentless table and spend the whole budget alone.
+	// Each route's diagnostic table is RE-PARENTED onto this proxy's aggregate, so a peer looping
+	// an unmapped method against one route cannot silence another's lines. BuildRoutes already
+	// built each one (parentless, so a route that never reaches a proxy is still bounded); what it
+	// could not do is name the aggregate, which belongs to a proxy that did not exist yet.
 	for _, route := range p.routes {
-		route.notices = newRouteNoticeLimiter(p.notices, len(p.routes))
+		route.notices = newRouteNoticeLimiter(p.notices)
 	}
 	// Registered at construction (not Serve) so a kill delivered during startup is not lost —
 	// the buffered slot coalesces it, served by the worker's first tick. Unregister is kept
@@ -758,29 +757,24 @@ func (p *HTTPProxy) serveCtx() context.Context {
 	return context.Background()
 }
 
-// noticeWriter is this proxy's diagnostic channel for a leg with NO route in scope: the
-// configured stderr writer and the aggregate class table. Nil-safe so a session assembled by a bare
-// struct literal (as tests build) writes unbounded rather than panicking.
+// noticeWriter is this proxy's diagnostic channel for a leg with NO route in scope: the configured
+// stderr writer and the aggregate class table. A leg that HAS a route uses routeNoticeWriter — one
+// tenant's flood must not silence another's, which is the whole reason the table below it exists.
 //
-// A leg that has a route uses routeNoticeWriter instead — one tenant's flood must not silence
-// another's, which is the whole reason the table below it exists.
-func (p *HTTPProxy) noticeWriter() noticeWriter {
-	if p == nil {
-		return noticeWriter{}
-	}
-	return noticeWriter{out: p.errOut(), limits: p.notices}
-}
+// Spelled as the nil-route case of that one rather than as a second body, so the nil-receiver
+// fallback and the writer it pairs with cannot drift between the two.
+func (p *HTTPProxy) noticeWriter() noticeWriter { return p.routeNoticeWriter(nil) }
 
 // routeNoticeWriter is the diagnostic channel for a leg serving route: the route's OWN class table,
 // which charges this proxy's aggregate as its parent (see newRouteNoticeLimiter). A nil route (a
-// leg with none, or a bare-struct-literal test) falls back to the aggregate directly — the
-// pre-split behaviour, and bounded either way.
+// leg that genuinely has none) falls back to the aggregate directly, and a nil receiver to an
+// unbounded channel, which is what a proxy assembled by a bare struct literal in a test gets.
 func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 	if p == nil {
 		return noticeWriter{}
 	}
 	if route == nil || route.notices == nil {
-		return p.noticeWriter()
+		return noticeWriter{out: p.errOut(), limits: p.notices}
 	}
 	return noticeWriter{out: p.errOut(), limits: route.notices}
 }
@@ -792,17 +786,12 @@ func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 //
 // Reads preSessionDenies directly: the single-caller accessor that used to wrap it duplicated this
 // function's own nil-receiver guard one line above it.
-func (p *HTTPProxy) refusalLimits() refusalLimits {
-	if p == nil {
-		return refusalLimits{}
-	}
-	return refusalLimits{records: p.preSessionDenies, notices: p.noticeWriter()}
-}
+func (p *HTTPProxy) refusalLimits() refusalLimits { return p.routeRefusalLimits(nil) }
 
 // routeRefusalLimits is the same wiring for a leg that HAS a route: the same proxy-wide record
-// buckets, and the route's own diagnostic table rather than the aggregate. Split from the
-// pre-session accessor above rather than taking a nilable route on it, so a leg that knows its
-// tenant cannot forget to say so.
+// buckets, and the route's own diagnostic table rather than the aggregate. Named separately from
+// the nil-route spelling above so a leg that knows its tenant says so at the call — the record
+// table and the nil fallback are written once, here, so the two cannot drift.
 func (p *HTTPProxy) routeRefusalLimits(route *UpstreamRoute) refusalLimits {
 	if p == nil {
 		return refusalLimits{}

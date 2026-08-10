@@ -33,7 +33,7 @@ func drive(w *strings.Builder, l *noticeLimiter, site noticeSite, n int) int {
 	return strings.Count(w.String()[before:], "\n")
 }
 
-// TestNoticeSplit_RefusalFloodCannotStarveAnUpstreamFailure is #337's property.
+// TestNoticeSplit_RefusalFloodCannotStarveAnUpstreamFailure pins the class split.
 //
 // refuseUnroutable's line is drivable at a peer's full send rate on the cheapest message it can
 // send — no id, no handler slot, no upstream round trip. Sharing one bucket with `upstream error`
@@ -43,7 +43,7 @@ func drive(w *strings.Builder, l *noticeLimiter, site noticeSite, n int) int {
 // an incident.
 func TestNoticeSplit_RefusalFloodCannotStarveAnUpstreamFailure(t *testing.T) {
 	t.Parallel()
-	limiter := newNoticeLimiter()
+	limiter := newNoticeLimiter(1)
 	frozen(limiter, time.Now())
 
 	var out strings.Builder
@@ -59,7 +59,7 @@ func TestNoticeSplit_RefusalFloodCannotStarveAnUpstreamFailure(t *testing.T) {
 // exempting it. A dead upstream drives its own line per frame just as a peer drives a refusal.
 func TestNoticeSplit_FailureClassIsBoundedToo(t *testing.T) {
 	t.Parallel()
-	limiter := newNoticeLimiter()
+	limiter := newNoticeLimiter(1)
 	frozen(limiter, time.Now())
 
 	var out strings.Builder
@@ -74,7 +74,7 @@ func TestNoticeSplit_FailureClassIsBoundedToo(t *testing.T) {
 func TestNoticeSplit_RollupNamesTheClassItSpans(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
-	limiter := newNoticeLimiter()
+	limiter := newNoticeLimiter(1)
 	limiter.setNow(func() time.Time { return now })
 
 	var out strings.Builder
@@ -83,12 +83,13 @@ func TestNoticeSplit_RollupNamesTheClassItSpans(t *testing.T) {
 	out.Reset()
 	drive(&out, limiter, siteUnmappedMethod, 1)
 
-	assert.Contains(t, out.String(), "further traffic diagnostics suppressed")
+	assert.Contains(t, out.String(), "further traffic diagnostics suppressed, proxy-wide",
+		"the tail names the class AND the tier: after the route split the same sentence would otherwise mean one tenant on a gateway and the whole process here")
 	assert.NotContains(t, out.String(), "failure",
 		"the count spans the class it charged; naming another would tell an operator a flood happened where none did")
 }
 
-// TestNoticeSplit_OneRouteCannotSilenceASibling is #330's property.
+// TestNoticeSplit_OneRouteCannotSilenceASibling pins the route split.
 //
 // A peer looping `{"jsonrpc":"2.0","method":"x/bogus"}` at /mcp/routeA drained the single
 // proxy-wide bucket and suppressed routeB's routing-refusal lines for as long as it kept sending.
@@ -97,8 +98,8 @@ func TestNoticeSplit_RollupNamesTheClassItSpans(t *testing.T) {
 func TestNoticeSplit_OneRouteCannotSilenceASibling(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
-	aggregate := newNoticeLimiter()
-	routeA, routeB := newRouteNoticeLimiter(aggregate, 2), newRouteNoticeLimiter(aggregate, 2)
+	aggregate := newNoticeLimiter(2)
+	routeA, routeB := newRouteNoticeLimiter(aggregate), newRouteNoticeLimiter(aggregate)
 	for _, l := range []*noticeLimiter{aggregate, routeA, routeB} {
 		frozen(l, at)
 	}
@@ -106,29 +107,50 @@ func TestNoticeSplit_OneRouteCannotSilenceASibling(t *testing.T) {
 	var outA, outB strings.Builder
 	drive(&outA, routeA, siteUnmappedMethod, 500)
 	assert.Positive(t, drive(&outB, routeB, siteUnmappedMethod, 5),
-		"one tenant's flood must not silence another's; a share of the aggregate is what makes the split mean something a bare parent does not")
+		"one tenant's flood must not silence another's; an aggregate sized for every tenant is what makes the split mean something a shared bucket does not")
 }
 
-// TestNoticeSplit_RouteSharesDoNotMultiplyTheAggregate is the other side of that split: the reachable
-// syscall rate must not grow with the route count. The parent is what holds it, and both tiers must
-// admit — a per-route table that only bounded its own share would hand a gateway operator N times the
-// diagnostic rate for adding routes.
-func TestNoticeSplit_RouteSharesDoNotMultiplyTheAggregate(t *testing.T) {
+// TestNoticeSplit_AggregateCoversEveryTenantsShare is the sizing decision the route split rests on:
+// the aggregate is derived from the tenant count so every route's own budget fits under it.
+//
+// The rejected alternative was dividing a FIXED aggregate. This is the test that would fail under
+// it: at four routes integer division floors each share to a burst of 2, so a route with no flood
+// anywhere gets two lines where the unsplit bucket gave ten — worse than not splitting, for exactly
+// the incident the class split exists to keep legible.
+func TestNoticeSplit_AggregateCoversEveryTenantsShare(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
 	const routes = 4
-	aggregate := newNoticeLimiter()
+	aggregate := newNoticeLimiter(routes)
+	frozen(aggregate, at)
+
+	var out strings.Builder
+	for range routes {
+		route := newRouteNoticeLimiter(aggregate)
+		frozen(route, at)
+		assert.Equal(t, perClassNoticeBurst, drive(&out, route, siteUnmappedMethod, 100),
+			"every tenant gets its whole share however many tenants there are; a share of a fixed aggregate floors to nothing past two")
+	}
+}
+
+// TestNoticeSplit_AggregateStillBoundsTheTotal is the other side: a route's own table is not the only
+// gate. Both tiers must admit, so a route cannot exceed what the aggregate was sized to give it —
+// which is what keeps the parent meaningful rather than decorative.
+func TestNoticeSplit_AggregateStillBoundsTheTotal(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	aggregate := newNoticeLimiter(1)
 	frozen(aggregate, at)
 
 	var out strings.Builder
 	total := 0
-	for range routes {
-		route := newRouteNoticeLimiter(aggregate, routes)
+	for range 3 {
+		route := newRouteNoticeLimiter(aggregate)
 		frozen(route, at)
 		total += drive(&out, route, siteUnmappedMethod, 100)
 	}
-	assert.LessOrEqual(t, total, perClassNoticeBurst,
-		"every route charges the aggregate too, so N routes flooding together stay at the pre-split ceiling")
+	assert.Equal(t, perClassNoticeBurst, total,
+		"three routes under an aggregate sized for one share that one budget; dropping the parent link would let each spend its own")
 }
 
 // TestNoticeSplit_SingleRouteKeepsThePreSplitBudget guards the common deployment: one route (and
@@ -136,8 +158,8 @@ func TestNoticeSplit_RouteSharesDoNotMultiplyTheAggregate(t *testing.T) {
 func TestNoticeSplit_SingleRouteKeepsThePreSplitBudget(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
-	aggregate := newNoticeLimiter()
-	route := newRouteNoticeLimiter(aggregate, 1)
+	aggregate := newNoticeLimiter(1)
+	route := newRouteNoticeLimiter(aggregate)
 	frozen(aggregate, at)
 	frozen(route, at)
 
@@ -145,12 +167,12 @@ func TestNoticeSplit_SingleRouteKeepsThePreSplitBudget(t *testing.T) {
 	assert.Equal(t, perClassNoticeBurst, drive(&out, route, siteUnmappedMethod, 100))
 }
 
-// TestNoticeMechanism_ClassComesFromTheDeclaration is #339's property: the bucket a line charges is
+// TestNoticeMechanism_ClassComesFromTheDeclaration pins the mechanism: the bucket a line charges is
 // READ from its site's declaration at write time, the analogue of forCategory on the record half —
 // not chosen by the call site, which is what let "declared metered" and "charges a bucket" disagree.
 func TestNoticeMechanism_ClassComesFromTheDeclaration(t *testing.T) {
 	t.Parallel()
-	limiter := newNoticeLimiter()
+	limiter := newNoticeLimiter(1)
 	frozen(limiter, time.Now())
 
 	for site, decl := range noticeDeclarations {
@@ -172,7 +194,7 @@ func TestNoticeMechanism_ClassComesFromTheDeclaration(t *testing.T) {
 // syscall that only the AST walk could catch, which is exactly the weakness the mechanism replaces.
 func TestNoticeMechanism_UndeclaredSiteIsBoundedNotFree(t *testing.T) {
 	t.Parallel()
-	limiter := newNoticeLimiter()
+	limiter := newNoticeLimiter(1)
 	frozen(limiter, time.Now())
 	require.NotContains(t, noticeDeclarations, noticeSite("undeclared-probe"))
 

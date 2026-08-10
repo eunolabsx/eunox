@@ -1236,10 +1236,9 @@ type serverRequestParams struct {
 	strictAuditState
 }
 
-// errOutOrStderr returns fp.errOut when set, else os.Stderr. See forwardParams.errOutOrStderr;
-// duplicated as a method (not shared via embedding) because serverRequestParams and
-// forwardParams are deliberately separate structs — the server-initiated leg carries none of
-// forwardParams' host-request-only fields (callUpstream, endDecision, upstreamTimeMs).
+// errOutOrStderr resolves this leg's diagnostic destination from the unblocker's own channel,
+// which is what makes the writer and its bound one field rather than two a leg can set half of.
+// The struct carries no writer of its own for that reason.
 func (fp serverRequestParams) errOutOrStderr() io.Writer {
 	return fp.unblocker.notices.errOut()
 }
