@@ -27,6 +27,7 @@
 package transport
 
 import (
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -310,7 +311,7 @@ var upstreamRefusalCategories = []refusalCategory{
 // other.
 //
 // Narrowing is safe rather than merely cheap because a category this table has no bucket for is
-// delegated WHOLLY to the aggregate parent (see tieredBuckets.admit) — the proxy-wide bound those
+// delegated WHOLLY to the aggregate parent (see tieredBuckets.admitWithFloor) — the proxy-wide bound those
 // records had before the per-session split existed, and now labelled with the aggregate's own
 // scope rather than this table's.
 var remoteUpstreamRefusalCategories = []refusalCategory{catServerRequestFailed}
@@ -470,6 +471,20 @@ type tieredBuckets[K comparable] struct {
 	// legibility during an incident — so an operator loosening the second must not be loosening
 	// the first. See recordReserveInterval and noticeReserveInterval for each one's argument.
 	reserveEvery time.Duration
+	// now is this table's clock, beside the per-bucket ones setNow already points at a test's.
+	// Held here for the one caller that samples an instant WITHOUT admitting through a bucket —
+	// the per-site collapse, which decides before any token is spent — so it cannot measure its
+	// interval on a different clock from the tier it sits above.
+	now func() time.Time
+}
+
+// clock is this table's instant. A table built by a bare struct literal in a test has none and
+// falls back to the wall clock, the behaviour every caller had before the field existed.
+func (t *tieredBuckets[K]) clock() time.Time {
+	if t == nil || t.now == nil {
+		return time.Now()
+	}
+	return t.now()
 }
 
 // floorTier declares where a holder's floor answers, which is the tier at which that holder
@@ -510,6 +525,7 @@ func newTieredBuckets[K comparable](ratePerSec, burst float64, reserveEvery time
 		scope:        scope,
 		floorAt:      floorAt,
 		reserveEvery: reserveEvery,
+		now:          time.Now,
 	}
 	if parent == nil {
 		t.unknown = newRecordRateLimiter(perBucketFloor, perBucketFloor)
@@ -703,7 +719,7 @@ func (r *keyReserve[K]) forKey(key K) *reserveSlot {
 // budget is what bounds every write that leaves it and the aggregate's ceiling therefore holds
 // transitively; charging both would make the aggregate under-serve by counting one write twice.
 // The debit is clamped at one burst of debt, past which floors are free — the residual, bounded by
-// holders x keys per reserveInterval — because an unbounded debt would let enough holders starve a
+// holders x keys per this table's reserveEvery — because an unbounded debt would let enough holders starve a
 // tier's ordinary writes permanently, which is worse than the excess it prevents.
 //
 // A floored write also takes the accumulated tally WITH it (deliveredAnyway) rather than leaving it
@@ -712,6 +728,12 @@ func (r *keyReserve[K]) forKey(key K) *reserveSlot {
 func (t *tieredBuckets[K]) admitWithFloor(key K, floor *reserveSlot) bucketVerdict {
 	own, registered := t.buckets[key]
 	if t.parent != nil && !registered {
+		// A delegated key is answered wholly by the tier it reaches, floor included: the parent's
+		// floorAt decides whether the floor is consulted at all, and the parent's reserveEvery is
+		// what re-arms it. That is the rule rather than an accident of recursion — the window a
+		// floored write buys is a property of the BUDGET it is charged against, and this write is
+		// charged against the parent's, so re-arming it on this tier's interval would size one
+		// table's bypass by another table's argument.
 		return t.parent.admitWithFloor(key, floor)
 	}
 	if !registered {
@@ -771,6 +793,7 @@ func (t *tieredBuckets[K]) bucket(key K) *recordRateLimiter {
 // descend to the parent: a test freezing both tiers says so explicitly, which is what keeps a
 // two-tier assertion from passing on one tier's clock.
 func (t *tieredBuckets[K]) setNow(now func() time.Time) {
+	t.now = now
 	for _, b := range t.buckets {
 		b.now = now
 	}
@@ -1059,47 +1082,29 @@ func (g *saturationGate) clear() {
 	g.recorded = false
 }
 
-// episodeGate collapses a REPEATING IDENTICAL fault to one report per episode: the first failure is
-// reported, every further one folds into a count, and the fault CLEARING is what reopens it.
+// nilInterface reports whether v holds no value at all — the interface itself nil, or a typed nil
+// inside a non-nil interface. The ONE answer in this package to a question three call sites now ask
+// (a diagnostic seam's subsystem, a server-initiated leg's sink), because `x == nil` compares the
+// INTERFACE and passes for an interface holding a nil pointer, whose method then dereferences a nil
+// receiver.
 //
-// saturationGate's shape one axis over, and for the same observation — an operator needs to know a
-// backend is broken once, not once per frame — applied to the two obligation-failure diagnostics a
-// merely broken deployment drives at the request rate from a conforming peer (a downed flow store
-// fails every approved declassification's commit; a stale effect.ref pin makes every receipt
-// inconsistent). Collapsing at the SOURCE frees the class bucket those lines were emptying, which
-// is strictly better than sharing a bucket already emptied, and the episode BOUNDARY tells an
-// operator when the backend recovered — which a suppression count cannot.
+// Reflection rather than a type switch, for redisutil.IsNilClient's reason one layer down: a list of
+// concrete types is a second thing to keep in agreement, and nilness is one question for every type
+// including one nobody has written yet. IsNil PANICS on any other kind, so the kinds are named
+// rather than tried — a guard must not become the crash it prevents. Interface is in the list for
+// completeness even though reflect.ValueOf unwraps to the dynamic type and never yields it.
 //
-// It is not saturationGate itself because the backstop differs: that gate carries a token bucket of
-// its own for a pool cycling saturate/drain/re-saturate, while this one sits ABOVE the notice class
-// bucket and is backstopped by it — a flapping fault is exactly the case episode collapsing handles
-// worst, so the bucket underneath (and the site floor under that) stays the answer for it.
-//
-// Lock-free, and nil-safe so a site with no gate needs no branch at the call site (reserveSlot's
-// idiom). The residual is stated where it is spent: leadingEdge is a PEEK, so failures concurrent
-// with an episode's first one may each write a line before collapse lands — bounded by in-flight
-// concurrency and by the class bucket underneath, the same residual exemptOncePerDegradation states
-// for the audit-degradation line.
-type episodeGate struct {
-	// open is set only once the leading-edge line has actually been WRITTEN (see collapse). A
-	// latch taken before that is saturationGate's documented bug: a leading edge the bucket
-	// declined would open an episode holding no line, and every further failure would fold into it
-	// until the fault cleared — the fault reported zero times.
-	open atomic.Bool
-}
-
-// leadingEdge reports whether this failure is a new episode's first, and therefore the one to
-// write. A nil gate answers true: a site that collapses nothing writes every line.
-func (g *episodeGate) leadingEdge() bool { return g == nil || !g.open.Load() }
-
-// collapse records that the leading-edge line was written, folding every further failure into a
-// count until the fault clears. Called only past the admission that ACCEPTED that line.
-func (g *episodeGate) collapse() {
-	if g != nil {
-		g.open.Store(true)
+// It answers for a value that IS nil, never for a wrapper AROUND one: reflecting into an embedded
+// field would refuse decorators that legitimately forward elsewhere.
+func nilInterface(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		return false
 	}
 }
-
-// clear ends an open episode — the fault's own operation just succeeded — reporting whether one was
-// open, which is what makes the recovery line the episode BOUNDARY rather than a line per success.
-func (g *episodeGate) clear() bool { return g != nil && g.open.CompareAndSwap(true, false) }

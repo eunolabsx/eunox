@@ -12,7 +12,6 @@
 package transport
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -34,7 +33,7 @@ func TestHealthSnapshot_AuditVerdictComesFromTheSink(t *testing.T) {
 	t.Run("coverage loss degrades", func(t *testing.T) {
 		t.Parallel()
 		snap := healthSnapshot{Status: statusOK, AuditConfigured: true, AuditHealthy: true}
-		snap.fold(audit.Health{Dropped: 1, Degraded: true, DegradedReason: "dropped"}, &snap.AuditHealthy)
+		snap.fold(audit.Health{Dropped: 1}, &snap.AuditHealthy)
 		assert.False(t, snap.AuditHealthy)
 		assert.Equal(t, statusDegraded, snap.Status)
 	})
@@ -45,7 +44,7 @@ func TestHealthSnapshot_AuditVerdictComesFromTheSink(t *testing.T) {
 	t.Run("a maintenance stall degrades readiness alone", func(t *testing.T) {
 		t.Parallel()
 		h := audit.Health{MaintenanceStalled: true, MaintenanceReason: "rotation deferred: no free name"}
-		require.False(t, h.Degraded, "a stall is not coverage loss; --require-audit=strict must not deny on it")
+		require.Zero(t, h.Dropped+h.WriteFailures, "a stall is not coverage loss; --require-audit=strict must not deny on it")
 		require.Error(t, h.HealthStatus(), "and it is still a readiness regression: the disk bound is unenforced")
 
 		snap := healthSnapshot{Status: statusOK, AuditConfigured: true, AuditHealthy: true}
@@ -95,17 +94,19 @@ func TestHealthMetrics_AuditVerdictIsOneSeries(t *testing.T) {
 		"and it answers for an absent sink too, which is the state an operator most needs a single series for")
 }
 
-// TestHealthFold_TypedNilSubsystemIsAbsentRatherThanAPanic pins the guard.
+// TestHealthFold_WiredButNilSubsystemDegrades pins the ANSWER, which is the part of this guard that
+// is a decision rather than a mechanism.
 //
 // `h == nil` compares the INTERFACE, so an interface holding a `(*killswitch.Redis)(nil)` passed it
-// and the call behind it dereferenced a nil receiver — on /healthz and /metrics, the endpoints an
-// operator reaches for when something is already wrong. The old guard read as a nil check and was
-// not one, which is worse than none: healthReporter's doc invites more subsystems through this seam,
-// and each one inherited the appearance of coverage.
-func TestHealthFold_TypedNilSubsystemIsAbsentRatherThanAPanic(t *testing.T) {
+// and the call behind it dereferenced a nil receiver — on the endpoints an operator reaches for when
+// something is already wrong. Reporting it HEALTHY was the first fix and is worse than the panic for
+// this subsystem: a green readiness signal over an emergency stop that cannot answer, against
+// killswitch.Manager's rule that a backend which cannot confirm its kill set never serves a silent
+// all-clear. A wired-but-nil subsystem therefore degrades — which is also what the audit arm already
+// does for a sink it could not open.
+func TestHealthFold_WiredButNilSubsystemDegrades(t *testing.T) {
 	t.Parallel()
 	for name, reporter := range map[string]healthReporter{
-		"interface nil":       nil,
 		"typed nil pointer":   (*killswitch.Redis)(nil),
 		"typed nil in-memory": (*killswitch.InMemory)(nil),
 	} {
@@ -113,25 +114,36 @@ func TestHealthFold_TypedNilSubsystemIsAbsentRatherThanAPanic(t *testing.T) {
 			t.Parallel()
 			snap := healthSnapshot{Status: statusOK, KillSwitchHealthy: true}
 			require.NotPanics(t, func() { snap.fold(reporter, &snap.KillSwitchHealthy) })
-			assert.True(t, snap.KillSwitchHealthy, "an absent subsystem is not a degraded one")
-			assert.Equal(t, statusOK, snap.Status)
+			assert.False(t, snap.KillSwitchHealthy, "a kill switch that cannot answer is not a healthy one")
+			assert.Equal(t, statusDegraded, snap.Status)
 		})
 	}
 
-	// A struct-valued sample is never absent, so the guard must not swallow its verdict — the
-	// failure mode a kind-blind reflect check would introduce while fixing the pointer one.
-	snap := healthSnapshot{Status: statusOK, AuditHealthy: true}
-	snap.fold(audit.Health{Degraded: true, DegradedReason: "dropped"}, &snap.AuditHealthy)
-	assert.False(t, snap.AuditHealthy)
+	// A nil INTERFACE is the other fact and still reports nothing: nothing was wired, which is the
+	// caller's own business — a proxy with no JWT layer folds no JWKS verdict.
+	snap := healthSnapshot{Status: statusOK, KillSwitchHealthy: true}
+	require.NotPanics(t, func() { snap.fold(nil, &snap.KillSwitchHealthy) })
+	assert.True(t, snap.KillSwitchHealthy)
+	assert.Equal(t, statusOK, snap.Status)
+
+	// And a struct-valued sample is never nil, so its verdict must still be read — the failure a
+	// kind-blind check would introduce while fixing the pointer one.
+	healthy := healthSnapshot{Status: statusOK, AuditHealthy: true}
+	healthy.fold(audit.Health{}, &healthy.AuditHealthy)
+	assert.True(t, healthy.AuditHealthy)
+	degraded := healthSnapshot{Status: statusOK, AuditHealthy: true}
+	degraded.fold(audit.Health{Dropped: 1}, &degraded.AuditHealthy)
+	assert.False(t, degraded.AuditHealthy)
 }
 
-// TestHealthSnapshot_TypedNilKillSwitchDoesNotPanicTheEndpoints is the reachable end of the same
-// hazard: the type assertion in snapshot() succeeds for a typed nil exactly as the guard did.
-func TestHealthSnapshot_TypedNilKillSwitchDoesNotPanicTheEndpoints(t *testing.T) {
+// TestHealthSnapshot_TypedNilKillSwitchDegradesRatherThanPanics is the reachable end of the same
+// hazard: the type assertion in snapshot() succeeds for a typed nil exactly as the old guard did.
+func TestHealthSnapshot_TypedNilKillSwitchDegradesRatherThanPanics(t *testing.T) {
 	t.Parallel()
 	p := &HTTPProxy{ks: (*killswitch.Redis)(nil)}
 	var snap healthSnapshot
 	require.NotPanics(t, func() { snap = p.snapshot() })
-	assert.True(t, snap.KillSwitchHealthy)
-	assert.True(t, strings.Contains(metricsBody(t, p), "eunox_kill_switch_healthy 1\n"))
+	assert.False(t, snap.KillSwitchHealthy)
+	assert.Equal(t, statusDegraded, snap.Status)
+	assert.Contains(t, metricsBody(t, p), "eunox_kill_switch_healthy 0\n")
 }

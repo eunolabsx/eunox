@@ -37,7 +37,7 @@ func TestHealth_ReadinessIsWiderThanTheEnforcementGate(t *testing.T) {
 	s.setRotationStalled("sibling directory unreadable")
 	h := s.Health()
 	assert.True(t, h.MaintenanceStalled)
-	assert.False(t, h.Degraded, "a stalled rotation is not coverage loss, so it may not deny traffic")
+	assert.Zero(t, h.Dropped+h.WriteFailures, "a stalled rotation loses no record, so it may not deny traffic")
 	degraded, _, _ := s.AuditDegraded()
 	assert.False(t, degraded, "and the enforcement gate must agree, since it is the same fact")
 	require.Error(t, h.HealthStatus(), "readiness is the wider question: the disk bound is unenforced")
@@ -60,10 +60,9 @@ func TestHealth_CoverageLossIsOnePredicate(t *testing.T) {
 	degraded, reason, detail := s.AuditDegraded()
 	require.True(t, degraded)
 	h := s.Health()
-	assert.True(t, h.Degraded)
-	assert.Equal(t, reason, h.DegradedReason, "one predicate, one reason: a second copy is a second thing to keep in agreement")
 	require.Error(t, h.HealthStatus())
-	assert.Contains(t, h.HealthStatus().Error(), reason)
+	assert.Contains(t, h.HealthStatus().Error(), reason,
+		"one predicate, one reason: the readiness verdict states the enforcement gate's own cause rather than a second copy of it")
 
 	// The sample carries the same numbers the reason was built from, which is the whole point of it
 	// being a sample: a consumer rendering the counters and folding the verdict takes one reading.

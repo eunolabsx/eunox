@@ -39,7 +39,6 @@ package transport
 import (
 	"context"
 	"encoding/json"
-	"reflect"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -272,15 +271,7 @@ func initiatorWriter(sink mcp.MsgSink) func(mcp.RPCMsg) error {
 // saying so, and calling an unusable one costs the process. The residual false refusal is a nil map
 // or slice whose Write happens to work on a nil receiver — a shape no in-tree sink has, and one an
 // out-of-tree consumer resolves by not holding a nil sink.
-func nilSink(sink mcp.MsgSink) bool {
-	v := reflect.ValueOf(sink)
-	switch v.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
-		return v.IsNil()
-	default:
-		return false
-	}
-}
+func nilSink(sink mcp.MsgSink) bool { return nilInterface(sink) }
 
 // writeToInitiator is the ONE nil-writer disposition every site that answers a blocked
 // server-initiated initiator shares: send reply through write, or report that there was no upstream

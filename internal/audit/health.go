@@ -13,10 +13,7 @@
 
 package audit
 
-import (
-	"errors"
-	"strings"
-)
+import "errors"
 
 // Health is the audit sink's operational state as ONE reading: the coverage counters, the log
 // maintenance status, and — through HealthStatus — the readiness verdict over them.
@@ -32,14 +29,13 @@ import (
 // into "degraded" here would report a healthy sink as broken every time one is legitimately
 // optional (--require-audit=off).
 type Health struct {
-	// Dropped and WriteFailures are the two coverage counters, sampled together.
+	// Dropped and WriteFailures are the two coverage counters, sampled together. The enforcement
+	// verdict is DERIVED from them rather than carried beside them: they are the same reading, so
+	// deriving it is not a second one — and a field would make a Health whose verdict contradicts
+	// its own counters representable, which is the self-contradicting body this type exists to
+	// prevent.
 	Dropped       int64
 	WriteFailures int64
-	// Degraded is the ENFORCEMENT verdict — the same one AuditDegraded returns, over the counters
-	// above — carried here so a consumer reporting the counters and the verdict cannot compute one
-	// from a second reading of the other.
-	Degraded       bool
-	DegradedReason string
 	// MaintenanceStalled reports rotation or retention pruning making no progress. Deliberately
 	// NOT part of Degraded: no record has been lost, so it must not deny traffic under
 	// --require-audit=strict. It IS part of HealthStatus, since an unenforced disk bound is a
@@ -51,14 +47,13 @@ type Health struct {
 // Health samples this sink's operational state. A nil sink answers the zero value (healthy), for
 // the reason stated on the type.
 //
-// The counters are loaded once and the verdict derived from that load, rather than each caller
-// asking DroppedRecords/WriteFailures/AuditDegraded in sequence.
+// The counters are loaded once and every verdict derived from that load, rather than each caller
+// asking DroppedRecords/WriteFailures/AuditDegraded in sequence and reconciling three readings.
 func (s *Sink) Health() Health {
 	if s == nil {
 		return Health{}
 	}
 	h := Health{Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
-	h.Degraded, h.DegradedReason = coverageLost(h.Dropped, h.WriteFailures)
 	h.MaintenanceStalled, h.MaintenanceReason = s.MaintenanceStalled()
 	return h
 }
@@ -72,16 +67,16 @@ func (s *Sink) Health() Health {
 // not reach the gate that denies live traffic. It is still a readiness regression: the configured
 // size/retention bound is unenforced, and the log grows until the filesystem fills, at which point
 // writes DO fail and strict mode denies everything. Reporting it early is the whole point.
+//
+// The two causes are joined rather than concatenated, so a consumer that grows past rendering the
+// string can still tell them apart — which is the whole content of the carve-out.
 func (h Health) HealthStatus() error {
-	var parts []string
-	if h.Degraded {
-		parts = append(parts, h.DegradedReason)
+	var causes []error
+	if degraded, reason := coverageLost(h.Dropped, h.WriteFailures); degraded {
+		causes = append(causes, errors.New(reason))
 	}
 	if h.MaintenanceStalled {
-		parts = append(parts, "audit log maintenance stalled: "+h.MaintenanceReason)
+		causes = append(causes, errors.New("audit log maintenance stalled: "+h.MaintenanceReason))
 	}
-	if len(parts) == 0 {
-		return nil
-	}
-	return errors.New(strings.Join(parts, "; "))
+	return errors.Join(causes...)
 }

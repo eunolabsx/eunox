@@ -2329,6 +2329,11 @@ func bareTargetName(tt capability.TargetType, identifier string) string {
 
 // DroppedRecords returns the number of records discarded because the write queue
 // was full. Expose as a metric to detect sustained disk pressure.
+//
+// One counter, one reading. A consumer that needs more than one fact about this sink — a counter
+// AND the verdict over it, or both counters together — takes Health() instead: composing these
+// getters is two readings of state that moves, which is how a body comes to carry a zero count
+// beside a degraded verdict.
 func (s *Sink) DroppedRecords() int64 {
 	return s.dropped.Load()
 }
@@ -2396,7 +2401,8 @@ func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
 // not be durably written (full disk, EIO, a serialization error, or a file lost to
 // a failed rotation). Distinct from DroppedRecords: that is a "queue can't keep up"
 // signal on a healthy file, this is a "file is broken" signal. Expose as
-// eunox_audit_write_failures_total and alert on it.
+// eunox_audit_write_failures_total and alert on it. See DroppedRecords for why a consumer wanting
+// more than this one counter takes Health() rather than composing the getters.
 func (s *Sink) WriteFailures() int64 {
 	return s.writeFailures.Load()
 }

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 
 	"github.com/eunolabs/eunox/pkg/circuitbreaker"
 )
@@ -98,42 +97,32 @@ type jwksHealth struct {
 // A pointer to the field rather than a returned bool, so a subsystem cannot be folded into the
 // summary while its own field silently stays true — the discrepancy nothing downstream could
 // detect.
+//
+// It answers a WIRED subsystem that holds nothing — a typed nil inside a non-nil interface — as
+// DEGRADED rather than as healthy or as a panic, which are the two answers this seam has had.
+//
+// The panic was the shipped one: `h == nil` compares the INTERFACE, so it passes for an interface
+// holding a `(*killswitch.Redis)(nil)` and the call behind it dereferences a nil receiver — on
+// /healthz and /metrics, the endpoints an operator reaches for when something is already wrong.
+// Reporting it healthy instead was the first fix and is worse: for the kill switch it is a green
+// readiness signal over an emergency stop that cannot answer, which is exactly what
+// killswitch.Manager's confirmability rule forbids ("a backend that cannot confirm its kill set
+// reports the cause from EVERY reader rather than serving a silent all-clear"). Degrading also makes
+// this arm agree with snapshot's audit arm, which already treats a sink it could not open as a
+// readiness failure rather than as nothing to report.
+//
+// An interface that is nil OUTRIGHT is a different fact and still reports nothing: no subsystem was
+// wired, which is the caller's own business (a proxy with no JWT layer folds no JWKS verdict), where
+// a typed nil means one was wired and cannot work.
 func (s *healthSnapshot) fold(h healthReporter, healthy *bool) {
-	if absentReporter(h) || h.HealthStatus() == nil {
+	if h == nil {
+		return
+	}
+	if !nilInterface(h) && h.HealthStatus() == nil {
 		return
 	}
 	*healthy = false
 	s.Status = statusDegraded
-}
-
-// absentReporter reports whether h holds no subsystem at all — the interface itself nil, or a typed
-// nil inside a non-nil interface.
-//
-// `h == nil` compares the INTERFACE, so it passes for an interface holding a `(*killswitch.Redis)(nil)`
-// and the call behind it dereferences a nil receiver. The guard read as a nil check and was not one,
-// which is worse than no guard: every later subsystem folded through this seam inherits the
-// appearance of coverage. Nothing in cmd/eunox produces a typed nil, but the seam is reached through
-// the EXPORTED API — a consumer wiring `var ks *killswitch.Redis` into HTTPGatewayOptions.KS — and
-// healthReporter's own doc invites more subsystems through it, so the ways to arrive here grow.
-//
-// Reflection over the nilable kinds, the treatment redisutil.IsNilClient carries for the same
-// question one layer down; a second copy rather than an import because that one is reached through a
-// `redis.Cmdable` signature this seam cannot satisfy, and exporting its half from a package that
-// exists to answer the go-redis TOPOLOGY question would widen that package to serve a caller with no
-// Redis in it. IsNil PANICS on any other kind, which is why the kinds are named rather than tried —
-// the guard must not become the crash it prevents — and a subsystem answering with a struct VALUE
-// (audit.Health, capability.KeyFetchHealth) lands in the default arm as present, which is correct: a
-// value sample is never absent.
-func absentReporter(h healthReporter) bool {
-	if h == nil {
-		return true
-	}
-	switch rv := reflect.ValueOf(h); rv.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Func, reflect.Slice, reflect.Chan, reflect.UnsafePointer:
-		return rv.IsNil()
-	default:
-		return false
-	}
 }
 
 // The two values the summary takes. Named because handleHealth designates it the READINESS
@@ -152,16 +141,15 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 		MaxSessions:       p.maxSessions,
 		Routes:            len(p.routes),
 		AuditConfigured:   p.sink != nil,
-		AuditHealthy:      p.sink != nil,
+		AuditHealthy:      true,
 		KillSwitchHealthy: true,
 	}
 	if p.sink == nil {
-		// ABSENCE, not degradation, and the one part of the audit answer that stays here: a sink
-		// that never opened cannot report on itself, and only the proxy knows it wired none. It
-		// still flips the summary — a trail that does not exist is not a trail an incident
-		// responder can read — but it is a different fact from the sink's own verdict below, which
-		// is why it is not folded through the seam.
-		snap.Status = statusDegraded
+		// ABSENCE is the one part of the audit answer that stays here: a sink that never opened
+		// cannot report on itself, and only the proxy knows it wired none. Both effects are set
+		// together, for the reason fold takes a pointer to the field — a subsystem folded into the
+		// summary while its own field stays true is a discrepancy nothing downstream can detect.
+		snap.AuditHealthy, snap.Status = false, statusDegraded
 	} else {
 		// ONE sample, and its own verdict folded from it: the counters below and the health seam's
 		// answer come from the same reading, so a record dropped mid-scrape cannot put a zero count

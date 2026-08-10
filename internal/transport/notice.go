@@ -90,7 +90,6 @@ const (
 	siteDeclassifyCommit         noticeSite = "declassify-commit"
 	siteDeclassifyDoubleCommit   noticeSite = "declassify-double-commit"
 	siteReceiptInconsistent      noticeSite = "effect-receipt-inconsistent"
-	siteObligationRecovered      noticeSite = "obligation-fault-recovered"
 )
 
 // noticeClass is what a diagnostic line is WORTH to an operator, and therefore which bucket it
@@ -200,53 +199,67 @@ var meteredNotices = map[noticeSite]noticeClass{
 	// (3) OBLIGATION: a security obligation that did not hold. Still metered — an upstream returning
 	// a redaction-failing response per call drives one per frame — but never from the same bucket as
 	// the generic errors that same upstream can flood beside them. The two INFRASTRUCTURE-driven
-	// ones are additionally collapsed per episode at their source (see episodeCollapsedSites), so
-	// the bucket they charge is the one a flapping fault reaches rather than a persistent one.
+	// ones are additionally COLLAPSED at their source (see collapsedNotices), so the bucket they
+	// charge is not the bucket a persistent backend fault empties.
 	siteRedactionFault:         classObligation,
 	siteDeclassifyCommit:       classObligation,
 	siteDeclassifyDoubleCommit: classObligation,
 	siteReceiptInconsistent:    classObligation,
-	siteObligationRecovered:    classObligation,
 }
 
-// episodeDeclaration is what a site whose fault is COLLAPSED PER EPISODE declares: what ends an
-// episode, which is the one thing an episode gate cannot infer for itself.
-//
-// The reopen condition is the whole design question — a pool's is obvious (it handed out a slot),
-// and these two are not — so it is written down beside the site rather than left implicit in
-// whichever call site happens to call clear. It doubles as the recovery line's text, which is what
-// keeps the operator-facing statement and the mechanism's condition from drifting apart.
-type episodeDeclaration struct {
-	endedBy string
+// collapseDeclaration is what a COLLAPSED site declares: why one line per interval is the whole of
+// what an operator needs from this fault, which is the judgment the collapse rests on. A site whose
+// occurrences are individually informative — different subjects, different causes — must not be
+// here, because what a reader loses is every occurrence after the first in the window.
+type collapseDeclaration struct {
+	why string
 }
 
-// episodeCollapsedSites declares which diagnostic sites collapse to one line per fault EPISODE at
-// their source, and what ends an episode for each.
+// collapsedNotices declares which diagnostic sites are reported at most once per
+// noticeCollapseInterval per SOURCE, rather than once per occurrence.
 //
 // Only the two obligation failures a merely broken deployment drives at the request rate. A flow
 // store that is down fails every approved declassification's commit, and a stale effect.ref pin
-// makes every receipt inconsistent — no adversary involved in either — so both used to empty the
-// class bucket that keeps `SECURITY: redaction failed` legible. The site floor under that line is
-// the backstop and stays (a fault that FLAPS is what episode collapsing handles worst); this is the
-// half that stops the flood existing.
+// makes every receipt inconsistent — no adversary involved in either — so both emptied the class
+// bucket that keeps `SECURITY: redaction failed` legible. Collapsing at the SOURCE means those
+// occurrences spend no token at all, which frees that bucket rather than sharing one the flood has
+// already emptied.
 //
-// The gates are held per ROUTE (see episodeGates), which is per upstream — one route has one
-// receipt verifier and one policy engine behind it. A flow store shared by several routes therefore
-// opens an episode per route rather than one overall: a residual worth stating, bounded by the
-// route count an operator configured, and the alternative (a process-wide gate) would let one
-// tenant's broken backend silence another's report of its own.
-var episodeCollapsedSites = map[noticeSite]episodeDeclaration{
-	siteDeclassifyCommit:    {endedBy: "an approved declassification's clear has committed to the flow store"},
-	siteReceiptInconsistent: {endedBy: "an upstream's signed receipt has verified against the contract this policy declares"},
+// A RE-ARMING interval, not an episode a success reopens. An episode was the first design and its
+// reopen condition is the part that does not survive contact with the scope available: the state
+// can only be keyed per SOURCE (a route has one receipt verifier and one policy engine), while the
+// faults are per CALL — one tool's stale effect.ref pin against a sibling tool that verifies fine,
+// one anchor's failing commit against another that succeeds. A success-reopened episode therefore
+// (1) alternated open/closed on ordinary mixed traffic, emitting MORE lines than no collapsing at
+// all, (2) announced a recovery on evidence from a different subject, which is a claim the gate has
+// no standing to make, and (3) could be held open indefinitely by an upstream that simply declined
+// to produce the success — an adversary-controlled mute on a security-relevant line, which is the
+// opposite of what the class split exists for. An interval answers none of those questions and
+// needs none of them: the fault reports again when the window re-arms, whatever the backend does.
+//
+// What it costs is stated plainly: within one window, occurrences after the first are folded into
+// the class bucket's tally and their SUBJECTS (the tool, the target) are not recorded anywhere on
+// stderr. The tape is unaffected — every one of these lines has a record beside it — so this is a
+// legibility trade, taken because the alternative is a bucket a broken deployment keeps empty.
+var collapsedNotices = map[noticeSite]collapseDeclaration{
+	siteDeclassifyCommit:    {why: "a downed flow store fails every approved declassification's commit, so the finding is 'the flow store is down' rather than one line per clear; an operator acts on it once"},
+	siteReceiptInconsistent: {why: "a stale effect.ref pin makes every receipt on the route inconsistent, so the finding is the pin; the per-call evidence is on the tape, which is where a per-receipt reader should be looking"},
 }
 
 // collapsedNoticeSites is the collapsed subset as a stable slice, DERIVED from the declarations so
-// a site cannot be declared collapsed and hold no gate. Sorted for a deterministic build.
-var collapsedNoticeSites = episodeSites()
+// a site cannot be declared collapsed and hold no slot. Sorted for a deterministic build.
+var collapsedNoticeSites = slices.Sorted(maps.Keys(collapsedNotices))
 
-func episodeSites() []noticeSite {
-	return slices.Sorted(maps.Keys(episodeCollapsedSites))
-}
+// noticeCollapseInterval is how often a collapsed site reports again. A minute for the reason
+// noticeReserveInterval is one: long enough that a persistent backend fault is a trickle rather than
+// a flood, short enough that a fault which returns after being fixed is not silent for an hour.
+//
+// It is deliberately the same MECHANISM as the diagnostic floor one tier down (a re-arming
+// reserveSlot), used in the opposite direction: the floor guarantees a line ARRIVES when the bucket
+// has nothing left, and this one guarantees a repeating line does NOT arrive more often than an
+// operator can act on it. One primitive, so the re-arm semantics — monotonic clock, no value meaning
+// "never claimed", exactly one winner under concurrency — are not implemented twice.
+const noticeCollapseInterval = time.Minute
 
 // noticeFunc is the key a line that never reaches admitNotice is declared by: the writing
 // function's QUALIFIED name (receiver included), which is what an AST walk can see.
@@ -517,41 +530,21 @@ var siteFloors = map[noticeSite]siteFloorDeclaration{
 	// the second commit nowhere. Elided by a class-mate's flood it costs the report of a build
 	// defect that reproduces on the next call, not visibility into an incident in progress.
 	siteDeclassifyDoubleCommit: {why: "a proxy wiring fault, not a backend one: nothing in the call graph reaches it and no peer can drive it, so a class-mate's flood eliding it defers a defect report rather than hiding a live incident"},
-	// The recovery line is the boundary of an episode a fault line already opened, so it is
-	// reachable at most once per episode and only after that line was itself admitted.
-	siteObligationRecovered: {why: "at most one per episode, and only where the fault line that opened it was already written; a flood of them means the deployment is flapping, which the fault lines beside them already report"},
 }
 
-// episodeGates is one SOURCE's episode gates: the collapsed sites' faults, each collapsed to one
-// report per episode. Built once and never resized, so a lookup takes no lock and a site that
-// collapses nothing resolves to no gate rather than to a shared one.
+// newNoticeCollapse builds one SOURCE's collapse slots — an upstream's, which is a route on the
+// gateway and the proxy itself on stdio, since that is what the collapsed faults are per (one route
+// has one receipt verifier and one policy engine behind it).
 //
-// A nil *episodeGates collapses nothing, which is what a leg with no source in hand gets (a
-// pre-session HTTP leg writes no obligation line at all) and what every leg had before this
-// existed.
-type episodeGates struct {
-	gates map[noticeSite]*episodeGate
-}
-
-// newEpisodeGates builds one source's gates. One backing array rather than a gate per site, for the
-// reason newKeyReserve gives: this is allocated per route and held for the process's life.
-func newEpisodeGates() *episodeGates {
-	g := &episodeGates{gates: make(map[noticeSite]*episodeGate, len(collapsedNoticeSites))}
-	backing := make([]episodeGate, len(collapsedNoticeSites))
-	for i, site := range collapsedNoticeSites {
-		g.gates[site] = &backing[i]
-	}
-	return g
-}
-
-// forSite is this source's gate for site, or nil where its fault is not collapsed. Nil-safe, so
-// admitNotice needs no branch for a leg that has no gates.
-func (g *episodeGates) forSite(site noticeSite) *episodeGate {
-	if g == nil {
-		return nil
-	}
-	return g.gates[site]
-}
+// keyReserve, the same primitive the diagnostic floor is built on, rather than a keyed table of its
+// own: this package has twice decided that two hand-mirrored keyed maps drift, and the re-arm
+// semantics being shared is the point rather than a coincidence.
+//
+// A flow store shared by several routes collapses per route rather than once overall — the stated
+// residual, bounded by the route count an operator configured. A process-wide source would let one
+// tenant's broken backend silence another tenant's report of its own, which is the elision the route
+// split one tier down exists to prevent.
+func newNoticeCollapse() *keyReserve[noticeSite] { return newKeyReserve(collapsedNoticeSites) }
 
 // floorProtectedSites is the protected subset, DERIVED from the declarations rather than listed
 // beside them, so a site cannot be declared protected and reserve nothing. Sorted for a
@@ -569,7 +562,7 @@ func protectedNoticeSites() []noticeSite {
 	return out
 }
 
-// noticeReserve is a leg's diagnostic floors: one guaranteed line per key per reserveInterval,
+// noticeReserve is a leg's diagnostic floors: one guaranteed line per key per noticeReserveInterval,
 // delivered when the tier that would have carried it has nothing left.
 //
 // TWO key spaces, and they answer different questions — the shape meteredNotices/unmeteredNotices
@@ -594,7 +587,7 @@ func protectedNoticeSites() []noticeSite {
 // splitting at all. What a sibling needs from this tier is an ARRIVAL — an operator learning that
 // THIS session's upstream is also down needs the first line, not the hundredth.
 //
-// What the floor costs is bounded twice over: it re-arms per reserveInterval rather than
+// What the floor costs is bounded twice over: it re-arms per noticeReserveInterval rather than
 // per lifetime (see that constant for the arithmetic), and a floored line DEBITS the bucket that
 // refused it, so it displaces the flooder's next line rather than adding to the process-wide total
 // (see tieredBuckets.admitWithFloor and recordRateLimiter.borrow). The residual is stated there:
@@ -661,10 +654,10 @@ type noticeWriter struct {
 	// reserve is this leg's floors under limits — its holder's per class, and the protected
 	// sites' own (see noticeReserve). Nil on a leg that is neither.
 	reserve *noticeReserve
-	// episodes is the SOURCE's episode gates for the faults collapsed at their source (see
-	// episodeCollapsedSites), above the buckets rather than under them: a line this gate folds
-	// spends no token at all. Nil on a leg that writes none of those lines.
-	episodes *episodeGates
+	// collapse is the SOURCE's per-site windows for the faults collapsed at their source (see
+	// collapsedNotices), consulted ABOVE the buckets rather than under them: an occurrence this
+	// folds spends no token at all. Nil on a leg with no source to attribute one to.
+	collapse *keyReserve[noticeSite]
 }
 
 // errOut resolves this channel's destination, os.Stderr when unset. The one place a leg's
@@ -767,9 +760,11 @@ func noticeTail(v bucketVerdict, class noticeClass) string {
 //
 // Where that ~110ns goes, since two of the three parts are decisions rather than givens: the
 // declaration lookup is ~11ns, the floor resolution two map probes at ~9ns, and an already-spent
-// slot's claim ~13ns (BenchmarkNoticeReserve_Claim), plus one more probe for the episode gate on a
-// leg that holds them — which pays for itself on the sites it serves, since a folded line stops
-// before the bucket rather than after it. The lookup stays a map probe rather than an
+// slot's claim ~13ns (BenchmarkNoticeReserve_Claim), plus one more probe for the collapse window on
+// a leg that holds one — paid by all sites and spent on the two, which is the price of the collapse
+// being a per-site declaration rather than a class-shaped special case, and which
+// BenchmarkNotice_SuppressedPath now measures because its channel carries the windows the shipped
+// legs do. The lookup stays a map probe rather than an
 // integer site indexing a dense array because it is not the part that dominates, and the constants'
 // readable values are what the call-site walk resolves and what its failures name. None of the
 // three reads a clock: the admission's own sample is handed to the floor, which is what keeps a
@@ -795,50 +790,33 @@ func (n noticeWriter) admitNotice(site noticeSite) (noticeLine, bool) {
 	// the zero value means nobody has answered the question, and the safe answer to that is the
 	// bounded one. noticeReserve reserves no floor for that class for the same reason.
 	class := meteredNotices[site]
-	// The episode gate sits ABOVE the bucket, which is the whole point of collapsing at the source:
-	// a folded line spends no token, so a persistent backend fault stops emptying the class bucket
-	// instead of merely sharing one it has already emptied. The fold goes onto that bucket's own
-	// tally rather than into a counter of its own, so the count reaches a reader through the tail
-	// every admitted line of the class already carries — one answer to "what did I not see", not
-	// two.
-	gate := n.episodes.forSite(site)
-	if !gate.leadingEdge() {
-		n.limits.bucket(class).suppress()
-		return noticeLine{}, false
+	// The collapse window sits ABOVE the bucket, which is the whole point of collapsing at the
+	// source: a folded occurrence spends no token, so a persistent backend fault stops emptying the
+	// class bucket instead of sharing one it has already emptied. It is checked FIRST for the same
+	// reason the admission precedes the caller's arguments — the cheapest answer on the flood path
+	// the mechanism exists for.
+	//
+	// The fold goes onto that bucket's own tally rather than a counter of its own, so the count
+	// reaches a reader through the tail every admitted line of the class already carries: one
+	// answer to "what did I not see", not two.
+	//
+	// The window is CLAIMED here, before the bucket is consulted, which is one atomic operation and
+	// not a peek. A peek-then-mark composition — check the window, take the bucket, then mark —
+	// reads better and is the shape saturationGate needed a mutex to make safe: two of its steps
+	// race, and the lost update leaves a site marked with nothing written or unmarked after a write.
+	// The residual of claiming first is stated rather than designed around: an occurrence whose
+	// class bucket is empty spends the window anyway, so that site's next report is delayed by at
+	// most one interval. Bounded, self-healing, and a line the bucket declined would not have been
+	// written under either shape.
+	if slot := n.collapse.forKey(site); slot != nil {
+		if !slot.claim(n.limits.clock(), noticeCollapseInterval) {
+			n.limits.bucket(class).suppress()
+			return noticeLine{}, false
+		}
 	}
 	verdict := n.limits.admitWithFloor(class, n.reserve.forSite(site, class))
 	if !verdict.ok {
-		// Deliberately NOT collapsed: an episode opened on a line the bucket declined would hold no
-		// written line at all, and every further failure would fold into it until the fault cleared
-		// — saturationGate's documented point (1), one axis over. Leaving it closed lets the next
-		// failure retry.
 		return noticeLine{}, false
 	}
-	gate.collapse()
 	return noticeLine{out: n.errOut(), tail: noticeTail(verdict, class)}, true
-}
-
-// endEpisode reports that the fault collapsed at site has CLEARED — its own operation just
-// succeeded — writing the boundary line if an episode was open, and nothing at all otherwise.
-//
-// The boundary is what collapsing buys beyond a quieter bucket: an operator learns WHEN the backend
-// recovered, which a suppression count cannot say. It is admitted like any other line, so a
-// deployment flapping fast enough to make the boundaries themselves a flood is bounded by the same
-// class bucket the fault lines charge.
-//
-// Called from the success path of every collapsed fault, so the gate answers for a nil receiver and
-// the whole thing costs one atomic load where no episode is open.
-//
-// The clear happens whether or not the boundary line is then admitted, deliberately: what the
-// episode gates is the NEXT fault, and an episode left open because the bucket had nothing left for
-// the recovery line would mute a returning fault indefinitely. A declined boundary costs the
-// "recovered at" line, never the reopen.
-func (n noticeWriter) endEpisode(site noticeSite) {
-	if !n.episodes.forSite(site).clear() {
-		return
-	}
-	if line, ok := n.admitNotice(siteObligationRecovered); ok {
-		line.writef("[eunox] NOTE %s: the reported fault has cleared — %s, so the next failure is reported rather than folded\n",
-			site, episodeCollapsedSites[site].endedBy)
-	}
 }

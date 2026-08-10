@@ -406,7 +406,7 @@ func TestNoticeReserve_SessionChannelCarriesItsOwnFloor(t *testing.T) {
 
 // TestNoticeReserve_NotClaimedWhenTheAggregateRefused pins which refusal the floor answers.
 //
-// tieredBuckets.admit says false two structurally different ways, and the floor may only answer one
+// tieredBuckets.admitWithFloor says false two structurally different ways, and the floor may only answer one
 // of them: the route's OWN bucket had nothing left. When the route had a token and the aggregate
 // above refused, the write is already paid for at this tier, both tiers have counted it, and the
 // pressure comes from other tenants this session cannot influence — claiming the floor there burned
@@ -724,10 +724,16 @@ func TestNoticeAdmission_SuppressedPreGateStillCountsIntoTheRollup(t *testing.T)
 // a small part.
 func BenchmarkNotice_SuppressedPath(b *testing.B) {
 	limiter := newNoticeLimiter(1)
-	// With a session floor, since that is the shipped HTTP-session channel: a reserve-less channel
-	// measures a shape only stdio and the pre-session legs have, and skips take() entirely. The
-	// floor is spent by the first drained line, so every measured iteration is the steady state.
-	channel := noticeWriter{out: io.Discard, limits: limiter, reserve: newNoticeReserve(noticeClasses)}
+	// With a session floor AND a source's collapse windows, since that is the shipped HTTP-session
+	// channel: a channel missing either measures a shape no transport has — every stdio proxy and
+	// every routed HTTP leg carries both — and would keep reporting the pre-collapse number while
+	// production paid the extra probe. The floor is spent by the first drained line, so every
+	// measured iteration is the steady state.
+	channel := noticeWriter{
+		out: io.Discard, limits: limiter,
+		reserve:  newNoticeReserve(noticeClasses),
+		collapse: newNoticeCollapse(),
+	}
 	drain := func() {
 		for range perClassNoticeBurst + 1 {
 			if line, ok := channel.admitNotice(siteNotifyPoolSaturated); ok {

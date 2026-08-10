@@ -189,15 +189,41 @@ func TestReserveInterval_IsPerTableNotPerPackage(t *testing.T) {
 	assert.Equal(t, noticeReserveInterval, newNoticeLimiter(1).reserveEvery)
 	assert.Equal(t, noticeReserveInterval, newRouteNoticeLimiter(nil).reserveEvery)
 
-	// And the slot measures against the table it was admitted THROUGH, not a constant of its own:
-	// the same holder's slot re-arms under a short-interval table while a long-interval one still
-	// refuses it.
+	// The four above catch a dropped or zeroed parameter but cannot catch a TRANSPOSED one, since
+	// the two constants are equal today. What distinguishes them is the behaviour: a slot measures
+	// against the interval the admission hands it, not one of its own.
 	at := time.Now()
 	slot := &reserveSlot{}
 	require.True(t, slot.claim(at, time.Minute))
 	assert.False(t, slot.claim(at.Add(2*time.Second), time.Minute))
 	assert.True(t, slot.claim(at.Add(2*time.Second), time.Second),
 		"a table that declares a shorter interval re-arms its holders' floors sooner, which is the whole point of the knob being per table")
+
+	// A key DELEGATED wholly upward is answered by the tier it reaches, interval included: the
+	// write is charged against the parent's budget, so it re-arms on the parent's argument. Pinned
+	// because both constants are a minute today, so the rule is otherwise invisible until the first
+	// time somebody moves one.
+	aggregate := newRefusalRecordLimiterFor(catDisplaced)
+	aggregate.reserveEvery = time.Hour
+	session := newUpstreamRefusalLimiter(aggregate, []refusalCategory{catServerRequestFailed})
+	require.NotContains(t, session.buckets, catDisplaced, "the category under test must be a delegated one")
+
+	now := at
+	aggregate.setNow(func() time.Time { return now })
+	session.setNow(func() time.Time { return now })
+	for range int(perCategoryDenyBurst) {
+		require.True(t, session.admitRefusal(catDisplaced).ok)
+	}
+	require.True(t, session.admitRefusal(catDisplaced).reserved, "the drained aggregate is floored through")
+
+	// Two minutes on, the parent's bucket has refilled, so drain it again to put the floor back in
+	// play: what is under test is whether the SLOT re-armed, not whether a token is available.
+	now = at.Add(2 * time.Minute)
+	for range int(perCategoryDenyBurst) {
+		require.True(t, session.admitRefusal(catDisplaced).ok)
+	}
+	assert.False(t, session.admitRefusal(catDisplaced).ok,
+		"the floor re-arms on the interval of the table that ANSWERED — the parent's hour, not the child's minute, since the write is charged against the parent's budget")
 }
 
 // TestReserveCeiling_IsDerivedFromTheLiveSets computes the floored-write ceiling the two interval
@@ -208,11 +234,14 @@ func TestReserveInterval_IsPerTableNotPerPackage(t *testing.T) {
 // is what keeps the arithmetic in those doc blocks from being a claim nobody re-checks.
 func TestReserveCeiling_IsDerivedFromTheLiveSets(t *testing.T) {
 	t.Parallel()
-	// The CLI's defaultMaxSessions, which internal/transport cannot import (cmd/eunox depends on
-	// this package, not the other way round). Named here because it is the holder count both doc
-	// blocks quote.
+	// The two inputs this package cannot see: cmd/eunox's defaultMaxSessions (that package depends
+	// on this one, not the reverse) and internal/audit's auditChannelSize (unexported). Copied here
+	// rather than derived, so each is held to its own source by a tripwire beside that source —
+	// TestDefaultMaxSessions_IsTheHolderCountTheReserveCeilingAssumes and
+	// TestAuditChannelSize_IsTheQueueDepthTheReserveCeilingAssumes — which name this test when they
+	// fail. Without them the arithmetic below re-checks nothing about the two numbers a future
+	// change is most likely to move.
 	const documentedHolders = 512
-	// internal/audit's auditChannelSize, the queue a floored refusal RECORD is admitted into.
 	const documentedAuditQueueDepth = 4096
 
 	recordKeys := len(upstreamRefusalCategories)

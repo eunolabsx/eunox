@@ -640,10 +640,6 @@ func commitDeclassify(ctx context.Context, notices noticeWriter, committer decla
 		// gone, which an uncertain set cannot back.
 		return nil, detail
 	}
-	// A commit that landed is the flow store working, which is what ends an episode the fault above
-	// opened. Not on the PendingClear early return: that path attempts no commit, so it is no
-	// evidence either way.
-	notices.endEpisode(siteDeclassifyCommit)
 	return cleared, detail
 }
 
