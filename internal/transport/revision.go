@@ -77,15 +77,22 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 	return resolved, nil
 }
 
-// upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg. Every leg
-// is opened with `initialize`, a method only the handshake-bearing revision has, so that is
-// what eunox negotiated there whatever the leg itself reported or an operator pinned — true of
-// a subprocess upstream, which reads bare JSON-RPC and no header at all, as much as of a
-// remote HTTP one.
+// upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg: the one
+// the leg was OPENED at (upstreamOpenRevision), which is what the leg's own field already
+// holds. True of a subprocess upstream, which reads bare JSON-RPC and no header at all, as
+// much as of a remote HTTP one — the opener's method differs either way.
 //
-// One expression, read by the header stamper and by the check below, so what is sent and what
-// is checked cannot drift — including on the day an opener for a newer revision lands.
-func upstreamAddressedRevision(_ capability.Revision) capability.Revision { return handshakeRevision }
+// It used to be the handshake revision unconditionally, because every leg was opened with
+// `initialize` whatever an operator pinned. That is no longer so, and the identity here is the
+// point rather than an accident: what is SENT (the MCP-Protocol-Version header, the opener's
+// method, eunox's own `_meta` declaration) and what is CHECKED (checkUpstreamHonorable) read
+// this one expression, so a pinned leg cannot be addressed as one revision and held to another.
+//
+// The empty leg revision resolves to capability.DefaultRevision for the reason every other
+// empty carrier does: a leg built without one never opened at anything else.
+func upstreamAddressedRevision(legRev capability.Revision) capability.Revision {
+	return resolveRevision(legRev)
+}
 
 // checkUpstreamHonorable refuses a message this proxy cannot forward without contradicting
 // itself: one whose RESOLVED revision is not the one the upstream leg is addressed as.
@@ -100,11 +107,9 @@ func upstreamAddressedRevision(_ capability.Revision) capability.Revision { retu
 // because "its bytes reach the upstream" is the whole trigger.
 //
 // A leg with no revision yet ("") is not checked: there is nothing to contradict, and refusing
-// would deny a message on the strength of a fact nobody has established.
-//
-// Consequence worth stating: today no method the newer revision declares reaches the PIN against
-// a live leg, so nothing downstream may assume the pin's value — that is incidental, not a
-// property to rely on.
+// would deny a message on the strength of a fact nobody has established. Every leg the proxy
+// opens now pins its revision at construction, so this covers the legs a test builds by
+// literal rather than a window a live one passes through.
 func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
 	if legRev == "" {
 		return nil
@@ -180,17 +185,10 @@ const (
 	gateRefusedReplyUpstreamError = "eunox: the host's reply was refused by this session's security gates; the reply was refused and cannot be relayed"
 )
 
-// resolveUpstreamRevision pins the revision a route speaks to its upstream: the operator's
-// explicit config pin when set, otherwise the revision the upstream itself reported in its
-// handshake. A handshake reporting a revision this build does not speak is NOT an error
-// here — it falls back to the default so the existing probe's own validation stays the one
-// place a bad handshake is rejected — but the pin never claims a revision nobody named.
-func resolveUpstreamRevision(configured capability.Revision, handshakeVersion string) capability.Revision {
-	if configured != "" {
-		return configured
-	}
-	if rev, ok := capability.ParseRevision(handshakeVersion); ok {
-		return rev
-	}
-	return capability.DefaultRevision
-}
+// The upstream-side revision is no longer resolved FROM the handshake. It is decided before
+// the leg is opened (upstreamOpenRevision, in upstream_open.go) and the handshake's own answer
+// is CHECKED against it (checkNegotiatedRevision) rather than allowed to set it.
+//
+// The inversion is the whole of what made the pin a control: a revision derived from a
+// handshake cannot select the opener that performs the handshake, so the pin could only ever
+// relabel a leg that had already been opened as something else.

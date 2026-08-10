@@ -196,7 +196,7 @@ func TestFetchLiveToolsStdio_NonJSONLineIsTerminal(t *testing.T) {
 		t.Skip("spawns a subprocess; skipped in -short")
 	}
 	cmd, args := noisyUpstreamArgs()
-	_, err := fetchLiveToolsStdio(context.Background(), cmd, args)
+	_, err := fetchLiveToolsStdio(context.Background(), cmd, args, "")
 	if err == nil {
 		t.Fatal("expected a banner-printing upstream to fail the probe, matching how the runtime treats it")
 	}
@@ -212,7 +212,7 @@ func TestFetchLiveToolsStdio_Subprocess(t *testing.T) {
 		t.Skip("spawns a subprocess; skipped in -short")
 	}
 	cmd, args := helperUpstreamArgs()
-	info, err := fetchLiveToolsStdio(context.Background(), cmd, args)
+	info, err := fetchLiveToolsStdio(context.Background(), cmd, args, "")
 	if err != nil {
 		t.Fatalf("fetchLiveToolsStdio: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestFetchLiveToolsStdio_Subprocess(t *testing.T) {
 // TestFetchLiveToolsStdio_BadCommand asserts the start error is surfaced.
 func TestFetchLiveToolsStdio_BadCommand(t *testing.T) {
 	t.Parallel()
-	_, err := fetchLiveToolsStdio(context.Background(), "this-command-does-not-exist-eunox", nil)
+	_, err := fetchLiveToolsStdio(context.Background(), "this-command-does-not-exist-eunox", nil, "")
 	if err == nil {
 		t.Fatal("expected fetchLiveToolsStdio to fail for a nonexistent command")
 	}
@@ -249,7 +249,7 @@ func TestFetchLiveToolsStdio_ContextTimeout(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := fetchLiveToolsStdio(ctx, cmd, args)
+	_, err := fetchLiveToolsStdio(ctx, cmd, args, "")
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -289,7 +289,7 @@ func TestValidateLive_EndToEnd_MockUpstream(t *testing.T) {
 		capability.Constraint{Target: "tool:legacy_search", Actions: []string{"call"}}, // stale → FM-2
 	)
 
-	info, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	info, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestValidateLive_EndToEnd_CleanManifest_Exit0(t *testing.T) {
 		capability.Constraint{Target: "tool:query_db", Actions: []string{"call"}},
 	)
 
-	info, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	info, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestValidateLive_EndToEnd_Stdio(t *testing.T) {
 		{"name": "get_customer"}, // matched by get_* glob → FM-1
 	}))
 
-	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err != nil {
 		t.Fatalf("runStdioHandshake: %v", err)

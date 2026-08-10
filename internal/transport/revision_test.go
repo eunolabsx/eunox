@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -47,19 +48,18 @@ func TestResolveHostRevision(t *testing.T) {
 		{name: "explicit null revision inherits the context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, contextRev: capability.Revision20260728, want: capability.Revision20260728},
 		{name: "explicit null revision with no context", rawParams: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`, want: capability.Revision20251125},
 		// The upstream leg. What a forwarded request must not contradict is the revision this
-		// proxy ADDRESSES its upstream as, which is the handshake revision on every leg eunox
-		// can open — not whatever the leg itself reported, which appears nowhere in the bytes
-		// sent.
+		// proxy ADDRESSES its upstream as, which is the revision the leg was OPENED at — the
+		// operator's pin, or the handshake revision under `auto`.
 		{name: "resolving to the addressed revision", contextRev: capability.Revision20251125, legRev: capability.Revision20251125, declared: "2025-11-25", want: capability.Revision20251125},
 		{name: "resolving past the addressed revision", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", wantErr: errUnhonorableUpstreamRevision},
-		// The regression: an upstream that merely ANSWERS initialize with a newer version puts
-		// the leg there with no operator action. The host's declaration then agrees with both
-		// its own context and the header eunox stamps, so refusing it would kill every
-		// declaring host on that route for a pair that is consistent.
-		{name: "leg reported newer, request agrees with the header", contextRev: capability.Revision20251125, legRev: capability.Revision20260728, declared: "2025-11-25", want: capability.Revision20251125},
-		// An operator pin the opener cannot reach is the same shape: the pin does not change
-		// what the leg is addressed as, so a request resolving to it is still refused.
-		{name: "resolving to a pin the opener cannot reach", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, declared: "2026-07-28", wantErr: errUnhonorableUpstreamRevision},
+		// A MATCHED pair on a pinned leg: the host declares what the leg speaks, so the body
+		// and the header eunox stamps name one revision and the request is forwardable. This is
+		// what the pin bought — before the opener was revision-selected, every leg was addressed
+		// as the handshake revision and this exact pair was refused.
+		{name: "matched pair on a pinned leg", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, declared: "2026-07-28", want: capability.Revision20260728},
+		// And the mismatched pair in the other direction: an old host in front of a pinned new
+		// upstream is refused rather than served into a conversation held at another revision.
+		{name: "old host against a pinned new leg", contextRev: capability.Revision20251125, legRev: capability.Revision20260728, declared: "2025-11-25", wantErr: errUnhonorableUpstreamRevision},
 		// INHERITED, not declared: a peer pins the newer revision by declaring once on a method
 		// that forwards nothing, then omits the declaration forever after. Checking the
 		// declaration alone let exactly that request through.
@@ -175,27 +175,77 @@ func TestRefuseHostRevision_NotificationGetsNoReply(t *testing.T) {
 	}
 }
 
-// TestResolveUpstreamRevision pins the upstream-side rule: an operator pin wins outright,
-// otherwise the upstream's own reported version, and a version this build cannot speak falls
-// back to the default rather than pinning something nobody named.
-func TestResolveUpstreamRevision(t *testing.T) {
+// TestUpstreamOpenRevision pins the upstream-side rule the pin became: the operator's pin
+// selects the revision the leg is OPENED at, and no pin opens with the handshake — the surface
+// every release before the pin existed presented.
+func TestUpstreamOpenRevision(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		configured capability.Revision
-		reported   string
-		want       capability.Revision
+		pin  capability.Revision
+		want capability.Revision
 	}{
-		{configured: "", reported: "2025-11-25", want: capability.Revision20251125},
-		{configured: "", reported: "2026-07-28", want: capability.Revision20260728},
-		{configured: "", reported: "1999-01-01", want: capability.DefaultRevision},
-		{configured: "", reported: "", want: capability.DefaultRevision},
-		{configured: capability.Revision20260728, reported: "2025-11-25", want: capability.Revision20260728},
-		{configured: capability.Revision20251125, reported: "2026-07-28", want: capability.Revision20251125},
+		{pin: "", want: handshakeRevision},
+		{pin: capability.Revision20251125, want: capability.Revision20251125},
+		{pin: capability.Revision20260728, want: capability.Revision20260728},
 	}
 	for _, tc := range cases {
-		if got := resolveUpstreamRevision(tc.configured, tc.reported); got != tc.want {
-			t.Errorf("resolveUpstreamRevision(%q, %q) = %q, want %q", tc.configured, tc.reported, got, tc.want)
+		if got := UpstreamOpenRevision(tc.pin); got != tc.want {
+			t.Errorf("UpstreamOpenRevision(%q) = %q, want %q", tc.pin, got, tc.want)
 		}
+	}
+}
+
+// TestCheckNegotiatedRevision pins the inversion: a handshake's answer is CHECKED against the
+// revision the leg was opened at rather than allowed to set it.
+//
+// The two refusals are the ones the silent downgrade used to hide. A version this build cannot
+// speak resolved to the default, so eunox stamped every later request with a header naming a
+// negotiation that never happened; a speakable version that is not the one offered produced a
+// leg that looked negotiated while eunox spoke a revision over a method that revision removed.
+func TestCheckNegotiatedRevision(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		opened   capability.Revision
+		reported string
+		wantErr  string
+	}{
+		{name: "agrees", opened: capability.Revision20251125, reported: "2025-11-25"},
+		{name: "unspeakable is refused, not downgraded", opened: capability.Revision20251125, reported: "1999-01-01", wantErr: "does not speak"},
+		{name: "empty is refused", opened: capability.Revision20251125, reported: "", wantErr: "does not speak"},
+		{name: "speakable but not the one offered", opened: capability.Revision20251125, reported: "2026-07-28", wantErr: "opened at"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := checkNegotiatedRevision(tc.opened, tc.reported)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("checkNegotiatedRevision(%q, %q) = %v, want nil", tc.opened, tc.reported, err)
+			case tc.wantErr != "" && err == nil:
+				t.Fatalf("checkNegotiatedRevision(%q, %q) = nil, want an error mentioning %q", tc.opened, tc.reported, tc.wantErr)
+			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
+				t.Errorf("error = %q, want it to mention %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestCheckNegotiatedRevision_BoundsTheReflectedVersion: the refusal echoes an
+// upstream-controlled string to an operator's console, so it must be bounded and stripped of
+// anything a terminal would act on — the same rule the host-side -32022 applies to a peer's.
+func TestCheckNegotiatedRevision_BoundsTheReflectedVersion(t *testing.T) {
+	t.Parallel()
+	hostile := "\x1b]0;pwned\x07" + strings.Repeat("A", 8192)
+	err := checkNegotiatedRevision(handshakeRevision, hostile)
+	if err == nil {
+		t.Fatal("a version this build cannot speak must be refused")
+	}
+	if strings.ContainsAny(err.Error(), "\x1b\x07") {
+		t.Error("the refusal reflected control characters from the upstream's version string")
+	}
+	if len(err.Error()) > 4096 {
+		t.Errorf("refusal is %d bytes; an upstream must not be able to size this diagnostic", len(err.Error()))
 	}
 }
 

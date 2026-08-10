@@ -571,9 +571,10 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	}
 
 	sess := newTestSession(&httpSession{
-		done:     make(chan struct{}),
-		upWriter: mcp.NewMsgWriter(io.Discard),
-		upReader: mcp.NewMsgReader(bytes.NewReader(append(line, '\n'))),
+		done:        make(chan struct{}),
+		upWriter:    mcp.NewMsgWriter(io.Discard),
+		upReader:    mcp.NewMsgReader(bytes.NewReader(append(line, '\n'))),
+		upstreamRev: UpstreamOpenRevision(""),
 	})
 	if err := sess.runInitHandshake(); err != nil {
 		t.Fatalf("runInitHandshake: %v", err)
@@ -584,8 +585,11 @@ func TestRunInitHandshake_CapturesServerVersion(t *testing.T) {
 	if sess.upstreamCaps == nil {
 		t.Error("upstreamCaps should also be captured")
 	}
+	// The handshake does not SET the leg's revision — it is decided before the open, and the
+	// handshake's own answer is checked against it. What this asserts is that a conforming
+	// answer leaves the decided value in place.
 	if sess.upstreamRev != capability.Revision20251125 {
-		t.Errorf("upstreamRev = %q, want %q (probed from the handshake's own protocolVersion)", sess.upstreamRev, capability.Revision20251125)
+		t.Errorf("upstreamRev = %q, want %q (decided by the pin before the open, not probed from the reply)", sess.upstreamRev, capability.Revision20251125)
 	}
 }
 

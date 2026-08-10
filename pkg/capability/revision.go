@@ -70,6 +70,15 @@ func (r Revision) String() string { return string(r) }
 // absent or unrecognized value a refusal rather than a negotiation.
 const MetaKeyProtocolVersion = "io.modelcontextprotocol/protocolVersion"
 
+// MetaKeyClientCapabilities is the request `_meta` key a 2026-07-28 client states its own
+// capabilities under, the per-request replacement for the handshake's `capabilities` object.
+//
+// eunox only ever WRITES it, on the leg it opens itself, and writes the empty object its
+// `initialize` params already offer: a proxy advertises no capabilities of its own to an
+// upstream. It is never read off a host message — what a host declares is forwarded verbatim
+// like the rest of `_meta`.
+const MetaKeyClientCapabilities = "io.modelcontextprotocol/clientCapabilities"
+
 // revisionCtxKey is the unexported context key the decided revision travels under, so no
 // package outside this one can plant a revision the transports did not resolve.
 type revisionCtxKey struct{}

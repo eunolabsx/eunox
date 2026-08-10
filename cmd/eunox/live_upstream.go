@@ -21,6 +21,7 @@ import (
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/transport"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // LiveUpstreamInfo holds the tool list and server metadata fetched from a live MCP HTTP
@@ -30,53 +31,62 @@ type LiveUpstreamInfo struct {
 	ServerVersion string // version field from initialize serverInfo; empty if absent
 }
 
-// fetchLiveTools connects to the remote MCP HTTP server at baseURL, performs the initialize
-// handshake, sends tools/list, and returns the live tool set with the server version.
-// baseURL is the server's base URL; "/mcp" is appended automatically.
-func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVerify bool) (LiveUpstreamInfo, error) {
+// fetchLiveTools connects to the remote MCP HTTP server at baseURL, opens the leg at the
+// revision the configured pin selects, sends tools/list, and returns the live tool set with
+// the server version. baseURL is the server's base URL; "/mcp" is appended automatically.
+func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVerify bool, pin capability.Revision) (LiveUpstreamInfo, error) {
 	// Bounded by the caller's liveUpstreamTimeout context, so no separate header cap needed.
 	client := transport.BuildUpstreamClient(tlsSkipVerify, 0)
 	endpoint := transport.UpstreamMCPEndpoint(baseURL)
 
-	// The probe opens with `initialize`, which exists only in the handshake-bearing
-	// revision — so that is the revision this leg speaks, and what its post-handshake
-	// requests declare. Read off the proxy's own method registry (transport.HandshakeRevision)
-	// rather than restated here, so the probe and the running proxy cannot open at different
-	// revisions. A discover-first opener is not implemented yet.
-	handshakeRev := transport.HandshakeRevision()
-	initResp, respHdr, err := transport.DoMCPHTTP(ctx, client, endpoint,
-		transport.BuildInitializeRequestWithID(mcp.RawJSON(`1`)), "", authHeader, handshakeRev)
+	// The SAME resolver the proxy's own legs use, applied to the SAME pin, so a probe cannot
+	// validate an upstream at a revision the running proxy would not open it at — which is the
+	// whole point of validating it. Everything else on this leg follows from that one value:
+	// the opener's method, the version header, and whether the open is completed.
+	rev := transport.UpstreamOpenRevision(pin)
+	opener, err := transport.BuildUpstreamOpenerWithID(rev, mcp.RawJSON(`1`))
+	if err != nil {
+		return LiveUpstreamInfo{}, err
+	}
+	initResp, respHdr, err := transport.DoMCPHTTP(ctx, client, endpoint, opener, "", authHeader, rev)
 	// Capture the session id and arm the terminating DELETE BEFORE the err gate: a lenient
-	// upstream may have already allocated a server-side session even on a failed initialize,
+	// upstream may have already allocated a server-side session even on a failed open,
 	// so it must be closed on every error path, not only success.
 	var sessID string
 	if respHdr != nil {
 		if sessID = respHdr.Get(transport.SessionHeader); sessID != "" {
 			//nolint:contextcheck // teardown deliberately uses the helper's own bounded background context: it runs from the defer as the probe's request context is being canceled.
-			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, handshakeRev, os.Stderr)
+			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, rev, os.Stderr)
 		}
 	}
 	if err != nil {
-		return LiveUpstreamInfo{}, fmt.Errorf("initialize: %w", err)
+		return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", opener.Method, err)
 	}
 
 	// Same checker the proxy uses, so the CLI and proxy can't diverge on what counts as a
-	// valid initialize result (e.g. a `null` result must be rejected).
-	hs, err := transport.ApplyInitializeResult(initResp)
+	// valid open (e.g. a `null` result must be rejected, and a handshake naming a revision
+	// this build does not speak is refused rather than downgraded).
+	hs, err := transport.ApplyUpstreamOpenerResult(rev, initResp)
 	if err != nil {
-		return LiveUpstreamInfo{}, fmt.Errorf("initialize: %w", err)
+		return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", opener.Method, err)
 	}
 	serverVersion := hs.ServerVersion
 
-	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
-	if _, _, err := transport.DoMCPHTTP(ctx, client, endpoint, notif, sessID, authHeader, handshakeRev); err != nil {
-		return LiveUpstreamInfo{}, fmt.Errorf("notifications/initialized: %w", err)
+	if notif, wanted, err := transport.UpstreamOpenerCompletion(rev); err != nil {
+		return LiveUpstreamInfo{}, err
+	} else if wanted {
+		if _, _, err := transport.DoMCPHTTP(ctx, client, endpoint, notif, sessID, authHeader, rev); err != nil {
+			return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", notif.Method, err)
+		}
 	}
 
 	// Page tools/list to exhaustion so the full tool catalog is observed.
 	merged, err := drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
-		req := drift.ToolsListRequest(mcp.RawJSON(`2`), cursor)
-		listResp, _, err := transport.DoMCPHTTP(ctx, client, endpoint, req, sessID, authHeader, handshakeRev)
+		req, err := transport.DeclareUpstreamRevision(drift.ToolsListRequest(mcp.RawJSON(`2`), cursor), rev)
+		if err != nil {
+			return nil, err
+		}
+		listResp, _, err := transport.DoMCPHTTP(ctx, client, endpoint, req, sessID, authHeader, rev)
 		if err != nil {
 			return nil, fmt.Errorf("tools/list: %w", err)
 		}
@@ -104,9 +114,9 @@ const stdioIntrospectShutdownMs = 2000
 // tests can shorten it.
 var liveUpstreamTimeout = 30 * time.Second
 
-// fetchLiveToolsStdio spawns the subprocess, runs the initialize + tools/list handshake
-// over its stdin/stdout, and shuts it down. The stdio peer of fetchLiveTools.
-func fetchLiveToolsStdio(ctx context.Context, command string, args []string) (LiveUpstreamInfo, error) {
+// fetchLiveToolsStdio spawns the subprocess, opens the leg and runs tools/list over its
+// stdin/stdout, and shuts it down. The stdio peer of fetchLiveTools.
+func fetchLiveToolsStdio(ctx context.Context, command string, args []string, pin capability.Revision) (LiveUpstreamInfo, error) {
 	// Cancel rather than call cmd.Process.Kill() directly: os/exec serializes the
 	// context-driven kill with cmd.Wait, so SIGKILL can never race a reaped/recycled PID.
 	procCtx, cancel := context.WithCancel(ctx)
@@ -166,42 +176,53 @@ func fetchLiveToolsStdio(ctx context.Context, command string, args []string) (Li
 
 	// procCtx, not the outer ctx: the handshake must observe the same cancellation as the
 	// subprocess, or an operator's Ctrl-C would surface as a misleading read EOF.
-	info, err := runStdioHandshake(procCtx, w, r)
+	info, err := runStdioHandshake(procCtx, w, r, pin)
 	if err != nil {
 		return LiveUpstreamInfo{}, err
 	}
 	return info, nil
 }
 
-// runStdioHandshake drives initialize -> notifications/initialized -> tools/list over the
-// supplied write/read pair. Factored out so it can be unit-tested without a real subprocess.
-func runStdioHandshake(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader) (LiveUpstreamInfo, error) {
+// runStdioHandshake drives the leg's opener -> its completion -> tools/list over the supplied
+// write/read pair. Factored out so it can be unit-tested without a real subprocess.
+func runStdioHandshake(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader, pin capability.Revision) (LiveUpstreamInfo, error) {
+	rev := transport.UpstreamOpenRevision(pin)
 	const initID = `"_init"`
-	if err := w.Write(transport.BuildInitializeRequestWithID(mcp.RawJSON(initID))); err != nil {
-		return LiveUpstreamInfo{}, fmt.Errorf("initialize: write: %w", err)
+	opener, err := transport.BuildUpstreamOpenerWithID(rev, mcp.RawJSON(initID))
+	if err != nil {
+		return LiveUpstreamInfo{}, err
+	}
+	if err := w.Write(opener); err != nil {
+		return LiveUpstreamInfo{}, fmt.Errorf("%s: write: %w", opener.Method, err)
 	}
 	initResp, err := readResponseWithID(ctx, w, r, initID)
 	if err != nil {
-		return LiveUpstreamInfo{}, fmt.Errorf("initialize: %w", err)
+		return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", opener.Method, err)
 	}
 	// Same checker as the HTTP probe, so the stdio path fails closed on a
-	// null/missing-field result. ApplyInitializeResult also surfaces an upstream error.
-	hs, err := transport.ApplyInitializeResult(initResp)
+	// null/missing-field result. It also surfaces an upstream error.
+	hs, err := transport.ApplyUpstreamOpenerResult(rev, initResp)
 	if err != nil {
-		return LiveUpstreamInfo{}, fmt.Errorf("initialize: %w", err)
+		return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", opener.Method, err)
 	}
 	serverVersion := hs.ServerVersion
 
-	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
-	if err := w.Write(notif); err != nil {
-		return LiveUpstreamInfo{}, fmt.Errorf("notifications/initialized: write: %w", err)
+	if notif, wanted, err := transport.UpstreamOpenerCompletion(rev); err != nil {
+		return LiveUpstreamInfo{}, err
+	} else if wanted {
+		if err := w.Write(notif); err != nil {
+			return LiveUpstreamInfo{}, fmt.Errorf("%s: write: %w", notif.Method, err)
+		}
 	}
 
 	const listID = `"_tools_list"`
 	// FetchAllToolPages follows nextCursor to exhaustion, bounding page/tool counts and
 	// rejecting a repeated cursor.
 	merged, err := drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
-		req := drift.ToolsListRequest(mcp.RawJSON(listID), cursor)
+		req, err := transport.DeclareUpstreamRevision(drift.ToolsListRequest(mcp.RawJSON(listID), cursor), rev)
+		if err != nil {
+			return nil, err
+		}
 		if err := w.Write(req); err != nil {
 			return nil, fmt.Errorf("tools/list: write: %w", err)
 		}
@@ -269,9 +290,9 @@ func readResponseWithID(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader,
 func fetchSpecLive(ctx context.Context, spec initUpstreamSpec) (LiveUpstreamInfo, error) {
 	switch spec.Transport {
 	case config.HostTransportStdio:
-		return fetchLiveToolsStdio(ctx, spec.Command, spec.Args)
+		return fetchLiveToolsStdio(ctx, spec.Command, spec.Args, spec.ProtocolVersion)
 	case config.HostTransportHTTP:
-		return fetchLiveTools(ctx, spec.URL, spec.AuthHeader, spec.TLSSkipVerify)
+		return fetchLiveTools(ctx, spec.URL, spec.AuthHeader, spec.TLSSkipVerify, spec.ProtocolVersion)
 	default:
 		// Fail closed rather than probing an unrecognized transport as HTTP; the structural
 		// guard against a future third transport silently inheriting the HTTP probe.
@@ -294,6 +315,10 @@ func fetchRouteLive(ctx context.Context, u *config.UpstreamConfig) (LiveUpstream
 		TLSSkipVerify: u.UpstreamTLSSkipVerify,
 		Command:       u.Command,
 		Args:          u.Args,
+		// The route's own pin, so `validate --live` opens this upstream exactly as
+		// `eunox proxy --config` would. Probing a pinned upstream at the handshake revision
+		// would report a drift verdict for a leg the proxy never opens.
+		ProtocolVersion: u.ResolvedProtocolVersion(),
 	})
 	if err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("upstream %q: %w", u.Name, err)

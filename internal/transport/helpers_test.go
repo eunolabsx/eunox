@@ -315,6 +315,9 @@ type httpProxyOptions struct {
 	UpstreamURL           string // base URL of remote MCP server, e.g. https://mcp.stripe.com
 	UpstreamAuthHeader    string // header line forwarded to upstream, e.g. "Authorization: Bearer sk-..."
 	UpstreamTLSSkipVerify bool   // skip TLS verification (dev only; logs a loud warning)
+	// UpstreamProtocolVersion is the route's revision pin, which selects how the upstream leg
+	// is opened. Empty opens with the handshake, as `auto` does.
+	UpstreamProtocolVersion capability.Revision
 
 	Audit              bool // observe mode: evaluate and log, but forward instead of block
 	RequireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
@@ -344,17 +347,18 @@ func newHTTPProxy(opts httpProxyOptions) *HTTPProxy {
 		transport = "http"
 	}
 	route := &UpstreamRoute{
-		name:                  "",
-		transport:             transport,
-		command:               opts.Command,
-		args:                  opts.Args,
-		upstreamURL:           opts.UpstreamURL,
-		upstreamAuthHeader:    opts.UpstreamAuthHeader,
-		upstreamTLSSkipVerify: opts.UpstreamTLSSkipVerify,
-		pdp:                   opts.PDP,
-		audit:                 opts.Audit,
-		driftCheck:            opts.DriftCheck,
-		sink:                  &routeSink{sink: opts.Sink},
+		name:                    "",
+		transport:               transport,
+		command:                 opts.Command,
+		args:                    opts.Args,
+		upstreamURL:             opts.UpstreamURL,
+		upstreamAuthHeader:      opts.UpstreamAuthHeader,
+		upstreamTLSSkipVerify:   opts.UpstreamTLSSkipVerify,
+		upstreamProtocolVersion: opts.UpstreamProtocolVersion,
+		pdp:                     opts.PDP,
+		audit:                   opts.Audit,
+		driftCheck:              opts.DriftCheck,
+		sink:                    &routeSink{sink: opts.Sink},
 	}
 	return NewHTTPProxyGateway(HTTPGatewayOptions{
 		Routes:             map[string]*UpstreamRoute{"": route},

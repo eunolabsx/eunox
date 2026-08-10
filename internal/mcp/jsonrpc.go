@@ -288,6 +288,15 @@ const MethodInitialize = "initialize"
 // silently drop it and leave a strict upstream refusing subsequent requests.
 const MethodNotificationsInitialized = "notifications/initialized"
 
+// MethodServerDiscover is the 2026-07-28 discovery request, which replaces the handshake as
+// the way a leg on that revision is opened: it carries no session and negotiates no version
+// (the client declares one per request), so what it yields is the same server facts
+// `initialize` returns rather than a negotiation.
+//
+// Beside MethodInitialize for the same reason: eunox opens legs with one or the other, and a
+// typo in either would silently misroute an opener at the several sites that build one.
+const MethodServerDiscover = "server/discover"
+
 // NotificationMsg builds a JSON-RPC 2.0 notification (no id).
 func NotificationMsg(method string, params interface{}) (RPCMsg, error) { //nolint:unparam // method is always MethodNotificationsInitialized today; kept generic for future use
 	var p json.RawMessage

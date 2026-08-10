@@ -44,7 +44,7 @@ func TestFetchLiveTools_HappyPath(t *testing.T) {
 	srv := httptest.NewServer(http.StripPrefix("/mcp", fake))
 	t.Cleanup(srv.Close)
 
-	info, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	info, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestFetchLiveTools_EmptyToolList(t *testing.T) {
 	srv := httptest.NewServer(http.StripPrefix("/mcp", fake))
 	t.Cleanup(srv.Close)
 
-	info, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	info, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestFetchLiveTools_EmptyToolList(t *testing.T) {
 // TestFetchLiveTools_ConnectionRefused verifies that a refused connection
 // produces an error.
 func TestFetchLiveTools_ConnectionRefused(t *testing.T) {
-	_, err := fetchLiveTools(context.Background(), "http://127.0.0.1:1", "", false)
+	_, err := fetchLiveTools(context.Background(), "http://127.0.0.1:1", "", false, "")
 	if err == nil {
 		t.Error("expected error for refused connection, got nil")
 	}
@@ -130,7 +130,7 @@ func TestFetchLiveTools_InitializeRPCError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err == nil {
 		t.Fatal("expected error for RPC error response, got nil")
 	}
@@ -147,7 +147,7 @@ func TestFetchLiveTools_UpstreamHTTP500(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err == nil {
 		t.Fatal("expected error for HTTP 500, got nil")
 	}
@@ -174,7 +174,7 @@ func TestFetchLiveTools_AuthHeaderForwarded(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	const wantAuth = "Bearer live-test-token"
-	_, err := fetchLiveTools(context.Background(), srv.URL, "Authorization: "+wantAuth, false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "Authorization: "+wantAuth, false, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools: %v", err)
 	}
@@ -195,13 +195,13 @@ func TestFetchLiveTools_TLSSkipVerify(t *testing.T) {
 	t.Cleanup(tlsSrv.Close)
 
 	// Without skip-verify: self-signed cert should cause an error.
-	_, err := fetchLiveTools(context.Background(), tlsSrv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), tlsSrv.URL, "", false, "")
 	if err == nil {
 		t.Error("expected TLS error without skip-verify, got nil")
 	}
 
 	// With skip-verify: should succeed despite the self-signed certificate.
-	info, err := fetchLiveTools(context.Background(), tlsSrv.URL, "", true)
+	info, err := fetchLiveTools(context.Background(), tlsSrv.URL, "", true, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools with skip-verify: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestFetchLiveTools_BaseURLTrailingSlash(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	// Pass URL with trailing slash.
-	info, err := fetchLiveTools(context.Background(), srv.URL+"/", "", false)
+	info, err := fetchLiveTools(context.Background(), srv.URL+"/", "", false, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools with trailing slash: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestFetchLiveTools_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before the call
 
-	_, err := fetchLiveTools(ctx, "http://127.0.0.1:19999", "", false)
+	_, err := fetchLiveTools(ctx, "http://127.0.0.1:19999", "", false, "")
 	if err == nil {
 		t.Error("expected error for canceled context, got nil")
 	}
@@ -262,7 +262,7 @@ func TestFetchLiveTools_SendsTerminatingDelete(t *testing.T) {
 	srv := httptest.NewServer(http.StripPrefix("/mcp", wrapped))
 	t.Cleanup(srv.Close)
 
-	if _, err := fetchLiveTools(context.Background(), srv.URL, "", false); err != nil {
+	if _, err := fetchLiveTools(context.Background(), srv.URL, "", false, ""); err != nil {
 		t.Fatalf("fetchLiveTools: %v", err)
 	}
 
@@ -300,7 +300,7 @@ func TestFetchLiveTools_DeletesSessionOnFailedInitialize(t *testing.T) {
 	})))
 	t.Cleanup(srv.Close)
 
-	_, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err == nil {
 		t.Fatal("expected an initialize error from the non-2xx response, got nil")
 	}
@@ -532,7 +532,7 @@ func TestRunStdioHandshake_RejectsServerInitiatedRequest(t *testing.T) {
 		_ = w.Write(mcp.RPCMsg{JSONRPC: "2.0", ID: listMsg.ID, Result: toolsResult})
 	})
 
-	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err != nil {
 		t.Fatalf("handshake must complete despite the server-initiated request: %v", err)
@@ -548,7 +548,7 @@ func TestRunStdioHandshake_HappyPath(t *testing.T) {
 		{"name": "write_file"},
 	}))
 
-	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err != nil {
 		t.Fatalf("runStdioHandshake: %v", err)
@@ -577,7 +577,7 @@ func TestRunStdioHandshake_InitializeErrorPropagates(t *testing.T) {
 		})
 	})
 
-	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err == nil {
 		t.Fatal("want error from initialize failure, got nil")
@@ -608,7 +608,7 @@ func TestRunStdioHandshake_ToolsListErrorPropagates(t *testing.T) {
 		})
 	})
 
-	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err == nil {
 		t.Fatal("want error from tools/list failure, got nil")
@@ -630,7 +630,7 @@ func TestRunStdioHandshake_UnexpectedResponseID(t *testing.T) {
 		})
 	})
 
-	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err == nil {
 		t.Fatal("want protocol error for mismatched response id, got nil")
@@ -680,7 +680,7 @@ func TestRunStdioHandshake_InvalidInitializeResultFailsClosed(t *testing.T) {
 				}
 			})
 
-			_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+			_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 			srv.close()
 			if err == nil {
 				t.Fatalf("want fail-closed error for %s, got nil", tc.name)

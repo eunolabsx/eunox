@@ -22,6 +22,19 @@ type InitResult struct {
 	Instructions    string                 `json:"instructions,omitempty"`
 }
 
+// DiscoverResult is the result field of a `server/discover` response — the 2026-07-28 way a
+// leg is opened.
+//
+// It carries no protocolVersion: that revision negotiates none, the client declares one on
+// every request, so there is no field here for an upstream to answer with. The rest is the
+// same server description `initialize` returns, which is what lets one UpstreamHandshake serve
+// both openers.
+type DiscoverResult struct {
+	Capabilities map[string]interface{} `json:"capabilities"`
+	ServerInfo   map[string]interface{} `json:"serverInfo"`
+	Instructions string                 `json:"instructions,omitempty"`
+}
+
 // ToolCallParams is the params field of a `tools/call` request.
 type ToolCallParams struct {
 	Name      string                 `json:"name"`

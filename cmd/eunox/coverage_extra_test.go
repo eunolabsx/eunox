@@ -826,7 +826,7 @@ func TestFetchLiveTools_ToolsListRPCError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err == nil {
 		t.Fatal("expected an error from the tools/list RPC error, got nil")
 	}
@@ -907,7 +907,7 @@ func TestFetchLiveTools_NotificationPostFails(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err == nil {
 		t.Fatal("expected an error from the failed notification POST, got nil")
 	}
@@ -931,7 +931,7 @@ func TestFetchLiveTools_MalformedToolsResult(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err == nil {
 		t.Fatal("expected a parse error from a malformed tools/list result, got nil")
 	}
@@ -946,7 +946,7 @@ func TestRunStdioHandshake_InitWriteError(t *testing.T) {
 	w := mcp.NewMsgWriter(pw)
 	r := mcp.NewMsgReader(pr)
 
-	_, err := runStdioHandshake(context.Background(), w, r)
+	_, err := runStdioHandshake(context.Background(), w, r, "")
 	if err == nil {
 		t.Fatal("expected an initialize write error against a closed pipe, got nil")
 	}
@@ -978,7 +978,7 @@ func TestRunStdioHandshake_ToolsListWriteError(t *testing.T) {
 		_ = srv.cToS_w.Close()
 	})
 
-	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err == nil {
 		t.Fatal("expected a tools/list write error after the reader side closed, got nil")
@@ -1172,7 +1172,7 @@ func TestFetchLiveTools_PaginatesToExhaustion(t *testing.T) {
 	srv := httptest.NewServer(http.StripPrefix("/mcp", pagingToolsHandler(t)))
 	t.Cleanup(srv.Close)
 
-	info, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	info, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err != nil {
 		t.Fatalf("fetchLiveTools: %v", err)
 	}
@@ -1216,7 +1216,7 @@ func TestRunStdioHandshake_PaginatesToExhaustion(t *testing.T) {
 			Result: json.RawMessage(`{"tools":[{"name":"page2"}]}`)})
 	})
 
-	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	info, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err != nil {
 		t.Fatalf("runStdioHandshake: %v", err)
@@ -1460,7 +1460,7 @@ func TestFetchLiveTools_ToolsListHTTPError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := fetchLiveTools(context.Background(), srv.URL, "", false)
+	_, err := fetchLiveTools(context.Background(), srv.URL, "", false, "")
 	if err == nil {
 		t.Fatal("expected a transport error from the tools/list HTTP 500, got nil")
 	}
@@ -1500,7 +1500,7 @@ func TestRunStdioHandshake_ToolsListServerErrorAfterRead(t *testing.T) {
 		})
 	})
 
-	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err == nil {
 		t.Fatal("expected an error from the tools/list JSON-RPC error, got nil")
@@ -1538,7 +1538,7 @@ func TestRunStdioHandshake_MalformedToolsResult(t *testing.T) {
 			Result: json.RawMessage(`{"tools": 123}`)})
 	})
 
-	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err == nil {
 		t.Fatal("expected a parse error from a malformed stdio tools/list result, got nil")
@@ -1615,7 +1615,7 @@ func TestRunStdioHandshake_NotificationWriteError(t *testing.T) {
 		_ = srv.cToS_w.Close()
 	})
 
-	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR)
+	_, err := runStdioHandshake(context.Background(), srv.clientW, srv.clientR, "")
 	srv.close()
 	if err == nil {
 		t.Fatal("expected a notifications/initialized write error, got nil")

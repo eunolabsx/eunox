@@ -127,13 +127,12 @@ type StdioProxy struct {
 	upstreamServerVersion string
 	upstreamInstructions  string
 
-	// upstreamRev is the protocol revision this proxy speaks to its upstream, pinned once
-	// at the handshake (configuredUpstreamRev overriding the probe) and read-only after. It
+	// upstreamRev is the protocol revision this proxy speaks to its upstream, decided at
+	// CONSTRUCTION from the operator's pin (upstreamOpenRevision) and read-only after — it
+	// selects the opener, so it cannot be a conclusion drawn from the opener's own reply. It
 	// is tracked apart from the host side because the two peers migrate independently —
 	// standing between a pair that disagrees is the whole reason a proxy exists.
 	upstreamRev capability.Revision
-	// configuredUpstreamRev is the operator's explicit pin, empty for "probe it".
-	configuredUpstreamRev capability.Revision
 
 	// hostRev is the revision this host connection's context resolved, pinned from its first
 	// message the resolved revision DISPATCHES in the framing it arrived in (see
@@ -304,9 +303,9 @@ type StdioProxyOptions struct {
 	DriftCheck drift.CheckFunc
 
 	// UpstreamProtocolVersion pins the protocol revision this proxy speaks to its upstream,
-	// overriding what the handshake reports. Empty (the default) probes: the upstream's own
-	// reported version wins, falling back to capability.DefaultRevision when it names one
-	// this build does not speak.
+	// which SELECTS the opener rather than relabelling a leg opened some other way. Empty
+	// (the default) opens with the handshake, and the upstream's reported version must then
+	// agree with it — see upstreamOpenRevision and checkNegotiatedRevision.
 	UpstreamProtocolVersion capability.Revision
 
 	// OnReady, when non-nil, runs inside Start once the session is live and before the host
@@ -354,7 +353,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		requireAuditStrict:    opts.RequireAuditStrict,
 		taskAnchored:          opts.TaskAnchoredState,
 		driftCheck:            opts.DriftCheck,
-		configuredUpstreamRev: opts.UpstreamProtocolVersion,
+		upstreamRev:           UpstreamOpenRevision(opts.UpstreamProtocolVersion),
 		honorAttribution:      opts.HonorAttribution,
 		receipts:              opts.EffectReceipts,
 		onReady:               opts.OnReady,
@@ -574,6 +573,11 @@ func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 		// A transport-level POST failure is reported back through upErr so the waiting
 		// caller records a deny/UPSTREAM_ERROR (matching the gateway) rather than an allow.
 		up.reportErr = p.reportUpstreamErr
+		// Pinned HERE, before the opener runs, not after it returns: on a declaring leg the
+		// opener is an ordinary request and carries the MCP-Protocol-Version header like any
+		// other, so a bridge still holding the empty revision would open the leg naming a
+		// version this proxy is not speaking.
+		up.setRevision(p.upstreamRev)
 		p.upHTTP = up
 		p.upWriter = up
 		p.upReader = up
@@ -798,9 +802,9 @@ func (p *StdioProxy) httpBridgeStartCtx(ctx context.Context) (context.Context, c
 	return context.WithTimeout(ctx, p.startupBudget())
 }
 
-// initUpstream performs the MCP initialize handshake with the upstream server.
-// ctx bounds the synchronous notifications/initialized delivery on the remote-
-// HTTP bridge path.
+// initUpstream opens the upstream leg at the revision this proxy speaks (p.upstreamRev): the
+// MCP initialize handshake, or `server/discover` on a declaring leg. ctx bounds the
+// synchronous notifications/initialized delivery on the remote-HTTP bridge path.
 func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	// Bound the whole remote-HTTP-bridge handshake by the session-start budget (a no-op on
 	// the subprocess path): runBoundedStartup does not wrap the HTTP path with a deadline,
@@ -810,7 +814,10 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	defer cancel()
 
 	p.idCounter++
-	initReq, initID := buildInitializeRequest(p.idCounter)
+	initReq, initID, err := buildUpstreamOpener(p.upstreamRev, p.idCounter)
+	if err != nil {
+		return err
+	}
 	// POST via the context-aware path and read via readProbeReply so the handshake honors
 	// ctx.Done(): the bridge's plain Read selects only on incoming/done, and a POST can be
 	// dropped on an already-canceled ctx, so a signal during a slow handshake would otherwise
@@ -831,30 +838,26 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 		p.upWriter,
 		func(msg mcp.RPCMsg) {
 			_, _ = fmt.Fprintf(p.errOut(),
-				"[eunox] debug: discarding upstream message during initialize handshake (method=%q).\n",
-				msg.Method)
+				"[eunox] debug: discarding upstream message while opening the upstream leg with %q (method=%q).\n",
+				initReq.Method, msg.Method)
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("reading initialize response: %w", err)
+		return fmt.Errorf("reading %s response: %w", initReq.Method, err)
 	}
-	hs, err := applyInitializeResult(resp)
+	hs, err := ApplyUpstreamOpenerResult(p.upstreamRev, resp)
 	if err != nil {
 		return err
 	}
 	p.upstreamCaps, p.upstreamServerVersion, p.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
-	// Pin the upstream-side revision once, here: every later leg (the MCP-Protocol-Version
-	// header, drift, the dispatch decisions taken against this upstream) must read one
-	// answer, not re-derive it from a handshake result that is no longer in scope.
-	p.upstreamRev = resolveUpstreamRevision(p.configuredUpstreamRev, hs.ProtocolVersion)
-	if p.upHTTP != nil {
-		p.upHTTP.setRevision(p.upstreamRev)
-	}
 
-	// Send `initialized` notification to upstream.
-	notif, err := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
+	// Close the handshake, on the one revision that has one to close.
+	notif, wanted, err := UpstreamOpenerCompletion(p.upstreamRev)
 	if err != nil {
 		return err
+	}
+	if !wanted {
+		return nil
 	}
 	// For the remote-HTTP bridge, Write is fire-and-forget, so the host's first request
 	// could race notifications/initialized and trip strict upstreams; deliver it

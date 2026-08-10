@@ -149,6 +149,10 @@ type initUpstreamSpec struct {
 	TLSSkipVerify bool     // http: introspected with --upstream-tls-skip-verify
 	Command       string   // stdio: subprocess command
 	Args          []string // stdio: subprocess args
+	// ProtocolVersion is the operator's per-upstream revision pin, which selects the opener
+	// the probe uses — empty (the default) opens with the handshake, as `init` always does:
+	// it is pointed at an upstream no config has yet described.
+	ProtocolVersion capability.Revision
 }
 
 // initRouteName is the placeholder route name `eunox init` scaffolds; it becomes the

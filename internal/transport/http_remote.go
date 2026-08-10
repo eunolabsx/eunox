@@ -211,8 +211,8 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		clientIP:       clientIP,
 		// See newSession: a session is minted by `initialize`, which is the older revision's
 		// method, so opening one negotiates that revision for the context's life.
-		hostRev:        handshakeRevision,
-		upstreamRevPin: route.upstreamProtocolVersion,
+		hostRev:     handshakeRevision,
+		upstreamRev: UpstreamOpenRevision(route.upstreamProtocolVersion),
 	}
 	// Marks initializing until this returns (after the drift check) so the idle reaper
 	// doesn't tear it down mid-establishment — same guard as local-subprocess newSession.
@@ -259,12 +259,15 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	return sess, nil
 }
 
-// initRemoteUpstream performs the MCP initialize handshake with the remote upstream:
-// sends initialize, captures the upstream Mcp-Session-Id, stores the server capabilities,
-// then sends notifications/initialized.
+// initRemoteUpstream opens the remote upstream leg at the revision this session speaks: sends
+// the opener, captures the upstream Mcp-Session-Id, stores the server capabilities, then
+// completes the open on the revision that has a completion.
 func (s *httpSession) initRemoteUpstream(ctx context.Context) error {
 	s.idCounter++
-	initReq, _ := buildInitializeRequest(s.idCounter)
+	initReq, _, err := buildUpstreamOpener(s.upstreamRev, s.idCounter)
+	if err != nil {
+		return err
+	}
 
 	respMsg, respHdr, err := s.doRemoteHTTP(ctx, initReq, "")
 	// Capture the session ID the instant headers arrive, BEFORE any gate: a non-2xx, a
@@ -276,26 +279,26 @@ func (s *httpSession) initRemoteUpstream(ctx context.Context) error {
 		s.upstreamSessID = respHdr.Get(SessionHeader)
 	}
 	if err != nil {
-		return fmt.Errorf("sending initialize: %w", err)
+		return fmt.Errorf("sending %s: %w", initReq.Method, err)
 	}
 	// Correlate by shape via the shared rule (same as callRemoteUpstream and the stdio
 	// bridge): a wrong-id reply is refused even as an error, since re-stamping it would let
 	// an adversarial upstream inject one caller's error into this handshake.
 	respMsg, err = correlateUpstreamReply(initReq, respMsg)
 	if err != nil {
-		return fmt.Errorf("upstream initialize: %w", err)
+		return fmt.Errorf("upstream %s: %w", initReq.Method, err)
 	}
 
-	hs, err := applyInitializeResult(respMsg)
+	hs, err := ApplyUpstreamOpenerResult(s.upstreamRev, respMsg)
 	if err != nil {
 		return err
 	}
 	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
-	// Pin the upstream-side revision once, at the handshake: every later leg reads this one
-	// answer rather than re-deriving it from a result no longer in scope.
-	s.upstreamRev = resolveUpstreamRevision(s.upstreamRevPin, hs.ProtocolVersion)
 
-	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
+	notif, wanted, err := UpstreamOpenerCompletion(s.upstreamRev)
+	if err != nil || !wanted {
+		return err
+	}
 	_, _, err = s.doRemoteHTTP(ctx, notif, s.upstreamSessID)
 	return err
 }
@@ -348,8 +351,10 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	// The spec requires the client to advertise both JSON and SSE content types so the
 	// server may answer either way.
 	req.Header.Set("Accept", CTJSON+", "+ctSSE)
-	// Every post-handshake request must carry the negotiated protocol version; the
-	// initialize request precedes negotiation and must not.
+	// Every post-handshake request must carry the negotiated protocol version; `initialize`
+	// is the one request that PERFORMS that negotiation, so it precedes the header and must
+	// not carry it. The other opener does: `server/discover` negotiates nothing, it is an
+	// ordinary request of a revision the client has already declared.
 	if msg.Method != mcp.MethodInitialize {
 		setNegotiatedVersionHeader(req, rev)
 	}
@@ -538,10 +543,13 @@ func (s *httpSession) doRemoteHTTP(ctx context.Context, msg mcp.RPCMsg, sessID s
 //
 // The value is upstreamAddressedRevision's, which the honorability check reads too — a request
 // this proxy refuses to forward and the header it would have forwarded it under must never be
-// two independent expressions. It must not be SUPPRESSED for a leg pinned newer: omitting the
-// header without emitting a replacement leaves the request with no version signal at all,
-// which a conformant upstream answers with 400 (including the terminating DELETE, whose
-// failure leaks the upstream session).
+// two independent expressions. That expression is now the revision the leg was OPENED at, so a
+// pinned leg is headed as what it speaks rather than as the handshake revision it was once
+// opened at regardless.
+//
+// It is never SUPPRESSED: omitting the header without emitting a replacement leaves the
+// request with no version signal at all, which a conformant upstream answers with 400
+// (including the terminating DELETE, whose failure leaks the upstream session).
 func setNegotiatedVersionHeader(req *http.Request, rev capability.Revision) {
 	req.Header.Set("MCP-Protocol-Version", upstreamAddressedRevision(rev).String())
 }
