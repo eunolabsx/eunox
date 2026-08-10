@@ -75,11 +75,9 @@ type httpSession struct {
 	// session (as tests build), which records unbounded rather than panicking.
 	upstreamDenies *categoryRecordLimiter
 
-	// noticeFloor is this session's reserved diagnostic line per notice class, spent only where
-	// the ROUTE's bucket refuses (see noticeReserve). The notice half's answer to the same
-	// question upstreamDenies answers for records, one mechanism weaker on purpose: a session gets
-	// an arrival rather than a rate, since what a sibling's flood takes from an operator is the
-	// first line saying this session's upstream is down too. Zero value ready.
+	// noticeFloor is this session's reserved diagnostic line per notice class — the notice half's
+	// answer to the question upstreamDenies answers for records, deliberately a floor rather than
+	// buckets. See noticeReserve for that decision; zero value ready.
 	noticeFloor noticeReserve
 
 	upstreamCaps          map[string]interface{}

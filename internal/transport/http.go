@@ -785,11 +785,17 @@ func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 // and a leg that has a session but resolves its channel from the route alone loses the floor
 // silently. A nil session is a pre-session leg — it has no floor and needs none, since a refusal
 // taken before a session exists is attributable to no session.
+//
+// A session's table comes from the SESSION's own route, not from the caller's, so the pair cannot
+// be mismatched: reserving against one tenant's floor while charging another's bucket is a fault
+// nothing downstream could detect, and taking two arguments is what would make it expressible.
+// route is consulted only for a leg that has no session to ask.
 func (p *HTTPProxy) sessionNoticeWriter(sess *httpSession, route *UpstreamRoute) noticeWriter {
-	w := p.routeNoticeWriter(route)
-	if sess != nil {
-		w.reserve = &sess.noticeFloor
+	if sess == nil {
+		return p.routeNoticeWriter(route)
 	}
+	w := p.routeNoticeWriter(sess.route)
+	w.reserve = &sess.noticeFloor
 	return w
 }
 

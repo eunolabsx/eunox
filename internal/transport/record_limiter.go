@@ -690,11 +690,7 @@ func (l *recordRateLimiter) admit() (ok bool, suppressed uint64) {
 
 // suppress counts a refusal elided by an OUTER gate that never reached admit (spends no
 // token), keeping the rollup complete regardless of which layer did the eliding.
-func (l *recordRateLimiter) suppress() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.suppressed++
-}
+func (l *recordRateLimiter) suppress() { l.suppressN(1) }
 
 // suppressN returns n refusals to this bucket's tally, for a record this bucket ADMITTED that an
 // outer tier then refused. The token it spent is deliberately not returned: the outer tier's
