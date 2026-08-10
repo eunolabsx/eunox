@@ -212,7 +212,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		// must be refused without that side effect. Answering initialize is itself the
 		// negotiation, so the only admissible declaration here is the revision that defines
 		// the method.
-		rev, ok := p.negotiateHostRevision(w, r, route, sessionlessLeg(), msg)
+		rev, ok := p.negotiateHostRevision(w, r, route, nil, msg)
 		if !ok {
 			return
 		}
@@ -310,7 +310,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// notification gate. Hand-placing them here is what left this arm negotiating
 			// nothing at all while stdio recorded UNSUPPORTED_PROTOCOL_VERSION for identical
 			// bytes.
-			rev, ok := p.negotiateHostRevision(w, r, route, sessionlessLeg(), msg)
+			rev, ok := p.negotiateHostRevision(w, r, route, nil, msg)
 			if !ok {
 				return
 			}
@@ -400,12 +400,10 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	}
 	// Negotiate FIRST: every table below is revision-scoped, so resolving after the lookup
 	// would route by one table and record under another.
-	rev, ok := p.negotiateHostRevision(w, r, route, sess.leg(), msg)
+	// A refused host RESPONSE also unblocks the upstream request it would have answered; that
+	// is the shared prologue's, reached by handing it the SESSION rather than the session's leg.
+	rev, ok := p.negotiateHostRevision(w, r, route, sess, msg)
 	if !ok {
-		// A refused host RESPONSE would have answered a request the upstream is blocked on.
-		// Unblock it rather than let it hang: a protocol refusal is not an emergency stop, and
-		// eunox answers with its own error at its own revision — see unblockRefusedServerReply.
-		sess.unblockRefusedServerReply(r.Context(), msg)
 		return
 	}
 	// The stamped context is the ONE carrier of the decided revision from here down: the
@@ -1134,17 +1132,6 @@ const (
 	killDimensionSession = "session"
 )
 
-// hostLeg is what revision negotiation needs to know about the connection a message arrived on.
-//
-// A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
-// and three bare arguments at those call sites read as an oversight rather than as the fact
-// they are: no session established, and no upstream leg their message could reach.
-type hostLeg struct {
-	contextRev  capability.Revision
-	upstreamRev capability.Revision
-	sessionID   string
-}
-
 // sessionlessLeg is the leg every pre-session arm negotiates against: `initialize` exists only
 // in the handshake-bearing revision, so that is the context, and nothing this arm answers
 // reaches an upstream.
@@ -1185,21 +1172,49 @@ func (s *httpSession) leg() hostLeg {
 // which enumerates the arms rather than the calls — a guard phrased as "who may call the
 // primitives" is blind to an arm that calls neither, which is how an entry point came to
 // negotiate nothing at all.
-func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, leg hostLeg, msg mcp.RPCMsg) (capability.Revision, bool) {
-	rev, err := resolveHostRevision(leg.contextRev, leg.upstreamRev, msg)
-	if err == nil {
-		return rev, true
+func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg) (capability.Revision, bool) {
+	return hostMessageGate{
+		leg:      sessionLeg(sess),
+		recorder: func() auditRecorder { return p.revisionRefusalRecorder(route) },
+		// A zero response is one JSON-RPC forbids replying to. This peer is waiting on an HTTP
+		// response either way, so the drop is acked bodyless rather than left silent — the same
+		// answer every other fire-and-forget refusal on this transport gives.
+		refuse: func(resp mcp.RPCMsg) {
+			if resp.IsZero() {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			writeJSONMsg(w, resp)
+		},
+		// A refused host RESPONSE would have answered a request the upstream is blocked on;
+		// unblock it rather than let it hang. A protocol refusal is not an emergency stop, and
+		// eunox can answer with its own error at its own revision without relaying anything the
+		// host said. Nil on the sessionless arms: their messages reach no upstream, so there is
+		// nothing blocked to answer.
+		unblock: sessionUnblockRefusedServerReply(sess),
+	}.negotiate(r.Context(), msg)
+}
+
+// sessionLeg is the leg a message on this session negotiates against, or the pre-session one
+// when there is no session. Taking the SESSION rather than an already-built hostLeg is what
+// pairs the leg's facts with the leg's unblocker: a caller could otherwise hand over a
+// session's revisions while its blocked initiator went unanswered, which is exactly the split
+// that left the unblock at HTTP's call site instead of in its prologue.
+func sessionLeg(sess *httpSession) hostLeg {
+	if sess == nil {
+		return sessionlessLeg()
 	}
-	// Rate-limited like every other caller-driven refusal: a suppressed record still gets its
-	// -32022 on the wire, so the peer is refused either way — what the bucket bounds is the
-	// tape write, which is the part a flood turns into an availability problem.
-	resp := refuseHostRevision(r.Context(), p.revisionRefusalRecorder(route), leg.sessionID, leg.contextRev, msg, err)
-	if msg.IsRequest() {
-		writeJSONMsg(w, resp)
-	} else {
-		w.WriteHeader(http.StatusAccepted)
+	return sess.leg()
+}
+
+// sessionUnblockRefusedServerReply adapts a session's unblock to the shared prologue's hook,
+// answering nil for a leg that has no session — whose messages reach no upstream, so there is
+// nothing blocked to answer.
+func sessionUnblockRefusedServerReply(sess *httpSession) func(context.Context, mcp.RPCMsg) {
+	if sess == nil {
+		return nil
 	}
-	return "", false
+	return sess.unblockRefusedServerReply
 }
 
 // routeHostServerResponse routes a host POST that is neither request nor notification: a

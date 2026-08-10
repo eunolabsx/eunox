@@ -319,15 +319,46 @@ upstreams:
     protocolVersion: auto        # auto (default) | "2025-11-25" | "2026-07-28"
 ```
 
-The `proxy --audit` wiretap equivalent is `--upstream-protocol-version` (remote
-`--upstream-url` upstreams only — a subprocess upstream speaks the handshake it is
-given). A value this build does not speak is refused at load, not at the first
-request.
+The `proxy --audit` wiretap equivalent is `--upstream-protocol-version`, on either
+upstream transport. A value this build does not speak is refused at load, not at the
+first request.
 
-The pin names the revision eunox speaks to that upstream; it does not yet change the
-opener. Every upstream leg is opened with `initialize`, so the `MCP-Protocol-Version`
-header its post-handshake requests carry names the handshake revision regardless of
-the pin.
+The pin **selects the opener**, and everything else about the leg follows from it:
+
+| | `auto` (the default) | `protocolVersion: "2026-07-28"` |
+|---|---|---|
+| opened with | `initialize` | `server/discover` |
+| open completed with | `notifications/initialized` | nothing — no handshake to close |
+| `MCP-Protocol-Version` header | `2025-11-25` | `2026-07-28` |
+| eunox's own requests declare `_meta` | no | yes (`io.modelcontextprotocol/protocolVersion` + `clientCapabilities`) |
+| a host message must resolve to | `2025-11-25` | `2026-07-28` |
+
+`auto` is byte-identical to what every release before the revision-selected opener
+sent, deliberately. ADR-0006 also describes a **probe** for `auto` — open with
+`server/discover`, fall back to `initialize` on method-not-found — and that half is
+not activated: it changes what every existing 2025-11-25 upstream sees before eunox
+knows anything about it, and its arbiter is the interop matrix the plan tracks as
+W13. Pinning needs neither, because an operator who writes the pin has stated the
+fact the probe would have gone looking for.
+
+Two consequences of the pin worth stating before you set it:
+
+- **A pinned leg is a matched pair only for a host on the same revision.** A
+  2025-11-25 host in front of an upstream pinned to `2026-07-28` has every
+  forwarding method refused `UNSUPPORTED_PROTOCOL_VERSION` (`-32022`), because
+  translating that pair is what the mismatched-pair boundary governs and this
+  release does not implement it. Pin the upstream when the host declares the same
+  revision, not before.
+- **eunox declares only on the requests it originates** — the opener and the
+  session-start `tools/list` drift probe. A host's own params are still forwarded
+  verbatim, `_meta` included, so a host on a declaring leg must carry its own
+  per-request declaration; on a matched pair it already does.
+
+The handshake's own answer is now **checked** rather than allowed to set the leg's
+revision. An upstream answering `initialize` with a `protocolVersion` this build does
+not speak, or with a speakable revision other than the one offered, is refused at
+session start. It used to resolve silently to `2025-11-25`, so eunox stamped every
+later request with a header naming a negotiation that never happened.
 
 A host request's own `_meta` declaration is forwarded **verbatim** — nothing strips or
 rewrites `_meta`. Rewriting it to match the leg is translation, which the mismatched-pair

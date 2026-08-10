@@ -1274,15 +1274,26 @@ func (p *StdioProxy) noticeWriter() noticeWriter {
 // ok=false means the message was refused: the record is written either way, and a REQUEST
 // also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
 // serveHost, the single goroutine that owns the pin.
+//
+// The negotiation itself, its refusal, and the debt a refused host RESPONSE owes its blocked
+// initiator are hostMessageGate's — shared with the HTTP prologue, so this transport holds only
+// what is genuinely its own: the pin, the stamp, and what a stream peer is sent when JSON-RPC
+// forbids a reply.
 func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (context.Context, bool) {
 	pinned := p.hostRevision()
-	rev, err := resolveHostRevision(pinned, p.upstreamRev, msg)
-	if err != nil {
-		resp := refuseHostRevision(ctx, p.revisionRefusalRecorder(), p.sessionID, pinned, msg, err)
-		if msg.IsRequest() {
-			_ = p.hostWriter.Write(resp)
-		}
-		p.unblockRefusedServerReply(ctx, msg)
+	rev, ok := hostMessageGate{
+		leg:      hostLeg{contextRev: pinned, upstreamRev: p.upstreamRev, sessionID: p.sessionID},
+		recorder: p.revisionRefusalRecorder,
+		// A zero response is one JSON-RPC forbids replying to, and this transport's peer reads a
+		// stream: there is nothing to send in its place, so silence IS the disposition.
+		refuse: func(resp mcp.RPCMsg) {
+			if !resp.IsZero() {
+				_ = p.hostWriter.Write(resp)
+			}
+		},
+		unblock: p.unblockRefusedServerReply,
+	}.negotiate(ctx, msg)
+	if !ok {
 		return ctx, false
 	}
 	// Guarded on the pin being UNSET. It is write-once by construction — resolveHostRevision

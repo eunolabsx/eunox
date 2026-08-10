@@ -38,6 +38,88 @@ var errRevisionMismatch = errors.New("protocol revision disagrees with the conte
 // boundary governs and this build does not do.
 var errUnhonorableUpstreamRevision = errors.New("request revision cannot be honored by the upstream leg")
 
+// hostLeg is what revision negotiation needs to know about the connection a message arrived on.
+//
+// A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
+// and three bare arguments at those call sites read as an oversight rather than as the fact
+// they are: no session established, and no upstream leg their message could reach.
+type hostLeg struct {
+	contextRev  capability.Revision
+	upstreamRev capability.Revision
+	sessionID   string
+}
+
+// hostMessageGate is the shared prologue every host message passes before its framing is
+// dispatched — the head of the gate order (see dispatch.go), with the three per-transport
+// facts injected rather than restated.
+//
+// It exists for the reason hostNotificationGate does one framing over. Before it, each
+// transport spelled the sequence out: resolve, build the refusal, write it in whatever shape
+// this peer takes, and — on the one transport that remembered — answer the upstream request a
+// refused host RESPONSE would have completed. That last step lived at HTTP's CALL SITE rather
+// than in its negotiation helper, so a third HTTP entry point that negotiated would have
+// inherited the refusal and not the unblock, which is the same shape as the arm that inherited
+// neither.
+//
+// The two transports still hold their own negotiateHostRevision, because their SHAPES differ
+// for a reason that is not a preference: stdio returns the stamped context (its reader owns the
+// pin and nothing may route a message without giving its records the revision it routed by),
+// while contextcheck requires HTTP's derivation from r.Context() to be visible at the site. The
+// prologue below is what is common underneath both — negotiation, its refusal, and its debt to
+// a blocked initiator.
+//
+// Revocation is deliberately NOT part of this prologue, though the gate order places it next.
+// For the REQUEST framing the kill check must be taken AFTER the decision turn, freshly, so a
+// kill landing during an unbounded wait is recorded as KILL_SWITCH rather than as the method's
+// own refusal; a prologue-level answer would be the stale one. That is why the request framing
+// takes it inside dispatchRequest and enforcedForwardCore, and why the notification framing —
+// which waits for nothing — can and does take it here-adjacent, in hostNotificationGate.
+type hostMessageGate struct {
+	// leg is the connection's own answer to what negotiation needs to know.
+	leg hostLeg
+	// recorder resolves the refusal's audit recorder, LAZILY: it is drawn from a rate-limit
+	// bucket, so resolving it for a message that is about to be admitted spends a token on
+	// nothing — and an unauthenticated peer can send those at will. Nil resolves to no
+	// recorder, which refuseHostRevision reads as "record nothing"; the wire refusal is
+	// unaffected either way.
+	recorder func() auditRecorder
+	// refuse writes the refusal to THIS peer. It is handed the response refuseHostRevision
+	// built, which is the zero message for any framing JSON-RPC forbids replying to — each
+	// transport decides what it sends instead (stdio nothing, HTTP a bodyless 202).
+	refuse func(mcp.RPCMsg)
+	// unblock answers the upstream request a refused host RESPONSE would have completed, so it
+	// does not hang until the connection ends. Nil on a leg that has no upstream to unblock —
+	// the pre-session arms, whose messages reach none. See server_request_unblock.go for the
+	// leg's one rule and its two exceptions.
+	unblock func(context.Context, mcp.RPCMsg)
+}
+
+// negotiate resolves the revision one host message is dispatched under, disposing of it
+// entirely when it cannot be established: ok=false means the record is written, this peer has
+// its refusal in whatever shape it takes, and any upstream request the message would have
+// answered has been unblocked.
+//
+// The revision is returned rather than stamped onto a context here, because which context it is
+// stamped onto is exactly the part that differs between the transports — see the type's doc.
+func (g hostMessageGate) negotiate(ctx context.Context, msg mcp.RPCMsg) (capability.Revision, bool) {
+	rev, err := resolveHostRevision(g.leg.contextRev, g.leg.upstreamRev, msg)
+	if err == nil {
+		return rev, true
+	}
+	var rec auditRecorder
+	if g.recorder != nil {
+		rec = g.recorder()
+	}
+	// Rate-limited like every other caller-driven refusal: a suppressed record still gets its
+	// refusal on the wire, so the peer is refused either way — what the bucket bounds is the
+	// tape write, which is the part a flood turns into an availability problem.
+	g.refuse(refuseHostRevision(ctx, rec, g.leg.sessionID, g.leg.contextRev, msg, err))
+	if g.unblock != nil {
+		g.unblock(ctx, msg)
+	}
+	return "", false
+}
+
 // resolveHostRevision decides which revision one host message is dispatched under.
 //
 // contextRev is the revision the peer's context was opened at, or "" for a context that

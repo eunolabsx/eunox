@@ -7,8 +7,18 @@
 // # Gate order
 //
 // The cross-cutting gates every host message passes are ordered ONCE, here, rather than
-// re-derived at each transport's prologue. Both transports inherit it: the notification
-// framing by calling hostNotificationGate.admit, the request framing by dispatchRequest.
+// re-derived at each transport's prologue. Both transports inherit it: the head of the order
+// by calling hostMessageGate.negotiate (in revision.go), the notification framing by
+// hostNotificationGate.admit, the request framing by dispatchRequest.
+//
+// The head and the tail are shared; the MIDDLE is deliberately not one prologue. Revocation
+// cannot be hoisted beside negotiation for the request framing, because that check must be
+// taken FRESH after the decision turn — a kill landing during an unbounded wait has to be
+// recorded as KILL_SWITCH rather than as the method's own refusal, and a prologue-level answer
+// would be the stale one. So the request framing takes it inside dispatchRequest and
+// enforcedForwardCore, and the notification framing — which waits for nothing — takes it in
+// hostNotificationGate. See hostMessageGate's doc for what the two transports still hold of
+// their own, and why.
 //
 //  1. REVISION negotiation (resolveHostRevision / refuseHostRevision). First, because every
 //     table below is revision-scoped: a message whose revision cannot be established has no
