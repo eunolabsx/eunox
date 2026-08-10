@@ -62,6 +62,13 @@ type UpstreamRoute struct {
 	// after BuildRoutes.
 	receipts *capability.EffectReceiptVerifier
 
+	// notices is this route's stderr-diagnostic table: one bucket per notice CLASS, charging the
+	// proxy's aggregate as its parent. Per route so one tenant's flood of the cheapest peer-driven
+	// line cannot suppress another tenant's — the rule saturationGate states for its own records,
+	// one axis out. Attached by NewHTTPProxyGateway (the aggregate is the proxy's, and BuildRoutes
+	// runs before there is one); nil until then, which falls back to the aggregate directly.
+	notices *noticeLimiter
+
 	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route: the
 	// transport needs it to pick which key a request's decision turn is taken on, since
 	// under task anchoring that isn't the session. Read-only after BuildRoutes.

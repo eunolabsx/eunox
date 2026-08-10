@@ -49,7 +49,7 @@ func TestUnblock_DestroyedAnswerReachesTheTape(t *testing.T) {
 	rec := &fwdRecorder{}
 	_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`7`), Method: capability.MethodSamplingCreateMessage}, io.Discard)
 	u := serverRequestUnblocker{
-		reqs: &reqs, sink: brokenSink(), errOut: io.Discard,
+		reqs: &reqs, sink: brokenSink(), notices: noticesTo(io.Discard),
 		report: dropReport{
 			recs: refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec),
 			subj: verifiedSession("s"),
@@ -79,7 +79,7 @@ func TestUnblock_RecordNamesTheTakenRequest(t *testing.T) {
 	rec := &fwdRecorder{}
 	_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`7`), Method: "roots/list"}, io.Discard)
 	u := serverRequestUnblocker{
-		reqs: &reqs, sink: brokenSink(), errOut: io.Discard,
+		reqs: &reqs, sink: brokenSink(), notices: noticesTo(io.Discard),
 		report: dropReport{
 			recs: refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec),
 			subj: verifiedSession("s"),
@@ -103,7 +103,7 @@ func TestUnblock_DeliveredAnswerRecordsNothing(t *testing.T) {
 	rec := &fwdRecorder{}
 	_, _ = reqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`7`), Method: "roots/list"}, io.Discard)
 	u := serverRequestUnblocker{
-		reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), errOut: io.Discard,
+		reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), notices: noticesTo(io.Discard),
 		report: dropReport{
 			recs: refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec),
 			subj: verifiedSession("s"),
@@ -126,7 +126,7 @@ func TestBroadcastServerRequest_NoSubscriberRecordsADestroyedAnswer(t *testing.T
 		route:          &UpstreamRoute{name: "up1", sink: nil},
 		proxy:          newTestHTTPProxy(),
 		done:           make(chan struct{}),
-		upstreamDenies: newUpstreamRefusalLimiter(nil),
+		upstreamDenies: newUpstreamRefusalLimiter(nil, upstreamRefusalCategories...),
 	})
 	// The route's own sink is what a session's refusal records resolve through; substitute the
 	// capture recorder by driving the seam the session builds.
@@ -156,7 +156,7 @@ func TestUpstreamRefusalBuckets_ArePerSession(t *testing.T) {
 	drain := func(rec *fwdRecorder, lim *categoryRecordLimiter, rounds int) {
 		var reqs serverReqTracker
 		u := serverRequestUnblocker{
-			reqs: &reqs, sink: brokenSink(), errOut: io.Discard,
+			reqs: &reqs, sink: brokenSink(), notices: noticesTo(io.Discard),
 			report: dropReport{
 				recs: refusalLimits{records: lim}.recorders(rec),
 				subj: verifiedSession("s"),
@@ -171,13 +171,13 @@ func TestUpstreamRefusalBuckets_ArePerSession(t *testing.T) {
 	}
 
 	// Session A empties its own bucket many times over.
-	a, aLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil)
+	a, aLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil, upstreamRefusalCategories...)
 	drain(a, aLim, 200)
 	require.NotEmpty(t, a.records)
 	assert.LessOrEqual(t, len(a.records), int(perCategoryDenyBurst)+1, "A's own flood is still bounded by A's bucket")
 
 	// Session B, with one lost in-flight refusal, must still be recorded.
-	b, bLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil)
+	b, bLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil, upstreamRefusalCategories...)
 	drain(b, bLim, 1)
 	assert.Len(t, b.records, 1,
 		"a sibling session's flood must not elide the record that says THIS session lost a live in-flight request")
@@ -196,7 +196,7 @@ func TestUpstreamRefusalBuckets_StillChargeTheAggregate(t *testing.T) {
 	admitted := 0
 	// Many sessions, each with its own full-share table, all flooding the same category.
 	for range 50 {
-		lim := newUpstreamRefusalLimiter(aggregate)
+		lim := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories...)
 		for range 20 {
 			if ok, _ := lim.admit(catDisplaced); ok {
 				admitted++
@@ -217,7 +217,7 @@ func TestUpstreamRefusalBuckets_StillChargeTheAggregate(t *testing.T) {
 func TestUpstreamRefusalBuckets_RollupNamesItsOwnScope(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
-	lim := newUpstreamRefusalLimiter(nil)
+	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories...)
 	// Exhaust the burst so the next admitted record carries a rollup.
 	for range int(perCategoryDenyBurst) + 20 {
 		_ = admitRefusalRecord(rec, lim, catDisplaced)
@@ -238,7 +238,7 @@ func TestUpstreamRefusalBuckets_RollupNamesItsOwnScope(t *testing.T) {
 // the floor rate and shared with every other unregistered category.
 func TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory(t *testing.T) {
 	t.Parallel()
-	lim := newUpstreamRefusalLimiter(nil)
+	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories...)
 	require.NotEmpty(t, upstreamRefusalCategories)
 	for _, cat := range upstreamRefusalCategories {
 		assert.Equal(t, meteringMetered, refusalDeclarations[cat].metering,
@@ -365,7 +365,7 @@ func TestEnforcedForwardCore_SendsNothingForAMessageWithNoReplyChannel(t *testin
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			fp := forwardParams{rec: &fwdRecorder{}, errOut: io.Discard, callUpstream: tc.up}
+			fp := forwardParams{rec: &fwdRecorder{}, limits: refusalLimits{notices: noticesTo(io.Discard)}, callUpstream: tc.up}
 			got := enforcedForwardCore(context.Background(), fp, nil, notification, tc.dec,
 				"tools/call", "tool:x", "x", "tool", false, func(mcp.RPCMsg) map[string]interface{} { return nil })
 			assert.True(t, got.IsZero(),

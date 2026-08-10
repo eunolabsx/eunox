@@ -334,9 +334,9 @@ func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() 
 // nothing for a writer they never call.
 func (s *httpSession) unblocker() serverRequestUnblocker {
 	return serverRequestUnblocker{
-		reqs:   &s.serverReqs,
-		sink:   s.upWriter,
-		errOut: s.errOut(),
+		reqs:    &s.serverReqs,
+		sink:    s.upWriter,
+		notices: s.noticeWriter(),
 		report: dropReport{
 			recs: s.refusalRecorders(),
 			subj: verifiedSession(s.id),
@@ -421,7 +421,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		route:          route,
 		byUpstreamID:   make(map[string]chan upstreamResult),
 		hostToUp:       make(map[string]*json.RawMessage),
-		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies),
+		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, upstreamRefusalCategories...),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,
@@ -1215,6 +1215,13 @@ func (s *httpSession) errOut() io.Writer {
 	return s.proxy.errOut()
 }
 
+// noticeWriter is this session's diagnostic channel: the proxy's writer, bounded by this session's
+// ROUTE table rather than the proxy-wide aggregate, so one tenant's flood cannot silence another's
+// lines. Nil-safe throughout for a bare-struct-literal session.
+func (s *httpSession) noticeWriter() noticeWriter {
+	return s.proxy.routeNoticeWriter(s.route)
+}
+
 // shutdownBudget is this session's configured teardown budget (--shutdown-grace), or a 5s
 // fallback for a proxy-less test session — mirroring stdio's killDelay default.
 func (s *httpSession) shutdownBudget() time.Duration {
@@ -1277,7 +1284,7 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		defer cancel()
 		if _, err := s.callRemoteUpstream(notifyCtx, msg); err != nil {
 			// No response to deliver to the host; log so a dropped notification isn't silent.
-			noticef(s.errOut(), s.proxy.refusalNoticeLimiter(),
+			noticef(s.noticeWriter(), siteUpstreamNotifyFailed,
 				"[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, audit.BoundEnvelopeField(msg.Method), err)
 		}
 		return
@@ -1563,7 +1570,7 @@ func (s *httpSession) refusalRecorders() refusalRecorders {
 	if s.route != nil {
 		rec = asRecorder(s.route.sink)
 	}
-	return refusalLimits{records: s.upstreamDenies, notices: s.proxy.refusalNoticeLimiter()}.recorders(rec)
+	return refusalLimits{records: s.upstreamDenies, notices: s.noticeWriter()}.recorders(rec)
 }
 
 // withSessionClaims stamps this session's captured JWT identity onto ctx, for a record written on a

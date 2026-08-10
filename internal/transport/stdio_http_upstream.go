@@ -82,14 +82,11 @@ type httpUpstream struct {
 	// reason: it is written once at the handshake and read by every later POST.
 	rev capability.Revision
 
-	// errOut is where this bridge writes its diagnostic lines. Read through
-	// errOutOrStderr(), never directly, so a nil value (the zero value, and every
-	// pre-existing test call site) still falls back to os.Stderr.
-	errOut io.Writer
-	// notices bounds the one per-frame diagnostic this bridge writes — a notification POST
-	// failure, which an unreachable upstream produces once per notification a host sends. nil
-	// (the zero value, and every test call site) writes every line.
-	notices *recordRateLimiter
+	// notices is this bridge's diagnostic CHANNEL: where its lines go AND what bounds them, as one
+	// value. It needs a bound because a notification-POST failure is written once per notification
+	// a host sends against an unreachable upstream. The zero value (every test call site) writes
+	// every line, to os.Stderr — the same fallback errOutOrStderr has always applied.
+	notices noticeWriter
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -118,7 +115,7 @@ func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkip
 		done:       make(chan struct{}),
 	}
 	if len(errOut) > 0 {
-		h.errOut = errOut[0]
+		h.notices.out = errOut[0]
 	}
 	return h
 }
@@ -127,7 +124,7 @@ func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkip
 // forwardParams.errOutOrStderr so this bridge's diagnostic lines resolve through the
 // same configured-writer-with-fallback rule as the rest of the transport layer.
 func (h *httpUpstream) errOutOrStderr() io.Writer {
-	return resolvedErrOut(h.errOut)
+	return h.notices.errOut()
 }
 
 // notifyPostTimeout bounds a fire-and-forget POST (the Write path) so a stalling
@@ -230,7 +227,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		// Notification: no response to deliver. Log POST failures so dropped
 		// notifications/initialized and notifications/cancelled are not silent.
 		if err != nil {
-			noticef(h.errOutOrStderr(), h.notices,
+			noticef(h.notices, siteUpstreamPostFailed,
 				"[eunox] upstream notification %q POST failed: %v\n", audit.BoundEnvelopeField(msg.Method), err)
 		}
 		return
@@ -255,7 +252,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		if h.reportErr != nil && h.reportErr(mcp.MsgKey(msg.ID), err) {
 			return
 		}
-		_, reason, rpcCode := upstreamErrInfo(h.errOutOrStderr(), h.notices, err, 0)
+		_, reason, rpcCode := upstreamErrInfo(h.notices, err, 0)
 		resp = mcp.ErrorResponse(msg.ID, rpcCode, reason)
 	case resp.JSONRPC == "" && resp.Result == nil && resp.Error == nil:
 		// Deliberately LOOSER than mcp.RPCMsg.IsZero, which also requires id/method/params empty:

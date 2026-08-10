@@ -334,7 +334,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				// other method. Answered as the drop it must be anyway — there is no session
 				// here, so nothing to forward it on — rather than discarding the verdict and
 				// letting a future forwardable pre-session method be dropped in silence.
-				noticef(p.errOut(), p.refusalNoticeLimiter(),
+				noticef(p.routeNoticeWriter(route), siteUpstreamlessNotification,
 					"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
 					audit.SanitizeAuditField(msg.Method))
 			}
@@ -497,7 +497,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// Bounded for the reason the routing refusal's notice is: the record above is
 				// collapsed to one per saturation EPISODE while this line ran once per refused
 				// frame, so the diagnostic was the cheaper flood of the two.
-				noticef(p.errOut(), p.refusalNoticeLimiter(), "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, audit.BoundEnvelopeField(msg.Method))
+				noticef(p.routeNoticeWriter(route), siteNotifyPoolSaturated, "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, audit.BoundEnvelopeField(msg.Method))
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}

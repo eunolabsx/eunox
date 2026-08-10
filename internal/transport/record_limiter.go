@@ -15,22 +15,19 @@
 //
 // The two halves of one refusal are bounded SEPARATELY and for different reasons: a record may be
 // exempt because it is a verdict, and a stderr line is never a verdict (see
-// exemptBecausePolicyDenyCostsTheSame and refusalNoticeRatePerSec). They were reasoned about with
-// one standard applied to both, which left the cheapest refusal in the tree writing an unbuffered
-// syscall per frame while its record was argued exempt.
+// exemptBecausePolicyDenyCostsTheSame and notice.go). They were reasoned about with one standard
+// applied to both, which left the cheapest refusal in the tree writing an unbuffered syscall per
+// frame while its record was argued exempt.
 //
-// The NOTICE half now carries the same treatment (noticeBound, and the per-site declarations the
-// walk in notice_bounding_test.go enforces): four different mechanisms bound a diagnostic line here
-// and only one of them was written down, so "how many diagnostic syscalls can a peer drive" was a
-// sum over sites nobody had surveyed rather than the one number this file's bucket claims.
+// The NOTICE half lives in notice.go and now carries the same treatment one step further: its
+// per-site declaration is READ at write time to pick a bucket, where this file's is read to resolve
+// a recorder. What is shared between them is the table below it — tieredBuckets, the two-tier keyed
+// admission both are built on.
 
 package transport
 
 import (
-	"fmt"
-	"io"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 )
@@ -174,86 +171,10 @@ type refusalDeclaration struct {
 // SCOPE, because the argument was read wider than it holds: it covers the RECORD. The second clause
 // is what carries it, and a stderr line is not a verdict — nor does a policy DENY write one, so the
 // first clause does not carry it either. The routing refusal's own diagnostic is therefore bounded
-// on refusalNoticeRatePerSec rather than inheriting this, which is how it came to be the one place
-// in the tree where an unauthenticated peer drives an unbuffered write syscall per frame.
+// on its own class bucket (see notice.go) rather than inheriting this, which is how it came to be
+// the one place in the tree where an unauthenticated peer drives an unbuffered write syscall per
+// frame.
 const exemptBecausePolicyDenyCostsTheSame = "reaching it needs a peer whose ordinary traffic writes policy DENY records at the same one-per-message cost, and a policy verdict may never be metered"
-
-// The stderr NOTICE budget, on its own rather than a share of the record aggregate above: a notice
-// is not a record, so it neither spends that budget nor may it divide it. Sized for an operator
-// watching a terminal — a couple of lines a second names the drift or the flood, and every line
-// this elides is counted into the next one rather than lost, so the notice never under-states what
-// is happening.
-const (
-	refusalNoticeRatePerSec = 2
-	refusalNoticeBurst      = 10
-)
-
-// newRefusalNoticeLimiter builds a leg's stderr-notice bucket. One per transport instance (not per
-// category), which is what makes "how many diagnostic syscalls can a peer drive" one number rather
-// than a sum over sites — a claim noticeDeclarations is what keeps true, since a site that writes
-// its line with a bare Fprintf spends nothing here and adds to that sum unseen.
-func newRefusalNoticeLimiter() *recordRateLimiter {
-	return newRecordRateLimiter(refusalNoticeRatePerSec, refusalNoticeBurst)
-}
-
-// noticeBound is how ONE diagnostic site is bounded. The zero value is "undeclared", so a site
-// added with no entry fails the call-site walk rather than inheriting an answer — the same shape
-// refusalDeclarations uses for the RECORD half of a refusal.
-//
-// Four mechanisms bound a line in this package and only the first was ever written down. The
-// declaration exists because the survey behind "how many syscalls can a peer drive" was re-derived
-// by hand each time, which is how the routing refusal's line came to be unbounded while its
-// record's exemption was being argued in prose.
-type noticeBound int
-
-const (
-	noticeUndeclared noticeBound = iota
-	// noticeMetered: the line goes through noticef, charging the shared notice bucket. What a
-	// peer-drivable per-frame diagnostic must be.
-	noticeMetered
-	// noticeRecordGated: the line is written only when the refusal's own RECORD was admitted, so
-	// it is bounded at that category's rate (recordRefusal returns its verdict for exactly this).
-	// A second mechanism rather than a redundancy: these sites describe the record they ride on.
-	noticeRecordGated
-	// noticeOnce: a latch — at most one line per process or per session — so a peer's rate cannot
-	// drive it however cheap the message is.
-	noticeOnce
-	// noticeExempt: not drivable at a per-frame rate, for the reason declared. Startup, teardown,
-	// configuration, and session-lifecycle lines.
-	noticeExempt
-)
-
-// noticeDeclaration is what every diagnostic site declares. why is required for an exemption and
-// must be empty otherwise, mirroring refusalDeclaration: the reason IS the exemption.
-//
-// The TABLE of declarations lives beside its call-site walk (noticeDeclarations, in
-// notice_bounding_test.go) rather than here, because unlike refusalDeclarations nothing reads it at
-// runtime — the bound is applied by which mechanism a site uses, and the declaration exists to make
-// that a decision on the record. The vocabulary stays here, beside the record half's, since the two
-// halves of one refusal are bounded for different reasons and are best read together.
-type noticeDeclaration struct {
-	bound noticeBound
-	why   string
-}
-
-// The reasons an exemption can rest on, stated once each because they are shared arguments rather
-// than per-site prose.
-const (
-	// exemptNotPeerDriven covers startup, shutdown, configuration and operator-command lines: the
-	// number written over a process's life is fixed by how the operator ran it, not by traffic.
-	exemptNotPeerDriven = "written from startup, teardown or operator-command paths, so a peer's send rate cannot drive it"
-	// exemptCostsASession covers the per-session lifecycle lines. A peer CAN drive them, but only
-	// by opening and closing sessions — each of which spawns or contacts an upstream, so the line
-	// is many orders of magnitude cheaper than what it reports and bounding it would hide churn
-	// that is itself the signal.
-	exemptCostsASession = "one line per session lifecycle event, and a session costs an upstream spawn or handshake — the line is not the expensive part"
-	// exemptOncePerConnection covers a line written at most once per host connection or upstream,
-	// on a path that then ends it.
-	exemptOncePerConnection = "written at most once per connection, on a path that ends it"
-	// exemptNotADiagnostic covers a site that writes a RESPONSE BODY with the same fmt call the
-	// walk looks for. Bounding it would corrupt what it serves.
-	exemptNotADiagnostic = "not a diagnostic: it writes a response body, which bounding would truncate"
-)
 
 // refusalDeclarations is authoritative for BOTH questions: which categories exist, and what each
 // one's metering disposition is. refusalCategories (the bucket table, and the divisor for every
@@ -302,18 +223,21 @@ func meteredRefusalCategories() []refusalCategory {
 	return out
 }
 
-// perCategoryFloor keeps every category's bucket alive even where plain division would
+// perBucketFloor keeps every bucket in a divided table alive even where plain division would
 // floor its share to 0 (possible past ~20 categories at today's rate) — a 0-rate bucket
-// never refills and would permanently suppress that category's records.
-const perCategoryFloor = 1
+// never refills and would permanently suppress that key's writes.
+const perBucketFloor = 1
 
-// perCategoryShare divides total evenly across categories, floored at perCategoryFloor.
+// perBucketShare divides total evenly across keys, floored at perBucketFloor.
 // Integer division (not float) keeps each share a whole token count and lands the sum at
 // or slightly UNDER the aggregate when it doesn't divide evenly — the safe direction.
-func perCategoryShare(total, categories int) float64 {
-	share := total / categories
-	if share < perCategoryFloor {
-		share = perCategoryFloor
+//
+// Shared by both divided tables in this package (refusal categories, notice classes): the
+// derivation is the same one, and a second copy is a second place for the floor to be forgotten.
+func perBucketShare(total, keys int) float64 {
+	share := total / keys
+	if share < perBucketFloor {
+		share = perBucketFloor
 	}
 	return float64(share)
 }
@@ -323,8 +247,8 @@ func perCategoryShare(total, categories int) float64 {
 // deliberately NOT sized from these — it gets perCategoryFloor instead, so it doesn't
 // dilute every real category's share for a bucket no call site actually uses.
 var (
-	perCategoryDenyRate  = perCategoryShare(preSessionDenyRatePerSec, len(refusalCategories))
-	perCategoryDenyBurst = perCategoryShare(preSessionDenyBurst, len(refusalCategories))
+	perCategoryDenyRate  = perBucketShare(preSessionDenyRatePerSec, len(refusalCategories))
+	perCategoryDenyBurst = perBucketShare(preSessionDenyBurst, len(refusalCategories))
 )
 
 // newRefusalRecordLimiter builds a bucket for every METERED category, each holding an equal
@@ -345,15 +269,10 @@ func newRefusalRecordLimiter() *categoryRecordLimiter {
 // unbounded — the safe direction — and each transport's charged set is held to what it declares,
 // so the fallback stays unreachable.
 func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter {
-	c := &categoryRecordLimiter{
-		buckets: make(map[refusalCategory]*recordRateLimiter, len(cats)),
-		unknown: newRecordRateLimiter(perCategoryFloor, perCategoryFloor),
-		scope:   suppressedScopeProxyCategory,
+	return &categoryRecordLimiter{
+		tieredBuckets: newTieredBuckets(perCategoryDenyRate, perCategoryDenyBurst, cats),
+		scope:         suppressedScopeProxyCategory,
 	}
-	for _, cat := range cats {
-		c.buckets[cat] = newRecordRateLimiter(perCategoryDenyRate, perCategoryDenyBurst)
-	}
-	return c
 }
 
 // stdioRefusalCategories is the set the stdio transport charges. Declared rather than left implicit
@@ -371,6 +290,17 @@ var upstreamRefusalCategories = []refusalCategory{
 	catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
 }
 
+// remoteUpstreamRefusalCategories is the subset a REMOTE-upstream session can actually reach.
+// Three of the four are driven by a server-initiated request, and a remote upstream issues none
+// through this proxy — there is no upstream reader to receive one and no sink to answer one
+// through — so a table holding their buckets is four rate limiters and four map entries per
+// session for records nothing can write. What remains is the host reply this mode cannot relay.
+//
+// Safe to narrow rather than merely wasteful to keep: a category this table has no bucket for is
+// delegated WHOLLY to the aggregate parent (see categoryRecordLimiter.admit), which is the
+// proxy-wide bound those records had before the per-session split existed.
+var remoteUpstreamRefusalCategories = []refusalCategory{catServerRequestFailed}
+
 // newUpstreamRefusalLimiter builds ONE HTTP session's buckets for the upstream-driven categories.
 //
 // Per session, not proxy-wide, for the reason saturationGate states for its own records: one
@@ -387,9 +317,14 @@ var upstreamRefusalCategories = []refusalCategory{
 // own table as its AGGREGATE parent: this session's buckets decide fairness, the parent keeps the
 // total at the pre-split ceiling. aggregate may be nil (a bare-struct-literal proxy in a test),
 // which bounds the session alone. See docs/threat-model-mcp.md §3.7.
-func newUpstreamRefusalLimiter(aggregate *categoryRecordLimiter) *categoryRecordLimiter {
-	c := newRefusalRecordLimiterFor(upstreamRefusalCategories...)
-	c.parent = aggregate
+//
+// cats is the session's own reachable set rather than a constant, since a remote-upstream session
+// reaches one of the four — see remoteUpstreamRefusalCategories.
+func newUpstreamRefusalLimiter(aggregate *categoryRecordLimiter, cats ...refusalCategory) *categoryRecordLimiter {
+	c := newRefusalRecordLimiterFor(cats...)
+	if aggregate != nil {
+		c.parent = &aggregate.tieredBuckets
+	}
 	c.scope = suppressedScopeSessionCategory
 	return c
 }
@@ -409,11 +344,11 @@ type refusalLimits struct {
 	// meters none of them: stdio's notification gate, and the established-session HTTP arm, whose
 	// kill records describe an already-admitted caller and are deliberately unbounded.
 	records *categoryRecordLimiter
-	// notices bounds this leg's refusal DIAGNOSTICS. Separate from records because the two answer
-	// to different arguments and a leg can legitimately want one without the other — the
-	// established-session arm above meters no record it writes and still owes a bound on a
-	// per-frame syscall. See refusalNoticeRatePerSec.
-	notices *recordRateLimiter
+	// notices is this leg's diagnostic CHANNEL — where a line goes and what bounds it, as one
+	// value. Separate from records because the two answer to different arguments and a leg can
+	// legitimately want one without the other: the established-session arm above meters no record
+	// it writes and still owes a bound on a per-frame syscall. See noticeWriter.
+	notices noticeWriter
 }
 
 // recorders pairs these limits with the leg's audit sink; rec may be nil (the leg has no tape).
@@ -467,118 +402,107 @@ func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
 	return admitRefusalRecord(r.rec, r.limits.records, category)
 }
 
-// notices is this wiring's stderr-diagnostic bucket, reached through the named limits field so a
+// notices is this wiring's diagnostic channel, reached through the named limits field so a
 // caller needs no second vocabulary for the half of a refusal that is not a record.
-func (r refusalRecorders) notices() *recordRateLimiter { return r.limits.notices }
+func (r refusalRecorders) notices() noticeWriter { return r.limits.notices }
 
-// noticef writes one bounded diagnostic line, folding whatever the bucket elided since the last
-// admitted line into this one's own text.
-//
-// The rollup is applied HERE rather than returned for a caller to append, for the reason
-// admitRefusalRecord hides its own: a site that spends a token and forgets the count silently
-// under-states a flood, and nothing fails. A nil limiter writes every line — the unbounded
-// disposition a bare-struct-literal proxy in a test gets.
-//
-// "further diagnostics", not "further such notices": one bucket serves every bounded line on the
-// proxy, so the count is not a tally of the message it rides on. Which lines it spans is
-// deliberately not claimed by the text — see refusalNoticeRatePerSec for the scope, and the
-// per-line detail stays on the tape, which is the channel that keeps it.
-func noticef(w io.Writer, l *recordRateLimiter, format string, args ...interface{}) {
-	admitted, suppressed := admitNotice(l)
-	if !admitted {
-		return
-	}
-	if suppressed > 0 {
-		format = strings.TrimSuffix(format, "\n") + " (%d further diagnostics suppressed)\n"
-		args = append(args, suppressed)
-	}
-	_, _ = fmt.Fprintf(w, format, args...)
-}
-
-// admitNotice reports whether a diagnostic bounded by l may be written now, and how many were
-// elided since the last admitted one. Callers go through noticef; this is separate only for the one
-// site that must decide BEFORE building its arguments.
-func admitNotice(l *recordRateLimiter) (ok bool, suppressed uint64) {
-	if l == nil {
-		return true, 0
-	}
-	return l.admit()
-}
-
-// categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
-// cheap refusals in one category cannot suppress another's records.
+// tieredBuckets is the two-tier keyed token-bucket table BOTH admission controls in this package
+// are built on: refusal records keyed by category (categoryRecordLimiter) and stderr diagnostics
+// keyed by class (noticeLimiter). One implementation rather than two, because the subtle part is
+// the same subtle part on either axis — an outer tier that refuses must not lose the inner tier's
+// tally — and a second copy of it is a second thing to keep in agreement.
 //
 // The table is built ONCE at construction rather than lazily, so admit takes no lock but
 // its own bucket's — not a second proxy-global lock on the path this file exists to keep
 // cheap under attack.
-type categoryRecordLimiter struct {
-	buckets map[refusalCategory]*recordRateLimiter
-	// unknown serves an unregistered category on a table with no parent. Unreachable from call
-	// sites (all pass constants), but keeps a future typo bounded rather than unbounded.
+type tieredBuckets[K comparable] struct {
+	buckets map[K]*recordRateLimiter
+	// unknown serves an unregistered key on a table with no parent. Unreachable from call
+	// sites that pass constants, but keeps a future typo (or a site with no declaration behind
+	// it) bounded rather than unbounded.
 	unknown *recordRateLimiter
-	// parent is the proxy-wide AGGREGATE this table's records also charge, or nil when this
-	// table IS that aggregate. A per-session table has one: its own buckets stop one session's
-	// flood eliding another's record, and the parent stops N sessions multiplying the sustained
-	// write rate into the single shared audit queue by N. Without it a per-session split trades
-	// the elision bug for an availability one — see newUpstreamRefusalLimiter.
-	parent *categoryRecordLimiter
-	// scope names what a rollup from this table SPANS, stamped into the record beside the count.
-	// Held here rather than passed per call because it is a property of the table, and a count
-	// whose scope a reader has to infer from the stamp beside it is a count that gets misread.
-	scope string
+	// parent is the proxy-wide AGGREGATE this table's writes also charge, or nil when this
+	// table IS that aggregate. A per-session (or per-route) table has one: its own buckets stop
+	// one tenant's flood eliding another's, and the parent stops N tenants multiplying the
+	// sustained rate by N. Without it a split trades the elision bug for an availability one —
+	// see newUpstreamRefusalLimiter.
+	parent *tieredBuckets[K]
 }
 
-// admit reports whether a refusal record in category may be written now, and how many
-// records IN THAT CATEGORY were suppressed since the last admitted one.
+// newTieredBuckets builds one bucket per key at the given share of the aggregate, plus the
+// floor-rate fallback for a key the table does not hold.
+func newTieredBuckets[K comparable](ratePerSec, burst float64, keys []K) tieredBuckets[K] {
+	t := tieredBuckets[K]{
+		buckets: make(map[K]*recordRateLimiter, len(keys)),
+		unknown: newRecordRateLimiter(perBucketFloor, perBucketFloor),
+	}
+	for _, k := range keys {
+		t.buckets[k] = newRecordRateLimiter(ratePerSec, burst)
+	}
+	return t
+}
+
+// admit reports whether a write under key may happen now, and how many writes UNDER THAT KEY
+// were suppressed since the last admitted one.
 //
-// A table with a PARENT charges both tiers, own bucket first: this table bounds one session's
-// share, the parent bounds the aggregate. A record the parent refuses is pushed BACK onto this
+// A table with a PARENT charges both tiers, own bucket first: this table bounds one tenant's
+// share, the parent bounds the aggregate. A write the parent refuses is pushed BACK onto this
 // table's own count rather than lost, so the rollup stays complete whichever tier elided it.
 //
-// A category this table holds no bucket for is delegated WHOLLY to the parent — it is simply not
-// session-scoped, so it charges the proxy-wide table as it did before the split. That is what
-// keeps a subset table from silently routing an unlisted category to the floor-rate `unknown`
+// A key this table holds no bucket for is delegated WHOLLY to the parent — it is simply not
+// scoped to this tier, so it charges the aggregate as it did before the split. That is what
+// keeps a subset table from silently routing an unlisted key to the floor-rate `unknown`
 // bucket, which no test could have caught (the metering walk cannot answer "which categories does
 // this leg charge" from source).
-func (c *categoryRecordLimiter) admit(category refusalCategory) (ok bool, suppressed uint64) {
-	own, registered := c.buckets[category]
-	if c.parent != nil && !registered {
-		return c.parent.admit(category)
+func (t *tieredBuckets[K]) admit(key K) (ok bool, suppressed uint64) {
+	own, registered := t.buckets[key]
+	if t.parent != nil && !registered {
+		return t.parent.admit(key)
 	}
 	if !registered {
-		own = c.unknown
+		own = t.unknown
 	}
 	ok, suppressed = own.admit()
-	if !ok || c.parent == nil {
+	if !ok || t.parent == nil {
 		return ok, suppressed
 	}
-	if parentOK, _ := c.parent.admit(category); !parentOK {
-		// The aggregate refused, so this record is not written; give this table back the token's
-		// worth of tally (this record plus everything it had accumulated) so the next admitted
+	if parentOK, _ := t.parent.admit(key); !parentOK {
+		// The aggregate refused, so this write does not happen; give this table back the token's
+		// worth of tally (this one plus everything it had accumulated) so the next admitted
 		// one still states the true count. The parent's own tally is deliberately discarded: the
-		// same records are already counted here, and counting them twice would over-state a flood.
+		// same writes are already counted here, and counting them twice would over-state a flood.
 		own.suppressN(suppressed + 1)
 		return false, 0
 	}
 	return true, suppressed
 }
 
-// bucket returns category's token bucket. No lock: the table is immutable after
+// bucket returns key's token bucket. No lock: the table is immutable after
 // construction.
-func (c *categoryRecordLimiter) bucket(category refusalCategory) *recordRateLimiter {
-	if b, exists := c.buckets[category]; exists {
+func (t *tieredBuckets[K]) bucket(key K) *recordRateLimiter {
+	if b, exists := t.buckets[key]; exists {
 		return b
 	}
-	return c.unknown
+	return t.unknown
 }
 
 // setNow points every bucket at an injectable clock (test-only). A method rather than a
 // field because an assignment to a parent field would miss the per-bucket clocks.
-func (c *categoryRecordLimiter) setNow(now func() time.Time) {
-	for _, b := range c.buckets {
+func (t *tieredBuckets[K]) setNow(now func() time.Time) {
+	for _, b := range t.buckets {
 		b.now = now
 	}
-	c.unknown.now = now
+	t.unknown.now = now
+}
+
+// categoryRecordLimiter holds one recordRateLimiter per refusal category, so a flood of
+// cheap refusals in one category cannot suppress another's records.
+type categoryRecordLimiter struct {
+	tieredBuckets[refusalCategory]
+	// scope names what a rollup from this table SPANS, stamped into the record beside the count.
+	// Held here rather than passed per call because it is a property of the table, and a count
+	// whose scope a reader has to infer from the stamp beside it is a count that gets misread.
+	scope string
 }
 
 // admitRefusalRecord applies limiter's verdict for category to rec: nil when this record is

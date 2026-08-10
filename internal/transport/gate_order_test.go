@@ -164,7 +164,6 @@ func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 		revision:  capability.Revision20260728,
 		forward:   func(context.Context, mcp.RPCMsg) bool { return true },
 		unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
-		errOut:    io.Discard,
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"}, fp)
 	_ = sink.Close()
@@ -227,7 +226,7 @@ func TestGateOrder_NotificationGateAppliesTheCanonicalOrder(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			gate := hostNotificationGate{
-				recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, leg: legStdioNotification,
+				recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, leg: legStdioNotification,
 				checkKill: func() *capability.EnforceResponse {
 					if tc.revoked {
 						return killed
@@ -266,7 +265,7 @@ func TestGateOrder_LocallyAnsweredMethodsInheritRevocation(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			d := dispatchParams{
-				forwardParams: forwardParams{rec: rec, sessionID: "killed-sess", errOut: io.Discard},
+				forwardParams: forwardParams{rec: rec, sessionID: "killed-sess", limits: refusalLimits{notices: noticesTo(io.Discard)}},
 				pdp:           newTestManifestPDPWithKS(ks),
 				buildInit: func(msg mcp.RPCMsg) mcp.RPCMsg {
 					return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}
@@ -294,7 +293,7 @@ func TestGateOrder_RevisionRidesOneCarrier(t *testing.T) {
 	// verdict — and the record it writes must name that same revision.
 	rec := &fwdRecorder{}
 	d := dispatchParams{
-		forwardParams: forwardParams{rec: rec, errOut: io.Discard},
+		forwardParams: forwardParams{rec: rec, limits: refusalLimits{notices: noticesTo(io.Discard)}},
 		pdp:           pdp.AlwaysAllowPDP{},
 	}
 	ctx := revisionContext(capability.Revision20260728)
@@ -466,7 +465,10 @@ func TestGateOrder_SessionCapDenialNamesItsRevision(t *testing.T) {
 // staticRecorder adapts a test recorder to the gate's per-category recorder wiring: a test recorder
 // meters nothing, so every category resolves to it.
 func staticRecorder(rec auditRecorder) refusalRecorders {
-	return refusalLimits{}.recorders(rec)
+	// The channel is the gate's only diagnostic destination now that the leg carries no writer of
+	// its own — refuseUnroutable takes both halves from the recorders it is handed — so a test
+	// gate that named nothing here would put its refusal lines on the process's real stderr.
+	return refusalLimits{notices: noticesTo(io.Discard)}.recorders(rec)
 }
 
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and

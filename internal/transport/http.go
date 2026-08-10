@@ -247,12 +247,13 @@ type HTTPProxy struct {
 	// preSessionDenies bounds the rate of transport-level refusal records — the only audit
 	// writes an unauthenticated caller can trigger, else a lever on --require-audit=strict.
 	preSessionDenies *categoryRecordLimiter
-	// noticeLimiter bounds the stderr DIAGNOSTIC a refusal writes beside its record. Proxy-wide
-	// rather than per leg, and separate from the record buckets above, because a leg that meters no
-	// record (an established session's kill records are deliberately unbounded) still owes a bound
-	// on a write syscall per refused frame. See refusalNoticeRatePerSec.
-	noticeLimiter *recordRateLimiter
-	trustFwdFor   bool
+	// notices is the AGGREGATE stderr-diagnostic table: one bucket per notice CLASS, charged
+	// directly by every leg with no route in scope and as the parent of each route's own table.
+	// Separate from the record buckets above because a leg that meters no record (an established
+	// session's kill records are deliberately unbounded) still owes a bound on a write syscall per
+	// refused frame. See noticeLimiter.
+	notices     *noticeLimiter
+	trustFwdFor bool
 	// trustedProxyNets is the compiled listen.trustedProxyCIDRs allowlist: under trustFwdFor,
 	// the immediate TCP peer must match one before X-Forwarded-For is honored — see sourceIP.
 	trustedProxyNets []*net.IPNet
@@ -431,7 +432,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		afterListen:        opts.AfterListen,
 		authTimingKey:      newAuthTimingKey(),
 		preSessionDenies:   newRefusalRecordLimiter(),
-		noticeLimiter:      newRefusalNoticeLimiter(),
+		notices:            newNoticeLimiter(),
 		trustFwdFor:        opts.TrustFwdFor,
 		trustedProxyNets:   trustedProxyNets,
 		trustedProxyHops:   opts.TrustedProxyHops,
@@ -445,6 +446,14 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		routes:             opts.Routes,
 		sessions:           make(map[string]*httpSession),
 		revoked:            make(chan struct{}, 1),
+	}
+	// Each route gets its own diagnostic table under this proxy's aggregate, so a peer looping an
+	// unmapped method against one route cannot silence another's lines. Attached HERE rather than
+	// in BuildRoutes because the aggregate a route charges is the PROXY's, and BuildRoutes runs
+	// before there is one — a route built for a proxy that never stood would otherwise hold a
+	// parentless table and spend the whole budget alone.
+	for _, route := range p.routes {
+		route.notices = newRouteNoticeLimiter(p.notices, len(p.routes))
 	}
 	// Registered at construction (not Serve) so a kill delivered during startup is not lost —
 	// the buffered slot coalesces it, served by the worker's first tick. Unregister is kept
@@ -749,13 +758,31 @@ func (p *HTTPProxy) serveCtx() context.Context {
 	return context.Background()
 }
 
-// refusalNoticeLimiter is this proxy's stderr-notice admission control, nil-safe so a session
-// assembled by a bare struct literal (as tests build) writes unbounded rather than panicking.
-func (p *HTTPProxy) refusalNoticeLimiter() *recordRateLimiter {
+// noticeWriter is this proxy's diagnostic channel for a leg with NO route in scope: the
+// configured stderr writer and the aggregate class table. Nil-safe so a session assembled by a bare
+// struct literal (as tests build) writes unbounded rather than panicking.
+//
+// A leg that has a route uses routeNoticeWriter instead — one tenant's flood must not silence
+// another's, which is the whole reason the table below it exists.
+func (p *HTTPProxy) noticeWriter() noticeWriter {
 	if p == nil {
-		return nil
+		return noticeWriter{}
 	}
-	return p.noticeLimiter
+	return noticeWriter{out: p.errOut(), limits: p.notices}
+}
+
+// routeNoticeWriter is the diagnostic channel for a leg serving route: the route's OWN class table,
+// which charges this proxy's aggregate as its parent (see newRouteNoticeLimiter). A nil route (a
+// leg with none, or a bare-struct-literal test) falls back to the aggregate directly — the
+// pre-split behaviour, and bounded either way.
+func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
+	if p == nil {
+		return noticeWriter{}
+	}
+	if route == nil || route.notices == nil {
+		return p.noticeWriter()
+	}
+	return noticeWriter{out: p.errOut(), limits: route.notices}
 }
 
 // refusalLimits pairs this proxy's two admission controls for the PRE-SESSION leg, whose refusal
@@ -769,5 +796,16 @@ func (p *HTTPProxy) refusalLimits() refusalLimits {
 	if p == nil {
 		return refusalLimits{}
 	}
-	return refusalLimits{records: p.preSessionDenies, notices: p.noticeLimiter}
+	return refusalLimits{records: p.preSessionDenies, notices: p.noticeWriter()}
+}
+
+// routeRefusalLimits is the same wiring for a leg that HAS a route: the same proxy-wide record
+// buckets, and the route's own diagnostic table rather than the aggregate. Split from the
+// pre-session accessor above rather than taking a nilable route on it, so a leg that knows its
+// tenant cannot forget to say so.
+func (p *HTTPProxy) routeRefusalLimits(route *UpstreamRoute) refusalLimits {
+	if p == nil {
+		return refusalLimits{}
+	}
+	return refusalLimits{records: p.preSessionDenies, notices: p.routeNoticeWriter(route)}
 }

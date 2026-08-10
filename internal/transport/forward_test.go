@@ -1026,9 +1026,13 @@ func TestForwardServerRequest_ObserveLeg_RecordsBeforeLogging(t *testing.T) {
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
-		pdp:       newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
-		forward:   func(context.Context, mcp.RPCMsg) bool { return true },
-		unblocker: writingSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }),
+		pdp:     newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
+		forward: func(context.Context, mcp.RPCMsg) bool { return true },
+		// The seam's diagnostic channel is left UNSET rather than pointed at io.Discard: this leg's
+		// notice resolves its destination at write time, which is what lets it reach the os.Stderr
+		// swapped in above. A channel naming a writer would answer the ordering question about the
+		// wrong pipe.
+		unblocker: unwrittenSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }),
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
 

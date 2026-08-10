@@ -39,7 +39,6 @@ package transport
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"reflect"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -118,18 +117,17 @@ type serverRequestUnblocker struct {
 	// sink is the upstream's message sink, possibly a typed nil (HTTP holds a concrete
 	// *mcp.MsgWriter) — which is exactly what initiatorWriter resolves and why nothing here may
 	// test it with a bare != nil.
-	sink   mcp.MsgSink
-	errOut io.Writer
-	// report is where a destroyed answer lands, and the bound on the diagnostic beside it. Held
-	// here rather than passed per call because the seam below is what every answering site funnels
-	// through, and an obligation placed on one caller is one the next site added does not inherit.
+	sink mcp.MsgSink
+	// notices is this leg's diagnostic CHANNEL — where a line goes and what bounds it, as ONE
+	// field. It used to be a writer here beside a bucket reached through report, two independently
+	// zeroable things feeding one line: a leg that set the writer and not the bucket wrote
+	// unbounded with every guard still green. See noticeWriter.
+	notices noticeWriter
+	// report is where a destroyed answer lands. Held here rather than passed per call because the
+	// seam below is what every answering site funnels through, and an obligation placed on one
+	// caller is one the next site added does not inherit.
 	report dropReport
 }
-
-// notices bounds the diagnostic every answering site here writes when a reply does not land. Taken
-// from the report's own wiring, so a leg cannot bound its records and its lines through two
-// different buckets. nil writes every line.
-func (u serverRequestUnblocker) notices() *recordRateLimiter { return u.report.recs.notices() }
 
 // writeUpstream resolves this unblocker's sink into the writer the answering seam takes, or nil when
 // there is genuinely nothing to answer through. Nothing outside this file holds a raw writer any
@@ -200,7 +198,7 @@ func (u serverRequestUnblocker) relay(ctx context.Context, reply mcp.RPCMsg) {
 // the three answers genuinely differ — unblock takes it, relay's caller already did, and an
 // eviction removed it as the very act that created the debt.
 func (u serverRequestUnblocker) write(reply mcp.RPCMsg, what string) bool {
-	return writeToInitiator(u.writeUpstream(), u.errOut, u.notices(), reply, what)
+	return writeToInitiator(u.writeUpstream(), u.notices, reply, what)
 }
 
 // answer sends an error of eunox's OWN making to a blocked initiator and records one that did not
@@ -312,14 +310,14 @@ func nilSink(sink mcp.MsgSink) bool {
 // line here is one write syscall per frame — the record beside it metered while the syscall was not.
 // Residual: a blocked stderr (a pipe to a stalled collector) still blocks the writer; the bound
 // lowers the rate, it does not make the write non-blocking.
-func writeToInitiator(write func(mcp.RPCMsg) error, errOut io.Writer, notices *recordRateLimiter, reply mcp.RPCMsg, what string) bool {
+func writeToInitiator(write func(mcp.RPCMsg) error, notices noticeWriter, reply mcp.RPCMsg, what string) bool {
 	if write == nil {
-		noticef(resolvedErrOut(errOut), notices,
+		noticef(notices, siteInitiatorUnanswerable,
 			"[eunox] WARNING: a server-initiated request was left blocked: no upstream writer to answer it (%s)\n", what)
 		return false
 	}
 	if err := write(reply); err != nil {
-		noticef(resolvedErrOut(errOut), notices,
+		noticef(notices, siteInitiatorUnanswerable,
 			"[eunox] WARNING: a server-initiated request was left blocked: answering its initiator failed (%s): %v\n", what, err)
 		return false
 	}
@@ -436,7 +434,7 @@ func recordServerRequestDropped(ctx context.Context, rec auditRecorder, subj kil
 // leaving the tracker with its initiator unanswered — asserted by a source guard, since Go does not
 // require a return value to be consumed.
 func trackServerRequest(ctx context.Context, u serverRequestUnblocker, msg mcp.RPCMsg) {
-	displaced, ok := u.reqs.track(msg, u.errOut)
+	displaced, ok := u.reqs.track(msg, u.notices.errOut())
 	if !ok {
 		return
 	}

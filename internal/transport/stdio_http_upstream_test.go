@@ -367,7 +367,7 @@ func TestStdioProxy_HTTPUpstream_UnreachableSurfacesError(t *testing.T) {
 	}
 	// The same classifier both transports feed into enforcedForwardCore must bucket
 	// this as an infra denial, so the stdio bridge and the gateway agree on the code.
-	code, reason, _ := upstreamErrInfo(io.Discard, nil, err, p.upstreamTimeMs)
+	code, reason, _ := upstreamErrInfo(noticesTo(io.Discard), err, p.upstreamTimeMs)
 	if !IsInfraDenialCode(code) {
 		t.Fatalf("upstreamErrInfo(%v) = %q, want an infra denial code", err, code)
 	}

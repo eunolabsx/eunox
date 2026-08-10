@@ -293,21 +293,22 @@ type forwardParams struct {
 	// `fp.recorders(someOtherSink)` would compile and mint a wiring keeping this leg's buckets
 	// while pointing at a different tape, beside call sites that idiomatically write
 	// `.recorders(...)` already.
+	//
+	// Its notices field is also where this forward's diagnostic (SECURITY/AUDIT) lines GO, not
+	// just what bounds them — one channel rather than a writer field beside a bucket field, which
+	// a leg can set half of. Unset (the default, and what every test literal that doesn't set it
+	// gets) means os.Stderr, mirroring StdioProxyOptions.Stderr/HTTPGatewayOptions.Stderr: a
+	// caller that wants to capture these lines (or avoid racing a concurrently-read os.Stderr)
+	// configures the proxy's writer, which flows down to here, instead of reassigning the
+	// process-global os.Stderr.
 	limits refusalLimits
-	// errOut is where this forward's diagnostic (SECURITY/AUDIT) lines are written. Nil (the
-	// default, and what every construction that doesn't set it gets — including every test
-	// literal) means os.Stderr, mirroring StdioProxyOptions.Stderr/HTTPGatewayOptions.Stderr:
-	// a caller that wants to capture these lines (or avoid racing a concurrently-read
-	// os.Stderr) configures the proxy's writer, which flows down to here, instead of
-	// reassigning the process-global os.Stderr.
-	errOut io.Writer
 }
 
-// errOutOrStderr returns fp.errOut when set, else os.Stderr — the one place every
-// dispatch/forward diagnostic line resolves its destination, so a proxy's configured Stderr
-// writer actually reaches them instead of being bypassed by a direct os.Stderr write.
+// errOutOrStderr returns this leg's diagnostic destination, os.Stderr when unset — the one place
+// every dispatch/forward line resolves it, so a proxy's configured Stderr writer actually reaches
+// them instead of being bypassed by a direct os.Stderr write.
 func (fp forwardParams) errOutOrStderr() io.Writer {
-	return resolvedErrOut(fp.errOut)
+	return fp.limits.notices.errOut()
 }
 
 // resolvedErrOut returns w when set, else os.Stderr — the package's ONE nil-writer fallback.
@@ -417,7 +418,7 @@ func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, 
 // byte-identical records for the same physical outage. dispatchList passes the method as
 // both auditID and method (no sub-target); the forward core passes the per-target audit id.
 func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string, detail map[string]interface{}) mcp.RPCMsg {
-	code, reason, rpcCode := upstreamErrInfo(fp.errOutOrStderr(), fp.limits.notices, err, fp.upstreamTimeMs)
+	code, reason, rpcCode := upstreamErrInfo(fp.limits.notices, err, fp.upstreamTimeMs)
 	// This deny records a call already forwarded to (and answered, however badly, by)
 	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
 	// for, so it gets the same immediate diagnostic under strict mode.
@@ -588,7 +589,7 @@ func addSpentApproval(detail map[string]interface{}, dec capability.EnforceRespo
 //
 // committer and sessionID are passed rather than read off a params struct so the host path
 // and the server-initiated one share this body instead of mirroring it.
-func commitDeclassify(ctx context.Context, w io.Writer, notices *recordRateLimiter, committer declassifyCommitter, sessionID string, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
+func commitDeclassify(ctx context.Context, notices noticeWriter, committer declassifyCommitter, sessionID string, dec capability.EnforceResponse, kind, target string) (cleared []string, detail map[string]interface{}) {
 	decl := dec.Declassification
 	if !decl.PendingClear() {
 		// Either no declassify directive at all, or an approved one whose labels the anchor
@@ -613,7 +614,7 @@ func commitDeclassify(ctx context.Context, w io.Writer, notices *recordRateLimit
 		// folding this into the fault arm below would tell an operator to reissue an
 		// approval for work that already landed — the unsafe direction for an alert to be
 		// wrong in. Nothing is cleared HERE, so the record carries only the spent grant.
-		noticef(w, notices,
+		noticef(notices, siteDeclassifyCommit,
 			"[eunox] WARN declassify %s %q: the authorized clear was committed twice; the first commit applied it and this one changed nothing (proxy wiring fault, not a flow-store failure — the session is NOT over-tainted)\n",
 			kind, target)
 		return nil, spentGrantDetail(dec)
@@ -624,7 +625,7 @@ func commitDeclassify(ctx context.Context, w io.Writer, notices *recordRateLimit
 		// refusal's, since the operator action differs: reissue the approval to reach the
 		// state the policy describes.
 		detail[audit.DeclassifyCommitFailedKey] = authorized
-		noticef(w, notices,
+		noticef(notices, siteDeclassifyCommit,
 			"[eunox] WARN declassify %s %q ran under an approved declassification, but the flow label(s) %v could not be cleared: %v — the session stays tainted, so a later sink will over-block until the action is retried under a new approval\n",
 			kind, target, authorized, err)
 		// cleared may still be non-empty beside the error (a Remove can delete and lose its
@@ -719,7 +720,7 @@ func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, 
 		fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "",
 			decisionDetail(dec), false)
 	}
-	noticef(fp.errOutOrStderr(), fp.limits.notices,
+	noticef(fp.limits.notices, siteUpstreamlessForward,
 		"[eunox] SECURITY: %q was authorized but this path has no upstream to forward it to; refused (ENFORCEMENT_ERROR) — a proxy wiring fault, not an upstream failure\n",
 		audit.SanitizeAuditField(method))
 	return refusalResponse(msg.ID, capability.ErrCodeEnforcementError, "", denialTarget, "")
@@ -881,7 +882,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, observeDetail, true)
 			}
 		})
-		noticef(fp.errOutOrStderr(), fp.limits.notices,
+		noticef(fp.limits.notices, siteObserveDowngrade,
 			"[eunox] AUDIT: %s %q would be denied (%s) — forwarding (audit mode)\n",
 			kind, denialTarget, denial.Code,
 		)
@@ -916,7 +917,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	if len(dec.Obligations) > 0 && upResp.Result != nil {
 		redacted, redactErr := pdp.ApplyRedactObligs(upResp.Result, dec.Obligations)
 		if redactErr != nil {
-			noticef(fp.errOutOrStderr(), fp.limits.notices, "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
+			noticef(fp.limits.notices, siteRedactionFault, "[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
 			// Record a deny so the call stays visible on the tape — otherwise an adversarial
 			// upstream could return a redaction-failing response to make every redactFields-
 			// guarded call vanish from the audit trail.
@@ -938,7 +939,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// upstream returning BOTH a result and an error (which JSON-RPC forbids) must not forward
 	// a redactable value through error.data, a free-form channel the redact paths can't verify.
 	if upResp.Error != nil && upResp.Error.Data != nil && hasRedactFieldsObligation(dec.Obligations) {
-		noticef(fp.errOutOrStderr(), fp.limits.notices, "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
+		noticef(fp.limits.notices, siteRedactionFault, "[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
 		upResp.Error.Data = nil
 	}
 
@@ -962,7 +963,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 	// was a DENY, and a downgraded deny must never untaint a session (defense in depth against
 	// a PDP that stamps a handle on a deny).
 	if dec.Decision == capability.DecisionAllow && declassifyCommitted(upResp) {
-		labelsCleared, declDetail = commitDeclassify(ctx, fp.errOutOrStderr(), fp.limits.notices, committer, fp.sessionID, dec, kind, denialTarget)
+		labelsCleared, declDetail = commitDeclassify(ctx, fp.limits.notices, committer, fp.sessionID, dec, kind, denialTarget)
 		declDetail = mergeAuditDetails(declDetail, handlerFaultDetail(dec))
 	} else {
 		declDetail = decisionDetail(dec)
@@ -1021,19 +1022,20 @@ const (
 // must stay an unverified detail. A bare string parameter here is exactly the shape that lets a
 // raw Mcp-Session-Id header become a signed assertion.
 //
-// It carries no recorder: refuseUnroutable resolves its own from the refusalRecorders it is handed,
-// which is what keeps one producer from having two provenances for one record.
+// It carries no recorder and no diagnostic channel: refuseUnroutable resolves BOTH from the
+// refusalRecorders it is handed, which is what keeps one producer from having two provenances for
+// one record — and, since the channel now carries its own writer, from writing the two framings'
+// identical line to two different places.
 //
 // strict is threaded rather than left zero even though the routing refusal hard-denies above the
 // strict-audit gate today. The whole point of routing both framings through one producer is that
 // they cannot diverge; a params struct that silently drops the field re-introduces the divergence
 // one zero value at a time, and the request-framed twin carries the leg's real state.
-func refusalForwardParams(subj killSubject, auditMode bool, strict strictAuditState, errOut io.Writer) forwardParams {
+func refusalForwardParams(subj killSubject, auditMode bool, strict strictAuditState) forwardParams {
 	return forwardParams{
 		audit:            auditMode,
 		sessionID:        subj.auditSessionID(),
 		strictAuditState: strict,
-		errOut:           errOut,
 	}
 }
 
@@ -1114,7 +1116,7 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorde
 	// pipe or a terminal), spent per frame at the peer's rate. Elided lines are counted into the
 	// next one rather than lost, so an operator watching stderr still sees the rate; the RECORD
 	// above is unbounded by declaration, so nothing a SIEM reads is elided either way.
-	noticef(fp.errOutOrStderr(), recs.notices(),
+	noticef(recs.notices(), siteUnmappedMethod,
 		"[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded\n",
 		framing, sanitizedMethod,
 	)
@@ -1208,7 +1210,10 @@ type serverRequestParams struct {
 	//
 	// ONE field rather than the writer, the record buckets and the leg threaded separately: the
 	// three are one obligation, and holding them apart is what let two hand-mirrored constructors
-	// zero-fill whichever a caller missed.
+	// zero-fill whichever a caller missed. Its notices field is also this leg's diagnostic CHANNEL
+	// — the writer AND its bound — which is why there is no errOut beside it: the two used to be
+	// independent fields feeding one line, so a leg that wired one and not the other wrote
+	// unbounded with the call-site walk still green.
 	unblocker serverRequestUnblocker
 	// decideLock serializes the sampling decision against host-path decisions on the same
 	// anchor when the policy is flow-relevant, since this path runs on the upstream-reader
@@ -1229,9 +1234,6 @@ type serverRequestParams struct {
 	// strictAuditState (embedded) carries the --require-audit=strict gate, which also
 	// covers the enforced sampling/createMessage path below. See forwardParams.
 	strictAuditState
-	// errOut is this leg's diagnostic writer; see forwardParams.errOut for the fallback rule
-	// and rationale (nil means os.Stderr).
-	errOut io.Writer
 }
 
 // errOutOrStderr returns fp.errOut when set, else os.Stderr. See forwardParams.errOutOrStderr;
@@ -1239,7 +1241,7 @@ type serverRequestParams struct {
 // forwardParams are deliberately separate structs — the server-initiated leg carries none of
 // forwardParams' host-request-only fields (callUpstream, endDecision, upstreamTimeMs).
 func (fp serverRequestParams) errOutOrStderr() io.Writer {
-	return resolvedErrOut(fp.errOut)
+	return fp.unblocker.notices.errOut()
 }
 
 // answerInitiator sends reply to the blocked upstream initiator through the shared answering seam,
@@ -1518,7 +1520,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 			mergeAuditDetails(denial.Details, decisionDetail(dec)), true)
 	}
-	noticef(fp.errOutOrStderr(), fp.unblocker.notices(),
+	noticef(fp.unblocker.notices, siteSamplingDowngrade,
 		"[eunox] AUDIT: sampling/createMessage would be denied (%s) — forwarding (audit mode)\n",
 		denial.Code,
 	)
