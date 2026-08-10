@@ -323,8 +323,9 @@ upstreams:
 ```
 
 The `proxy --audit` wiretap equivalent is `--upstream-protocol-version`, on either
-upstream transport. A value this build does not speak is refused at load, not at the
-first request.
+upstream transport; `eunox validate --live` and `eunox init` take the same flag, so a
+probe opens the leg the way the proxy would rather than always with the handshake.
+A value this build does not speak is refused at load, not at the first request.
 
 The pin **selects the opener**, and everything else about the leg follows from it:
 
@@ -355,7 +356,13 @@ Two consequences of the pin worth stating before you set it:
 - **eunox declares only on the requests it originates** — the opener and the
   session-start `tools/list` drift probe. A host's own params are still forwarded
   verbatim, `_meta` included, so a host on a declaring leg must carry its own
-  per-request declaration; on a matched pair it already does.
+  per-request declaration on every request. A message that reached a declaring
+  revision by *inheriting* its context rather than stating a version is refused
+  `UNSUPPORTED_PROTOCOL_VERSION` before it is forwarded: host-side omission
+  inherits, upstream-side eunox adds nothing, and together they would deliver a
+  request missing the member that revision requires. Refusing names the cause
+  where the upstream's own rejection would not. (A host *response* owes no
+  declaration — it answers something the upstream declared for itself.)
 
 The handshake's own answer is now **checked** rather than allowed to set the leg's
 revision, and the two ways it can disagree get different answers:

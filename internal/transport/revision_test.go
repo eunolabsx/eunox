@@ -57,6 +57,11 @@ func TestResolveHostRevision(t *testing.T) {
 		// what the pin bought — before the opener was revision-selected, every leg was addressed
 		// as the handshake revision and this exact pair was refused.
 		{name: "matched pair on a pinned leg", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, declared: "2026-07-28", want: capability.Revision20260728},
+		// The same pair with the declaration OMITTED. Host-side, omission inherits the context;
+		// upstream-side, eunox declares only on requests it originates. Together they would send
+		// a declaring upstream a request missing the member that revision requires, so this is
+		// refused HERE rather than one layer away by the upstream.
+		{name: "inherited on a declaring leg", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, wantErr: errUndeclaredOnDeclaringLeg},
 		// And the mismatched pair in the other direction: an old host in front of a pinned new
 		// upstream is refused rather than served into a conversation held at another revision.
 		{name: "old host against a pinned new leg", contextRev: capability.Revision20251125, legRev: capability.Revision20260728, declared: "2025-11-25", wantErr: errUnhonorableUpstreamRevision},
@@ -324,5 +329,43 @@ func TestUpstreamDeclaration_NeverContradictsTheHeaderEunoxStamps(t *testing.T) 
 	// making the whole declaration surface unusable.
 	if admitted == 0 {
 		t.Error("no declaration was admitted on any leg; the property held only because nothing is ever forwarded")
+	}
+}
+
+// TestCheckDeclarationReachesUpstream covers the seam between two rules that are each correct
+// alone: host-side omission INHERITS the context, and upstream-side eunox declares only on the
+// requests it originates. Only their combination is a defect, and only on a declaring leg.
+func TestCheckDeclarationReachesUpstream(t *testing.T) {
+	t.Parallel()
+	call := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall}
+	response := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{}`)}
+	cases := []struct {
+		name     string
+		resolved capability.Revision
+		legRev   capability.Revision
+		msg      mcp.RPCMsg
+		declared bool
+		wantErr  bool
+	}{
+		{name: "inherited on a declaring leg", resolved: capability.Revision20260728, legRev: capability.Revision20260728, msg: call, wantErr: true},
+		{name: "declared on a declaring leg", resolved: capability.Revision20260728, legRev: capability.Revision20260728, msg: call, declared: true},
+		{name: "inherited on a negotiating leg", resolved: capability.Revision20251125, legRev: capability.Revision20251125, msg: call},
+		// A host RESPONSE is the one framing relayed verbatim with no method of its own; it
+		// answers something the upstream already declared for, so it owes no declaration.
+		{name: "a response owes none", resolved: capability.Revision20260728, legRev: capability.Revision20260728, msg: response},
+		// No leg means no upstream to reach, so there is nothing to arrive undeclared at.
+		{name: "no upstream leg", resolved: capability.Revision20260728, msg: call},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := checkDeclarationReachesUpstream(tc.resolved, tc.legRev, tc.msg, tc.declared)
+			if tc.wantErr && !errors.Is(err, errUndeclaredOnDeclaringLeg) {
+				t.Errorf("err = %v, want the undeclared-on-a-declaring-leg refusal", err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("err = %v, want none", err)
+			}
+		})
 	}
 }

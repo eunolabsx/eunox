@@ -352,11 +352,13 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	// The spec requires the client to advertise both JSON and SSE content types so the
 	// server may answer either way.
 	req.Header.Set("Accept", CTJSON+", "+ctSSE)
-	// Every post-handshake request must carry the negotiated protocol version; `initialize`
-	// is the one request that PERFORMS that negotiation, so it precedes the header and must
-	// not carry it. The other opener does: `server/discover` negotiates nothing, it is an
-	// ordinary request of a revision the client has already declared.
-	if msg.Method != mcp.MethodInitialize {
+	// Every post-handshake request must carry the negotiated protocol version; the one request
+	// that PERFORMS that negotiation precedes the header and must not carry it. Which request
+	// that is comes from the leg's own opener declaration (openerNegotiatesVersion), not from a
+	// method name hardcoded in this generic sender — a revision whose opener negotiates nothing
+	// carries the header on its opener too, and this file has no other revision knowledge to
+	// keep in step with the rest.
+	if !openerNegotiatesVersion(rev, msg.Method) {
 		setNegotiatedVersionHeader(req, rev)
 	}
 	if sessID != "" {

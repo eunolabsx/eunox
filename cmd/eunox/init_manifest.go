@@ -380,6 +380,7 @@ Flags:
 	force := fs.Bool("force", false, "Overwrite --output / --config-output if they already exist (default: refuse to\nclobber). An overwrite also re-tightens the file mode to 0600.")
 	name := fs.String("name", "generated-manifest", "Value for the manifest name field.")
 	authHeader := fs.String("upstream-auth-header", "", `Header forwarded to the HTTP upstream in "Name: Value" format.`)
+	protocolVersion := fs.String("upstream-protocol-version", "", "MCP protocol revision to open the upstream leg at, which selects the opener:\n\"auto\" (the default) opens with the `initialize` handshake, or name a revision.\nThe same key an eunox config sets per upstream — pass it so `init` introspects\nthe upstream the way `eunox proxy` would open it.")
 	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the HTTP upstream (development only).")
 	pinDescriptions := fs.Bool("pin-descriptions", false, "Include a descriptionHash field for each tool, computed from its current live\ndescription. When set in the manifest, the proxy verifies the hash at startup\nand aborts if the description has changed — detecting upstream tool poisoning.")
 
@@ -398,7 +399,7 @@ Flags:
 	}
 
 	positional := fs.Args()
-	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, positional)
+	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, positional, *protocolVersion)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
 		return initUsageExit
@@ -452,7 +453,13 @@ Flags:
 // buildInitUpstreamSpec validates and returns the live-introspection target, rejecting
 // cross-axis flag mixes up front rather than at the first network call. Shared by `init`
 // and `validate --live`.
-func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSkipVerify bool, positional []string) (initUpstreamSpec, error) {
+func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSkipVerify bool, positional []string, protocolVersion string) (initUpstreamSpec, error) {
+	// The same rule the config key and the proxy flag take, so a probe cannot be pointed at a
+	// revision the proxy would refuse to open.
+	if err := config.ValidateProtocolVersionFlag(protocolVersion); err != nil {
+		return initUpstreamSpec{}, err
+	}
+	pin := (&config.UpstreamConfig{ProtocolVersion: protocolVersion}).ResolvedProtocolVersion()
 	switch transportMode {
 	case config.HostTransportHTTP:
 		if upstreamURL == "" {
@@ -462,10 +469,11 @@ func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSki
 			return initUpstreamSpec{}, fmt.Errorf("positional args are not allowed with --transport http (got %q); they are the stdio subprocess command", positional)
 		}
 		return initUpstreamSpec{
-			Transport:     config.HostTransportHTTP,
-			URL:           upstreamURL,
-			AuthHeader:    authHeader,
-			TLSSkipVerify: tlsSkipVerify,
+			Transport:       config.HostTransportHTTP,
+			URL:             upstreamURL,
+			AuthHeader:      authHeader,
+			TLSSkipVerify:   tlsSkipVerify,
+			ProtocolVersion: pin,
 		}, nil
 	case config.HostTransportStdio:
 		if upstreamURL != "" {
@@ -481,9 +489,10 @@ func buildInitUpstreamSpec(transportMode, upstreamURL, authHeader string, tlsSki
 			return initUpstreamSpec{}, fmt.Errorf(`--transport stdio requires a subprocess command after "--", e.g.: --transport stdio -- npx -y @modelcontextprotocol/server-filesystem /data`)
 		}
 		return initUpstreamSpec{
-			Transport: config.HostTransportStdio,
-			Command:   positional[0],
-			Args:      positional[1:],
+			Transport:       config.HostTransportStdio,
+			Command:         positional[0],
+			Args:            positional[1:],
+			ProtocolVersion: pin,
 		}, nil
 	default:
 		return initUpstreamSpec{}, fmt.Errorf("--transport must be %q or %q (got %q)", config.HostTransportHTTP, config.HostTransportStdio, transportMode)

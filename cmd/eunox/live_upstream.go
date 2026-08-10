@@ -84,7 +84,7 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 
 	// Page tools/list to exhaustion so the full tool catalog is observed.
 	merged, err := drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
-		req, err := transport.DeclareUpstreamRevision(drift.ToolsListRequest(mcp.RawJSON(`2`), cursor), rev)
+		req, err := transport.BuildToolsListProbe(rev, mcp.RawJSON(`2`), cursor)
 		if err != nil {
 			return nil, err
 		}
@@ -234,7 +234,7 @@ func runStdioHandshake(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader, 
 	// FetchAllToolPages follows nextCursor to exhaustion, bounding page/tool counts and
 	// rejecting a repeated cursor.
 	merged, err := drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
-		req, err := transport.DeclareUpstreamRevision(drift.ToolsListRequest(mcp.RawJSON(listID), cursor), rev)
+		req, err := transport.BuildToolsListProbe(rev, mcp.RawJSON(listID), cursor)
 		if err != nil {
 			return nil, err
 		}

@@ -59,8 +59,8 @@ Section conventions:
   enforced exactly as before. Nothing changes for a 2025-11-25 peer.
 - **`protocolVersion` selects how eunox opens an upstream leg.** A per-upstream
   config key — `auto` (the default), `"2025-11-25"`, or `"2026-07-28"` — with
-  `--upstream-protocol-version` as the `proxy --audit` wiretap equivalent, on
-  either upstream transport. Per upstream rather than per gateway, since a
+  `--upstream-protocol-version` as the equivalent on `proxy --audit`,
+  `validate --live` and `init`, on either upstream transport. Per upstream rather than per gateway, since a
   gateway's upstreams migrate independently. A value this build does not speak is
   refused at load, not at the first request.
 
@@ -334,6 +334,11 @@ Section conventions:
   continues where it was opened. The notice bounds and strips the upstream's own string, so it
   cannot size or drive the console line. No behavior change for an upstream on an unpublished
   revision beyond the new warning.
+- **A request that would reach a declaring upstream with no declaration is refused.** Host-side
+  omission inherits the context; upstream-side eunox declares only on the requests it
+  originates. Together they delivered a 2026-07-28 upstream a request missing the
+  `io.modelcontextprotocol/protocolVersion` member that revision requires on every one — refused
+  by the upstream, one layer from the cause. It is now refused at the proxy, naming the cause.
 - **A pin that could never form a matched pair is refused instead of establishing a dead
   route.** `protocolVersion` naming a revision with no handshake is rejected at config load
   under `transport: http` (an HTTP session is minted by `initialize`, so the host context is

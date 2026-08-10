@@ -17,15 +17,21 @@ import (
 // both transports.
 var driftProbeID = mcp.RawJSON(`"_drift"`)
 
-// driftProbeRequest builds one page of the session-start tools/list probe for a leg speaking
-// rev — drift.ToolsListRequest plus, on a declaring leg, the per-request revision declaration
-// that revision requires.
+// BuildToolsListProbe builds one page of a tools/list probe for a leg speaking rev —
+// drift.ToolsListRequest plus, on a declaring leg, the per-request revision declaration that
+// revision requires.
 //
-// The declaration belongs HERE rather than in internal/drift: this is a request eunox
-// originates on an upstream leg whose revision only the transport knows, and the drift package
-// builds the same envelope for the CLI probe, which opens its own leg.
+// Exported and shared with the CLI probe for the reason the opener is: this is a request eunox
+// ORIGINATES on an upstream leg, so it owes the declaration, and three hand-wrapped call sites
+// across two packages is three places to forget it. The id is the caller's, since the proxy's
+// probe and the CLI's use different ones.
+func BuildToolsListProbe(rev capability.Revision, id *json.RawMessage, cursor string) (mcp.RPCMsg, error) {
+	return DeclareUpstreamRevision(drift.ToolsListRequest(id, cursor), rev)
+}
+
+// driftProbeRequest is the session-start probe's own call, with this proxy's fixed id.
 func driftProbeRequest(rev capability.Revision, cursor string) (mcp.RPCMsg, error) {
-	return DeclareUpstreamRevision(drift.ToolsListRequest(driftProbeID, cursor), rev)
+	return BuildToolsListProbe(rev, driftProbeID, cursor)
 }
 
 // fetchUpstreamToolsRaw sends a tools/list probe over the HTTP session's callUpstream and

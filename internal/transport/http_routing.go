@@ -1173,8 +1173,16 @@ func (s *httpSession) leg() hostLeg {
 // primitives" is blind to an arm that calls neither, which is how an entry point came to
 // negotiate nothing at all.
 func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg) (capability.Revision, bool) {
+	// One branch for both halves — the leg's revisions and the leg's unblocker — so a caller
+	// cannot supply a session's facts while its blocked initiator goes unanswered. The
+	// pre-session arms pass a nil session: `initialize` exists only in the handshake-bearing
+	// revision, so that is their context, and nothing they answer reaches an upstream.
+	leg, unblock := sessionlessLeg(), (func(context.Context, mcp.RPCMsg))(nil)
+	if sess != nil {
+		leg, unblock = sess.leg(), sess.unblockRefusedServerReply
+	}
 	return hostMessageGate{
-		leg:      sessionLeg(sess),
+		leg:      leg,
 		recorder: func() auditRecorder { return p.revisionRefusalRecorder(route) },
 		// writeDispatchResult, not a second spelling of it: "a zero RPCMsg is acked bodyless,
 		// never written as a `{"jsonrpc":""}` frame" is one rule on this transport, and the
@@ -1183,34 +1191,9 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 		// A refused host RESPONSE would have answered a request the upstream is blocked on;
 		// unblock it rather than let it hang. A protocol refusal is not an emergency stop, and
 		// eunox can answer with its own error at its own revision without relaying anything the
-		// host said. Nil on the sessionless arms: their messages reach no upstream, so there is
-		// nothing blocked to answer.
-		unblock: sessionUnblockRefusedServerReply(sess),
+		// host said.
+		unblock: unblock,
 	}.negotiate(r.Context(), msg)
-}
-
-// sessionLeg is the leg a message on this session negotiates against, or the pre-session one
-// when there is no session.
-//
-// negotiateHostRevision takes the SESSION rather than an already-built hostLeg so that a caller
-// supplies one value and this file derives both halves — the leg's revisions and the leg's
-// unblocker — from it. That is a smaller surface to get wrong than two arguments a caller pairs
-// itself; it is not a proof, since a future caller could still build a hostMessageGate by hand.
-func sessionLeg(sess *httpSession) hostLeg {
-	if sess == nil {
-		return sessionlessLeg()
-	}
-	return sess.leg()
-}
-
-// sessionUnblockRefusedServerReply adapts a session's unblock to the shared prologue's hook,
-// answering nil for a leg that has no session — whose messages reach no upstream, so there is
-// nothing blocked to answer.
-func sessionUnblockRefusedServerReply(sess *httpSession) func(context.Context, mcp.RPCMsg) {
-	if sess == nil {
-		return nil
-	}
-	return sess.unblockRefusedServerReply
 }
 
 // routeHostServerResponse routes a host POST that is neither request nor notification: a

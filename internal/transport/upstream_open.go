@@ -59,15 +59,68 @@ func UpstreamOpenRevision(pin capability.Revision) capability.Revision {
 	return handshakeRevision
 }
 
+// openerSpec is everything a revision decides about how eunox opens an upstream leg at it.
+//
+// One declaration per revision, in a registry, for the reason methodRegistry is one: these four
+// facts were five `if rev != handshakeRevision` branches across three exported functions and
+// one HTTP sender, and a third published revision inherited the DECLARING arm of every one of
+// them by default. It would have been opened with `server/discover` whether or not it has that
+// method, never completed, and stamped with the other revision's `_meta` keys — with nothing
+// failing until a live upstream answered -32601 at session start. Absence is a build failure
+// now (TestOpenerRegistry_EveryPublishedRevisionDeclaresItsOpener), which is the same trade
+// `methodSpec.In` makes for routing.
+type openerSpec struct {
+	// method opens the leg.
+	method string
+	// completion closes the open, or "" for a revision with nothing to close.
+	completion string
+	// declares is true when this revision carries its protocol version in every request's
+	// `_meta` rather than negotiating it once.
+	declares bool
+	// negotiatesVersion is true when the OPENER itself performs the version negotiation, so it
+	// precedes the MCP-Protocol-Version header and must not carry one. False for an opener that
+	// is an ordinary request of a revision the client has already declared.
+	negotiatesVersion bool
+}
+
+// openerRegistry declares the opener for every revision this build speaks. A revision missing
+// from it has no opener and fails the build rather than inheriting another revision's.
+var openerRegistry = map[capability.Revision]openerSpec{
+	capability.Revision20251125: {
+		method:            mcp.MethodInitialize,
+		completion:        mcp.MethodNotificationsInitialized,
+		negotiatesVersion: true,
+	},
+	capability.Revision20260728: {
+		method:   mcp.MethodServerDiscover,
+		declares: true,
+	},
+}
+
+// openerFor returns the opener declaration for a leg speaking rev, resolving an unset or
+// unspeakable revision through UpstreamOpenRevision — the one resolver that decides what a leg
+// with no explicit revision is opened at, so this cannot answer a different question than the
+// construction that picked the opener in the first place.
+func openerFor(rev capability.Revision) openerSpec {
+	return openerRegistry[UpstreamOpenRevision(rev)]
+}
+
 // declaresPerRequestRevision reports whether a leg at rev carries its protocol revision in each
 // request's `_meta` rather than negotiating it once.
-//
-// Phrased against the handshake revision rather than listing the revisions that declare, so a
-// third published revision inherits the declaring behavior by default: a revision with no
-// handshake has nowhere else to state its version, and defaulting the other way would open a
-// leg whose every request omits a member that revision requires.
 func declaresPerRequestRevision(rev capability.Revision) bool {
-	return resolveRevision(rev) != handshakeRevision
+	return openerFor(rev).declares
+}
+
+// openerNegotiatesVersion reports whether method is the opener of a leg at rev AND that opener
+// performs the version negotiation — the one request that must NOT carry the negotiated version
+// header, because it is what establishes it.
+//
+// Keyed on the leg's revision as well as the method, so the rule follows the opener declaration
+// rather than a hardcoded method name in the generic HTTP sender. A host-forwarded message that
+// merely shares the opener's name on a leg that does not open with it still carries its header.
+func openerNegotiatesVersion(rev capability.Revision, method string) bool {
+	spec := openerFor(rev)
+	return spec.negotiatesVersion && method == spec.method
 }
 
 // revisionDeclaration returns the `_meta` members eunox stamps on the requests it originates on
@@ -179,10 +232,13 @@ func buildInitializeParams() json.RawMessage {
 // member for a request whose schema this build cannot check would be exactly the guess the
 // fail-closed posture exists to avoid.
 func BuildUpstreamOpenerWithID(rev capability.Revision, id *json.RawMessage) (mcp.RPCMsg, error) {
-	if !declaresPerRequestRevision(rev) {
-		return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: mcp.MethodInitialize, Params: buildInitializeParams()}, nil
+	spec := openerFor(rev)
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: spec.method}
+	if !spec.declares {
+		msg.Params = buildInitializeParams()
+		return msg, nil
 	}
-	return DeclareUpstreamRevision(mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: mcp.MethodServerDiscover}, rev)
+	return DeclareUpstreamRevision(msg, rev)
 }
 
 // buildUpstreamOpener constructs the opener with the id derived from idCounter so the caller
@@ -206,10 +262,11 @@ func buildUpstreamOpener(rev capability.Revision, idCounter int64) (mcp.RPCMsg, 
 // three different idioms across five call sites, one of which (`if err != nil || !wanted {
 // return err }`) returns nil to mean "nothing to do" and reads as a bug.
 func UpstreamOpenerCompletion(rev capability.Revision) (mcp.RPCMsg, bool) {
-	if declaresPerRequestRevision(rev) {
+	completion := openerFor(rev).completion
+	if completion == "" {
 		return mcp.RPCMsg{}, false
 	}
-	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
+	notif, _ := mcp.NotificationMsg(completion, nil)
 	return notif, true
 }
 
@@ -278,11 +335,8 @@ func openerResult(method string, resp mcp.RPCMsg) (json.RawMessage, error) {
 // exactly one of the two openers skip the judgement is how "check the answer, never infer from
 // it" would have held for half the legs.
 func ApplyUpstreamOpenerResult(rev capability.Revision, resp mcp.RPCMsg) (UpstreamHandshake, error) {
-	declaring := declaresPerRequestRevision(rev)
-	method := mcp.MethodInitialize
-	if declaring {
-		method = mcp.MethodServerDiscover
-	}
+	spec := openerFor(rev)
+	method := spec.method
 	raw, err := openerResult(method, resp)
 	if err != nil {
 		return UpstreamHandshake{}, err
@@ -294,7 +348,9 @@ func ApplyUpstreamOpenerResult(rev capability.Revision, resp mcp.RPCMsg) (Upstre
 	// Unmarshalling JSON `null` into a struct succeeds with all fields zero, which would be
 	// accepted as a successful open with empty capabilities. Require the mandatory fields
 	// before accepting it (fail closed).
-	if err := validateOpenerResultFields(method, result, !declaring); err != nil {
+	// requireVersion follows the opener's own declaration: only an opener that NEGOTIATES a
+	// version can be missing one.
+	if err := validateOpenerResultFields(method, result, spec.negotiatesVersion); err != nil {
 		return UpstreamHandshake{}, err
 	}
 	notice, err := checkNegotiatedRevision(rev, result.ProtocolVersion)

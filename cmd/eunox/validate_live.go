@@ -444,6 +444,7 @@ Flags:
 	transportFlag := fs.String("transport", config.HostTransportHTTP, "Upstream transport for --live: \"http\" (default, with --upstream-url) or \"stdio\"\n(subprocess command after \"--\").")
 	upstreamURL := fs.String("upstream-url", "", "Base URL of the MCP HTTP server (required with --live --transport http, unless --config is set).")
 	authHeader := fs.String("upstream-auth-header", "", `Header forwarded to the upstream in "Name: Value" format.`)
+	protocolVersion := fs.String("upstream-protocol-version", "", "MCP protocol revision to open the upstream leg at for --live, which selects the\nopener: \"auto\" (the default) opens with the `initialize` handshake, or name a\nrevision. Ignored under --config, where each route's own protocolVersion is used.")
 	tlsSkipVerify := fs.Bool("upstream-tls-skip-verify", false, "Skip TLS certificate verification for the upstream (development only).")
 
 	// Split off a stdio subprocess command after the first standalone "--", before
@@ -549,7 +550,7 @@ Flags:
 		return 0
 	}
 
-	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, stdioCmd)
+	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, stdioCmd, *protocolVersion)
 	if err != nil {
 		// A missing/incoherent upstream wiring is a connection error (exit 2), not drift.
 		fmt.Fprintf(os.Stderr, "eunox validate: %v (or use --config <eunox.yaml>)\n", err)

@@ -40,6 +40,16 @@ var errRevisionMismatch = errors.New("protocol revision disagrees with the conte
 // boundary governs and this build does not do.
 var errUnhonorableUpstreamRevision = errors.New("request revision cannot be honored by the upstream leg")
 
+// errUndeclaredOnDeclaringLeg marks a message that resolved to a declaring revision by
+// INHERITING its context rather than by stating a version, on a leg whose revision requires the
+// declaration on every request.
+//
+// eunox forwards a host's params verbatim and declares only on the requests it originates, so
+// there is nothing to add on the way through — the member would simply be absent at the
+// upstream, which refuses it one layer away from the cause. Refusing here names the cause: the
+// peer inherited a revision whose own rule is that inheritance is not enough.
+var errUndeclaredOnDeclaringLeg = errors.New("request inherited a revision that requires a per-request declaration, and carries none")
+
 // hostLeg is what revision negotiation needs to know about the connection a message arrived on.
 //
 // A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
@@ -171,8 +181,38 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 		if err := checkUpstreamHonorable(resolved, legRev); err != nil {
 			return "", err
 		}
+		if err := checkDeclarationReachesUpstream(resolved, legRev, msg, present); err != nil {
+			return "", err
+		}
 	}
 	return resolved, nil
+}
+
+// checkDeclarationReachesUpstream refuses a message that would arrive at a declaring upstream
+// without the per-request version member that revision requires.
+//
+// The gap it closes is the seam between two rules that are each correct alone. Host-side,
+// omission INHERITS the context — so a peer may declare once and omit forever after. Upstream-
+// side, eunox declares only on the requests it ORIGINATES, because adding a member to a host's
+// params is translation. Put together, an inherited request crosses to a declaring upstream with
+// no declaration at all and is refused there, by a peer that cannot say which of eunox's two
+// rules produced it.
+//
+// Scoped to a message that carries a METHOD: the revision requires the declaration on requests
+// and notifications, and a host RESPONSE — the one framing relayed verbatim with no method — is
+// an answer to something the upstream already declared for itself.
+//
+// Not applied when the message declared its own revision, which is the matched-pair case and
+// the normal one: a conforming peer on a declaring revision states its version every time.
+func checkDeclarationReachesUpstream(resolved, legRev capability.Revision, msg mcp.RPCMsg, declared bool) error {
+	if declared || legRev == "" || msg.Method == "" {
+		return nil
+	}
+	if !declaresPerRequestRevision(resolved) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s requires io.modelcontextprotocol/protocolVersion in every request's _meta, and eunox forwards params verbatim rather than adding one",
+		errUndeclaredOnDeclaringLeg, resolved)
 }
 
 // upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg: the one

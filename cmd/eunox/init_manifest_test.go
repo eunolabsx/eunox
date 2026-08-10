@@ -1070,7 +1070,7 @@ func TestBuildInitUpstreamSpec(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := buildInitUpstreamSpec(tc.transport, tc.upstreamURL, tc.authHeader, tc.tlsSkipVerify, tc.positional)
+			got, err := buildInitUpstreamSpec(tc.transport, tc.upstreamURL, tc.authHeader, tc.tlsSkipVerify, tc.positional, "")
 			if tc.wantErr != "" {
 				if err == nil {
 					t.Fatalf("want error containing %q, got nil (spec=%+v)", tc.wantErr, got)

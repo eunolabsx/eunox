@@ -104,7 +104,7 @@ func TestBuildUpstreamOpener_DeclaringLegCarriesTheDeclaration(t *testing.T) {
 func TestDeclareUpstreamRevision(t *testing.T) {
 	t.Parallel()
 
-	probe := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`"_drift"`), Method: capability.MethodToolsList,
+	probe := mcp.RPCMsg{JSONRPC: "2.0", ID: driftProbeID, Method: capability.MethodToolsList,
 		Params: json.RawMessage(`{"cursor":"page2"}`)}
 
 	unchanged, err := DeclareUpstreamRevision(probe, capability.Revision20251125)
@@ -411,5 +411,64 @@ func TestInitializeAcrossRevisions_IsRefusedNotTranslated(t *testing.T) {
 	})
 	if resp := ok.buildInitResponse(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize}); resp.Error != nil {
 		t.Errorf("a matched handshake was refused: %+v", resp.Error)
+	}
+}
+
+// TestOpenerRegistry_EveryPublishedRevisionDeclaresItsOpener is the build-time guard the
+// opener registry exists for: a revision this build says it speaks but cannot open a leg at is
+// one an operator can pin and then watch fail against a live upstream.
+//
+// It also pins the two facts an inherited declaration would get wrong. An opener that
+// negotiates the version must not also declare one per request (the two are alternatives, not
+// a pair), and a declaring revision must have no completion — there is no handshake to close.
+func TestOpenerRegistry_EveryPublishedRevisionDeclaresItsOpener(t *testing.T) {
+	t.Parallel()
+	for _, rev := range capability.PublishedRevisions() {
+		spec, declared := openerRegistry[rev]
+		if !declared {
+			t.Errorf("revision %s is published but declares no opener; add an openerRegistry entry rather than letting it inherit another revision's", rev)
+			continue
+		}
+		if spec.method == "" {
+			t.Errorf("revision %s declares an empty opener method", rev)
+		}
+		if spec.negotiatesVersion && spec.declares {
+			t.Errorf("revision %s both negotiates a version and declares one per request; they are alternatives", rev)
+		}
+		if spec.declares && spec.completion != "" {
+			t.Errorf("revision %s declares per request but has completion %q; a revision with no handshake has nothing to close", rev, spec.completion)
+		}
+	}
+	// A stale entry is the other direction: a revision the registry describes but this build
+	// no longer speaks would be dead weight a reader trusts.
+	for rev := range openerRegistry {
+		if !rev.Supported() {
+			t.Errorf("openerRegistry declares %s, which this build does not speak; drop the stale entry", rev)
+		}
+	}
+}
+
+// TestOpenerNegotiatesVersion_FollowsTheDeclaration: the version header is suppressed for the
+// request that PERFORMS the negotiation and for nothing else. Keyed on the leg's revision, so a
+// host-forwarded message merely sharing the opener's name on a leg that does not open with it
+// still carries its header.
+func TestOpenerNegotiatesVersion_FollowsTheDeclaration(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		rev    capability.Revision
+		method string
+		want   bool
+	}{
+		{rev: capability.Revision20251125, method: mcp.MethodInitialize, want: true},
+		{rev: capability.Revision20251125, method: capability.MethodToolsCall, want: false},
+		// The declaring leg's opener negotiates nothing — it is an ordinary request of a
+		// revision the client already stated, so it carries the header like any other.
+		{rev: capability.Revision20260728, method: mcp.MethodServerDiscover, want: false},
+		{rev: capability.Revision20260728, method: mcp.MethodInitialize, want: false},
+	}
+	for _, tc := range cases {
+		if got := openerNegotiatesVersion(tc.rev, tc.method); got != tc.want {
+			t.Errorf("openerNegotiatesVersion(%q, %q) = %v, want %v", tc.rev, tc.method, got, tc.want)
+		}
 	}
 }
