@@ -152,7 +152,7 @@ jobs:
       # log. Verify with:
       #   gh attestation verify <artifact> --repo eunolabs/eunox
       - name: Attest release artifact provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
@@ -252,7 +252,7 @@ jobs:
       # pushed to GHCR alongside the cosign signature. Verify with:
       #   gh attestation verify oci://ghcr.io/eunolabs/eunox:<tag> --repo eunolabs/eunox
       - name: Attest Linux image provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/eunolabs/eunox
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -331,7 +331,7 @@ jobs:
           done
 
       - name: Attest Mac image provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/eunolabs/eunox
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -409,7 +409,7 @@ jobs:
           done
 
       - name: Attest Windows image provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/eunolabs/eunox
           subject-digest: ${{ steps.build.outputs.digest }}
