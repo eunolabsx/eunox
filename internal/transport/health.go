@@ -40,14 +40,31 @@ type healthSnapshot struct {
 	// gate traffic) — the size/retention bound is just unenforced until the fault is fixed.
 	AuditMaintenanceStalled bool   `json:"auditMaintenanceStalled"`
 	AuditMaintenanceReason  string `json:"auditMaintenanceReason,omitempty"`
-	// JWKSFetchState is the state of the circuit breaker guarding IdP key fetches:
-	// "closed" | "half-open" | "open". Empty means no JWT layer is configured, which is the
-	// one thing a value could not say — "closed" on a proxy that fetches no keys would read
-	// as healthy key fetching rather than as none. The two counters travel with it and are
-	// omitted for the same reason.
-	JWKSFetchState     string `json:"jwksFetchState,omitempty"`
-	JWKSFetchFailures  int64  `json:"jwksFetchFailures,omitempty"`
-	JWKSFetchSuccesses int64  `json:"jwksFetchSuccesses,omitempty"`
+	// JWKS is absent when no JWT layer reports a key-fetch breaker. Nested rather than three
+	// flat fields so presence is ONE fact: a per-field `omitempty` drops a legitimate zero
+	// counter, and a zeroed state on a proxy that fetches no keys reads as healthy key
+	// fetching rather than as none.
+	JWKS *jwksHealth `json:"jwks,omitempty"`
+}
+
+// jwksHealth is the JWT layer's key-fetch state, as reported by the circuit breaker guarding
+// IdP fetches. Its fields carry no omitempty: within the block a zero is a measurement.
+type jwksHealth struct {
+	BreakerState   circuitbreaker.State `json:"breakerState"`
+	FetchFailures  int64                `json:"fetchFailures"`
+	FetchSuccesses int64                `json:"fetchSuccesses"`
+}
+
+// keyFetchImpeded reports whether the breaker is refusing, or has tripped and not yet proved
+// recovery. Anything but closed counts, including a state this build does not recognize.
+//
+// Half-open is NOT a recovering state: it is entered only from open and closes only once a
+// probe SUCCEEDS, so it means "tripped, retry outstanding" — and at the shipped
+// HalfOpenMaxProbes=1 a probe in flight refuses every other fetch exactly as open does, while
+// a cooldown that merely lapsed with no traffic reports half-open forever. Reading only
+// StateOpen therefore went quiet for most of a sustained outage.
+func (j *jwksHealth) keyFetchImpeded() bool {
+	return j != nil && j.BreakerState != circuitbreaker.StateClosed
 }
 
 // snapshot gathers the current operational state (locked map reads plus atomic
@@ -77,18 +94,18 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 	// route wrapper this one validator's cache, so the routes share a single breaker.
 	if p.jwtPDP != nil {
 		if st, ok := p.jwtPDP.Cache().BreakerStats(); ok {
-			snap.JWKSFetchState = string(st.State)
-			snap.JWKSFetchFailures = st.TotalFailures
-			snap.JWKSFetchSuccesses = st.TotalSuccesses
-			// Only OPEN is degraded. Open means refreshes are being refused, so an
-			// unknown-kid token fails closed now and every token does once the cached set
-			// passes its TTL — token validation is down with nothing else to see it by. A
-			// projected half-open admits the next fetch, so it is a recovering state, not a
-			// refusing one; the failure counter is what shows it flapping.
-			if st.State == circuitbreaker.StateOpen {
-				snap.Status = "degraded"
+			snap.JWKS = &jwksHealth{
+				BreakerState:   st.State,
+				FetchFailures:  st.TotalFailures,
+				FetchSuccesses: st.TotalSuccesses,
 			}
 		}
+	}
+	// An impeded breaker means key refreshes are being refused: an unknown-kid token fails
+	// closed now and every token does once the cached set passes its TTL. Degraded here means
+	// what it means for the kill switch — not operating normally — not "already rejecting".
+	if snap.JWKS.keyFetchImpeded() {
+		snap.Status = "degraded"
 	}
 	// Audit-integrity loss also flips status to "degraded": no sink, dropped records, or
 	// failed writes each mean the tamper-evident audit trail is incomplete.
@@ -129,14 +146,6 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := p.snapshot()
-	killHealthy := 0
-	if snap.KillSwitchHealthy {
-		killHealthy = 1
-	}
-	auditUp := 0
-	if snap.AuditConfigured {
-		auditUp = 1
-	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	// wf discards write errors: a broken scrape connection is not actionable here.
 	wf := func(format string, args ...interface{}) { _, _ = fmt.Fprintf(w, format, args...) }
@@ -157,33 +166,41 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	wf("eunox_audit_write_failures_total %d\n", snap.AuditWriteFailed)
 	wf("# HELP eunox_audit_sink_up Whether the audit sink opened successfully (1 = up).\n")
 	wf("# TYPE eunox_audit_sink_up gauge\n")
-	wf("eunox_audit_sink_up %d\n", auditUp)
+	wf("eunox_audit_sink_up %d\n", gaugeBool(snap.AuditConfigured))
 	wf("# HELP eunox_kill_switch_healthy Kill-switch backend health (1 = healthy, 0 = degraded).\n")
 	wf("# TYPE eunox_kill_switch_healthy gauge\n")
-	wf("eunox_kill_switch_healthy %d\n", killHealthy)
-	maintStalled := 0
-	if snap.AuditMaintenanceStalled {
-		maintStalled = 1
-	}
+	wf("eunox_kill_switch_healthy %d\n", gaugeBool(snap.KillSwitchHealthy))
 	wf("# HELP eunox_audit_maintenance_stalled Audit rotation or retention pruning is not making progress (1 = stalled). No records are lost, but the configured size/retention bound is unenforced and the log will grow until the fault is fixed.\n")
 	wf("# TYPE eunox_audit_maintenance_stalled gauge\n")
-	wf("eunox_audit_maintenance_stalled %d\n", maintStalled)
-	// The whole block is absent without a JWT layer rather than emitted as zeros: a
-	// permanently-0 breaker gauge on a proxy that fetches no keys is indistinguishable from
-	// healthy key fetching, and an absent series is what a scraper already knows how to read.
-	if snap.JWKSFetchState != "" {
-		jwksOpen := 0
-		if snap.JWKSFetchState == string(circuitbreaker.StateOpen) {
-			jwksOpen = 1
+	wf("eunox_audit_maintenance_stalled %d\n", gaugeBool(snap.AuditMaintenanceStalled))
+	// Absent without a JWT layer rather than emitted as zeros: a permanently-healthy gauge on
+	// a proxy that fetches no keys is indistinguishable from healthy key fetching, and an
+	// absent series is what a scraper already knows how to read.
+	if snap.JWKS != nil {
+		wf("# HELP eunox_jwks_fetch_healthy IdP key fetching is unimpeded (1 = breaker closed). 0 means refreshes are refused or the breaker has tripped and not yet proved recovery: a token whose kid the cached key set does not carry fails closed now, and every token fails once that set passes its TTL.\n")
+		wf("# TYPE eunox_jwks_fetch_healthy gauge\n")
+		wf("eunox_jwks_fetch_healthy %d\n", gaugeBool(!snap.JWKS.keyFetchImpeded()))
+		// The state as a labelled set, the Prometheus spelling for an enum: a single boolean
+		// could not name half-open, which is the state a sustained outage sits in longest.
+		wf("# HELP eunox_jwks_breaker_state IdP key-fetch circuit breaker state (1 on the active state).\n")
+		wf("# TYPE eunox_jwks_breaker_state gauge\n")
+		for _, st := range []circuitbreaker.State{circuitbreaker.StateClosed, circuitbreaker.StateHalfOpen, circuitbreaker.StateOpen} {
+			wf("eunox_jwks_breaker_state{state=%q} %d\n", string(st), gaugeBool(snap.JWKS.BreakerState == st))
 		}
-		wf("# HELP eunox_jwks_breaker_open IdP key-fetch circuit breaker is open (1 = open): JWKS refreshes are refused, so a token whose kid the cached key set does not carry fails closed now and every token fails once that set passes its TTL.\n")
-		wf("# TYPE eunox_jwks_breaker_open gauge\n")
-		wf("eunox_jwks_breaker_open %d\n", jwksOpen)
-		wf("# HELP eunox_jwks_fetch_failures_total JWKS fetches that failed, as counted by the circuit breaker. Rising against a closed breaker is a flapping IdP endpoint.\n")
+		wf("# HELP eunox_jwks_fetch_failures_total JWKS fetches the breaker admitted and saw fail. Fetches it REFUSED are not counted here -- watch eunox_jwks_fetch_healthy for those.\n")
 		wf("# TYPE eunox_jwks_fetch_failures_total counter\n")
-		wf("eunox_jwks_fetch_failures_total %d\n", snap.JWKSFetchFailures)
-		wf("# HELP eunox_jwks_fetch_successes_total JWKS fetches that succeeded, as counted by the circuit breaker.\n")
+		wf("eunox_jwks_fetch_failures_total %d\n", snap.JWKS.FetchFailures)
+		wf("# HELP eunox_jwks_fetch_successes_total JWKS fetches reported successful to the breaker, including outcomes it then discarded as stale. Observability only -- do not read a rising value as recovery; eunox_jwks_fetch_healthy is the recovery signal.\n")
 		wf("# TYPE eunox_jwks_fetch_successes_total counter\n")
-		wf("eunox_jwks_fetch_successes_total %d\n", snap.JWKSFetchSuccesses)
+		wf("eunox_jwks_fetch_successes_total %d\n", snap.JWKS.FetchSuccesses)
 	}
+}
+
+// gaugeBool renders a boolean as a Prometheus gauge sample. One spelling, so a new gauge
+// cannot invert the conversion in its own copy of the three-line idiom.
+func gaugeBool(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

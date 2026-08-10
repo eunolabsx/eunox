@@ -306,19 +306,24 @@ Section conventions:
   or that it was authorized. Written only after the kill takes effect; the control
   token is never recorded. See `docs/threat-model-mcp.md` §3.7.
 - **A JWKS outage is now visible on the operational endpoints.** The circuit breaker
-  guarding IdP key fetches is reported as `jwksFetchState` on `/healthz` (`closed` /
-  `half-open` / `open`) and as `eunox_jwks_breaker_open` plus
-  `eunox_jwks_fetch_failures_total` / `eunox_jwks_fetch_successes_total` on `/metrics`.
-  An **open** breaker also flips `/healthz` `status` to `degraded`: open means refreshes
-  are refused, so a token whose `kid` the cached key set does not carry fails closed at
-  once and every token does once that set passes its TTL — token validation down, with
-  the only prior signal being one `jwks_unavailable` audit record per rejected token.
-  A half-open breaker admits the next fetch and is reported without degrading; reading
-  either state projects it without consuming the half-open probe budget a real
-  validation needs. All of it is absent — no field, no series — when no JWT layer is
-  configured, since a permanently-healthy zero on a proxy that fetches no keys is
-  indistinguishable from healthy key fetching. Backed by
-  `capability.(*JWKSCache).BreakerStats`. See `docs/threat-model-mcp.md` §5.2.
+  guarding IdP key fetches is reported as a `jwks` block on `/healthz` (`breakerState`
+  plus `fetchFailures` / `fetchSuccesses`) and as `eunox_jwks_fetch_healthy`,
+  `eunox_jwks_breaker_state{state=...}` and the two `eunox_jwks_fetch_*_total` counters
+  on `/metrics`. A breaker in any state but `closed` reports unhealthy and flips
+  `/healthz` `status` to `degraded`: refreshes are being refused, so a token whose `kid`
+  the cached key set does not carry fails closed at once and every token does once that
+  set passes its TTL. `half-open` counts as impeded — it is entered only from `open` and
+  left only after a probe *succeeds*, and at the shipped one-probe budget a probe in
+  flight refuses every other fetch, so a cooldown that merely lapsed must not read as
+  recovery. Reading the state is a projection and never consumes the probe budget a real
+  validation needs. The whole block is absent — no field, no series — when no JWT layer
+  is configured, since a permanently-healthy reading on a proxy that fetches no keys is
+  indistinguishable from healthy key fetching; within the block a zero counter is a
+  measurement and is always emitted. The prior signal, `jwks_unavailable` audit records,
+  is rate-limited as a pre-session refusal, so it can report that an outage happened but
+  not its size. Backed by `capability.(*JWKSCache).BreakerStats`; a `JWTPDPOptions.Clock`
+  now also drives the default breaker, whose projected state this reports. See
+  `docs/threat-model-mcp.md` §5.2.
 - `capability.MatchOperation`, plus `Compile`/`AllowsOperation`/`MatchExtensions`/
   `TableLookup`/`MatchDomains` on the `allowedOperations`, `allowedExtensions`,
   `allowedTables`, and `recipientDomain` conditions. `Compile` normalizes a condition's

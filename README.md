@@ -402,8 +402,8 @@ boundary.
 beside `/control/kill` (same on-host-only guard — never reachable off the box):
 
 ```bash
-curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, jwksFetchState, ...}
-curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, eunox_jwks_breaker_open, …
+curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, jwks:{breakerState, fetchFailures, fetchSuccesses}, ...}
+curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, eunox_jwks_fetch_healthy, …
 ```
 
 `eunox_audit_dropped_records_total` and `eunox_audit_write_failures_total` are the
@@ -431,18 +431,32 @@ at which point the volume fills, writes *do* start failing, and strict mode
 denies everything. Alert on it as a disk-capacity warning, not an
 audit-integrity one.
 
-`jwksFetchState` / `eunox_jwks_breaker_open` is the JWT layer's signal, present
-only when `--jwks-uri` is configured (a proxy that fetches no keys emits neither,
-rather than a permanently-healthy zero). It reports the circuit breaker guarding
-IdP key fetches: `closed`, `half-open`, or `open`. **Open** also flips `status`
-to `degraded` — refreshes are being refused, so a token whose `kid` the cached
-key set does not carry is rejected right now, and *every* token is rejected once
-that set passes its TTL. Page on it: the alternative signal is one
-`jwks_unavailable` audit record per rejected token, which needs traffic to arrive
-and the tape to be read. `half-open` means the cooldown elapsed and the next
-fetch is admitted — recovering, not refusing, so it is reported without
-degrading. `eunox_jwks_fetch_failures_total` rising while the breaker is still
-closed is a flapping IdP endpoint, worth a warning before it trips.
+The `jwks` block on `/healthz` and the `eunox_jwks_*` series are the JWT layer's
+signal, present only when `--jwks-uri` is configured — a proxy that fetches no
+keys emits neither, rather than a permanently-healthy zero. **Page on
+`eunox_jwks_fetch_healthy == 0`.** It goes to `0`, and `status` to `degraded`,
+whenever the circuit breaker guarding IdP key fetches is anything but `closed`:
+refreshes are being refused, so a token whose `kid` the cached key set does not
+carry is rejected right now, and *every* token is rejected once that set passes
+its TTL.
+
+`half-open` counts as impeded, which is the non-obvious part. The breaker enters
+it only from `open` and leaves it for `closed` only after a probe **succeeds**,
+so it means "tripped, retry outstanding" — and at the shipped
+`HalfOpenMaxProbes: 1` a probe in flight refuses every other fetch exactly as
+`open` does. A cooldown that merely lapsed with no traffic reports `half-open`
+indefinitely, so treating it as recovery would leave the signal quiet through
+most of a sustained outage. `eunox_jwks_breaker_state{state=...}` carries which
+of the three it is, for triage rather than paging.
+
+The audit tape is not a substitute here: the `jwks_unavailable` records an
+outage produces are themselves rate-limited (they are pre-session refusals an
+unauthenticated caller can drive), so they arrive at the bucket's rate with a
+suppressed-count rollup rather than one per rejected token — enough to tell you
+it happened, not enough to size it. `eunox_jwks_fetch_failures_total` rising
+while the breaker is still closed is a flapping IdP endpoint, worth a warning
+before it trips; it counts only fetches the breaker *admitted*, so it stops
+rising once the breaker starts refusing them.
 
 Rotation and retention stall **independently** — one can be wedged while the
 other runs normally — so `auditMaintenanceReason` on `/healthz` reports each

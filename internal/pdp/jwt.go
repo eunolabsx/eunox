@@ -275,7 +275,15 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 	// shipped proxy always has JWKS-fetch protection.
 	breaker := opts.Breaker
 	if breaker == nil {
-		breaker = circuitbreaker.New(circuitbreaker.DefaultConfig())
+		// The injected clock reaches the breaker too: its open/half-open projection is a
+		// wall-clock comparison, and that state is operator-visible, so a frozen test clock
+		// that governed exp/nbf and the cache TTL but not this would report a state
+		// transitioning on real time while everything around it stood still.
+		var copts []circuitbreaker.Option
+		if opts.Clock != nil {
+			copts = append(copts, circuitbreaker.WithClock(opts.Clock.Now))
+		}
+		breaker = circuitbreaker.New(circuitbreaker.DefaultConfig(), copts...)
 	}
 	logger := jwtLogger
 	if normalizeAudience(opts.Audience) == "" && len(sanitizeAudiences(opts.AcceptedAudiences)) == 0 && !opts.AllowAnyAudience {
@@ -368,14 +376,17 @@ func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 // cache. Route wrappers never fetch keys themselves, so a fresh JWKSCache per route
 // would waste N-1 allocations. No audience warning here — the shared validator
 // (NewJWTPDP) already warns once.
+//
+// The cache-shaping fields of opts (Breaker, JWKSURI, CacheTTL, Client, and the cache half of
+// Clock) are IGNORED: cache is already built. That is what makes every wrapper answer from one
+// breaker, so a caller passing its own Breaker here monitors something no route fetches through.
 func NewJWTPDPWithCache(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 	return newJWTPDP(opts, cache)
 }
 
 // Cache returns the JWKS cache this validator owns, so a gateway can build
-// per-route wrappers (NewJWTPDPWithCache) that share one key-fetching cache — and so a
-// health endpoint can read that one cache's key-fetch state (BreakerStats) knowing every
-// route answers from it.
+// per-route wrappers (NewJWTPDPWithCache) that share one key-fetching cache — one cache means
+// one breaker, so a reader of its key-fetch state gets an answer true for every route.
 func (p *JWTPDP) Cache() *capability.JWKSCache {
 	return p.cache
 }

@@ -1173,12 +1173,15 @@ func TestJWKSCacheBreakerStats(t *testing.T) {
 
 	t.Run("reports the live state and fetch counters", func(t *testing.T) {
 		var fail atomic.Bool
+		// Body built here, not in the handler: jwksJSONWithNKeys calls t.Fatalf, which from
+		// the server's goroutine would Goexit it and surface as a truncated-body parse error.
+		body := jwksJSONWithNKeys(t, 1)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			if fail.Load() {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-			_, _ = w.Write(jwksJSONWithNKeys(t, 1))
+			_, _ = w.Write(body)
 		}))
 		defer srv.Close()
 		// Threshold 1 trips on the first failed fetch; the long cooldown keeps it OPEN
@@ -1209,11 +1212,17 @@ func TestJWKSCacheBreakerStats(t *testing.T) {
 			"a failed fetch at threshold 1 must leave the breaker open, which is what the health endpoint reports as degraded")
 		require.EqualValues(t, 1, st.TotalFailures)
 
-		// Reading again must not admit a probe or otherwise advance the breaker: an
-		// operator polling /healthz cannot be allowed to consume the half-open budget a
-		// real verification needs.
-		again, ok := cache.BreakerStats()
-		require.True(t, ok)
-		require.Equal(t, st, again)
+		// Reading must not advance the breaker. Comparing two reported snapshots cannot show
+		// that -- the projection is identical either way -- so require that a real fetch is
+		// still admitted after the reads, which is what a consumed probe budget would deny.
+		require.Equal(t, st, mustBreakerStats(t, cache))
 	})
+}
+
+// mustBreakerStats reads the cache's breaker state, failing if there is none to read.
+func mustBreakerStats(t *testing.T, c *JWKSCache) circuitbreaker.Stats {
+	t.Helper()
+	st, ok := c.BreakerStats()
+	require.True(t, ok, "the cache was built with a breaker, so it must report one")
+	return st
 }
