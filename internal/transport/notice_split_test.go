@@ -10,12 +10,15 @@
 package transport
 
 import (
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/eunolabs/eunox/internal/audit"
 )
 
 // frozen points every bucket in l at a fixed clock, so a burst is measured against the burst size
@@ -26,9 +29,19 @@ func frozen(l *noticeLimiter, at time.Time) {
 
 // drive writes n lines for site and reports how many reached w.
 func drive(w *strings.Builder, l *noticeLimiter, site noticeSite, n int) int {
+	return driveFrom(w, noticeWriter{out: w, limits: l}, site, n)
+}
+
+// driveSession is drive for a leg that has a SESSION behind it: the same route table, plus that
+// session's own reserved floor under it.
+func driveSession(w *strings.Builder, l *noticeLimiter, reserve *noticeReserve, site noticeSite, n int) int {
+	return driveFrom(w, noticeWriter{out: w, limits: l, reserve: reserve}, site, n)
+}
+
+func driveFrom(w *strings.Builder, channel noticeWriter, site noticeSite, n int) int {
 	before := w.Len()
 	for range n {
-		noticef(noticeWriter{out: w, limits: l}, site, "line\n")
+		noticef(channel, site, "line\n")
 	}
 	return strings.Count(w.String()[before:], "\n")
 }
@@ -172,20 +185,17 @@ func TestNoticeSplit_SingleRouteKeepsThePreSplitBudget(t *testing.T) {
 // not chosen by the call site, which is what let "declared metered" and "charges a bucket" disagree.
 func TestNoticeMechanism_ClassComesFromTheDeclaration(t *testing.T) {
 	t.Parallel()
-	for site, decl := range noticeDeclarations {
-		if decl.bound != noticeMetered {
-			continue
-		}
+	for site, class := range meteredNotices {
 		// A FRESH table per site: one shared across the loop drains as sites accumulate, so the
 		// "admitted nothing on a full bucket" arm would eventually fail naming an arbitrary site
 		// (map order is randomized) for the crime of being visited last.
 		limiter := newNoticeLimiter(1)
 		frozen(limiter, time.Now())
-		before := limiter.bucket(decl.class).tokens
+		before := limiter.bucket(class).tokens
 		var out strings.Builder
 		noticef(noticeWriter{out: &out, limits: limiter}, site, "line\n")
 		require.NotEmpty(t, out.String(), "site %q admitted nothing on a full bucket", site)
-		assert.Less(t, limiter.bucket(decl.class).tokens, before,
+		assert.Less(t, limiter.bucket(class).tokens, before,
 			"site %q must charge the class its declaration names; a site that charges another bucket is the disagreement the runtime lookup exists to remove", site)
 	}
 }
@@ -198,7 +208,7 @@ func TestNoticeMechanism_UndeclaredSiteIsBoundedNotFree(t *testing.T) {
 	t.Parallel()
 	limiter := newNoticeLimiter(1)
 	frozen(limiter, time.Now())
-	require.NotContains(t, noticeDeclarations, noticeSite("undeclared-probe"))
+	require.NotContains(t, meteredNotices, noticeSite("undeclared-probe"))
 
 	var out strings.Builder
 	written := drive(&out, limiter, "undeclared-probe", 100)
@@ -218,4 +228,273 @@ func TestNoticeMechanism_ZeroChannelWritesEveryLine(t *testing.T) {
 	t.Parallel()
 	var out strings.Builder
 	assert.Equal(t, 20, drive(&out, nil, siteUnmappedMethod, 20))
+}
+
+// TestNoticeSplit_UpstreamErrorFloodCannotStarveAnObligationFailure pins the THIRD class.
+//
+// The two-class split rests on "who can drive a line and at what cost", and both halves of the old
+// failure class are upstream-driven — but not at the same cost. A flapping upstream produces
+// `upstream error` per call as its ordinary behaviour, while a redactFields obligation that cannot
+// be applied is a thing a conforming deployment never produces. Sharing one bucket let an
+// adversarial upstream elide its own `SECURITY: redaction failed` lines by erroring generically on
+// every OTHER call — which forward.go's own note about that upstream already contemplates.
+func TestNoticeSplit_UpstreamErrorFloodCannotStarveAnObligationFailure(t *testing.T) {
+	t.Parallel()
+	limiter := newNoticeLimiter(1)
+	frozen(limiter, time.Now())
+
+	var out strings.Builder
+	flood := drive(&out, limiter, siteUpstreamError, 500)
+	assert.LessOrEqual(t, flood, perClassNoticeBurst, "a dead upstream's own line must still be bounded")
+
+	for _, site := range []noticeSite{siteRedactionFault, siteDeclassifyCommit, siteReceiptInconsistent} {
+		assert.Equal(t, 2, drive(&out, limiter, site, 2),
+			"%q reports a security obligation that did not hold; an upstream must not be able to elide it by flooding the errors it can produce at will", site)
+	}
+}
+
+// TestNoticeReserve_SiblingSessionKeepsItsFirstFailureLine is the gap the per-session floor closes.
+//
+// One route, two sessions. A's subprocess dies and drives the failure class per frame, which is
+// exactly what the route's bucket is there to bound — and before the floor existed it also meant
+// B's `upstream error` line never reached the operator at all, for as long as A kept failing. The
+// record half answers this with a per-session TABLE; the notice half answers it with one guaranteed
+// arrival, because what an operator needs from B is that its upstream is down too, not a rate.
+func TestNoticeReserve_SiblingSessionKeepsItsFirstFailureLine(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	aggregate := newNoticeLimiter(1)
+	route := newRouteNoticeLimiter(aggregate)
+	frozen(aggregate, at)
+	frozen(route, at)
+
+	var sessionA, sessionB noticeReserve
+	var outA, outB strings.Builder
+	driveSession(&outA, route, &sessionA, siteUpstreamError, 500)
+
+	assert.Equal(t, 1, driveSession(&outB, route, &sessionB, siteUpstreamError, 5),
+		"a sibling session's first failure line must survive a flood that has emptied the route's bucket")
+	assert.Contains(t, outB.String(), "session-reserved",
+		"a line that got out on the floor says so: one line from a session is not evidence that only one thing happened to it")
+}
+
+// TestNoticeReserve_IsOnePerClassPerSession pins the floor's bound in both directions. One line per
+// class is what makes it affordable at maxSessions (a session already costs an upstream spawn — see
+// exemptCostsASession); one line per CLASS is what keeps a session's traffic flood from spending
+// the floor its own failure line will need.
+func TestNoticeReserve_IsOnePerClassPerSession(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	route := newRouteNoticeLimiter(newNoticeLimiter(1))
+	frozen(route, at)
+
+	var session noticeReserve
+	var out strings.Builder
+	// Drain two classes THROUGH this session, spending its floor for each on the way, and the third
+	// through a sibling so this session's floor for it is still unspent.
+	driveSession(&out, route, &session, siteUnmappedMethod, 500)
+	driveSession(&out, route, &session, siteUpstreamError, 500)
+	drive(&out, route, siteRedactionFault, 500)
+	out.Reset()
+
+	assert.Zero(t, driveSession(&out, route, &session, siteUnmappedMethod, 5),
+		"the floor is one line per class per session, not a second budget")
+	assert.Zero(t, driveSession(&out, route, &session, siteUpstreamError, 5),
+		"the failure floor is spent once too")
+	assert.Equal(t, 1, driveSession(&out, route, &session, siteRedactionFault, 5),
+		"a class this session has not written yet still has its own floor; classes do not share one")
+}
+
+// TestNoticeReserve_UnspentWhileTheRouteBucketAdmits is why the floor is a fallback rather than a
+// first-line rule: a session whose lines all fit under the route's budget must still have its floor
+// when the incident that needs it arrives, possibly hours later.
+func TestNoticeReserve_UnspentWhileTheRouteBucketAdmits(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	route := newRouteNoticeLimiter(newNoticeLimiter(1))
+	frozen(route, at)
+
+	var quiet, noisy noticeReserve
+	var out strings.Builder
+	require.Positive(t, driveSession(&out, route, &quiet, siteUpstreamError, 1), "the first line fits under a full bucket")
+	driveSession(&out, route, &noisy, siteUpstreamError, 500)
+	out.Reset()
+
+	assert.Equal(t, 1, driveSession(&out, route, &quiet, siteUpstreamError, 3),
+		"a line admitted by the bucket must not spend the floor; the quiet session's reserve is for the flood it has not met yet")
+}
+
+// TestNoticeReserve_DoesNotOverStateTheRollup covers the accounting. The bucket counts a refused
+// line the instant it refuses it, so a line the floor then delivers would be counted as one the
+// operator did not see — and the rollup exists to state exactly that.
+func TestNoticeReserve_DoesNotOverStateTheRollup(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	route := newRouteNoticeLimiter(newNoticeLimiter(1))
+	frozen(route, at)
+
+	var session noticeReserve
+	var out strings.Builder
+	drive(&out, route, siteUpstreamError, perClassNoticeBurst) // empty the bucket without a floor
+	refused := 10
+	driveSession(&out, route, &session, siteUpstreamError, refused)
+	withFloor := route.bucket(classFailure).suppressed
+
+	route2 := newRouteNoticeLimiter(newNoticeLimiter(1))
+	frozen(route2, at)
+	drive(&out, route2, siteUpstreamError, perClassNoticeBurst)
+	drive(&out, route2, siteUpstreamError, refused)
+
+	assert.Equal(t, route2.bucket(classFailure).suppressed-1, withFloor,
+		"the one line the floor delivered must come back off the tally; counting it would report a line the operator did see as one they did not")
+}
+
+// TestNoticeReserve_AbsentWithoutASession pins the nil case. A refusal taken before a session exists
+// is attributable to no session, so there is no floor to fall back on and the route's bucket is the
+// whole answer — which is also what every stdio leg gets.
+func TestNoticeReserve_AbsentWithoutASession(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	route := newRouteNoticeLimiter(newNoticeLimiter(1))
+	frozen(route, at)
+
+	var out strings.Builder
+	drive(&out, route, siteUpstreamError, 500)
+	out.Reset()
+	assert.Zero(t, drive(&out, route, siteUpstreamError, 5),
+		"a channel with no session behind it has no floor; a nil reserve must not read as an unspent one")
+}
+
+// TestNoticeReserve_SessionChannelCarriesItsOwnFloor is the wiring half: the floor is only worth
+// anything if the leg that writes a session's lines actually resolves the session's channel, and
+// two sessions on one route must not share one reserve.
+func TestNoticeReserve_SessionChannelCarriesItsOwnFloor(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	route := &UpstreamRoute{name: "up1", notices: newRouteNoticeLimiter(proxy.notices)}
+	a, b := &httpSession{id: "a", proxy: proxy, route: route}, &httpSession{id: "b", proxy: proxy, route: route}
+
+	require.NotNil(t, a.noticeWriter().reserve, "an established session's channel carries its floor")
+	assert.Same(t, route.notices, a.noticeWriter().limits, "and still charges its route's table")
+	assert.NotSame(t, a.noticeWriter().reserve, b.noticeWriter().reserve,
+		"two sessions sharing one reserve would let the first to fail spend the second's line")
+	assert.Nil(t, proxy.routeNoticeWriter(route).reserve,
+		"a pre-session leg on the same route has none")
+
+	// The legs the failure lines actually run on. `upstream error`, the upstreamless forward and
+	// the redaction fault are written through the enforced path's limits, and the notification
+	// gate's through its recorders — either resolving its channel from the ROUTE would lose the
+	// floor with every other guard still green, which is the wiring fault this pins.
+	assert.Same(t, a.noticeWriter().reserve, proxy.dispatchParams(a, "").limits.notices.reserve,
+		"the enforced path's channel must carry the session's floor")
+	assert.Same(t, a.noticeWriter().reserve, proxy.routeRefusalRecorders(a, route).notices().reserve,
+		"the established-session notification gate's must too")
+}
+
+// TestNoticeAdmission_PreGateSpendsExactlyOneToken pins the escape hatch's accounting against
+// noticef's. A site that pre-gates its arguments takes the SAME admission noticef takes; if it
+// took a second one, the cheap sites and the expensive ones would drain the bucket at different
+// rates for the same number of lines.
+func TestNoticeAdmission_PreGateSpendsExactlyOneToken(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	gated, plain := newNoticeLimiter(1), newNoticeLimiter(1)
+	frozen(gated, at)
+	frozen(plain, at)
+
+	var out strings.Builder
+	written := 0
+	for range 500 {
+		if line, ok := (noticeWriter{out: &out, limits: gated}).admitNotice(siteUnmappedMethod); ok {
+			line.writef("line\n")
+			written++
+		}
+	}
+	assert.Equal(t, drive(&out, plain, siteUnmappedMethod, 500), written,
+		"pre-gating must not change how many lines get out, only what a suppressed one costs to decide")
+	assert.InDelta(t, plain.bucket(classTraffic).tokens, gated.bucket(classTraffic).tokens, 0.001,
+		"the pre-gated site charges one token per line, as noticef does")
+}
+
+// TestNoticeAdmission_SuppressedPreGateStillCountsIntoTheRollup is why the escape hatch returns a
+// LINE rather than the bool it was first proposed as.
+//
+// A bool would be a peek the caller acts on and the mechanism never hears about again: the site
+// skips, nothing counts the line, and the next admitted one under-states the flood by however many
+// frames the expensive sites elided. Here the admission happens exactly once whichever way the
+// caller spells it, so the count is the same either way.
+func TestNoticeAdmission_SuppressedPreGateStillCountsIntoTheRollup(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	limiter := newNoticeLimiter(1)
+	limiter.setNow(func() time.Time { return now })
+
+	var out strings.Builder
+	channel := noticeWriter{out: &out, limits: limiter}
+	for range 200 {
+		if line, ok := channel.admitNotice(siteUnmappedMethod); ok {
+			line.writef("line\n")
+		}
+	}
+	now = now.Add(time.Second)
+	out.Reset()
+	if line, ok := channel.admitNotice(siteUnmappedMethod); ok {
+		line.writef("line\n")
+	}
+	assert.Contains(t, out.String(), "further traffic diagnostics suppressed",
+		"a site that never built its arguments still elided lines, and the count is what says so")
+}
+
+// BenchmarkNotice_SuppressedPath measures the path the bucket exists for: a peer or a dead upstream
+// driving a line per frame, every one of them elided. `arguments` is what a site pays to build a
+// line noticef then throws away — the shape http_routing.go's notification-pool line has — and
+// `preGated` is the same site deciding first. The gap is what the escape hatch buys; the `admission`
+// arm is the floor under both, of which the declaration lookup is a small part.
+func BenchmarkNotice_SuppressedPath(b *testing.B) {
+	limiter := newNoticeLimiter(1)
+	channel := noticeWriter{out: io.Discard, limits: limiter}
+	drain := func() {
+		for range perClassNoticeBurst + 1 {
+			noticef(channel, siteNotifyPoolSaturated, "drain\n")
+		}
+	}
+	const method = "notifications/progress"
+	sessionID := "01J8ZK2S0000000000000000"
+
+	b.Run("arguments", func(b *testing.B) {
+		drain()
+		b.ReportAllocs()
+		for b.Loop() {
+			noticef(channel, siteNotifyPoolSaturated, "[eunox] HTTP session %s: notification %q dropped\n",
+				sessionID, audit.BoundEnvelopeField(method))
+		}
+	})
+	b.Run("preGated", func(b *testing.B) {
+		drain()
+		b.ReportAllocs()
+		for b.Loop() {
+			if line, ok := channel.admitNotice(siteNotifyPoolSaturated); ok {
+				line.writef("[eunox] HTTP session %s: notification %q dropped\n",
+					sessionID, audit.BoundEnvelopeField(method))
+			}
+		}
+	})
+	b.Run("admission", func(b *testing.B) {
+		drain()
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = channel.admitNotice(siteNotifyPoolSaturated)
+		}
+	})
+	// The declaration lookup's own share of that admission — the number the "leave it a map probe"
+	// decision rests on, rather than one to re-derive when the next reader wonders whether an
+	// integer site indexing an array would be worth the constants' readable values.
+	b.Run("lookup", func(b *testing.B) {
+		b.ReportAllocs()
+		class := classUnclassified
+		for b.Loop() {
+			class = meteredNotices[siteNotifyPoolSaturated]
+		}
+		require.NotEqual(b, classUnclassified, class)
+	})
 }

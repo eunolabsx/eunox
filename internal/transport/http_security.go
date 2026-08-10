@@ -437,7 +437,7 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // bucket; the earlier claim that it "panics inside admitRefusalRecord like one" was never reachable,
 // since forCategory returns before that call.
 func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return p.routeRefusalLimits(route).recorders(asRecorder(route.sink))
+	return p.routeRefusalLimits(nil, route).recorders(asRecorder(route.sink))
 }
 
 // routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering no
@@ -445,11 +445,13 @@ func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalReco
 // describes an already-admitted caller and is the record an operator most needs during an
 // emergency stop (see catKill) — and the two refusals beside it are declared exempt.
 //
-// It takes the proxy's notice bucket all the same: every argument above is about what a VERDICT may
-// cost, and the routing refusal's stderr line is not one — this leg can be driven at a refused
-// frame per POST, and the notice is the only unbuffered syscall in that loop.
-func (p *HTTPProxy) routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return refusalLimits{notices: p.routeNoticeWriter(route)}.recorders(asRecorder(route.sink))
+// It takes a notice bucket all the same: every argument above is about what a VERDICT may cost, and
+// the routing refusal's stderr line is not one — this leg can be driven at a refused frame per POST,
+// and the notice is the only unbuffered syscall in that loop. The channel is the SESSION's, since
+// this leg is reached with one in hand and the route table alone lets a sibling's dead upstream take
+// its floor (see noticeReserve); sess may be nil for a leg that genuinely has none.
+func (p *HTTPProxy) routeRefusalRecorders(sess *httpSession, route *UpstreamRoute) refusalRecorders {
+	return refusalLimits{notices: p.sessionNoticeWriter(sess, route)}.recorders(asRecorder(route.sink))
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's

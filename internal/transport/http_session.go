@@ -75,6 +75,13 @@ type httpSession struct {
 	// session (as tests build), which records unbounded rather than panicking.
 	upstreamDenies *categoryRecordLimiter
 
+	// noticeFloor is this session's reserved diagnostic line per notice class, spent only where
+	// the ROUTE's bucket refuses (see noticeReserve). The notice half's answer to the same
+	// question upstreamDenies answers for records, one mechanism weaker on purpose: a session gets
+	// an arrival rather than a rate, since what a sibling's flood takes from an operator is the
+	// first line saying this session's upstream is down too. Zero value ready.
+	noticeFloor noticeReserve
+
 	upstreamCaps          map[string]interface{}
 	upstreamServerVersion string // version from the upstream initialize serverInfo response
 	upstreamInstructions  string // instructions from the upstream initialize response
@@ -1224,9 +1231,11 @@ func (s *httpSession) errOut() io.Writer {
 
 // noticeWriter is this session's diagnostic channel: the proxy's writer, bounded by this session's
 // ROUTE table rather than the proxy-wide aggregate, so one tenant's flood cannot silence another's
-// lines. Nil-safe throughout for a bare-struct-literal session.
+// lines — and under it this session's own reserved floor, so a SIBLING session's dead upstream
+// cannot elide this one's first line of a class. Nil-safe throughout for a bare-struct-literal
+// session.
 func (s *httpSession) noticeWriter() noticeWriter {
-	return s.proxy.routeNoticeWriter(s.route)
+	return s.proxy.sessionNoticeWriter(s, s.route)
 }
 
 // shutdownBudget is this session's configured teardown budget (--shutdown-grace), or a 5s

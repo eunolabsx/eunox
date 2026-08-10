@@ -457,7 +457,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
 		gate := hostNotificationGate{
-			recorders:   p.routeRefusalRecorders(route),
+			recorders:   p.routeRefusalRecorders(sess, route),
 			subject:     verifiedSession(sessionID),
 			established: true,
 			audit:       route.audit,
@@ -492,8 +492,14 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				recordResourceExhausted(ctx, asRecorder(route.sink), &sess.notifySaturation, sessionID, msg.Method)
 				// Bounded for the reason the routing refusal's notice is: the record above is
 				// collapsed to one per saturation EPISODE while this line ran once per refused
-				// frame, so the diagnostic was the cheaper flood of the two.
-				noticef(p.routeNoticeWriter(route), siteNotifyPoolSaturated, "[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n", sessionID, audit.BoundEnvelopeField(msg.Method))
+				// frame, so the diagnostic was the cheaper flood of the two. Admitted BEFORE its
+				// arguments are built: this is the flood path the bucket exists for, and the
+				// bounded method name escapes to the heap per refused frame for a line that is
+				// then thrown away (see admitNotice).
+				if line, ok := sess.noticeWriter().admitNotice(siteNotifyPoolSaturated); ok {
+					line.writef("[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n",
+						sessionID, audit.BoundEnvelopeField(msg.Method))
+				}
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
@@ -1252,5 +1258,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	return p.routeRefusalLimits(route).recorders(rec).forCategory(catRevision)
+	return p.routeRefusalLimits(nil, route).recorders(rec).forCategory(catRevision)
 }

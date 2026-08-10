@@ -720,9 +720,13 @@ func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, 
 		fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "",
 			decisionDetail(dec), false)
 	}
-	noticef(fp.limits.notices, siteUpstreamlessForward,
-		"[eunox] SECURITY: %q was authorized but this path has no upstream to forward it to; refused (ENFORCEMENT_ERROR) — a proxy wiring fault, not an upstream failure\n",
-		audit.SanitizeAuditField(method))
+	// Admitted before the sanitizing walk over the method name: a wiring fault refuses every
+	// request on this leg, so the line is drivable per frame and its one argument is a full UTF-8
+	// scan (see admitNotice, and refuseUnroutable for the same treatment done by hand).
+	if line, ok := fp.limits.notices.admitNotice(siteUpstreamlessForward); ok {
+		line.writef("[eunox] SECURITY: %q was authorized but this path has no upstream to forward it to; refused (ENFORCEMENT_ERROR) — a proxy wiring fault, not an upstream failure\n",
+			audit.SanitizeAuditField(method))
+	}
 	return refusalResponse(msg.ID, capability.ErrCodeEnforcementError, "", denialTarget, "")
 }
 

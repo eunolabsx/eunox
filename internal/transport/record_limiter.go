@@ -657,6 +657,19 @@ func (l *recordRateLimiter) suppressN(n uint64) {
 	l.suppressed += n
 }
 
+// unsuppress takes one write back OFF this bucket's tally, for a write this bucket refused that
+// another mechanism then delivered anyway — today only a session's reserved diagnostic floor (see
+// noticeReserve). The rollup states what the reader did NOT see, so counting a line they did see
+// would over-state the next flood it rides on. No token is spent either way: the floor is a
+// bypass of this bucket, not a draw on it.
+func (l *recordRateLimiter) unsuppress() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.suppressed > 0 {
+		l.suppressed--
+	}
+}
+
 // A saturation refusal needs a far smaller sustained rate than a pre-session one: it's
 // written once per EPISODE (see saturationGate), so steady state is zero and even a real
 // incident produces a handful of records. 5/s bounds a flip-flop (saturate/drain/re-

@@ -205,7 +205,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     sess.callUpstream,
 			strictAuditState: p.strictAudit(),
-			limits:           p.routeRefusalLimits(rt),
+			limits:           p.routeRefusalLimits(sess, rt),
 		},
 		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
