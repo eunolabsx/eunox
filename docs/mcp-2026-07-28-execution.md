@@ -68,6 +68,16 @@ manifest, so selecting one can only REMOVE methods, never grant one policy did n
 permit — no translation is activated, and the mismatched-pair behavior D1 governs
 is untouched. D1 still gates W3, W4, and W13's mismatch cells.
 
+W11's **revision-selected upstream opener** landed under D1 In Review on the same
+kind of argument, and it is worth stating precisely because this one DOES change
+wire behavior. The change is reachable only through a configuration that did not
+previously exist as a control: with no `protocolVersion` pin the leg is opened,
+headed and completed byte for byte as before, so no existing deployment's upstream
+sees anything new. A pinned leg is a matched pair or a refusal — never a
+translated one — so the mismatched-pair behavior D1 governs is still untouched.
+The half that would change an UNPINNED leg (ADR-0006's discover-then-`initialize`
+probe for `auto`) is deliberately not activated, and its arbiter is W13's matrix.
+
 ---
 
 ## Workstreams
@@ -138,15 +148,20 @@ Exit criteria:
 - [ ] Old-revision wire behavior unchanged through the refactor (full suite + old×old
       e2e cell green). **Half met, so unticked:** the full suite passes unmodified except
       where a test called a signature this workstream widened, but the old×old cell this
-      criterion names as its arbiter is W13's and does not exist. The suite is a weaker
-      guarantee than a byte-stable interop cell, and this doc's own rule is that "mostly
-      done" has no checkbox. Ticks when W13 stands the cell up.
-      **Partially narrowed since:** `internal/transport/revision_wire_test.go` pins the exact
-      host-facing BYTES for every old-revision response the proxy generates itself
-      (`initialize`, `ping`, a filtered `tools/list`, the fail-closed default, and the -32022
-      refusal), against a context that negotiated nothing — the old-revision peer's own shape.
-      That covers the responses this workstream's refactor actually rewrote; what it does not
-      cover, and what still needs W13, is a live old upstream on the other side of the proxy.
+      criterion names as its arbiter is W13's Docker cell and does not exist. This doc's own
+      rule is that "mostly done" has no checkbox. Ticks when W13 stands that cell up.
+      **Narrowed twice since, and the gap is now the harness rather than the property:**
+      `internal/transport/revision_wire_test.go` pins the exact host-facing BYTES for every
+      old-revision response the proxy generates itself (`initialize`, `ping`, a filtered
+      `tools/list`, the fail-closed default, and the -32022 refusal), against a context that
+      negotiated nothing — the old-revision peer's own shape. `internal/transport/revision_interop_test.go`
+      then adds the half that named W13 as its arbiter: a LIVE old-revision upstream on the
+      other side of a real proxy, on BOTH transports (their upstream legs are different code
+      reaching one opener), with bytes asserted in both directions — the leg's opener, its
+      `notifications/initialized` completion, the `MCP-Protocol-Version` header on every
+      post-handshake request, a host's `tools/call` params crossing untouched, and the
+      host-facing filtered list and allowed-call results. What remains is W13's out-of-process
+      matrix over the demo mocks, not the property itself.
 - [x] -32022 on unsupported or missing protocol version, with audit record.
       (`mcp.UnsupportedProtocolVersionResponse`, `refuseHostRevision`;
       `TestRefuseHostRevision_EmitsSpecCodeAndRecords` plus the stdio e2e cell.)
@@ -507,10 +522,26 @@ method-not-found or unmapped denial (or honors a config pin); generalize
 --live`, `init`, `drift.MakeDriftCheck`, and `ParseToolsListResult` handle both
 revisions; the drift check's fatal-or-skip semantics preserved.
 
+**Partially landed** — the revision-selected opener and the CLI's share of it are
+in (`internal/transport/upstream_open.go`: `UpstreamOpenRevision`,
+`BuildUpstreamOpenerWithID`, `ApplyUpstreamOpenerResult`,
+`UpstreamOpenerCompletion`, `DeclareUpstreamRevision`, all consumed by
+`cmd/eunox/live_upstream.go` so a probe cannot open a configured upstream at a
+revision the running proxy would not). What is NOT in is the FALLBACK: `auto`
+opens with `initialize` and does not probe `server/discover` first, because that
+changes what every existing 2025-11-25 upstream sees and its arbiter is W13's
+matrix. See the note under ADR-0006's upstream bullet.
+
 Exit criteria:
 
-- [ ] Probe fallback matrix test green against both mock upstreams.
+- [ ] Probe fallback matrix test green against both mock upstreams. **Not started** —
+      the fallback itself is deliberately unactivated; the pin-selected opener that
+      replaces it for a configured upstream is covered by
+      `internal/transport/upstream_open_test.go`.
 - [ ] `init`, `validate --live`, and the session-start drift check all work against a 2026-07-28-only upstream in e2e.
+      **In-process half met:** all three open the leg through the shared opener and carry the
+      per-request `_meta` declaration on a declaring leg
+      (`TestPinnedUpstreamLeg_ReachesTheWire`); the e2e cell is W13's.
 - [ ] Fatal-or-skip behavior unchanged (test).
 
 ### W12 — Documentation and ADR housekeeping (plan §12) — M, continuous

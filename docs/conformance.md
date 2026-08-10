@@ -234,12 +234,15 @@ over-cite:
   negotiation (host side per request, upstream side pinned per route), the
   revision-scoped dispatch tables derived from one declaration per method, the
   `UNSUPPORTED_PROTOCOL_VERSION` (-32022) refusal, the per-upstream
-  `protocolVersion` config pin, and the `protocol_revision` audit field. See the
-  per-revision method table below.
+  `protocolVersion` config pin — which now selects how the upstream leg is
+  OPENED, including the `server/discover` opener and the per-request `_meta`
+  declaration on eunox's own requests — and the `protocol_revision` audit field.
+  See the per-revision method table below.
 - **Designed in Draft ADRs, not yet implemented:** the mismatched-pair
-  translation boundary, the `server/discover` responder and its list-filter
-  parity, the `Mcp-Method`/`Mcp-Name` headers, and the CLI probe/drift
-  dual-revision handling in
+  translation boundary, the `server/discover` RESPONDER and its list-filter
+  parity (the *client* side of discover ships as the pinned leg's opener), the
+  discover-first probe for an `auto` upstream, the `Mcp-Method`/`Mcp-Name`
+  headers, and the rest of the CLI probe/drift dual-revision handling in
   [ADR-0006](adr/0006-dual-revision-translation-boundary.md); the
   MRTR signed continuation and its commit-once metering in
   [ADR-0007](adr/0007-mrtr-signed-continuation.md); `subscriptions/listen` and
@@ -293,7 +296,7 @@ decision behind it follows (the `-32022` revision refusal included).
 | `notifications/cancelled` | forwarded | forwarded |
 | `notifications/progress` | forwarded | forwarded |
 | `notifications/roots/list_changed` | forwarded | denied and recorded (roots deprecated) |
-| `server/discover` | denied | denied — responder not yet implemented |
+| `server/discover` | denied | denied — responder not yet implemented (eunox *sends* it upstream on a pinned leg; see below) |
 | `subscriptions/listen` | denied | denied — not yet implemented |
 | `tasks/*` | denied | denied — not yet implemented |
 
