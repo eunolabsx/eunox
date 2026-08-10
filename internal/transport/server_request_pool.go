@@ -73,6 +73,14 @@ type serverRequestPool struct {
 // written, who records it, and the handler itself. Named fields rather than positional
 // parameters, for the reason the audit RecordParams struct has them: a transposition of
 // two same-typed arguments is otherwise silent.
+//
+// SIZE, recorded because the threshold is invisible and long since crossed: this is 248 bytes,
+// well past the compiler's 128-byte limit for capturing a variable by VALUE in a closure
+// (escape.go's `Size() <= 128`). A closure that names any field of it therefore captures it by
+// reference and heap-moves it at function ENTRY — one allocation per server-initiated request,
+// including on the saturation path that spawns no goroutine at all. dispatch below hoists the one
+// field its goroutine needs for exactly that reason, and a source guard holds it there. Growing
+// this further is free; a new closure over it is not.
 type serverRequestDispatch struct {
 	// rec receives the saturation refusal record; nil (no sink configured) skips it.
 	rec auditRecorder
@@ -143,10 +151,15 @@ func (p *serverRequestPool) dispatch(ctx context.Context, msg mcp.RPCMsg, d serv
 	// Counted before the goroutine starts, so teardown's drain cannot observe zero for a
 	// request that has been admitted but not yet begun.
 	p.inFlight.Add(1)
+	// Hoisted out of the closure: naming d.handle inside it would capture the whole dispatch
+	// struct by reference and heap-move it on EVERY dispatch — the saturation return above
+	// included, since the move happens at function entry. The goroutine needs one func value;
+	// capturing that costs a word. See serverRequestDispatch's size note.
+	handle := d.handle
 	go func() {
 		defer p.inFlight.Add(-1)
 		defer func() { <-p.sem }()
-		d.handle(ctx, msg)
+		handle(ctx, msg)
 	}()
 }
 

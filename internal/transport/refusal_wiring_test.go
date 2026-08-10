@@ -39,7 +39,6 @@ func preSessionGateFor(p *HTTPProxy, route *UpstreamRoute) hostNotificationGate 
 	return hostNotificationGate{
 		recorders: p.preSessionRefusalRecorders(route),
 		subject:   verifiedSession(""),
-		errOut:    io.Discard,
 		checkKill: noKill,
 		leg:       legHTTPNotification,
 	}
@@ -140,8 +139,8 @@ func TestRoutingRefusal_NotificationFramingBuildsNoResponse(t *testing.T) {
 	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: "x/bogus"}
 
 	notifRec := &fwdRecorder{}
-	resp := refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, io.Discard),
-		refusalLimits{}.recorders(notifRec), verifiedSession("s"), msg, unroutableFramingNotification)
+	resp := refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}),
+		refusalLimits{notices: noticesTo(io.Discard)}.recorders(notifRec), verifiedSession("s"), msg, unroutableFramingNotification)
 	assert.Nil(t, resp.Error, "the notification framing has no reply channel, so no denial envelope may be built for it")
 	assert.Nil(t, resp.ID)
 	require.Len(t, notifRec.records, 1, "skipping the response must not skip the record the refusal legitimately writes")
@@ -150,8 +149,8 @@ func TestRoutingRefusal_NotificationFramingBuildsNoResponse(t *testing.T) {
 	// The request framing is the control: same refusal, same record, and an envelope to send.
 	reqRec := &fwdRecorder{}
 	reqMsg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "x/bogus"}
-	resp = refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, io.Discard),
-		refusalLimits{}.recorders(reqRec), verifiedSession("s"), reqMsg, unroutableFramingRequest)
+	resp = refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}),
+		refusalLimits{notices: noticesTo(io.Discard)}.recorders(reqRec), verifiedSession("s"), reqMsg, unroutableFramingRequest)
 	require.NotNil(t, resp.Error, "the request framing must still be answered")
 	require.Len(t, reqRec.records, 1)
 	assert.Equal(t, notifRec.records[0].code, reqRec.records[0].code,
@@ -175,7 +174,7 @@ func TestEnforcedForwardCore_NoIDRefusalsBuildNoEnvelope(t *testing.T) {
 	t.Run("upstream failure", func(t *testing.T) {
 		t.Parallel()
 		rec := &fwdRecorder{}
-		fp := forwardParams{rec: rec, sessionID: "s", errOut: io.Discard,
+		fp := forwardParams{rec: rec, sessionID: "s", limits: refusalLimits{notices: noticesTo(io.Discard)},
 			callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 				return mcp.RPCMsg{}, errors.New("upstream exited (test probe)")
 			}}
@@ -191,7 +190,7 @@ func TestEnforcedForwardCore_NoIDRefusalsBuildNoEnvelope(t *testing.T) {
 		rec := &fwdRecorder{}
 		redacting := allow
 		redacting.Obligations = []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"secret"}}}
-		fp := forwardParams{rec: rec, sessionID: "s", errOut: io.Discard,
+		fp := forwardParams{rec: rec, sessionID: "s", limits: refusalLimits{notices: noticesTo(io.Discard)},
 			callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 				// "content" present but not an array: ApplyRedactObligs fails closed on it.
 				return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"content":{}}`)}, nil
@@ -221,14 +220,14 @@ func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
 	const frames = 200
 
 	now := time.Now()
-	notices := newRefusalNoticeLimiter()
-	notices.now = func() time.Time { return now }
+	notices := newNoticeLimiter(1)
+	notices.setNow(func() time.Time { return now })
 
 	var errOut strings.Builder
 	rec := &fwdRecorder{}
-	recs := refusalLimits{notices: notices}.recorders(rec)
+	recs := refusalLimits{notices: noticeWriter{out: &errOut, limits: notices}}.recorders(rec)
 	refuse := func() {
-		refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, &errOut),
+		refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}),
 			recs, verifiedSession("s"), msg, unroutableFramingNotification)
 	}
 	for range frames {
@@ -238,7 +237,7 @@ func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
 	assert.Len(t, rec.records, frames,
 		"the RECORD is exempt by declaration: a verdict elided is a verdict an incident responder does not have, so every refused frame still reaches the tape")
 	lines := strings.Count(errOut.String(), "\n")
-	assert.LessOrEqual(t, lines, refusalNoticeBurst,
+	assert.LessOrEqual(t, lines, perClassNoticeBurst,
 		"the notice must be bounded: one write syscall per refused frame is what a peer looping an unmapped method drives for free")
 	assert.Positive(t, lines, "a bucket that never admits is not bounding the notice, it is silencing it")
 
@@ -247,10 +246,10 @@ func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
 	now = now.Add(time.Second)
 	errOut.Reset()
 	refuse()
-	assert.Contains(t, errOut.String(), "further diagnostics suppressed",
-		"an elided notice folds into the next admitted one; losing the count would under-state the flood")
+	assert.Contains(t, errOut.String(), "further traffic diagnostics suppressed",
+		"an elided notice folds into the next admitted one, naming the CLASS it spans; losing the count would under-state the flood")
 	assert.NotContains(t, errOut.String(), "such",
-		"one bucket serves every bounded line on the proxy, so the count may not be claimed as a tally of the message it rides on")
+		"one bucket serves every line of a class, so the count may not be claimed as a tally of the message it rides on")
 }
 
 // TestRoutingRefusal_NoNoticeBucketWritesEveryLine pins the other side of that bound: nil is the
@@ -260,10 +259,10 @@ func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
 func TestRoutingRefusal_NoNoticeBucketWritesEveryLine(t *testing.T) {
 	t.Parallel()
 	var errOut strings.Builder
-	recs := refusalLimits{}.recorders(&fwdRecorder{})
+	recs := refusalLimits{notices: noticesTo(&errOut)}.recorders(&fwdRecorder{})
 	for range 20 {
 		refuseUnroutable(revisionContext(handshakeRevision),
-			refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, &errOut),
+			refusalForwardParams(verifiedSession("s"), false, strictAuditState{}),
 			recs, verifiedSession("s"), mcp.RPCMsg{JSONRPC: "2.0", Method: "x/bogus"}, unroutableFramingNotification)
 	}
 	assert.Equal(t, 20, strings.Count(errOut.String(), "\n"))
@@ -285,7 +284,7 @@ func TestUpstreamlessLeg_ObserveCannotDowngradeIntoAFabricatedOutage(t *testing.
 	t.Parallel()
 	rec := &fwdRecorder{}
 	// audit:true and a downgradable denial: every condition for the observe forward but an upstream.
-	fp := forwardParams{rec: rec, audit: true, sessionID: "s", errOut: io.Discard}
+	fp := forwardParams{rec: rec, audit: true, sessionID: "s", limits: refusalLimits{notices: noticesTo(io.Discard)}}
 	dec := capability.EnforceResponse{
 		Decision: capability.DecisionDeny,
 		Denial:   &capability.DenialInfo{Code: capability.ErrCodeCapabilityDenied},
@@ -311,7 +310,7 @@ func TestUpstreamlessLeg_ObserveCannotDowngradeIntoAFabricatedOutage(t *testing.
 func TestUpstreamlessLeg_AnAllowRefusesRatherThanNilCalling(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
-	fp := forwardParams{rec: rec, sessionID: "s", errOut: io.Discard}
+	fp := forwardParams{rec: rec, sessionID: "s", limits: refusalLimits{notices: noticesTo(io.Discard)}}
 	resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall},
 		capability.EnforceResponse{Decision: capability.DecisionAllow},
@@ -338,7 +337,7 @@ func TestFoldDecisionDetail_HandsOverAMapNoRecorderWillMutate(t *testing.T) {
 	t.Parallel()
 	engineOwned := map[string]interface{}{"argument": "path"}
 	rec := &fwdRecorder{}
-	fp := forwardParams{rec: rolledUpRecorder{auditRecorder: rec, suppressed: 3}, sessionID: "s", errOut: io.Discard}
+	fp := forwardParams{rec: rolledUpRecorder{auditRecorder: rec, suppressed: 3}, sessionID: "s", limits: refusalLimits{notices: noticesTo(io.Discard)}}
 	dec := capability.EnforceResponse{
 		Decision: capability.DecisionDeny,
 		Denial:   &capability.DenialInfo{Code: capability.ErrCodeCapabilityDenied, Details: engineOwned},
@@ -583,7 +582,7 @@ func TestServerRequestLegs_NilWriterReportsRatherThanPanics(t *testing.T) {
 	require.NotPanics(t, func() {
 		forwardServerRequest(revisionContext(handshakeRevision),
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: capability.MethodSamplingCreateMessage},
-			serverRequestParams{rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+			serverRequestParams{rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
 				unblocker: answeringSeam(nil, rec, stdioServerRequestLegs, &errOut)})
 	}, "a denial that answers its initiator must report a missing upstream sink, not panic after writing its record")
 	assert.Contains(t, errOut.String(), "no upstream writer to answer it")
@@ -609,7 +608,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 		t.Parallel()
 		rec := &fwdRecorder{}
 		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
-			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
 			unblocker: answeringSeam(broken, rec, stdioServerRequestLegs, io.Discard),
 		})
 		require.Len(t, rec.records, 2, "a destroyed answer is a second fact about the request, and the refusal's own record does not carry it")
@@ -641,7 +640,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 		t.Parallel()
 		rec := &fwdRecorder{}
 		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
-			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
 			unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, stdioServerRequestLegs, io.Discard),
 		})
 		assert.Len(t, rec.records, 1, "a refusal the initiator received is one event, not two")
@@ -672,14 +671,15 @@ func TestServerRequestAnswer_DiagnosticIsBoundedAtTheSeam(t *testing.T) {
 	var errOut strings.Builder
 	broken := func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") }
 	u := serverRequestUnblocker{
-		reqs: &serverReqTracker{}, sink: sinkFunc(broken), errOut: &errOut,
-		report: dropReport{recs: refusalLimits{notices: newRefusalNoticeLimiter()}.recorders(nil)},
+		reqs: &serverReqTracker{}, sink: sinkFunc(broken),
+		notices: noticeWriter{out: &errOut, limits: newNoticeLimiter(1)},
+		report:  dropReport{recs: refusalLimits{}.recorders(nil)},
 	}
 	for range 200 {
 		u.write(mcp.RPCMsg{}, "test probe")
 	}
 	lines := strings.Count(errOut.String(), "\n")
-	assert.LessOrEqual(t, lines, refusalNoticeBurst,
+	assert.LessOrEqual(t, lines, perClassNoticeBurst,
 		"a dead upstream sink fails every answer; unbounded, that is one write syscall per frame at the peer's rate")
 	assert.Positive(t, lines, "a bucket that never admits is not bounding the diagnostic, it is silencing it")
 }
@@ -717,7 +717,7 @@ func TestServerRequestRefusal_DestroyedAnswerRecordIsMetered(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	fp := serverRequestParams{
-		rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+		rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
 		unblocker: answeringSeam(func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") },
 			rec, stdioServerRequestLegs, io.Discard),
 	}
@@ -813,10 +813,10 @@ func TestServerRequestAdmission_RefusesAnIDLargerThanTheTrackerRetains(t *testin
 	var written []mcp.RPCMsg
 	rec := &fwdRecorder{}
 	u := serverRequestUnblocker{
-		reqs:   &reqs,
-		sink:   sinkFunc(func(m mcp.RPCMsg) error { written = append(written, m); return nil }),
-		errOut: io.Discard,
-		report: displacementReport(rec, verifiedSession("s")),
+		reqs:    &reqs,
+		sink:    sinkFunc(func(m mcp.RPCMsg) error { written = append(written, m); return nil }),
+		notices: noticesTo(io.Discard),
+		report:  displacementReport(rec, verifiedSession("s")),
 	}
 	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
 
@@ -922,7 +922,7 @@ func TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota(t *testing.T) {
 	rec := &fwdRecorder{}
 	decided := 0
 	u := serverRequestUnblocker{
-		reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), errOut: io.Discard,
+		reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), notices: noticesTo(io.Discard),
 		report: displacementReport(rec, verifiedSession("s")),
 	}
 	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes+1) + `"`)
@@ -932,7 +932,7 @@ func TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota(t *testing.T) {
 		// Only reached if the gate admits; the decision below is what the gate exists to precede.
 		decided++
 		forwardServerRequest(revisionContext(handshakeRevision), msg, serverRequestParams{
-			rec: rec, sessionID: "s", pdp: pdp.AlwaysAllowPDP{}, errOut: io.Discard,
+			rec: rec, sessionID: "s", pdp: pdp.AlwaysAllowPDP{},
 			forward:   func(context.Context, mcp.RPCMsg) bool { return false },
 			unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
 		})

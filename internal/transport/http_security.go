@@ -437,7 +437,7 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // bucket; the earlier claim that it "panics inside admitRefusalRecord like one" was never reachable,
 // since forCategory returns before that call.
 func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return p.refusalLimits().recorders(asRecorder(route.sink))
+	return p.routeRefusalLimits(route).recorders(asRecorder(route.sink))
 }
 
 // routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering no
@@ -449,7 +449,7 @@ func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalReco
 // cost, and the routing refusal's stderr line is not one — this leg can be driven at a refused
 // frame per POST, and the notice is the only unbuffered syscall in that loop.
 func (p *HTTPProxy) routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return refusalLimits{notices: p.refusalNoticeLimiter()}.recorders(asRecorder(route.sink))
+	return refusalLimits{notices: p.routeNoticeWriter(route)}.recorders(asRecorder(route.sink))
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's
@@ -541,7 +541,7 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 	if rec == nil && p.preSessionDenies == nil {
 		return true
 	}
-	ok, suppressed := p.preSessionDenies.admit(category)
+	ok, suppressed, scope := p.preSessionDenies.admit(category)
 	if !ok {
 		return false
 	}
@@ -555,7 +555,7 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 			extra = make(map[string]interface{}, 2)
 		}
 		extra[detailSuppressedRefusalCount] = suppressed
-		extra[detailSuppressedRefusalScope] = suppressedScopeProxyCategory
+		extra[detailSuppressedRefusalScope] = scope
 	}
 	rec.RecordDeny(ctx, "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
 	return true

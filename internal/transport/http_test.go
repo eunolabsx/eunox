@@ -5554,7 +5554,7 @@ func TestUpstreamErrInfo(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			code, reason, rpcCode := upstreamErrInfo(io.Discard, nil, tc.err, tc.timeMs)
+			code, reason, rpcCode := upstreamErrInfo(noticesTo(io.Discard), tc.err, tc.timeMs)
 			if code != tc.wantCode || reason != tc.wantReason || rpcCode != tc.wantRPCCode {
 				t.Errorf("upstreamErrInfo(%v, %d) = (%q, %q, %d), want (%q, %q, %d)",
 					tc.err, tc.timeMs, code, reason, rpcCode, tc.wantCode, tc.wantReason, tc.wantRPCCode)
@@ -6470,6 +6470,12 @@ func newTestHTTPProxy() *HTTPProxy {
 	return &HTTPProxy{
 		sessions:         make(map[string]*httpSession),
 		preSessionDenies: newRefusalRecordLimiter(),
+		// A diagnostic channel, not the zero value: legs resolve their writer FROM this proxy now
+		// that a leg carries no writer of its own, so a bare literal put every refusal line on the
+		// real os.Stderr with no bucket at all — five hundred SECURITY lines from one flood test,
+		// ahead of whatever actually failed.
+		stderr:  io.Discard,
+		notices: newNoticeLimiter(1),
 	}
 }
 

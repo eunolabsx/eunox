@@ -176,12 +176,13 @@ type StdioProxy struct {
 	// HTTP sibling's nil does.
 	refusalLimiter *categoryRecordLimiter
 
-	// noticeLimiter bounds the stderr DIAGNOSTIC a refusal writes beside its record. Separate from
-	// the record buckets above because this transport meters almost no record its host drives (an
-	// established session's are deliberately unbounded) and still owes a bound on a write syscall
-	// per frame — the cheapest thing a peer pipelining `{"jsonrpc":"2.0","method":"x/bogus"}` down
-	// one pipe can make this process do. See refusalNoticeRatePerSec.
-	noticeLimiter *recordRateLimiter
+	// notices is this transport's stderr-diagnostic table, one bucket per notice CLASS. Separate
+	// from the record buckets above because this transport meters almost no record its host drives
+	// (an established session's are deliberately unbounded) and still owes a bound on a write
+	// syscall per frame — the cheapest thing a peer pipelining `{"jsonrpc":"2.0","method":"x/bogus"}`
+	// down one pipe can make this process do. No parent: stdio serves ONE upstream, so this table
+	// is both the tenant's and the aggregate. See noticeLimiter.
+	notices *noticeLimiter
 
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
 	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
@@ -363,7 +364,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostReader:            mcp.NewMsgReader(os.Stdin),
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories...),
-		noticeLimiter:         newRefusalNoticeLimiter(),
+		notices:               newNoticeLimiter(1),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -564,10 +565,12 @@ func awaitDrained(counter *atomic.Int64, timeout time.Duration) {
 // a remote HTTP bridge when upstreamURL is set, otherwise a local subprocess.
 func (p *StdioProxy) connectUpstream(ctx context.Context) error {
 	if p.upstreamURL != "" {
-		up := newHTTPUpstream(ctx, p.upstreamURL, p.upstreamAuthHeader, p.upstreamTLSSkipVerify, p.upstreamTimeMs, p.errOut())
-		// The bridge's notification-POST failure line is per frame and driven by the host's send
-		// rate against an unreachable upstream, so it shares this proxy's notice bucket.
-		up.notices = p.noticeLimiter
+		up := newHTTPUpstream(ctx, p.upstreamURL, p.upstreamAuthHeader, p.upstreamTLSSkipVerify, p.upstreamTimeMs)
+		// The bridge's diagnostic channel — writer AND bucket — in ONE assignment: its
+		// notification-POST failure line is per frame, driven by the host's send rate against an
+		// unreachable upstream, so a channel wired half at construction and half here is one
+		// reorder away from unbounded.
+		up.notices = p.noticeWriter()
 		// A transport-level POST failure is reported back through upErr so the waiting
 		// caller records a deny/UPSTREAM_ERROR (matching the gateway) rather than an allow.
 		up.reportErr = p.reportUpstreamErr
@@ -1148,12 +1151,11 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		// unbounded) nor the two declared-exempt refusals, so this leg carries no record bucket at
 		// all. The notice bucket is supplied all the same: metering no RECORD here is an argument
 		// about verdicts, and the routing refusal's stderr line is not one.
-		recorders:   refusalLimits{notices: p.noticeLimiter}.recorders(p.rec()),
+		recorders:   refusalLimits{notices: p.noticeWriter()}.recorders(p.rec()),
 		subject:     verifiedSession(p.sessionID),
 		established: true,
 		audit:       p.audit,
 		strictAudit: p.strictAudit(),
-		errOut:      p.errOut(),
 		checkKill:   func() *capability.EnforceResponse { return p.pdp.CheckKill(ctx, p.sessionID) },
 		leg:         legStdioNotification,
 	}
@@ -1220,7 +1222,6 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     p.callUpstream,
 			strictAuditState: p.strictAudit(),
-			errOut:           p.errOut(),
 			limits:           p.refusalLimits(),
 		},
 		pdp:              p.pdp,
@@ -1234,7 +1235,13 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 // refusalLimits is this transport's admission control over the writes a refusal makes: the record
 // buckets for the categories stdioRefusalCategories declares, and the stderr-notice bucket.
 func (p *StdioProxy) refusalLimits() refusalLimits {
-	return refusalLimits{records: p.refusalLimiter, notices: p.noticeLimiter}
+	return refusalLimits{records: p.refusalLimiter, notices: p.noticeWriter()}
+}
+
+// noticeWriter is this transport's diagnostic channel: the configured stderr writer and the class
+// table that bounds it, as one value — so a leg cannot carry the writer without the bound.
+func (p *StdioProxy) noticeWriter() noticeWriter {
+	return noticeWriter{out: p.errOut(), limits: p.notices}
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its
@@ -1291,12 +1298,14 @@ func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) 
 // close. Building the unblocker itself allocates nothing, which is what makes it free for the
 // holders that only ever want the tracker.
 func (p *StdioProxy) unblocker() serverRequestUnblocker {
+	// See httpSession.unblocker: one resolution feeds both fields.
+	recs := p.refusalRecorders()
 	return serverRequestUnblocker{
-		reqs:   &p.serverReqs,
-		sink:   p.upWriter,
-		errOut: p.errOut(),
+		reqs:    &p.serverReqs,
+		sink:    p.upWriter,
+		notices: recs.notices(),
 		report: dropReport{
-			recs: p.refusalRecorders(),
+			recs: recs,
 			subj: verifiedSession(p.sessionID),
 			legs: stdioServerRequestLegs,
 		},
@@ -1346,7 +1355,7 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	// Bounded: a host may re-initialize as often as it likes and this answer is LOCAL — no session
 	// created, no upstream contacted — so an unbounded line here is one write syscall per frame at
 	// the host's send rate, the same shape the routing refusal's notice was bounded for.
-	noticef(p.errOut(), p.noticeLimiter,
+	noticef(p.noticeWriter(), siteHostInitialized,
 		"[eunox] Session %s: host initialized (protocol %s).\n",
 		p.sessionID, handshakeRevision,
 	)
@@ -1429,7 +1438,6 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		decideLock:       p.samplingDecideLock(),
 		strictAuditState: p.strictAudit(),
 		pdp:              p.pdp,
-		errOut:           p.errOut(),
 	})
 }
 

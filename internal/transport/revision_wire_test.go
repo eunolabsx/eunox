@@ -73,7 +73,7 @@ func TestOldRevisionWire_ProxyAnsweredResponsesAreByteStable(t *testing.T) {
 			var buf bytes.Buffer
 			d := dispatchParams{
 				forwardParams: forwardParams{
-					errOut: io.Discard,
+					limits: refusalLimits{notices: noticesTo(io.Discard)},
 					callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 						return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: upstreamTools}, nil
 					},

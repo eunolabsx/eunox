@@ -36,7 +36,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	const attempts = 5000
 	catBurst := int(perCategoryDenyBurst)
 	for i := 0; i < attempts; i++ {
-		if ok, _ := l.admit(catAuth); ok {
+		if ok, _, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
@@ -47,7 +47,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	// The suppressed refusals are not lost: the next admitted record carries the count, so
 	// an operator sees both that the attack happened and its scale.
 	now = base.Add(time.Second)
-	ok, suppressed := l.admit(catAuth)
+	ok, suppressed, _ := l.admit(catAuth)
 	if !ok {
 		t.Fatal("a refill second must admit again")
 	}
@@ -56,7 +56,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	}
 
 	// And the count resets, so the following record does not double-report.
-	if ok, s := l.admit(catAuth); !ok || s != 0 {
+	if ok, s, _ := l.admit(catAuth); !ok || s != 0 {
 		t.Fatalf("after reporting, the suppressed counter must reset; ok=%v suppressed=%d", ok, s)
 	}
 }
@@ -245,11 +245,11 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 
 	// Drain the burst.
 	for i := 0; i < catBurst; i++ {
-		if ok, _ := l.admit(catAuth); !ok {
+		if ok, _, _ := l.admit(catAuth); !ok {
 			t.Fatalf("burst token %d should have been admitted", i)
 		}
 	}
-	if ok, _ := l.admit(catAuth); ok {
+	if ok, _, _ := l.admit(catAuth); ok {
 		t.Fatal("the bucket must be empty after the burst is drained")
 	}
 
@@ -257,7 +257,7 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	now = base.Add(time.Second)
 	admitted := 0
 	for i := 0; i < catRate*10; i++ {
-		if ok, _ := l.admit(catAuth); ok {
+		if ok, _, _ := l.admit(catAuth); ok {
 			admitted++
 		}
 	}
@@ -278,7 +278,7 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 		l.admit(catAuth)
 	}
 	now = base.Add(-time.Hour)
-	if ok, _ := l.admit(catAuth); ok {
+	if ok, _, _ := l.admit(catAuth); ok {
 		t.Fatal("a backwards clock step must not refill the bucket")
 	}
 }

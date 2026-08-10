@@ -58,7 +58,7 @@ func TestUnmappedDenial_NamesNoPolicyTargetWhenTheMethodResolvesOne(t *testing.T
 			t.Parallel()
 			rec := &fwdRecorder{}
 			d := dispatchParams{
-				forwardParams: forwardParams{rec: rec, errOut: io.Discard},
+				forwardParams: forwardParams{rec: rec, limits: refusalLimits{notices: noticesTo(io.Discard)}},
 				pdp:           pdp.AlwaysAllowPDP{},
 			}
 			dispatchUnmapped(revisionContext(tc.rev), d, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method})
@@ -95,7 +95,7 @@ func TestUnmappedNotificationDenial_NamesNoPolicyTargetWhenTheMethodResolvesOne(
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
-			gate := hostNotificationGate{recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification}
+			gate := hostNotificationGate{recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true, checkKill: noKill, leg: legStdioNotification}
 			if gate.admit(revisionContext(tc.rev), mcp.RPCMsg{JSONRPC: "2.0", Method: tc.method}) == notificationForward {
 				t.Fatalf("%s must be denied in notification framing", tc.method)
 			}
@@ -281,7 +281,7 @@ func TestDispatchesMessage_MatchesWhatTheDispatcherActuallyDoes(t *testing.T) {
 				notification := mcp.RPCMsg{JSONRPC: "2.0", Method: method}
 				gate := hostNotificationGate{
 					recorders: staticRecorder(&fwdRecorder{}), subject: verifiedSession("sess"),
-					established: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
+					established: true, checkKill: noKill, leg: legStdioNotification,
 				}
 				admitted := gate.admit(ctx, notification) != notificationRefused
 				if got := dispatchesMessage(rev, notification); got != admitted {
@@ -308,7 +308,7 @@ func actedOrDropped(acted bool) string {
 func dispatcherProbeParams(errOut io.Writer) dispatchParams {
 	return dispatchParams{
 		forwardParams: forwardParams{
-			errOut: errOut,
+			limits: refusalLimits{notices: noticesTo(errOut)},
 			callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 				return mcp.RPCMsg{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage(`{}`)}, nil
 			},
@@ -654,7 +654,7 @@ func TestObserveMode_DoesNotDowngradeARoutingRefusal(t *testing.T) {
 			// The wiretap posture exactly: no policy (AlwaysAllowPDP) and audit=true, so
 			// nothing below could produce a policy denial to observe.
 			d := dispatchParams{
-				forwardParams: forwardParams{rec: rec, errOut: io.Discard, audit: true},
+				forwardParams: forwardParams{rec: rec, limits: refusalLimits{notices: noticesTo(io.Discard)}, audit: true},
 				pdp:           pdp.AlwaysAllowPDP{},
 			}
 			msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method}
@@ -690,7 +690,7 @@ func TestObserveMode_MarksTheNotificationFramedRefusalToo(t *testing.T) {
 	rec := &fwdRecorder{}
 	gate := hostNotificationGate{
 		recorders: staticRecorder(rec), subject: verifiedSession("sess"), established: true,
-		audit: true, errOut: io.Discard, checkKill: noKill, leg: legStdioNotification,
+		audit: true, checkKill: noKill, leg: legStdioNotification,
 	}
 	// ping exists in this revision and is answered locally; it has no notification disposition
 	// at all, so its notification framing falls to the same fail-closed default.
@@ -720,7 +720,7 @@ func TestRoutingRefusal_NeverForwardsEvenIfTheObserveGateAdmittedIt(t *testing.T
 	fp := forwardParams{
 		rec:    &fwdRecorder{},
 		audit:  true,
-		errOut: io.Discard,
+		limits: refusalLimits{notices: noticesTo(io.Discard)},
 		callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 			forwarded = true
 			return mcp.RPCMsg{Result: json.RawMessage(`{}`)}, nil

@@ -82,14 +82,11 @@ type httpUpstream struct {
 	// reason: it is written once at the handshake and read by every later POST.
 	rev capability.Revision
 
-	// errOut is where this bridge writes its diagnostic lines. Read through
-	// errOutOrStderr(), never directly, so a nil value (the zero value, and every
-	// pre-existing test call site) still falls back to os.Stderr.
-	errOut io.Writer
-	// notices bounds the one per-frame diagnostic this bridge writes — a notification POST
-	// failure, which an unreachable upstream produces once per notification a host sends. nil
-	// (the zero value, and every test call site) writes every line.
-	notices *recordRateLimiter
+	// notices is this bridge's diagnostic CHANNEL: where its lines go AND what bounds them, as one
+	// value. It needs a bound because a notification-POST failure is written once per notification
+	// a host sends against an unreachable upstream. The zero value (every test call site) writes
+	// every line, to os.Stderr — the same fallback errOutOrStderr has always applied.
+	notices noticeWriter
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -101,11 +98,13 @@ type httpUpstream struct {
 // response-header wait (0 = disabled). The bridge POSTs under a context derived
 // from parent that close() cancels.
 //
-// errOut is an optional trailing arg (at most one is read) carrying the caller's
-// configured diagnostic writer, e.g. StdioProxy.errOut(); omitting it falls back to
-// os.Stderr. Variadic rather than a plain parameter so the ~15 existing test call
-// sites don't need updating for a field only production wiring sets.
-func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkipVerify bool, upstreamTimeoutMs int, errOut ...io.Writer) *httpUpstream {
+// The bridge's diagnostic CHANNEL is NOT a parameter: it is set by the caller as one whole
+// noticeWriter afterwards (see StdioProxy.connectUpstream). A writer parameter here built half of
+// one — destination set, bucket nil, i.e. unbounded — which production only survived because the
+// single call site overwrote the whole field on the next line. Half a channel is exactly what
+// noticeWriter exists to make unrepresentable; leaving the zero value writes to os.Stderr
+// unbounded, which is the disposition every test call site already had.
+func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkipVerify bool, upstreamTimeoutMs int) *httpUpstream {
 	ctx, cancel := context.WithCancel(parent)
 	h := &httpUpstream{
 		endpoint:   UpstreamMCPEndpoint(baseURL),
@@ -117,17 +116,7 @@ func newHTTPUpstream(parent context.Context, baseURL, authHeader string, tlsSkip
 		sem:        make(chan struct{}, maxInflightPosts),
 		done:       make(chan struct{}),
 	}
-	if len(errOut) > 0 {
-		h.errOut = errOut[0]
-	}
 	return h
-}
-
-// errOutOrStderr returns h.errOut when set, else os.Stderr — mirrors
-// forwardParams.errOutOrStderr so this bridge's diagnostic lines resolve through the
-// same configured-writer-with-fallback rule as the rest of the transport layer.
-func (h *httpUpstream) errOutOrStderr() io.Writer {
-	return resolvedErrOut(h.errOut)
 }
 
 // notifyPostTimeout bounds a fire-and-forget POST (the Write path) so a stalling
@@ -230,7 +219,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		// Notification: no response to deliver. Log POST failures so dropped
 		// notifications/initialized and notifications/cancelled are not silent.
 		if err != nil {
-			noticef(h.errOutOrStderr(), h.notices,
+			noticef(h.notices, siteUpstreamPostFailed,
 				"[eunox] upstream notification %q POST failed: %v\n", audit.BoundEnvelopeField(msg.Method), err)
 		}
 		return
@@ -255,7 +244,7 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 		if h.reportErr != nil && h.reportErr(mcp.MsgKey(msg.ID), err) {
 			return
 		}
-		_, reason, rpcCode := upstreamErrInfo(h.errOutOrStderr(), h.notices, err, 0)
+		_, reason, rpcCode := upstreamErrInfo(h.notices, err, 0)
 		resp = mcp.ErrorResponse(msg.ID, rpcCode, reason)
 	case resp.JSONRPC == "" && resp.Result == nil && resp.Error == nil:
 		// Deliberately LOOSER than mcp.RPCMsg.IsZero, which also requires id/method/params empty:
@@ -346,7 +335,7 @@ func (h *httpUpstream) close() {
 		h.mu.Lock()
 		sid, rev := h.sessID, h.rev
 		h.mu.Unlock()
-		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader, rev, h.errOutOrStderr())
+		DeleteMCPHTTPSession(h.client, h.endpoint, sid, h.authHeader, rev, h.notices.errOut())
 		close(h.done)
 		h.cancel()
 	})

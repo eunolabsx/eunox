@@ -46,13 +46,21 @@ linters:
 
   settings:
     # noticef is a printf wrapper: it rewrites the format and appends an argument before
-    # Fprintf, which go vet cannot infer, so the twelve diagnostics moved onto it would
-    # silently lose format/argument checking. Declaring it restores that.
+    # Fprintf, which go vet cannot infer (printf.findPrintfLike gives up on any assignment to
+    # the format or args parameter), so every diagnostic routed through it would silently lose
+    # format/argument checking. Declaring it restores that.
+    #
+    # UNPARENTHESIZED, and the difference is the whole entry: vet matches this against
+    # (*types.Func).FullName(), which for a package-level function has no parentheses. The
+    # `(pkg.Type).Method` spelling is for methods, so the parenthesized form this carried
+    # matched nothing at all and every call site was unchecked while the comment above claimed
+    # otherwise. Verified by reproduction: a `%d` handed a string is reported under this
+    # spelling and silent under the other.
     govet:
       settings:
         printf:
           funcs:
-            - (github.com/eunolabs/eunox/internal/transport).noticef
+            - github.com/eunolabs/eunox/internal/transport.noticef
     gocritic:
       enabled-tags:
         - diagnostic

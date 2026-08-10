@@ -41,7 +41,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"slices"
 	"sort"
 	"strings"
@@ -595,7 +594,6 @@ type hostNotificationGate struct {
 	// and a zero value here would give the notification framing a different audit posture from the
 	// identical bytes in request framing.
 	strictAudit strictAuditState
-	errOut      io.Writer
 	// checkKill is a thunk, not a value, so the swallowed set costs no revocation lookup: on
 	// a Redis-backed kill switch that lookup can be a network round trip, and a swallowed
 	// notification is dropped before revocation is even a question.
@@ -684,7 +682,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	// denial message to throw away (JSON-RPC forbids replying to a notification, and the caller
 	// acks). What is not skipped is everything else the shared path owns — the observe gate, the
 	// strict-audit gate and the record shape.
-	refuseUnroutable(ctx, refusalForwardParams(g.subject, g.audit, g.strictAudit, g.errOut), g.recorders, g.subject, msg, unroutableFramingNotification)
+	refuseUnroutable(ctx, refusalForwardParams(g.subject, g.audit, g.strictAudit), g.recorders, g.subject, msg, unroutableFramingNotification)
 	return notificationRefused
 }
 
@@ -924,7 +922,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: the server's own signed
 		// account contradicts the contract policy was written against.
-		noticef(d.errOutOrStderr(), d.limits.notices,
+		noticef(d.limits.notices, siteReceiptInconsistent,
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
 	}
