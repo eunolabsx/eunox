@@ -68,6 +68,10 @@ type hostLeg struct {
 // prologue below is what is common underneath both — negotiation, its refusal, and its debt to
 // a blocked initiator.
 //
+// Allocation-neutral, measured rather than assumed: `negotiate` stores none of these fields, so
+// escape analysis keeps the value and its closures on the stack. BenchmarkStdioProxy and
+// BenchmarkHTTPProxy report the same allocs/op and B/op as before this type existed.
+//
 // Revocation is deliberately NOT part of this prologue, though the gate order places it next.
 // For the REQUEST framing the kill check must be taken AFTER the decision turn, freshly, so a
 // kill landing during an unbounded wait is recorded as KILL_SWITCH rather than as the method's
@@ -86,6 +90,10 @@ type hostMessageGate struct {
 	// refuse writes the refusal to THIS peer. It is handed the response refuseHostRevision
 	// built, which is the zero message for any framing JSON-RPC forbids replying to — each
 	// transport decides what it sends instead (stdio nothing, HTTP a bodyless 202).
+	//
+	// Never nil, like hostNotificationGate.checkKill: every gate has a peer to answer, and the
+	// refusal path is reachable by any peer sending a bad version, so there is nothing a
+	// fallback here could do that a caller with no writer has not already got wrong.
 	refuse func(mcp.RPCMsg)
 	// unblock answers the upstream request a refused host RESPONSE would have completed, so it
 	// does not hang until the connection ends. Nil on a leg that has no upstream to unblock —
