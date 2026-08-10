@@ -75,6 +75,11 @@ type httpSession struct {
 	// session (as tests build), which records unbounded rather than panicking.
 	upstreamDenies *categoryRecordLimiter
 
+	// noticeFloor is this session's reserved diagnostic line per notice class — the notice half's
+	// answer to the question upstreamDenies answers for records, deliberately a floor rather than
+	// buckets. See noticeReserve for that decision; zero value ready.
+	noticeFloor noticeReserve
+
 	upstreamCaps          map[string]interface{}
 	upstreamServerVersion string // version from the upstream initialize serverInfo response
 	upstreamInstructions  string // instructions from the upstream initialize response
@@ -1224,9 +1229,11 @@ func (s *httpSession) errOut() io.Writer {
 
 // noticeWriter is this session's diagnostic channel: the proxy's writer, bounded by this session's
 // ROUTE table rather than the proxy-wide aggregate, so one tenant's flood cannot silence another's
-// lines. Nil-safe throughout for a bare-struct-literal session.
+// lines — and under it this session's own reserved floor, so a SIBLING session's dead upstream
+// cannot elide this one's first line of a class. Nil-safe throughout for a bare-struct-literal
+// session.
 func (s *httpSession) noticeWriter() noticeWriter {
-	return s.proxy.routeNoticeWriter(s.route)
+	return s.proxy.sessionNoticeWriter(s, s.route)
 }
 
 // shutdownBudget is this session's configured teardown budget (--shutdown-grace), or a 5s
@@ -1291,8 +1298,13 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		defer cancel()
 		if _, err := s.callRemoteUpstream(notifyCtx, msg); err != nil {
 			// No response to deliver to the host; log so a dropped notification isn't silent.
-			noticef(s.noticeWriter(), siteUpstreamNotifyFailed,
-				"[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, audit.BoundEnvelopeField(msg.Method), err)
+			// Pre-gated: a down remote upstream fails every POST, so this is a per-frame line whose
+			// arguments (a bounded method name, three boxed values) are pure waste when the bucket
+			// discards it — see admitNotice.
+			if line, ok := s.noticeWriter().admitNotice(siteUpstreamNotifyFailed); ok {
+				line.writef("[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n",
+					s.id, audit.BoundEnvelopeField(msg.Method), err)
+			}
 		}
 		return
 	}

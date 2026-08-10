@@ -218,9 +218,14 @@ func (h *httpUpstream) post(ctx context.Context, msg mcp.RPCMsg) {
 	if msg.ID == nil {
 		// Notification: no response to deliver. Log POST failures so dropped
 		// notifications/initialized and notifications/cancelled are not silent.
+		// Pre-gated for the reason its HTTP-transport twin is: a down upstream fails every POST,
+		// so the arguments are built per frame for a line the bucket discards (see admitNotice) —
+		// and this transport has no route tier, so the bucket is the whole budget.
 		if err != nil {
-			noticef(h.notices, siteUpstreamPostFailed,
-				"[eunox] upstream notification %q POST failed: %v\n", audit.BoundEnvelopeField(msg.Method), err)
+			if line, ok := h.notices.admitNotice(siteUpstreamPostFailed); ok {
+				line.writef("[eunox] upstream notification %q POST failed: %v\n",
+					audit.BoundEnvelopeField(msg.Method), err)
+			}
 		}
 		return
 	}

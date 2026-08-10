@@ -777,16 +777,40 @@ func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 	return noticeWriter{out: p.errOut(), limits: route.notices}
 }
 
+// sessionNoticeWriter is routeNoticeWriter for a leg holding the SESSION: the same route table,
+// plus that session's reserved floor under it (see noticeReserve).
+//
+// One accessor taking a nilable session rather than the reserve being attached wherever a session
+// happens to be in scope: which floor a line may fall back on is a property of the leg's wiring,
+// and a leg that has a session but resolves its channel from the route alone loses the floor
+// silently. A nil session is a pre-session leg — it has no floor and needs none, since a refusal
+// taken before a session exists is attributable to no session.
+//
+// A session's table comes from the SESSION's own route, not from the caller's, so the pair cannot
+// be mismatched: reserving against one tenant's floor while charging another's bucket is a fault
+// nothing downstream could detect, and taking two arguments is what would make it expressible.
+// route is consulted only for a leg that has no session to ask.
+func (p *HTTPProxy) sessionNoticeWriter(sess *httpSession, route *UpstreamRoute) noticeWriter {
+	if sess == nil {
+		return p.routeNoticeWriter(route)
+	}
+	w := p.routeNoticeWriter(sess.route)
+	w.reserve = &sess.noticeFloor
+	return w
+}
+
 // routeRefusalLimits pairs this proxy's two admission controls for a leg serving route: the
 // proxy-wide category buckets its refusal RECORDS charge, and that route's own diagnostic table.
 // The leg that meters no record (routeRefusalRecorders) takes the notice channel alone, and an
 // established session's upstream-driven refusals charge its own per-session table instead (see
 // newUpstreamRefusalLimiter).
 //
-// Nilable route for the reason routeNoticeWriter takes one.
-func (p *HTTPProxy) routeRefusalLimits(route *UpstreamRoute) refusalLimits {
+// Nilable route for the reason routeNoticeWriter takes one, and nilable session for the reason
+// sessionNoticeWriter does: a leg that has one names it, so the per-session floor is not lost by a
+// leg resolving its channel from the route alone.
+func (p *HTTPProxy) routeRefusalLimits(sess *httpSession, route *UpstreamRoute) refusalLimits {
 	if p == nil {
 		return refusalLimits{}
 	}
-	return refusalLimits{records: p.preSessionDenies, notices: p.routeNoticeWriter(route)}
+	return refusalLimits{records: p.preSessionDenies, notices: p.sessionNoticeWriter(sess, route)}
 }

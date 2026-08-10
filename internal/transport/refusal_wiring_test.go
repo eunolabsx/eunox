@@ -120,7 +120,8 @@ func TestRouteRefusalRecorders_EstablishedSessionKillIsUnbounded(t *testing.T) {
 	t.Parallel()
 	sink, _ := newTempAuditSink(t)
 	defer func() { _ = sink.Close() }()
-	recs := newTestHTTPProxy().routeRefusalRecorders(&UpstreamRoute{name: "up1", sink: &routeSink{sink: sink, upstream: "up1"}})
+	route := &UpstreamRoute{name: "up1", sink: &routeSink{sink: sink, upstream: "up1"}}
+	recs := newTestHTTPProxy().routeRefusalRecorders(&httpSession{route: route}, route)
 	for i := range int(perCategoryDenyBurst) + 50 {
 		require.NotNil(t, recs.forCategory(catKill),
 			"kill record %d was suppressed on an ESTABLISHED session; that record is the one an operator most needs during an emergency stop", i)

@@ -321,7 +321,7 @@ func TestPreSessionLimiterAndSaturationGate_DoNotShareABucket(t *testing.T) {
 		t.Fatal("the saturation bucket must be drained for this test to mean anything")
 	}
 	// The pre-session bucket is untouched by that.
-	if ok, _, _ := preSession.admit(catAuth); !ok {
+	if !preSession.admit(catAuth).ok {
 		t.Fatal("a saturation flood must not spend the pre-session refusal budget")
 	}
 }

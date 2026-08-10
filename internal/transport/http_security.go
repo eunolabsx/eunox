@@ -437,7 +437,7 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // bucket; the earlier claim that it "panics inside admitRefusalRecord like one" was never reachable,
 // since forCategory returns before that call.
 func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return p.routeRefusalLimits(route).recorders(asRecorder(route.sink))
+	return p.routeRefusalLimits(nil, route).recorders(asRecorder(route.sink))
 }
 
 // routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering no
@@ -445,11 +445,13 @@ func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalReco
 // describes an already-admitted caller and is the record an operator most needs during an
 // emergency stop (see catKill) — and the two refusals beside it are declared exempt.
 //
-// It takes the proxy's notice bucket all the same: every argument above is about what a VERDICT may
-// cost, and the routing refusal's stderr line is not one — this leg can be driven at a refused
-// frame per POST, and the notice is the only unbuffered syscall in that loop.
-func (p *HTTPProxy) routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return refusalLimits{notices: p.routeNoticeWriter(route)}.recorders(asRecorder(route.sink))
+// It takes a notice bucket all the same: every argument above is about what a VERDICT may cost, and
+// the routing refusal's stderr line is not one — this leg can be driven at a refused frame per POST,
+// and the notice is the only unbuffered syscall in that loop. The channel is the SESSION's, since
+// this leg is reached with one in hand and the route table alone lets a sibling's dead upstream take
+// its floor (see noticeReserve); sess may be nil for a leg that genuinely has none.
+func (p *HTTPProxy) routeRefusalRecorders(sess *httpSession, route *UpstreamRoute) refusalRecorders {
+	return refusalLimits{notices: p.sessionNoticeWriter(sess, route)}.recorders(asRecorder(route.sink))
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's
@@ -541,8 +543,8 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 	if rec == nil && p.preSessionDenies == nil {
 		return true
 	}
-	ok, suppressed, scope := p.preSessionDenies.admit(category)
-	if !ok {
+	verdict := p.preSessionDenies.admit(category)
+	if !verdict.ok {
 		return false
 	}
 	if rec == nil {
@@ -550,12 +552,12 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 		// (and rate-limited) as the refusal's only surviving signal.
 		return true
 	}
-	if suppressed > 0 {
+	if verdict.suppressed > 0 {
 		if extra == nil {
 			extra = make(map[string]interface{}, 2)
 		}
-		extra[detailSuppressedRefusalCount] = suppressed
-		extra[detailSuppressedRefusalScope] = scope
+		extra[detailSuppressedRefusalCount] = verdict.suppressed
+		extra[detailSuppressedRefusalScope] = verdict.scope
 	}
 	rec.RecordDeny(ctx, "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
 	return true

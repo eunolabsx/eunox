@@ -10,30 +10,50 @@
 // with no runtime reader at all. What bounded a line was which function a site called, and the
 // declaration only checked afterwards that the two agreed.
 //
-// Now noticef takes the SITE and resolves the bucket from that site's own declaration, which is the
-// direct analogue of forCategory: a site cannot be declared metered and charge nothing, and a site
-// with no declaration at all charges the floor-rate bucket rather than writing free. The walk in
-// notice_bounding_test.go stays, for the two questions a runtime reader cannot answer — a line
+// Now admitNotice takes the SITE and resolves the bucket from that site's own declaration, which is
+// the direct analogue of forCategory: a site cannot be declared metered and charge nothing, and a
+// site with no declaration at all charges the floor-rate bucket rather than writing free. The walk
+// in notice_bounding_test.go stays, for the two questions a runtime reader cannot answer — a line
 // written through a shape it does not model, and a declaration nothing reaches.
 //
-// The bucket is no longer singular. It is split on the two axes the shared one collapsed:
+// The declaration is TWO tables rather than one with two key spaces. A metered site is keyed by the
+// site constant its own call passes (meteredNotices, which admitNotice reads); every other line is
+// keyed by the writing function's qualified name (unmeteredNotices, which only the walk can read,
+// since the line never reaches this file). One map held both, so a key meant "site constant" or "Go
+// function name" depending on the value beside it, and nothing stopped a metered entry being keyed
+// by a function name — where admitNotice could never find it and it would silently charge the floor
+// bucket. Splitting by key kind is not the "two lists that must agree" the single table replaced:
+// the halves answer different questions about disjoint sets of lines and there is nothing to
+// reconcile between them. Metered-ness is now membership in the first map rather than a field, so
+// noticeBound has no metered value to write in the second.
+//
+// The bucket is no longer singular. It is split on the axes the shared one collapsed:
 //
 //   - by CLASS, so a flood of the cheapest peer-driven line cannot take the last token from the
-//     line that says an upstream is down (see noticeClass);
+//     line that says an upstream is down, nor a flapping upstream's own errors from the line that
+//     says a security obligation did not hold (see noticeClass);
 //   - by ROUTE, so one gateway tenant cannot silence another's (see newRouteNoticeLimiter),
-//     with the proxy-wide table as the aggregate parent holding the total where it was.
+//     with the proxy-wide table as the aggregate parent holding the total where it was;
+//   - and, below the route, by a per-SESSION reserved FLOOR rather than a third tier of buckets —
+//     one guaranteed line per class per session (see noticeReserve).
 //
-// Both splits are the treatment the refusal RECORDS already had, on the same tieredBuckets: shares
-// of one budget rather than a full budget each, so the reachable syscall rate does not multiply by
-// the class or route count.
+// Every key on the first two axes holds a FULL per-key budget and the aggregate is derived by
+// multiplying up, which is the treatment the refusal RECORDS' categories already had — see the
+// sizing constants for why dividing a fixed aggregate was measured and rejected. What that costs is
+// stated where it is spent: the rate a PEER can drive is one key's budget however many keys there
+// are, while the process-wide total grows with the class and route counts, deliberately, because
+// "one tenant must not silence another" is exactly the statement that their budgets add.
 
 package transport
 
 import (
 	"fmt"
 	"io"
+	"maps"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // noticeSite names ONE diagnostic line (or one group of lines answering to the same
@@ -45,27 +65,28 @@ import (
 // forces both into one answer.
 type noticeSite string
 
-// The metered diagnostic sites. Each is passed at its own call and looked up in
-// noticeDeclarations at write time; the value is descriptive rather than the function's name,
-// since several functions hold more than one site and two hold the same name.
+// The metered diagnostic sites. Each is passed at its own call and looked up in meteredNotices at
+// write time; the value is descriptive rather than the function's name, since several functions hold
+// more than one site and two hold the same name.
+//
+// Deliberately NOT grouped by class here: meteredNotices is where a site's class is declared, and a
+// grouping comment beside the constant is a second statement of the same fact that a table edit can
+// silently contradict.
 const (
-	// Class-traffic sites: an account of what a peer (or an upstream) SENT.
-	siteUnmappedMethod      noticeSite = "unmapped-method"
-	siteObserveDowngrade    noticeSite = "observe-downgrade"
-	siteSamplingDowngrade   noticeSite = "sampling-observe-downgrade"
-	siteNotifyPoolSaturated noticeSite = "notification-pool-saturated"
-	siteHostInitialized     noticeSite = "host-initialized"
-
-	// Class-failure sites: an account of something that BROKE.
+	siteUnmappedMethod           noticeSite = "unmapped-method"
+	siteObserveDowngrade         noticeSite = "observe-downgrade"
+	siteSamplingDowngrade        noticeSite = "sampling-observe-downgrade"
+	siteNotifyPoolSaturated      noticeSite = "notification-pool-saturated"
+	siteHostInitialized          noticeSite = "host-initialized"
 	siteUpstreamlessForward      noticeSite = "upstreamless-forward"
 	siteUpstreamlessNotification noticeSite = "upstreamless-notification"
-	siteRedactionFault           noticeSite = "redaction-fault"
-	siteDeclassifyCommit         noticeSite = "declassify-commit"
 	siteUpstreamError            noticeSite = "upstream-error"
 	siteInitiatorUnanswerable    noticeSite = "initiator-unanswerable"
-	siteReceiptInconsistent      noticeSite = "effect-receipt-inconsistent"
 	siteUpstreamNotifyFailed     noticeSite = "upstream-notification-failed"
 	siteUpstreamPostFailed       noticeSite = "upstream-post-failed"
+	siteRedactionFault           noticeSite = "redaction-fault"
+	siteDeclassifyCommit         noticeSite = "declassify-commit"
+	siteReceiptInconsistent      noticeSite = "effect-receipt-inconsistent"
 )
 
 // noticeClass is what a diagnostic line is WORTH to an operator, and therefore which bucket it
@@ -79,6 +100,20 @@ const (
 // onto an unrelated refusal. The tape was never affected (UPSTREAM_ERROR denies are policy-path
 // records and unmetered), so what was lost is stderr legibility during an incident — which is the
 // channel an operator actually watches while it is happening.
+//
+// The class is about WHO can drive a line and at what cost, which is why the failure half is two
+// classes rather than one. A generic transit error is free to an upstream — it can return one for
+// any call, on a route with no policy obligation in play at all — while an obligation failure takes
+// a call that CARRIES one. Sharing a bucket therefore let an adversarial upstream elide its own
+// `SECURITY: redaction failed` lines by erroring generically on every OTHER call, which is the
+// argument the split rests on, one level in.
+//
+// What that does NOT buy, stated because the first draft of this comment claimed it: an obligation
+// failure is not undrivable by a merely broken deployment. A flow store that is down fails every
+// approved declassification's commit, and a stale effect.ref pin makes every receipt inconsistent —
+// both at the request rate, both from a conforming peer. So a flood of this class is a finding
+// about the DEPLOYMENT rather than proof of an attack, and within the class one obligation's
+// failure can still elide another's. A fourth bucket would only move that line again.
 type noticeClass int
 
 const (
@@ -88,12 +123,28 @@ const (
 	// message, and every one of these has a record beside it on the tape, so an elided line costs
 	// legibility rather than evidence.
 	classTraffic
-	// classFailure: an account of something that BROKE inside eunox, its flow store, or an
-	// upstream — a connection down, a redaction that failed, a clear that did not commit, a
-	// signed receipt that contradicts its contract. Well-formed traffic does not produce these,
-	// so a flood of them is itself the signal, and they must not be starved by one that is.
+	// classFailure: an account of something that BROKE in transit — an upstream connection down, a
+	// notification POST that failed, a forward with no upstream to forward through. Well-formed
+	// traffic does not produce these, so a flood of them is itself the signal, and they must not be
+	// starved by one that is. Routine under a flapping upstream, which is what keeps them apart
+	// from the class below.
 	classFailure
+	// classObligation: a security obligation policy attached to a call did not hold — a redactFields
+	// directive that could not be applied, an approved declassification whose clear did not commit,
+	// a signed effect receipt contradicting the contract policy was written against. Apart from
+	// classFailure because reaching one takes a call CARRYING an obligation, which a generic transit
+	// error does not — see the type's doc for what that does and does not bound.
+	classObligation
+	// lastNoticeClass is the highest declared class, which noticeReserve packs into a bitmap. A
+	// name rather than a sentinel INSIDE the enum: a sentinel is a value label() and every range
+	// over classes must then answer for, for a fact only the reserve needs.
+	lastNoticeClass = classObligation
 )
+
+// The reserve is one bit per class in a uint32 (see noticeReserve). A class past bit 31 would shift
+// to zero there and hand out an unlimited reserve rather than a single line, so the width is a
+// compile-time assertion instead of an invariant to remember.
+const _ = uint(31 - lastNoticeClass)
 
 // noticeClasses is the set the bucket tables are keyed by, DERIVED from the declarations rather
 // than typed out beside them — the shape refusalCategories uses. A hand-typed list is two lists that
@@ -102,17 +153,7 @@ const (
 var noticeClasses = meteredNoticeClasses()
 
 func meteredNoticeClasses() []noticeClass {
-	seen := map[noticeClass]bool{}
-	out := make([]noticeClass, 0, 2)
-	for _, decl := range noticeDeclarations {
-		if decl.bound != noticeMetered || seen[decl.class] {
-			continue
-		}
-		seen[decl.class] = true
-		out = append(out, decl.class)
-	}
-	slices.Sort(out)
-	return out
+	return slices.Compact(slices.Sorted(maps.Values(meteredNotices)))
 }
 
 // label names a class in the suppression rollup. A count that spans one class must say which,
@@ -123,26 +164,73 @@ func (c noticeClass) label() string {
 		return "traffic"
 	case classFailure:
 		return "failure"
+	case classObligation:
+		return "obligation"
 	default:
 		return "unclassified"
 	}
 }
 
-// noticeBound is how ONE diagnostic site is bounded. The zero value is "undeclared", so a site
-// added with no entry fails the call-site walk rather than inheriting an answer — the same shape
-// refusalDeclarations uses for the RECORD half of a refusal.
+// meteredNotices is the class each metered diagnostic site charges, read at WRITE time by
+// admitNotice — which is what makes "declared metered" and "charges that class's bucket" one fact
+// rather than two that a call site could put out of agreement.
 //
-// Four mechanisms bound a line in this package and only the first was ever written down. The
-// declaration exists because the survey behind "how many syscalls can a peer drive" was re-derived
-// by hand each time, which is how the routing refusal's line came to be unbounded while its
-// record's exemption was being argued in prose.
+// Membership IS the metering declaration: there is no bound field to set here and no metered value
+// to set in unmeteredNotices, so the one disagreement a single table permitted — a metered entry
+// keyed by a Go function name, unreachable from this lookup and silently charging the floor bucket
+// — cannot be written.
+var meteredNotices = map[noticeSite]noticeClass{
+	// (1) TRAFFIC: reachable at a peer's or an upstream's send rate, one line per frame, each with
+	// a record beside it on the tape.
+	siteUnmappedMethod:      classTraffic,
+	siteObserveDowngrade:    classTraffic,
+	siteSamplingDowngrade:   classTraffic,
+	siteNotifyPoolSaturated: classTraffic,
+	// The host-initialized line is per `initialize` REQUEST: re-initialize is answered LOCALLY, so
+	// it creates no session and contacts no upstream — the exemption it used to carry was reasoned
+	// from a session's cost and did not apply.
+	siteHostInitialized: classTraffic,
+
+	// (2) FAILURE: an operator-facing account of something broken in transit. Metered because a
+	// peer or a dead upstream can drive them per frame, classed apart from traffic so that flood
+	// cannot take the last token from a class it does not belong to.
+	siteUpstreamlessForward:      classFailure,
+	siteUpstreamlessNotification: classFailure,
+	siteUpstreamError:            classFailure,
+	siteInitiatorUnanswerable:    classFailure,
+	siteUpstreamNotifyFailed:     classFailure,
+	siteUpstreamPostFailed:       classFailure,
+
+	// (3) OBLIGATION: a security obligation that did not hold. Still metered — an upstream returning
+	// a redaction-failing response per call drives one per frame — but never from the same bucket as
+	// the generic errors that same upstream can flood beside them.
+	siteRedactionFault:      classObligation,
+	siteDeclassifyCommit:    classObligation,
+	siteReceiptInconsistent: classObligation,
+}
+
+// noticeFunc is the key a line that never reaches admitNotice is declared by: the writing
+// function's QUALIFIED name (receiver included), which is what an AST walk can see.
+//
+// Qualified rather than bare because this package has same-named twins that write on both
+// transports — readUpstream — and a bare key would let the second silently inherit the first's
+// answer. A distinct type from noticeSite because the two name different things and only one of
+// them is resolvable at runtime.
+type noticeFunc string
+
+// noticeBound is how ONE unmetered diagnostic site is bounded. The zero value is "undeclared", so a
+// site added with no entry fails the call-site walk rather than inheriting an answer — the same
+// shape refusalDeclarations uses for the RECORD half of a refusal.
+//
+// Four mechanisms bound a line in this package and only the first was ever written down; the fourth
+// is metering, which is membership in meteredNotices rather than a value here. The declaration
+// exists because the survey behind "how many syscalls can a peer drive" was re-derived by hand each
+// time, which is how the routing refusal's line came to be unbounded while its record's exemption
+// was being argued in prose.
 type noticeBound int
 
 const (
 	noticeUndeclared noticeBound = iota
-	// noticeMetered: the line goes through noticef, charging its class's bucket. What a
-	// peer-drivable per-frame diagnostic must be.
-	noticeMetered
 	// noticeRecordGated: the line is written only when the refusal's own RECORD was admitted, so
 	// it is bounded at that category's rate (recordRefusal returns its verdict for exactly this).
 	// A second mechanism rather than a redundancy: these sites describe the record they ride on.
@@ -155,15 +243,11 @@ const (
 	noticeExempt
 )
 
-// noticeDeclaration is what every diagnostic site declares. class is required for a metered site
-// and must be unset otherwise; why is required for an exemption and must be empty otherwise,
-// mirroring refusalDeclaration: the reason IS the exemption.
+// noticeDeclaration is what every UNMETERED diagnostic site declares. why is required for an
+// exemption and must be empty otherwise, mirroring refusalDeclaration: the reason IS the exemption.
+// It carries no class, since a line that charges no bucket names none.
 type noticeDeclaration struct {
 	bound noticeBound
-	// class picks the bucket a metered line charges. Read at WRITE time (see noticef), which is
-	// what makes "declared metered" and "charges that class's bucket" one fact rather than two
-	// that a call site could put out of agreement.
-	class noticeClass
 	why   string
 }
 
@@ -192,48 +276,20 @@ const (
 	exemptOncePerDegradation = "written on the audit trail's healthy-to-degraded transition, which happens once, so a peer's send rate cannot drive it"
 )
 
-// noticeDeclarations answers, for every diagnostic line in this package, how it is bounded — and
-// for a METERED one, which class's bucket it charges.
+// unmeteredNotices answers, for every diagnostic line in this package that does NOT go through
+// admitNotice, how it is bounded instead.
 //
-// It ships here rather than in the test that walks it because noticef READS it: the metered
-// entries are consulted at write time, exactly as forCategory consults refusalDeclarations. The
-// non-metered entries are the walk's half of the same table and are keyed by the writing
-// function's qualified name, which is what an AST walk can see; a metered entry is keyed by the
-// site constant its call passes, since one function can hold lines of two different classes.
-var noticeDeclarations = map[noticeSite]noticeDeclaration{
-	// (1) Metered, class TRAFFIC: reachable at a peer's or an upstream's send rate, one line per
-	// frame, each with a record beside it on the tape.
-	siteUnmappedMethod:      {bound: noticeMetered, class: classTraffic},
-	siteObserveDowngrade:    {bound: noticeMetered, class: classTraffic},
-	siteSamplingDowngrade:   {bound: noticeMetered, class: classTraffic},
-	siteNotifyPoolSaturated: {bound: noticeMetered, class: classTraffic},
-	// The host-initialized line is per `initialize` REQUEST: re-initialize is answered LOCALLY, so
-	// it creates no session and contacts no upstream — the exemption it used to carry was reasoned
-	// from a session's cost and did not apply.
-	siteHostInitialized: {bound: noticeMetered, class: classTraffic},
-
-	// (2) Metered, class FAILURE: an operator-facing account of something broken. Metered because
-	// a peer or a dead upstream can still drive them per frame, classed apart so that flood cannot
-	// take the last token from a class it does not belong to.
-	siteUpstreamlessForward:      {bound: noticeMetered, class: classFailure},
-	siteUpstreamlessNotification: {bound: noticeMetered, class: classFailure},
-	siteRedactionFault:           {bound: noticeMetered, class: classFailure},
-	siteDeclassifyCommit:         {bound: noticeMetered, class: classFailure},
-	siteUpstreamError:            {bound: noticeMetered, class: classFailure},
-	siteInitiatorUnanswerable:    {bound: noticeMetered, class: classFailure},
-	siteReceiptInconsistent:      {bound: noticeMetered, class: classFailure},
-	siteUpstreamNotifyFailed:     {bound: noticeMetered, class: classFailure},
-	siteUpstreamPostFailed:       {bound: noticeMetered, class: classFailure},
-
-	// (3) Gated on the RECORD's admission verdict, which spends that category's own bucket.
-	// These and everything below are keyed by the writing function's QUALIFIED name (receiver
-	// included), which is what an AST walk can see for a line that never reaches noticef. Qualified
-	// rather than bare because this package has same-named twins that write on both — readUpstream
-	// on each transport — and a bare key would let the second silently inherit the first's answer.
+// It ships beside the metered half rather than in the test that walks it for the reason that half
+// ships here: these are statements about production lines, the same kind of statement
+// refusalDeclarations makes about a refusal it exempts, and a reason that lives in a test is a
+// reason the next reader of the code does not find. Only its READER is a test, because a line that
+// never reaches this file cannot be checked by anything that runs here.
+var unmeteredNotices = map[noticeFunc]noticeDeclaration{
+	// (1) Gated on the RECORD's admission verdict, which spends that category's own bucket.
 	"*HTTPProxy.checkOrigin":            {bound: noticeRecordGated},
 	"*HTTPProxy.requireJSONContentType": {bound: noticeRecordGated},
 
-	// (4) One-shot latches: at most one line however hard the source is driven.
+	// (2) One-shot latches: at most one line however hard the source is driven.
 	"warnStrictAuditOnce":     {bound: noticeOnce},
 	"*serverReqTracker.track": {bound: noticeOnce},
 	"*httpSession.broadcast":  {bound: noticeOnce},
@@ -242,7 +298,7 @@ var noticeDeclarations = map[noticeSite]noticeDeclaration{
 	// compares the trail's health across one record and writes only when that record degraded it.
 	"warnIfStrictAuditJustDegraded": {bound: noticeExempt, why: exemptOncePerDegradation},
 
-	// (5) Deliberately unbounded, each carrying the reason it cannot be driven per frame.
+	// (3) Deliberately unbounded, each carrying the reason it cannot be driven per frame.
 	// The scrape RESPONSE BODY, written through the one emitter every series goes through —
 	// declared where the bytes are produced, since the scan keys on the writing function.
 	"metricWriter.emit":                  {bound: noticeExempt, why: exemptNotADiagnostic},
@@ -293,7 +349,7 @@ var noticeDeclarations = map[noticeSite]noticeDeclaration{
 // What multiplying up costs is that the process-wide diagnostic syscall rate grows with the route
 // count. That is a bound an OPERATOR sets in configuration, not one a peer can drive: a peer on one
 // route still drives at most this per-class rate, and "one tenant must not silence another"
-// necessarily means the tenants' budgets add. Ten routes is 40 stderr lines a second at worst.
+// necessarily means the tenants' budgets add. Ten routes is 60 stderr lines a second at worst.
 const (
 	perClassNoticeRatePerSec = 2
 	perClassNoticeBurst      = 10
@@ -336,16 +392,14 @@ func newNoticeLimiter(tenants int) *noticeLimiter {
 // lines for as long as it kept sending — and refuseUnroutable's whole reason for naming the method is
 // that an operator can see protocol drift, which a suppressed line reduces to a count.
 //
-// Per route rather than per SESSION because a route is an operator-configured tenant boundary with a
-// small, known count, while sessions are unbounded by anything but maxSessions — a per-session split
-// would put thousands of buckets under one aggregate for a channel whose whole budget is a few lines
-// a second. The residual is stated rather than hidden: within one route, one session's dead upstream
-// can still elide a sibling session's failure line.
-//
 // A route takes the FULL per-class budget and the aggregate is sized to cover every route's, rather
 // than each route taking a share of a fixed one — see the sizing constants for why the division was
 // measured and rejected. aggregate may be nil (a route built by BuildRoutes for a proxy that never
 // stood), which bounds the route alone at the same rate.
+//
+// The route is the LAST tier with buckets. Below it a session gets a reserved floor instead, which
+// is a decision rather than where the split stopped — see noticeReserve for the measurement it
+// rests on and the residual it leaves.
 func newRouteNoticeLimiter(aggregate *noticeLimiter) *noticeLimiter {
 	var parent *tieredBuckets[noticeClass]
 	if aggregate != nil {
@@ -355,56 +409,214 @@ func newRouteNoticeLimiter(aggregate *noticeLimiter) *noticeLimiter {
 		perClassNoticeRatePerSec, perClassNoticeBurst, noticeClasses, parent, noticeScopeRoute)}
 }
 
-// noticeWriter is a leg's diagnostic CHANNEL: where a line goes AND what bounds it, as one value.
+// noticeReserve is one SESSION's floor inside its route's class buckets: the first line of each
+// class this session cannot get through the route table is written anyway.
 //
-// One value rather than two fields, because holding them apart is a wiring fault nothing catches —
-// a leg that sets the writer and not the bucket writes unbounded with every guard still green.
-// serverRequestParams was the live shape: its writer was its own errOut field while its bucket came
-// from the unblocker it carries, two independently zeroable fields feeding one line.
+// A floor rather than a third tier of buckets, which is what the RECORD half does one axis over and
+// what would buy almost nothing here. Sized as the record half sizes it — a child bucket at the
+// parent's own rate — a flooding session is paced to exactly the rate the route bucket refills at,
+// so a sibling's line still arrives to find it empty; sized as a share instead, the per-session rate
+// floors to 1/s and a burst of 1 at any realistic maxSessions, worse for the single-session case
+// than not splitting at all. What a sibling needs from this tier is an ARRIVAL — an operator
+// learning that THIS session's upstream is also down needs the first line, not the hundredth.
+//
+// Claimed only where the ROUTE's own bucket refused (see tieredBuckets.admitWithFloor for why a
+// refusal from the aggregate above is deliberately not floored), and only then, so a session whose
+// lines all fit under the route's budget keeps its reserve for the incident that eventually needs
+// it.
+//
+// The bound is one line per class per session, and it is the argument exemptCostsASession already
+// makes for the session-lifecycle lines: driving a reserve costs OPENING a session, and a session
+// costs an upstream spawn or handshake — orders of magnitude more than the line it buys, and a cost
+// the same peer already pays for the several unbounded lines those exemptions permit. Stated
+// precisely, since two weaker versions of it are wrong: the bound is per session CREATED, not per
+// concurrent session (a peer churning sessions re-arms it each time), and maxSessions does not cap
+// it at all under `maxSessions: 0`, which is a supported "unlimited" setting.
+//
+// Two residuals, both where they are spent: the reserve never refills, so a session's guaranteed
+// `upstream error` arrival can be spent hours earlier by any other line of that class; and after it
+// is spent, a session with a dead upstream and a quiet sibling share the route's tokens first-come.
+//
+// The zero value is an unspent reserve, and a nil *noticeReserve is none at all — what a leg with no
+// session in hand gets, since a refusal taken before a session exists is attributable to no session.
+type noticeReserve struct {
+	// taken is one bit per noticeClass. A bitmap rather than a map so a session that never writes
+	// a diagnostic allocates nothing, and atomic because sessions write from the request goroutine
+	// and their own upstream reader concurrently.
+	taken atomic.Uint32
+}
+
+// take claims this session's reserved line for class, reporting whether it was still unspent.
+//
+// The class RANGE check is not defensive: classUnclassified is the value an undeclared site resolves
+// to, and the answer for a site nobody has classified is the floor-rate fallback bucket and nothing
+// else — a reserve for it would hand exactly that site a per-session line outside every bucket.
+// Out-of-range is refused for a harder reason: a shift past the bitmap width is 0 in Go, so `Or(0)`
+// would report an unspent reserve forever and floor every line of that class.
+//
+// The Load ahead of the Or is the flood path's own: after the first refused line of a class the bit
+// is set for the session's life, and every later refused frame would otherwise run a locked
+// read-modify-write over a cache line the request goroutine and the upstream reader share (~10ns
+// against ~1ns, measured by BenchmarkNoticeReserve_Take).
+func (r *noticeReserve) take(class noticeClass) bool {
+	if r == nil || class <= classUnclassified || class > lastNoticeClass {
+		return false
+	}
+	bit := uint32(1) << uint(class)
+	if r.taken.Load()&bit != 0 {
+		return false
+	}
+	return r.taken.Or(bit)&bit == 0
+}
+
+// noticeWriter is a leg's diagnostic CHANNEL: where a line goes, what bounds it, and what floor it
+// may fall back on, as one value.
+//
+// One value rather than fields held apart, because holding them apart is a wiring fault nothing
+// catches — a leg that sets the writer and not the bucket writes unbounded with every guard still
+// green. serverRequestParams was the live shape: its writer was its own errOut field while its
+// bucket came from the unblocker it carries, two independently zeroable fields feeding one line.
 //
 // The zero value writes every line to os.Stderr, which is what a bare-struct-literal proxy in a
 // test gets and the behaviour every leg had before the bucket existed.
 type noticeWriter struct {
 	out    io.Writer
 	limits *noticeLimiter
+	// reserve is the per-SESSION floor under limits, nil on a leg with no session (see
+	// noticeReserve). Nil is the common case: only an established HTTP session has one.
+	reserve *noticeReserve
 }
 
 // errOut resolves this channel's destination, os.Stderr when unset. The one place a leg's
 // diagnostic lines — bounded or not — resolve where they go.
 func (n noticeWriter) errOut() io.Writer { return resolvedErrOut(n.out) }
 
-// noticef writes one bounded diagnostic line for site, folding whatever site's CLASS elided since
-// its last admitted line into this one's own text.
+// noticeLine is an ADMITTED diagnostic: the bucket has already been charged and the rollup already
+// resolved, so the only thing left is the text. The zero value writes nothing, which is what a
+// caller ignoring admitNotice's verdict gets.
+type noticeLine struct {
+	out io.Writer
+	// tail is what the admission has to say beyond the caller's own text — see noticeTail.
+	tail string
+}
+
+// writef renders this line, folding in whatever tail the admission resolved.
 //
-// The bucket is resolved from site's declaration rather than handed in, which is what makes
-// "declared metered" and "charges that class's bucket" one fact — the rule forCategory applies to
-// the record half. A site with no declaration charges the floor-rate fallback: the zero
-// noticeDeclaration means nobody has answered the question, and the safe answer to that is the
-// bounded one.
+// A line with a tail is rendered whole and written ONCE rather than appending the tail to the
+// caller's format: appending it puts the tail through Fprintf's own scan, where a `%` in a scope or
+// a class label would be read as a verb against an already-exhausted argument list. Every component
+// of a tail is a constant today; the point is that it does not have to stay one for this to be
+// safe. Two writes were not an option — a diagnostic must reach the pipe as one syscall or two
+// goroutines interleave halves of a line.
 //
-// The rollup is applied HERE rather than returned for a caller to append, for the reason
-// admitRefusalRecord hides its own: a site that spends a token and forgets the count silently
-// under-states a flood, and nothing fails. Its text names BOTH what the count spans — the class,
-// since one bucket serves several sites, and the tier, since after the route split the same
-// sentence would otherwise mean one tenant on a gateway and the whole process on stdio. That is
-// the record half's suppressed_refusal_scope, said in a line rather than a field.
+// It also keeps this a printf wrapper vet can INFER, since neither branch assigns to format or args
+// — the shape that appended to the format did not, which is how a wrapper loses its checking with
+// nothing failing. It is declared in .golangci.yml regardless; both are cheap and only one of them
+// survives an edit here.
+func (l noticeLine) writef(format string, args ...interface{}) {
+	if l.out == nil {
+		return
+	}
+	if l.tail == "" {
+		_, _ = fmt.Fprintf(l.out, format, args...)
+		return
+	}
+	_, _ = io.WriteString(l.out, strings.TrimSuffix(fmt.Sprintf(format, args...), "\n")+l.tail)
+}
+
+// noticeTail is what an admitted line says beyond its own text: that lines of its class were elided
+// since the last one, that this line got out on its session's floor, or both.
 //
-// The nil guard is here rather than on a second admit method, because nil is the state a zero
+// It names the CLASS and the TIER, for the reason the record half stamps suppressed_refusal_scope:
+// one bucket serves several sites, and after the route split the same sentence would otherwise mean
+// one tenant on a gateway and the whole process on stdio. The scope comes from the VERDICT rather
+// than from the table the caller holds, since those disagree for a class delegated wholly to the
+// parent.
+//
+// A floored line carries the count too. It is the line an operator actually sees during the flood
+// the floor exists for, so a count deferred to "the next admitted line" is a count deferred to after
+// the incident.
+//
+// Built rather than Sprintf'd because this is also the ADMITTED path's only extra work, and a
+// second format-string parse to render one integer is the kind of cost that is invisible until it
+// is the thing being measured.
+func noticeTail(v bucketVerdict, class noticeClass) string {
+	if v.suppressed == 0 && !v.reserved {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(" (")
+	if v.reserved {
+		b.WriteString("session-reserved: this ")
+		b.WriteString(v.scope)
+		b.WriteString("'s ")
+		b.WriteString(class.label())
+		b.WriteString(" budget is spent")
+		if v.suppressed > 0 {
+			b.WriteString("; ")
+		}
+	}
+	if v.suppressed > 0 {
+		var digits [20]byte
+		b.Write(strconv.AppendUint(digits[:0], v.suppressed, 10))
+		b.WriteString(" further ")
+		b.WriteString(class.label())
+		b.WriteString(" diagnostics suppressed, ")
+		b.WriteString(v.scope)
+		b.WriteString("-wide")
+	}
+	b.WriteString(")\n")
+	return b.String()
+}
+
+// admitNotice charges site's bucket and returns the line to write, or false when this one is
+// elided. It is the ONE entry point that resolves a site's declaration — noticef is a call to it,
+// and so is a site that wants to decide BEFORE building its arguments.
+//
+// That escape hatch is the whole reason this is separate from noticef rather than folded into it:
+// on the flood path the bucket exists for, every argument the caller built is thrown away. Six sites
+// build a line per frame from arguments that cost a UTF-8 walk, a join, or simply the variadic
+// boxing every one of them pays; they call this first and build nothing when it says no. Measured on
+// the suppressed path of a SESSION channel, floor included, which is the shape that ships
+// (BenchmarkNotice_SuppressedPath): the admission is ~110ns and allocation-free, while building and
+// boxing the arguments for a line then discarded costs ~120ns more and two heap allocations — the
+// boxing is most of it, which is why the escape hatch is at the CALL SITE and not a lazier signature
+// here. The declaration lookup is ~13ns of the admission, which is why it stays a map probe rather
+// than an integer site indexing a dense array: it is not the part that dominates, and the constants'
+// readable values are what the call-site walk resolves and what its failures name.
+//
+// It returns a LINE rather than a bool. A bool is a peek the mechanism never hears about again, so
+// a site pre-gating on one would either write its line through a second admission (spending two
+// tokens for one line) or skip without counting (under-stating the very flood the count exists to
+// report). Here the admission happens exactly once whichever way the caller spells it — and because
+// this hands out the bucket's accumulated tally, a caller that takes a line and does not write it
+// destroys that count, which is why the call-site walk requires the one shape that always writes.
+//
+// The nil-limits guard is here rather than on a second method, because nil is the state a zero
 // noticeWriter carries and this is the one place that can produce one: an admit-with-a-guard beside
 // the table's own promoted admit is two entry points with opposite nil semantics, and the promoted
 // one is the spelling a later site reaches for.
+func (n noticeWriter) admitNotice(site noticeSite) (noticeLine, bool) {
+	if n.limits == nil {
+		return noticeLine{out: n.errOut()}, true
+	}
+	// A site with no declaration resolves to classUnclassified and charges the floor-rate fallback:
+	// the zero value means nobody has answered the question, and the safe answer to that is the
+	// bounded one. noticeReserve.take refuses that class for the same reason.
+	class := meteredNotices[site]
+	verdict := n.limits.admitWithFloor(class, n.reserve)
+	if !verdict.ok {
+		return noticeLine{}, false
+	}
+	return noticeLine{out: n.errOut(), tail: noticeTail(verdict, class)}, true
+}
+
+// noticef writes one bounded diagnostic line for site, for the sites whose arguments are cheap
+// enough not to bother gating. The rollup is applied by the admission rather than returned for a
+// caller to append, for the reason admitRefusalRecord hides its own: a site that spends a token and
+// forgets the count silently under-states a flood, and nothing fails.
 func noticef(n noticeWriter, site noticeSite, format string, args ...interface{}) {
-	admitted, suppressed, scope := true, uint64(0), ""
-	class := noticeDeclarations[site].class
-	if n.limits != nil {
-		admitted, suppressed, scope = n.limits.admit(class)
+	if line, ok := n.admitNotice(site); ok {
+		line.writef(format, args...)
 	}
-	if !admitted {
-		return
-	}
-	if suppressed > 0 {
-		format = strings.TrimSuffix(format, "\n") + " (%d further " + class.label() + " diagnostics suppressed, " + scope + "-wide)\n"
-		args = append(args, suppressed)
-	}
-	_, _ = fmt.Fprintf(n.errOut(), format, args...)
 }

@@ -931,10 +931,14 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	}
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: the server's own signed
-		// account contradicts the contract policy was written against.
-		noticef(d.limits.notices, siteReceiptInconsistent,
-			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
-			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
+		// account contradicts the contract policy was written against. Admitted before the
+		// arguments are built — an upstream returning an inconsistent receipt per call drives one
+		// of these per frame, and a discarded line still costs the join over its reason list, the
+		// sanitizing walk, and the variadic boxing of both (see admitNotice).
+		if line, ok := d.limits.notices.admitNotice(siteReceiptInconsistent); ok {
+			line.writef("[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
+				audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
+		}
 	}
 	return result.AuditDetails()
 }

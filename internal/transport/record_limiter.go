@@ -466,6 +466,31 @@ func newTieredBuckets[K comparable](ratePerSec, burst float64, keys []K, parent 
 	return t
 }
 
+// bucketVerdict is one tiered admission's outcome: whether the write may happen, how many writes
+// UNDER THAT KEY were elided since the last admitted one, which tier's scope that count spans, and
+// whether it was the caller's own FLOOR rather than a token that let it through.
+//
+// A struct rather than a tail of unnamed returns because the fourth answer only exists for a caller
+// that supplies a floor, and a bool bolted onto three positional values is the shape a caller
+// silently gets the wrong way round.
+type bucketVerdict struct {
+	ok         bool
+	suppressed uint64
+	scope      string
+	// reserved reports that this table's own bucket had nothing left and the caller's floor
+	// delivered the write anyway. The distinction is for the caller's TEXT: a reserved write says
+	// so, since it is the one write whose arrival does not mean the tier had room for it.
+	reserved bool
+}
+
+// keyFloor is a per-holder reserve consulted when a tiered table's own bucket has nothing left for
+// key — one guaranteed write, held by something SMALLER than the table's own tenant (see
+// noticeReserve). An interface rather than a func so passing one costs no closure on the flood path
+// the bucket exists for, and so a nil holder answers for itself.
+type keyFloor[K comparable] interface {
+	take(K) bool
+}
+
 // admit reports whether a write under key may happen now, how many writes UNDER THAT KEY were
 // suppressed since the last admitted one, and which tier's scope that count spans.
 //
@@ -478,27 +503,51 @@ func newTieredBuckets[K comparable](ratePerSec, burst float64, keys []K, parent 
 // with the aggregate's scope. That is what keeps a subset table from silently routing an
 // unlisted key to a floor-rate fallback, which no test could have caught (the metering walk
 // cannot answer "which categories does this leg charge" from source).
-func (t *tieredBuckets[K]) admit(key K) (ok bool, suppressed uint64, scope string) {
+func (t *tieredBuckets[K]) admit(key K) bucketVerdict {
+	return t.admitWithFloor(key, nil)
+}
+
+// admitWithFloor is admit with an optional per-holder FLOOR, consulted at exactly one point: this
+// table's OWN bucket had nothing left, which is the only refusal attributable to contention among
+// the holders that share this tier.
+//
+// A refusal from a tier ABOVE is deliberately not floored. It means the aggregate is at the ceiling
+// an operator configured, where an extra write is least appropriate — and the floor could not be
+// claimed honestly there anyway: the own bucket has already spent a token, both tiers have counted
+// the write, and this table's scope is not the one that refused. Claiming it there burned a holder's
+// one-per-key reserve for pressure it cannot influence, which is the cross-tenant elision the tiers
+// exist to stop, one level up.
+//
+// A floored write takes the accumulated tally WITH it (deliveredAnyway) rather than leaving it for
+// the next admitted write: under a sustained flood the floored line is the next line the reader
+// actually sees, so a count left behind is a count reported after the incident or not at all.
+func (t *tieredBuckets[K]) admitWithFloor(key K, floor keyFloor[K]) bucketVerdict {
 	own, registered := t.buckets[key]
 	if t.parent != nil && !registered {
-		return t.parent.admit(key)
+		return t.parent.admitWithFloor(key, floor)
 	}
 	if !registered {
 		own = t.unknown
 	}
-	ok, suppressed = own.admit()
-	if !ok || t.parent == nil {
-		return ok, suppressed, t.scope
+	ok, suppressed := own.admit()
+	if !ok {
+		if floor == nil || !floor.take(key) {
+			return bucketVerdict{scope: t.scope}
+		}
+		return bucketVerdict{ok: true, suppressed: own.deliveredAnyway(), scope: t.scope, reserved: true}
 	}
-	if parentOK, _, _ := t.parent.admit(key); !parentOK {
+	if t.parent == nil {
+		return bucketVerdict{ok: true, suppressed: suppressed, scope: t.scope}
+	}
+	if parent := t.parent.admitWithFloor(key, nil); !parent.ok {
 		// The aggregate refused, so this write does not happen; give this table back the token's
 		// worth of tally (this one plus everything it had accumulated) so the next admitted
 		// one still states the true count. The parent's own tally is deliberately discarded: the
 		// same writes are already counted here, and counting them twice would over-state a flood.
 		own.suppressN(suppressed + 1)
-		return false, 0, t.scope
+		return bucketVerdict{scope: t.scope}
 	}
-	return true, suppressed, t.scope
+	return bucketVerdict{ok: true, suppressed: suppressed, scope: t.scope}
 }
 
 // bucket returns the token bucket key actually charges — this table's own, or the parent's for a
@@ -551,17 +600,17 @@ func admitRefusalRecord(rec auditRecorder, limiter *categoryRecordLimiter, categ
 		// delegation would nil-deref on a goroutine nothing recovers.
 		return nil
 	}
-	admitted, suppressed, scope := limiter.admit(category)
+	verdict := limiter.admit(category)
 	switch {
-	case !admitted:
+	case !verdict.ok:
 		return nil
-	case suppressed == 0:
+	case verdict.suppressed == 0:
 		return rec
 	default:
-		// scope comes from admit rather than from limiter, because the two disagree for exactly
-		// the delegated category: the count is the PARENT's and a table's own label would stamp a
-		// proxy-wide tally as spanning one session.
-		return rolledUpRecorder{auditRecorder: rec, suppressed: suppressed, scope: scope}
+		// scope comes from the verdict rather than from limiter, because the two disagree for
+		// exactly the delegated category: the count is the PARENT's and a table's own label would
+		// stamp a proxy-wide tally as spanning one session.
+		return rolledUpRecorder{auditRecorder: rec, suppressed: verdict.suppressed, scope: verdict.scope}
 	}
 }
 
@@ -641,11 +690,7 @@ func (l *recordRateLimiter) admit() (ok bool, suppressed uint64) {
 
 // suppress counts a refusal elided by an OUTER gate that never reached admit (spends no
 // token), keeping the rollup complete regardless of which layer did the eliding.
-func (l *recordRateLimiter) suppress() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.suppressed++
-}
+func (l *recordRateLimiter) suppress() { l.suppressN(1) }
 
 // suppressN returns n refusals to this bucket's tally, for a record this bucket ADMITTED that an
 // outer tier then refused. The token it spent is deliberately not returned: the outer tier's
@@ -655,6 +700,27 @@ func (l *recordRateLimiter) suppressN(n uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.suppressed += n
+}
+
+// deliveredAnyway resolves the tally for a write this bucket just REFUSED that a floor above it is
+// about to deliver (see admitWithFloor): the refused write comes back off the count, since the
+// rollup states what the reader did not see, and what remains is handed to the caller to report on
+// the line it is writing. One critical section, because a decrement and a harvest as two calls can
+// interleave with a concurrent admit and either lose the remainder or double-count it.
+//
+// Best-effort in exactly one direction, and only under concurrency: if another goroutine's admit
+// harvested the tally between this bucket's refusal and this call, the decrement finds nothing to
+// take and that line stands counted as unseen on the other goroutine's rollup. The counter is
+// unsigned, so the alternative to the guard is a wrap — over-stating by one beats under-stating by
+// 2^64, and no token is spent either way: the floor is a bypass of this bucket, not a draw on it.
+func (l *recordRateLimiter) deliveredAnyway() (remaining uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.suppressed > 0 {
+		l.suppressed--
+	}
+	remaining, l.suppressed = l.suppressed, 0
+	return remaining
 }
 
 // A saturation refusal needs a far smaller sustained rate than a pre-session one: it's
