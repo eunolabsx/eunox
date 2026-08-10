@@ -370,13 +370,6 @@ type noticeWriter struct {
 // diagnostic lines — bounded or not — resolve where they go.
 func (n noticeWriter) errOut() io.Writer { return resolvedErrOut(n.out) }
 
-// noticesTo builds an UNBOUNDED channel on w.
-//
-// Test-only, and held to that by the call-site walk rather than by this comment: a production leg
-// reaching for it would be declared metered and charge nothing, which is the exact disagreement
-// this file's mechanism exists to make impossible.
-func noticesTo(w io.Writer) noticeWriter { return noticeWriter{out: w} }
-
 // noticef writes one bounded diagnostic line for site, folding whatever site's CLASS elided since
 // its last admitted line into this one's own text.
 //

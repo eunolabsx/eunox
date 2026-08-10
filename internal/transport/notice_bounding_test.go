@@ -19,6 +19,7 @@ package transport
 import (
 	"go/ast"
 	"go/types"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -152,26 +153,14 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 	}
 }
 
-// TestNoticeBounding_UnboundedChannelIsTestOnly holds noticesTo to what its doc claims. A
-// production leg reaching for it would be declared metered and charge nothing — the disagreement
-// the runtime lookup cannot catch, because the lookup governs which bucket a line charges and this
-// hands it no bucket at all.
-func TestNoticeBounding_UnboundedChannelIsTestOnly(t *testing.T) {
-	t.Parallel()
-	found := 0
-	for _, src := range packageSources(t) {
-		ast.Inspect(src.file, func(n ast.Node) bool {
-			if !isCallTo(n, "noticesTo") {
-				return true
-			}
-			found++
-			t.Errorf("%s:%d: noticesTo builds an UNBOUNDED diagnostic channel and is test-only; a production leg takes its channel from the proxy (noticeWriter/routeNoticeWriter) so its lines are bounded",
-				src.name, src.fset.Position(n.Pos()).Line)
-			return true
-		})
-	}
-	assert.Zero(t, found)
-}
+// noticesTo builds an UNBOUNDED diagnostic channel on w, for a leg a test assembles by hand.
+//
+// It lives HERE rather than beside noticeWriter, which is what makes it test-only by construction:
+// a production leg reaching for it would be declared metered and charge nothing — the one
+// disagreement the runtime lookup cannot catch, since the lookup governs which bucket a line
+// charges and this hands it no bucket at all. It used to ship in the package under an AST guard
+// that said the same thing more weakly; file placement is the compiler saying it.
+func noticesTo(w io.Writer) noticeWriter { return noticeWriter{out: w} }
 
 // noticeSiteConstants collects notice.go's `noticeSite` constants as name -> value, so the walk can
 // resolve the identifier a call passes to the key the declaration table is read by. Without it the

@@ -172,13 +172,15 @@ func TestNoticeSplit_SingleRouteKeepsThePreSplitBudget(t *testing.T) {
 // not chosen by the call site, which is what let "declared metered" and "charges a bucket" disagree.
 func TestNoticeMechanism_ClassComesFromTheDeclaration(t *testing.T) {
 	t.Parallel()
-	limiter := newNoticeLimiter(1)
-	frozen(limiter, time.Now())
-
 	for site, decl := range noticeDeclarations {
 		if decl.bound != noticeMetered {
 			continue
 		}
+		// A FRESH table per site: one shared across the loop drains as sites accumulate, so the
+		// "admitted nothing on a full bucket" arm would eventually fail naming an arbitrary site
+		// (map order is randomized) for the crime of being visited last.
+		limiter := newNoticeLimiter(1)
+		frozen(limiter, time.Now())
 		before := limiter.bucket(decl.class).tokens
 		var out strings.Builder
 		noticef(noticeWriter{out: &out, limits: limiter}, site, "line\n")
@@ -203,8 +205,10 @@ func TestNoticeMechanism_UndeclaredSiteIsBoundedNotFree(t *testing.T) {
 	assert.Positive(t, written)
 	assert.LessOrEqual(t, written, perBucketFloor,
 		"an undeclared site falls to the floor-rate fallback, not to a real class's share and not to writing free")
-	assert.Zero(t, drive(&out, limiter, siteUnmappedMethod, 0),
-		"and it must not have spent a declared class's tokens on the way")
+	// And it spent nothing of a declared class on the way: a full traffic burst must still be
+	// available. Asserted by DRIVING one, since a zero-length drive reports zero whatever happened.
+	assert.Equal(t, perClassNoticeBurst, drive(&out, limiter, siteUnmappedMethod, perClassNoticeBurst),
+		"an undeclared site must not charge a real class's bucket")
 }
 
 // TestNoticeMechanism_ZeroChannelWritesEveryLine pins the unbounded disposition: a bare-struct-literal
