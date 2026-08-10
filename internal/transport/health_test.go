@@ -16,6 +16,7 @@ import (
 
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/circuitbreaker"
+	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
 // newJWKSHealthProxy builds a proxy through the real gateway constructor, so the wiring the
@@ -241,4 +242,49 @@ func TestHealthSnapshot_JWKSBreaker(t *testing.T) {
 			t.Errorf("an unrecognized state must not claim any named state:\n%s", got)
 		}
 	})
+}
+
+// TestHealthSnapshot_JWKSReportsTheCacheEveryRouteFetchesThrough pins the invariant snapshot()
+// states in prose and relies on: it reads ONE validator's breaker and calls the answer
+// proxy-wide. That is only true because WrapRoutesWithJWT hands every route wrapper the
+// validator's own cache, and because the gateway is handed that same validator — two
+// independent inputs to NewHTTPProxyGateway that nothing else ties together. Split them and
+// /healthz reports a breaker no route fetches through, permanently healthy.
+func TestHealthSnapshot_JWKSReportsTheCacheEveryRouteFetchesThrough(t *testing.T) {
+	sink, _ := newTempAuditSink(t)
+	routes := map[string]*UpstreamRoute{
+		"alpha": {name: "alpha", pdp: pdp.AlwaysAllowPDP{}},
+		"beta":  {name: "beta", pdp: pdp.AlwaysAllowPDP{}},
+	}
+	validator, err := WrapRoutesWithJWT(routes, pdp.JWTPDPOptions{
+		JWKSURI:          "https://idp.example/.well-known/jwks.json",
+		AllowAnyAudience: true,
+		AllowAnyIssuer:   true,
+	})
+	if err != nil {
+		t.Fatalf("WrapRoutesWithJWT: %v", err)
+	}
+	p := NewHTTPProxyGateway(HTTPGatewayOptions{
+		Routes: routes,
+		JWTPDP: validator,
+		KS:     killswitch.NewInMemory(),
+		Sink:   sink,
+	})
+
+	reported := p.jwtPDP.Cache()
+	if reported == nil {
+		t.Fatal("the proxy must hold the validator whose cache /healthz reports")
+	}
+	for name, rt := range routes {
+		wrapper, ok := rt.pdp.(*pdp.JWTPDP)
+		if !ok {
+			t.Fatalf("route %q was not wrapped: %T", name, rt.pdp)
+		}
+		if wrapper.Cache() != reported {
+			t.Errorf("route %q fetches keys through a different cache than /healthz reports; the proxy-wide reading would be wrong for it", name)
+		}
+	}
+	if p.snapshot().JWKS == nil {
+		t.Error("a wrapped gateway must report a jwks block: absence is documented to mean no JWT layer")
+	}
 }

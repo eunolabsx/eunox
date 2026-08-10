@@ -10,6 +10,7 @@ package transport
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/eunolabs/eunox/pkg/circuitbreaker"
@@ -147,58 +148,73 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := p.snapshot()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	// wf discards write errors: a broken scrape connection is not actionable here.
-	wf := func(format string, args ...interface{}) { _, _ = fmt.Fprintf(w, format, args...) }
-	wf("# HELP eunox_active_sessions Current number of active client sessions.\n")
-	wf("# TYPE eunox_active_sessions gauge\n")
-	wf("eunox_active_sessions %d\n", snap.Sessions)
-	wf("# HELP eunox_max_sessions Configured maximum concurrent sessions (0 = unlimited).\n")
-	wf("# TYPE eunox_max_sessions gauge\n")
-	wf("eunox_max_sessions %d\n", snap.MaxSessions)
-	wf("# HELP eunox_routes Configured upstream routes.\n")
-	wf("# TYPE eunox_routes gauge\n")
-	wf("eunox_routes %d\n", snap.Routes)
-	wf("# HELP eunox_audit_dropped_records_total Audit records discarded because the write queue was full.\n")
-	wf("# TYPE eunox_audit_dropped_records_total counter\n")
-	wf("eunox_audit_dropped_records_total %d\n", snap.AuditDropped)
-	wf("# HELP eunox_audit_write_failures_total Audit records that reached the drainer but failed to write to disk (full disk, EIO, ...). A non-zero value means the audit trail is incomplete.\n")
-	wf("# TYPE eunox_audit_write_failures_total counter\n")
-	wf("eunox_audit_write_failures_total %d\n", snap.AuditWriteFailed)
-	wf("# HELP eunox_audit_sink_up Whether the audit sink opened successfully (1 = up).\n")
-	wf("# TYPE eunox_audit_sink_up gauge\n")
-	wf("eunox_audit_sink_up %d\n", gaugeBool(snap.AuditConfigured))
-	wf("# HELP eunox_kill_switch_healthy Kill-switch backend health (1 = healthy, 0 = degraded).\n")
-	wf("# TYPE eunox_kill_switch_healthy gauge\n")
-	wf("eunox_kill_switch_healthy %d\n", gaugeBool(snap.KillSwitchHealthy))
-	wf("# HELP eunox_audit_maintenance_stalled Audit rotation or retention pruning is not making progress (1 = stalled). No records are lost, but the configured size/retention bound is unenforced and the log will grow until the fault is fixed.\n")
-	wf("# TYPE eunox_audit_maintenance_stalled gauge\n")
-	wf("eunox_audit_maintenance_stalled %d\n", gaugeBool(snap.AuditMaintenanceStalled))
+	// Every series goes through one of these three, so the name cannot be spelled differently
+	// in a metric's own HELP, TYPE and sample lines, and the TYPE word cannot contradict the
+	// suffix. Hand-transcribing the trio per metric is what made that possible.
+	m := metricWriter{w: w}
+	m.gauge("eunox_active_sessions", "Current number of active client sessions.", int64(snap.Sessions))
+	m.gauge("eunox_max_sessions", "Configured maximum concurrent sessions (0 = unlimited).", int64(snap.MaxSessions))
+	m.gauge("eunox_routes", "Configured upstream routes.", int64(snap.Routes))
+	m.counter("eunox_audit_dropped_records_total", "Audit records discarded because the write queue was full.", snap.AuditDropped)
+	m.counter("eunox_audit_write_failures_total", "Audit records that reached the drainer but failed to write to disk (full disk, EIO, ...). A non-zero value means the audit trail is incomplete.", snap.AuditWriteFailed)
+	m.gauge("eunox_audit_sink_up", "Whether the audit sink opened successfully (1 = up).", gaugeBool(snap.AuditConfigured))
+	m.gauge("eunox_kill_switch_healthy", "Kill-switch backend health (1 = healthy, 0 = degraded).", gaugeBool(snap.KillSwitchHealthy))
+	m.gauge("eunox_audit_maintenance_stalled", "Audit rotation or retention pruning is not making progress (1 = stalled). No records are lost, but the configured size/retention bound is unenforced and the log will grow until the fault is fixed.", gaugeBool(snap.AuditMaintenanceStalled))
 	// Absent without a JWT layer rather than emitted as zeros: a permanently-healthy gauge on
 	// a proxy that fetches no keys is indistinguishable from healthy key fetching, and an
 	// absent series is what a scraper already knows how to read.
 	if snap.JWKS != nil {
-		wf("# HELP eunox_jwks_fetch_healthy IdP key fetching is unimpeded (1 = breaker closed). 0 means refreshes are refused or the breaker has tripped and not yet proved recovery: a token whose kid the cached key set does not carry fails closed now, and every token fails once that set passes its TTL.\n")
-		wf("# TYPE eunox_jwks_fetch_healthy gauge\n")
-		wf("eunox_jwks_fetch_healthy %d\n", gaugeBool(!snap.JWKS.keyFetchImpeded()))
+		m.gauge("eunox_jwks_fetch_healthy", "IdP key fetching is unimpeded (1 = breaker closed). 0 means refreshes are refused or the breaker has tripped and not yet proved recovery: a token whose kid the cached key set does not carry fails closed now, and every token fails once that set passes its TTL.", gaugeBool(!snap.JWKS.keyFetchImpeded()))
 		// The state as a labelled set, the Prometheus spelling for an enum: a single boolean
 		// could not name half-open, which is the state a sustained outage sits in longest.
-		wf("# HELP eunox_jwks_breaker_state IdP key-fetch circuit breaker state (1 on the active state).\n")
-		wf("# TYPE eunox_jwks_breaker_state gauge\n")
+		states := make([]labelledSample, 0, 3)
 		for _, st := range []circuitbreaker.State{circuitbreaker.StateClosed, circuitbreaker.StateHalfOpen, circuitbreaker.StateOpen} {
-			wf("eunox_jwks_breaker_state{state=%q} %d\n", string(st), gaugeBool(snap.JWKS.BreakerState == st))
+			states = append(states, labelledSample{
+				labels: fmt.Sprintf("{state=%q}", string(st)),
+				value:  gaugeBool(snap.JWKS.BreakerState == st),
+			})
 		}
-		wf("# HELP eunox_jwks_fetch_failures_total JWKS fetches the breaker admitted and saw fail. Fetches it REFUSED are not counted here -- watch eunox_jwks_fetch_healthy for those.\n")
-		wf("# TYPE eunox_jwks_fetch_failures_total counter\n")
-		wf("eunox_jwks_fetch_failures_total %d\n", snap.JWKS.FetchFailures)
-		wf("# HELP eunox_jwks_fetch_successes_total JWKS fetches reported successful to the breaker, including outcomes it then discarded as stale. Observability only -- do not read a rising value as recovery; eunox_jwks_fetch_healthy is the recovery signal.\n")
-		wf("# TYPE eunox_jwks_fetch_successes_total counter\n")
-		wf("eunox_jwks_fetch_successes_total %d\n", snap.JWKS.FetchSuccesses)
+		m.gaugeSet("eunox_jwks_breaker_state", "IdP key-fetch circuit breaker state (1 on the active state).", states)
+		m.counter("eunox_jwks_fetch_failures_total", "JWKS fetches the breaker admitted and saw fail. Fetches it REFUSED are not counted here -- watch eunox_jwks_fetch_healthy for those.", snap.JWKS.FetchFailures)
+		m.counter("eunox_jwks_fetch_successes_total", "JWKS fetches reported successful to the breaker, including outcomes it then discarded as stale. Observability only -- do not read a rising value as recovery; eunox_jwks_fetch_healthy is the recovery signal.", snap.JWKS.FetchSuccesses)
 	}
 }
 
-// gaugeBool renders a boolean as a Prometheus gauge sample. One spelling, so a new gauge
-// cannot invert the conversion in its own copy of the three-line idiom.
-func gaugeBool(b bool) int {
+// metricWriter renders Prometheus text exposition groups. Write errors are discarded: a broken
+// scrape connection is not actionable here.
+type metricWriter struct{ w io.Writer }
+
+// labelledSample is one sample of a multi-series metric: the rendered label set (including
+// braces) and its value.
+type labelledSample struct {
+	labels string
+	value  int64
+}
+
+func (m metricWriter) emit(name, help, kind string, samples []labelledSample) {
+	_, _ = fmt.Fprintf(m.w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+	for _, s := range samples {
+		_, _ = fmt.Fprintf(m.w, "%s%s %d\n", name, s.labels, s.value)
+	}
+}
+
+func (m metricWriter) gauge(name, help string, v int64) {
+	m.emit(name, help, "gauge", []labelledSample{{value: v}})
+}
+
+func (m metricWriter) counter(name, help string, v int64) {
+	m.emit(name, help, "counter", []labelledSample{{value: v}})
+}
+
+// gaugeSet renders an enum as the Prometheus idiom: one HELP/TYPE for the family, one sample
+// per member.
+func (m metricWriter) gaugeSet(name, help string, samples []labelledSample) {
+	m.emit(name, help, "gauge", samples)
+}
+
+// gaugeBool renders a boolean as a gauge value. One spelling, so a new gauge cannot invert the
+// conversion in its own copy of the three-line idiom.
+func gaugeBool(b bool) int64 {
 	if b {
 		return 1
 	}

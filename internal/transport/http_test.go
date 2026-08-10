@@ -6377,9 +6377,13 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("metrics status = %d", resp.StatusCode)
 		}
-		buf := make([]byte, 4096)
-		n, _ := resp.Body.Read(buf)
-		body := string(buf[:n])
+		// io.ReadAll, not one Read into a fixed buffer: a single Read may return short by
+		// contract, so the assertions below would go vacuous as the exposition grows.
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read metrics body: %v", err)
+		}
+		body := string(raw)
 		for _, want := range []string{
 			"eunox_active_sessions 1",
 			"eunox_max_sessions 5",
