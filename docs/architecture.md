@@ -94,7 +94,7 @@ Within `pkg/`:
 | `pkg/enforcement` | The decision engine: constraint matching, condition evaluation via a handler registry, argument-schema validation, Rego input construction. |
 | `pkg/callcounter` | Call-count store for `maxCalls` conditions — in-memory and Redis backends behind one interface. |
 | `pkg/killswitch` | Emergency kill switch — in-memory and Redis backends behind one interface. |
-| `pkg/circuitbreaker` | Generic circuit breaker (`Do` around a fallible call). Currently guards JWKS endpoint fetches. |
+| `pkg/circuitbreaker` | Generic circuit breaker (`Do` around a fallible call). Currently guards JWKS endpoint fetches; its `Stats` are read back through `capability.(*JWKSCache).BreakerStats` and reported on the HTTP transport's `/healthz` and `/metrics`. |
 
 The dependency direction is strictly inward — `cmd` → `internal/` → `pkg/` —
 and never back: nothing in `internal/` or `pkg/` imports the binary. Within the
