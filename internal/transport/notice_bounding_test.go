@@ -3,11 +3,11 @@
 
 // The residual the notice MECHANISM cannot answer for itself.
 //
-// noticef now reads a site's declaration at write time (see notice.go), so "declared metered" and
+// admitNotice now reads a site's declaration at write time (see notice.go), so "declared metered" and
 // "charges that class's bucket" are one fact — the analogue of forCategory on the record half. Two
 // questions remain outside a runtime reader, and they are what this walk is for:
 //
-//   - a line written through a shape that never reaches noticef at all (a bare fmt.Fprintf), which
+//   - a line written through a shape that never reaches the mechanism at all (a bare fmt.Fprintf), which
 //     the mechanism cannot see because it is never called;
 //   - a declaration nothing reaches, which is an answer to a question nobody asks.
 //
@@ -28,7 +28,7 @@ import (
 )
 
 // noticeWriters maps a package qualifier to the calls through it that put a diagnostic line on this
-// package's error writer. noticef is deliberately absent: it IS the mechanism, so a call to it is
+// package's error writer. noticeLine.writef is deliberately absent: it IS the mechanism, so a call to it is
 // the metered site rather than one needing a declaration found for it.
 //
 // RESIDUAL, stated rather than implied: a line written through a shape not listed here — a raw
@@ -54,15 +54,38 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 	t.Parallel()
 	// NOT `Contains(noticeClasses, class)`: noticeClasses is DERIVED from this map's own values, so
 	// that assertion holds for any content whatsoever — including the entry it claims to catch.
-	// Naming a real class is the check, and the range is what makes an unclassified or out-of-band
-	// value fail here rather than at the floor-rate fallback (and, for the reserve, at a bitmap
-	// shift that would report an unspent floor forever).
+	// Naming a real class is the check, and it is what keeps an unclassified value from silently
+	// charging the floor-rate fallback.
 	for site, class := range meteredNotices {
 		assert.Greater(t, class, classUnclassified,
 			"site %q is metered but names no notice class; an unclassified one charges the floor-rate fallback rather than its own share, and registering it as a bucket key would move every genuinely undeclared site off that fallback too", site)
-		assert.LessOrEqual(t, class, lastNoticeClass,
-			"site %q names a class outside the declared set; noticeReserve packs one bit per class and a shift past the last one hands out an unlimited floor", site)
+		// Through label()'s own default arm rather than a list of the class names, which would be
+		// the second hand-typed list this file's header argues against: every out-of-range value
+		// labels itself "unclassified", so one comparison covers both ways a class can be undeclared.
+		assert.NotEqual(t, classUnclassified.label(), class.label(),
+			"site %q names a class outside the declared set, so its lines would roll up under the label an unclassified line carries", site)
 	}
+	// Every site of a class one of whose members is PROTECTED has to answer which side it is on:
+	// an unanswered one lands on the flooding side by default, which is exactly the elision the
+	// site floor exists to close, arriving silently with the next obligation site somebody adds.
+	protectedClasses := map[noticeClass]bool{}
+	for site, decl := range siteFloors {
+		assert.Contains(t, meteredNotices, site,
+			"site %q declares a floor disposition but charges no bucket; an unmetered line has no tier to be floored under", site)
+		assert.Equal(t, decl.protected, decl.why == "",
+			"site %q must be protected, or declare WHY it is the one that may be elided — and never both", site)
+		if decl.protected {
+			protectedClasses[meteredNotices[site]] = true
+		}
+	}
+	for site, class := range meteredNotices {
+		if !protectedClasses[class] {
+			continue
+		}
+		assert.Contains(t, siteFloors, site,
+			"site %q shares class %q with a site that holds its own floor, so it must say whether it does too; undeclared means it is the one a class-mate's flood elides, which is a decision rather than an oversight", site, class.label())
+	}
+
 	for fn, decl := range unmeteredNotices {
 		switch decl.bound {
 		case noticeUndeclared:
@@ -76,18 +99,16 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 }
 
 // noticeEntryPoints are the mechanism's site-taking calls, mapped to the argument index the site
-// travels in. Two, because a site whose arguments are expensive enough to be worth not building
-// takes its admission directly and writes through the line it gets back (see admitNotice) — so a
-// walk that recognized only noticef would report those sites as declared-but-unreached.
+// travels in. ONE, now that every metered site takes its admission before building its arguments:
+// the eager wrapper that took the format string is gone, so there is no second spelling for a new
+// site to reach for and no per-site judgment about which to use.
 var noticeEntryPoints = map[string]int{
-	"noticef":     1,
 	"admitNotice": 0,
 }
 
 // noticeMechanism is the set of functions that IMPLEMENT the bounded channel rather than write
 // through it. Their fmt calls are the mechanism's own and need no declaration of their own.
 var noticeMechanism = map[noticeFunc]bool{
-	"noticef":           true,
 	"noticeLine.writef": true,
 }
 
@@ -135,7 +156,7 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 				checked++
 				seenFuncs[qualified] = true
 				if _, isDeclared := unmeteredNotices[qualified]; !isDeclared {
-					t.Errorf("%s:%d: %s writes a diagnostic line with no entry in unmeteredNotices; declare how it is bounded (its record's admission verdict, a one-shot latch, or exempt with a reason) — or meter it, which means routing it through noticef and declaring its class in meteredNotices",
+					t.Errorf("%s:%d: %s writes a diagnostic line with no entry in unmeteredNotices; declare how it is bounded (its record's admission verdict, a one-shot latch, or exempt with a reason) — or meter it, which means taking its admission through admitNotice and declaring its class in meteredNotices",
 						src.name, src.fset.Position(call.Pos()).Line, qualified)
 				}
 				return true

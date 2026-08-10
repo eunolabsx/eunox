@@ -391,6 +391,21 @@ func (p *JWTPDP) Cache() *capability.JWKSCache {
 	return p.cache
 }
 
+// KeyFetchHealth is one SAMPLE of this validator's key-fetch readiness, and whether there is a
+// guard to report on at all.
+//
+// The sample is what a health endpoint both renders and folds: it carries the detail (a breaker
+// state plus two counters, which no `error` has room for) and answers the readiness verdict itself
+// through capability.KeyFetchHealth.HealthStatus. That is what keeps the rendered fields and the
+// verdict beside them from being two independent readings of a cache whose TTL can lapse between
+// them — so this validator deliberately does NOT relay the verdict itself.
+func (p *JWTPDP) KeyFetchHealth() (capability.KeyFetchHealth, bool) {
+	if p == nil {
+		return capability.KeyFetchHealth{}, false
+	}
+	return p.cache.KeyFetchHealth()
+}
+
 // innerEnforces reports whether p.inner is a real policy backstop for an
 // identity-only (no mcp.capabilities) request. Neither nil nor AlwaysAllowPDP
 // qualify — in JWT mode the wrapper must fail closed, not inherit allow-everything.

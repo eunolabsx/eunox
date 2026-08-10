@@ -402,8 +402,8 @@ boundary.
 beside `/control/kill` (same on-host-only guard — never reachable off the box):
 
 ```bash
-curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, jwks:{breakerState, fetchFailures, fetchSuccesses}, ...}
-curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, eunox_jwks_fetch_healthy, …
+curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, jwks:{breakerState, fetchFailures, fetchSuccesses, keysServable, healthy}, ...}
+curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, eunox_jwks_fetch_healthy, eunox_jwks_keys_servable, …
 ```
 
 `eunox_audit_dropped_records_total` and `eunox_audit_write_failures_total` are the
@@ -434,11 +434,24 @@ audit-integrity one.
 The `jwks` block on `/healthz` and the `eunox_jwks_*` series are the JWT layer's
 signal, present only when `--jwks-uri` is configured — a proxy that fetches no
 keys emits neither, rather than a permanently-healthy zero. **Page on
-`eunox_jwks_fetch_healthy == 0`.** It goes to `0`, and `status` to `degraded`,
-whenever the circuit breaker guarding IdP key fetches is anything but `closed`:
-refreshes are being refused, so a token whose `kid` the cached key set does not
-carry is rejected right now, and *every* token is rejected once that set passes
-its TTL.
+`eunox_jwks_fetch_healthy == 0`.** It goes to `0` whenever the circuit breaker
+guarding IdP key fetches is anything but `closed`: refreshes are being refused,
+so key rotation is blocked and a token whose `kid` the cached key set does not
+carry is rejected right now.
+
+**That is an alert, not a drain signal, and `status` is deliberately not tied to
+it.** The breaker's cooldown is tens of seconds while the key cache serves for
+five minutes, so an IdP blip trips it while the cached set is seconds old and
+carries every `kid` in use — a window in which every token still validates,
+which is the cache doing its job. `status` (the readiness field, the one a
+Kubernetes probe or an LB health check reads) flips to `degraded` only once
+refreshes are refused **and** the cached set has passed its TTL, which is when
+tokens actually start failing closed. That distinction matters most for exactly
+this cause: every replica shares the IdP, so they all trip inside the same
+window, and draining on the trip alone takes the whole fleet out of rotation
+over a blip nothing rejected. `eunox_jwks_keys_servable` is the second half if
+you want to alert on the composite yourself; `jwks.healthy` on `/healthz` is the
+same verdict `status` folds in.
 
 `half-open` counts as impeded, which is the non-obvious part. The breaker enters
 it only from `open` and leaves it for `closed` only after a probe **succeeds**,

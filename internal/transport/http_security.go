@@ -473,6 +473,13 @@ func (p *HTTPProxy) preSessionAudienceRecorder(route *UpstreamRoute) auditRecord
 // grows a hole.
 type rolledUpRecorder struct {
 	auditRecorder
+	// floored reports that this record exists only because its holder's reserve delivered it —
+	// the tier that would have carried it had nothing left. Stamped for the reason the count
+	// beside it is: without it, a record written on the floor is byte-identical to one the tier
+	// had room for, so an auditor reading the tape during a saturation sees clean records and no
+	// sign that sibling holders' records are being dropped wholesale. The notice half renders the
+	// same fact in its line.
+	floored    bool
 	suppressed uint64
 	// scope is what the count SPANS, taken from the table that produced it. A parameter rather
 	// than the constant it used to be: the upstream-driven categories are bucketed per SESSION
@@ -493,6 +500,9 @@ func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier,
 	details = mergeAuditDetails(details, nil)
 	if details == nil {
 		details = make(map[string]interface{}, 2)
+	}
+	if r.floored {
+		details[detailRefusalFloored] = true
 	}
 	// Always paired: a count whose scope a reader has to infer from the stamp beside it
 	// is a count that gets misread.

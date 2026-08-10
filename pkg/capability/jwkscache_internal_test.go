@@ -1154,20 +1154,20 @@ func TestJWKSCache_SlowBackgroundRefreshDoesNotClobberForcedRotation(t *testing.
 		"the newer forced rotation (set B) must survive; the slower background fetch (set A) must not clobber it")
 }
 
-// TestJWKSCacheBreakerStats pins the observability seam an operator health endpoint reads:
+// TestJWKSCacheKeyFetchHealth pins the observability seam an operator health endpoint reads:
 // a cache with no breaker has nothing to report, a configured one reports its live state and
 // counters, and reading it neither mutates the breaker nor consumes a half-open probe.
-func TestJWKSCacheBreakerStats(t *testing.T) {
+func TestJWKSCacheKeyFetchHealth(t *testing.T) {
 	t.Run("no breaker configured reports nothing", func(t *testing.T) {
 		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: "https://idp.example/jwks", CacheTTL: time.Hour})
-		st, ok := cache.BreakerStats()
+		h, ok := cache.KeyFetchHealth()
 		require.False(t, ok, "a cache fetching without a breaker has no state to report")
-		require.Equal(t, circuitbreaker.Stats{}, st)
+		require.Equal(t, KeyFetchHealth{}, h)
 	})
 
 	t.Run("nil cache reports nothing rather than panicking", func(t *testing.T) {
 		var cache *JWKSCache
-		_, ok := cache.BreakerStats()
+		_, ok := cache.KeyFetchHealth()
 		require.False(t, ok)
 	})
 
@@ -1197,32 +1197,66 @@ func TestJWKSCacheBreakerStats(t *testing.T) {
 		// a TTL-fresh GetKeys serves the cache without reaching the breaker at all.
 		_, _, err := cache.refresh(context.Background(), true)
 		require.NoError(t, err)
-		st, ok := cache.BreakerStats()
+		h, ok := cache.KeyFetchHealth()
 		require.True(t, ok)
-		require.Equal(t, circuitbreaker.StateClosed, st.State)
-		require.EqualValues(t, 1, st.TotalSuccesses)
-		require.EqualValues(t, 0, st.TotalFailures)
+		require.Equal(t, circuitbreaker.StateClosed, h.Breaker.State)
+		require.EqualValues(t, 1, h.Breaker.TotalSuccesses)
+		require.EqualValues(t, 0, h.Breaker.TotalFailures)
+		require.True(t, h.KeysServable, "the fetch just installed a set inside its TTL")
+		require.NoError(t, h.HealthStatus())
 
 		fail.Store(true)
 		_, _, err = cache.refresh(context.Background(), true)
 		require.Error(t, err)
-		st, ok = cache.BreakerStats()
+		h, ok = cache.KeyFetchHealth()
 		require.True(t, ok)
-		require.Equal(t, circuitbreaker.StateOpen, st.State,
-			"a failed fetch at threshold 1 must leave the breaker open, which is what the health endpoint reports as degraded")
-		require.EqualValues(t, 1, st.TotalFailures)
+		require.Equal(t, circuitbreaker.StateOpen, h.Breaker.State,
+			"a failed fetch at threshold 1 must leave the breaker open, which is what the health endpoint reports as impeded")
+		require.EqualValues(t, 1, h.Breaker.TotalFailures)
+		require.True(t, h.FetchImpeded())
+		// The cached set from the first fetch is still inside its hour-long TTL, so the layer
+		// keeps validating: the trip is an alert, not a readiness regression.
+		require.True(t, h.KeysServable)
+		require.NoError(t, h.HealthStatus(),
+			"an impeded breaker over a warm cache must not report unreadiness -- every token still validates")
 
 		// Reading must not advance the breaker. Comparing two reported snapshots cannot show
 		// that -- the projection is identical either way -- so require that a real fetch is
 		// still admitted after the reads, which is what a consumed probe budget would deny.
-		require.Equal(t, st, mustBreakerStats(t, cache))
+		require.Equal(t, h, mustKeyFetchHealth(t, cache))
+	})
+
+	t.Run("impeded with a stale cache is the readiness verdict", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+		now := time.Now()
+		br := circuitbreaker.New(circuitbreaker.Config{
+			FailureThreshold:  1,
+			CooldownDuration:  time.Hour,
+			HalfOpenMaxProbes: 1,
+		})
+		cache := NewJWKSCache(JWKSCacheConfig{
+			JWKSURL: srv.URL, Client: srv.Client(), CacheTTL: time.Minute, Breaker: br,
+			Now: func() time.Time { return now },
+		})
+		_, _, err := cache.refresh(context.Background(), true)
+		require.Error(t, err)
+
+		h := mustKeyFetchHealth(t, cache)
+		require.True(t, h.FetchImpeded())
+		require.False(t, h.KeysServable, "no fetch ever succeeded, so there is no set to serve")
+		require.ErrorIs(t, h.HealthStatus(), ErrKeysUnservable)
+		require.ErrorIs(t, h.HealthStatus(), ErrJWKSUnavailable,
+			"the verdict must classify as a key-infrastructure outage, which is what a token arriving now meets")
 	})
 }
 
-// mustBreakerStats reads the cache's breaker state, failing if there is none to read.
-func mustBreakerStats(t *testing.T, c *JWKSCache) circuitbreaker.Stats {
+// mustKeyFetchHealth reads the cache's key-fetch health, failing if there is none to read.
+func mustKeyFetchHealth(t *testing.T, c *JWKSCache) KeyFetchHealth {
 	t.Helper()
-	st, ok := c.BreakerStats()
+	h, ok := c.KeyFetchHealth()
 	require.True(t, ok, "the cache was built with a breaker, so it must report one")
-	return st
+	return h
 }

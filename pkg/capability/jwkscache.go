@@ -163,18 +163,78 @@ func NewJWKSCache(cfg JWKSCacheConfig) *JWKSCache { //nolint:gocritic // hugePar
 	}
 }
 
-// BreakerStats reports the state of the circuit breaker guarding key fetches, and whether
-// there is one to report on: Breaker is optional, and a cache without one fetches directly.
+// ErrKeysUnservable is the key-fetch health verdict for the one condition under which this
+// layer can no longer validate anything: refreshes refused AND no cached set inside its TTL.
+// It wraps [ErrJWKSUnavailable] because that is exactly what a token arriving now would meet.
+var ErrKeysUnservable = fmt.Errorf("%w: key refreshes are being refused and no cached key set is within its TTL, so every token fails closed", ErrJWKSUnavailable)
+
+// KeyFetchHealth is a cache's key-fetch readiness: the breaker's own statistics, plus the one
+// fact the breaker cannot know — whether the cached key set can still serve.
 //
-// Read-only by construction: Stats PROJECTS the post-cooldown half-open state without
-// mutating, so a caller polling this can never consume the half-open probe budget a real
-// verification needs. The nil-receiver arm lets a health endpoint report rather than panic on
-// a consumer-built validator carrying no cache.
-func (c *JWKSCache) BreakerStats() (circuitbreaker.Stats, bool) {
-	if c == nil || c.breaker == nil {
-		return circuitbreaker.Stats{}, false
+// Both, rather than the breaker's state alone, because trip time and impact time are not the
+// same moment: the breaker's cooldown is tens of seconds while CacheTTL defaults to five
+// minutes, so an IdP blip trips it while the cached set is seconds old and carries every `kid`
+// in live use. A consumer reading only the state reports an outage through a window in which
+// 100% of tokens validate — which is the cached-then-fail-closed posture working as intended.
+type KeyFetchHealth struct {
+	// Breaker is the guard's projected state and counters. Read-only by construction: Stats
+	// PROJECTS the post-cooldown half-open state without mutating, so a caller polling this
+	// can never consume the half-open probe budget a real verification needs.
+	Breaker circuitbreaker.Stats
+	// KeysServable reports that a fetched key set is installed and still inside its TTL, so
+	// tokens carrying a `kid` it holds keep validating however the breaker reads.
+	KeysServable bool
+}
+
+// FetchImpeded reports that key REFRESHES are refused: rotation is blocked for the duration,
+// and a token carrying a `kid` the cached set does not hold fails closed at once, since
+// ForceRefreshForKID is refused too. True well before the layer stops working, which is why it
+// is not on its own the readiness verdict — see Status.
+func (h KeyFetchHealth) FetchImpeded() bool { //nolint:gocritic // hugeParam: a value receiver keeps these predicates callable directly on the snapshot KeyFetchHealth returns, including a non-addressable one; the type is a read-only sample read once per scrape, and a pointer receiver on it would invite the reader to treat it as live state
+	return h.Breaker.State.Impeded()
+}
+
+// HealthStatus is the readiness verdict for THIS sample: nil while the layer it describes can
+// still validate tokens, and [ErrKeysUnservable] once it cannot.
+//
+// The verdict is impact rather than impediment. An impeded breaker over a warm cache is
+// worth an ALERT (rotation is blocked, an unknown `kid` fails now) and is reported as
+// FetchImpeded for exactly that, but it is not a readiness regression: draining a replica on
+// it takes the whole fleet out of rotation on a blip the cache absorbs, and every replica
+// shares the IdP, so they all trip inside the same window.
+//
+// On the SAMPLE rather than on the cache, and named to satisfy a consumer's readiness seam, so a
+// consumer that also renders this sample's fields folds the verdict OF THE FIELDS IT RENDERED. Re-
+// asking the cache takes a second, independent reading: one /healthz body could then report a
+// servable key set beside a verdict that says every token fails closed, purely because the TTL
+// lapsed between the two reads.
+//
+// The zero value is not a sample and reports an outage — [KeyFetchHealth]'s zero State is unknown,
+// which [circuitbreaker.State.Impeded] answers true for, fail-safe. A caller must honour the ok
+// result of [JWKSCache.KeyFetchHealth] rather than verdict on an unpopulated value.
+func (h KeyFetchHealth) HealthStatus() error { //nolint:gocritic // hugeParam: see FetchImpeded
+	if h.FetchImpeded() && !h.KeysServable {
+		return ErrKeysUnservable
 	}
-	return c.breaker.Stats(), true
+	return nil
+}
+
+// KeyFetchHealth reports this cache's key-fetch readiness, and whether there is a guard to
+// report on at all: Breaker is optional, and a cache without one fetches directly.
+//
+// It answers the readiness question rather than passing its dependency's state machine
+// through, because the staleness half of that answer is this type's own (see freshAt) and a
+// consumer joining the two would be re-deriving a predicate it cannot see. The nil-receiver
+// arm lets a health endpoint report rather than panic on a consumer-built validator carrying
+// no cache.
+func (c *JWKSCache) KeyFetchHealth() (KeyFetchHealth, bool) {
+	if c == nil || c.breaker == nil {
+		return KeyFetchHealth{}, false
+	}
+	c.mu.RLock()
+	servable := c.freshAt(c.now())
+	c.mu.RUnlock()
+	return KeyFetchHealth{Breaker: c.breaker.Stats(), KeysServable: servable}, true
 }
 
 // IsLoopbackHost reports whether host (a URL hostname, no port) is a loopback name or

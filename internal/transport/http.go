@@ -795,7 +795,7 @@ func (p *HTTPProxy) sessionNoticeWriter(sess *httpSession, route *UpstreamRoute)
 		return p.routeNoticeWriter(route)
 	}
 	w := p.routeNoticeWriter(sess.route)
-	w.reserve = &sess.noticeFloor
+	w.reserve = sess.noticeFloor
 	return w
 }
 

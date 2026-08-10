@@ -184,7 +184,9 @@ func TestUpstreamRefusalBuckets_ArePerSession(t *testing.T) {
 }
 
 // TestUpstreamRefusalBuckets_StillChargeTheAggregate is the other half, and the reason the split is
-// not simply "a full share each".
+// not simply "a full share each". It isolates the TIER arithmetic: it drives admit directly, so no
+// holder floor is in play (see TestUpstreamRefusalFloor_AggregateStillHoldsTheTotal for the same
+// property through the production entry point, floor included).
 //
 // Per-session buckets alone multiply the sustained write rate into the ONE shared audit queue by the
 // session count — at the default maxSessions that is 4096/s sustained against a 4096-deep queue,

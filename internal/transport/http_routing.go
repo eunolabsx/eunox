@@ -333,9 +333,11 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				// other method. Answered as the drop it must be anyway — there is no session
 				// here, so nothing to forward it on — rather than discarding the verdict and
 				// letting a future forwardable pre-session method be dropped in silence.
-				noticef(p.routeNoticeWriter(route), siteUpstreamlessNotification,
-					"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
-					audit.SanitizeAuditField(msg.Method))
+				if line, ok := p.routeNoticeWriter(route).admitNotice(siteUpstreamlessNotification); ok {
+					line.writef(
+						"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
+						audit.SanitizeAuditField(msg.Method))
+				}
 			}
 			w.WriteHeader(http.StatusAccepted)
 			return

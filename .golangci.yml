@@ -45,34 +45,25 @@ linters:
     - dupl
 
   settings:
-    # noticef is a printf wrapper: it rewrites the format and appends an argument before
-    # Fprintf, which go vet cannot infer (printf.findPrintfLike gives up on any assignment to
-    # the format or args parameter), so every diagnostic routed through it would silently lose
-    # format/argument checking. Declaring it restores that.
+    # noticeLine.writef is the transport's one bounded-diagnostic writer: every metered stderr
+    # line takes its admission first (noticeWriter.admitNotice) and writes through the line it
+    # gets back, so this is the only printf wrapper the mechanism has.
     #
-    # UNPARENTHESIZED, and the difference is the whole entry: vet matches this against
-    # (*types.Func).FullName(), which for a package-level function has no parentheses. The
-    # `(pkg.Type).Method` spelling is for methods, so the parenthesized form this carried
-    # matched nothing at all and every call site was unchecked while the comment above claimed
-    # otherwise. Verified by reproduction: a `%d` handed a string is reported under this
-    # spelling and silent under the other.
-    # noticeLine.writef is the second half of the same mechanism (a site that must decide before
-    # building its arguments takes the admission itself and writes through the line it gets back).
     # It is currently INFERRED — verified by reproduction: a %d handed a string is reported with no
     # funcs list at all — because it forwards format and args untouched on its common branch. It is
     # declared anyway, and this is the reason: the first version of it appended its tail to the
-    # format before the Fprintf, which is the assignment that makes findPrintfLike give up, and the
-    # only signal that every pre-gated diagnostic had silently stopped being checked would have been
+    # format before the Fprintf, which is the assignment that makes printf.findPrintfLike give up,
+    # and the only signal that every diagnostic had silently stopped being checked would have been
     # nobody noticing. A declaration costs one line and does not depend on the body's shape.
     #
-    # METHOD spelling, parenthesized, for the reason the note above gives for noticef's being
-    # unparenthesized: vet matches (*types.Func).FullName(), which parenthesizes a method's receiver
-    # and nothing else.
+    # METHOD spelling, PARENTHESIZED: vet matches this against (*types.Func).FullName(), which
+    # parenthesizes a method's receiver and nothing else. The `pkg.Func` spelling is for
+    # package-level functions, and getting the two the wrong way round matches nothing at all while
+    # the comment claims otherwise — which is how the wrapper this replaced went unchecked.
     govet:
       settings:
         printf:
           funcs:
-            - github.com/eunolabs/eunox/internal/transport.noticef
             - (github.com/eunolabs/eunox/internal/transport.noticeLine).writef
     gocritic:
       enabled-tags:

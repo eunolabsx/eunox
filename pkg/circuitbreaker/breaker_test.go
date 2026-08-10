@@ -1411,3 +1411,57 @@ func TestStateAndStatsShareProjection(t *testing.T) {
 		t.Fatalf("projected LastTransitionAt = %v, want %v", st.LastTransitionAt, want)
 	}
 }
+
+// TestStateImpeded pins the predicate a consumer would otherwise write for itself, which is why it
+// lives here: what the states MEAN belongs beside the state machine, and the one copy that lived in
+// a health endpoint read only StateOpen — going quiet through most of a sustained outage, and
+// testable only by standing up that endpoint's whole server.
+func TestStateImpeded(t *testing.T) {
+	for _, tc := range []struct {
+		state State
+		want  bool
+	}{
+		{StateClosed, false},
+		{StateOpen, true},
+		// Entered only from open, left for closed only after a probe SUCCEEDS, so it means
+		// "tripped, retry outstanding" rather than "recovered" — and a cooldown that merely lapsed
+		// with no traffic projects it indefinitely.
+		{StateHalfOpen, true},
+		// A Breaker not built through New carries the zero State; anything this build does not
+		// recognize must fail safe rather than read as closed.
+		{State(""), true},
+		{State("recovering"), true},
+	} {
+		if got := tc.state.Impeded(); got != tc.want {
+			t.Errorf("State(%q).Impeded() = %v, want %v", string(tc.state), got, tc.want)
+		}
+	}
+}
+
+// TestStateImpeded_TracksTheLiveStateMachine drives a real breaker through the states, so the
+// predicate is pinned against the machine rather than against a list of string constants that could
+// drift from it.
+func TestStateImpeded_TracksTheLiveStateMachine(t *testing.T) {
+	now := time.Unix(1000, 0)
+	b := New(Config{FailureThreshold: 1, CooldownDuration: 30 * time.Second, HalfOpenMaxProbes: 1},
+		WithClock(func() time.Time { return now }))
+	if b.State().Impeded() {
+		t.Fatal("a fresh breaker is closed and unimpeded")
+	}
+	b.recordFailure(b.halfOpenGen)
+	if !b.State().Impeded() {
+		t.Fatal("a tripped breaker is impeded")
+	}
+	now = now.Add(31 * time.Second)
+	if got := b.State(); got != StateHalfOpen || !got.Impeded() {
+		t.Fatalf("state = %q impeded = %v; a lapsed cooldown is a retry outstanding, not a recovery", got, got.Impeded())
+	}
+	admitted, p := b.allowProbe()
+	if !admitted {
+		t.Fatal("the half-open probe must be admitted")
+	}
+	p.success()
+	if b.State().Impeded() {
+		t.Fatal("a probe that succeeded closes the breaker; only then is the impediment over")
+	}
+}

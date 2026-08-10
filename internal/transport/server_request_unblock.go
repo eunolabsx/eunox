@@ -312,13 +312,17 @@ func nilSink(sink mcp.MsgSink) bool {
 // lowers the rate, it does not make the write non-blocking.
 func writeToInitiator(write func(mcp.RPCMsg) error, notices noticeWriter, reply mcp.RPCMsg, what string) bool {
 	if write == nil {
-		noticef(notices, siteInitiatorUnanswerable,
-			"[eunox] WARNING: a server-initiated request was left blocked: no upstream writer to answer it (%s)\n", what)
+		if line, ok := notices.admitNotice(siteInitiatorUnanswerable); ok {
+			line.writef(
+				"[eunox] WARNING: a server-initiated request was left blocked: no upstream writer to answer it (%s)\n", what)
+		}
 		return false
 	}
 	if err := write(reply); err != nil {
-		noticef(notices, siteInitiatorUnanswerable,
-			"[eunox] WARNING: a server-initiated request was left blocked: answering its initiator failed (%s): %v\n", what, err)
+		if line, ok := notices.admitNotice(siteInitiatorUnanswerable); ok {
+			line.writef(
+				"[eunox] WARNING: a server-initiated request was left blocked: answering its initiator failed (%s): %v\n", what, err)
+		}
 		return false
 	}
 	return true

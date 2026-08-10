@@ -34,8 +34,10 @@
 //     says a security obligation did not hold (see noticeClass);
 //   - by ROUTE, so one gateway tenant cannot silence another's (see newRouteNoticeLimiter),
 //     with the proxy-wide table as the aggregate parent holding the total where it was;
-//   - and, below the route, by a per-SESSION reserved FLOOR rather than a third tier of buckets —
-//     one guaranteed line per class per session (see noticeReserve).
+//   - and, below the route, by reserved FLOORS rather than a third tier of buckets — one guaranteed
+//     line per key per interval, on the holder axis (a session, so a sibling's flood cannot elide
+//     its first line) and on the site axis (so a class-mate's flood cannot elide the one line in a
+//     class that most needs to arrive). See noticeReserve.
 //
 // Every key on the first two axes holds a FULL per-key budget and the aggregate is derived by
 // multiplying up, which is the treatment the refusal RECORDS' categories already had — see the
@@ -53,7 +55,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 )
 
 // noticeSite names ONE diagnostic line (or one group of lines answering to the same
@@ -108,12 +109,13 @@ const (
 // `SECURITY: redaction failed` lines by erroring generically on every OTHER call, which is the
 // argument the split rests on, one level in.
 //
-// What that does NOT buy, stated because the first draft of this comment claimed it: an obligation
-// failure is not undrivable by a merely broken deployment. A flow store that is down fails every
-// approved declassification's commit, and a stale effect.ref pin makes every receipt inconsistent —
-// both at the request rate, both from a conforming peer. So a flood of this class is a finding
-// about the DEPLOYMENT rather than proof of an attack, and within the class one obligation's
-// failure can still elide another's. A fourth bucket would only move that line again.
+// What the class does NOT buy on its own: an obligation failure is not undrivable by a merely
+// broken deployment. A flow store that is down fails every approved declassification's commit, and a
+// stale effect.ref pin makes every receipt inconsistent — both at the request rate, both from a
+// conforming peer. So a flood of this class is a finding about the DEPLOYMENT rather than proof of
+// an attack, and it is why the line the class exists to keep legible holds a floor of its OWN
+// inside it (floorProtectedSites) rather than a fourth bucket, which would only move the same
+// argument one level finer.
 type noticeClass int
 
 const (
@@ -135,16 +137,7 @@ const (
 	// classFailure because reaching one takes a call CARRYING an obligation, which a generic transit
 	// error does not — see the type's doc for what that does and does not bound.
 	classObligation
-	// lastNoticeClass is the highest declared class, which noticeReserve packs into a bitmap. A
-	// name rather than a sentinel INSIDE the enum: a sentinel is a value label() and every range
-	// over classes must then answer for, for a fact only the reserve needs.
-	lastNoticeClass = classObligation
 )
-
-// The reserve is one bit per class in a uint32 (see noticeReserve). A class past bit 31 would shift
-// to zero there and hand out an unlimited reserve rather than a single line, so the width is a
-// compile-time assertion instead of an invariant to remember.
-const _ = uint(31 - lastNoticeClass)
 
 // noticeClasses is the set the bucket tables are keyed by, DERIVED from the declarations rather
 // than typed out beside them — the shape refusalCategories uses. A hand-typed list is two lists that
@@ -381,7 +374,7 @@ func newNoticeLimiter(tenants int) *noticeLimiter {
 	tenants = max(tenants, 1)
 	return &noticeLimiter{tieredBuckets: newTieredBuckets(
 		float64(perClassNoticeRatePerSec*tenants), float64(perClassNoticeBurst*tenants),
-		noticeClasses, nil, noticeScopeProxy)}
+		noticeClasses, nil, noticeScopeProxy, floorOwnBucket)}
 }
 
 // newRouteNoticeLimiter builds ONE gateway route's notice table, charging aggregate as its parent.
@@ -397,76 +390,148 @@ func newNoticeLimiter(tenants int) *noticeLimiter {
 // measured and rejected. aggregate may be nil (a route built by BuildRoutes for a proxy that never
 // stood), which bounds the route alone at the same rate.
 //
-// The route is the LAST tier with buckets. Below it a session gets a reserved floor instead, which
+// The route is the LAST tier with buckets. Below it a holder gets a reserved floor instead, which
 // is a decision rather than where the split stopped — see noticeReserve for the measurement it
-// rests on and the residual it leaves.
+// rests on and the residuals it leaves.
 func newRouteNoticeLimiter(aggregate *noticeLimiter) *noticeLimiter {
 	var parent *tieredBuckets[noticeClass]
 	if aggregate != nil {
 		parent = &aggregate.tieredBuckets
 	}
 	return &noticeLimiter{tieredBuckets: newTieredBuckets(
-		perClassNoticeRatePerSec, perClassNoticeBurst, noticeClasses, parent, noticeScopeRoute)}
+		perClassNoticeRatePerSec, perClassNoticeBurst, noticeClasses, parent, noticeScopeRoute,
+		floorOwnBucket)}
 }
 
-// noticeReserve is one SESSION's floor inside its route's class buckets: the first line of each
-// class this session cannot get through the route table is written anyway.
+// siteFloorDeclaration is whether ONE site holds a floor of its own inside its class, and — when it
+// does not — why it is the one that may be elided.
 //
-// A floor rather than a third tier of buckets, which is what the RECORD half does one axis over and
-// what would buy almost nothing here. Sized as the record half sizes it — a child bucket at the
-// parent's own rate — a flooding session is paced to exactly the rate the route bucket refills at,
-// so a sibling's line still arrives to find it empty; sized as a share instead, the per-session rate
-// floors to 1/s and a burst of 1 at any realistic maxSessions, worse for the single-session case
-// than not splitting at all. What a sibling needs from this tier is an ARRIVAL — an operator
-// learning that THIS session's upstream is also down needs the first line, not the hundredth.
+// The zero value is "undeclared", so a site added to a class that HAS a protected member fails the
+// table test rather than silently landing on the flooding side. That is the whole reason this is a
+// declaration rather than the bare list it started as: the list named the victim and asked nothing
+// of the class-mates, so the next obligation site would have shipped unprotected with no reader
+// having answered the question — the same shape refusalDeclarations and unmeteredNotices exist to
+// prevent one axis over.
+type siteFloorDeclaration struct {
+	protected bool
+	why       string
+}
+
+// siteFloors declares, for every site of a class one of whose members is protected, which side of
+// that protection it is on. A class with no protected member needs no entries: its sites contend
+// only with each other for the holder's one class reserve, which is the ordinary arrangement.
 //
-// Claimed only where the ROUTE's own bucket refused (see tieredBuckets.admitWithFloor for why a
-// refusal from the aggregate above is deliberately not floored), and only then, so a session whose
-// lines all fit under the route's budget keeps its reserve for the incident that eventually needs
-// it.
+// classObligation is the only such class today, and the argument is its own stated residual. Two of
+// its three sites are drivable at the request rate by a CONFORMING peer against a merely broken
+// deployment — a flow store that is down fails every approved declassification's commit, and a
+// stale effect.ref pin makes every receipt inconsistent — so the class bucket can be held empty
+// with no adversary involved, and what that reduces to a count on somebody else's line is
+// `SECURITY: redaction failed`, the line the class was split out to keep legible.
 //
-// The bound is one line per class per session, and it is the argument exemptCostsASession already
-// makes for the session-lifecycle lines: driving a reserve costs OPENING a session, and a session
-// costs an upstream spawn or handshake — orders of magnitude more than the line it buys, and a cost
-// the same peer already pays for the several unbounded lines those exemptions permit. Stated
-// precisely, since two weaker versions of it are wrong: the bound is per session CREATED, not per
-// concurrent session (a peer churning sessions re-arms it each time), and maxSessions does not cap
-// it at all under `maxSessions: 0`, which is a supported "unlimited" setting.
+// A FOURTH class was the alternative and is rejected because it recurses: it is the same argument
+// one level finer, and the next reader asks what elides the declassify-commit line. A floor answers
+// the question actually being asked, which is arrival rather than rate, and without another budget:
+// the flooding sites keep sharing their holder's class reserve, so the flood spends that one and
+// leaves the protected site's untouched.
+var siteFloors = map[noticeSite]siteFloorDeclaration{
+	siteRedactionFault: {protected: true},
+	// The two that CAN be the flood. Each is a report that a backend the operator runs is broken,
+	// and a flood of either is itself the finding — which is what makes them the right side to be
+	// elided from, and why the answer is not a fourth budget.
+	siteDeclassifyCommit:    {why: "a downed flow store drives it per frame, so it is the flood the protection is against rather than its victim; the first of them still arrives on the holder's class reserve"},
+	siteReceiptInconsistent: {why: "a stale effect.ref pin drives it per frame, same as the commit line beside it, and a flood of either is a finding about the deployment"},
+}
+
+// floorProtectedSites is the protected subset, DERIVED from the declarations rather than listed
+// beside them, so a site cannot be declared protected and reserve nothing. Sorted for a
+// deterministic reserve.
+var floorProtectedSites = protectedNoticeSites()
+
+func protectedNoticeSites() []noticeSite {
+	out := make([]noticeSite, 0, len(siteFloors))
+	for site, decl := range siteFloors {
+		if decl.protected {
+			out = append(out, site)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// noticeReserve is a leg's diagnostic floors: one guaranteed line per key per reserveInterval,
+// delivered when the tier that would have carried it has nothing left.
 //
-// Two residuals, both where they are spent: the reserve never refills, so a session's guaranteed
-// `upstream error` arrival can be spent hours earlier by any other line of that class; and after it
-// is spent, a session with a dead upstream and a quiet sibling share the route's tokens first-come.
+// TWO key spaces, and they answer different questions — the shape meteredNotices/unmeteredNotices
+// already uses for the same reason, rather than one map whose key means whichever the value beside
+// it implies:
 //
-// The zero value is an unspent reserve, and a nil *noticeReserve is none at all — what a leg with no
-// session in hand gets, since a refusal taken before a session exists is attributable to no session.
+//   - byClass is the HOLDER axis. A session shares its route's class buckets with every other
+//     session on that route, so one session's dead upstream held the failure bucket empty and elided
+//     a sibling's first `upstream error` line — the elision the route split closed one tier up. Only
+//     a holder among peers reserves here: a whole stdio proxy is one holder with no sibling to be
+//     starved by, and a pre-session HTTP leg is attributable to no holder at all (it carries no
+//     reserve whatsoever, on either axis).
+//   - bySite is the SITE axis (see floorProtectedSites). Not about holders at all — it is about
+//     which line a CLASS-MATE's flood must not elide — so it applies wherever such a line is
+//     written, on either transport.
+//
+// A third tier of BUCKETS was the alternative on the holder axis and is rejected on measured
+// grounds: sized like the record half's per-session tables (a child bucket at its parent's own
+// rate) a flooding session is paced to exactly the rate the route bucket refills at, so a sibling's
+// line still arrives to find it empty; sized as a share instead, the per-session rate floors to 1/s
+// and a burst of 1 at any realistic maxSessions, worse for the single-session case than not
+// splitting at all. What a sibling needs from this tier is an ARRIVAL — an operator learning that
+// THIS session's upstream is also down needs the first line, not the hundredth.
+//
+// What the floor costs is bounded twice over: it re-arms per reserveInterval rather than
+// per lifetime (see that constant for the arithmetic), and a floored line DEBITS the bucket that
+// refused it, so it displaces the flooder's next line rather than adding to the process-wide total
+// (see tieredBuckets.admitWithFloor and recordRateLimiter.borrow). The residual is stated there:
+// past a burst of debt the debit stops, so a flood driven by enough holders at once exceeds the
+// tier's configured rate by holders x keys per interval.
+//
+// A nil *noticeReserve is no floors at all, which is what a leg with neither a session nor a
+// site-protected line to write gets.
 type noticeReserve struct {
-	// taken is one bit per noticeClass. A bitmap rather than a map so a session that never writes
-	// a diagnostic allocates nothing, and atomic because sessions write from the request goroutine
-	// and their own upstream reader concurrently.
-	taken atomic.Uint32
+	byClass *keyReserve[noticeClass]
+	bySite  *keyReserve[noticeSite]
 }
 
-// take claims this session's reserved line for class, reporting whether it was still unspent.
+// newNoticeReserve builds a leg's floors. classes is what the leg reserves on the HOLDER axis —
+// noticeClasses for a session, nil for a leg that is not a holder among peers (a whole stdio proxy
+// has no sibling to be starved by) — while the site axis is unconditional, being about which line a
+// class-mate's flood must not elide rather than about holders.
 //
-// The class RANGE check is not defensive: classUnclassified is the value an undeclared site resolves
-// to, and the answer for a site nobody has classified is the floor-rate fallback bucket and nothing
-// else — a reserve for it would hand exactly that site a per-session line outside every bucket.
-// Out-of-range is refused for a harder reason: a shift past the bitmap width is 0 in Go, so `Or(0)`
-// would report an unspent reserve forever and floor every line of that class.
+// One constructor taking the axis that varies, rather than a named pair differing by one field: the
+// pair made a reader open both to learn which, and a third leg kind needed a third name.
+func newNoticeReserve(classes []noticeClass) *noticeReserve {
+	r := &noticeReserve{bySite: newKeyReserve(floorProtectedSites)}
+	if len(classes) > 0 {
+		r.byClass = newKeyReserve(classes)
+	}
+	return r
+}
+
+// forSite is the floor a line from site (of class) may fall back on: its own where it has one,
+// this holder's class floor otherwise, and nil for neither.
 //
-// The Load ahead of the Or is the flood path's own: after the first refused line of a class the bit
-// is set for the session's life, and every later refused frame would otherwise run a locked
-// read-modify-write over a cache line the request goroutine and the upstream reader share (~10ns
-// against ~1ns, measured by BenchmarkNoticeReserve_Take).
-func (r *noticeReserve) take(class noticeClass) bool {
-	if r == nil || class <= classUnclassified || class > lastNoticeClass {
-		return false
+// The site slot WINS rather than composing with the class slot. Falling back to the class floor
+// after a site floor is spent would hand the protected site two arrivals per interval and the
+// others none, which is not the property being bought: the site floor exists so a class-mate's
+// flood cannot elide this line, and the class floor because a peer holder's flood cannot.
+func (r *noticeReserve) forSite(site noticeSite, class noticeClass) *reserveSlot {
+	if r == nil {
+		return nil
 	}
-	bit := uint32(1) << uint(class)
-	if r.taken.Load()&bit != 0 {
-		return false
+	if slot := r.bySite.forKey(site); slot != nil {
+		return slot
 	}
-	return r.taken.Or(bit)&bit == 0
+	// classUnclassified is deliberately unreserved: an undeclared site charges the floor-rate
+	// fallback bucket and nothing else, and a reserve for it would hand exactly that site a line
+	// outside every bucket. newKeyReserve builds slots for the declared classes alone, so this
+	// resolves to nil for it structurally rather than by a range check that must be kept in
+	// agreement with the enum.
+	return r.byClass.forKey(class)
 }
 
 // noticeWriter is a leg's diagnostic CHANNEL: where a line goes, what bounds it, and what floor it
@@ -482,8 +547,8 @@ func (r *noticeReserve) take(class noticeClass) bool {
 type noticeWriter struct {
 	out    io.Writer
 	limits *noticeLimiter
-	// reserve is the per-SESSION floor under limits, nil on a leg with no session (see
-	// noticeReserve). Nil is the common case: only an established HTTP session has one.
+	// reserve is this leg's floors under limits — its holder's per class, and the protected
+	// sites' own (see noticeReserve). Nil on a leg that is neither.
 	reserve *noticeReserve
 }
 
@@ -547,7 +612,7 @@ func noticeTail(v bucketVerdict, class noticeClass) string {
 	var b strings.Builder
 	b.WriteString(" (")
 	if v.reserved {
-		b.WriteString("session-reserved: this ")
+		b.WriteString("reserved: this ")
 		b.WriteString(v.scope)
 		b.WriteString("'s ")
 		b.WriteString(class.label())
@@ -570,20 +635,29 @@ func noticeTail(v bucketVerdict, class noticeClass) string {
 }
 
 // admitNotice charges site's bucket and returns the line to write, or false when this one is
-// elided. It is the ONE entry point that resolves a site's declaration — noticef is a call to it,
-// and so is a site that wants to decide BEFORE building its arguments.
+// elided. It is the ONE entry point every metered diagnostic goes through, and the admission is
+// taken BEFORE the caller builds its arguments.
 //
-// That escape hatch is the whole reason this is separate from noticef rather than folded into it:
-// on the flood path the bucket exists for, every argument the caller built is thrown away. Six sites
-// build a line per frame from arguments that cost a UTF-8 walk, a join, or simply the variadic
-// boxing every one of them pays; they call this first and build nothing when it says no. Measured on
-// the suppressed path of a SESSION channel, floor included, which is the shape that ships
+// That ordering is the whole shape, and it is now uniform rather than applied per site by judgment.
+// On the flood path the bucket exists for, every argument the caller built is thrown away — a UTF-8
+// walk, a join, or simply the variadic boxing every one of them pays. Measured on the suppressed
+// path of a SESSION channel, floor included, which is the shape that ships
 // (BenchmarkNotice_SuppressedPath): the admission is ~110ns and allocation-free, while building and
-// boxing the arguments for a line then discarded costs ~120ns more and two heap allocations — the
-// boxing is most of it, which is why the escape hatch is at the CALL SITE and not a lazier signature
-// here. The declaration lookup is ~13ns of the admission, which is why it stays a map probe rather
-// than an integer site indexing a dense array: it is not the part that dominates, and the constants'
-// readable values are what the call-site walk resolves and what its failures name.
+// boxing the arguments for a line then discarded costs ~110ns more and two heap allocations. The
+// boxing is most of it, which is why this is a CALL-SITE ordering and no lazier signature here would
+// remove it — and why the alternative, a convenience wrapper taking the format eagerly, is gone
+// rather than kept for the sites whose arguments happen to be cheap: judged per site it left eight
+// of fourteen paying for lines they discard, several of them per-frame drivable, and every one of
+// them a fresh judgment for the next reader to re-derive.
+//
+// Where that ~110ns goes, since two of the three parts are decisions rather than givens: the
+// declaration lookup is ~11ns, the floor resolution two map probes at ~9ns, and an already-spent
+// slot's claim ~13ns (BenchmarkNoticeReserve_Claim). The lookup stays a map probe rather than an
+// integer site indexing a dense array because it is not the part that dominates, and the constants'
+// readable values are what the call-site walk resolves and what its failures name. None of the
+// three reads a clock: the admission's own sample is handed to the floor, which is what keeps a
+// refused frame — the path this whole budget exists for — off a vDSO call it would otherwise pay
+// per frame per session.
 //
 // It returns a LINE rather than a bool. A bool is a peek the mechanism never hears about again, so
 // a site pre-gating on one would either write its line through a second admission (spending two
@@ -602,21 +676,11 @@ func (n noticeWriter) admitNotice(site noticeSite) (noticeLine, bool) {
 	}
 	// A site with no declaration resolves to classUnclassified and charges the floor-rate fallback:
 	// the zero value means nobody has answered the question, and the safe answer to that is the
-	// bounded one. noticeReserve.take refuses that class for the same reason.
+	// bounded one. noticeReserve reserves no floor for that class for the same reason.
 	class := meteredNotices[site]
-	verdict := n.limits.admitWithFloor(class, n.reserve)
+	verdict := n.limits.admitWithFloor(class, n.reserve.forSite(site, class))
 	if !verdict.ok {
 		return noticeLine{}, false
 	}
 	return noticeLine{out: n.errOut(), tail: noticeTail(verdict, class)}, true
-}
-
-// noticef writes one bounded diagnostic line for site, for the sites whose arguments are cheap
-// enough not to bother gating. The rollup is applied by the admission rather than returned for a
-// caller to append, for the reason admitRefusalRecord hides its own: a site that spends a token and
-// forgets the count silently under-states a flood, and nothing fails.
-func noticef(n noticeWriter, site noticeSite, format string, args ...interface{}) {
-	if line, ok := n.admitNotice(site); ok {
-		line.writef(format, args...)
-	}
 }
