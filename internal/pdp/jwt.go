@@ -373,7 +373,9 @@ func NewJWTPDPWithCache(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP
 }
 
 // Cache returns the JWKS cache this validator owns, so a gateway can build
-// per-route wrappers (NewJWTPDPWithCache) that share one key-fetching cache.
+// per-route wrappers (NewJWTPDPWithCache) that share one key-fetching cache — and so a
+// health endpoint can read that one cache's key-fetch state (BreakerStats) knowing every
+// route answers from it.
 func (p *JWTPDP) Cache() *capability.JWKSCache {
 	return p.cache
 }

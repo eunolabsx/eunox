@@ -11,6 +11,8 @@ package transport
 import (
 	"fmt"
 	"net/http"
+
+	"github.com/eunolabs/eunox/pkg/circuitbreaker"
 )
 
 // healthReporter is the readiness question asked of a kill-switch backend with no request in
@@ -38,6 +40,14 @@ type healthSnapshot struct {
 	// gate traffic) — the size/retention bound is just unenforced until the fault is fixed.
 	AuditMaintenanceStalled bool   `json:"auditMaintenanceStalled"`
 	AuditMaintenanceReason  string `json:"auditMaintenanceReason,omitempty"`
+	// JWKSFetchState is the state of the circuit breaker guarding IdP key fetches:
+	// "closed" | "half-open" | "open". Empty means no JWT layer is configured, which is the
+	// one thing a value could not say — "closed" on a proxy that fetches no keys would read
+	// as healthy key fetching rather than as none. The two counters travel with it and are
+	// omitted for the same reason.
+	JWKSFetchState     string `json:"jwksFetchState,omitempty"`
+	JWKSFetchFailures  int64  `json:"jwksFetchFailures,omitempty"`
+	JWKSFetchSuccesses int64  `json:"jwksFetchSuccesses,omitempty"`
 }
 
 // snapshot gathers the current operational state (locked map reads plus atomic
@@ -62,6 +72,23 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 	if hr, ok := p.ks.(healthReporter); ok && hr.HealthStatus() != nil {
 		snap.KillSwitchHealthy = false
 		snap.Status = "degraded"
+	}
+	// Asked of the shared validator rather than per route: WrapRoutesWithJWT gives every
+	// route wrapper this one validator's cache, so the routes share a single breaker.
+	if p.jwtPDP != nil {
+		if st, ok := p.jwtPDP.Cache().BreakerStats(); ok {
+			snap.JWKSFetchState = string(st.State)
+			snap.JWKSFetchFailures = st.TotalFailures
+			snap.JWKSFetchSuccesses = st.TotalSuccesses
+			// Only OPEN is degraded. Open means refreshes are being refused, so an
+			// unknown-kid token fails closed now and every token does once the cached set
+			// passes its TTL — token validation is down with nothing else to see it by. A
+			// projected half-open admits the next fetch, so it is a recovering state, not a
+			// refusing one; the failure counter is what shows it flapping.
+			if st.State == circuitbreaker.StateOpen {
+				snap.Status = "degraded"
+			}
+		}
 	}
 	// Audit-integrity loss also flips status to "degraded": no sink, dropped records, or
 	// failed writes each mean the tamper-evident audit trail is incomplete.
@@ -141,4 +168,22 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	wf("# HELP eunox_audit_maintenance_stalled Audit rotation or retention pruning is not making progress (1 = stalled). No records are lost, but the configured size/retention bound is unenforced and the log will grow until the fault is fixed.\n")
 	wf("# TYPE eunox_audit_maintenance_stalled gauge\n")
 	wf("eunox_audit_maintenance_stalled %d\n", maintStalled)
+	// The whole block is absent without a JWT layer rather than emitted as zeros: a
+	// permanently-0 breaker gauge on a proxy that fetches no keys is indistinguishable from
+	// healthy key fetching, and an absent series is what a scraper already knows how to read.
+	if snap.JWKSFetchState != "" {
+		jwksOpen := 0
+		if snap.JWKSFetchState == string(circuitbreaker.StateOpen) {
+			jwksOpen = 1
+		}
+		wf("# HELP eunox_jwks_breaker_open IdP key-fetch circuit breaker is open (1 = open): JWKS refreshes are refused, so a token whose kid the cached key set does not carry fails closed now and every token fails once that set passes its TTL.\n")
+		wf("# TYPE eunox_jwks_breaker_open gauge\n")
+		wf("eunox_jwks_breaker_open %d\n", jwksOpen)
+		wf("# HELP eunox_jwks_fetch_failures_total JWKS fetches that failed, as counted by the circuit breaker. Rising against a closed breaker is a flapping IdP endpoint.\n")
+		wf("# TYPE eunox_jwks_fetch_failures_total counter\n")
+		wf("eunox_jwks_fetch_failures_total %d\n", snap.JWKSFetchFailures)
+		wf("# HELP eunox_jwks_fetch_successes_total JWKS fetches that succeeded, as counted by the circuit breaker.\n")
+		wf("# TYPE eunox_jwks_fetch_successes_total counter\n")
+		wf("eunox_jwks_fetch_successes_total %d\n", snap.JWKSFetchSuccesses)
+	}
 }

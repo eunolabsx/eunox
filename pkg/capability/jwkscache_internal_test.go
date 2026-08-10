@@ -1153,3 +1153,67 @@ func TestJWKSCache_SlowBackgroundRefreshDoesNotClobberForcedRotation(t *testing.
 	require.Equal(t, "kB", keys.Keys[0].KeyID,
 		"the newer forced rotation (set B) must survive; the slower background fetch (set A) must not clobber it")
 }
+
+// TestJWKSCacheBreakerStats pins the observability seam an operator health endpoint reads:
+// a cache with no breaker has nothing to report, a configured one reports its live state and
+// counters, and reading it neither mutates the breaker nor consumes a half-open probe.
+func TestJWKSCacheBreakerStats(t *testing.T) {
+	t.Run("no breaker configured reports nothing", func(t *testing.T) {
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: "https://idp.example/jwks", CacheTTL: time.Hour})
+		st, ok := cache.BreakerStats()
+		require.False(t, ok, "a cache fetching without a breaker has no state to report")
+		require.Equal(t, circuitbreaker.Stats{}, st)
+	})
+
+	t.Run("nil cache reports nothing rather than panicking", func(t *testing.T) {
+		var cache *JWKSCache
+		_, ok := cache.BreakerStats()
+		require.False(t, ok)
+	})
+
+	t.Run("reports the live state and fetch counters", func(t *testing.T) {
+		var fail atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if fail.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write(jwksJSONWithNKeys(t, 1))
+		}))
+		defer srv.Close()
+		// Threshold 1 trips on the first failed fetch; the long cooldown keeps it OPEN
+		// rather than projecting half-open the instant the cooldown lapses.
+		br := circuitbreaker.New(circuitbreaker.Config{
+			FailureThreshold:  1,
+			CooldownDuration:  time.Hour,
+			HalfOpenMaxProbes: 1,
+		})
+		cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: srv.URL, Client: srv.Client(), CacheTTL: time.Hour, Breaker: br})
+
+		// Forced refreshes rather than GetKeys: the counters move only on a real fetch, and
+		// a TTL-fresh GetKeys serves the cache without reaching the breaker at all.
+		_, _, err := cache.refresh(context.Background(), true)
+		require.NoError(t, err)
+		st, ok := cache.BreakerStats()
+		require.True(t, ok)
+		require.Equal(t, circuitbreaker.StateClosed, st.State)
+		require.EqualValues(t, 1, st.TotalSuccesses)
+		require.EqualValues(t, 0, st.TotalFailures)
+
+		fail.Store(true)
+		_, _, err = cache.refresh(context.Background(), true)
+		require.Error(t, err)
+		st, ok = cache.BreakerStats()
+		require.True(t, ok)
+		require.Equal(t, circuitbreaker.StateOpen, st.State,
+			"a failed fetch at threshold 1 must leave the breaker open, which is what the health endpoint reports as degraded")
+		require.EqualValues(t, 1, st.TotalFailures)
+
+		// Reading again must not admit a probe or otherwise advance the breaker: an
+		// operator polling /healthz cannot be allowed to consume the half-open budget a
+		// real verification needs.
+		again, ok := cache.BreakerStats()
+		require.True(t, ok)
+		require.Equal(t, st, again)
+	})
+}

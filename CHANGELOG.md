@@ -305,6 +305,20 @@ Section conventions:
   an incident reconstruction had no signed evidence of when the stop was tripped
   or that it was authorized. Written only after the kill takes effect; the control
   token is never recorded. See `docs/threat-model-mcp.md` §3.7.
+- **A JWKS outage is now visible on the operational endpoints.** The circuit breaker
+  guarding IdP key fetches is reported as `jwksFetchState` on `/healthz` (`closed` /
+  `half-open` / `open`) and as `eunox_jwks_breaker_open` plus
+  `eunox_jwks_fetch_failures_total` / `eunox_jwks_fetch_successes_total` on `/metrics`.
+  An **open** breaker also flips `/healthz` `status` to `degraded`: open means refreshes
+  are refused, so a token whose `kid` the cached key set does not carry fails closed at
+  once and every token does once that set passes its TTL — token validation down, with
+  the only prior signal being one `jwks_unavailable` audit record per rejected token.
+  A half-open breaker admits the next fetch and is reported without degrading; reading
+  either state projects it without consuming the half-open probe budget a real
+  validation needs. All of it is absent — no field, no series — when no JWT layer is
+  configured, since a permanently-healthy zero on a proxy that fetches no keys is
+  indistinguishable from healthy key fetching. Backed by
+  `capability.(*JWKSCache).BreakerStats`. See `docs/threat-model-mcp.md` §5.2.
 - `capability.MatchOperation`, plus `Compile`/`AllowsOperation`/`MatchExtensions`/
   `TableLookup`/`MatchDomains` on the `allowedOperations`, `allowedExtensions`,
   `allowedTables`, and `recipientDomain` conditions. `Compile` normalizes a condition's

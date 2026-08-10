@@ -250,9 +250,9 @@ func TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory(t *testing.T) {
 	assert.Equal(t, perCategoryDenyRate, lim.bucket(catDisplaced).ratePerSec)
 }
 
-// TestInitiatorWriter_AnswersTheConcreteWriterByName pins the half of issue 335's nil-writer note
-// that is safe to act on: the sink both transports hold is resolved by NAME, above the reflection,
-// so the relay path — every answered initiator — no longer reaches reflect at all.
+// TestInitiatorWriter_AnswersTheConcreteWriterByName pins the half of the nil-writer question that
+// is safe to answer statically: the sink both transports hold is resolved by NAME, above the
+// reflection, so the relay path — every answered initiator — no longer reaches reflect at all.
 func TestInitiatorWriter_AnswersTheConcreteWriterByName(t *testing.T) {
 	t.Parallel()
 	assert.NotNil(t, initiatorWriter(mcp.NewMsgWriter(io.Discard)))

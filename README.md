@@ -402,8 +402,8 @@ boundary.
 beside `/control/kill` (same on-host-only guard — never reachable off the box):
 
 ```bash
-curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, ...}
-curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, …
+curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, jwksFetchState, ...}
+curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, eunox_jwks_breaker_open, …
 ```
 
 `eunox_audit_dropped_records_total` and `eunox_audit_write_failures_total` are the
@@ -430,6 +430,19 @@ currently unenforced and the log will grow until the underlying fault is fixed �
 at which point the volume fills, writes *do* start failing, and strict mode
 denies everything. Alert on it as a disk-capacity warning, not an
 audit-integrity one.
+
+`jwksFetchState` / `eunox_jwks_breaker_open` is the JWT layer's signal, present
+only when `--jwks-uri` is configured (a proxy that fetches no keys emits neither,
+rather than a permanently-healthy zero). It reports the circuit breaker guarding
+IdP key fetches: `closed`, `half-open`, or `open`. **Open** also flips `status`
+to `degraded` — refreshes are being refused, so a token whose `kid` the cached
+key set does not carry is rejected right now, and *every* token is rejected once
+that set passes its TTL. Page on it: the alternative signal is one
+`jwks_unavailable` audit record per rejected token, which needs traffic to arrive
+and the tape to be read. `half-open` means the cooldown elapsed and the next
+fetch is admitted — recovering, not refusing, so it is reported without
+degrading. `eunox_jwks_fetch_failures_total` rising while the breaker is still
+closed is a flapping IdP endpoint, worth a warning before it trips.
 
 Rotation and retention stall **independently** — one can be wedged while the
 other runs normally — so `auditMaintenanceReason` on `/healthz` reports each
