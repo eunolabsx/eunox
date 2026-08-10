@@ -33,6 +33,22 @@ const (
 	StateHalfOpen State = "half-open"
 )
 
+// Impeded reports whether a breaker in this state is refusing calls, or has tripped and not
+// yet proved recovery. Anything but [StateClosed] counts, including a state this build does
+// not recognize.
+//
+// Half-open is NOT a recovering state: it is entered only from open and closes only once a
+// probe SUCCEEDS, so it means "tripped, retry outstanding" — and at the common
+// HalfOpenMaxProbes of 1 a probe in flight refuses every other call exactly as open does,
+// while a cooldown that merely lapsed with no traffic projects half-open indefinitely.
+// Reading only [StateOpen] therefore goes quiet for most of a sustained outage.
+//
+// It lives beside the state machine rather than in each consumer's health endpoint because
+// what the states MEAN is this package's to define: a consumer encoding the predicate itself
+// got exactly the half-open case wrong, and could only fix and test it by standing up its own
+// server.
+func (s State) Impeded() bool { return s != StateClosed }
+
 // ErrOpen is returned when a request is rejected because the circuit is open.
 var ErrOpen = errors.New("circuit breaker is open")
 

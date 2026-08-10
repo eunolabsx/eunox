@@ -75,10 +75,12 @@ type httpSession struct {
 	// session (as tests build), which records unbounded rather than panicking.
 	upstreamDenies *categoryRecordLimiter
 
-	// noticeFloor is this session's reserved diagnostic line per notice class — the notice half's
-	// answer to the question upstreamDenies answers for records, deliberately a floor rather than
-	// buckets. See noticeReserve for that decision; zero value ready.
-	noticeFloor noticeReserve
+	// noticeFloor is this session's diagnostic floors — one reserved line per notice class, and
+	// one for each site protected against its own class-mates. The notice half's answer to the
+	// question upstreamDenies answers for records, deliberately floors rather than buckets. See
+	// noticeReserve for that decision. nil on a bare-struct-literal session (as tests build),
+	// which simply has no floor.
+	noticeFloor *noticeReserve
 
 	upstreamCaps          map[string]interface{}
 	upstreamServerVersion string // version from the upstream initialize serverInfo response
@@ -433,6 +435,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		byUpstreamID:   make(map[string]chan upstreamResult),
 		hostToUp:       make(map[string]*json.RawMessage),
 		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, upstreamRefusalCategories),
+		noticeFloor:    newSessionNoticeReserve(),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,

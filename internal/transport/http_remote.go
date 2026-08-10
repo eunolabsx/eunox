@@ -202,6 +202,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		// are unreachable here and their buckets would bound nothing. See
 		// remoteUpstreamRefusalCategories for what is kept and on what grounds.
 		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, remoteUpstreamRefusalCategories),
+		noticeFloor:    newSessionNoticeReserve(),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		sessCtx:        sessCtx,

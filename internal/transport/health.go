@@ -16,12 +16,25 @@ import (
 	"github.com/eunolabs/eunox/pkg/circuitbreaker"
 )
 
-// healthReporter is the readiness question asked of a kill-switch backend with no request in
-// hand. Every killswitch.Manager answers it (in-memory always nil: an in-process kill set is
-// always confirmable), but the proxy holds killActivator — narrow to keep the kill's UNDO path
-// shut — which carries no reader at all, so the assertion stays. A value satisfying that
-// interface without HealthStatus is reported healthy, which is why the one the binary wires is
-// a full Manager.
+// healthReporter is the readiness question asked of a degradable subsystem with no request in
+// hand: nil while it is operating normally, the cause otherwise.
+//
+// It is the RULE, not one subsystem's precedent. Every degradable subsystem answers the verdict
+// through this seam, from the package that owns its state machine, and the transport only folds
+// verdicts and renders whatever DETAIL that subsystem hands over separately (jwksHealth is one).
+// Splitting verdict from detail is what lets one seam serve subsystems whose details have
+// nothing in common: an `error` has no room for a breaker state plus two counters, and the
+// alternative — reaching through concrete types for one subsystem while asserting an interface
+// for the next — is two precedents eight lines apart that a third subsystem would pick between
+// arbitrarily. The degradation PREDICATE never lives here either: a transport encoding "which
+// breaker states are impeded" got the half-open case wrong and could only be fixed and tested by
+// standing up an HTTPProxy.
+//
+// Every killswitch.Manager answers it (in-memory always nil: an in-process kill set is always
+// confirmable), but the proxy holds killActivator — narrow to keep the kill's UNDO path shut —
+// which carries no reader at all, so that one arrives through a type assertion. A value
+// satisfying killActivator without HealthStatus is reported healthy, which is why the one the
+// binary wires is a full Manager.
 type healthReporter interface {
 	HealthStatus() error
 }
@@ -48,31 +61,61 @@ type healthSnapshot struct {
 	JWKS *jwksHealth `json:"jwks,omitempty"`
 }
 
-// jwksHealth is the JWT layer's key-fetch state, as reported by the circuit breaker guarding
-// IdP fetches. Its fields carry no omitempty: within the block a zero is a measurement.
+// jwksHealth is the JWT layer's key-fetch state: the circuit breaker guarding IdP fetches, and
+// whether the cached key set can still serve. Its fields carry no omitempty: within the block a
+// zero is a measurement.
+//
+// Two booleans rather than one because they answer different questions and an operator alerts
+// on them differently. KeysServable false with an impeded breaker is a READINESS regression —
+// every token now fails closed — while an impeded breaker over a servable set is an ALERT with
+// no rejections behind it yet: key rotation is blocked and a token carrying a `kid` the cached
+// set does not hold fails closed at once, but everything else validates.
 type jwksHealth struct {
 	BreakerState   circuitbreaker.State `json:"breakerState"`
 	FetchFailures  int64                `json:"fetchFailures"`
 	FetchSuccesses int64                `json:"fetchSuccesses"`
+	// KeysServable: a fetched key set is installed and still inside its TTL.
+	KeysServable bool `json:"keysServable"`
+	// Healthy: this layer can still validate tokens. False is what flips the summary, and it is
+	// the verdict pkg/capability reached, never one recomputed from the two fields above.
+	Healthy bool `json:"healthy"`
 }
 
-// keyFetchImpeded reports whether the breaker is refusing, or has tripped and not yet proved
-// recovery. Anything but closed counts, including a state this build does not recognize.
+// keyFetchImpeded reports whether key REFRESHES are being refused, which is the alert signal
+// eunox_jwks_fetch_healthy carries — not the readiness verdict, which is Healthy.
 //
-// Half-open is NOT a recovering state: it is entered only from open and closes only once a
-// probe SUCCEEDS, so it means "tripped, retry outstanding" — and at the shipped
-// HalfOpenMaxProbes=1 a probe in flight refuses every other fetch exactly as open does, while
-// a cooldown that merely lapsed with no traffic reports half-open forever. Reading only
-// StateOpen therefore went quiet for most of a sustained outage.
+// The predicate is circuitbreaker's own: what its states mean belongs beside the state machine,
+// and a copy here read only StateOpen and so went quiet through most of a sustained outage.
 func (j *jwksHealth) keyFetchImpeded() bool {
-	return j != nil && j.BreakerState != circuitbreaker.StateClosed
+	return j != nil && j.BreakerState.Impeded()
 }
+
+// fold applies one subsystem's verdict to the snapshot: healthy is its own field (a scraper
+// reads the field, not the aggregate) and a non-nil verdict also flips the summary.
+//
+// A pointer to the field rather than a returned bool, so a subsystem cannot be folded into the
+// summary while its own field silently stays true — the discrepancy nothing downstream could
+// detect.
+func (s *healthSnapshot) fold(h healthReporter, healthy *bool) {
+	if h == nil || h.HealthStatus() == nil {
+		return
+	}
+	*healthy = false
+	s.Status = statusDegraded
+}
+
+// The two values the summary takes. Named because handleHealth designates it the READINESS
+// signal, so an operator wires a probe to it and every write of the string is load-bearing.
+const (
+	statusOK       = "ok"
+	statusDegraded = "degraded"
+)
 
 // snapshot gathers the current operational state (locked map reads plus atomic
 // counter loads).
 func (p *HTTPProxy) snapshot() healthSnapshot {
 	snap := healthSnapshot{
-		Status:            "ok",
+		Status:            statusOK,
 		Sessions:          p.sessionCount(),
 		MaxSessions:       p.maxSessions,
 		Routes:            len(p.routes),
@@ -87,36 +130,40 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 	// A degraded kill switch (e.g. a Redis partition) flips status to "degraded". The
 	// operational consequence depends on the configured degraded mode (fail-closed by
 	// default, fail-open opt-in) — either way it's not operating normally.
-	if hr, ok := p.ks.(healthReporter); ok && hr.HealthStatus() != nil {
-		snap.KillSwitchHealthy = false
-		snap.Status = "degraded"
+	if hr, ok := p.ks.(healthReporter); ok {
+		snap.fold(hr, &snap.KillSwitchHealthy)
 	}
 	// Asked of the shared validator rather than per route: WrapRoutesWithJWT gives every
 	// route wrapper this one validator's cache, so the routes share a single breaker.
+	//
+	// The verdict comes back through the same seam the kill switch answers, and it degrades on
+	// IMPACT rather than on the breaker tripping: the breaker's cooldown is tens of seconds
+	// against a five-minute default key TTL, so degrading on the trip alone reports a fleet-wide
+	// readiness regression — every replica shares the IdP and trips in the same window — through
+	// a window in which every token still validates. The impediment itself is still reported, in
+	// the block below and as eunox_jwks_fetch_healthy, since it blocks rotation and fails an
+	// unknown-kid token now.
 	if p.jwtPDP != nil {
-		if st, ok := p.jwtPDP.Cache().BreakerStats(); ok {
+		if h, ok := p.jwtPDP.KeyFetchHealth(); ok {
 			snap.JWKS = &jwksHealth{
-				BreakerState:   st.State,
-				FetchFailures:  st.TotalFailures,
-				FetchSuccesses: st.TotalSuccesses,
+				BreakerState:   h.Breaker.State,
+				FetchFailures:  h.Breaker.TotalFailures,
+				FetchSuccesses: h.Breaker.TotalSuccesses,
+				KeysServable:   h.KeysServable,
+				Healthy:        true,
 			}
+			snap.fold(p.jwtPDP, &snap.JWKS.Healthy)
 		}
-	}
-	// An impeded breaker means key refreshes are being refused: an unknown-kid token fails
-	// closed now and every token does once the cached set passes its TTL. Degraded here means
-	// what it means for the kill switch — not operating normally — not "already rejecting".
-	if snap.JWKS.keyFetchImpeded() {
-		snap.Status = "degraded"
 	}
 	// Audit-integrity loss also flips status to "degraded": no sink, dropped records, or
 	// failed writes each mean the tamper-evident audit trail is incomplete.
 	if !snap.AuditConfigured || snap.AuditDropped > 0 || snap.AuditWriteFailed > 0 {
-		snap.Status = "degraded"
+		snap.Status = statusDegraded
 	}
 	// A stalled rotation/prune is a readiness regression too, even though no record was lost.
 	// NOT part of AuditDegraded, so it never denies live traffic under --require-audit=strict.
 	if snap.AuditMaintenanceStalled {
-		snap.Status = "degraded"
+		snap.Status = statusDegraded
 	}
 	return snap
 }
@@ -164,7 +211,10 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// a proxy that fetches no keys is indistinguishable from healthy key fetching, and an
 	// absent series is what a scraper already knows how to read.
 	if snap.JWKS != nil {
-		m.gauge("eunox_jwks_fetch_healthy", "IdP key fetching is unimpeded (1 = breaker closed). 0 means refreshes are refused or the breaker has tripped and not yet proved recovery: a token whose kid the cached key set does not carry fails closed now, and every token fails once that set passes its TTL.", gaugeBool(!snap.JWKS.keyFetchImpeded()))
+		m.gauge("eunox_jwks_fetch_healthy", "IdP key fetching is unimpeded (1 = breaker closed). 0 means refreshes are refused or the breaker has tripped and not yet proved recovery: key rotation is blocked and a token whose kid the cached key set does not carry fails closed now. Alert on it; it does NOT by itself flip /healthz status, since a warm cache keeps validating -- pair it with eunox_jwks_keys_servable for that.", gaugeBool(!snap.JWKS.keyFetchImpeded()))
+		// The second half of the readiness question, and the reason the gauge above is an alert
+		// rather than a drain signal: 0 on BOTH is the window in which every token fails closed.
+		m.gauge("eunox_jwks_keys_servable", "A fetched key set is installed and still within its cache TTL (1 = tokens carrying a kid it holds keep validating). 0 alongside eunox_jwks_fetch_healthy 0 is the window in which every token fails closed, and is what flips /healthz status to degraded.", gaugeBool(snap.JWKS.KeysServable))
 		// The state as a labelled set, the Prometheus spelling for an enum: a single boolean
 		// could not name half-open, which is the state a sustained outage sits in longest.
 		states := make([]labelledSample, 0, 3)

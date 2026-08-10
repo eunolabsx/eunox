@@ -167,7 +167,9 @@ func upstreamErrInfo(notices noticeWriter, err error, upstreamTimeMs int) (code,
 		if errors.As(err, &ne) && ne.Timeout() {
 			return codeUpstreamTimeout, upstreamTimeoutReason(upstreamTimeMs), jsonRPCCodeInternalError
 		}
-		noticef(notices, siteUpstreamError, "[eunox] upstream error: %v\n", err)
+		if line, ok := notices.admitNotice(siteUpstreamError); ok {
+			line.writef("[eunox] upstream error: %v\n", err)
+		}
 		return codeUpstreamError, "upstream error", jsonRPCCodeInternalError
 	}
 }

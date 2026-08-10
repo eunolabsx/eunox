@@ -182,6 +182,10 @@ type StdioProxy struct {
 	// down one pipe can make this process do. No parent: stdio serves ONE upstream, so this table
 	// is both the tenant's and the aggregate. See noticeLimiter.
 	notices *noticeLimiter
+	// noticeFloor reserves on the SITE axis alone: this proxy is one holder with no sibling to be
+	// starved by, so it needs no per-class floor, but the line a class-mate's flood must not elide
+	// is written here exactly as it is on the HTTP transport. nil on a bare-struct-literal proxy.
+	noticeFloor *noticeReserve
 
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
 	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
@@ -364,6 +368,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories...),
 		notices:               newNoticeLimiter(1),
+		noticeFloor:           newSiteNoticeReserve(),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -1242,7 +1247,7 @@ func (p *StdioProxy) refusalLimits() refusalLimits {
 // noticeWriter is this transport's diagnostic channel: the configured stderr writer and the class
 // table that bounds it, as one value — so a leg cannot carry the writer without the bound.
 func (p *StdioProxy) noticeWriter() noticeWriter {
-	return noticeWriter{out: p.errOut(), limits: p.notices}
+	return noticeWriter{out: p.errOut(), limits: p.notices, reserve: p.noticeFloor}
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its
@@ -1370,10 +1375,12 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 	// Bounded: a host may re-initialize as often as it likes and this answer is LOCAL — no session
 	// created, no upstream contacted — so an unbounded line here is one write syscall per frame at
 	// the host's send rate, the same shape the routing refusal's notice was bounded for.
-	noticef(p.noticeWriter(), siteHostInitialized,
-		"[eunox] Session %s: host initialized (protocol %s).\n",
-		p.sessionID, handshakeRevision,
-	)
+	if line, ok := p.noticeWriter().admitNotice(siteHostInitialized); ok {
+		line.writef(
+			"[eunox] Session %s: host initialized (protocol %s).\n",
+			p.sessionID, handshakeRevision,
+		)
+	}
 	return resp
 }
 

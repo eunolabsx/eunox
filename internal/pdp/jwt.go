@@ -391,6 +391,37 @@ func (p *JWTPDP) Cache() *capability.JWKSCache {
 	return p.cache
 }
 
+// KeyFetchHealth is this validator's key-fetch readiness, and whether there is a guard to
+// report on at all — the DETAIL half of the health seam, beside the HealthStatus verdict every
+// degradable subsystem answers through.
+//
+// Split that way because the verdict is one comparable thing across subsystems while the detail
+// is each subsystem's own: an `error` has no room for a state plus two counters, and a seam
+// widened to carry every subsystem's detail would describe none of them.
+func (p *JWTPDP) KeyFetchHealth() (capability.KeyFetchHealth, bool) {
+	if p == nil {
+		return capability.KeyFetchHealth{}, false
+	}
+	return p.cache.KeyFetchHealth()
+}
+
+// HealthStatus is the readiness question asked with no request in hand: nil while this layer
+// can still validate tokens, the cause once it cannot. It is the same seam
+// killswitch.Manager answers, so a health endpoint folds every degradable subsystem's verdict
+// the same way instead of reaching through concrete types for one and asking an interface for
+// the next.
+//
+// The predicate itself is capability.KeyFetchHealth.Status's, beside the two facts it joins —
+// this method only relays, so a consumer cannot get the semantics wrong the way one encoding
+// "any state but closed" in its own snapshot did.
+func (p *JWTPDP) HealthStatus() error {
+	h, ok := p.KeyFetchHealth()
+	if !ok {
+		return nil
+	}
+	return h.Status()
+}
+
 // innerEnforces reports whether p.inner is a real policy backstop for an
 // identity-only (no mcp.capabilities) request. Neither nil nor AlwaysAllowPDP
 // qualify — in JWT mode the wrapper must fail closed, not inherit allow-everything.

@@ -8,6 +8,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // withFakeClock pins a gate's bucket to a caller-driven clock and returns the setter, so a
@@ -335,4 +338,137 @@ func TestPerCategoryShare_DividesTheAggregateEvenly(t *testing.T) {
 	if int(perCategoryDenyRate) != perCategoryDenyRatePerSec || int(perCategoryDenyBurst) != perCategoryDenyBurstSize {
 		t.Errorf("per-category share = %v/%v, want %d/%d", perCategoryDenyRate, perCategoryDenyBurst, perCategoryDenyRatePerSec, perCategoryDenyBurstSize)
 	}
+}
+
+// TestUpstreamRefusalFloor_SiblingKeepsItsFirstRecord is the gap the per-session TABLE alone left,
+// one axis over from the notice half's.
+//
+// The child and the parent are the same rate, so a session flooding one category is paced by its
+// own bucket to exactly the rate the parent refills at, and a sibling's FIRST record arrives to find
+// the parent empty. What is elided there is evidence — the record saying a live in-flight request
+// was evicted — not stderr legibility, which is why the floor is worth its cost here even though a
+// floored record is an audit WRITE.
+//
+// The refusal this floor answers is the PARENT's, which is the opposite of the notice half's, and
+// for a reason rather than by symmetry: a record holder owns its whole table, so its own bucket
+// refusing means it outran its own budget, and its peers contend one tier up.
+func TestUpstreamRefusalFloor_SiblingKeepsItsFirstRecord(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	aggregate := newRefusalRecordLimiter()
+	aggregate.setNow(func() time.Time { return at })
+
+	drain := func(lim *categoryRecordLimiter, n int) int {
+		lim.setNow(func() time.Time { return at })
+		admitted := 0
+		for range n {
+			if admitRefusalRecord(&fwdRecorder{}, lim, catDisplaced) != nil {
+				admitted++
+			}
+		}
+		return admitted
+	}
+
+	a := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
+	require.Positive(t, drain(a, 200), "A's leading edge reaches the tape")
+	require.Zero(t, aggregate.bucket(catDisplaced).tokens > 1,
+		"A's flood must have drained the shared parent; otherwise this test proves nothing")
+
+	b := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
+	assert.Equal(t, 1, drain(b, 5),
+		"a sibling session's first record must survive a flood that has emptied the parent; a table alone paces A to exactly the parent's refill rate")
+	assert.Zero(t, drain(b, 5),
+		"and it is one record per category per interval, not a second budget")
+}
+
+// TestUpstreamRefusalFloor_IsPerCategory keeps the record floor from being spent on the wrong
+// evidence: a session whose upstream floods one category must not thereby lose the floor for the
+// category that says a LIVE in-flight request was evicted.
+func TestUpstreamRefusalFloor_IsPerCategory(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	aggregate := newRefusalRecordLimiter()
+	aggregate.setNow(func() time.Time { return at })
+	flooder := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
+	flooder.setNow(func() time.Time { return at })
+	for range 200 {
+		_ = admitRefusalRecord(&fwdRecorder{}, flooder, catServerRequestFailed)
+	}
+
+	sibling := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
+	sibling.setNow(func() time.Time { return at })
+	assert.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sibling, catServerRequestFailed),
+		"the flooded category's own floor still delivers this session's first record")
+	assert.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sibling, catDisplaced),
+		"and a category this session has not written keeps its own floor; categories do not share one")
+}
+
+// TestUpstreamRefusalFloor_AggregateStillHoldsTheTotal is the bound that makes a floored AUDIT
+// write affordable at all. The parent exists because per-session buckets multiply the sustained
+// write rate into one 4096-deep queue by the session count under a --require-audit that defaults to
+// strict, so the floor must not reopen that: a floored record DEBITS the tier that refused it, so
+// it displaces the flooder's next record rather than adding to the total.
+func TestUpstreamRefusalFloor_AggregateStillHoldsTheTotal(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	aggregate := newRefusalRecordLimiter()
+	aggregate.setNow(func() time.Time { return at })
+
+	const sessions = 50
+	admitted := 0
+	for range sessions {
+		lim := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
+		lim.setNow(func() time.Time { return at })
+		for range 20 {
+			if admitRefusalRecord(&fwdRecorder{}, lim, catDisplaced) != nil {
+				admitted++
+			}
+		}
+	}
+	assert.LessOrEqual(t, admitted, int(perCategoryDenyBurst)+sessions,
+		"N sessions must not multiply the sustained audit-write rate by N: the parent bounds the total and the floor adds at most one record per session per interval")
+	assert.GreaterOrEqual(t, admitted, sessions,
+		"every session's first record is the whole point; a bound that elides it is the gap this closes")
+	assert.GreaterOrEqual(t, aggregate.bucket(catDisplaced).tokens, -perCategoryDenyBurst,
+		"the debt the floors ran up is clamped at one burst, so the aggregate recovers rather than staying shut")
+}
+
+// TestRecordFloor_NotClaimedWhenTheHoldersOwnBucketRefused pins the direction the record half's
+// floorTier declares, which is the notice half's inverted. A session that outran its OWN table is
+// not owed an arrival: nobody else caused that refusal, and flooring it would hand every flooding
+// session a bonus record per interval on top of its share.
+func TestRecordFloor_NotClaimedWhenTheHoldersOwnBucketRefused(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	// No aggregate: every refusal below is this session's own bucket refusing.
+	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
+	lim.setNow(func() time.Time { return at })
+
+	admitted := 0
+	for range 200 {
+		if admitRefusalRecord(&fwdRecorder{}, lim, catDisplaced) != nil {
+			admitted++
+		}
+	}
+	assert.LessOrEqual(t, admitted, int(perCategoryDenyBurst),
+		"a holder's own budget is the whole answer to its own flood; a floor on top is a second budget")
+}
+
+// TestFloorTier_ZeroValueFloorsNothing pins the enum's fail-safe default. floorNowhere is what a
+// table that never declared where its holder's peers contend resolves to, and the safe answer for
+// "nobody decided" is the one that hands out no writes outside a bucket.
+func TestFloorTier_ZeroValueFloorsNothing(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	table := newTieredBuckets(1, 1, []refusalCategory{catDisplaced}, nil, "test", floorNowhere)
+	table.setNow(func() time.Time { return at })
+	reserve := newKeyReserve([]refusalCategory{catDisplaced})
+
+	admitted := 0
+	for range 20 {
+		if table.admitWithFloor(catDisplaced, reserve.forKey(catDisplaced)).ok {
+			admitted++
+		}
+	}
+	assert.Equal(t, 1, admitted, "an undeclared floor tier must consult no floor at all")
 }
