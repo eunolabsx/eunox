@@ -749,17 +749,8 @@ func (p *HTTPProxy) serveCtx() context.Context {
 	return context.Background()
 }
 
-// refusalRecordLimiter is this proxy's refusal-record admission control, nil-safe so a session
-// assembled by a bare struct literal (as tests build) records unbounded rather than panicking.
-func (p *HTTPProxy) refusalRecordLimiter() *categoryRecordLimiter {
-	if p == nil {
-		return nil
-	}
-	return p.preSessionDenies
-}
-
-// refusalNoticeLimiter is this proxy's stderr-notice admission control, nil-safe for the same
-// bare-struct-literal session refusalRecordLimiter is.
+// refusalNoticeLimiter is this proxy's stderr-notice admission control, nil-safe so a session
+// assembled by a bare struct literal (as tests build) writes unbounded rather than panicking.
 func (p *HTTPProxy) refusalNoticeLimiter() *recordRateLimiter {
 	if p == nil {
 		return nil
@@ -767,9 +758,16 @@ func (p *HTTPProxy) refusalNoticeLimiter() *recordRateLimiter {
 	return p.noticeLimiter
 }
 
-// refusalLimits pairs this proxy's two admission controls for a leg whose refusal RECORDS are
-// bounded — the pre-session arm and the established session's own. The leg that meters no record
-// (routeRefusalRecorders) takes the notice bucket alone.
+// refusalLimits pairs this proxy's two admission controls for the PRE-SESSION leg, whose refusal
+// records charge the proxy-wide category buckets. The leg that meters no record
+// (routeRefusalRecorders) takes the notice bucket alone, and an established session's
+// upstream-driven refusals charge its own per-session table instead (see newUpstreamRefusalLimiter).
+//
+// Reads preSessionDenies directly: the single-caller accessor that used to wrap it duplicated this
+// function's own nil-receiver guard one line above it.
 func (p *HTTPProxy) refusalLimits() refusalLimits {
-	return refusalLimits{records: p.refusalRecordLimiter(), notices: p.refusalNoticeLimiter()}
+	if p == nil {
+		return refusalLimits{}
+	}
+	return refusalLimits{records: p.preSessionDenies, notices: p.noticeLimiter}
 }

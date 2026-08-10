@@ -45,6 +45,14 @@ linters:
     - dupl
 
   settings:
+    # noticef is a printf wrapper: it rewrites the format and appends an argument before
+    # Fprintf, which go vet cannot infer, so the twelve diagnostics moved onto it would
+    # silently lose format/argument checking. Declaring it restores that.
+    govet:
+      settings:
+        printf:
+          funcs:
+            - (github.com/eunolabs/eunox/internal/transport).noticef
     gocritic:
       enabled-tags:
         - diagnostic

@@ -43,6 +43,10 @@ var meteringCallSites = map[string]struct {
 	"recordRefusal":        {categoryArg: 4, implements: meteringMetered},
 	"recordPreSessionDeny": {categoryArg: 2, implements: meteringMetered},
 	"forCategory":          {categoryArg: 0, readsDeclaration: true},
+	// The server-initiated leg's drop records resolve through dropReport.recordDrop, which threads
+	// its own category parameter into forCategory — so the sites the walk must see are ITS callers,
+	// the four dispositions in server_request_unblock.go, not the single forCategory inside it.
+	"recordDrop": {categoryArg: 1, readsDeclaration: true},
 }
 
 // TestRefusalMetering_EveryCategoryDeclaresOne is the build-time half: an entry missing its

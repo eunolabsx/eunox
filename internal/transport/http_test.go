@@ -2466,7 +2466,7 @@ func TestHTTPSamplingRoundTrip_HostResponseRoutedToUpstream(t *testing.T) {
 	sess.addSub(ch)
 
 	// Upstream initiated a request with ID 5 that was broadcast to the host.
-	sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
+	sess.broadcastServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
 
 	// Host POSTs its response (same ID) back to /mcp.
 	body := `{"jsonrpc":"2.0","id":5,"result":{"role":"assistant","content":{"type":"text","text":"hi"}}}`
@@ -2553,7 +2553,7 @@ func TestHTTPBroadcastServerRequest_NoSubscriberFailsClosed(t *testing.T) {
 		upWriter: mcp.NewMsgWriter(&up),
 	})
 
-	delivered := sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
+	delivered := sess.broadcastServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"})
 	if delivered {
 		t.Fatalf("broadcastServerRequest reported delivered with no subscriber")
 	}
@@ -2569,7 +2569,7 @@ func TestHTTPBroadcastServerRequest_NoSubscriberFailsClosed(t *testing.T) {
 
 	// The ID must be untracked so a (never-arriving) host response cannot later be
 	// mis-routed, and so the tracker is not leaked.
-	if sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`5`))) {
+	if _, held := sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`5`))); held {
 		t.Errorf("id 5 is still tracked after a fail-closed broadcast; want untracked")
 	}
 }
@@ -2774,7 +2774,7 @@ func TestHTTPRemoveSubAndDrain_RepliesErrorForBufferedServerRequest(t *testing.T
 	// The upstream broadcasts a server-initiated request; deliverToOne buffers it in
 	// ch and the ID is tracked. The SSE loop never reads it (simulating a client that
 	// disconnected with the request still buffered).
-	if !sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}) {
+	if !sess.broadcastServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}) {
 		t.Fatalf("broadcastServerRequest reported not delivered; want delivered to the buffered sub")
 	}
 
@@ -2790,7 +2790,7 @@ func TestHTTPRemoveSubAndDrain_RepliesErrorForBufferedServerRequest(t *testing.T
 	}
 	// The ID must be untracked so a (never-arriving) host response cannot later be
 	// misrouted and the tracker is not leaked.
-	if sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`7`))) {
+	if _, held := sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`7`))); held {
 		t.Errorf("id 7 still tracked after drain; want untracked")
 	}
 	// The subscription must be gone so no further messages are delivered to ch.
@@ -2832,7 +2832,7 @@ func TestHTTPFailServerRequestDelivery_RepliesErrorUpstream(t *testing.T) {
 	if mcp.MsgKey(routed.ID) != "n:9" || routed.Error == nil {
 		t.Errorf("upstream message = %+v, want an error response for id 9", routed)
 	}
-	if sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`9`))) {
+	if _, held := sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`9`))); held {
 		t.Error("id 9 still tracked after delivery failure; want untracked")
 	}
 
@@ -2932,7 +2932,7 @@ func TestHTTPHandleMCPPost_RemoteModeServerResponseWarnsAndUntracks(t *testing.T
 		t.Errorf("expected 202, got %d", rec.Code)
 	}
 	// The tracked ID must be removed even though it could not be delivered.
-	if sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`42`))) {
+	if _, held := sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`42`))); held {
 		t.Errorf("id 42 still tracked after a remote-mode drop; want untracked")
 	}
 	// The ONE nil-writer wording every site on this leg shares: "reported rather than dropped" is
@@ -4046,7 +4046,7 @@ func TestHTTPHandleGet_WriteErrorUnblocksInflightServerRequest(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if !sess.broadcastServerRequest(context.Background(), refusalLimits{}, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}) {
+	if !sess.broadcastServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}) {
 		t.Fatal("broadcastServerRequest reported not delivered; want delivered to the open stream")
 	}
 
@@ -4065,7 +4065,7 @@ func TestHTTPHandleGet_WriteErrorUnblocksInflightServerRequest(t *testing.T) {
 	if mcp.MsgKey(routed.ID) != "n:9" || routed.Error == nil {
 		t.Errorf("upstream message = %+v, want an error reply for id 9", routed)
 	}
-	if sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`9`))) {
+	if _, held := sess.serverReqs.take(mcp.MsgKey(mcp.RawJSON(`9`))); held {
 		t.Error("id 9 still tracked after the write-error teardown; want untracked")
 	}
 }
@@ -5554,7 +5554,7 @@ func TestUpstreamErrInfo(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			code, reason, rpcCode := upstreamErrInfo(io.Discard, tc.err, tc.timeMs)
+			code, reason, rpcCode := upstreamErrInfo(io.Discard, nil, tc.err, tc.timeMs)
 			if code != tc.wantCode || reason != tc.wantReason || rpcCode != tc.wantRPCCode {
 				t.Errorf("upstreamErrInfo(%v, %d) = (%q, %q, %d), want (%q, %q, %d)",
 					tc.err, tc.timeMs, code, reason, rpcCode, tc.wantCode, tc.wantReason, tc.wantRPCCode)

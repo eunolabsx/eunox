@@ -41,7 +41,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"slices"
 	"sort"
@@ -80,12 +79,6 @@ type dispatchParams struct {
 	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
 	// ignored (union-only, so falling back to the session join is the stricter reading).
 	honorAttribution bool
-
-	// refusalLimits (embedded) is this leg's admission control over the writes the fail-closed
-	// ROUTING refusal makes. The sink is forwardParams.rec, above: a refusal resolves its recorder
-	// by pairing the two (see refusalLimits), rather than carrying a second copy of the sink that
-	// could name a different tape.
-	refusalLimits
 }
 
 // finishDecision closes the decision critical section (if open) right after the PDP decision
@@ -704,7 +697,18 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 // shares one simple gate applied here, so a new locally-answered method inherits revocation by
 // construction rather than needing killDenied re-placed inside its handler. Its position
 // relative to revision negotiation is the package gate order at the top of this file.
-func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
+func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) (reply mcp.RPCMsg) {
+	// The same no-reply-channel rule enforcedForwardCore applies at its own boundary, applied at
+	// THIS one too, because the two boundaries cover different exits: the core is also reached from
+	// the notification gate (refuseUnroutable), which never passes through here, while the
+	// locally-answered set below never passes through the core — and `ID` carries `omitempty`, so
+	// an id-less ping or re-initialize returns `{"jsonrpc":"2.0","result":{}}`, a response to a
+	// message JSON-RPC forbids answering. Unreachable while both transports gate on IsRequest.
+	defer func() {
+		if msg.ID == nil {
+			reply = mcp.RPCMsg{}
+		}
+	}()
 	handler, enforced := tablesFromContext(ctx).request(msg.Method)
 	if enforced {
 		return handler(ctx, d, msg)
@@ -920,7 +924,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	if result.Verdict == capability.ReceiptInconsistent {
 		// The one verdict that is a finding rather than bookkeeping: the server's own signed
 		// account contradicts the contract policy was written against.
-		_, _ = fmt.Fprintf(d.errOutOrStderr(),
+		noticef(d.errOutOrStderr(), d.limits.notices,
 			"[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 			audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))
 	}
@@ -1149,5 +1153,5 @@ func completeToolsListing(params, result json.RawMessage) bool {
 // refusalDeclarations exactly as the notification framing is — it used to be handed an
 // already-resolved recorder that never met the declaration at all.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
-	return refuseUnroutable(ctx, d.forwardParams, d.recorders(d.rec), verifiedSession(d.sessionID), msg, unroutableFramingRequest)
+	return refuseUnroutable(ctx, d.forwardParams, d.limits.recorders(d.rec), verifiedSession(d.sessionID), msg, unroutableFramingRequest)
 }

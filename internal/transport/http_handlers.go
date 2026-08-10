@@ -140,7 +140,7 @@ func IsInfraDenialCode(code string) bool {
 // internal hostname/path), so the host only ever sees the failure class. Only the generic
 // UPSTREAM_ERROR branch logs the full error to w — the others are already on the tape, so
 // re-logging them would spam it under a sustained outage.
-func upstreamErrInfo(w io.Writer, err error, upstreamTimeMs int) (code, reason string, rpcCode int) {
+func upstreamErrInfo(w io.Writer, notices *recordRateLimiter, err error, upstreamTimeMs int) (code, reason string, rpcCode int) {
 	switch {
 	case errors.Is(err, errDuplicateID):
 		// A host pipelined a request reusing an in-flight JSON-RPC id: a client fault, not an
@@ -168,7 +168,7 @@ func upstreamErrInfo(w io.Writer, err error, upstreamTimeMs int) (code, reason s
 		if errors.As(err, &ne) && ne.Timeout() {
 			return codeUpstreamTimeout, upstreamTimeoutReason(upstreamTimeMs), jsonRPCCodeInternalError
 		}
-		_, _ = fmt.Fprintf(resolvedErrOut(w), "[eunox] upstream error: %v\n", err)
+		noticef(resolvedErrOut(w), notices, "[eunox] upstream error: %v\n", err)
 		return codeUpstreamError, "upstream error", jsonRPCCodeInternalError
 	}
 }
@@ -207,13 +207,13 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			callUpstream:     sess.callUpstream,
 			strictAuditState: p.strictAudit(),
 			errOut:           p.errOut(),
+			limits:           p.refusalLimits(),
 		},
 		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
 		buildInit:        sess.buildInitResponse,
 		receipts:         rt.receipts,
 		honorAttribution: rt.honorAttribution,
-		refusalLimits:    p.refusalLimits(),
 	}
 }
 
@@ -293,16 +293,14 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		// forwardServerRequest does the stamping; this supplies the fact.
 		revision: sess.hostRev,
 		forward: func(ctx context.Context, m mcp.RPCMsg) bool {
-			return sess.broadcastServerRequest(ctx, p.refusalLimits(), m)
+			return sess.broadcastServerRequest(ctx, m)
 		},
 		// Through the seam, not a bare closure over the concrete writer: remote-upstream mode
 		// leaves upWriter nil, and every denial arm below answers the initiator AFTER its audit
 		// record — a nil-receiver panic there leaves a tape recording a denial the process died
 		// delivering. See writeToInitiator.
-		writeUpstream: sess.unblocker().writeUpstream(),
-		refusalLimits: p.refusalLimits(),
-		leg:           dropHTTPRefusalUndeliverable,
-		decideLock:    decideLock,
+		unblocker:  sess.unblocker(),
+		decideLock: decideLock,
 		// A session that has spanned two state anchors cannot decide on this leg at all; see
 		// samplingAnchorSplitDenial. Always wired: the session answers false unless it
 		// actually spanned, so the question is asked in one place.

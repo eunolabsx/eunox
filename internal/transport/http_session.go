@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -66,6 +67,13 @@ type httpSession struct {
 	// handleMCPPost can route the host's POSTed response back to the upstream
 	// instead of dropping it (which would hang the upstream).
 	serverReqs serverReqTracker
+
+	// upstreamDenies bounds the refusal records THIS session's upstream can drive (see
+	// newUpstreamRefusalLimiter). Per session because each session has its own upstream, and the
+	// proxy-wide table let one dead subprocess drain a category's share and suppress a sibling
+	// session's record that a live in-flight request was lost. nil on a bare-struct-literal
+	// session (as tests build), which records unbounded rather than panicking.
+	upstreamDenies *categoryRecordLimiter
 
 	upstreamCaps          map[string]interface{}
 	upstreamServerVersion string // version from the upstream initialize serverInfo response
@@ -325,7 +333,16 @@ func (s *httpSession) spansAnchors() bool { return s != nil && s.spanned.Load() 
 // disposition resolves at ANSWER time, so the tracker-only holders (every forwarded request) pay
 // nothing for a writer they never call.
 func (s *httpSession) unblocker() serverRequestUnblocker {
-	return serverRequestUnblocker{reqs: &s.serverReqs, sink: s.upWriter, errOut: s.errOut(), notices: s.proxy.refusalNoticeLimiter()}
+	return serverRequestUnblocker{
+		reqs:   &s.serverReqs,
+		sink:   s.upWriter,
+		errOut: s.errOut(),
+		report: dropReport{
+			recs: s.refusalRecorders(),
+			subj: verifiedSession(s.id),
+			legs: httpServerRequestLegs,
+		},
+	}
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would
@@ -336,11 +353,11 @@ func (s *httpSession) unblocker() serverRequestUnblocker {
 // revoked session's refused reply may still unblock its initiator — that costs nothing the kill
 // protects, since what a kill forbids is DELIVERING the host's reply and this answer is eunox's
 // own. See this file's package-level rule for the drops that deliberately do not answer.
-func (s *httpSession) unblockRefusedServerReply(msg mcp.RPCMsg) {
+func (s *httpSession) unblockRefusedServerReply(ctx context.Context, msg mcp.RPCMsg) {
 	if !msg.IsResponse() {
 		return
 	}
-	s.unblocker().unblock(msg.ID, refusedReplyUpstreamError)
+	s.unblocker().unblock(s.withSessionClaims(ctx), msg.ID, refusedReplyUpstreamError)
 }
 
 // senderIsProvenOwner reports whether cur is the identity that CREATED this session — PROVEN,
@@ -386,7 +403,7 @@ func (s *httpSession) unblockGateRefusedServerReply(ctx context.Context, msg mcp
 	if !msg.IsResponse() || !s.senderIsProvenOwner(pdp.JWTClaimsPtr(ctx)) {
 		return
 	}
-	s.unblocker().unblock(msg.ID, gateRefusedReplyUpstreamError)
+	s.unblocker().unblock(s.withSessionClaims(ctx), msg.ID, gateRefusedReplyUpstreamError)
 }
 
 // newSession spawns an upstream subprocess and performs the MCP initialize handshake. The
@@ -399,17 +416,18 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// this handshake returns.
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	sess := &httpSession{
-		id:           uuid.New().String(),
-		proxy:        p,
-		route:        route,
-		byUpstreamID: make(map[string]chan upstreamResult),
-		hostToUp:     make(map[string]*json.RawMessage),
-		done:         make(chan struct{}),
-		evicted:      make(chan struct{}),
-		sessCtx:      sessCtx,
-		sessCancel:   sessCancel,
-		claims:       pdp.JWTClaimsPtr(ctx),
-		clientIP:     clientIP,
+		id:             uuid.New().String(),
+		proxy:          p,
+		route:          route,
+		byUpstreamID:   make(map[string]chan upstreamResult),
+		hostToUp:       make(map[string]*json.RawMessage),
+		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies),
+		done:           make(chan struct{}),
+		evicted:        make(chan struct{}),
+		sessCtx:        sessCtx,
+		sessCancel:     sessCancel,
+		claims:         pdp.JWTClaimsPtr(ctx),
+		clientIP:       clientIP,
 		// Every session is minted by a host `initialize` today, and that method exists only
 		// in the older revision — so opening one IS negotiating it. Each request is checked
 		// against this pin, so one declaring a different revision is refused rather than
@@ -1161,24 +1179,15 @@ func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMs
 	// — the entry gate's, the pool's saturation record, and a destroyed answer's — drop out of the
 	// per-agent grouping the sampling leg's own refusals appear in, for one transport leg value.
 	ctx = s.withSessionClaims(ctx)
-	u := s.unblocker()
-	// Refused at the ENTRY, above the pool and above any decision — see admitServerRequestID. The
-	// limiter is the proxy's, reached here because this leg has no request in scope to carry one.
-	if !admitServerRequestID(ctx, u, s.refusalRecorders(), verifiedSession(s.id), dropHTTPUnroutableID, msg) {
-		return
-	}
-	s.serverPool.dispatch(ctx, msg, serverRequestDispatch{
+	dispatchServerRequest(ctx, &s.serverPool, msg, serverRequestDispatch{
 		rec:       asRecorder(s.route.sink),
 		sessionID: s.id,
 		// Through the seam rather than a closure over the concrete writer: remote-upstream mode
 		// leaves upWriter nil, and (*mcp.MsgWriter).Write locks its mutex on a nil receiver — so
 		// the saturation path would panic after its record rather than report. See writeToInitiator.
-		writeUpstream: u.writeUpstream(),
-		refusalLimits: s.proxy.refusalLimits(),
-		leg:           dropHTTPRefusalUndeliverable,
-		errOut:        s.errOut(),
-		handle:        func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
-		revision:      s.hostRev,
+		unblocker: s.unblocker(),
+		handle:    func(hctx context.Context, m mcp.RPCMsg) { s.proxy.handleHTTPUpstreamRequest(hctx, s, m) },
+		revision:  s.hostRev,
 	})
 }
 
@@ -1268,7 +1277,8 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		defer cancel()
 		if _, err := s.callRemoteUpstream(notifyCtx, msg); err != nil {
 			// No response to deliver to the host; log so a dropped notification isn't silent.
-			_, _ = fmt.Fprintf(s.errOut(), "[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, msg.Method, err)
+			noticef(s.errOut(), s.proxy.refusalNoticeLimiter(),
+				"[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, audit.BoundEnvelopeField(msg.Method), err)
 		}
 		return
 	}
@@ -1428,22 +1438,20 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // back by handleMCPPost). Such a request blocks the upstream until answered, so with no
 // subscriber able to receive it, fail closed: untrack the ID and reply an error so the upstream
 // unblocks, rather than let it hang until teardown.
-// The refusal limits are a PARAMETER rather than reached through s.proxy: this runs on a session,
-// and the proxy that holds the buckets is already in scope at the one site that wires this in. Both
-// halves travel, never the record bucket alone — a half-built refusalLimits is the wiring fault the
-// type exists to make unrepresentable, and it is the notice half that a leg silently loses.
-func (s *httpSession) broadcastServerRequest(ctx context.Context, limits refusalLimits, msg mcp.RPCMsg) bool {
-	u, recs := s.unblocker(), limits.recorders(asRecorder(s.route.sink))
+// The refusal wiring is the SESSION's own (see newUpstreamRefusalLimiter): every category charged
+// below is driven by this session's upstream, so the buckets it charges are per session and the
+// caller no longer has to carry them in from the proxy.
+func (s *httpSession) broadcastServerRequest(ctx context.Context, msg mcp.RPCMsg) bool {
+	u := s.unblocker()
 	// See forwardServerRequestToHost: an id the tracker will not retain must be REFUSED here, never
 	// delivered untracked to a host whose answer nothing could route back.
-	if !admitServerRequestID(ctx, u, recs, verifiedSession(s.id), dropHTTPUnroutableID, msg) {
+	if !admitAndTrackServerRequest(ctx, u, msg) {
 		return false
 	}
-	trackServerRequest(ctx, u, recs, verifiedSession(s.id), dropHTTPDisplaced, msg)
 	if s.deliverToOne(msg) {
 		return true
 	}
-	u.unblock(msg.ID, "no client stream available to service server-initiated request")
+	u.unblock(ctx, msg.ID, "no client stream available to service server-initiated request")
 	return false
 }
 
@@ -1529,19 +1537,33 @@ func (s *httpSession) removeSubAndDrain(ctx context.Context, ch chan mcp.RPCMsg)
 // on the unblock having actually CONSUMED the request. That is what makes it exactly-once: both
 // callers (the SSE write loop and the drain) can see the same message, and only one take succeeds.
 func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPCMsg, reason string) {
-	if !s.unblocker().unblock(msg.ID, reason) {
+	ctx = s.withSessionClaims(ctx)
+	if !s.unblocker().unblock(ctx, msg.ID, reason) {
 		return
 	}
 	// This request was recorded as an allow when deliverToOne buffered it, but it never
 	// reached the host — append a correction so the tamper-evident tape doesn't stand as
 	// claiming delivery that didn't happen.
-	recordServerRequestDropped(s.withSessionClaims(ctx), s.refusalRecorders().forCategory(catServerRequestFailed), verifiedSession(s.id), msg.Method, dropHTTPUndelivered)
+	s.unblocker().report.recordDrop(ctx, catServerRequestFailed, dropHTTPUndelivered, msg.Method)
 }
 
 // refusalRecorders is this session's wiring for a refusal record's recorder: the route's sink and
-// the proxy's admission control, with forCategory applying each category's own declaration.
+// this session's OWN upstream-driven bucket table, with forCategory applying each category's own
+// declaration.
+//
+// Per session rather than the proxy-wide pre-session table: every category this leg charges is
+// driven by this session's upstream, and a shared table let one dead subprocess suppress another
+// session's record that a live in-flight request was lost. See newUpstreamRefusalLimiter.
 func (s *httpSession) refusalRecorders() refusalRecorders {
-	return s.proxy.refusalLimits().recorders(asRecorder(s.route.sink))
+	// Nil-route tolerant like every other accessor a bare-struct-literal session reaches
+	// (refusalNoticeLimiter, upstreamDenies): every unblocker() now resolves this, including the
+	// tracker-only holders, so a routeless test session must degrade to recording nothing rather
+	// than crash a leg that used to touch no route at all.
+	var rec auditRecorder
+	if s.route != nil {
+		rec = asRecorder(s.route.sink)
+	}
+	return refusalLimits{records: s.upstreamDenies, notices: s.proxy.refusalNoticeLimiter()}.recorders(rec)
 }
 
 // withSessionClaims stamps this session's captured JWT identity onto ctx, for a record written on a

@@ -5,7 +5,6 @@ package transport
 
 import (
 	"context"
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,19 +78,12 @@ type serverRequestDispatch struct {
 	rec auditRecorder
 	// sessionID identifies the session on that record.
 	sessionID string
-	// writeUpstream answers the upstream initiator. Called on the CALLER's goroutine
-	// (the reader) for a refusal, since no handler is spawned. nil means this transport has no
-	// upstream sink to answer through — a case the shared seam REPORTS (see writeToInitiator);
-	// each transport supplies its unblocker's writer rather than a closure over a concrete one,
-	// which would panic here instead.
-	writeUpstream func(mcp.RPCMsg) error
-	// refusalLimits (embedded) bounds the record a DESTROYED saturation answer writes; rec above
-	// stays the unmetered sink for the saturation refusal itself. See refusalAnswer.
-	refusalLimits
-	// leg names this transport's refusal-answering site on that record.
-	leg transportLeg
-	// errOut is where the seam writes that report; nil means os.Stderr.
-	errOut io.Writer
+	// unblocker answers the upstream initiator, on the CALLER's goroutine (the reader) for a
+	// refusal, since no handler is spawned — and RECORDS an answer that did not land. ONE field
+	// rather than the writer, the limits and the leg threaded separately: those three are one
+	// obligation, and a sixth thing this leg needs is then declared once instead of at both
+	// transports' literals, where a keyed literal zero-fills whichever is missed.
+	unblocker serverRequestUnblocker
 	// handle is the server-initiated request's handler, run on its own goroutine.
 	handle func(context.Context, mcp.RPCMsg)
 	// revision is the session's negotiated host revision, stamped onto ctx BEFORE the admission
@@ -101,16 +93,26 @@ type serverRequestDispatch struct {
 	revision capability.Revision
 }
 
-// refusalAnswer is this dispatch's wiring for answering a saturation-refused initiator, the same
-// shape the sampling leg builds so the two cannot report a destroyed answer differently.
-func (d serverRequestDispatch) refusalAnswer() refusalAnswer {
-	return refusalAnswer{
-		write:  d.writeUpstream,
-		recs:   d.recorders(d.rec),
-		subj:   verifiedSession(d.sessionID),
-		leg:    d.leg,
-		errOut: d.errOut,
+// dispatchServerRequest is the ENTRY both transports take for one server-initiated request: refuse
+// an id no reply could ever be routed back to, then hand the request to the pool.
+//
+// One function rather than the same three-step sequence hand-mirrored per transport, in the mould
+// hostNotificationGate.admit set for the four checks each used to hand-place: the pair took the same
+// edit twice the last two times this leg changed, and the per-transport delta is now the dispatch
+// struct alone.
+func dispatchServerRequest(ctx context.Context, pool *serverRequestPool, msg mcp.RPCMsg, d serverRequestDispatch) {
+	// Stamped BEFORE the entry gate, not just before the handler: the gate's own refusal writes a
+	// record, and an absent protocol_revision on this tape means "written before one could be
+	// resolved" — which is false for a request refused on an established session. The pool stamps
+	// it too, for a caller that dispatches directly.
+	ctx = capability.WithProtocolRevision(ctx, resolveRevision(d.revision))
+	// Refused at the ENTRY, above the pool and above any decision: a request whose reply could
+	// never be routed back must not consume a handler slot, a policy quota, or the host's
+	// attention. See admitServerRequestID.
+	if !admitServerRequestID(ctx, d.unblocker, msg) {
+		return
 	}
+	pool.dispatch(ctx, msg, d)
 }
 
 // dispatch runs d.handle for msg on its own goroutine, or refuses msg when the pool is at
@@ -134,7 +136,7 @@ func (p *serverRequestPool) dispatch(ctx context.Context, msg mcp.RPCMsg, d serv
 		// would panic here and leave a tape reporting a refusal the process died delivering — and
 		// an answer that is merely DESTROYED leaves the initiator blocked with the saturation
 		// record describing the refusal but not the delivery, which is why the seam appends its own.
-		d.refusalAnswer().answer(ctx, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy,
+		d.unblocker.answer(ctx, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy,
 			"eunox: too many concurrent server-initiated requests in flight; retry"), answerPoolSaturated, msg.Method)
 		return
 	}

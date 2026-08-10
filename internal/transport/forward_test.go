@@ -820,7 +820,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSampling(t *testing.T) {
 		sessionID:        "s",
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
 		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream:    func(m mcp.RPCMsg) error { upstreamReply = m; return nil },
+		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
@@ -843,7 +843,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsSampling(t *testing.T) 
 		sessionID:        "s",
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
 		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream:    func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil },
+		unblocker:        writingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
@@ -891,7 +891,7 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 			t.Error("an enforced flowLabel deny must not forward to the host")
 			return false
 		},
-		writeUpstream: func(m mcp.RPCMsg) error { upstreamReply = m; return nil },
+		unblocker: writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 	}
 	forwardServerRequest(ctx, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
 
@@ -922,7 +922,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesNonSampling(t *testing.T
 		// CheckKill returns nil; the strict gate is what fires
 		pdp:              pdp.AlwaysAllowPDP{},
 		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream:    func(m mcp.RPCMsg) error { upstreamReply = m; return nil },
+		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "roots/list"}, fp)
@@ -946,7 +946,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsNonSampling(t *testing.
 		sessionID:        "s",
 		pdp:              pdp.AlwaysAllowPDP{},
 		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream:    func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil },
+		unblocker:        writingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "roots/list"}, fp)
@@ -977,7 +977,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 			forwardedBeforeRecords = len(rec.records)
 			return true
 		},
-		writeUpstream: func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil },
+		unblocker: writingSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }),
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
 
@@ -1026,9 +1026,9 @@ func TestForwardServerRequest_ObserveLeg_RecordsBeforeLogging(t *testing.T) {
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
-		pdp:           newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
-		forward:       func(context.Context, mcp.RPCMsg) bool { return true },
-		writeUpstream: func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil },
+		pdp:       newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
+		forward:   func(context.Context, mcp.RPCMsg) bool { return true },
+		unblocker: writingSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }),
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
 
@@ -1064,7 +1064,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSamplingObserveLeg(t *te
 		// kill-switch deny), so the request reaches the audit-mode observe leg.
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
 		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
-		writeUpstream:    func(m mcp.RPCMsg) error { upstreamReply = m; return nil },
+		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}, fp)
@@ -2408,6 +2408,10 @@ func TestSamplingAuditRecord_CarriesSessionJWTIdentity(t *testing.T) {
 		route:  rt,
 		claims: &pdp.JWTClaims{AgentID: "agent-xyz", TaskID: "task-abc"},
 		done:   make(chan struct{}),
+		// No SSE subscriber here, so the request is answered back to its initiator — which needs
+		// an upstream sink, or the destroyed answer appends a second record of its own and this
+		// test stops being about identity. See serverRequestUnblocker.answer.
+		upWriter: mcp.NewMsgWriter(io.Discard),
 	})
 
 	id := json.RawMessage(`1`)
@@ -2446,7 +2450,9 @@ func TestSamplingAuditRecord_NoJWT_OmitsIdentity(t *testing.T) {
 		),
 		sink: &routeSink{sink: sink},
 	}
-	sess := newTestSession(&httpSession{id: "sess-2", route: rt, done: make(chan struct{})}) // no claims
+	// upWriter as above: the answer to the undelivered request must land, or its own drop record
+	// joins the one this test counts.
+	sess := newTestSession(&httpSession{id: "sess-2", route: rt, done: make(chan struct{}), upWriter: mcp.NewMsgWriter(io.Discard)}) // no claims
 
 	id := json.RawMessage(`1`)
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: &id, Method: "sampling/createMessage"}

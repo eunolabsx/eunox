@@ -141,7 +141,7 @@ func TestRoutingRefusal_NotificationFramingBuildsNoResponse(t *testing.T) {
 
 	notifRec := &fwdRecorder{}
 	resp := refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, io.Discard),
-		unmeteredRecorders(notifRec, nil), verifiedSession("s"), msg, unroutableFramingNotification)
+		refusalLimits{}.recorders(notifRec), verifiedSession("s"), msg, unroutableFramingNotification)
 	assert.Nil(t, resp.Error, "the notification framing has no reply channel, so no denial envelope may be built for it")
 	assert.Nil(t, resp.ID)
 	require.Len(t, notifRec.records, 1, "skipping the response must not skip the record the refusal legitimately writes")
@@ -151,7 +151,7 @@ func TestRoutingRefusal_NotificationFramingBuildsNoResponse(t *testing.T) {
 	reqRec := &fwdRecorder{}
 	reqMsg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "x/bogus"}
 	resp = refuseUnroutable(ctx, refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, io.Discard),
-		unmeteredRecorders(reqRec, nil), verifiedSession("s"), reqMsg, unroutableFramingRequest)
+		refusalLimits{}.recorders(reqRec), verifiedSession("s"), reqMsg, unroutableFramingRequest)
 	require.NotNil(t, resp.Error, "the request framing must still be answered")
 	require.Len(t, reqRec.records, 1)
 	assert.Equal(t, notifRec.records[0].code, reqRec.records[0].code,
@@ -260,7 +260,7 @@ func TestRoutingRefusal_NoticeIsBoundedWhileItsRecordIsNot(t *testing.T) {
 func TestRoutingRefusal_NoNoticeBucketWritesEveryLine(t *testing.T) {
 	t.Parallel()
 	var errOut strings.Builder
-	recs := unmeteredRecorders(&fwdRecorder{}, nil)
+	recs := refusalLimits{}.recorders(&fwdRecorder{})
 	for range 20 {
 		refuseUnroutable(revisionContext(handshakeRevision),
 			refusalForwardParams(verifiedSession("s"), false, strictAuditState{}, &errOut),
@@ -478,50 +478,67 @@ func TestServerReqTracker_TrackIsOnlyReachedThroughTheDisposingWrapper(t *testin
 // denial arms that panic lands AFTER the audit record, leaving a tape recording a denial the
 // process died delivering.
 //
-// Every writeUpstream must therefore come from an unblocker, which decides the nil answer once —
-// now at ANSWER time rather than at wiring time, so the guard is on PROVENANCE rather than on a
-// spelling: a hoisted `u := p.unblocker()` reused for two fields of one request is the same
-// decision, and a suffix match on the old spelling would have called it a violation.
+// The guard is now STRUCTURAL rather than a provenance walk: the two params structs hold the
+// unblocker itself, so there is no writer field for a bare closure to be assigned to. What this
+// checks is that no struct grows one back, plus the half that cannot be made structural — that
+// initiatorWriter, which sees through the typed-nil trap, is called from the one method that
+// DECIDES the nil answer and from nowhere else.
 func TestServerRequestLegs_AnswerThroughTheNilWriterSeam(t *testing.T) {
 	t.Parallel()
-	// serverRequestUnblocker.writeUpstream is where the nil answer is DECIDED — it is the only
-	// caller of initiatorWriter, which sees through the typed-nil trap. Every other site inherits
-	// that decision rather than re-making it, which is what the two halves below check.
 	const resolver = "writeUpstream"
-	wirings, resolvers := 0, 0
+	resolvers, structs := 0, 0
 	for _, src := range packageSources(t) {
 		for _, decl := range src.file.Decls {
-			fnDecl, isFunc := decl.(*ast.FuncDecl)
-			if !isFunc || fnDecl.Body == nil {
-				continue
-			}
-			locals := unblockerLocals(fnDecl)
-			// Struct-literal keys AND assignments: `d.writeUpstream = func(...){...}` reintroduces
-			// the same bare closure without ever appearing as a KeyValueExpr.
-			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
-				if isCallTo(n, "initiatorWriter") {
+			if fnDecl, isFunc := decl.(*ast.FuncDecl); isFunc && fnDecl.Body != nil {
+				ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
+					if !isCallTo(n, "initiatorWriter") {
+						return true
+					}
 					resolvers++
 					if fnDecl.Name.Name != resolver {
 						t.Errorf("%s:%d: %s resolves the upstream sink itself; the nil answer is decided once, in the unblocker's %s, and every other site takes it from there",
 							src.name, src.fset.Position(n.Pos()).Line, fnDecl.Name.Name, resolver)
 					}
 					return true
-				}
-				pos, value := writeUpstreamWiring(n)
-				if value == nil {
+				})
+			}
+			// A struct carrying a raw `func(mcp.RPCMsg) error` is a field a caller can fill with a
+			// closure over a concrete writer — the exact shape that panicked past the audit record.
+			// Carry the unblocker instead; it answers AND reports.
+			ast.Inspect(decl, func(n ast.Node) bool {
+				st, isStruct := n.(*ast.StructType)
+				if !isStruct || st.Fields == nil {
 					return true
 				}
-				wirings++
-				if !fromUnblocker(value, locals) {
-					t.Errorf("%s:%d: %s wires writeUpstream as %s; take it from an unblocker so a missing upstream sink is REPORTED once rather than panicking at each site",
-						src.name, src.fset.Position(pos).Line, fnDecl.Name.Name, exprText(src.fset, value))
+				structs++
+				for _, field := range st.Fields.List {
+					if !isMsgWriterFuncType(field.Type) {
+						continue
+					}
+					t.Errorf("%s:%d: a struct field of type %s lets a leg be wired with a bare closure over a concrete writer; hold a serverRequestUnblocker, which decides the nil answer once and records an answer that did not land",
+						src.name, src.fset.Position(field.Pos()).Line, exprText(src.fset, field.Type))
 				}
 				return true
 			})
 		}
 	}
-	require.Positive(t, wirings, "no writeUpstream wiring was found in any non-test file; this guard would pass vacuously")
 	require.Positive(t, resolvers, "no initiatorWriter call was found; the single-decider half is matching on a name nothing calls")
+	require.Positive(t, structs, "no struct declaration was found in any non-test file; the field guard would pass vacuously")
+}
+
+// isMsgWriterFuncType reports whether e spells `func(mcp.RPCMsg) error`, the writer shape a leg must
+// take from an unblocker rather than hold itself.
+func isMsgWriterFuncType(e ast.Expr) bool {
+	fn, isFunc := e.(*ast.FuncType)
+	if !isFunc || fn.Params == nil || fn.Results == nil || len(fn.Params.List) != 1 || len(fn.Results.List) != 1 {
+		return false
+	}
+	param, isSel := fn.Params.List[0].Type.(*ast.SelectorExpr)
+	if !isSel || param.Sel.Name != "RPCMsg" {
+		return false
+	}
+	result, isIdent := fn.Results.List[0].Type.(*ast.Ident)
+	return isIdent && result.Name == "error"
 }
 
 // isCallTo reports whether n is a call of the named package-level function.
@@ -532,57 +549,6 @@ func isCallTo(n ast.Node, name string) bool {
 	}
 	fn, isIdent := call.Fun.(*ast.Ident)
 	return isIdent && fn.Name == name
-}
-
-// unblockerLocals returns the names fn binds to an unblocker() call, so a writer taken from a
-// hoisted unblocker is recognized as having the same provenance as one taken inline. Hoisting is
-// the point — one unblocker per request rather than one per field that wants a writer.
-func unblockerLocals(fn *ast.FuncDecl) map[string]bool {
-	locals := map[string]bool{}
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		assign, isAssign := n.(*ast.AssignStmt)
-		if !isAssign {
-			return true
-		}
-		for i, rhs := range assign.Rhs {
-			if !isUnblockerCall(rhs) || i >= len(assign.Lhs) {
-				continue
-			}
-			if ident, isIdent := assign.Lhs[i].(*ast.Ident); isIdent {
-				locals[ident.Name] = true
-			}
-		}
-		return true
-	})
-	return locals
-}
-
-// isUnblockerCall reports whether e is `<transport>.unblocker()`.
-func isUnblockerCall(e ast.Expr) bool {
-	call, isCall := e.(*ast.CallExpr)
-	if !isCall {
-		return false
-	}
-	sel, isSel := call.Fun.(*ast.SelectorExpr)
-	return isSel && sel.Sel.Name == "unblocker"
-}
-
-// fromUnblocker reports whether e is a `writeUpstream()` call on an unblocker — built inline or
-// bound to one of locals.
-func fromUnblocker(e ast.Expr, locals map[string]bool) bool {
-	call, isCall := e.(*ast.CallExpr)
-	if !isCall {
-		return false
-	}
-	sel, isSel := call.Fun.(*ast.SelectorExpr)
-	if !isSel || sel.Sel.Name != "writeUpstream" {
-		return false
-	}
-	if isUnblockerCall(sel.X) {
-		return true
-	}
-	ident, isIdent := sel.X.(*ast.Ident)
-	return isIdent && locals[ident.Name]
 }
 
 // TestServerRequestLegs_NilWriterReportsRatherThanPanics is the behavioral half, on the two shapes
@@ -604,8 +570,11 @@ func TestServerRequestLegs_NilWriterReportsRatherThanPanics(t *testing.T) {
 			handle: func(context.Context, mcp.RPCMsg) { <-block },
 		})
 	}
+	// A nil write func is the leg with NO upstream sink at all — the case the seam reports rather
+	// than nil-calls. errOut rides the unblocker, which is what writes the report.
+	sinkless := answeringSeam(nil, rec, httpServerRequestLegs, &errOut)
 	require.NotPanics(t, func() {
-		pool.dispatch(context.Background(), msg, serverRequestDispatch{rec: rec, sessionID: "s", errOut: &errOut})
+		pool.dispatch(context.Background(), msg, serverRequestDispatch{rec: rec, sessionID: "s", unblocker: sinkless})
 	}, "the saturation refusal must report a missing upstream sink, not panic on a nil concrete writer")
 	assert.Contains(t, errOut.String(), "no upstream writer to answer it")
 
@@ -614,7 +583,8 @@ func TestServerRequestLegs_NilWriterReportsRatherThanPanics(t *testing.T) {
 	require.NotPanics(t, func() {
 		forwardServerRequest(revisionContext(handshakeRevision),
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: capability.MethodSamplingCreateMessage},
-			serverRequestParams{rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: &errOut})
+			serverRequestParams{rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
+				unblocker: answeringSeam(nil, rec, stdioServerRequestLegs, &errOut)})
 	}, "a denial that answers its initiator must report a missing upstream sink, not panic after writing its record")
 	assert.Contains(t, errOut.String(), "no upstream writer to answer it")
 }
@@ -640,9 +610,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 		rec := &fwdRecorder{}
 		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
 			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
-			writeUpstream: broken,
-			refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
-			leg:           dropStdioRefusalUndeliverable,
+			unblocker: answeringSeam(broken, rec, stdioServerRequestLegs, io.Discard),
 		})
 		require.Len(t, rec.records, 2, "a destroyed answer is a second fact about the request, and the refusal's own record does not carry it")
 		assertRefusalDropRecord(t, rec.records[1], dropStdioRefusalUndeliverable)
@@ -659,10 +627,8 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 			})
 		}
 		pool.dispatch(context.Background(), samplingReq, serverRequestDispatch{
-			rec: rec, sessionID: "s", errOut: io.Discard,
-			writeUpstream: broken,
-			refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
-			leg:           dropHTTPRefusalUndeliverable,
+			rec: rec, sessionID: "s",
+			unblocker: answeringSeam(broken, rec, httpServerRequestLegs, io.Discard),
 		})
 		require.Len(t, rec.records, 2, "the saturation refusal has the same shape and the same gap")
 		assert.Equal(t, codeResourceExhausted, rec.records[0].code)
@@ -676,9 +642,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 		rec := &fwdRecorder{}
 		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
 			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
-			writeUpstream: func(mcp.RPCMsg) error { return nil },
-			refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
-			leg:           dropStdioRefusalUndeliverable,
+			unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, stdioServerRequestLegs, io.Discard),
 		})
 		assert.Len(t, rec.records, 1, "a refusal the initiator received is one event, not two")
 	})
@@ -709,7 +673,7 @@ func TestServerRequestAnswer_DiagnosticIsBoundedAtTheSeam(t *testing.T) {
 	broken := func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") }
 	u := serverRequestUnblocker{
 		reqs: &serverReqTracker{}, sink: sinkFunc(broken), errOut: &errOut,
-		notices: newRefusalNoticeLimiter(),
+		report: dropReport{recs: refusalLimits{notices: newRefusalNoticeLimiter()}.recorders(nil)},
 	}
 	for range 200 {
 		u.write(mcp.RPCMsg{}, "test probe")
@@ -738,7 +702,7 @@ func TestServerRequestForward_UntrackableIDIsRefusedNotForwarded(t *testing.T) {
 	})
 	sub := make(chan mcp.RPCMsg, 1)
 	require.True(t, sess.addSub(sub))
-	ok := sess.broadcastServerRequest(context.Background(), refusalLimits{}, msg)
+	ok := sess.broadcastServerRequest(context.Background(), msg)
 	delivered = len(sub)
 
 	assert.False(t, ok, "a request whose reply could never be routed must not be reported as delivered")
@@ -754,9 +718,8 @@ func TestServerRequestRefusal_DestroyedAnswerRecordIsMetered(t *testing.T) {
 	rec := &fwdRecorder{}
 	fp := serverRequestParams{
 		rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{}, errOut: io.Discard,
-		writeUpstream: func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") },
-		refusalLimits: refusalLimits{records: newRefusalRecordLimiter()},
-		leg:           dropStdioRefusalUndeliverable,
+		unblocker: answeringSeam(func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") },
+			rec, stdioServerRequestLegs, io.Discard),
 	}
 	drops := 0
 	for range 200 {
@@ -848,16 +811,16 @@ func TestServerRequestAdmission_RefusesAnIDLargerThanTheTrackerRetains(t *testin
 	t.Parallel()
 	var reqs serverReqTracker
 	var written []mcp.RPCMsg
+	rec := &fwdRecorder{}
 	u := serverRequestUnblocker{
 		reqs:   &reqs,
 		sink:   sinkFunc(func(m mcp.RPCMsg) error { written = append(written, m); return nil }),
 		errOut: io.Discard,
+		report: displacementReport(rec, verifiedSession("s")),
 	}
 	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
-	rec := &fwdRecorder{}
-	recs := refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec)
 
-	admitted := admitServerRequestID(context.Background(), u, recs, verifiedSession("s"), dropStdioUnroutableID,
+	admitted := admitServerRequestID(context.Background(), u,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: &huge, Method: capability.MethodSamplingCreateMessage})
 
 	assert.False(t, admitted, "a request whose reply could never be routed must not reach the pool, the decision, or the host")
@@ -873,8 +836,8 @@ func TestServerRequestAdmission_RefusesAnIDLargerThanTheTrackerRetains(t *testin
 	// The control: one byte under the cap is admitted and tracked as before.
 	ok := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes-3) + `"`)
 	okMsg := mcp.RPCMsg{JSONRPC: "2.0", ID: &ok, Method: "roots/list"}
-	assert.True(t, admitServerRequestID(context.Background(), u, recs, verifiedSession("s"), dropStdioUnroutableID, okMsg))
-	trackServerRequest(context.Background(), u, recs, verifiedSession("s"), dropStdioDisplaced, okMsg)
+	assert.True(t, admitServerRequestID(context.Background(), u, okMsg))
+	trackServerRequest(context.Background(), u, okMsg)
 	assert.True(t, reqs.tracked(mcp.MsgKey(&ok)))
 }
 
@@ -921,26 +884,6 @@ func TestServerReqTracker_BoundsTheRetainedMethod(t *testing.T) {
 		"bounded through the audit envelope cap, so the tracker and the record it feeds cannot disagree about the limit")
 }
 
-// writeUpstreamWiring reports the value a node binds to a writeUpstream field, in either shape a
-// binding can take: a composite-literal key, or an assignment to the field. An assignment is the
-// shape that reintroduces the bare closure without ever appearing as a composite literal.
-func writeUpstreamWiring(n ast.Node) (token.Pos, ast.Expr) {
-	switch node := n.(type) {
-	case *ast.KeyValueExpr:
-		if key, isIdent := node.Key.(*ast.Ident); isIdent && key.Name == "writeUpstream" {
-			return node.Pos(), node.Value
-		}
-	case *ast.AssignStmt:
-		for i, lhs := range node.Lhs {
-			sel, isSel := lhs.(*ast.SelectorExpr)
-			if isSel && sel.Sel.Name == "writeUpstream" && i < len(node.Rhs) {
-				return node.Pos(), node.Rhs[i]
-			}
-		}
-	}
-	return token.NoPos, nil
-}
-
 // TestAdmitRefusalRecord_NeverWrapsANilRecorder is the regression for a crash, not a record.
 //
 // A proxy with no audit sink (--require-audit=off, or an unopenable path — a shape recordRefusal
@@ -978,18 +921,20 @@ func TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota(t *testing.T) {
 	var reqs serverReqTracker
 	rec := &fwdRecorder{}
 	decided := 0
-	u := serverRequestUnblocker{reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), errOut: io.Discard}
-	recs := refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec)
+	u := serverRequestUnblocker{
+		reqs: &reqs, sink: sinkFunc(func(mcp.RPCMsg) error { return nil }), errOut: io.Discard,
+		report: displacementReport(rec, verifiedSession("s")),
+	}
 	huge := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes+1) + `"`)
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: &huge, Method: capability.MethodSamplingCreateMessage}
 
-	if admitServerRequestID(context.Background(), u, recs, verifiedSession("s"), dropStdioUnroutableID, msg) {
+	if admitServerRequestID(context.Background(), u, msg) {
 		// Only reached if the gate admits; the decision below is what the gate exists to precede.
 		decided++
 		forwardServerRequest(revisionContext(handshakeRevision), msg, serverRequestParams{
 			rec: rec, sessionID: "s", pdp: pdp.AlwaysAllowPDP{}, errOut: io.Discard,
-			forward:       func(context.Context, mcp.RPCMsg) bool { return false },
-			writeUpstream: func(mcp.RPCMsg) error { return nil },
+			forward:   func(context.Context, mcp.RPCMsg) bool { return false },
+			unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
 		})
 	}
 
