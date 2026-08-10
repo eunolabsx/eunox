@@ -151,11 +151,7 @@ func BoundReflectedRevision(version string) string {
 var unsupportedRevisionData = buildUnsupportedRevisionData()
 
 func buildUnsupportedRevisionData() json.RawMessage {
-	supported := capability.PublishedRevisions()
-	versions := make([]string, 0, len(supported))
-	for _, rev := range supported {
-		versions = append(versions, rev.String())
-	}
+	versions := capability.PublishedRevisionNames()
 	data, _ := json.Marshal(struct {
 		Code      string   `json:"code"`
 		Supported []string `json:"supported"`

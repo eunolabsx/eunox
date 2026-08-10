@@ -15,9 +15,8 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// TestBuildUpstreamOpener_PinSelectsTheMethod is the property #245 was filed for: the
-// operator's pin has to reach the WIRE, not merely a label. Before the opener was
-// revision-selected, both rows produced `initialize`.
+// TestBuildUpstreamOpener_PinSelectsTheMethod: the operator's pin has to reach the WIRE, not
+// merely a label. Before the opener was revision-selected, every row produced `initialize`.
 func TestBuildUpstreamOpener_PinSelectsTheMethod(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -44,9 +43,13 @@ func TestBuildUpstreamOpener_PinSelectsTheMethod(t *testing.T) {
 // revision-selected opener sent, or an existing deployment's upstream sees new traffic at
 // session start.
 func TestBuildUpstreamOpener_HandshakeBytesAreUnchanged(t *testing.T) {
-	t.Parallel()
+	// Not parallel, and restoring the SAVED value rather than a literal: proxyVersion is
+	// package-global and buildInitializeParams reads it on every upstream open, so a parallel
+	// writer races every test that opens a leg — and a cleanup that writes back a guessed
+	// default silently reverts whatever a serial test had set.
+	prev := proxyVersion
+	t.Cleanup(func() { proxyVersion = prev })
 	SetProxyVersion("1.2.3")
-	t.Cleanup(func() { SetProxyVersion("dev") })
 
 	msg, err := BuildUpstreamOpenerWithID(UpstreamOpenRevision(""), mcp.RawJSON(`7`))
 	if err != nil {
@@ -139,15 +142,15 @@ func TestDeclareUpstreamRevision(t *testing.T) {
 // TestUpstreamOpenerCompletion: only the revision that HAS a handshake closes one.
 func TestUpstreamOpenerCompletion(t *testing.T) {
 	t.Parallel()
-	notif, wanted, err := UpstreamOpenerCompletion(handshakeRevision)
-	if err != nil || !wanted {
-		t.Fatalf("handshake revision: wanted=%v err=%v, want a completion", wanted, err)
+	notif, wanted := UpstreamOpenerCompletion(handshakeRevision)
+	if !wanted {
+		t.Fatal("handshake revision: want a completion")
 	}
 	if notif.Method != mcp.MethodNotificationsInitialized {
 		t.Errorf("completion method = %q, want %q", notif.Method, mcp.MethodNotificationsInitialized)
 	}
-	if _, wanted, err := UpstreamOpenerCompletion(capability.Revision20260728); err != nil || wanted {
-		t.Errorf("declaring revision: wanted=%v err=%v, want no completion — it has no handshake to close", wanted, err)
+	if _, wanted := UpstreamOpenerCompletion(capability.Revision20260728); wanted {
+		t.Error("declaring revision: want no completion — it has no handshake to close")
 	}
 }
 
@@ -165,8 +168,8 @@ func TestApplyUpstreamOpenerResult_Discover(t *testing.T) {
 	if hs.ServerVersion != "3.2.1" || hs.Instructions != "hi" || hs.Capabilities == nil {
 		t.Errorf("handshake facts = %+v", hs)
 	}
-	if hs.ProtocolVersion != "" {
-		t.Errorf("ProtocolVersion = %q, want empty — a declaring leg negotiates none", hs.ProtocolVersion)
+	if hs.Notice != "" {
+		t.Errorf("Notice = %q, want none — a declaring leg negotiates no version, so a reply carrying none states no disagreement", hs.Notice)
 	}
 
 	for _, tc := range []struct {
@@ -176,6 +179,9 @@ func TestApplyUpstreamOpenerResult_Discover(t *testing.T) {
 	}{
 		{name: "null result", result: `null`, want: "capabilities"},
 		{name: "no serverInfo", result: `{"capabilities":{}}`, want: "serverInfo"},
+		// A discover reply that VOLUNTEERS a version is stating a disagreement, and the
+		// declaring opener must be judged for it exactly as the handshake opener is.
+		{name: "volunteers a contradicting version", result: `{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{}}`, want: "opened at"},
 	} {
 		_, err := ApplyUpstreamOpenerResult(capability.Revision20260728,
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(tc.result)})
@@ -220,8 +226,8 @@ func TestUpstreamOpen_EveryPublishedRevisionHasAnOpener(t *testing.T) {
 	}
 }
 
-// TestPinnedUpstreamLeg_ReachesTheWire is #245's whole claim, asserted against a live
-// upstream rather than against the builders: an operator who pins a revision gets a leg
+// TestPinnedUpstreamLeg_ReachesTheWire is the whole claim, asserted against a live upstream
+// rather than against the builders: an operator who pins a revision gets a leg
 // OPENED, HEADED and DECLARED at that revision, on every request eunox itself originates.
 //
 // Before this, all three named the handshake revision whatever the pin said, so the pin was a
@@ -300,5 +306,110 @@ func TestPinnedUpstreamLeg_ReachesTheWire(t *testing.T) {
 		if req.method == mcp.MethodNotificationsInitialized {
 			t.Error("a declaring leg was sent notifications/initialized; that revision has no handshake to close")
 		}
+	}
+}
+
+// TestDeclareUpstreamRevision_MalformedParamsFailClosed covers the two shapes that look like
+// successes to a naive decoder: params that are the JSON literal `null` (which unmarshals into
+// a map by NILLING it, with no error), and a params body carrying a duplicate key.
+func TestDeclareUpstreamRevision_MalformedParamsFailClosed(t *testing.T) {
+	t.Parallel()
+	// `null` params must not panic, and must not silently produce a declaration-only body: the
+	// caller asked to declare on params it supplied, and eunox cannot tell which it meant.
+	nullParams := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsList,
+		Params: json.RawMessage(`null`)}
+	got, err := DeclareUpstreamRevision(nullParams, capability.Revision20260728)
+	if err != nil {
+		t.Fatalf("null params: %v", err)
+	}
+	if declared, present, err := mcp.DeclaredRevisionOf(got); err != nil || !present || declared != capability.Revision20260728 {
+		t.Errorf("null params produced %s (declared=%q present=%v err=%v)", got.Params, declared, present, err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		params string
+	}{
+		{name: "duplicate key", params: `{"cursor":"a","cursor":"b"}`},
+		{name: "not an object", params: `["cursor"]`},
+		{name: "_meta is not an object", params: `{"_meta":7}`},
+	} {
+		msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsList,
+			Params: json.RawMessage(tc.params)}
+		if _, err := DeclareUpstreamRevision(msg, capability.Revision20260728); err == nil {
+			t.Errorf("%s: accepted %s, want a fail-closed refusal", tc.name, tc.params)
+		}
+	}
+}
+
+// TestDeclareUpstreamRevision_MergesIntoAnExistingMeta: the declaration joins whatever `_meta`
+// the request already carries rather than replacing it. Replacing it would silently drop a
+// progress token or an attribution block, with the member's absence at the upstream as the
+// only symptom.
+func TestDeclareUpstreamRevision_MergesIntoAnExistingMeta(t *testing.T) {
+	t.Parallel()
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsList,
+		Params: json.RawMessage(`{"_meta":{"progressToken":"tok-1"}}`)}
+	got, err := DeclareUpstreamRevision(msg, capability.Revision20260728)
+	if err != nil {
+		t.Fatalf("declaring: %v", err)
+	}
+	var params struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	if err := json.Unmarshal(got.Params, &params); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if string(params.Meta["progressToken"]) != `"tok-1"` {
+		t.Errorf("the declaration replaced the request's own _meta: %s", got.Params)
+	}
+	if string(params.Meta[capability.MetaKeyProtocolVersion]) != `"2026-07-28"` {
+		t.Errorf("declared version missing from the merged _meta: %s", got.Params)
+	}
+}
+
+// TestUpstreamOpenRevision_UnsupportedPinFailsClosed: this is an exported resolver behind an
+// exported option field, and the branch an unvalidated value would otherwise fall into is the
+// DECLARING one — the newest wire behavior, reached by a value nobody checked.
+func TestUpstreamOpenRevision_UnsupportedPinFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, pin := range []capability.Revision{"", "2025-06-18", "latest", "2026-07-29"} {
+		if got := UpstreamOpenRevision(pin); got != handshakeRevision {
+			t.Errorf("UpstreamOpenRevision(%q) = %q, want the handshake revision — an unrecognized pin must not select the declaring opener", pin, got)
+		}
+	}
+}
+
+// TestInitializeAcrossRevisions_IsRefusedNotTranslated: a host handshake reaching a leg that
+// speaks a handshake-less revision must be refused, not answered from that leg's discovery
+// data. Answering would stamp the handshake revision over a capability object in the newer
+// revision's shape — a cross-revision translation this build does not perform — and the host
+// would then feature-detect off methods eunox denies fail-closed.
+func TestInitializeAcrossRevisions_IsRefusedNotTranslated(t *testing.T) {
+	t.Parallel()
+	sess := newTestSession(&httpSession{
+		upstreamRev:  capability.Revision20260728,
+		upstreamCaps: map[string]interface{}{"subscriptions": map[string]interface{}{}},
+		done:         make(chan struct{}),
+	})
+	resp := sess.buildInitResponse(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize})
+	if resp.Error == nil {
+		t.Fatalf("the handshake was answered from a declaring leg: %s", resp.Result)
+	}
+	if resp.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
+		t.Errorf("code = %d, want the -32022 revision refusal", resp.Error.Code)
+	}
+	if strings.Contains(string(resp.Result), "subscriptions") {
+		t.Error("the declaring leg's capability object reached the host")
+	}
+
+	// The matched case is unaffected: a handshake leg still answers its own handshake.
+	ok := newTestSession(&httpSession{
+		upstreamRev:  handshakeRevision,
+		upstreamCaps: map[string]interface{}{"tools": map[string]interface{}{}},
+		done:         make(chan struct{}),
+	})
+	if resp := ok.buildInitResponse(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize}); resp.Error != nil {
+		t.Errorf("a matched handshake was refused: %+v", resp.Error)
 	}
 }

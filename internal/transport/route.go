@@ -40,7 +40,7 @@ type UpstreamRoute struct {
 	upstreamAuthHeader    string
 	upstreamTLSSkipVerify bool
 	// upstreamProtocolVersion is the operator's explicit protocol-revision pin for this
-	// upstream; empty means probe it from the handshake. Per route, not per proxy, because
+	// upstream; empty opens the leg with the handshake. Per route, not per proxy, because
 	// a gateway's upstreams migrate on independent schedules.
 	upstreamProtocolVersion capability.Revision
 

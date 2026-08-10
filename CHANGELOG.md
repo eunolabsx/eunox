@@ -323,16 +323,24 @@ Section conventions:
 
 ### Changed
 
-- **An upstream handshake that contradicts the leg is refused rather than downgraded.**
-  An `initialize` answering a `protocolVersion` this build does not speak used to resolve
+- **An upstream handshake that contradicts the leg is judged rather than swallowed.** An
+  `initialize` answering a `protocolVersion` this build does not speak used to resolve
   silently to `2025-11-25`, so eunox stamped every later request with a header naming a
   negotiation that never happened; nothing else caught it, since the drift check compares
-  `serverInfo.version`, not this. It now refuses the leg at session start, as does an answer
-  naming a revision this build DOES speak other than the one offered — continuing would mean
-  speaking a revision over a leg opened with a method that revision removed. The refusal
-  names both versions and bounds the upstream's own string, so it cannot size or drive the
-  console line. **Breaking** for an upstream that reports a revision outside
-  `2025-11-25` / `2026-07-28`.
+  `serverInfo.version`, not this. The two disagreements now get different answers: a revision
+  this build DOES speak other than the one offered **refuses the leg** at session start
+  (continuing would mean speaking a revision over a leg opened with a method that revision
+  removed), while a revision outside the published set is **reported on stderr** and the leg
+  continues where it was opened. The notice bounds and strips the upstream's own string, so it
+  cannot size or drive the console line. No behavior change for an upstream on an unpublished
+  revision beyond the new warning.
+- **A pin that could never form a matched pair is refused instead of establishing a dead
+  route.** `protocolVersion` naming a revision with no handshake is rejected at config load
+  under `transport: http` (an HTTP session is minted by `initialize`, so the host context is
+  always `2025-11-25`), and a host `initialize` reaching a leg speaking such a revision is
+  refused `UNSUPPORTED_PROTOCOL_VERSION` rather than answered from that leg's
+  `server/discover` data — synthesizing one revision's handshake from the other's capability
+  object is the translation the mismatched-pair boundary governs.
 - **`--upstream-protocol-version` no longer refuses a subprocess upstream.** The flag was
   rejected there because the pin reached no wire behavior on that transport — it only
   selected a version header a subprocess never sees. It now selects the opener, which a

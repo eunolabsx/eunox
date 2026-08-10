@@ -81,7 +81,7 @@ type httpSession struct {
 	idCounter             int64
 
 	// upstreamRev is the protocol revision this session speaks to its upstream, decided at
-	// CONSTRUCTION from the route's pin (upstreamOpenRevision) and read-only after — it picks
+	// CONSTRUCTION from the route's pin (UpstreamOpenRevision) and read-only after — it picks
 	// the opener, so it cannot be a conclusion drawn from the opener's own reply. hostRev is
 	// the revision the HOST context was opened at. The two are separate because host and
 	// upstream migrate independently, and bridging that gap is what a proxy is for.
@@ -276,6 +276,9 @@ func (s *httpSession) touchRequest() {
 // buildInitResponse builds an initialize response for the host using the
 // upstream capabilities gathered during session startup.
 func (s *httpSession) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
+	if resp, refused := refuseInitializeAcrossRevisions(msg.ID, s.upstreamRev); refused {
+		return resp
+	}
 	return buildInitializeResponse(msg.ID, s.upstreamCaps, s.upstreamInstructions)
 }
 
@@ -1082,7 +1085,7 @@ func (s *httpSession) initUpstream(ctx context.Context) error {
 		// pipe open indefinitely, and this giving up does not mean the goroutine stopped
 		// reading it — handshakeStopped, not this return, is what callers must join.
 		waitBounded(done, s.shutdownBudget(), "upstream initialize output stream", s.errOut())
-		return fmt.Errorf("upstream did not complete initialize: %w", ctx.Err())
+		return fmt.Errorf("upstream did not complete its opener: %w", ctx.Err())
 	}
 }
 
@@ -1106,11 +1109,12 @@ func (s *httpSession) runInitHandshake() error {
 	if err != nil {
 		return err
 	}
+	reportUpstreamOpenNotice(s.errOut(), hs)
 	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
 
-	notif, wanted, err := UpstreamOpenerCompletion(s.upstreamRev)
-	if err != nil || !wanted {
-		return err
+	notif, wanted := UpstreamOpenerCompletion(s.upstreamRev)
+	if !wanted {
+		return nil
 	}
 	return s.upWriter.Write(notif)
 }

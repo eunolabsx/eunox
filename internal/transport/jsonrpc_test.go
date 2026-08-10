@@ -712,7 +712,7 @@ func TestServerReqTracker_TalliesEvictions(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// applyInitializeResult fail-closed
+// ApplyUpstreamOpenerResult fail-closed (the handshake opener)
 // ---------------------------------------------------------------------------
 
 // TestApplyInitializeResult_RejectsErrorResponse: a JSON-RPC
@@ -724,10 +724,10 @@ func TestApplyInitializeResult_RejectsErrorResponse(t *testing.T) {
 		ID:      mcp.RawJSON("1"),
 		Error:   &mcp.RPCError{Code: -32600, Message: "unsupported protocol version"},
 	}
-	hs, err := applyInitializeResult(resp)
+	hs, err := ApplyUpstreamOpenerResult(handshakeRevision, resp)
 	caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 	if err == nil {
-		t.Fatal("applyInitializeResult must fail on an error response")
+		t.Fatal("ApplyUpstreamOpenerResult must fail on an error response")
 	}
 	if caps != nil || ver != "" || instructions != "" {
 		t.Errorf("error response must yield no caps/version/instructions, got caps=%v ver=%q instructions=%q", caps, ver, instructions)
@@ -780,10 +780,10 @@ func TestApplyInitializeResult_FailsClosedOnMalformedShapes(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			hs, err := applyInitializeResult(tc.resp)
+			hs, err := ApplyUpstreamOpenerResult(handshakeRevision, tc.resp)
 			caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 			if err == nil {
-				t.Fatalf("applyInitializeResult must fail closed on a %s", tc.name)
+				t.Fatalf("ApplyUpstreamOpenerResult must fail closed on a %s", tc.name)
 			}
 			if caps != nil || ver != "" || instructions != "" {
 				t.Errorf("malformed response must yield no caps/version/instructions, got caps=%v ver=%q instructions=%q", caps, ver, instructions)
@@ -809,10 +809,10 @@ func TestApplyInitializeResult_AcceptsValidResult(t *testing.T) {
 		t.Fatalf("marshal result: %v", err)
 	}
 	resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)}
-	hs, err := applyInitializeResult(resp)
+	hs, err := ApplyUpstreamOpenerResult(handshakeRevision, resp)
 	caps, ver := hs.Capabilities, hs.ServerVersion
 	if err != nil {
-		t.Fatalf("applyInitializeResult rejected a valid result: %v", err)
+		t.Fatalf("ApplyUpstreamOpenerResult rejected a valid result: %v", err)
 	}
 	if ver != "9.9.9" {
 		t.Errorf("serverVersion = %q, want %q", ver, "9.9.9")
@@ -837,10 +837,10 @@ func TestApplyInitializeResult_PreservesInstructions(t *testing.T) {
 		t.Fatalf("marshal result: %v", err)
 	}
 	resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)}
-	hs, err := applyInitializeResult(resp)
+	hs, err := ApplyUpstreamOpenerResult(handshakeRevision, resp)
 	caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 	if err != nil {
-		t.Fatalf("applyInitializeResult rejected a valid result: %v", err)
+		t.Fatalf("ApplyUpstreamOpenerResult rejected a valid result: %v", err)
 	}
 	if ver != "1.0.0" {
 		t.Errorf("serverVersion = %q, want %q", ver, "1.0.0")

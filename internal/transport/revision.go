@@ -6,7 +6,9 @@
 // The two are tracked independently on purpose: a proxy exists to stand between peers that
 // disagree, and the common migration deployment is a current host in front of a lagging
 // upstream (or the reverse). The host-side result is established per context and CHECKED per
-// request; the upstream-side result is probed once and pinned for the route's life.
+// request; the upstream-side result is DECIDED once, before the leg opens, and pinned for the
+// route's life (see upstream_open.go — it selects the opener, so it cannot be a conclusion
+// drawn from the opener's own reply).
 
 package transport
 
@@ -68,9 +70,15 @@ type hostLeg struct {
 // prologue below is what is common underneath both — negotiation, its refusal, and its debt to
 // a blocked initiator.
 //
-// Allocation-neutral, measured rather than assumed: `negotiate` stores none of these fields, so
-// escape analysis keeps the value and its closures on the stack. BenchmarkStdioProxy and
-// BenchmarkHTTPProxy report the same allocs/op and B/op as before this type existed.
+// It COSTS three heap allocations per host message, measured rather than assumed: `negotiate`
+// calls its three fields indirectly, so the receiver leaks (`-gcflags=-m`: "leaking param: g")
+// and every closure spills. BenchmarkHTTPProxy moves +3 allocs/op and ~+65 B/op on each proxied
+// subtest — around 1% of a request that already allocates ~330 times. Accepted rather than
+// optimized away, because the two shapes that would remove it both undo the point: hoisting the
+// resolve out of `negotiate` puts the sequence back at the call sites, and boxing the three
+// hooks into an interface only moves the allocation to the transport that cannot supply a
+// long-lived receiver. BenchmarkStdioProxy cannot see any of this — it drives handleHostRequest
+// directly, below serveHost, which is the only caller of stdio's negotiateHostRevision.
 //
 // Revocation is deliberately NOT part of this prologue, though the gate order places it next.
 // For the REQUEST framing the kill check must be taken AFTER the decision turn, freshly, so a
@@ -168,7 +176,7 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 }
 
 // upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg: the one
-// the leg was OPENED at (upstreamOpenRevision), which is what the leg's own field already
+// the leg was OPENED at (UpstreamOpenRevision), which is what the leg's own field already
 // holds. True of a subprocess upstream, which reads bare JSON-RPC and no header at all, as
 // much as of a remote HTTP one — the opener's method differs either way.
 //
@@ -178,10 +186,14 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 // method, eunox's own `_meta` declaration) and what is CHECKED (checkUpstreamHonorable) read
 // this one expression, so a pinned leg cannot be addressed as one revision and held to another.
 //
-// The empty leg revision resolves to capability.DefaultRevision for the reason every other
-// empty carrier does: a leg built without one never opened at anything else.
+// An unset (or unspeakable) leg revision resolves through UpstreamOpenRevision, the SAME
+// resolver that decided what to open with — not through resolveRevision, which answers the
+// HOST-side empty-carrier question and lands on capability.DefaultRevision. The two agree only
+// while DefaultRevision and the handshake revision are the same value, and the day the default
+// advances they would open a leg with `initialize` while heading and checking it as something
+// else. One resolver is what keeps that from being two.
 func upstreamAddressedRevision(legRev capability.Revision) capability.Revision {
-	return resolveRevision(legRev)
+	return UpstreamOpenRevision(legRev)
 }
 
 // checkUpstreamHonorable refuses a message this proxy cannot forward without contradicting
@@ -274,11 +286,3 @@ const (
 	refusedReplyUpstreamError     = "eunox: the host's reply declared an MCP protocol revision that could not be established; the reply was refused and cannot be relayed"
 	gateRefusedReplyUpstreamError = "eunox: the host's reply was refused by this session's security gates; the reply was refused and cannot be relayed"
 )
-
-// The upstream-side revision is no longer resolved FROM the handshake. It is decided before
-// the leg is opened (upstreamOpenRevision, in upstream_open.go) and the handshake's own answer
-// is CHECKED against it (checkNegotiatedRevision) rather than allowed to set it.
-//
-// The inversion is the whole of what made the pin a control: a revision derived from a
-// handshake cannot select the opener that performs the handshake, so the pin could only ever
-// relabel a leg that had already been opened as something else.

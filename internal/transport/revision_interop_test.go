@@ -4,19 +4,18 @@
 // The old x old interop cell: a 2025-11-25 host and a LIVE 2025-11-25 upstream, one on each
 // side of a real proxy, with the exact BYTES asserted in both directions.
 //
-// revision_wire_test.go pins the responses the proxy GENERATES. What it cannot reach — and what
-// the negotiation spine's regression criterion names as its arbiter — is a live upstream on the
-// other side: the leg's opener, the header its requests carry, and whether a host's own params
-// cross to it untouched were all covered by field-level assertions, which pass a changed
-// envelope, a dropped member, or an added `_meta` block.
+// revision_wire_test.go pins the responses the proxy GENERATES. What it cannot reach is a live
+// upstream on the other side: the leg's opener, the header its requests carry, and whether a
+// host's own params cross to it untouched were all covered by field-level assertions, which
+// pass a changed envelope, a dropped member, or an added `_meta` block.
 //
 // Both transports, because their upstream legs are different code (the HTTP session's own
 // client, and stdio's remote bridge) reaching one shared opener, and a cell on one of them
 // would not have caught a change to the other.
 //
-// The e2e matrix's four Docker cells are still separate work; what is here is the same cell in
-// process, and it is what makes the upstream half of the old-revision surface byte-stable
-// rather than field-stable.
+// The out-of-process interop matrix is separate work; what is here is the same cell in process,
+// and it is what makes the upstream half of the old-revision surface byte-stable rather than
+// field-stable.
 
 package transport
 
@@ -234,7 +233,7 @@ func TestOldRevisionInterop_StdioTransport(t *testing.T) {
 	}()
 	t.Cleanup(p.closeUpstreamInput)
 
-	var hostOut lockedBuffer
+	var hostOut syncBuffer
 	pr, pw := io.Pipe()
 	p.hostReader = mcp.NewMsgReader(pr)
 	p.hostWriter = mcp.NewMsgWriter(&hostOut)
@@ -265,25 +264,6 @@ const (
 	oldFilteredToolsList = `{"tools":[{"name":"read_file","description":"d"}]}`
 	oldAllowedCallResult = `{"content":[{"type":"text","text":"ok"}]}`
 )
-
-// lockedBuffer is a bytes.Buffer safe for the concurrent writes serveHost's per-request handler
-// goroutines make through one MsgWriter.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
 
 // decodeHostLines splits the host stream into messages keyed by their JSON-RPC id. Keyed
 // rather than ordered: serveHost dispatches each request on its own goroutine, so the reply

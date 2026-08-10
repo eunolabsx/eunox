@@ -77,9 +77,9 @@ type httpUpstream struct {
 
 	mu     sync.Mutex
 	sessID string // upstream Mcp-Session-Id, captured from the initialize response
-	// rev is the protocol revision this leg speaks, captured from the initialize response
-	// alongside sessID (and overridden by an operator pin). Guarded by mu for the same
-	// reason: it is written once at the handshake and read by every later POST.
+	// rev is the protocol revision this leg speaks — decided from the operator's pin before the
+	// leg is opened, not captured from a reply. Guarded by mu because it is written once at
+	// construction and read by every later POST, including the opener's own. See setRevision.
 	rev capability.Revision
 
 	// notices is this bridge's diagnostic CHANNEL: where its lines go AND what bounds them, as one
@@ -289,7 +289,11 @@ func (h *httpUpstream) do(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, http
 	return DoMCPHTTP(ctx, h.client, h.endpoint, msg, sid, h.authHeader, rev)
 }
 
-// setRevision pins the protocol revision this leg speaks, once the handshake has settled it.
+// setRevision pins the protocol revision this leg speaks. Called from connectUpstream, BEFORE
+// the opener runs — the opener of a declaring revision is an ordinary request and carries the
+// MCP-Protocol-Version header like any other, so a bridge still holding the empty revision
+// would open the leg naming a version this proxy is not speaking. Do not move it after the
+// open.
 func (h *httpUpstream) setRevision(rev capability.Revision) {
 	h.mu.Lock()
 	h.rev = rev

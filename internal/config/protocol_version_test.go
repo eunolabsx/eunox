@@ -29,8 +29,11 @@ func TestLoadGatewayConfig_ProtocolVersionRoundTrip(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			// Host transport stdio: a pin naming a revision with no handshake is refused over
+			// the HTTP host transport, since an HTTP session is opened by `initialize`.
 			cfg, err := LoadGatewayConfig(writeConfig(t, fmt.Sprintf(`
 schemaVersion: "0.1"
+transport: stdio
 defaults:
   enforcement: audit
 upstreams:
@@ -62,6 +65,7 @@ func TestLoadGatewayConfig_RejectsUnspokenProtocolVersion(t *testing.T) {
 	for _, bad := range []string{"2026-07-27", "2099-01-01", "latest", "AUTO", "1.0"} {
 		_, err := LoadGatewayConfig(writeConfig(t, fmt.Sprintf(`
 schemaVersion: "0.1"
+transport: stdio
 defaults:
   enforcement: audit
 upstreams:
@@ -115,5 +119,51 @@ func TestProtocolVersion_EveryPublishedRevisionIsAccepted(t *testing.T) {
 		if err := validateProtocolVersion("mock", rev.String()); err != nil {
 			t.Errorf("published revision %q is refused by the config loader: %v", rev, err)
 		}
+	}
+}
+
+// TestLoadGatewayConfig_RefusesHandshakelessPinOnHTTPHost: a pin the HOST leg could never match
+// is refused at load rather than at the first request.
+//
+// An HTTP-hosted session is minted by `initialize`, so its host context is always the handshake
+// revision. Pinning an upstream to a revision that removed `initialize` builds a route whose
+// every forwarding request is refused as a mismatched pair for the session's life — the failure
+// an operator would otherwise diagnose as an upstream fault, on a route that started clean.
+func TestLoadGatewayConfig_RefusesHandshakelessPinOnHTTPHost(t *testing.T) {
+	t.Parallel()
+	newer := capability.Revision20260728.String()
+	_, err := LoadGatewayConfig(writeConfig(t, fmt.Sprintf(`
+schemaVersion: "0.1"
+defaults:
+  enforcement: audit
+upstreams:
+  - name: mock
+    transport: stdio
+    command: echo
+    protocolVersion: %q
+`, newer)))
+	if err == nil {
+		t.Fatalf("protocolVersion %q was accepted on the HTTP host transport; the route could never forward anything", newer)
+	}
+	for _, want := range []string{"protocolVersion", "mock", HostTransportHTTP} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %q, got: %v", want, err)
+		}
+	}
+
+	// The same pin over the stdio host transport is admissible: a peer there opens its context
+	// by declaring a revision, so a host and a pinned upstream on the same one is reachable.
+	if _, err := LoadGatewayConfig(writeConfig(t, fmt.Sprintf(`
+schemaVersion: "0.1"
+transport: stdio
+defaults:
+  enforcement: audit
+upstreams:
+  - name: mock
+    transport: stdio
+    command: echo
+    protocolVersion: %q
+`, newer))); err != nil {
+		t.Errorf("protocolVersion %q must be accepted over the stdio host transport: %v", newer, err)
 	}
 }

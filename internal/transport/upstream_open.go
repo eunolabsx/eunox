@@ -18,18 +18,18 @@
 // far has, so an existing deployment's upstream sees byte-identical traffic at session start.
 //
 // ADR-0006 also describes a PROBE for the `auto` case: open with `server/discover` and fall
-// back to `initialize` on method-not-found. That half is deliberately not activated here. It
-// changes what every 2025-11-25 upstream sees before eunox knows anything about it, which is
-// the one thing this release's regression invariant forbids, and its arbiter is the interop
-// matrix that does not exist yet. Selecting the opener from the pin needs neither: an operator
-// who writes `protocolVersion: "2026-07-28"` has stated the fact the probe would have gone
-// looking for.
+// back to `initialize` on method-not-found. That half is deliberately not activated here,
+// because it changes what every 2025-11-25 upstream sees before eunox knows anything about it,
+// and the interop matrix that would arbitrate the change does not exist. Selecting the opener
+// from the pin needs neither: an operator who writes `protocolVersion: "2026-07-28"` has stated
+// the fact the probe would have gone looking for.
 
 package transport
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -45,8 +45,15 @@ import (
 // it is validating cannot open the same configured upstream at different revisions. The empty
 // pin resolving to the handshake revision is what keeps `auto` byte-identical to the releases
 // before the pin existed.
+//
+// A pin this build does not speak resolves to the handshake revision rather than being taken
+// verbatim. The config and flag loaders already refuse one, but this is an EXPORTED resolver
+// behind an exported option field, and the branch an unrecognized value would otherwise fall
+// into is the DECLARING one — the newest wire behavior, reached by a value nobody validated,
+// which is the fail-open direction. Resolving it to the surface eunox already shipped is the
+// same rule every other unresolvable revision takes.
 func UpstreamOpenRevision(pin capability.Revision) capability.Revision {
-	if pin != "" {
+	if pin.Supported() {
 		return pin
 	}
 	return handshakeRevision
@@ -63,18 +70,26 @@ func declaresPerRequestRevision(rev capability.Revision) bool {
 	return resolveRevision(rev) != handshakeRevision
 }
 
-// revisionDeclaration builds the `_meta` block eunox stamps on the requests it originates on a
-// declaring leg: the revision, and the empty client-capabilities object its `initialize` params
-// already offer (a proxy advertises no capabilities of its own upstream).
-func revisionDeclaration(rev capability.Revision) map[string]interface{} {
-	return map[string]interface{}{
-		capability.MetaKeyProtocolVersion:    rev.String(),
-		capability.MetaKeyClientCapabilities: map[string]interface{}{},
+// revisionDeclaration returns the `_meta` members eunox stamps on the requests it originates on
+// a declaring leg: the revision, and the empty client-capabilities object its `initialize`
+// params already offer (a proxy advertises no capabilities of its own upstream).
+//
+// Per member rather than as one pre-encoded block, so DeclareUpstreamRevision can merge them
+// into whatever `_meta` the request already carries instead of replacing it.
+func revisionDeclaration(rev capability.Revision) map[string]json.RawMessage {
+	version, _ := json.Marshal(rev.String())
+	return map[string]json.RawMessage{
+		capability.MetaKeyProtocolVersion:    version,
+		capability.MetaKeyClientCapabilities: json.RawMessage(`{}`),
 	}
 }
 
+// metaMember is the params member every MCP request carries its out-of-band metadata in.
+const metaMember = "_meta"
+
 // DeclareUpstreamRevision returns msg with the leg's per-request revision declaration merged
-// into its params, or msg unchanged on a leg that negotiated once.
+// into its params — and into whatever `_meta` block they already carry — or msg unchanged on a
+// leg that negotiated once.
 //
 // Only for requests eunox ORIGINATES — the opener and the session-start drift probe. A host's
 // own params are forwarded verbatim, `_meta` included: adding a member to them is translation,
@@ -82,39 +97,59 @@ func revisionDeclaration(rev capability.Revision) map[string]interface{} {
 // stated in docs/conformance.md rather than papered over here: a host message reaching a
 // declaring leg must carry its own declaration, which on a matched pair it already does.
 //
-// Fails closed rather than returning msg unmodified on a marshal error. These params are
-// eunox's own, so an error here is a bug rather than a wire input — but a leg that silently
-// dropped the declaration would be refused per request by the upstream, one layer away from
-// the cause.
+// Merged at BOTH levels, not just the params one. Replacing `_meta` wholesale would silently
+// drop whatever else the caller put there — a progress token, an attribution block — and the
+// only symptom would be the member's absence at the upstream. Nothing eunox originates carries
+// one today; that is why the wholesale write survived review, and why the merge is written now
+// rather than the first time it matters.
+//
+// Fails closed on every malformed shape, including the two that look like successes: params
+// that decode to JSON `null` (which unmarshals into a map by NILLING it, with no error, so an
+// unguarded write panics), and params carrying a duplicate key (mcp.DecodeParams refuses those,
+// where a plain Unmarshal would resolve one last-wins and re-emit normalized bytes — the
+// enforcement-versus-upstream parser differential mcp.DeclaredRevision refuses for the same
+// reason).
 func DeclareUpstreamRevision(msg mcp.RPCMsg, rev capability.Revision) (mcp.RPCMsg, error) {
 	if !declaresPerRequestRevision(rev) {
 		return msg, nil
 	}
+	fail := func(err error) (mcp.RPCMsg, error) {
+		return mcp.RPCMsg{}, fmt.Errorf("declaring revision %s on %s: %w", rev, msg.Method, err)
+	}
 	fields := map[string]json.RawMessage{}
 	if len(msg.Params) > 0 {
-		if err := json.Unmarshal(msg.Params, &fields); err != nil {
-			return mcp.RPCMsg{}, fmt.Errorf("declaring revision %s on %s: params are not a JSON object: %w", rev, msg.Method, err)
+		if err := mcp.DecodeParams(msg.Params, &fields); err != nil {
+			return fail(fmt.Errorf("params are not a JSON object: %w", err))
 		}
 	}
-	meta, err := json.Marshal(revisionDeclaration(rev))
-	if err != nil {
-		return mcp.RPCMsg{}, fmt.Errorf("declaring revision %s on %s: %w", rev, msg.Method, err)
+	// A `null` params body decodes without error and leaves the map nil, so re-make it rather
+	// than writing into nil.
+	if fields == nil {
+		fields = map[string]json.RawMessage{}
 	}
-	fields["_meta"] = meta
+	meta := map[string]json.RawMessage{}
+	if existing, ok := fields[metaMember]; ok && len(existing) > 0 {
+		if err := mcp.DecodeParams(existing, &meta); err != nil {
+			return fail(fmt.Errorf("existing %s is not a JSON object: %w", metaMember, err))
+		}
+		if meta == nil {
+			meta = map[string]json.RawMessage{}
+		}
+	}
+	for key, value := range revisionDeclaration(rev) {
+		meta[key] = value
+	}
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return fail(err)
+	}
+	fields[metaMember] = encoded
 	raw, err := json.Marshal(fields)
 	if err != nil {
-		return mcp.RPCMsg{}, fmt.Errorf("declaring revision %s on %s: %w", rev, msg.Method, err)
+		return fail(err)
 	}
 	msg.Params = raw
 	return msg, nil
-}
-
-// openerMethod returns the method that opens a leg at rev.
-func openerMethod(rev capability.Revision) string {
-	if declaresPerRequestRevision(rev) {
-		return mcp.MethodServerDiscover
-	}
-	return mcp.MethodInitialize
 }
 
 // buildInitializeParams marshals the initialize params the proxy sends to a handshake-revision
@@ -144,12 +179,10 @@ func buildInitializeParams() json.RawMessage {
 // member for a request whose schema this build cannot check would be exactly the guess the
 // fail-closed posture exists to avoid.
 func BuildUpstreamOpenerWithID(rev capability.Revision, id *json.RawMessage) (mcp.RPCMsg, error) {
-	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: openerMethod(rev)}
 	if !declaresPerRequestRevision(rev) {
-		msg.Params = buildInitializeParams()
-		return msg, nil
+		return mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: mcp.MethodInitialize, Params: buildInitializeParams()}, nil
 	}
-	return DeclareUpstreamRevision(msg, rev)
+	return DeclareUpstreamRevision(mcp.RPCMsg{JSONRPC: "2.0", ID: id, Method: mcp.MethodServerDiscover}, rev)
 }
 
 // buildUpstreamOpener constructs the opener with the id derived from idCounter so the caller
@@ -167,12 +200,32 @@ func buildUpstreamOpener(rev capability.Revision, idCounter int64) (mcp.RPCMsg, 
 //
 // Exported for the CLI probe, which opens its own leg and owes the upstream the same
 // completion the proxy does.
-func UpstreamOpenerCompletion(rev capability.Revision) (mcp.RPCMsg, bool, error) {
+//
+// No error return: the notification carries no params, and mcp.NotificationMsg marshals
+// nothing in that case, so there is nothing here that can fail. An always-nil error forced
+// three different idioms across five call sites, one of which (`if err != nil || !wanted {
+// return err }`) returns nil to mean "nothing to do" and reads as a bug.
+func UpstreamOpenerCompletion(rev capability.Revision) (mcp.RPCMsg, bool) {
 	if declaresPerRequestRevision(rev) {
-		return mcp.RPCMsg{}, false, nil
+		return mcp.RPCMsg{}, false
 	}
-	notif, err := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
-	return notif, true, err
+	notif, _ := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
+	return notif, true
+}
+
+// reportUpstreamOpenNotice writes an opener's non-fatal disagreement to a leg's diagnostic
+// stream, or nothing when there is none.
+//
+// Exempt from the notice budget by the shape every caller shares: it runs once per LEG OPEN,
+// which costs an upstream spawn or handshake, so a peer cannot drive it at a per-frame rate.
+// One function rather than three inline writes so the three transports cannot disagree about
+// whether a disagreement is reported at all — the silence this notice exists to end was
+// itself three sites agreeing to say nothing.
+func reportUpstreamOpenNotice(errOut io.Writer, hs UpstreamHandshake) {
+	if hs.Notice == "" {
+		return
+	}
+	_, _ = fmt.Fprintf(resolvedErrOut(errOut), "[eunox] WARN upstream protocol revision: %s\n", hs.Notice)
 }
 
 // UpstreamHandshake is what a validated upstream opener reply yields.
@@ -187,23 +240,30 @@ type UpstreamHandshake struct {
 	ServerVersion string
 	// Instructions is the upstream's optional instructions string.
 	Instructions string
-	// ProtocolVersion is the revision the upstream NEGOTIATED, verbatim rather than parsed —
-	// empty on a declaring leg, which negotiates none (the client states it per request, so
-	// there is no field for an upstream to answer with). Carried rather than resolved here so
-	// checkNegotiatedRevision is the one place a reported version is judged.
-	ProtocolVersion string
+	// Notice is a non-fatal disagreement the caller must SURFACE rather than swallow: the
+	// upstream answered a protocol version this build does not speak, so the leg continues at
+	// the revision it was opened at. Empty when there is nothing to report. It is a return
+	// value rather than a stderr write here because this function is shared with the CLI probe,
+	// which writes to its own stream. See checkNegotiatedRevision for why this is a notice
+	// rather than a refusal.
+	Notice string
 }
 
 // openerResult extracts the success result bytes from an opener reply, failing closed on any
 // non-success shape rather than handing the caller a session backed by an unconfirmed
 // upstream. method names the opener in the error, since the two are told apart by nothing else
 // on this path.
+//
+// The exactly-one-of-result/error shape is isMalformedResponse's, not a fourth hand-written
+// spelling of it: this is the ONLY well-formedness gate the subprocess and local-HTTP openers
+// pass (they read through awaitStartupReply, which does not run correlateUpstreamReply), so a
+// reply carrying BOTH members must be refused here rather than silently read as a rejection.
 func openerResult(method string, resp mcp.RPCMsg) (json.RawMessage, error) {
+	if isMalformedResponse(resp) {
+		return nil, fmt.Errorf("upstream %s response carried neither result nor error (or both)", method)
+	}
 	if resp.Error != nil {
 		return nil, fmt.Errorf("upstream %s rejected: %s (code %d)", method, resp.Error.Message, resp.Error.Code)
-	}
-	if resp.Result == nil {
-		return nil, fmt.Errorf("upstream %s response carried neither result nor error", method)
 	}
 	return resp.Result, nil
 }
@@ -211,67 +271,41 @@ func openerResult(method string, resp mcp.RPCMsg) (json.RawMessage, error) {
 // ApplyUpstreamOpenerResult validates the reply to a leg opened at rev and extracts the
 // handshake facts. Exported and shared with the CLI's live-upstream probe so the proxy and CLI
 // cannot diverge on what counts as a valid open.
+//
+// Both openers reach checkNegotiatedRevision, not just the handshake. A declaring revision
+// negotiates no version, so a conforming discover reply carries none and the check passes on
+// an empty string — but an upstream that VOLUNTEERS one is stating a disagreement, and letting
+// exactly one of the two openers skip the judgement is how "check the answer, never infer from
+// it" would have held for half the legs.
 func ApplyUpstreamOpenerResult(rev capability.Revision, resp mcp.RPCMsg) (UpstreamHandshake, error) {
-	if declaresPerRequestRevision(rev) {
-		return applyDiscoverResult(resp)
+	declaring := declaresPerRequestRevision(rev)
+	method := mcp.MethodInitialize
+	if declaring {
+		method = mcp.MethodServerDiscover
 	}
-	hs, err := applyInitializeResult(resp)
-	if err != nil {
-		return UpstreamHandshake{}, err
-	}
-	if err := checkNegotiatedRevision(rev, hs.ProtocolVersion); err != nil {
-		return UpstreamHandshake{}, err
-	}
-	return hs, nil
-}
-
-// applyInitializeResult validates an upstream's `initialize` response and extracts the
-// handshake facts.
-func applyInitializeResult(resp mcp.RPCMsg) (UpstreamHandshake, error) {
-	raw, err := openerResult(mcp.MethodInitialize, resp)
+	raw, err := openerResult(method, resp)
 	if err != nil {
 		return UpstreamHandshake{}, err
 	}
 	var result mcp.InitResult
 	if err := json.Unmarshal(raw, &result); err != nil {
-		return UpstreamHandshake{}, fmt.Errorf("upstream initialize result malformed: %w", err)
+		return UpstreamHandshake{}, fmt.Errorf("upstream %s result malformed: %w", method, err)
 	}
-	// Unmarshalling JSON `null` into a struct succeeds with all fields zero, which
-	// would be accepted as a successful handshake with empty capabilities. Require
-	// the mandatory MCP fields before accepting the handshake (fail closed).
-	if err := validateInitializeResultFields(result); err != nil {
+	// Unmarshalling JSON `null` into a struct succeeds with all fields zero, which would be
+	// accepted as a successful open with empty capabilities. Require the mandatory fields
+	// before accepting it (fail closed).
+	if err := validateOpenerResultFields(method, result, !declaring); err != nil {
 		return UpstreamHandshake{}, err
 	}
-	return UpstreamHandshake{
-		Capabilities:    result.Capabilities,
-		Instructions:    result.Instructions,
-		ProtocolVersion: result.ProtocolVersion,
-		ServerVersion:   serverInfoVersion(result.ServerInfo),
-	}, nil
-}
-
-// applyDiscoverResult validates an upstream's `server/discover` response. Same fail-closed
-// shape as the handshake's, minus the version: that revision negotiates none, so requiring a
-// field the upstream has no way to answer would refuse every conforming server.
-func applyDiscoverResult(resp mcp.RPCMsg) (UpstreamHandshake, error) {
-	raw, err := openerResult(mcp.MethodServerDiscover, resp)
+	notice, err := checkNegotiatedRevision(rev, result.ProtocolVersion)
 	if err != nil {
 		return UpstreamHandshake{}, err
-	}
-	var result mcp.DiscoverResult
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return UpstreamHandshake{}, fmt.Errorf("upstream server/discover result malformed: %w", err)
-	}
-	if result.Capabilities == nil {
-		return UpstreamHandshake{}, fmt.Errorf("upstream server/discover result missing required 'capabilities' object (a null or empty result is not a valid discovery response)")
-	}
-	if result.ServerInfo == nil {
-		return UpstreamHandshake{}, fmt.Errorf("upstream server/discover result missing required 'serverInfo' object")
 	}
 	return UpstreamHandshake{
 		Capabilities:  result.Capabilities,
 		Instructions:  result.Instructions,
 		ServerVersion: serverInfoVersion(result.ServerInfo),
+		Notice:        notice,
 	}, nil
 }
 
@@ -284,61 +318,63 @@ func serverInfoVersion(serverInfo map[string]interface{}) string {
 	return version
 }
 
-// validateInitializeResultFields rejects a structurally invalid MCP InitializeResult —
-// most importantly a JSON `null` result, which unmarshals without error but leaves every
-// field zero.
-func validateInitializeResultFields(result mcp.InitResult) error {
-	if result.ProtocolVersion == "" {
-		return fmt.Errorf("upstream initialize result missing required 'protocolVersion' (a null or empty result is not a valid MCP handshake)")
+// validateOpenerResultFields rejects a structurally invalid opener result — most importantly a
+// JSON `null`, which unmarshals without error but leaves every field zero.
+//
+// requireVersion is the one difference between the two openers: the handshake NEGOTIATES a
+// version, so a reply without one negotiated nothing; a declaring revision has no version to
+// answer with, and requiring one there would refuse every conforming server.
+func validateOpenerResultFields(method string, result mcp.InitResult, requireVersion bool) error {
+	if requireVersion && result.ProtocolVersion == "" {
+		return fmt.Errorf("upstream %s result missing required 'protocolVersion' (a null or empty result is not a valid MCP handshake)", method)
 	}
 	if result.Capabilities == nil {
-		return fmt.Errorf("upstream initialize result missing required 'capabilities' object")
+		return fmt.Errorf("upstream %s result missing required 'capabilities' object", method)
 	}
 	if result.ServerInfo == nil {
-		return fmt.Errorf("upstream initialize result missing required 'serverInfo' object")
+		return fmt.Errorf("upstream %s result missing required 'serverInfo' object", method)
 	}
 	return nil
 }
 
-// checkNegotiatedRevision refuses a handshake whose answer contradicts the revision the leg was
-// opened at.
+// checkNegotiatedRevision judges the version a handshake answered against the revision the leg
+// was OPENED at, and the two failures get different answers because their blast radii differ.
 //
-// Two failures, one rule — the leg speaks what it was opened at, and eunox does not switch
-// revisions on an already-open one:
+//   - A version this build DOES speak but that is not the one offered is REFUSED. The resulting
+//     leg would look negotiated while eunox spoke a revision over a leg opened with a method
+//     that revision removed — an incoherence with no honest way to continue.
+//   - A version this build does NOT speak is reported and the leg continues at the revision it
+//     was opened at. That is the surface every release so far presented, and refusing it instead
+//     would take eunox offline against every server on a revision outside the published set —
+//     which today is most of them, since the handshake rule requires a server that cannot meet
+//     the offered version to answer with its own. What was wrong before was not the fallback but
+//     the SILENCE: it resolved to the default with nothing on stderr and nothing in the drift
+//     check, which compares serverInfo.version and never this. The returned notice is what
+//     closes that, so an operator learns the upstream disagreed rather than discovering it from
+//     a header naming a negotiation that did not happen.
 //
-//   - A version this build does not speak used to resolve silently to capability.DefaultRevision,
-//     so eunox stamped every later request with a header naming a negotiation that did not
-//     happen. Nothing else caught it: the drift check compares serverInfo.version, not this.
-//   - A version this build DOES speak but that is not the one offered is the same problem with a
-//     worse blast radius, because the resulting leg looks negotiated. Continuing would mean
-//     speaking a revision over a leg opened with a method that revision removed.
-//
-// The refusal reflects the upstream's own string back to the operator, bounded and stripped of
-// control characters: it is a startup diagnostic, and an unbounded one would put an upstream in
-// control of the console.
-func checkNegotiatedRevision(opened capability.Revision, reported string) error {
+// The notice reflects the upstream's own string back, bounded and stripped of control
+// characters through the same rule a peer's takes: it is a startup diagnostic, and an unbounded
+// one would put an upstream in control of the console.
+func checkNegotiatedRevision(opened capability.Revision, reported string) (notice string, err error) {
 	// An opener built with no explicit revision opened at the default, the same resolution
-	// every other empty carrier takes; refusing here on the strength of an empty string would
-	// name a revision no caller chose.
+	// every other empty carrier takes; judging on the strength of an empty string would name a
+	// revision no caller chose.
 	opened = resolveRevision(opened)
+	// Nothing stated is nothing to judge. Only a declaring leg reaches this with an empty
+	// string — the handshake opener's own result validation requires the member before this
+	// runs — and that revision negotiates no version, so silence there is conformance.
+	if reported == "" {
+		return "", nil
+	}
 	got, ok := capability.ParseRevision(reported)
 	if !ok {
-		return fmt.Errorf("upstream initialize answered protocolVersion %q, which this build does not speak (it speaks %s); refusing rather than proceeding as %s, which would stamp every later request with a version nobody negotiated",
-			mcp.BoundReflectedRevision(reported), publishedRevisionList(), opened)
+		return fmt.Sprintf("upstream answered protocolVersion %q, which this build does not speak (it speaks %s); this leg continues at %s, which is the version eunox offered — its requests carry that in MCP-Protocol-Version, so an upstream expecting its own will refuse them",
+			mcp.BoundReflectedRevision(reported), strings.Join(capability.PublishedRevisionNames(), ", "), opened), nil
 	}
 	if got != opened {
-		return fmt.Errorf("upstream initialize answered protocolVersion %s, but this leg was opened at %s; eunox does not switch revisions on an already-opened leg — pin `protocolVersion: %s` on this upstream to open it at %s instead",
+		return "", fmt.Errorf("upstream answered protocolVersion %s, but this leg was opened at %s; eunox does not switch revisions on an already-opened leg. Open it at %s instead by pinning `protocolVersion: %s` on this upstream — but note that pin also selects the OPENER, so only pin a revision the upstream implements the opener for, and only where the host can declare the same revision (see docs/conformance.md)",
 			got, opened, got, got)
 	}
-	return nil
-}
-
-// publishedRevisionList renders the revisions this build speaks for an operator-facing error.
-func publishedRevisionList() string {
-	revs := capability.PublishedRevisions()
-	names := make([]string, 0, len(revs))
-	for _, rev := range revs {
-		names = append(names, rev.String())
-	}
-	return strings.Join(names, ", ")
+	return "", nil
 }

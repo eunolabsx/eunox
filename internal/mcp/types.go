@@ -14,25 +14,18 @@ package mcp
 
 import "encoding/json"
 
-// InitResult is the result field of an `initialize` response.
+// InitResult is the result field of an opener response — `initialize`, and `server/discover`
+// on the revision that replaced it.
+//
+// One type for both because the two carry the same server description; they differ only in
+// ProtocolVersion, which the handshake NEGOTIATES and the stateless revision has no field for
+// (its client declares one per request). Which of them may leave it empty is the caller's
+// question, not the shape's — see validateOpenerResultFields.
 type InitResult struct {
 	ProtocolVersion string                 `json:"protocolVersion"`
 	Capabilities    map[string]interface{} `json:"capabilities"`
 	ServerInfo      map[string]interface{} `json:"serverInfo"`
 	Instructions    string                 `json:"instructions,omitempty"`
-}
-
-// DiscoverResult is the result field of a `server/discover` response — the 2026-07-28 way a
-// leg is opened.
-//
-// It carries no protocolVersion: that revision negotiates none, the client declares one on
-// every request, so there is no field here for an upstream to answer with. The rest is the
-// same server description `initialize` returns, which is what lets one UpstreamHandshake serve
-// both openers.
-type DiscoverResult struct {
-	Capabilities map[string]interface{} `json:"capabilities"`
-	ServerInfo   map[string]interface{} `json:"serverInfo"`
-	Instructions string                 `json:"instructions,omitempty"`
 }
 
 // ToolCallParams is the params field of a `tools/call` request.

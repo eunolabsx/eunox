@@ -424,16 +424,16 @@ func buildRevisionDispatch(registry map[string]methodSpec) map[capability.Revisi
 }
 
 // handshakeRevision is the revision whose method set contains `initialize` — the one place
-// "the handshake exists only in the older revision" is written down, DERIVED from
-// methodRegistry rather than restated at each site that opens, answers, or version-stamps a
-// handshake. A registry that stops declaring exactly one revision for `initialize` falls back
+// "the handshake exists only in the older revision" is written down for this package, DERIVED
+// from methodRegistry rather than restated at each site that opens, answers, or version-stamps
+// a handshake. A registry that stops declaring exactly one revision for `initialize` falls back
 // to the shipped default here (production must not panic on a data slip) and fails
 // TestHandshakeRevision_DerivedFromTheRegistry.
+//
+// capability.HandshakeRevision() is the same fact for the layers that may not import this
+// package (the config loader refusing an unmatchable pin). The derivation stays here so the
+// registry remains the operational source; the test asserts the two agree.
 var handshakeRevision = deriveHandshakeRevision(methodRegistry)
-
-// HandshakeRevision returns the MCP revision that defines the `initialize` handshake, so the
-// CLI's live-upstream probes open a leg at the same revision the running proxy does.
-func HandshakeRevision() capability.Revision { return handshakeRevision }
 
 func deriveHandshakeRevision(registry map[string]methodSpec) capability.Revision {
 	if spec, ok := registry[mcp.MethodInitialize]; ok && len(spec.In) == 1 {

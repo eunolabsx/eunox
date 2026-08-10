@@ -195,57 +195,92 @@ func TestUpstreamOpenRevision(t *testing.T) {
 	}
 }
 
-// TestCheckNegotiatedRevision pins the inversion: a handshake's answer is CHECKED against the
-// revision the leg was opened at rather than allowed to set it.
+// TestCheckNegotiatedRevision pins the inversion — a handshake's answer is CHECKED against the
+// revision the leg was opened at rather than allowed to set it — and the two answers it gets.
 //
-// The two refusals are the ones the silent downgrade used to hide. A version this build cannot
-// speak resolved to the default, so eunox stamped every later request with a header naming a
-// negotiation that never happened; a speakable version that is not the one offered produced a
-// leg that looked negotiated while eunox spoke a revision over a method that revision removed.
+// A speakable revision other than the one offered is REFUSED: the leg would look negotiated
+// while eunox spoke a revision over a method that revision removed. A version this build does
+// not speak is REPORTED and the leg continues, because refusing it would take eunox offline
+// against every server on a revision outside the published set; what was wrong before was the
+// silence, not the fallback.
 func TestCheckNegotiatedRevision(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name     string
-		opened   capability.Revision
-		reported string
-		wantErr  string
+		name       string
+		opened     capability.Revision
+		reported   string
+		wantErr    string
+		wantNotice string
 	}{
 		{name: "agrees", opened: capability.Revision20251125, reported: "2025-11-25"},
-		{name: "unspeakable is refused, not downgraded", opened: capability.Revision20251125, reported: "1999-01-01", wantErr: "does not speak"},
-		{name: "empty is refused", opened: capability.Revision20251125, reported: "", wantErr: "does not speak"},
-		{name: "speakable but not the one offered", opened: capability.Revision20251125, reported: "2026-07-28", wantErr: "opened at"},
+		{
+			name: "an unspeakable version is reported, not refused", opened: capability.Revision20251125,
+			reported: "2025-06-18", wantNotice: "does not speak",
+		},
+		{
+			// Only a declaring leg reaches this with an empty string: the handshake opener's
+			// own result validation requires the member first. Silence there is conformance,
+			// not a disagreement to report.
+			name: "nothing stated is nothing to judge", opened: capability.Revision20251125,
+			reported: "",
+		},
+		{
+			name: "a speakable version that is not the one offered is refused", opened: capability.Revision20251125,
+			reported: "2026-07-28", wantErr: "opened at",
+		},
+		{
+			// The declaring opener negotiates none, so a conforming reply carries none.
+			name: "a declaring leg's silent reply is neither", opened: capability.Revision20260728,
+			reported: "",
+		},
+		{
+			// But one that VOLUNTEERS a speakable version other than the leg's is stating a
+			// disagreement, and is refused on the same terms the handshake opener's is.
+			name: "a declaring leg's contradicting reply is refused", opened: capability.Revision20260728,
+			reported: "2025-11-25", wantErr: "opened at",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := checkNegotiatedRevision(tc.opened, tc.reported)
+			notice, err := checkNegotiatedRevision(tc.opened, tc.reported)
 			switch {
 			case tc.wantErr == "" && err != nil:
-				t.Fatalf("checkNegotiatedRevision(%q, %q) = %v, want nil", tc.opened, tc.reported, err)
+				t.Fatalf("checkNegotiatedRevision(%q, %q) = %v, want no error", tc.opened, tc.reported, err)
 			case tc.wantErr != "" && err == nil:
 				t.Fatalf("checkNegotiatedRevision(%q, %q) = nil, want an error mentioning %q", tc.opened, tc.reported, tc.wantErr)
 			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
 				t.Errorf("error = %q, want it to mention %q", err.Error(), tc.wantErr)
 			}
+			if tc.wantNotice == "" && notice != "" {
+				t.Errorf("notice = %q, want none", notice)
+			}
+			if tc.wantNotice != "" && !strings.Contains(notice, tc.wantNotice) {
+				t.Errorf("notice = %q, want it to mention %q", notice, tc.wantNotice)
+			}
 		})
 	}
 }
 
-// TestCheckNegotiatedRevision_BoundsTheReflectedVersion: the refusal echoes an
+// TestCheckNegotiatedRevision_BoundsTheReflectedVersion: the notice echoes an
 // upstream-controlled string to an operator's console, so it must be bounded and stripped of
-// anything a terminal would act on — the same rule the host-side -32022 applies to a peer's.
+// anything a terminal would act on — the same rule the host-side -32022 refusal applies to a
+// peer's.
 func TestCheckNegotiatedRevision_BoundsTheReflectedVersion(t *testing.T) {
 	t.Parallel()
 	hostile := "\x1b]0;pwned\x07" + strings.Repeat("A", 8192)
-	err := checkNegotiatedRevision(handshakeRevision, hostile)
-	if err == nil {
-		t.Fatal("a version this build cannot speak must be refused")
+	notice, err := checkNegotiatedRevision(handshakeRevision, hostile)
+	if err != nil {
+		t.Fatalf("an unspeakable version must be reported, not refused: %v", err)
 	}
-	if strings.ContainsAny(err.Error(), "\x1b\x07") {
-		t.Error("the refusal reflected control characters from the upstream's version string")
+	if notice == "" {
+		t.Fatal("an unspeakable version must produce a notice")
 	}
-	if len(err.Error()) > 4096 {
-		t.Errorf("refusal is %d bytes; an upstream must not be able to size this diagnostic", len(err.Error()))
+	if strings.ContainsAny(notice, "\x1b\x07") {
+		t.Error("the notice reflected control characters from the upstream's version string")
+	}
+	if len(notice) > 4096 {
+		t.Errorf("notice is %d bytes; an upstream must not be able to size this diagnostic", len(notice))
 	}
 }
 

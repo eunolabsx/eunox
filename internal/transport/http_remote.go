@@ -293,11 +293,12 @@ func (s *httpSession) initRemoteUpstream(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	reportUpstreamOpenNotice(s.errOut(), hs)
 	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
 
-	notif, wanted, err := UpstreamOpenerCompletion(s.upstreamRev)
-	if err != nil || !wanted {
-		return err
+	notif, wanted := UpstreamOpenerCompletion(s.upstreamRev)
+	if !wanted {
+		return nil
 	}
 	_, _, err = s.doRemoteHTTP(ctx, notif, s.upstreamSessID)
 	return err

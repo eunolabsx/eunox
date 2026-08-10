@@ -1176,16 +1176,10 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	return hostMessageGate{
 		leg:      sessionLeg(sess),
 		recorder: func() auditRecorder { return p.revisionRefusalRecorder(route) },
-		// A zero response is one JSON-RPC forbids replying to. This peer is waiting on an HTTP
-		// response either way, so the drop is acked bodyless rather than left silent — the same
-		// answer every other fire-and-forget refusal on this transport gives.
-		refuse: func(resp mcp.RPCMsg) {
-			if resp.IsZero() {
-				w.WriteHeader(http.StatusAccepted)
-				return
-			}
-			writeJSONMsg(w, resp)
-		},
+		// writeDispatchResult, not a second spelling of it: "a zero RPCMsg is acked bodyless,
+		// never written as a `{"jsonrpc":""}` frame" is one rule on this transport, and the
+		// refusal is one more caller of it.
+		refuse: func(resp mcp.RPCMsg) { writeDispatchResult(w, resp) },
 		// A refused host RESPONSE would have answered a request the upstream is blocked on;
 		// unblock it rather than let it hang. A protocol refusal is not an emergency stop, and
 		// eunox can answer with its own error at its own revision without relaying anything the
@@ -1196,10 +1190,12 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 }
 
 // sessionLeg is the leg a message on this session negotiates against, or the pre-session one
-// when there is no session. Taking the SESSION rather than an already-built hostLeg is what
-// pairs the leg's facts with the leg's unblocker: a caller could otherwise hand over a
-// session's revisions while its blocked initiator went unanswered, which is exactly the split
-// that left the unblock at HTTP's call site instead of in its prologue.
+// when there is no session.
+//
+// negotiateHostRevision takes the SESSION rather than an already-built hostLeg so that a caller
+// supplies one value and this file derives both halves — the leg's revisions and the leg's
+// unblocker — from it. That is a smaller surface to get wrong than two arguments a caller pairs
+// itself; it is not a proof, since a future caller could still build a hostMessageGate by hand.
 func sessionLeg(sess *httpSession) hostLeg {
 	if sess == nil {
 		return sessionlessLeg()

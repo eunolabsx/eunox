@@ -33,7 +33,7 @@ import (
 
 const (
 	// proxyName is the clientInfo.name the proxy presents to upstreams. The CLI's
-	// live-upstream probe reuses it via BuildInitializeRequestWithID rather than a second spelling.
+	// live-upstream probe reuses it via BuildUpstreamOpenerWithID rather than a second spelling.
 	proxyName = "eunox-proxy"
 )
 
@@ -128,7 +128,7 @@ type StdioProxy struct {
 	upstreamInstructions  string
 
 	// upstreamRev is the protocol revision this proxy speaks to its upstream, decided at
-	// CONSTRUCTION from the operator's pin (upstreamOpenRevision) and read-only after — it
+	// CONSTRUCTION from the operator's pin (UpstreamOpenRevision) and read-only after — it
 	// selects the opener, so it cannot be a conclusion drawn from the opener's own reply. It
 	// is tracked apart from the host side because the two peers migrate independently —
 	// standing between a pair that disagrees is the whole reason a proxy exists.
@@ -305,7 +305,7 @@ type StdioProxyOptions struct {
 	// UpstreamProtocolVersion pins the protocol revision this proxy speaks to its upstream,
 	// which SELECTS the opener rather than relabelling a leg opened some other way. Empty
 	// (the default) opens with the handshake, and the upstream's reported version must then
-	// agree with it — see upstreamOpenRevision and checkNegotiatedRevision.
+	// agree with it — see UpstreamOpenRevision and checkNegotiatedRevision.
 	UpstreamProtocolVersion capability.Revision
 
 	// OnReady, when non-nil, runs inside Start once the session is live and before the host
@@ -826,7 +826,7 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	if p.upHTTP != nil {
 		p.upHTTP.postWithCtx(ctx, initReq)
 	} else if err := p.upWriter.Write(initReq); err != nil {
-		return fmt.Errorf("sending initialize: %w", err)
+		return fmt.Errorf("sending %s: %w", initReq.Method, err)
 	}
 
 	// Read messages until the initialize response arrives, discarding any
@@ -849,13 +849,11 @@ func (p *StdioProxy) initUpstream(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	reportUpstreamOpenNotice(p.errOut(), hs)
 	p.upstreamCaps, p.upstreamServerVersion, p.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
 
 	// Close the handshake, on the one revision that has one to close.
-	notif, wanted, err := UpstreamOpenerCompletion(p.upstreamRev)
-	if err != nil {
-		return err
-	}
+	notif, wanted := UpstreamOpenerCompletion(p.upstreamRev)
 	if !wanted {
 		return nil
 	}
@@ -1363,6 +1361,9 @@ func (p *StdioProxy) hostRevision() capability.Revision {
 // dispatchInitialize calls after the shared kill gate passes; the caller writes the
 // returned message to the host.
 func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
+	if refusal, refused := refuseInitializeAcrossRevisions(msg.ID, p.upstreamRev); refused {
+		return refusal
+	}
 	resp := buildInitializeResponse(msg.ID, p.upstreamCaps, p.upstreamInstructions)
 	// The context pin is serveHost's, not this handler's — see StdioProxy.hostRev. Reaching
 	// this method at all means the request resolved to the revision that defines initialize.

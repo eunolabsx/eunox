@@ -62,9 +62,21 @@ and refuse the rest fail-closed.** Concretely:
   `notifications/initialized`, what `MCP-Protocol-Version` names, whether eunox's
   own requests carry the per-request `_meta` declaration, and which resolved
   revision a host message must agree with to be forwardable). The upstream's own
-  handshake answer is CHECKED against that decision, never allowed to set it: a
-  `protocolVersion` this build does not speak, or one other than the version
-  offered, refuses the leg at session start.
+  handshake answer is CHECKED against that decision, never allowed to set it. The
+  two failures get different answers, by blast radius: a version this build DOES
+  speak that is not the one offered refuses the leg at session start (the leg
+  would look negotiated while eunox spoke a revision over a method that revision
+  removed), while a version outside the published set is REPORTED and the leg
+  continues at the revision it was opened at — refusing there would take eunox
+  offline against every server on an unpublished revision, which is most of them,
+  and what was wrong before was the silence rather than the fallback.
+
+  A pin naming a revision with no handshake is refused at config load on the HTTP
+  host transport, where a session can only be minted by `initialize` and the pair
+  could therefore never match; and a host `initialize` reaching a leg that speaks
+  such a revision is refused rather than answered from that leg's discovery data,
+  since synthesizing one revision's handshake from the other's capability object
+  is exactly the translation this boundary governs.
 
   *As landed, `auto` does not PROBE.* This ADR's original text had the
   session-start probe open with `server/discover` and fall back to `initialize`
@@ -72,7 +84,7 @@ and refuse the rest fail-closed.** Concretely:
   writes the pin has stated the fact the probe would go looking for — and the
   probe changes what every existing 2025-11-25 upstream sees before eunox knows
   anything about it, which the release's own regression invariant forbids without
-  the interop matrix (W13) as its arbiter. `auto` therefore opens with
+  the interop matrix as its arbiter. `auto` therefore opens with
   `initialize`, byte for byte as before. If the probe is still wanted once that
   matrix stands, it is an addition to the `auto` branch alone and changes nothing
   a pin already decides.

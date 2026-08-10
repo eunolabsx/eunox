@@ -340,9 +340,9 @@ The pin **selects the opener**, and everything else about the leg follows from i
 sent, deliberately. ADR-0006 also describes a **probe** for `auto` — open with
 `server/discover`, fall back to `initialize` on method-not-found — and that half is
 not activated: it changes what every existing 2025-11-25 upstream sees before eunox
-knows anything about it, and its arbiter is the interop matrix the plan tracks as
-W13. Pinning needs neither, because an operator who writes the pin has stated the
-fact the probe would have gone looking for.
+knows anything about it, and the interop matrix that would arbitrate that change
+does not exist yet. Pinning needs neither, because an operator who writes the pin
+has stated the fact the probe would have gone looking for.
 
 Two consequences of the pin worth stating before you set it:
 
@@ -358,10 +358,32 @@ Two consequences of the pin worth stating before you set it:
   per-request declaration; on a matched pair it already does.
 
 The handshake's own answer is now **checked** rather than allowed to set the leg's
-revision. An upstream answering `initialize` with a `protocolVersion` this build does
-not speak, or with a speakable revision other than the one offered, is refused at
-session start. It used to resolve silently to `2025-11-25`, so eunox stamped every
-later request with a header naming a negotiation that never happened.
+revision, and the two ways it can disagree get different answers:
+
+- A revision this build **does** speak that is not the one offered **refuses the leg
+  at session start**. The leg would otherwise look negotiated while eunox spoke a
+  revision over a method that revision removed.
+- A revision **outside** the published set is **reported on stderr** and the leg
+  continues at the revision it was opened at — the surface every prior release
+  presented. Refusing there would take eunox offline against every server on an
+  unpublished revision (`2025-06-18`, `2025-03-26`, …), which is most of them, since
+  the handshake rule requires a server that cannot meet the offered version to answer
+  with its own. What was wrong before was the **silence**: it resolved to the default
+  with nothing on stderr and nothing in the drift check, which compares
+  `serverInfo.version` and never this.
+
+Two guards keep a pin from producing a route that establishes and then refuses
+everything:
+
+- **A pin naming a revision with no handshake is refused at config load under
+  `transport: http`.** An HTTP session is minted by `initialize`, so its host context
+  is always `2025-11-25` and the pair could never match. Use `transport: stdio` for
+  such an upstream, where a peer opens its context by declaring a revision.
+- **A host `initialize` reaching a leg that speaks a handshake-less revision is
+  refused** `UNSUPPORTED_PROTOCOL_VERSION`, rather than answered from that leg's
+  `server/discover` data. Synthesizing one revision's handshake from the other's
+  capability object is translation, and it would hand the host a capability set
+  describing methods this build then denies fail-closed.
 
 A host request's own `_meta` declaration is forwarded **verbatim** — nothing strips or
 rewrites `_meta`. Rewriting it to match the leg is translation, which the mismatched-pair

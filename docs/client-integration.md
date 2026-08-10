@@ -160,10 +160,12 @@ eunox proxy --config gateway.yaml
 > build does not speak is refused at startup, not at the first request.
 >
 > Pinning `2026-07-28` makes this route a **matched pair only for a host that
-> declares the same revision**; a 2025-11-25 host in front of it has its
-> forwarding methods refused `UNSUPPORTED_PROTOCOL_VERSION` (-32022), because
-> translating a mismatched pair is not implemented. `auto` is unchanged from
-> earlier releases, byte for byte.
+> declares the same revision**, so it is refused at config load under
+> `transport: http` — an HTTP session is minted by `initialize`, which that
+> revision does not have. Under `transport: stdio` it is accepted, and a
+> 2025-11-25 host reaching it is refused at its `initialize` with
+> `UNSUPPORTED_PROTOCOL_VERSION` (-32022) rather than served a translated pair.
+> `auto` is unchanged from earlier releases, byte for byte.
 
 > **Editor support.** A JSON Schema for this config lives at
 > [`schemas/eunox-gateway-config.schema.json`](../schemas/eunox-gateway-config.schema.json).

@@ -291,6 +291,28 @@ func correlateUpstreamReply(req, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 	return resp, nil
 }
 
+// refuseInitializeAcrossRevisions refuses a host `initialize` when the upstream leg speaks a
+// revision that has no handshake, and reports whether it did.
+//
+// The handshake answer eunox synthesizes carries the UPSTREAM's advertised capability object
+// while stamping the handshake revision over it. On a declaring leg that object came from
+// `server/discover` and is in the newer revision's shape, so answering would hand a
+// 2025-11-25 host a capability set describing methods this build then denies fail-closed —
+// a cross-revision capability translation, which is what the mismatched-pair boundary governs
+// and this build does not perform.
+//
+// Refused at the HANDSHAKE rather than at each later call, because that is the first message
+// of the pair and the only one whose refusal an operator can act on: the alternative is a
+// session that establishes clean and then denies every request for its life.
+func refuseInitializeAcrossRevisions(id *json.RawMessage, upstreamRev capability.Revision) (mcp.RPCMsg, bool) {
+	if !declaresPerRequestRevision(upstreamRev) {
+		return mcp.RPCMsg{}, false
+	}
+	return mcp.UnsupportedProtocolVersionResponse(id, fmt.Sprintf(
+		"this proxy speaks %s to its upstream, which has no %s handshake; a host on %s cannot be served from that leg without translating a mismatched pair, which this build does not do",
+		upstreamRev, mcp.MethodInitialize, handshakeRevision)), true
+}
+
 // buildInitializeResponse constructs the host-facing `initialize` response from the
 // upstream capabilities/instructions gathered at session startup. A nil caps map defaults
 // to an empty `tools` capability so the host still sees the proxy as MCP-capable. Both

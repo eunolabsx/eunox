@@ -506,9 +506,15 @@ func staticRecorder(rec auditRecorder) refusalRecorders {
 // The transports' own negotiateHostRevision helpers are ADAPTERS over it, kept because their
 // shapes genuinely differ (see hostMessageGate's doc); what they no longer hold is the
 // sequence. A second transport-level copy of "resolve, refuse, unblock" is what this closes.
+//
+// Keyed by the caller's QUALIFIED name for the reason notice_bounding_test.go's sibling guard
+// is: `negotiate` alone is a name any method in this package could take, and a future
+// `func (s *httpSession) negotiate(...)` that hand-placed the sequence and forgot the unblock
+// would satisfy a bare-name comparison — the exact regression the shared prologue exists to
+// prevent.
 var negotiationPrimitives = map[string]string{
-	"resolveHostRevision": "negotiate",
-	"refuseHostRevision":  "negotiate",
+	"resolveHostRevision": "hostMessageGate.negotiate",
+	"refuseHostRevision":  "hostMessageGate.negotiate",
 }
 
 // hostMessageDispositions are the SINKS this guard recognizes as disposing of a host message:
@@ -626,9 +632,9 @@ func TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue(t *testing.T
 					return true
 				}
 				calls++
-				if fn.Name.Name != caller {
+				if got := string(qualifiedFuncName(fn)); got != caller {
 					t.Errorf("%s: %s calls %s directly; every entry point must reach negotiation through %s, or the gate order is hand-placed again",
-						name, fn.Name.Name, ident.Name, caller)
+						name, got, ident.Name, caller)
 				}
 				return true
 			})

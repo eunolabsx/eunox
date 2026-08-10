@@ -70,11 +70,13 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 	if err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", opener.Method, err)
 	}
+	// A non-fatal disagreement the operator has to see: the upstream answered a version this
+	// build does not speak, so the leg continues at the one it was opened at. Surfacing it here
+	// is what makes `validate --live` report the same fact the proxy reports at session start.
+	reportUpstreamOpenNotice(hs)
 	serverVersion := hs.ServerVersion
 
-	if notif, wanted, err := transport.UpstreamOpenerCompletion(rev); err != nil {
-		return LiveUpstreamInfo{}, err
-	} else if wanted {
+	if notif, wanted := transport.UpstreamOpenerCompletion(rev); wanted {
 		if _, _, err := transport.DoMCPHTTP(ctx, client, endpoint, notif, sessID, authHeader, rev); err != nil {
 			return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", notif.Method, err)
 		}
@@ -103,6 +105,17 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 		return LiveUpstreamInfo{}, err
 	}
 	return LiveUpstreamInfo{Tools: tools, ServerVersion: serverVersion}, nil
+}
+
+// reportUpstreamOpenNotice writes an opener's non-fatal revision disagreement to stderr, or
+// nothing when there is none. The probe's own stream, since it has no proxy diagnostic channel
+// — but the same fact the running proxy reports, so validating an upstream and serving it
+// cannot disagree about whether its handshake said something unexpected.
+func reportUpstreamOpenNotice(hs transport.UpstreamHandshake) {
+	if hs.Notice == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\n[eunox] WARN upstream protocol revision: %s\n", hs.Notice)
 }
 
 // stdioIntrospectShutdownMs caps the post-tools/list wait before SIGKILL — most servers
@@ -205,11 +218,13 @@ func runStdioHandshake(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader, 
 	if err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", opener.Method, err)
 	}
+	// A non-fatal disagreement the operator has to see: the upstream answered a version this
+	// build does not speak, so the leg continues at the one it was opened at. Surfacing it here
+	// is what makes `validate --live` report the same fact the proxy reports at session start.
+	reportUpstreamOpenNotice(hs)
 	serverVersion := hs.ServerVersion
 
-	if notif, wanted, err := transport.UpstreamOpenerCompletion(rev); err != nil {
-		return LiveUpstreamInfo{}, err
-	} else if wanted {
+	if notif, wanted := transport.UpstreamOpenerCompletion(rev); wanted {
 		if err := w.Write(notif); err != nil {
 			return LiveUpstreamInfo{}, fmt.Errorf("%s: write: %w", notif.Method, err)
 		}
