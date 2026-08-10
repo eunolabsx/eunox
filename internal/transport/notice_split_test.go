@@ -629,6 +629,15 @@ func TestNoticeReserve_ProtectedSiteFallsBackToNoClassFloor(t *testing.T) {
 		require.True(t, metered, "a protected site must be metered; an unmetered one charges no bucket to be floored under")
 		assert.NotSame(t, session.forSite(site, class), session.byClass.forKey(class),
 			"site %q must resolve to its own slot rather than the class slot it is protected from", site)
+		// And its class-mates resolve to the shared class slot, which is what makes the protection
+		// mean something: a flood of theirs spends that one and leaves this site's alone.
+		for mate, mateClass := range meteredNotices {
+			if mate == site || mateClass != class || siteFloors[mate].protected {
+				continue
+			}
+			assert.Same(t, session.byClass.forKey(class), session.forSite(mate, mateClass),
+				"site %q is declared elidable, so it must share its holder's class reserve rather than hold one of its own", mate)
+		}
 	}
 }
 

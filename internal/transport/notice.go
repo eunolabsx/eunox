@@ -403,23 +403,60 @@ func newRouteNoticeLimiter(aggregate *noticeLimiter) *noticeLimiter {
 		floorOwnBucket)}
 }
 
-// floorProtectedSites are the sites that hold a floor of their OWN, consulted ahead of the class
-// floor a holder gets — the answer to a class-mate eliding the one line in that class an operator
-// cannot do without.
+// siteFloorDeclaration is whether ONE site holds a floor of its own inside its class, and — when it
+// does not — why it is the one that may be elided.
 //
-// One site today, and the argument is classObligation's own residual. Two of that class's three
-// sites are drivable at the request rate by a CONFORMING peer against a merely broken deployment:
-// a flow store that is down fails every approved declassification's commit, and a stale effect.ref
-// pin makes every receipt inconsistent. Either drains the class bucket with no adversary involved,
-// and what it reduces to a count on somebody else's line is `SECURITY: redaction failed` — the line
-// the class was split out to keep legible.
+// The zero value is "undeclared", so a site added to a class that HAS a protected member fails the
+// table test rather than silently landing on the flooding side. That is the whole reason this is a
+// declaration rather than the bare list it started as: the list named the victim and asked nothing
+// of the class-mates, so the next obligation site would have shipped unprotected with no reader
+// having answered the question — the same shape refusalDeclarations and unmeteredNotices exist to
+// prevent one axis over.
+type siteFloorDeclaration struct {
+	protected bool
+	why       string
+}
+
+// siteFloors declares, for every site of a class one of whose members is protected, which side of
+// that protection it is on. A class with no protected member needs no entries: its sites contend
+// only with each other for the holder's one class reserve, which is the ordinary arrangement.
+//
+// classObligation is the only such class today, and the argument is its own stated residual. Two of
+// its three sites are drivable at the request rate by a CONFORMING peer against a merely broken
+// deployment — a flow store that is down fails every approved declassification's commit, and a
+// stale effect.ref pin makes every receipt inconsistent — so the class bucket can be held empty
+// with no adversary involved, and what that reduces to a count on somebody else's line is
+// `SECURITY: redaction failed`, the line the class was split out to keep legible.
 //
 // A FOURTH class was the alternative and is rejected because it recurses: it is the same argument
 // one level finer, and the next reader asks what elides the declassify-commit line. A floor answers
 // the question actually being asked, which is arrival rather than rate, and without another budget:
 // the flooding sites keep sharing their holder's class reserve, so the flood spends that one and
-// leaves this site's untouched.
-var floorProtectedSites = []noticeSite{siteRedactionFault}
+// leaves the protected site's untouched.
+var siteFloors = map[noticeSite]siteFloorDeclaration{
+	siteRedactionFault: {protected: true},
+	// The two that CAN be the flood. Each is a report that a backend the operator runs is broken,
+	// and a flood of either is itself the finding — which is what makes them the right side to be
+	// elided from, and why the answer is not a fourth budget.
+	siteDeclassifyCommit:    {why: "a downed flow store drives it per frame, so it is the flood the protection is against rather than its victim; the first of them still arrives on the holder's class reserve"},
+	siteReceiptInconsistent: {why: "a stale effect.ref pin drives it per frame, same as the commit line beside it, and a flood of either is a finding about the deployment"},
+}
+
+// floorProtectedSites is the protected subset, DERIVED from the declarations rather than listed
+// beside them, so a site cannot be declared protected and reserve nothing. Sorted for a
+// deterministic reserve.
+var floorProtectedSites = protectedNoticeSites()
+
+func protectedNoticeSites() []noticeSite {
+	out := make([]noticeSite, 0, len(siteFloors))
+	for site, decl := range siteFloors {
+		if decl.protected {
+			out = append(out, site)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
 
 // noticeReserve is a leg's diagnostic floors: one guaranteed line per key per reserveInterval,
 // delivered when the tier that would have carried it has nothing left.

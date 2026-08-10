@@ -65,6 +65,27 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 		assert.NotEqual(t, classUnclassified.label(), class.label(),
 			"site %q names a class outside the declared set, so its lines would roll up under the label an unclassified line carries", site)
 	}
+	// Every site of a class one of whose members is PROTECTED has to answer which side it is on:
+	// an unanswered one lands on the flooding side by default, which is exactly the elision the
+	// site floor exists to close, arriving silently with the next obligation site somebody adds.
+	protectedClasses := map[noticeClass]bool{}
+	for site, decl := range siteFloors {
+		assert.Contains(t, meteredNotices, site,
+			"site %q declares a floor disposition but charges no bucket; an unmetered line has no tier to be floored under", site)
+		assert.Equal(t, decl.protected, decl.why == "",
+			"site %q must be protected, or declare WHY it is the one that may be elided — and never both", site)
+		if decl.protected {
+			protectedClasses[meteredNotices[site]] = true
+		}
+	}
+	for site, class := range meteredNotices {
+		if !protectedClasses[class] {
+			continue
+		}
+		assert.Contains(t, siteFloors, site,
+			"site %q shares class %q with a site that holds its own floor, so it must say whether it does too; undeclared means it is the one a class-mate's flood elides, which is a decision rather than an oversight", site, class.label())
+	}
+
 	for fn, decl := range unmeteredNotices {
 		switch decl.bound {
 		case noticeUndeclared:
