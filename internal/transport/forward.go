@@ -720,9 +720,9 @@ func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, 
 		fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "",
 			decisionDetail(dec), false)
 	}
-	// Admitted before the sanitizing walk over the method name: a wiring fault refuses every
-	// request on this leg, so the line is drivable per frame and its one argument is a full UTF-8
-	// scan (see admitNotice, and refuseUnroutable for the same treatment done by hand).
+	// Admitted before the arguments are built: a wiring fault refuses every request on this leg, so
+	// the line is drivable per frame, and what a discarded one costs is the sanitizing walk plus the
+	// variadic boxing that heap-allocates every argument (see admitNotice).
 	if line, ok := fp.limits.notices.admitNotice(siteUpstreamlessForward); ok {
 		line.writef("[eunox] SECURITY: %q was authorized but this path has no upstream to forward it to; refused (ENFORCEMENT_ERROR) — a proxy wiring fault, not an upstream failure\n",
 			audit.SanitizeAuditField(method))
@@ -1120,10 +1120,13 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorde
 	// pipe or a terminal), spent per frame at the peer's rate. Elided lines are counted into the
 	// next one rather than lost, so an operator watching stderr still sees the rate; the RECORD
 	// above is unbounded by declaration, so nothing a SIEM reads is elided either way.
-	noticef(recs.notices(), siteUnmappedMethod,
-		"[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded\n",
-		framing, sanitizedMethod,
-	)
+	// Pre-gated like the other per-frame sites: this is the loudest of them — the peer described
+	// above drives one per frame at its full send rate — and while the method name is already bound
+	// once above for the record, boxing it and the framing for a discarded line is not (admitNotice).
+	if line, ok := recs.notices().admitNotice(siteUnmappedMethod); ok {
+		line.writef("[eunox] SECURITY: unmapped %s %q denied (UNROUTABLE_METHOD) — not forwarded\n",
+			framing, sanitizedMethod)
+	}
 	return resp
 }
 

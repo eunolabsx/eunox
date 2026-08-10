@@ -18,6 +18,7 @@ package transport
 
 import (
 	"go/ast"
+	"go/token"
 	"go/types"
 	"io"
 	"testing"
@@ -51,9 +52,16 @@ var noticeWriters = map[string]map[string]bool{
 // membership in meteredNotices, which noticeFunc cannot key.
 func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 	t.Parallel()
+	// NOT `Contains(noticeClasses, class)`: noticeClasses is DERIVED from this map's own values, so
+	// that assertion holds for any content whatsoever — including the entry it claims to catch.
+	// Naming a real class is the check, and the range is what makes an unclassified or out-of-band
+	// value fail here rather than at the floor-rate fallback (and, for the reserve, at a bitmap
+	// shift that would report an unspent floor forever).
 	for site, class := range meteredNotices {
-		assert.Contains(t, noticeClasses, class,
-			"site %q is metered but names no notice class; the class picks the bucket at write time, and an unclassified one charges the floor-rate fallback rather than its own share", site)
+		assert.Greater(t, class, classUnclassified,
+			"site %q is metered but names no notice class; an unclassified one charges the floor-rate fallback rather than its own share, and registering it as a bucket key would move every genuinely undeclared site off that fallback too", site)
+		assert.LessOrEqual(t, class, lastNoticeClass,
+			"site %q names a class outside the declared set; noticeReserve packs one bit per class and a shift past the last one hands out an unlimited floor", site)
 	}
 	for fn, decl := range unmeteredNotices {
 		switch decl.bound {
@@ -181,15 +189,10 @@ func noticeEntryPointCall(n ast.Node) (string, []ast.Expr, bool) {
 	if !isCall {
 		return "", nil, false
 	}
-	var name string
-	switch fn := call.Fun.(type) {
-	case *ast.Ident:
-		name = fn.Name
-	case *ast.SelectorExpr:
-		name = fn.Sel.Name
-	default:
-		return "", nil, false
-	}
+	// Through the package's shared callName rather than a third copy of the ident-or-selector
+	// switch: it already serves two other walks, and a fix to how a callee is named should reach
+	// all of them.
+	name := callName(call)
 	if _, isEntry := noticeEntryPoints[name]; !isEntry {
 		return "", nil, false
 	}
@@ -245,15 +248,106 @@ func qualifiedFuncName(fn *ast.FuncDecl) noticeFunc {
 // method. That is the silent inheritance the qualified key exists to make unrepresentable.
 func exprString(e ast.Expr) string { return types.ExprString(e) }
 
-func noticeBoundName(b noticeBound) string {
-	switch b {
-	case noticeRecordGated:
-		return "record-gated"
-	case noticeOnce:
-		return "one-shot"
-	case noticeExempt:
-		return "exempt"
-	default:
-		return "undeclared"
+// TestNoticeBounding_EveryAdmissionIsWritten is the source guard over admitNotice's return, the
+// same shape the tracker's disposal obligation carries.
+//
+// admitNotice does not peek: it spends the token AND takes the bucket's accumulated suppression
+// tally into the line it hands back, so a caller that drops that line destroys a count of what an
+// operator did not see, and one that writes it twice buys N write syscalls with one token. Go
+// requires neither, and the runtime cannot report either — the line is a value like any other. So
+// the shape is required here: the admission is an `if` initializer, its body writes the bound line
+// exactly once and unconditionally, and there is no else.
+//
+// Preparatory statements inside the body are allowed on purpose. Building an expensive argument
+// after the admission is the entire point of the escape hatch, and a rule that permitted only the
+// bare writef would push those arguments back above the gate.
+func TestNoticeBounding_EveryAdmissionIsWritten(t *testing.T) {
+	t.Parallel()
+	guarded, admissions := map[token.Pos]bool{}, 0
+	for _, src := range packageSources(t) {
+		ast.Inspect(src.file, func(n ast.Node) bool {
+			if _, _, isEntry := noticeEntryPointCall(n); isEntry && callName(n.(*ast.CallExpr)) == "admitNotice" {
+				admissions++
+			}
+			stmt, isIf := n.(*ast.IfStmt)
+			if !isIf {
+				return true
+			}
+			line, call, isAdmission := admissionIf(stmt)
+			if !isAdmission {
+				return true
+			}
+			guarded[call.Pos()] = true
+			at := src.fset.Position(call.Pos())
+			assert.Nil(t, stmt.Else,
+				"%s:%d: an admitted notice line must be written on the only path out of its gate; an else arm is a path that spent the token and the tally and wrote nothing", src.name, at.Line)
+			total, unconditional := writefCalls(stmt.Body, line)
+			assert.Equal(t, 1, total,
+				"%s:%d: the admitted line must be written exactly once — %d writef calls buy N write syscalls with one token, and 0 destroys the suppression tally admitNotice just harvested", src.name, at.Line, total)
+			assert.Equal(t, 1, unconditional,
+				"%s:%d: the write must be unconditional inside the gate; a writef under a further branch or a loop is the same lost-or-repeated tally one level in", src.name, at.Line)
+			return true
+		})
 	}
+	require.Positive(t, admissions, "no admitNotice call was found; this guard would pass vacuously")
+	for _, src := range packageSources(t) {
+		ast.Inspect(src.file, func(n ast.Node) bool {
+			call, isCall := n.(*ast.CallExpr)
+			if !isCall || callName(call) != "admitNotice" || guarded[call.Pos()] {
+				return true
+			}
+			t.Errorf("%s:%d: admitNotice's result must be taken by `if line, ok := ...; ok { line.writef(...) }`; any other shape can spend a token and a suppression tally without writing the line they were spent on",
+				src.name, src.fset.Position(call.Pos()).Line)
+			return true
+		})
+	}
+}
+
+// admissionIf matches `if <line>, <ok> := <expr>.admitNotice(<site>); <ok> { ... }`, returning the
+// identifier the line was bound to and the call itself.
+func admissionIf(stmt *ast.IfStmt) (line string, call *ast.CallExpr, ok bool) {
+	assign, isAssign := stmt.Init.(*ast.AssignStmt)
+	if !isAssign || len(assign.Lhs) != 2 || len(assign.Rhs) != 1 {
+		return "", nil, false
+	}
+	rhs, isCall := assign.Rhs[0].(*ast.CallExpr)
+	if !isCall || callName(rhs) != "admitNotice" {
+		return "", nil, false
+	}
+	lineIdent, lineIsIdent := assign.Lhs[0].(*ast.Ident)
+	okIdent, okIsIdent := assign.Lhs[1].(*ast.Ident)
+	cond, condIsIdent := stmt.Cond.(*ast.Ident)
+	if !lineIsIdent || !okIsIdent || !condIsIdent || cond.Name != okIdent.Name {
+		return "", nil, false
+	}
+	return lineIdent.Name, rhs, true
+}
+
+// writefCalls counts calls to line.writef anywhere in body, and separately those that are
+// statements of body ITSELF — the difference being a write the gate does not guarantee.
+func writefCalls(body *ast.BlockStmt, line string) (total, unconditional int) {
+	isWrite := func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall {
+			return false
+		}
+		sel, isSel := call.Fun.(*ast.SelectorExpr)
+		if !isSel || sel.Sel.Name != "writef" {
+			return false
+		}
+		recv, isIdent := sel.X.(*ast.Ident)
+		return isIdent && recv.Name == line
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if isWrite(n) {
+			total++
+		}
+		return true
+	})
+	for _, stmt := range body.List {
+		if expr, isExpr := stmt.(*ast.ExprStmt); isExpr && isWrite(expr.X) {
+			unconditional++
+		}
+	}
+	return total, unconditional
 }

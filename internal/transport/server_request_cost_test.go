@@ -100,10 +100,10 @@ func TestRemoteSession_RefusalTableHoldsOnlyWhatItCanReach(t *testing.T) {
 	// bound those records had before the per-session split existed — never the floor-rate `unknown`
 	// bucket, which would silently make an unlisted category the most suppressed one on the proxy.
 	for range int(perCategoryDenyBurst) {
-		ok, _, _ := remote.admit(catDisplaced)
+		ok := remote.admit(catDisplaced).ok
 		require.True(t, ok)
 	}
-	ok, _, _ := remote.admit(catDisplaced)
+	ok := remote.admit(catDisplaced).ok
 	assert.False(t, ok, "an unlisted category charges the aggregate's bucket for that category, so it is bounded at the pre-split rate")
 	assert.Greater(t, aggregate.bucket(catDisplaced).burst, float64(perBucketFloor),
 		"and the bucket it charged is the aggregate's real one, not the floor-rate fallback")

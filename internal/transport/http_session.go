@@ -1300,8 +1300,13 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		defer cancel()
 		if _, err := s.callRemoteUpstream(notifyCtx, msg); err != nil {
 			// No response to deliver to the host; log so a dropped notification isn't silent.
-			noticef(s.noticeWriter(), siteUpstreamNotifyFailed,
-				"[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n", s.id, audit.BoundEnvelopeField(msg.Method), err)
+			// Pre-gated: a down remote upstream fails every POST, so this is a per-frame line whose
+			// arguments (a bounded method name, three boxed values) are pure waste when the bucket
+			// discards it — see admitNotice.
+			if line, ok := s.noticeWriter().admitNotice(siteUpstreamNotifyFailed); ok {
+				line.writef("[eunox] HTTP session %s: notification %q POST to upstream failed: %v\n",
+					s.id, audit.BoundEnvelopeField(msg.Method), err)
+			}
 		}
 		return
 	}

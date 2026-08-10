@@ -493,9 +493,9 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 				// Bounded for the reason the routing refusal's notice is: the record above is
 				// collapsed to one per saturation EPISODE while this line ran once per refused
 				// frame, so the diagnostic was the cheaper flood of the two. Admitted BEFORE its
-				// arguments are built: this is the flood path the bucket exists for, and the
-				// bounded method name escapes to the heap per refused frame for a line that is
-				// then thrown away (see admitNotice).
+				// arguments are built: this is the flood path the bucket exists for, and both the
+				// method-name bound and the variadic boxing of its arguments are spent per refused
+				// frame on a line that is then thrown away (see admitNotice).
 				if line, ok := sess.noticeWriter().admitNotice(siteNotifyPoolSaturated); ok {
 					line.writef("[eunox] HTTP session %s: notification %q dropped: too many concurrent notifications in flight\n",
 						sessionID, audit.BoundEnvelopeField(msg.Method))
@@ -1189,7 +1189,7 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	}
 	return hostMessageGate{
 		leg:      leg,
-		recorder: func() auditRecorder { return p.revisionRefusalRecorder(route) },
+		recorder: func() auditRecorder { return p.revisionRefusalRecorder(sess, route) },
 		// writeDispatchResult, not a second spelling of it: "a zero RPCMsg is acked bodyless,
 		// never written as a `{"jsonrpc":""}` frame" is one rule on this transport, and the
 		// refusal is one more caller of it.
@@ -1253,10 +1253,15 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 //
 // Nil-limiter tolerance mirrors recordRefusal's: a proxy built without one (tests) records
 // unbounded rather than not at all.
-func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder {
+func (p *HTTPProxy) revisionRefusalRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
 	rec := asRecorder(p.sink)
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
-	return p.routeRefusalLimits(nil, route).recorders(rec).forCategory(catRevision)
+	// sess is threaded even though this leg writes no stderr line today: the whole reason the
+	// accessor takes a nilable session is that a leg holding one must name it, and this one holds
+	// a live session on the established-POST path. A nil here would be a floorless channel waiting
+	// for the first diagnostic anyone adds to the -32022 refusal — which catRevision's own doc
+	// describes as the cheapest refusal an unauthenticated peer can drive.
+	return p.routeRefusalLimits(sess, route).recorders(rec).forCategory(catRevision)
 }
