@@ -757,18 +757,16 @@ func (p *HTTPProxy) serveCtx() context.Context {
 	return context.Background()
 }
 
-// noticeWriter is this proxy's diagnostic channel for a leg with NO route in scope: the configured
-// stderr writer and the aggregate class table. A leg that HAS a route uses routeNoticeWriter — one
-// tenant's flood must not silence another's, which is the whole reason the table below it exists.
+// routeNoticeWriter is the diagnostic channel for a leg serving route: the configured stderr writer
+// and the route's OWN class table, which charges this proxy's aggregate as its parent (see
+// newRouteNoticeLimiter) — one tenant's flood must not silence another's, which is the whole reason
+// that table exists.
 //
-// Spelled as the nil-route case of that one rather than as a second body, so the nil-receiver
-// fallback and the writer it pairs with cannot drift between the two.
-func (p *HTTPProxy) noticeWriter() noticeWriter { return p.routeNoticeWriter(nil) }
-
-// routeNoticeWriter is the diagnostic channel for a leg serving route: the route's OWN class table,
-// which charges this proxy's aggregate as its parent (see newRouteNoticeLimiter). A nil route (a
-// leg that genuinely has none) falls back to the aggregate directly, and a nil receiver to an
-// unbounded channel, which is what a proxy assembled by a bare struct literal in a test gets.
+// ONE accessor taking a nilable route rather than a route-less twin beside it: every HTTP leg that
+// writes a diagnostic has its route in hand, so a second spelling had no caller left once they were
+// all converted, and the pair could only drift. A nil route (a leg that genuinely has none) falls
+// back to the aggregate directly, and a nil receiver to an unbounded channel, which is what a proxy
+// assembled by a bare struct literal in a test gets.
 func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 	if p == nil {
 		return noticeWriter{}
@@ -779,19 +777,13 @@ func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 	return noticeWriter{out: p.errOut(), limits: route.notices}
 }
 
-// refusalLimits pairs this proxy's two admission controls for the PRE-SESSION leg, whose refusal
-// records charge the proxy-wide category buckets. The leg that meters no record
-// (routeRefusalRecorders) takes the notice bucket alone, and an established session's
-// upstream-driven refusals charge its own per-session table instead (see newUpstreamRefusalLimiter).
+// routeRefusalLimits pairs this proxy's two admission controls for a leg serving route: the
+// proxy-wide category buckets its refusal RECORDS charge, and that route's own diagnostic table.
+// The leg that meters no record (routeRefusalRecorders) takes the notice channel alone, and an
+// established session's upstream-driven refusals charge its own per-session table instead (see
+// newUpstreamRefusalLimiter).
 //
-// Reads preSessionDenies directly: the single-caller accessor that used to wrap it duplicated this
-// function's own nil-receiver guard one line above it.
-func (p *HTTPProxy) refusalLimits() refusalLimits { return p.routeRefusalLimits(nil) }
-
-// routeRefusalLimits is the same wiring for a leg that HAS a route: the same proxy-wide record
-// buckets, and the route's own diagnostic table rather than the aggregate. Named separately from
-// the nil-route spelling above so a leg that knows its tenant says so at the call — the record
-// table and the nil fallback are written once, here, so the two cannot drift.
+// Nilable route for the reason routeNoticeWriter takes one.
 func (p *HTTPProxy) routeRefusalLimits(route *UpstreamRoute) refusalLimits {
 	if p == nil {
 		return refusalLimits{}
