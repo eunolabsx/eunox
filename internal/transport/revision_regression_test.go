@@ -853,20 +853,34 @@ func TestRevisionRefusal_IsClassedAsInfrastructure(t *testing.T) {
 }
 
 // TestSetNegotiatedVersionHeader_AlwaysSignalsAVersion is the regression for suppressing the
-// header on a leg pinned to a revision this build has no opener for.
+// header on a leg pinned to a revision this build once had no opener for.
 //
-// eunox opens every upstream leg with `initialize`, so the handshake revision is what was
-// negotiated whatever the pin says. Omitting the header without emitting a replacement leaves
-// the request with no version signal at all, which a conformant upstream answers with 400 —
-// including the terminating DELETE, whose failure leaks the upstream session.
+// Two properties in one table, and the second is why the first is still needed. The header
+// NAMES the revision the leg was opened at, so a pinned leg is addressed as what it speaks;
+// and it is never EMPTY, whatever it is handed — omitting it without emitting a replacement
+// leaves the request with no version signal at all, which a conformant upstream answers with
+// 400, including the terminating DELETE, whose failure leaks the upstream session.
 func TestSetNegotiatedVersionHeader_AlwaysSignalsAVersion(t *testing.T) {
 	t.Parallel()
-	for _, rev := range []capability.Revision{"", capability.Revision20251125, capability.Revision20260728, "1999-01-01"} {
+	cases := map[capability.Revision]capability.Revision{
+		// An unopened leg resolves to the surface eunox already shipped rather than to nothing.
+		"":                          capability.DefaultRevision,
+		capability.Revision20251125: capability.Revision20251125,
+		capability.Revision20260728: capability.Revision20260728,
+	}
+	for rev, want := range cases {
 		req := newTestRequestForHeader(t)
 		setNegotiatedVersionHeader(req, rev)
-		if got := req.Header.Get("MCP-Protocol-Version"); got != handshakeRevision.String() {
-			t.Errorf("rev %q: MCP-Protocol-Version = %q, want %q — a post-handshake request must always carry the version the handshake negotiated", rev, got, handshakeRevision)
+		if got := req.Header.Get("MCP-Protocol-Version"); got != want.String() {
+			t.Errorf("rev %q: MCP-Protocol-Version = %q, want %q — the header must name the revision the leg was opened at", rev, got, want)
 		}
+	}
+	// A revision this build does not speak reaches no leg (config load and the handshake check
+	// both refuse it), but the stamper must still signal SOMETHING rather than an empty header.
+	req := newTestRequestForHeader(t)
+	setNegotiatedVersionHeader(req, "1999-01-01")
+	if got := req.Header.Get("MCP-Protocol-Version"); got == "" {
+		t.Error("an unspeakable leg revision stamped no header at all; a request with no version signal is answered 400")
 	}
 }
 

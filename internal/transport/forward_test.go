@@ -1611,7 +1611,7 @@ func TestAuditOnly_WiretapRoute_Kill_HardBlocks(t *testing.T) {
 		case msg.Method == "initialize":
 			w.Header().Set("Mcp-Session-Id", "up-sess")
 			initResult, _ := json.Marshal(map[string]interface{}{
-				"protocolVersion": "2025-11-05",
+				"protocolVersion": capability.Revision20251125.String(),
 				"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
 				"serverInfo":      map[string]interface{}{"name": "test", "version": "0"},
 			})

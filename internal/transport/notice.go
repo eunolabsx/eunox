@@ -259,6 +259,7 @@ var noticeDeclarations = map[noticeSite]noticeDeclaration{
 	"*StdioProxy.initUpstream":           {bound: noticeExempt, why: exemptNotPeerDriven},
 	"waitBounded":                        {bound: noticeExempt, why: exemptNotPeerDriven},
 	"*StdioProxy.Start":                  {bound: noticeExempt, why: exemptNotPeerDriven},
+	"reportUpstreamOpenNotice":           {bound: noticeExempt, why: exemptCostsASession},
 	"*HTTPProxy.writeSessionCreateError": {bound: noticeExempt, why: exemptCostsASession},
 	"*HTTPProxy.newSession":              {bound: noticeExempt, why: exemptCostsASession},
 	"*HTTPProxy.newRemoteSession":        {bound: noticeExempt, why: exemptCostsASession},

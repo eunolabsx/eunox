@@ -57,12 +57,29 @@ Section conventions:
   and `notifications/roots/list_changed` are denied and recorded, while
   `tools/call`, `resources/read`, `prompts/get` and the three `*/list` methods are
   enforced exactly as before. Nothing changes for a 2025-11-25 peer.
-- **`protocolVersion` pins the revision eunox speaks to an upstream.** A new
-  per-upstream config key — `auto` (the default; probe it from the upstream's own
-  handshake), `"2025-11-25"`, or `"2026-07-28"` — with `--upstream-protocol-version`
-  as the `proxy --audit` wiretap equivalent. Per upstream rather than per gateway,
-  since a gateway's upstreams migrate independently. A value this build does not
-  speak is refused at load, not at the first request.
+- **`protocolVersion` selects how eunox opens an upstream leg.** A per-upstream
+  config key — `auto` (the default), `"2025-11-25"`, or `"2026-07-28"` — with
+  `--upstream-protocol-version` as the equivalent on `proxy --audit`,
+  `validate --live` and `init`, on either upstream transport. Per upstream rather than per gateway, since a
+  gateway's upstreams migrate independently. A value this build does not speak is
+  refused at load, not at the first request.
+
+  The pin **selects the opener**, and every other fact about the leg follows from
+  it: the method it is opened with (`initialize`, or `server/discover` on a
+  declaring revision), whether the open is completed with
+  `notifications/initialized`, what `MCP-Protocol-Version` names on every later
+  request, whether eunox's own requests carry the per-request
+  `io.modelcontextprotocol/protocolVersion` `_meta` declaration, and which
+  resolved revision a host message must agree with to be forwardable. `auto`
+  opens with `initialize`, byte for byte as before — the discover-first *probe*
+  ADR-0006 also describes is deliberately not activated, since it would change
+  what every existing 2025-11-25 upstream sees at session start.
+
+  A pinned leg is a matched pair or a refusal, never a translated one: a
+  2025-11-25 host in front of an upstream pinned to `2026-07-28` has its
+  forwarding methods refused `UNSUPPORTED_PROTOCOL_VERSION` (-32022). eunox
+  declares only on the requests it originates (the opener and the session-start
+  drift probe); a host's params still cross verbatim, `_meta` included.
 - **`protocol_revision` on every audit record** (signed, `omitempty`): the MCP
   revision the decision was taken under. Without it, a `tools/call` denied
   `AUTHORIZATION_FAILED` reads identically whether policy refused the call or the
@@ -306,6 +323,42 @@ Section conventions:
 
 ### Changed
 
+- **An upstream handshake that contradicts the leg is judged rather than swallowed.** An
+  `initialize` answering a `protocolVersion` this build does not speak used to resolve
+  silently to `2025-11-25`, so eunox stamped every later request with a header naming a
+  negotiation that never happened; nothing else caught it, since the drift check compares
+  `serverInfo.version`, not this. The two disagreements now get different answers: a revision
+  this build DOES speak other than the one offered **refuses the leg** at session start
+  (continuing would mean speaking a revision over a leg opened with a method that revision
+  removed), while a revision outside the published set is **reported on stderr** and the leg
+  continues where it was opened. The notice bounds and strips the upstream's own string, so it
+  cannot size or drive the console line. No behavior change for an upstream on an unpublished
+  revision beyond the new warning.
+- **A request that would reach a declaring upstream with no declaration is refused.** Host-side
+  omission inherits the context; upstream-side eunox declares only on the requests it
+  originates. Together they delivered a 2026-07-28 upstream a request missing the
+  `io.modelcontextprotocol/protocolVersion` member that revision requires on every one — refused
+  by the upstream, one layer from the cause. It is now refused at the proxy, naming the cause.
+- **A pin that could never form a matched pair is refused instead of establishing a dead
+  route.** `protocolVersion` naming a revision with no handshake is rejected at config load
+  under `transport: http` (an HTTP session is minted by `initialize`, so the host context is
+  always `2025-11-25`), and a host `initialize` reaching a leg speaking such a revision is
+  refused `UNSUPPORTED_PROTOCOL_VERSION` rather than answered from that leg's
+  `server/discover` data — synthesizing one revision's handshake from the other's capability
+  object is the translation the mismatched-pair boundary governs.
+- **`--upstream-protocol-version` no longer refuses a subprocess upstream.** The flag was
+  rejected there because the pin reached no wire behavior on that transport — it only
+  selected a version header a subprocess never sees. It now selects the opener, which a
+  subprocess upstream reads exactly as a remote one does.
+- **One shared host-message prologue.** The head of the per-message gate order (revision
+  negotiation, its refusal, and answering the upstream request a refused host RESPONSE would
+  have completed) is one implementation both transports call, with only the leg, the
+  refusal's recorder and how the peer is written to injected. The unblock previously lived in
+  stdio's negotiation helper but at HTTP's call site, so an HTTP entry point could inherit the
+  refusal without the debt. A source guard fails the build on a hand-placed copy. Revocation
+  deliberately stays out of it for the request framing: that check must be taken fresh after
+  the decision turn, or a kill landing during an unbounded wait is recorded as the method's
+  own refusal.
 - **The fail-closed routing refusal goes through the shared deny path, so its fault class is
   load-bearing rather than decorative.** `UNROUTABLE_METHOD` was given a FAULT class so
   `DenialInfo.Downgradable()` answers false for it wherever it is asked — but nothing asked:

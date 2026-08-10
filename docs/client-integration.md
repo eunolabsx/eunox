@@ -147,13 +147,25 @@ eunox proxy --config gateway.yaml
 > to start on a version mismatch — or if `expectVersion` is set on a route that
 > merges several policy files, since the pin would silently track only the first.
 
-> **Protocol revision per upstream.** `protocolVersion` pins the MCP revision
-> eunox speaks to that upstream, overriding what its handshake reports. It is per
-> upstream, not per gateway, because upstreams migrate on independent schedules —
-> and it is only the *upstream* leg: the revision each host request is decided
-> under is negotiated from that request's own context (see
+> **Protocol revision per upstream.** `protocolVersion` selects how eunox OPENS
+> that upstream's leg — `initialize` for `auto` and `2025-11-25`,
+> `server/discover` for `2026-07-28` — and with it the version header its later
+> requests carry and whether eunox's own requests declare a revision in `_meta`.
+> The upstream's handshake answer is then checked against the pin rather than
+> allowed to override it. It is per upstream, not per gateway, because upstreams
+> migrate on independent schedules — and it is only the *upstream* leg: the
+> revision each host request is decided under is negotiated from that request's
+> own context (see
 > [conformance.md](conformance.md#per-revision-method-disposition)). A value this
 > build does not speak is refused at startup, not at the first request.
+>
+> Pinning `2026-07-28` makes this route a **matched pair only for a host that
+> declares the same revision**, so it is refused at config load under
+> `transport: http` — an HTTP session is minted by `initialize`, which that
+> revision does not have. Under `transport: stdio` it is accepted, and a
+> 2025-11-25 host reaching it is refused at its `initialize` with
+> `UNSUPPORTED_PROTOCOL_VERSION` (-32022) rather than served a translated pair.
+> `auto` is unchanged from earlier releases, byte for byte.
 
 > **Editor support.** A JSON Schema for this config lives at
 > [`schemas/eunox-gateway-config.schema.json`](../schemas/eunox-gateway-config.schema.json).

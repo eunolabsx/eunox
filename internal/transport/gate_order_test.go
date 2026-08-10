@@ -148,6 +148,33 @@ func TestGateOrder_DispatchedRecordsNameTheRevisionTheyRoutedBy(t *testing.T) {
 	}
 }
 
+// TestGateOrder_StdioDispatchedRecordsNameTheRevisionTheyRoutedBy is the HTTP test's stdio
+// sibling. The property is cross-transport — a record must name the revision whose table
+// refused it — but it was held on one transport only, which is the shape a second entry point
+// with the same gap slips through.
+//
+// It also pins the half the HTTP test cannot reach: stdio negotiates in its READ loop and
+// dispatches on a handler goroutine, so the stamp has to survive the hand-off.
+func TestGateOrder_StdioDispatchedRecordsNameTheRevisionTheyRoutedBy(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	serveHostMessages(t, stdioServe{sink: sink},
+		// Declared, so the peer's context is the newer revision and its tables are what refuse
+		// this method — a record naming the default would be naming the wrong table's verdict.
+		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: methodPing,
+			Params: metaParams(t, capability.Revision20260728.String(), nil)},
+	)
+	_ = sink.Close()
+
+	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), methodPing, "deny")
+	if rec == nil {
+		t.Fatal("a method the declared revision removed left no record")
+	}
+	if got, _ := rec["protocol_revision"].(string); got != capability.Revision20260728.String() {
+		t.Errorf("protocol_revision = %q, want %q — the record must name the revision whose table refused it", got, capability.Revision20260728)
+	}
+}
+
 // TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp is the regression for the entry
 // point that had NEITHER carrier: the server-initiated leg has no host request to read a
 // revision from, so every sampling decision on a negotiated session was recorded as though
@@ -473,11 +500,21 @@ func staticRecorder(rec auditRecorder) refusalRecorders {
 
 // negotiationPrimitives are the two functions that IMPLEMENT the head of the gate order, and
 // the one function allowed to call them. Every host message must reach revision negotiation
-// through a transport's negotiateHostRevision — the shared prologue — rather than through a
-// hand-placed copy.
+// through hostMessageGate.negotiate — the shared prologue, now cross-transport — rather than
+// through a hand-placed copy.
+//
+// The transports' own negotiateHostRevision helpers are ADAPTERS over it, kept because their
+// shapes genuinely differ (see hostMessageGate's doc); what they no longer hold is the
+// sequence. A second transport-level copy of "resolve, refuse, unblock" is what this closes.
+//
+// Keyed by the caller's QUALIFIED name for the reason notice_bounding_test.go's sibling guard
+// is: `negotiate` alone is a name any method in this package could take, and a future
+// `func (s *httpSession) negotiate(...)` that hand-placed the sequence and forgot the unblock
+// would satisfy a bare-name comparison — the exact regression the shared prologue exists to
+// prevent.
 var negotiationPrimitives = map[string]string{
-	"resolveHostRevision": "negotiateHostRevision",
-	"refuseHostRevision":  "negotiateHostRevision",
+	"resolveHostRevision": "hostMessageGate.negotiate",
+	"refuseHostRevision":  "hostMessageGate.negotiate",
 }
 
 // hostMessageDispositions are the SINKS this guard recognizes as disposing of a host message:
@@ -595,9 +632,9 @@ func TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue(t *testing.T
 					return true
 				}
 				calls++
-				if fn.Name.Name != caller {
+				if got := string(qualifiedFuncName(fn)); got != caller {
 					t.Errorf("%s: %s calls %s directly; every entry point must reach negotiation through %s, or the gate order is hand-placed again",
-						name, fn.Name.Name, ident.Name, caller)
+						name, got, ident.Name, caller)
 				}
 				return true
 			})

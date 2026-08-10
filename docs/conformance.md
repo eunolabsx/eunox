@@ -234,12 +234,15 @@ over-cite:
   negotiation (host side per request, upstream side pinned per route), the
   revision-scoped dispatch tables derived from one declaration per method, the
   `UNSUPPORTED_PROTOCOL_VERSION` (-32022) refusal, the per-upstream
-  `protocolVersion` config pin, and the `protocol_revision` audit field. See the
-  per-revision method table below.
+  `protocolVersion` config pin — which now selects how the upstream leg is
+  OPENED, including the `server/discover` opener and the per-request `_meta`
+  declaration on eunox's own requests — and the `protocol_revision` audit field.
+  See the per-revision method table below.
 - **Designed in Draft ADRs, not yet implemented:** the mismatched-pair
-  translation boundary, the `server/discover` responder and its list-filter
-  parity, the `Mcp-Method`/`Mcp-Name` headers, and the CLI probe/drift
-  dual-revision handling in
+  translation boundary, the `server/discover` RESPONDER and its list-filter
+  parity (the *client* side of discover ships as the pinned leg's opener), the
+  discover-first probe for an `auto` upstream, the `Mcp-Method`/`Mcp-Name`
+  headers, and the rest of the CLI probe/drift dual-revision handling in
   [ADR-0006](adr/0006-dual-revision-translation-boundary.md); the
   MRTR signed continuation and its commit-once metering in
   [ADR-0007](adr/0007-mrtr-signed-continuation.md); `subscriptions/listen` and
@@ -293,7 +296,7 @@ decision behind it follows (the `-32022` revision refusal included).
 | `notifications/cancelled` | forwarded | forwarded |
 | `notifications/progress` | forwarded | forwarded |
 | `notifications/roots/list_changed` | forwarded | denied and recorded (roots deprecated) |
-| `server/discover` | denied | denied — responder not yet implemented |
+| `server/discover` | denied | denied — responder not yet implemented (eunox *sends* it upstream on a pinned leg; see below) |
 | `subscriptions/listen` | denied | denied — not yet implemented |
 | `tasks/*` | denied | denied — not yet implemented |
 
@@ -319,15 +322,75 @@ upstreams:
     protocolVersion: auto        # auto (default) | "2025-11-25" | "2026-07-28"
 ```
 
-The `proxy --audit` wiretap equivalent is `--upstream-protocol-version` (remote
-`--upstream-url` upstreams only — a subprocess upstream speaks the handshake it is
-given). A value this build does not speak is refused at load, not at the first
-request.
+The `proxy --audit` wiretap equivalent is `--upstream-protocol-version`, on either
+upstream transport; `eunox validate --live` and `eunox init` take the same flag, so a
+probe opens the leg the way the proxy would rather than always with the handshake.
+A value this build does not speak is refused at load, not at the first request.
 
-The pin names the revision eunox speaks to that upstream; it does not yet change the
-opener. Every upstream leg is opened with `initialize`, so the `MCP-Protocol-Version`
-header its post-handshake requests carry names the handshake revision regardless of
-the pin.
+The pin **selects the opener**, and everything else about the leg follows from it:
+
+| | `auto` (the default) | `protocolVersion: "2026-07-28"` |
+|---|---|---|
+| opened with | `initialize` | `server/discover` |
+| open completed with | `notifications/initialized` | nothing — no handshake to close |
+| `MCP-Protocol-Version` header | `2025-11-25` | `2026-07-28` |
+| eunox's own requests declare `_meta` | no | yes (`io.modelcontextprotocol/protocolVersion` + `clientCapabilities`) |
+| a host message must resolve to | `2025-11-25` | `2026-07-28` |
+
+`auto` is byte-identical to what every release before the revision-selected opener
+sent, deliberately. ADR-0006 also describes a **probe** for `auto` — open with
+`server/discover`, fall back to `initialize` on method-not-found — and that half is
+not activated: it changes what every existing 2025-11-25 upstream sees before eunox
+knows anything about it, and the interop matrix that would arbitrate that change
+does not exist yet. Pinning needs neither, because an operator who writes the pin
+has stated the fact the probe would have gone looking for.
+
+Two consequences of the pin worth stating before you set it:
+
+- **A pinned leg is a matched pair only for a host on the same revision.** A
+  2025-11-25 host in front of an upstream pinned to `2026-07-28` has every
+  forwarding method refused `UNSUPPORTED_PROTOCOL_VERSION` (`-32022`), because
+  translating that pair is what the mismatched-pair boundary governs and this
+  release does not implement it. Pin the upstream when the host declares the same
+  revision, not before.
+- **eunox declares only on the requests it originates** — the opener and the
+  session-start `tools/list` drift probe. A host's own params are still forwarded
+  verbatim, `_meta` included, so a host on a declaring leg must carry its own
+  per-request declaration on every request. A message that reached a declaring
+  revision by *inheriting* its context rather than stating a version is refused
+  `UNSUPPORTED_PROTOCOL_VERSION` before it is forwarded: host-side omission
+  inherits, upstream-side eunox adds nothing, and together they would deliver a
+  request missing the member that revision requires. Refusing names the cause
+  where the upstream's own rejection would not. (A host *response* owes no
+  declaration — it answers something the upstream declared for itself.)
+
+The handshake's own answer is now **checked** rather than allowed to set the leg's
+revision, and the two ways it can disagree get different answers:
+
+- A revision this build **does** speak that is not the one offered **refuses the leg
+  at session start**. The leg would otherwise look negotiated while eunox spoke a
+  revision over a method that revision removed.
+- A revision **outside** the published set is **reported on stderr** and the leg
+  continues at the revision it was opened at — the surface every prior release
+  presented. Refusing there would take eunox offline against every server on an
+  unpublished revision (`2025-06-18`, `2025-03-26`, …), which is most of them, since
+  the handshake rule requires a server that cannot meet the offered version to answer
+  with its own. What was wrong before was the **silence**: it resolved to the default
+  with nothing on stderr and nothing in the drift check, which compares
+  `serverInfo.version` and never this.
+
+Two guards keep a pin from producing a route that establishes and then refuses
+everything:
+
+- **A pin naming a revision with no handshake is refused at config load under
+  `transport: http`.** An HTTP session is minted by `initialize`, so its host context
+  is always `2025-11-25` and the pair could never match. Use `transport: stdio` for
+  such an upstream, where a peer opens its context by declaring a revision.
+- **A host `initialize` reaching a leg that speaks a handshake-less revision is
+  refused** `UNSUPPORTED_PROTOCOL_VERSION`, rather than answered from that leg's
+  `server/discover` data. Synthesizing one revision's handshake from the other's
+  capability object is translation, and it would hand the host a capability set
+  describing methods this build then denies fail-closed.
 
 A host request's own `_meta` declaration is forwarded **verbatim** — nothing strips or
 rewrites `_meta`. Rewriting it to match the leg is translation, which the mismatched-pair

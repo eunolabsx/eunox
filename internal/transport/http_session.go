@@ -80,17 +80,16 @@ type httpSession struct {
 	upstreamInstructions  string // instructions from the upstream initialize response
 	idCounter             int64
 
-	// upstreamRev is the protocol revision this session speaks to its upstream, pinned at
-	// the handshake and read-only after. hostRev is the revision the HOST context was
-	// opened at. The two are separate because host and upstream migrate independently, and
-	// bridging that gap is what a proxy is for.
+	// upstreamRev is the protocol revision this session speaks to its upstream, decided at
+	// CONSTRUCTION from the route's pin (UpstreamOpenRevision) and read-only after — it picks
+	// the opener, so it cannot be a conclusion drawn from the opener's own reply. hostRev is
+	// the revision the HOST context was opened at. The two are separate because host and
+	// upstream migrate independently, and bridging that gap is what a proxy is for.
+	//
+	// Copied from the route rather than read through it, so the open has no route dependency
+	// and a bare upstream leg stays exercisable on its own.
 	upstreamRev capability.Revision
 	hostRev     capability.Revision
-	// upstreamRevPin is the route's operator pin, copied at construction so the handshake
-	// resolves the revision from a session field rather than reaching back through the
-	// route — the handshake has no other route dependency, and giving it one would make a
-	// bare upstream handshake impossible to exercise on its own. Empty means probe it.
-	upstreamRevPin capability.Revision
 
 	// claims holds the JWT claims validated at initialize, or nil if none. Server-initiated
 	// decisions (e.g. sampling/createMessage) have no host request in scope, so they're
@@ -277,6 +276,9 @@ func (s *httpSession) touchRequest() {
 // buildInitResponse builds an initialize response for the host using the
 // upstream capabilities gathered during session startup.
 func (s *httpSession) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
+	if resp, refused := refuseInitializeAcrossRevisions(msg.ID, s.upstreamRev); refused {
+		return resp
+	}
 	return buildInitializeResponse(msg.ID, s.upstreamCaps, s.upstreamInstructions)
 }
 
@@ -436,8 +438,8 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		// in the older revision — so opening one IS negotiating it. Each request is checked
 		// against this pin, so one declaring a different revision is refused rather than
 		// switching method tables mid-context.
-		hostRev:        handshakeRevision,
-		upstreamRevPin: route.upstreamProtocolVersion,
+		hostRev:     handshakeRevision,
+		upstreamRev: UpstreamOpenRevision(route.upstreamProtocolVersion),
 	}
 	// Cleared only when newSession returns, so the idle reaper spares the drift-check window.
 	sess.initInProgress.Store(true)
@@ -1083,35 +1085,36 @@ func (s *httpSession) initUpstream(ctx context.Context) error {
 		// pipe open indefinitely, and this giving up does not mean the goroutine stopped
 		// reading it — handshakeStopped, not this return, is what callers must join.
 		waitBounded(done, s.shutdownBudget(), "upstream initialize output stream", s.errOut())
-		return fmt.Errorf("upstream did not complete initialize: %w", ctx.Err())
+		return fmt.Errorf("upstream did not complete its opener: %w", ctx.Err())
 	}
 }
 
-// runInitHandshake writes the initialize request, waits for the matching
-// response, and sends notifications/initialized.
+// runInitHandshake opens the upstream leg at the revision this session speaks, waits for the
+// matching response, and completes the open on the revision that has a completion.
 func (s *httpSession) runInitHandshake() error {
 	s.idCounter++
-	req, initID := buildInitializeRequest(s.idCounter)
+	req, initID, err := buildUpstreamOpener(s.upstreamRev, s.idCounter)
+	if err != nil {
+		return err
+	}
 	if err := s.upWriter.Write(req); err != nil {
-		return fmt.Errorf("sending initialize: %w", err)
+		return fmt.Errorf("sending %s: %w", req.Method, err)
 	}
 
 	resp, err := awaitStartupReply(s.upReader.Read, initID, s.upWriter, nil)
 	if err != nil {
-		return fmt.Errorf("reading initialize response: %w", err)
+		return fmt.Errorf("reading %s response: %w", req.Method, err)
 	}
-	hs, err := applyInitializeResult(resp)
+	hs, err := ApplyUpstreamOpenerResult(s.upstreamRev, resp)
 	if err != nil {
 		return err
 	}
+	reportUpstreamOpenNotice(s.errOut(), hs)
 	s.upstreamCaps, s.upstreamServerVersion, s.upstreamInstructions = hs.Capabilities, hs.ServerVersion, hs.Instructions
-	// Pin the upstream-side revision once, at the handshake: every later leg reads this one
-	// answer rather than re-deriving it from a result no longer in scope.
-	s.upstreamRev = resolveUpstreamRevision(s.upstreamRevPin, hs.ProtocolVersion)
 
-	notif, err := mcp.NotificationMsg(mcp.MethodNotificationsInitialized, nil)
-	if err != nil {
-		return err
+	notif, wanted := UpstreamOpenerCompletion(s.upstreamRev)
+	if !wanted {
+		return nil
 	}
 	return s.upWriter.Write(notif)
 }

@@ -10,7 +10,29 @@ import (
 
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
+
+// driftProbeID is the JSON-RPC id every session-start tools/list probe is stamped with, on
+// both transports.
+var driftProbeID = mcp.RawJSON(`"_drift"`)
+
+// BuildToolsListProbe builds one page of a tools/list probe for a leg speaking rev —
+// drift.ToolsListRequest plus, on a declaring leg, the per-request revision declaration that
+// revision requires.
+//
+// Exported and shared with the CLI probe for the reason the opener is: this is a request eunox
+// ORIGINATES on an upstream leg, so it owes the declaration, and three hand-wrapped call sites
+// across two packages is three places to forget it. The id is the caller's, since the proxy's
+// probe and the CLI's use different ones.
+func BuildToolsListProbe(rev capability.Revision, id *json.RawMessage, cursor string) (mcp.RPCMsg, error) {
+	return DeclareUpstreamRevision(drift.ToolsListRequest(id, cursor), rev)
+}
+
+// driftProbeRequest is the session-start probe's own call, with this proxy's fixed id.
+func driftProbeRequest(rev capability.Revision, cursor string) (mcp.RPCMsg, error) {
+	return BuildToolsListProbe(rev, driftProbeID, cursor)
+}
 
 // fetchUpstreamToolsRaw sends a tools/list probe over the HTTP session's callUpstream and
 // returns the raw JSON result. Marked withoutUpstreamTimeout since it's session-start work,
@@ -18,7 +40,10 @@ import (
 // establishment when the manifest pins descriptionHash (fetch failure is fatal then).
 func (sess *httpSession) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage, error) {
 	return drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
-		req := drift.ToolsListRequest(mcp.RawJSON(`"_drift"`), cursor)
+		req, err := driftProbeRequest(sess.upstreamRev, cursor)
+		if err != nil {
+			return nil, err
+		}
 		resp, err := sess.callUpstream(withoutUpstreamTimeout(ctx), req)
 		if err != nil {
 			return nil, fmt.Errorf("tools/list: %w", err)
@@ -54,7 +79,10 @@ func (p *StdioProxy) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage
 	probeCtx, cancel := p.httpBridgeStartCtx(ctx)
 	defer cancel()
 	return drift.FetchAllToolPages(func(cursor string) (json.RawMessage, error) {
-		req := drift.ToolsListRequest(mcp.RawJSON(`"_drift"`), cursor)
+		req, err := driftProbeRequest(p.upstreamRev, cursor)
+		if err != nil {
+			return nil, err
+		}
 		if p.upHTTP != nil {
 			p.upHTTP.postWithCtx(probeCtx, req)
 		} else if err := p.upWriter.Write(req); err != nil {
@@ -62,7 +90,7 @@ func (p *StdioProxy) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage
 		}
 		msg, err := awaitStartupReply(
 			func() (mcp.RPCMsg, error) { return p.readProbeReply(probeCtx) },
-			mcp.RawJSON(`"_drift"`),
+			driftProbeID,
 			p.upWriter,
 			nil,
 		)

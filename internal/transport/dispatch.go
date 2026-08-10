@@ -7,8 +7,18 @@
 // # Gate order
 //
 // The cross-cutting gates every host message passes are ordered ONCE, here, rather than
-// re-derived at each transport's prologue. Both transports inherit it: the notification
-// framing by calling hostNotificationGate.admit, the request framing by dispatchRequest.
+// re-derived at each transport's prologue. Both transports inherit it: the head of the order
+// by calling hostMessageGate.negotiate (in revision.go), the notification framing by
+// hostNotificationGate.admit, the request framing by dispatchRequest.
+//
+// The head and the tail are shared; the MIDDLE is deliberately not one prologue. Revocation
+// cannot be hoisted beside negotiation for the request framing, because that check must be
+// taken FRESH after the decision turn — a kill landing during an unbounded wait has to be
+// recorded as KILL_SWITCH rather than as the method's own refusal, and a prologue-level answer
+// would be the stale one. So the request framing takes it inside dispatchRequest and
+// enforcedForwardCore, and the notification framing — which waits for nothing — takes it in
+// hostNotificationGate. See hostMessageGate's doc for what the two transports still hold of
+// their own, and why.
 //
 //  1. REVISION negotiation (resolveHostRevision / refuseHostRevision). First, because every
 //     table below is revision-scoped: a message whose revision cannot be established has no
@@ -414,16 +424,16 @@ func buildRevisionDispatch(registry map[string]methodSpec) map[capability.Revisi
 }
 
 // handshakeRevision is the revision whose method set contains `initialize` — the one place
-// "the handshake exists only in the older revision" is written down, DERIVED from
-// methodRegistry rather than restated at each site that opens, answers, or version-stamps a
-// handshake. A registry that stops declaring exactly one revision for `initialize` falls back
+// "the handshake exists only in the older revision" is written down for this package, DERIVED
+// from methodRegistry rather than restated at each site that opens, answers, or version-stamps
+// a handshake. A registry that stops declaring exactly one revision for `initialize` falls back
 // to the shipped default here (production must not panic on a data slip) and fails
 // TestHandshakeRevision_DerivedFromTheRegistry.
+//
+// capability.HandshakeRevision() is the same fact for the layers that may not import this
+// package (the config loader refusing an unmatchable pin). The derivation stays here so the
+// registry remains the operational source; the test asserts the two agree.
 var handshakeRevision = deriveHandshakeRevision(methodRegistry)
-
-// HandshakeRevision returns the MCP revision that defines the `initialize` handshake, so the
-// CLI's live-upstream probes open a leg at the same revision the running proxy does.
-func HandshakeRevision() capability.Revision { return handshakeRevision }
 
 func deriveHandshakeRevision(registry map[string]methodSpec) capability.Revision {
 	if spec, ok := registry[mcp.MethodInitialize]; ok && len(spec.In) == 1 {

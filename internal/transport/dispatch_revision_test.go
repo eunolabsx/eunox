@@ -76,8 +76,15 @@ func TestHandshakeRevision_DerivedFromTheRegistry(t *testing.T) {
 	if len(spec.In) != 1 {
 		t.Fatalf("%q declares %v; the handshake revision is derivable only while exactly one revision has it — give the sites that read handshakeRevision a per-peer answer before widening this", mcp.MethodInitialize, spec.In)
 	}
-	if handshakeRevision != spec.In[0] || HandshakeRevision() != spec.In[0] {
-		t.Errorf("handshakeRevision = %q / %q, want %q from the registry", handshakeRevision, HandshakeRevision(), spec.In[0])
+	if handshakeRevision != spec.In[0] {
+		t.Errorf("handshakeRevision = %q, want %q from the registry", handshakeRevision, spec.In[0])
+	}
+	// The same fact lives in pkg/capability for the layers that may not import this package
+	// (the config loader refusing a pin the host leg could never match). Two homes, one
+	// authority: the registry derives it, and this is what keeps the published constant honest.
+	if capability.HandshakeRevision() != handshakeRevision {
+		t.Errorf("capability.HandshakeRevision() = %q, but the registry derives %q — the config loader would refuse the wrong pins",
+			capability.HandshakeRevision(), handshakeRevision)
 	}
 }
 

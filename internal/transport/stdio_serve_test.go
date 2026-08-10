@@ -126,10 +126,11 @@ func newStdioProxy(cfg stdioServe, hostReader io.Reader) (*StdioProxy, *mockHost
 		pdp:       decider,
 		sessionID: sessionID,
 		sink:      cfg.sink,
-		// The leg Start always leaves a proxy on: eunox opens every upstream with `initialize`,
-		// so the handshake revision is what it addresses one as. Set HERE, once, because it
-		// changes what resolveHostRevision honors.
-		upstreamRev: handshakeRevision,
+		// The leg an UNPINNED proxy is left on: with no `protocolVersion` pin the upstream is
+		// opened with `initialize`, so that is the revision it is addressed as. Set HERE, once,
+		// because it changes what resolveHostRevision honors. A fixture wanting a pinned leg
+		// sets it through UpstreamOpenRevision rather than by hand.
+		upstreamRev: UpstreamOpenRevision(""),
 		hostReader:  mcp.NewMsgReader(hostReader),
 		hostWriter:  mcp.NewMsgWriter(&writerAdapter{hostSink}),
 		upWriter:    upSink,

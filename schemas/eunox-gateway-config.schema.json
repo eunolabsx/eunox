@@ -263,7 +263,7 @@
         },
         "protocolVersion": {
           "type": "string",
-          "description": "MCP protocol revision eunox speaks to THIS upstream. \"auto\" (the default, and what an omitted key means) probes it from the upstream's own handshake; naming a revision pins it and overrides the probe. Per upstream, not per gateway, because upstreams migrate on independent schedules.",
+          "description": "MCP protocol revision eunox speaks to THIS upstream, which selects how its leg is OPENED. \"auto\" (the default, and what an omitted key means) opens with the `initialize` handshake; naming a revision opens with that revision's opener and sets the version header, the per-request `_meta` declaration, and which revision a host message must resolve to. The upstream's own handshake answer is checked against it, never allowed to override it. Per upstream, not per gateway, because upstreams migrate on independent schedules. A revision with no handshake cannot be pinned under `transport: http`, where a session is minted by `initialize`.",
           "enum": [
             "",
             "auto",

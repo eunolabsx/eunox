@@ -148,12 +148,12 @@ func TestBuildInitResponse_UsesUpstreamCapsAndInstructions(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ApplyInitializeResult (jsonrpc.go) — exported wrapper. The existing suite
-// drives the unexported applyInitializeResult; this exercises the exported
-// seam the CLI probe consumes (one happy + one fail-closed case).
+// ApplyUpstreamOpenerResult (upstream_open.go) — the exported seam the CLI probe
+// consumes. The existing suite drives the unexported applyInitializeResult; this
+// exercises the exported form (one happy + one fail-closed case).
 // ---------------------------------------------------------------------------
 
-func TestApplyInitializeResult_ExportedWrapper(t *testing.T) {
+func TestApplyUpstreamOpenerResult_ExportedWrapper(t *testing.T) {
 	t.Parallel()
 
 	result := mcp.InitResult{
@@ -166,19 +166,19 @@ func TestApplyInitializeResult_ExportedWrapper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	hs, err := ApplyInitializeResult(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)})
+	hs, err := ApplyUpstreamOpenerResult(handshakeRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Result: json.RawMessage(raw)})
 	caps, ver, instructions := hs.Capabilities, hs.ServerVersion, hs.Instructions
 	if err != nil {
-		t.Fatalf("ApplyInitializeResult rejected a valid result: %v", err)
+		t.Fatalf("ApplyUpstreamOpenerResult rejected a valid result: %v", err)
 	}
 	if ver != "4.5.6" || instructions != "exported path" || caps == nil {
 		t.Errorf("got caps=%v ver=%q instructions=%q", caps, ver, instructions)
 	}
 
 	// Fail-closed: an error response surfaces as an error from the exported form too.
-	_, err = ApplyInitializeResult(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Error: &mcp.RPCError{Code: -32600, Message: "nope"}})
+	_, err = ApplyUpstreamOpenerResult(handshakeRevision, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Error: &mcp.RPCError{Code: -32600, Message: "nope"}})
 	if err == nil {
-		t.Fatal("ApplyInitializeResult must fail closed on an error response")
+		t.Fatal("ApplyUpstreamOpenerResult must fail closed on an error response")
 	}
 
 	// A result missing the required serverInfo object must also fail closed
@@ -188,7 +188,7 @@ func TestApplyInitializeResult_ExportedWrapper(t *testing.T) {
 		ID:      mcp.RawJSON("1"),
 		Result:  json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{}}`),
 	}
-	if _, err := ApplyInitializeResult(noServerInfo); err == nil {
+	if _, err := ApplyUpstreamOpenerResult(handshakeRevision, noServerInfo); err == nil {
 		t.Fatal("a result missing serverInfo must fail closed")
 	} else if !strings.Contains(err.Error(), "serverInfo") {
 		t.Errorf("error = %q, want it to mention serverInfo", err.Error())

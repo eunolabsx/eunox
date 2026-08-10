@@ -429,10 +429,12 @@ type UpstreamConfig struct {
 	EffectReceiptKeys string `yaml:"effectReceiptKeys"`
 
 	// ProtocolVersion pins the MCP protocol revision eunox speaks to THIS upstream:
-	// "auto" (the default, and what an omitted key means) probes it from the upstream's own
-	// handshake, or name a revision to override the probe. Per upstream, not per gateway,
-	// because a gateway's upstreams migrate on independent schedules — serving a pair that
-	// disagrees is the deployment a proxy exists for.
+	// "auto" (the default, and what an omitted key means) opens the leg with the `initialize`
+	// handshake; naming a revision opens it with that revision's own opener and sets everything
+	// downstream of it — the version header, the per-request `_meta` declaration, and which
+	// revision a host message must resolve to. The upstream's handshake answer is checked
+	// against the pin, never allowed to override it. Validate refuses a revision this build
+	// does not speak, and one with no handshake under the HTTP host transport.
 	ProtocolVersion string `yaml:"protocolVersion"`
 
 	// Per-route overrides. Pointer ⟹ "unset, inherit from defaults".
@@ -902,6 +904,9 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 			return fmt.Errorf("transport: stdio fronts exactly one upstream, got %d", len(cfg.Upstreams))
 		}
 	}
+	if err := validateHandshakelessPins(cfg); err != nil {
+		return err
+	}
 	for _, cidr := range cfg.Listen.TrustedProxyCIDRs {
 		ip, network, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -1058,10 +1063,40 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 	return nil
 }
 
-// ProtocolVersionAuto is the upstream `protocolVersion` value — and the meaning of an
-// omitted key — that probes the revision from the upstream's own handshake instead of
-// pinning one. Spelled out rather than left as "" so an operator can write the default
-// explicitly and a reader can tell "probe" from "not yet configured".
+// validateHandshakelessPins refuses a per-upstream `protocolVersion` pin that the HOST leg
+// could never match.
+//
+// An HTTP-hosted session is minted by `initialize`, so its host context is always the
+// handshake revision. Pinning an upstream to a revision that removed `initialize` therefore
+// builds a route whose every forwarding request is refused UNSUPPORTED_PROTOCOL_VERSION for
+// the session's life — the pair is mismatched, and translating one is not implemented. Refused
+// at load, where an operator can act on it, rather than at the first request, where it reads
+// as an upstream fault.
+//
+// stdio is not refused: a peer there may open a context at any revision by declaring it, so a
+// host and a pinned upstream on the same revision is a reachable matched pair.
+func validateHandshakelessPins(cfg *GatewayConfig) error {
+	if cfg.HostTransport() != HostTransportHTTP {
+		return nil
+	}
+	for i := range cfg.Upstreams {
+		pin := cfg.Upstreams[i].ResolvedProtocolVersion()
+		if pin == "" || pin == capability.HandshakeRevision() {
+			continue
+		}
+		return fmt.Errorf("upstream %q: protocolVersion %q cannot be served over the %q host transport — "+
+			"an HTTP session is opened by `initialize`, which %s does not have, so every forwarded request "+
+			"would be refused as a mismatched pair. Use `transport: stdio` for this upstream, or leave "+
+			"protocolVersion at %q",
+			cfg.Upstreams[i].Name, pin, HostTransportHTTP, pin, ProtocolVersionAuto)
+	}
+	return nil
+}
+
+// ProtocolVersionAuto is the upstream `protocolVersion` value — and the meaning of an omitted
+// key — that opens the leg with the `initialize` handshake, the surface every release before
+// the pin presented. Spelled out rather than left as "" so an operator can write the default
+// explicitly and a reader can tell it from "not yet configured".
 const ProtocolVersionAuto = "auto"
 
 // validateProtocolVersion refuses an upstream `protocolVersion` that is neither the auto
@@ -1088,13 +1123,7 @@ func protocolVersionAccepted(value string) bool {
 // the config key's error and the flag's cannot list different sets while both claiming to
 // accept exactly the same one.
 func acceptedProtocolVersions() string {
-	supported := capability.PublishedRevisions()
-	names := make([]string, 0, len(supported)+1)
-	names = append(names, ProtocolVersionAuto)
-	for _, rev := range supported {
-		names = append(names, rev.String())
-	}
-	return strings.Join(names, ", ")
+	return strings.Join(append([]string{ProtocolVersionAuto}, capability.PublishedRevisionNames()...), ", ")
 }
 
 // ValidateProtocolVersionFlag applies the same rule to the CLI's --upstream-protocol-version

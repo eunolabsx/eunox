@@ -89,7 +89,7 @@ func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared
 	}
 	parsed, ok := capability.ParseRevision(version)
 	if !ok {
-		return "", true, fmt.Errorf("%w: %q", ErrUnknownRevision, boundReflected(version))
+		return "", true, fmt.Errorf("%w: %q", ErrUnknownRevision, BoundReflectedRevision(version))
 	}
 	return parsed, true, nil
 }
@@ -124,10 +124,14 @@ func DeclaredRevisionOf(msg RPCMsg) (rev capability.Revision, declared bool, err
 	}
 }
 
-// boundReflected truncates a rejected version string to what is safe to echo back to the peer
-// that sent it, and strips anything that is not printable ASCII so a terminal reading the
-// error cannot be driven by the value. See maxReflectedRevisionLen.
-func boundReflected(version string) string {
+// BoundReflectedRevision truncates a rejected version string to what is safe to echo back to
+// the peer that sent it, and strips anything that is not printable ASCII so a terminal reading
+// the error cannot be driven by the value. See maxReflectedRevisionLen.
+//
+// Exported because the UPSTREAM leg reflects one too — a handshake naming a revision this build
+// cannot speak is refused, naming what the upstream said, to an operator's console. What is
+// safe to echo does not depend on which peer sent it, so it is one rule rather than two.
+func BoundReflectedRevision(version string) string {
 	if len(version) > maxReflectedRevisionLen {
 		version = version[:maxReflectedRevisionLen] + "..."
 	}
@@ -147,11 +151,7 @@ func boundReflected(version string) string {
 var unsupportedRevisionData = buildUnsupportedRevisionData()
 
 func buildUnsupportedRevisionData() json.RawMessage {
-	supported := capability.PublishedRevisions()
-	versions := make([]string, 0, len(supported))
-	for _, rev := range supported {
-		versions = append(versions, rev.String())
-	}
+	versions := capability.PublishedRevisionNames()
 	data, _ := json.Marshal(struct {
 		Code      string   `json:"code"`
 		Supported []string `json:"supported"`
@@ -161,7 +161,7 @@ func buildUnsupportedRevisionData() json.RawMessage {
 
 // UnsupportedProtocolVersionResponse builds the spec's UNSUPPORTED_PROTOCOL_VERSION
 // (-32022) refusal. message names what was wrong with the request's own declaration; any
-// caller-supplied text it embeds has already been bounded and stripped by boundReflected.
+// caller-supplied text it embeds has already been bounded and stripped by BoundReflectedRevision.
 func UnsupportedProtocolVersionResponse(id *json.RawMessage, message string) RPCMsg {
 	return RPCMsg{
 		JSONRPC: "2.0",

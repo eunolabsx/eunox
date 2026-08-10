@@ -312,7 +312,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		wiretapURL:           fs.String("upstream-url", "", "HTTP upstream URL for --audit mode (alternative to a `--` subprocess)."),
 		wiretapAuthHeader:    fs.String("upstream-auth-header", "", `HTTP upstream auth header for --audit mode, "Name: Value".`),
 		wiretapTLSSkipVerify: fs.Bool("upstream-tls-skip-verify", false, "Skip TLS verification for --audit --upstream-url (development only)."),
-		wiretapProtocolVer:   fs.String("upstream-protocol-version", "", "Pin the MCP protocol revision eunox speaks to the --audit upstream, overriding\nwhat its handshake reports: \"auto\" (the default) probes it, or name a revision.\nThe config-file equivalent is an upstream's `protocolVersion` key; under --config\nthe pin comes from there, so this flag applies only to --audit wiretap mode."),
+		wiretapProtocolVer:   fs.String("upstream-protocol-version", "", "Pin the MCP protocol revision eunox speaks to the --audit upstream, which selects\nhow the leg is opened: \"auto\" (the default) opens with the `initialize` handshake,\nor name a revision. The config-file equivalent is an upstream's `protocolVersion`\nkey; under --config the pin comes from there, so this flag applies only to --audit\nwiretap mode."),
 
 		// Operational flags layered over the config.
 		unsafeBindAll:      fs.Bool("unsafe-bind-all", false, "Allow binding to all interfaces (transport: http only)."),
@@ -903,12 +903,11 @@ func buildAuditWiretapConfig(positional []string, upstreamURL, authHeader string
 		if authHeader != "" || tlsSkipVerify {
 			return nil, fmt.Errorf("--audit: --upstream-auth-header/--upstream-tls-skip-verify apply only to a remote --upstream-url upstream, not a positional `-- <command>` subprocess")
 		}
-		// The protocol pin only reaches the wire on a remote HTTP leg (it selects that leg's
-		// version header); a subprocess upstream speaks the handshake it is given. Refuse it
-		// here rather than accept a flag that would silently do nothing.
-		if protocolVersion != "" {
-			return nil, fmt.Errorf("--audit: --upstream-protocol-version applies only to a remote --upstream-url upstream, not a positional `-- <command>` subprocess")
-		}
+		// The pin used to be refused here, because it reached no wire behavior on a
+		// subprocess: every leg was opened with `initialize` whatever it said, and its only
+		// effect was the version header a subprocess never sees. It now selects the OPENER,
+		// which a subprocess upstream reads exactly as a remote one does — so the flag does
+		// something on this transport and refusing it would deny the operator the control.
 		u.Transport = config.HostTransportStdio
 		u.Command = positional[0]
 		u.Args = positional[1:]
@@ -1685,8 +1684,8 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 		UpstreamURL:           u.UpstreamURL,
 		UpstreamAuthHeader:    u.UpstreamAuthHeader,
 		UpstreamTLSSkipVerify: u.UpstreamTLSSkipVerify,
-		// Empty when the operator wrote `auto` or omitted the key: the handshake's own
-		// reported revision wins. LoadGatewayConfig has already refused anything else.
+		// Empty when the operator wrote `auto` or omitted the key, which opens the leg with
+		// the handshake. LoadGatewayConfig has already refused anything else.
 		UpstreamProtocolVersion: u.ResolvedProtocolVersion(),
 		PDP:                     dp,
 		Sink:                    sink,

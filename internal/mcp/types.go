@@ -14,7 +14,13 @@ package mcp
 
 import "encoding/json"
 
-// InitResult is the result field of an `initialize` response.
+// InitResult is the result field of an opener response — `initialize`, and `server/discover`
+// on the revision that replaced it.
+//
+// One type for both because the two carry the same server description; they differ only in
+// ProtocolVersion, which the handshake NEGOTIATES and the stateless revision has no field for
+// (its client declares one per request). Which of them may leave it empty is the caller's
+// question, not the shape's — see validateOpenerResultFields.
 type InitResult struct {
 	ProtocolVersion string                 `json:"protocolVersion"`
 	Capabilities    map[string]interface{} `json:"capabilities"`

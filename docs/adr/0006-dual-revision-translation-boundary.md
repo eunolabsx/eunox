@@ -54,10 +54,40 @@ and refuse the rest fail-closed.** Concretely:
   method set, and the newer table stays reachable only by explicit declaration.
   If handshake-less session creation later makes refusal the correct answer,
   it is ADR-0004's half that changes it, not a silent divergence here.
-- **Upstream-side revision is probed once and pinned** per route (gateway) or
-  per proxy (stdio): the session-start probe opens with `server/discover` and
-  falls back to `initialize`; a `protocolVersion: auto | "2025-11-25" |
-  "2026-07-28"` key on the upstream config overrides the probe.
+- **Upstream-side revision is decided once and pinned** per route (gateway) or
+  per proxy (stdio), and it SELECTS the opener rather than labelling a leg opened
+  some other way: a `protocolVersion: auto | "2025-11-25" | "2026-07-28"` key on
+  the upstream config picks `initialize` or `server/discover`, and everything
+  else about the leg follows from it (whether the open is completed with
+  `notifications/initialized`, what `MCP-Protocol-Version` names, whether eunox's
+  own requests carry the per-request `_meta` declaration, and which resolved
+  revision a host message must agree with to be forwardable). The upstream's own
+  handshake answer is CHECKED against that decision, never allowed to set it. The
+  two failures get different answers, by blast radius: a version this build DOES
+  speak that is not the one offered refuses the leg at session start (the leg
+  would look negotiated while eunox spoke a revision over a method that revision
+  removed), while a version outside the published set is REPORTED and the leg
+  continues at the revision it was opened at — refusing there would take eunox
+  offline against every server on an unpublished revision, which is most of them,
+  and what was wrong before was the silence rather than the fallback.
+
+  A pin naming a revision with no handshake is refused at config load on the HTTP
+  host transport, where a session can only be minted by `initialize` and the pair
+  could therefore never match; and a host `initialize` reaching a leg that speaks
+  such a revision is refused rather than answered from that leg's discovery data,
+  since synthesizing one revision's handshake from the other's capability object
+  is exactly the translation this boundary governs.
+
+  *As landed, `auto` does not PROBE.* This ADR's original text had the
+  session-start probe open with `server/discover` and fall back to `initialize`
+  on method-not-found. Selecting from the pin needs no probe — an operator who
+  writes the pin has stated the fact the probe would go looking for — and the
+  probe changes what every existing 2025-11-25 upstream sees before eunox knows
+  anything about it, which the release's own regression invariant forbids without
+  the interop matrix as its arbiter. `auto` therefore opens with
+  `initialize`, byte for byte as before. If the probe is still wanted once that
+  matrix stands, it is an addition to the `auto` branch alone and changes nothing
+  a pin already decides.
 - **Method routing is revision-scoped, declared once per method.** Each entry
   in the dispatch tables (`decideMethodHandlers`, `locallyAnsweredHandlers`,
   `forwardableHostNotifications`, `swallowedHostNotifications`) carries the

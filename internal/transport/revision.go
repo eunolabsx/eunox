@@ -6,7 +6,9 @@
 // The two are tracked independently on purpose: a proxy exists to stand between peers that
 // disagree, and the common migration deployment is a current host in front of a lagging
 // upstream (or the reverse). The host-side result is established per context and CHECKED per
-// request; the upstream-side result is probed once and pinned for the route's life.
+// request; the upstream-side result is DECIDED once, before the leg opens, and pinned for the
+// route's life (see upstream_open.go — it selects the opener, so it cannot be a conclusion
+// drawn from the opener's own reply).
 
 package transport
 
@@ -37,6 +39,112 @@ var errRevisionMismatch = errors.New("protocol revision disagrees with the conte
 // same revision. Rewriting the request to match is translation, which the mismatched-pair
 // boundary governs and this build does not do.
 var errUnhonorableUpstreamRevision = errors.New("request revision cannot be honored by the upstream leg")
+
+// errUndeclaredOnDeclaringLeg marks a message that resolved to a declaring revision by
+// INHERITING its context rather than by stating a version, on a leg whose revision requires the
+// declaration on every request.
+//
+// eunox forwards a host's params verbatim and declares only on the requests it originates, so
+// there is nothing to add on the way through — the member would simply be absent at the
+// upstream, which refuses it one layer away from the cause. Refusing here names the cause: the
+// peer inherited a revision whose own rule is that inheritance is not enough.
+var errUndeclaredOnDeclaringLeg = errors.New("request inherited a revision that requires a per-request declaration, and carries none")
+
+// hostLeg is what revision negotiation needs to know about the connection a message arrived on.
+//
+// A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
+// and three bare arguments at those call sites read as an oversight rather than as the fact
+// they are: no session established, and no upstream leg their message could reach.
+type hostLeg struct {
+	contextRev  capability.Revision
+	upstreamRev capability.Revision
+	sessionID   string
+}
+
+// hostMessageGate is the shared prologue every host message passes before its framing is
+// dispatched — the head of the gate order (see dispatch.go), with the three per-transport
+// facts injected rather than restated.
+//
+// It exists for the reason hostNotificationGate does one framing over. Before it, each
+// transport spelled the sequence out: resolve, build the refusal, write it in whatever shape
+// this peer takes, and — on the one transport that remembered — answer the upstream request a
+// refused host RESPONSE would have completed. That last step lived at HTTP's CALL SITE rather
+// than in its negotiation helper, so a third HTTP entry point that negotiated would have
+// inherited the refusal and not the unblock, which is the same shape as the arm that inherited
+// neither.
+//
+// The two transports still hold their own negotiateHostRevision, because their SHAPES differ
+// for a reason that is not a preference: stdio returns the stamped context (its reader owns the
+// pin and nothing may route a message without giving its records the revision it routed by),
+// while contextcheck requires HTTP's derivation from r.Context() to be visible at the site. The
+// prologue below is what is common underneath both — negotiation, its refusal, and its debt to
+// a blocked initiator.
+//
+// It COSTS three heap allocations per host message, measured rather than assumed: `negotiate`
+// calls its three fields indirectly, so the receiver leaks (`-gcflags=-m`: "leaking param: g")
+// and every closure spills. BenchmarkHTTPProxy moves +3 allocs/op and ~+65 B/op on each proxied
+// subtest — around 1% of a request that already allocates ~330 times. Accepted rather than
+// optimized away, because the two shapes that would remove it both undo the point: hoisting the
+// resolve out of `negotiate` puts the sequence back at the call sites, and boxing the three
+// hooks into an interface only moves the allocation to the transport that cannot supply a
+// long-lived receiver. BenchmarkStdioProxy cannot see any of this — it drives handleHostRequest
+// directly, below serveHost, which is the only caller of stdio's negotiateHostRevision.
+//
+// Revocation is deliberately NOT part of this prologue, though the gate order places it next.
+// For the REQUEST framing the kill check must be taken AFTER the decision turn, freshly, so a
+// kill landing during an unbounded wait is recorded as KILL_SWITCH rather than as the method's
+// own refusal; a prologue-level answer would be the stale one. That is why the request framing
+// takes it inside dispatchRequest and enforcedForwardCore, and why the notification framing —
+// which waits for nothing — can and does take it here-adjacent, in hostNotificationGate.
+type hostMessageGate struct {
+	// leg is the connection's own answer to what negotiation needs to know.
+	leg hostLeg
+	// recorder resolves the refusal's audit recorder, LAZILY: it is drawn from a rate-limit
+	// bucket, so resolving it for a message that is about to be admitted spends a token on
+	// nothing — and an unauthenticated peer can send those at will. Nil resolves to no
+	// recorder, which refuseHostRevision reads as "record nothing"; the wire refusal is
+	// unaffected either way.
+	recorder func() auditRecorder
+	// refuse writes the refusal to THIS peer. It is handed the response refuseHostRevision
+	// built, which is the zero message for any framing JSON-RPC forbids replying to — each
+	// transport decides what it sends instead (stdio nothing, HTTP a bodyless 202).
+	//
+	// Never nil, like hostNotificationGate.checkKill: every gate has a peer to answer, and the
+	// refusal path is reachable by any peer sending a bad version, so there is nothing a
+	// fallback here could do that a caller with no writer has not already got wrong.
+	refuse func(mcp.RPCMsg)
+	// unblock answers the upstream request a refused host RESPONSE would have completed, so it
+	// does not hang until the connection ends. Nil on a leg that has no upstream to unblock —
+	// the pre-session arms, whose messages reach none. See server_request_unblock.go for the
+	// leg's one rule and its two exceptions.
+	unblock func(context.Context, mcp.RPCMsg)
+}
+
+// negotiate resolves the revision one host message is dispatched under, disposing of it
+// entirely when it cannot be established: ok=false means the record is written, this peer has
+// its refusal in whatever shape it takes, and any upstream request the message would have
+// answered has been unblocked.
+//
+// The revision is returned rather than stamped onto a context here, because which context it is
+// stamped onto is exactly the part that differs between the transports — see the type's doc.
+func (g hostMessageGate) negotiate(ctx context.Context, msg mcp.RPCMsg) (capability.Revision, bool) {
+	rev, err := resolveHostRevision(g.leg.contextRev, g.leg.upstreamRev, msg)
+	if err == nil {
+		return rev, true
+	}
+	var rec auditRecorder
+	if g.recorder != nil {
+		rec = g.recorder()
+	}
+	// Rate-limited like every other caller-driven refusal: a suppressed record still gets its
+	// refusal on the wire, so the peer is refused either way — what the bucket bounds is the
+	// tape write, which is the part a flood turns into an availability problem.
+	g.refuse(refuseHostRevision(ctx, rec, g.leg.sessionID, g.leg.contextRev, msg, err))
+	if g.unblock != nil {
+		g.unblock(ctx, msg)
+	}
+	return "", false
+}
 
 // resolveHostRevision decides which revision one host message is dispatched under.
 //
@@ -73,19 +181,60 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 		if err := checkUpstreamHonorable(resolved, legRev); err != nil {
 			return "", err
 		}
+		if err := checkDeclarationReachesUpstream(resolved, legRev, msg, present); err != nil {
+			return "", err
+		}
 	}
 	return resolved, nil
 }
 
-// upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg. Every leg
-// is opened with `initialize`, a method only the handshake-bearing revision has, so that is
-// what eunox negotiated there whatever the leg itself reported or an operator pinned — true of
-// a subprocess upstream, which reads bare JSON-RPC and no header at all, as much as of a
-// remote HTTP one.
+// checkDeclarationReachesUpstream refuses a message that would arrive at a declaring upstream
+// without the per-request version member that revision requires.
 //
-// One expression, read by the header stamper and by the check below, so what is sent and what
-// is checked cannot drift — including on the day an opener for a newer revision lands.
-func upstreamAddressedRevision(_ capability.Revision) capability.Revision { return handshakeRevision }
+// The gap it closes is the seam between two rules that are each correct alone. Host-side,
+// omission INHERITS the context — so a peer may declare once and omit forever after. Upstream-
+// side, eunox declares only on the requests it ORIGINATES, because adding a member to a host's
+// params is translation. Put together, an inherited request crosses to a declaring upstream with
+// no declaration at all and is refused there, by a peer that cannot say which of eunox's two
+// rules produced it.
+//
+// Scoped to a message that carries a METHOD: the revision requires the declaration on requests
+// and notifications, and a host RESPONSE — the one framing relayed verbatim with no method — is
+// an answer to something the upstream already declared for itself.
+//
+// Not applied when the message declared its own revision, which is the matched-pair case and
+// the normal one: a conforming peer on a declaring revision states its version every time.
+func checkDeclarationReachesUpstream(resolved, legRev capability.Revision, msg mcp.RPCMsg, declared bool) error {
+	if declared || legRev == "" || msg.Method == "" {
+		return nil
+	}
+	if !declaresPerRequestRevision(resolved) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s requires io.modelcontextprotocol/protocolVersion in every request's _meta, and eunox forwards params verbatim rather than adding one",
+		errUndeclaredOnDeclaringLeg, resolved)
+}
+
+// upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg: the one
+// the leg was OPENED at (UpstreamOpenRevision), which is what the leg's own field already
+// holds. True of a subprocess upstream, which reads bare JSON-RPC and no header at all, as
+// much as of a remote HTTP one — the opener's method differs either way.
+//
+// It used to be the handshake revision unconditionally, because every leg was opened with
+// `initialize` whatever an operator pinned. That is no longer so, and the identity here is the
+// point rather than an accident: what is SENT (the MCP-Protocol-Version header, the opener's
+// method, eunox's own `_meta` declaration) and what is CHECKED (checkUpstreamHonorable) read
+// this one expression, so a pinned leg cannot be addressed as one revision and held to another.
+//
+// An unset (or unspeakable) leg revision resolves through UpstreamOpenRevision, the SAME
+// resolver that decided what to open with — not through resolveRevision, which answers the
+// HOST-side empty-carrier question and lands on capability.DefaultRevision. The two agree only
+// while DefaultRevision and the handshake revision are the same value, and the day the default
+// advances they would open a leg with `initialize` while heading and checking it as something
+// else. One resolver is what keeps that from being two.
+func upstreamAddressedRevision(legRev capability.Revision) capability.Revision {
+	return UpstreamOpenRevision(legRev)
+}
 
 // checkUpstreamHonorable refuses a message this proxy cannot forward without contradicting
 // itself: one whose RESOLVED revision is not the one the upstream leg is addressed as.
@@ -100,11 +249,9 @@ func upstreamAddressedRevision(_ capability.Revision) capability.Revision { retu
 // because "its bytes reach the upstream" is the whole trigger.
 //
 // A leg with no revision yet ("") is not checked: there is nothing to contradict, and refusing
-// would deny a message on the strength of a fact nobody has established.
-//
-// Consequence worth stating: today no method the newer revision declares reaches the PIN against
-// a live leg, so nothing downstream may assume the pin's value — that is incidental, not a
-// property to rely on.
+// would deny a message on the strength of a fact nobody has established. Every leg the proxy
+// opens now pins its revision at construction, so this covers the legs a test builds by
+// literal rather than a window a live one passes through.
 func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
 	if legRev == "" {
 		return nil
@@ -179,18 +326,3 @@ const (
 	refusedReplyUpstreamError     = "eunox: the host's reply declared an MCP protocol revision that could not be established; the reply was refused and cannot be relayed"
 	gateRefusedReplyUpstreamError = "eunox: the host's reply was refused by this session's security gates; the reply was refused and cannot be relayed"
 )
-
-// resolveUpstreamRevision pins the revision a route speaks to its upstream: the operator's
-// explicit config pin when set, otherwise the revision the upstream itself reported in its
-// handshake. A handshake reporting a revision this build does not speak is NOT an error
-// here — it falls back to the default so the existing probe's own validation stays the one
-// place a bad handshake is rejected — but the pin never claims a revision nobody named.
-func resolveUpstreamRevision(configured capability.Revision, handshakeVersion string) capability.Revision {
-	if configured != "" {
-		return configured
-	}
-	if rev, ok := capability.ParseRevision(handshakeVersion); ok {
-		return rev
-	}
-	return capability.DefaultRevision
-}
