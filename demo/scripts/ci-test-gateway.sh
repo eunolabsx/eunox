@@ -128,9 +128,28 @@ read_audit() {
   fi
 }
 
+# stamp_version reads the policy_version the records for one upstream carry, empty when none
+# have landed yet.
+stamp_version() {
+  read_audit | jq -r --arg u "$1" 'select(.upstream == $u) | .policy_version' 2>/dev/null | sort -u | head -1
+}
+
 assert_stamp() {
-  local desc="$1" upstream="$2" want_ver="$3" got_ver
-  got_ver=$(read_audit | jq -r --arg u "$upstream" 'select(.upstream == $u) | .policy_version' 2>/dev/null | sort -u | head -1) || true
+  local desc="$1" upstream="$2" want_ver="$3" got_ver=""
+  # Polled, because the audit sink is deliberately NON-BLOCKING: a recorder returns once the
+  # record is queued and a background drainer signs and writes it, so a request returning is not
+  # a promise that its record is on disk. Reading once, milliseconds after the last call, raced
+  # that drainer and failed on whichever route was exercised LAST — the record was written a few
+  # hundred milliseconds later, as the audit-verify pass below (which counts every record) shows.
+  # What is under test is the STAMP, not the write latency, so wait for the record rather than
+  # asserting on whether it happened to be flushed yet.
+  local deadline=$((SECONDS + 15))
+  while :; do
+    got_ver=$(stamp_version "$upstream")
+    [[ -n "$got_ver" && "$got_ver" != "null" ]] && break
+    (( SECONDS >= deadline )) && break
+    sleep 0.2
+  done
   if [[ "$got_ver" == "$want_ver" ]]; then
     printf 'PASS  %s (upstream=%s policy_version=%s)\n' "$desc" "$upstream" "$got_ver"
     ((pass++)) || true
@@ -143,7 +162,8 @@ assert_stamp() {
 if [[ -f "$AUDIT_LOG" ]]; then
   assert_stamp "files route records stamped" files "0.1.0"
   assert_stamp "db route records stamped" db "0.2.0"
-  # policy_sha256 present on at least one record.
+  # policy_sha256 present on at least one record. Not polled: the two assertions above have
+  # already waited for both routes' records, so by here the log is populated.
   if [[ -n "$(read_audit | jq -r 'select(.policy_sha256 != null) | .policy_sha256' 2>/dev/null | head -1 || true)" ]]; then
     printf 'PASS  records carry policy_sha256 digest\n'
     ((pass++)) || true
