@@ -163,6 +163,20 @@ func NewJWKSCache(cfg JWKSCacheConfig) *JWKSCache { //nolint:gocritic // hugePar
 	}
 }
 
+// BreakerStats reports the state of the circuit breaker guarding key fetches, and whether
+// there is one to report on: Breaker is optional, and a cache without one fetches directly.
+//
+// Read-only by construction: Stats PROJECTS the post-cooldown half-open state without
+// mutating, so a caller polling this can never consume the half-open probe budget a real
+// verification needs. The nil-receiver arm lets a health endpoint report rather than panic on
+// a consumer-built validator carrying no cache.
+func (c *JWKSCache) BreakerStats() (circuitbreaker.Stats, bool) {
+	if c == nil || c.breaker == nil {
+		return circuitbreaker.Stats{}, false
+	}
+	return c.breaker.Stats(), true
+}
+
 // IsLoopbackHost reports whether host (a URL hostname, no port) is a loopback name or
 // address — the one case where a plaintext http JWKS URL carries no MITM exposure. Exported
 // as the single source of truth: cmd/eunox's startup --jwks-uri scheme gate consults it too,

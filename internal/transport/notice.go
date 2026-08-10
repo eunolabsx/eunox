@@ -243,7 +243,9 @@ var noticeDeclarations = map[noticeSite]noticeDeclaration{
 	"warnIfStrictAuditJustDegraded": {bound: noticeExempt, why: exemptOncePerDegradation},
 
 	// (5) Deliberately unbounded, each carrying the reason it cannot be driven per frame.
-	"*HTTPProxy.handleMetrics":           {bound: noticeExempt, why: exemptNotADiagnostic},
+	// The scrape RESPONSE BODY, written through the one emitter every series goes through —
+	// declared where the bytes are produced, since the scan keys on the writing function.
+	"metricWriter.emit":                  {bound: noticeExempt, why: exemptNotADiagnostic},
 	"tightenTokenDir":                    {bound: noticeExempt, why: exemptNotPeerDriven},
 	"WriteControlTokenFile":              {bound: noticeExempt, why: exemptNotPeerDriven},
 	"*HTTPProxy.warnForwardedForPosture": {bound: noticeExempt, why: exemptNotPeerDriven},
