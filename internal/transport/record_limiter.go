@@ -641,6 +641,15 @@ func (s *reserveSlot) claim(at time.Time, every time.Duration) bool {
 	if s == nil {
 		return false
 	}
+	// A non-positive interval makes `elapsed < every` false for every clock reading, so the floor
+	// would deliver EVERY refused write rather than one per window — an unconditional bypass of the
+	// bucket, which on the record half means an unbounded audit-write rate past a drained tier under
+	// a --require-audit defaulting to strict. Refusing here rather than trusting the constructors
+	// because the interval is now a positional time.Duration in a seven-parameter signature, and the
+	// safe answer to "nobody sized this" is the bound, not the bypass.
+	if every <= 0 {
+		return false
+	}
 	for {
 		prev := s.last.Load()
 		// Sub over two time.Time values, so the monotonic readings decide when both carry one.

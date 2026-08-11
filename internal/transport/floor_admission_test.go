@@ -102,6 +102,30 @@ func TestFlooredWrite_UnsuppressionLandsOnTheRefusingTier(t *testing.T) {
 		"the write happened, so it comes off the tally of the tier that ELIDED it — the rollup states what the reader did not see")
 	assert.Equal(t, refusedMiddle, flooredMiddle,
 		"and never off a tier that admitted it: that tally is writes this tier really did elide, and taking one under-states the flood on the next line reporting it")
+
+	// STATED RESIDUAL, so this assertion is not read as more than it is: an INTERMEDIATE tier that
+	// admitted still pushes its token's worth of tally back when the tier above refuses, and a
+	// descendant's floor may then deliver the write anyway — so in a chain three or more deep that
+	// tier counts one delivered write as suppressed. Unreachable in the two-tier shape that ships
+	// (the child reports its own tally rather than pushing it back) and left for the change that
+	// builds a third tier, which needs the verdict to carry every tier it passed rather than only
+	// the one that refused.
+}
+
+// TestFlooredWrite_ZeroIntervalIsRefusedRatherThanUnbounded pins the direction a missing sizing
+// answer fails in.
+//
+// The interval is a positional time.Duration in a seven-parameter constructor, so a table can be
+// built with none. A zero makes `elapsed < every` false for every reading, which turns the floor
+// from one arrival per window into an unconditional bypass of the bucket — on the record half, an
+// unbounded audit-write rate past a drained tier under a strict-by-default --require-audit.
+func TestFlooredWrite_ZeroIntervalIsRefusedRatherThanUnbounded(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	slot := &reserveSlot{}
+	assert.False(t, slot.claim(at, 0), "an unsized floor delivers nothing rather than everything")
+	assert.False(t, slot.claim(at, -time.Second))
+	require.True(t, slot.claim(at, time.Minute), "and a sized one still answers")
 }
 
 // TestFlooredWrite_TwoTierChainIsUnchanged is the control: the fix is structural, so the shape that
