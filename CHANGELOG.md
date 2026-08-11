@@ -1347,10 +1347,11 @@ Section conventions:
   fifteen sites, including the per-frame ones a peer drives — and cost ~7% of the admission that
   bounds them. The declaration also gains a completeness gate: every metered site now states
   whether it collapses and why, so a site added later answers the question instead of inheriting
-  "no". The five failure-class sites that meet the collapsed sites' own criterion — an upstream
-  error, the two upstreamless forwards, the two failed notification POSTs — keep reporting per
-  occurrence, now as a recorded judgment: each names the failing call and the error behind it,
-  where a collapsed site reports a fault whose subject does not vary.
+  "no". Every failure-class site meets the collapsed sites' own criterion — an upstream error, the
+  two upstreamless forwards, the two failed notification POSTs, and the unanswerable initiator, all
+  drivable per frame by a dead upstream — and all six keep reporting per occurrence, now as a
+  recorded judgment: each names the failing call and the error behind it, where a collapsed site
+  reports a fault whose subject does not vary.
 
 - **The condition dispatch resolves each handler once per request instead of twice.** The first
   pass resolved a condition's registry entry to ask whether the type defers, then resolved it
@@ -1380,6 +1381,15 @@ Section conventions:
   here already answers deliberately (a deny-all PDP, an in-memory kill switch, `os.Stderr`) —
   and the check reaches only interface-typed options, so an optional `*audit.Sink` still
   constructs.
+
+  The same refusal covers the subsystems that reach a transport as *parameters* rather than
+  options: `BuildRoutes` and `LoadUpstreamPDP` check their counter, flow store and kill switch,
+  because `StdioProxyOptions` carries none of the three — they arrive through
+  `LoadUpstreamPDP`, so that transport's constructor sees a fully-built PDP and can refuse
+  nothing behind it. These are exactly the subsystems the engine guards with `x == nil` so an
+  unwired backend *denies* rather than panics, and a typed nil is the value those guards cannot
+  see: it reaches `AdmitAll` on the decision path, per request. Naming them one by one is
+  acceptable where naming struct fields was not — a parameter list is complete by compilation.
 
 - **A floored refusal record was counted as suppressed by every tier that carried it.** A tier
   whose own bucket admitted a write, and whose parent then refused it, returns its token's

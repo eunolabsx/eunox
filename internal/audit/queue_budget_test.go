@@ -274,6 +274,6 @@ func TestQueuedBytes_ReturnsToZeroAfterDrain(t *testing.T) {
 		t.Errorf("queuedBytes = %d after the queue drained, want 0 — the enqueue add and the drain subtract disagree", got)
 	}
 	if dropped := sink.Health().Dropped; dropped != 0 {
-		t.Errorf("DroppedRecords = %d, want 0 (the test load is far below the budget)", dropped)
+		t.Errorf("Health().Dropped = %d, want 0 (the test load is far below the budget)", dropped)
 	}
 }

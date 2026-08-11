@@ -138,6 +138,7 @@ func TestFlooredWrite_ADelegatingTierIsLeftAlone(t *testing.T) {
 	require.True(t, grand.admitWithFloor(catDisplaced, nil).ok) // drain the grandparent
 	require.False(t, child.admitWithFloor(catDisplaced, nil).ok)
 	killBefore := middle.buckets[catKill].suppressed
+	grandBefore := grand.buckets[catDisplaced].suppressed
 
 	floor := newKeyReserve([]refusalCategory{catDisplaced}).forKey(catDisplaced)
 	verdict := child.admitWithFloor(catDisplaced, floor)
@@ -145,8 +146,17 @@ func TestFlooredWrite_ADelegatingTierIsLeftAlone(t *testing.T) {
 	assert.True(t, verdict.reserved)
 	assert.Equal(t, float64(-1), grand.buckets[catDisplaced].tokens,
 		"the debit still reaches the tier that refused, through a tier that only forwarded the answer")
+
+	// The assertion with teeth, on the key actually under test: the refusing tier is corrected
+	// EXACTLY once, by borrow. A walk that corrected every tier it passed rather than stopping at
+	// the refuser takes a second write off it and under-states the next flood grand reports —
+	// verified by mutation, which is what distinguishes this from a check that holds under any
+	// implementation. (Resolving each tier through bucket() instead of its own map is NOT caught
+	// here: that recursion lands on the refuser, which the stop then answers.)
+	assert.Equal(t, grandBefore, grand.buckets[catDisplaced].suppressed,
+		"the refuser's tally moves by its own refusal and borrow's correction only; a delegating tier must not deliver a second decrement of the bucket it forwards to")
 	assert.Equal(t, killBefore, middle.buckets[catKill].suppressed,
-		"a delegating tier's OTHER buckets are untouched: the correction is per key, and this tier carried nothing under the key being delivered")
+		"and a delegating tier's OTHER buckets are untouched: the correction is per key, and this tier carried nothing under the key being delivered")
 }
 
 // TestFlooredWrite_ZeroIntervalIsRefusedRatherThanUnbounded pins the direction a missing sizing

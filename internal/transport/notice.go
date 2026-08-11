@@ -157,6 +157,15 @@ var noticeClasses = meteredNoticeClasses()
 func meteredNoticeClasses() []noticeClass {
 	out := make([]noticeClass, 0, len(meteredNotices))
 	for _, decl := range meteredNotices {
+		// classUnclassified is filtered rather than registered, which is what makes the
+		// undeclared answer STRUCTURAL rather than a property of the table test: registering it
+		// would hand an entry that forgot its class a full class bucket and a reserve slot — and
+		// move every genuinely undeclared site off the floor-rate fallback onto it, since they
+		// all resolve to the same key. Easy to write now that the value is a struct literal with
+		// an omissible field, where the bare noticeClass it replaced had to be stated.
+		if decl.class == classUnclassified {
+			continue
+		}
 		out = append(out, decl.class)
 	}
 	slices.Sort(out)
@@ -267,8 +276,9 @@ var meteredNotices = map[noticeSite]noticeSiteDeclaration{
 
 	// (2) FAILURE: an operator-facing account of something broken in transit. Metered because a
 	// peer or a dead upstream can drive them per frame, classed apart from traffic so that flood
-	// cannot take the last token from a class it does not belong to. Every one of them meets the
-	// windowed sites' criterion and is deliberately reported per occurrence anyway — see
+	// cannot take the last token from a class it does not belong to. All SIX meet the windowed
+	// sites' criterion — a dead upstream drives every one of them per frame, the unanswerable
+	// initiator included — and all six are deliberately reported per occurrence anyway; see
 	// uncollapsedNamesTheFailingCall, which is the whole of that judgment.
 	siteUpstreamlessForward:      {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
 	siteUpstreamlessNotification: {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
@@ -307,8 +317,8 @@ func windowedNoticeSites() []noticeSite {
 	return out
 }
 
-// The collapse itself: a windowed site is reported at most once per noticeCollapseInterval per
-// SOURCE, rather than once per occurrence.
+// noticeCollapseInterval is how often a windowed site reports again: one line per site per
+// interval per SOURCE, with every occurrence in between folded into the class bucket's tally.
 //
 // A RE-ARMING interval, not an episode a success reopens. An episode was the first design and its
 // reopen condition is the part that does not survive contact with the scope available: the state
@@ -326,8 +336,8 @@ func windowedNoticeSites() []noticeSite {
 // the class bucket's tally and their SUBJECTS (the tool, the target) are not recorded anywhere on
 // stderr. The tape is unaffected — every one of these lines has a record beside it — so this is a
 // legibility trade, taken because the alternative is a bucket a broken deployment keeps empty.
-
-// noticeCollapseInterval is how often a collapsed site reports again. A minute for the reason
+//
+// The interval itself is a minute. A minute for the reason
 // noticeReserveInterval is one: long enough that a persistent backend fault is a trickle rather than
 // a flood, short enough that a fault which returns after being fixed is not silent for an hour.
 //

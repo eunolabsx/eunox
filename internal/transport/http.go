@@ -460,7 +460,12 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	// aggregate: a route arriving through the exported Routes seam from somewhere other than
 	// BuildRoutes would otherwise get a repaired bucket table beside nil collapse windows, which
 	// reads as correctly wired and silently restores the per-frame flood.
-	for _, route := range p.routes {
+	for name, route := range p.routes {
+		// Routes is a caller-populated map, which requireUsableOptions cannot reach into (it walks
+		// interface FIELDS), so the nil value it may hold is refused here rather than dereferenced
+		// on the next line — a diagnosis-free constructor panic three lines under the guard that
+		// exists to replace one.
+		requireUsable("HTTPGatewayOptions.Routes["+name+"]", route)
 		route.notices = newRouteNoticeLimiter(p.notices)
 		route.noticeCollapse = newNoticeCollapse()
 	}

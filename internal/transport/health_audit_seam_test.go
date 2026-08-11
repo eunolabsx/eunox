@@ -62,10 +62,13 @@ func TestHealthSnapshot_AuditVerdictComesFromTheSink(t *testing.T) {
 	})
 }
 
-// TestHealthSnapshot_AbsentSinkIsAbsentNotDegraded pins the one part of the audit answer that stays
-// in the transport, and why: a sink that never opened cannot report on itself, and only the proxy
-// knows it wired none.
-func TestHealthSnapshot_AbsentSinkIsAbsentNotDegraded(t *testing.T) {
+// TestHealthSnapshot_AbsentSinkIsDegraded pins where absence is answered, and the answer.
+//
+// It used to be the transport's own: a `p.sink == nil` arm set both fields by hand while the sink's
+// documented verdict for a nil receiver said healthy — two answers to one question, disagreeing.
+// The sample carries it now (audit.Health.Absent), so this file holds no audit predicate at all,
+// and the answer is DEGRADED: a trail that does not exist is not one an incident responder can read.
+func TestHealthSnapshot_AbsentSinkIsDegraded(t *testing.T) {
 	t.Parallel()
 	p := newHTTPProxy(httpProxyOptions{})
 	snap := p.snapshot()

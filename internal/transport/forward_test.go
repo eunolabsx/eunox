@@ -1320,7 +1320,7 @@ func TestAuditRotate_TriggeredByMaxBytes(t *testing.T) {
 	}
 }
 
-// TestAuditDroppedRecords_Initial verifies DroppedRecords() on a fresh sink.
+// TestAuditDroppedRecords_Initial verifies Health().Dropped on a fresh sink.
 func TestAuditDroppedRecords_Initial(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

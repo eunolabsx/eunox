@@ -322,6 +322,15 @@ func PrintRoutePolicyNotices(w io.Writer, name, routePath string, auditOnlyCount
 // banner) passes its own writer instead of reassigning the process-global os.Stderr, which
 // races any other goroutine reading it.
 func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, globalStrictDrift bool, driftCheckFor func(*config.LocalManifest, bool) drift.CheckFunc, w io.Writer) (map[string]*UpstreamRoute, error) {
+	// The same refusal the proxy constructors make, at the seam that reaches these by parameter (see
+	// requireUsable). The first three are the subsystems the ENGINE guards with `x == nil` so an
+	// unwired backend denies rather than panics — a guard a typed nil walks straight past, on the
+	// decision path, per request. w is here for the reason HTTPGatewayOptions.Stderr is: the `if w
+	// == nil` normalization on the next line is the same interface comparison, one seam over.
+	requireUsable("BuildRoutes counter", counter)
+	requireUsable("BuildRoutes flowStore", flowStore)
+	requireUsable("BuildRoutes ks", ks)
+	requireUsable("BuildRoutes w", w)
 	if w == nil {
 		w = os.Stderr
 	}
@@ -587,6 +596,12 @@ func WalkRouteManifests(cfg *config.GatewayConfig, u *config.UpstreamConfig) Rou
 // finds its manifests. An empty baseDir (e.g. a programmatically built config) keeps
 // the prior cwd-relative behavior. Absolute policy paths are used verbatim.
 func LoadUpstreamPDP(u *config.UpstreamConfig, hostTransport, baseDir string, counter capability.CallCounter, flowStore capability.FlowLabelStore, ks killswitch.Manager, taskAnchored bool) (policy pdp.PolicyDecisionPoint, manifest *config.LocalManifest, policyVersion, policySHA256 string, err error) {
+	// Checked HERE as well as in BuildRoutes, because this is the seam the STDIO transport reaches
+	// these three through: StdioProxyOptions carries no kill switch, counter or flow store at all,
+	// so its constructor's guard sees a fully-built PDP and can refuse nothing behind it.
+	requireUsable("LoadUpstreamPDP counter", counter)
+	requireUsable("LoadUpstreamPDP flowStore", flowStore)
+	requireUsable("LoadUpstreamPDP ks", ks)
 	if len(u.Policy) == 0 {
 		if u.ExpectVersion != "" {
 			return nil, nil, "", "", fmt.Errorf("upstream %q: expectVersion %q set but no policy is configured", u.Name, u.ExpectVersion)

@@ -5,11 +5,14 @@
 // the coverage counters, the maintenance status, and the verdict over both.
 //
 // It lives in this package because the predicate does. A consumer's health endpoint used to
-// hand-code "no sink, or a dropped record, or a write failure, or a stalled rotation" over the
-// three getters below, which is one predicate written twice in two packages — the copy that drives
+// hand-code "no sink, or a dropped record, or a write failure, or a stalled rotation" over one
+// accessor per counter, which is one predicate written twice in two packages — the copy that drives
 // a readiness probe beside the copy that denies live traffic — and the deliberate carve-out between
 // them (a stalled rotation is a readiness regression and must NEVER deny traffic) had to be
-// remembered by hand at the far end.
+// remembered by hand at the far end. Those accessors are gone: this sample is the only way to READ
+// the counters, so there is no second reading to reconcile. AuditDegraded loads them too, but for
+// the enforcement gate and to stamp its own denial record — evidence beside a verdict rather than a
+// health reading, which is why it must not acquire the maintenance lock this sample does.
 
 package audit
 
@@ -30,12 +33,19 @@ import "errors"
 // documented answer and the shipped one disagreed, and the next consumer to follow the documented
 // one would report a proxy writing no audit trail at all as operating normally. "There is no trail
 // to read" is a statement about audit coverage like the two counters are, so it is answered here,
-// once, and a consumer for which a missing sink is EXPECTED (--require-audit=off wires none) reads
-// Absent and decides for itself rather than re-deriving the fact.
+// once. The verdict below therefore reports an absent sink, which is what the one production
+// consumer already did by hand; a consumer that wants the OPPOSITE for a deployment where no sink
+// is expected (--require-audit=off wires none) reads the Absent field rather than re-deriving the
+// fact from wiring it holds separately.
 type Health struct {
 	// Absent reports that there is no sink: this is a reading taken of nothing. The counters below
 	// are zero because nothing was measured, not because nothing was lost, which is the distinction
 	// a consumer rendering them needs — and the reason this is a field rather than a nil sample.
+	//
+	// Not the kind of field the doc below refuses. That argument is about carrying a VERDICT beside
+	// the counters it should be derived from; this is an input to the verdict, and the only
+	// constructor is Sink.Health, which sets it exactly when there is no sink to read the counters
+	// from — so an Absent sample with non-zero counters is unreachable rather than merely unwritten.
 	Absent bool
 	// Dropped and WriteFailures are the two coverage counters, sampled together. They are distinct
 	// findings for an operator: Dropped is back-pressure on a healthy file (the write queue could

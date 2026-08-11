@@ -3578,9 +3578,9 @@ func TestAuditSink_RecordDoesNotBlockOnSlowWriter(t *testing.T) {
 }
 
 // TestAuditSink_WriteFailuresCounted verifies that records which reach the
-// drainer but cannot be written to disk (full disk / EIO) are counted via
-// WriteFailures and are NOT misattributed to DroppedRecords. The two counters
-// are deliberately distinct: DroppedRecords is a "queue is full" signal on a
+// drainer but cannot be written to disk (full disk / EIO) are counted as
+// Health().WriteFailures and NOT misattributed to Health().Dropped. The two counters
+// are deliberately distinct: Dropped is a "queue is full" signal on a
 // healthy file, WriteFailures is a "file is broken" completeness signal. The
 // original gap this guards against: a persistent write failure degraded audit
 // coverage while eunox_audit_dropped_records_total stayed at zero.
@@ -3620,10 +3620,10 @@ func TestAuditSink_WriteFailuresCounted(t *testing.T) {
 	// The queue absorbed every send (nothing dropped under back-pressure), so the
 	// loss must surface as write failures, not as queue-full drops.
 	if got := sink.Health().Dropped; got != 0 {
-		t.Errorf("DroppedRecords() = %d; want 0 (the queue absorbed every send)", got)
+		t.Errorf("Health().Dropped = %d; want 0 (the queue absorbed every send)", got)
 	}
 	if got := sink.Health().WriteFailures; got != int64(n) {
-		t.Errorf("WriteFailures() = %d; want %d (every write failed)", got, n)
+		t.Errorf("Health().WriteFailures = %d; want %d (every write failed)", got, n)
 	}
 	if attempts < n {
 		t.Errorf("drainer attempted %d writes; want >= %d", attempts, n)
@@ -3750,12 +3750,12 @@ func TestAuditSink_DroppedRecordsCounter(t *testing.T) {
 
 	dropped := sink.Health().Dropped
 	if dropped < 0 {
-		t.Errorf("DroppedRecords() = %d; must be ≥ 0", dropped)
+		t.Errorf("Health().Dropped = %d; must be ≥ 0", dropped)
 	}
 	// We cannot assert a precise drop count because the drainer races with the
 	// senders, but if any records were dropped the counter must reflect it.
 	// The test's real assertion is that wg.Wait() above returned promptly.
-	t.Logf("DroppedRecords() = %d / %d total", dropped, total)
+	t.Logf("Health().Dropped = %d / %d total", dropped, total)
 }
 
 // TestLoadOrCreateAuditKey_CorruptHex_HardError verifies that a key file with
