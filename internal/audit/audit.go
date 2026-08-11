@@ -2329,6 +2329,11 @@ func bareTargetName(tt capability.TargetType, identifier string) string {
 
 // DroppedRecords returns the number of records discarded because the write queue
 // was full. Expose as a metric to detect sustained disk pressure.
+//
+// One counter, one reading. A consumer that needs more than one fact about this sink — a counter
+// AND the verdict over it, or both counters together — takes Health() instead: composing these
+// getters is two readings of state that moves, which is how a body comes to carry a zero count
+// beside a degraded verdict.
 func (s *Sink) DroppedRecords() int64 {
 	return s.dropped.Load()
 }
@@ -2396,7 +2401,8 @@ func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
 // not be durably written (full disk, EIO, a serialization error, or a file lost to
 // a failed rotation). Distinct from DroppedRecords: that is a "queue can't keep up"
 // signal on a healthy file, this is a "file is broken" signal. Expose as
-// eunox_audit_write_failures_total and alert on it.
+// eunox_audit_write_failures_total and alert on it. See DroppedRecords for why a consumer wanting
+// more than this one counter takes Health() rather than composing the getters.
 func (s *Sink) WriteFailures() int64 {
 	return s.writeFailures.Load()
 }
@@ -2421,7 +2427,8 @@ func (s *Sink) AuditDegraded() (degraded bool, reason string, detail map[string]
 	}
 	dropped := s.dropped.Load()
 	failures := s.writeFailures.Load()
-	if dropped == 0 && failures == 0 {
+	degraded, reason = coverageLost(dropped, failures)
+	if !degraded {
 		return false, "", nil
 	}
 	detail = make(map[string]interface{}, 2)
@@ -2431,15 +2438,28 @@ func (s *Sink) AuditDegraded() (degraded bool, reason string, detail map[string]
 	if failures > 0 {
 		detail["write_failure_count"] = failures
 	}
+	return true, reason, detail
+}
+
+// coverageLost is the predicate BOTH readings of the audit trail's coverage go through: the
+// enforcement gate (AuditDegraded, which --require-audit=strict consults to deny live traffic) and
+// the readiness verdict (Health.HealthStatus, which /healthz and /metrics report). One function
+// rather than two agreeing conditions, since "which counters mean the trail lost coverage" moving
+// in one and not the other is a divergence between a denial and a probe that nothing would fail on.
+//
+// It takes the counters rather than reading them, so a caller can take ONE sample and derive both
+// the numbers it reports and the verdict beside them — a re-read between the two is how a body
+// comes to carry a zero count next to a degraded verdict.
+func coverageLost(dropped, failures int64) (degraded bool, reason string) {
 	switch {
 	case dropped > 0 && failures > 0:
-		reason = fmt.Sprintf("audit trail degraded: %d record(s) dropped under back-pressure and %d write failure(s)", dropped, failures)
+		return true, fmt.Sprintf("audit trail degraded: %d record(s) dropped under back-pressure and %d write failure(s)", dropped, failures)
 	case dropped > 0:
-		reason = fmt.Sprintf("audit trail degraded: %d record(s) dropped under back-pressure", dropped)
-	default:
-		reason = fmt.Sprintf("audit trail degraded: %d audit write failure(s)", failures)
+		return true, fmt.Sprintf("audit trail degraded: %d record(s) dropped under back-pressure", dropped)
+	case failures > 0:
+		return true, fmt.Sprintf("audit trail degraded: %d audit write failure(s)", failures)
 	}
-	return true, reason, detail
+	return false, ""
 }
 
 // syncEveryN bounds the non-durable tail in COUNT under sustained load: the drainer

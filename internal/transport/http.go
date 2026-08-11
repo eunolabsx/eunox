@@ -451,8 +451,13 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	// an unmapped method against one route cannot silence another's lines. BuildRoutes already
 	// built each one (parentless, so a route that never reaches a proxy is still bounded); what it
 	// could not do is name the aggregate, which belongs to a proxy that did not exist yet.
+	// Both per-route diagnostic facilities are assigned here, not just the one that needs the
+	// aggregate: a route arriving through the exported Routes seam from somewhere other than
+	// BuildRoutes would otherwise get a repaired bucket table beside nil collapse windows, which
+	// reads as correctly wired and silently restores the per-frame flood.
 	for _, route := range p.routes {
 		route.notices = newRouteNoticeLimiter(p.notices)
+		route.noticeCollapse = newNoticeCollapse()
 	}
 	// Registered at construction (not Serve) so a kill delivered during startup is not lost —
 	// the buffered slot coalesces it, served by the worker's first tick. Unregister is kept
@@ -772,9 +777,12 @@ func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 		return noticeWriter{}
 	}
 	if route == nil || route.notices == nil {
+		// No collapse windows on this arm, deliberately: the faults they collapse are a route's own
+		// (its upstream's receipt pin, its policy engine's flow store), and a leg with no route has
+		// no source to attribute one to. Nothing on this arm writes a collapsed line.
 		return noticeWriter{out: p.errOut(), limits: p.notices}
 	}
-	return noticeWriter{out: p.errOut(), limits: route.notices}
+	return noticeWriter{out: p.errOut(), limits: route.notices, collapse: route.noticeCollapse}
 }
 
 // sessionNoticeWriter is routeNoticeWriter for a leg holding the SESSION: the same route table,

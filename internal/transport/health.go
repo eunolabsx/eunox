@@ -45,14 +45,20 @@ type healthReporter interface {
 
 // healthSnapshot is the live operational state surfaced by /healthz and /metrics.
 type healthSnapshot struct {
-	Status            string `json:"status"` // "ok" | "degraded"
-	Sessions          int    `json:"sessions"`
-	MaxSessions       int    `json:"maxSessions"` // 0 = unlimited
-	Routes            int    `json:"routes"`
-	AuditDropped      int64  `json:"auditDropped"`      // records dropped because the write queue was full
-	AuditWriteFailed  int64  `json:"auditWriteFailed"`  // records that reached the drainer but failed to write to disk
-	AuditConfigured   bool   `json:"auditConfigured"`   // false when the audit sink failed to open
-	KillSwitchHealthy bool   `json:"killSwitchHealthy"` // false when a Redis backend is degraded
+	Status           string `json:"status"` // "ok" | "degraded"
+	Sessions         int    `json:"sessions"`
+	MaxSessions      int    `json:"maxSessions"` // 0 = unlimited
+	Routes           int    `json:"routes"`
+	AuditDropped     int64  `json:"auditDropped"`     // records dropped because the write queue was full
+	AuditWriteFailed int64  `json:"auditWriteFailed"` // records that reached the drainer but failed to write to disk
+	AuditConfigured  bool   `json:"auditConfigured"`  // false when the audit sink failed to open
+	// AuditHealthy is the sink's OWN verdict, folded through the health seam rather than
+	// recomputed here. False for a trail that has lost coverage (a dropped record or a failed
+	// write, the same predicate --require-audit=strict denies on) or whose log maintenance has
+	// stalled — and for a sink that never opened, which is the one part of the answer the sink
+	// cannot give: absence is the proxy's own fact.
+	AuditHealthy      bool `json:"auditHealthy"`
+	KillSwitchHealthy bool `json:"killSwitchHealthy"` // false when a Redis backend is degraded
 	// AuditMaintenanceStalled is true when rotation/retention pruning has stopped making
 	// progress. Records are still written and signed (not an audit-integrity loss, does not
 	// gate traffic) — the size/retention bound is just unenforced until the fault is fixed.
@@ -91,8 +97,28 @@ type jwksHealth struct {
 // A pointer to the field rather than a returned bool, so a subsystem cannot be folded into the
 // summary while its own field silently stays true — the discrepancy nothing downstream could
 // detect.
+//
+// It answers a WIRED subsystem that holds nothing — a typed nil inside a non-nil interface — as
+// DEGRADED rather than as healthy or as a panic, which are the two answers this seam has had.
+//
+// The panic was the shipped one: `h == nil` compares the INTERFACE, so it passes for an interface
+// holding a `(*killswitch.Redis)(nil)` and the call behind it dereferences a nil receiver — on
+// /healthz and /metrics, the endpoints an operator reaches for when something is already wrong.
+// Reporting it healthy instead was the first fix and is worse: for the kill switch it is a green
+// readiness signal over an emergency stop that cannot answer, which is exactly what
+// killswitch.Manager's confirmability rule forbids ("a backend that cannot confirm its kill set
+// reports the cause from EVERY reader rather than serving a silent all-clear"). Degrading also makes
+// this arm agree with snapshot's audit arm, which already treats a sink it could not open as a
+// readiness failure rather than as nothing to report.
+//
+// An interface that is nil OUTRIGHT is a different fact and still reports nothing: no subsystem was
+// wired, which is the caller's own business (a proxy with no JWT layer folds no JWKS verdict), where
+// a typed nil means one was wired and cannot work.
 func (s *healthSnapshot) fold(h healthReporter, healthy *bool) {
-	if h == nil || h.HealthStatus() == nil {
+	if h == nil {
+		return
+	}
+	if !nilInterface(h) && h.HealthStatus() == nil {
 		return
 	}
 	*healthy = false
@@ -115,12 +141,27 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 		MaxSessions:       p.maxSessions,
 		Routes:            len(p.routes),
 		AuditConfigured:   p.sink != nil,
+		AuditHealthy:      true,
 		KillSwitchHealthy: true,
 	}
-	if p.sink != nil {
-		snap.AuditDropped = p.sink.DroppedRecords()
-		snap.AuditWriteFailed = p.sink.WriteFailures()
-		snap.AuditMaintenanceStalled, snap.AuditMaintenanceReason = p.sink.MaintenanceStalled()
+	if p.sink == nil {
+		// ABSENCE is the one part of the audit answer that stays here: a sink that never opened
+		// cannot report on itself, and only the proxy knows it wired none. Both effects are set
+		// together, for the reason fold takes a pointer to the field — a subsystem folded into the
+		// summary while its own field stays true is a discrepancy nothing downstream can detect.
+		snap.AuditHealthy, snap.Status = false, statusDegraded
+	} else {
+		// ONE sample, and its own verdict folded from it: the counters below and the health seam's
+		// answer come from the same reading, so a record dropped mid-scrape cannot put a zero count
+		// beside a degraded verdict in one body. The predicate itself belongs to the package that
+		// owns the state — including the carve-out that keeps a stalled rotation out of the gate
+		// that denies traffic while keeping it in this one (see audit.Health.HealthStatus), which
+		// the copy that used to live here had to remember by hand.
+		h := p.sink.Health()
+		snap.AuditDropped = h.Dropped
+		snap.AuditWriteFailed = h.WriteFailures
+		snap.AuditMaintenanceStalled, snap.AuditMaintenanceReason = h.MaintenanceStalled, h.MaintenanceReason
+		snap.fold(h, &snap.AuditHealthy)
 	}
 	// A degraded kill switch (e.g. a Redis partition) flips status to "degraded". The
 	// operational consequence depends on the configured degraded mode (fail-closed by
@@ -152,16 +193,6 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 			// emit a servable key set beside a verdict saying every token fails closed.
 			snap.fold(h, &snap.JWKS.Healthy)
 		}
-	}
-	// Audit-integrity loss also flips status to "degraded": no sink, dropped records, or
-	// failed writes each mean the tamper-evident audit trail is incomplete.
-	if !snap.AuditConfigured || snap.AuditDropped > 0 || snap.AuditWriteFailed > 0 {
-		snap.Status = statusDegraded
-	}
-	// A stalled rotation/prune is a readiness regression too, even though no record was lost.
-	// NOT part of AuditDegraded, so it never denies live traffic under --require-audit=strict.
-	if snap.AuditMaintenanceStalled {
-		snap.Status = statusDegraded
 	}
 	return snap
 }
@@ -203,6 +234,10 @@ func (p *HTTPProxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	m.counter("eunox_audit_dropped_records_total", "Audit records discarded because the write queue was full.", snap.AuditDropped)
 	m.counter("eunox_audit_write_failures_total", "Audit records that reached the drainer but failed to write to disk (full disk, EIO, ...). A non-zero value means the audit trail is incomplete.", snap.AuditWriteFailed)
 	m.gauge("eunox_audit_sink_up", "Whether the audit sink opened successfully (1 = up).", gaugeBool(snap.AuditConfigured))
+	// The sink's own verdict as one series, so alerting on "the audit trail is not operating
+	// normally" is one rule rather than an OR over the three series around it — and so a reader
+	// cannot reconstruct it from those three and get the maintenance carve-out wrong.
+	m.gauge("eunox_audit_healthy", "Audit trail health as the sink itself reports it (1 = healthy). 0 means the trail has lost coverage (see eunox_audit_dropped_records_total and eunox_audit_write_failures_total, the losses --require-audit=strict denies on), its log maintenance has stalled (eunox_audit_maintenance_stalled, which does NOT deny traffic), or no sink opened at all (eunox_audit_sink_up).", gaugeBool(snap.AuditHealthy))
 	m.gauge("eunox_kill_switch_healthy", "Kill-switch backend health (1 = healthy, 0 = degraded).", gaugeBool(snap.KillSwitchHealthy))
 	m.gauge("eunox_audit_maintenance_stalled", "Audit rotation or retention pruning is not making progress (1 = stalled). No records are lost, but the configured size/retention bound is unenforced and the log will grow until the fault is fixed.", gaugeBool(snap.AuditMaintenanceStalled))
 	// Absent without a JWT layer rather than emitted as zeros: a permanently-healthy gauge on

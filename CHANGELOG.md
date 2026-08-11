@@ -27,6 +27,13 @@ Section conventions:
 
 ### Added
 
+- **`auditHealthy` on `/healthz` and `eunox_audit_healthy` on `/metrics`** — the audit
+  subsystem's own verdict as one series, reported by the sink through the shared health seam
+  rather than reassembled by the endpoint from the three counters beside it. `0` means the trail
+  has lost coverage, its log maintenance has stalled, or no sink opened at all. Alert on this
+  instead of an OR across the three: the readiness question deliberately includes a maintenance
+  stall, which must never gate traffic, so the OR is not the same rule. See the Fixed entry below
+  for why the predicate moved.
 - **eunox speaks two MCP protocol revisions, negotiated per peer.** The single
   `MCPProtocolVersion` constant is replaced by a supported-revision set
   (`2025-11-25`, `2026-07-28`), with the host-side and upstream-side results tracked
@@ -375,6 +382,32 @@ Section conventions:
 
 ### Changed
 
+- **A repeating infrastructure fault is reported once per minute per upstream, not once per
+  frame.** Two of the obligation-class diagnostics — an approved declassification whose clear did
+  not commit, and a signed effect receipt contradicting its contract — are drivable at the request
+  rate by a CONFORMING peer against a merely broken deployment: a downed flow store fails every
+  commit, a stale `effect.ref` pin makes every receipt inconsistent. Either emptied the class
+  bucket that keeps `SECURITY: redaction failed` legible, with no adversary involved. Both are now
+  collapsed at their source: the first occurrence is written, further ones inside the window fold
+  into the class bucket's tally without spending a token, and the window re-arms on the clock. The
+  windows are per upstream (a route on a gateway, the proxy on `stdio`), so one tenant's broken
+  backend cannot silence another's report of its own. A TIME window rather than an episode a
+  success reopens, because the state keys per source while the faults are per call: a
+  success-driven reopen alternated open and closed on ordinary mixed traffic — emitting more lines
+  than no collapsing at all, each "recovered" claim resting on a different subject's evidence —
+  and could be held open indefinitely by an upstream that declined to produce the success. Within
+  a window the occurrences after the first are a count and their subjects are not on stderr; the
+  per-call evidence is unchanged on the tape. The site floor stays as the backstop. The declassify
+  double-commit line moves to a site of its own, so a store-fault window cannot swallow a proxy
+  wiring fault beside it.
+- **The reserve interval is a per-table knob rather than one package constant.** One constant
+  governed two budgets with unrelated failure modes — floored audit records into a queue whose
+  overflow denies the whole data plane under strict audit, and floored stderr diagnostics, which
+  cost terminal legibility — while the rate and burst beside it were already per table. Each
+  table now states its own, with the argument for its length beside the budget it bounds, and the
+  documented `holders x keys` ceiling is derived from the live sets by a test rather than written
+  in prose (it had already drifted once). Both intervals remain one minute, so no deployment
+  behavior changes.
 - **An upstream handshake that contradicts the leg is judged rather than swallowed.** An
   `initialize` answering a `protocolVersion` this build does not speak used to resolve
   silently to `2025-11-25`, so eunox stamped every later request with a header naming a
@@ -1314,6 +1347,50 @@ Section conventions:
 
 ### Fixed
 
+- **The audit sink answers the health seam, so one degradation predicate is not written
+  twice.** `/healthz` hand-coded "no sink, or a dropped record, or a failed write, or a
+  stalled rotation" over the sink's getters while `internal/audit` already owned that
+  predicate — the copy driving a readiness probe beside the copy `--require-audit=strict`
+  denies live traffic on, agreeing today and diverging silently the first time either moved.
+  The sink now answers `HealthStatus() error` through the same seam the kill switch and the
+  JWT layer do, with a SAMPLE (`audit.Health`) so the counters `/healthz` renders and the
+  verdict beside them come from one reading, and with the carve-out expressed there rather
+  than remembered at the far end: readiness is wider than the enforcement gate by exactly the
+  maintenance stall, which has lost no record and must never deny traffic. `/healthz` gains
+  `auditHealthy` and `/metrics` gains `eunox_audit_healthy`, so alerting on "the audit trail
+  is not operating normally" is one series rather than an OR that re-derives the carve-out.
+  Absence stays the proxy's own fact — a sink that never opened cannot report on itself, and
+  reports `auditConfigured: false` beside `auditHealthy: false`.
+- **A typed nil in the health seam panicked `/healthz` and `/metrics`.** The fold's `h == nil`
+  compared the INTERFACE, so an interface holding a `(*killswitch.Redis)(nil)` passed it and
+  the call behind it dereferenced a nil receiver — on the operational endpoints, which is where
+  an operator goes when something is already wrong. Not reachable from the binary, which never
+  produces one, but reachable through the exported API (`HTTPGatewayOptions.KS`), and the guard
+  read as a nil check while not being one, so every subsystem added through the seam inherited
+  the appearance of coverage. The guard is now reflect-based over the nilable kinds, the
+  treatment `redisutil.IsNilClient` carries for the same question; an absent subsystem is
+  degraded rather than crashing the scrape — a wired subsystem that holds nothing is not a healthy
+  one, which is what `killswitch.Manager`'s confirmability rule requires and what the audit arm
+  already did for a sink it could not open. An interface that is nil outright stays silent: nothing
+  was wired, which is the caller's own business.
+- **A floored write debits the tier that refused it, however deep the chain.** The refusal
+  reached through exactly one level (`t.parent.bucket(key)`), which is correct only while the
+  chain is two tiers deep — and `tieredBuckets` is written recursively. With a tier in between,
+  a middle tier that had ADMITTED (spending a token and pushing its tally back) was debited for
+  a grandparent's refusal while the tier that actually refused kept its token, silently ending
+  the property that makes a floored audit write affordable: that the arrival displaces the
+  flooder's next write rather than adding to the tier's total. Nothing detected it — `bucket()`
+  recurses past a refusing tier and hands back a bucket. The admission now reports the refusing
+  bucket on its verdict, so the debit is structural rather than positional. Latent: two tiers is
+  all that ships.
+- **Every refusal record now takes the admission that resolves the holder's floor.** The
+  pre-session path (`recordRefusal`, which writes its record inline) reached the buckets
+  directly, agreeing with the other spelling only because that table happens to hold no floor.
+  The day it gained one — a per-tenant or per-source-IP holder is exactly what would want it —
+  all ten categories an unauthenticated caller can drive would have skipped it while the four
+  upstream-driven ones did not, with nothing able to detect the difference. Both spellings now
+  go through one admission, and a record delivered on a floor carries `refusal_record_floored`
+  on either.
 - **A refusal DECLARED exempt from metering charged the kill switch's bucket.**
   `refusalDeclarations` declares the fail-closed routing refusal and the
   enforced-method-as-notification reject unmetered, and both arms named their category — but the

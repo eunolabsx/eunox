@@ -402,9 +402,16 @@ boundary.
 beside `/control/kill` (same on-host-only guard — never reachable off the box):
 
 ```bash
-curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditMaintenanceStalled, killSwitchHealthy, jwks:{breakerState, fetchFailures, fetchSuccesses, keysServable, healthy}, ...}
-curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_maintenance_stalled, eunox_jwks_fetch_healthy, eunox_jwks_keys_servable, …
+curl -s localhost:3000/healthz   # {"status":"ok"|"degraded", sessions, auditDropped, auditWriteFailed, auditHealthy, auditMaintenanceStalled, killSwitchHealthy, jwks:{breakerState, fetchFailures, fetchSuccesses, keysServable, healthy}, ...}
+curl -s localhost:3000/metrics   # Prometheus text: eunox_active_sessions, eunox_audit_dropped_records_total, eunox_audit_write_failures_total, eunox_audit_healthy, eunox_audit_maintenance_stalled, eunox_jwks_fetch_healthy, eunox_jwks_keys_servable, …
 ```
+
+`auditHealthy` / `eunox_audit_healthy` is the audit subsystem's own verdict over
+everything below, reported by the sink rather than reassembled by the endpoint:
+`0` means the trail has lost coverage (the two counters below), its log
+maintenance has stalled, or no sink opened at all. Alert on that one series
+instead of an OR across the three — the two are not the same rule, because a
+maintenance stall belongs in it and deliberately does **not** gate traffic.
 
 `eunox_audit_dropped_records_total` and `eunox_audit_write_failures_total` are the
 two audit-loss signals to alert on. The audit path is non-blocking, so it never

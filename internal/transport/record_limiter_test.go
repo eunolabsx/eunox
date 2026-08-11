@@ -327,7 +327,7 @@ func TestPreSessionLimiterAndSaturationGate_DoNotShareABucket(t *testing.T) {
 		t.Fatal("the saturation bucket must be drained for this test to mean anything")
 	}
 	// The pre-session bucket is untouched by that.
-	if !preSession.admit(catAuth).ok {
+	if !preSession.admitRefusal(catAuth).ok {
 		t.Fatal("a saturation flood must not spend the pre-session refusal budget")
 	}
 }
@@ -463,7 +463,7 @@ func TestRecordFloor_NotClaimedWhenTheHoldersOwnBucketRefused(t *testing.T) {
 func TestFloorTier_ZeroValueFloorsNothing(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
-	table := newTieredBuckets(1, 1, []refusalCategory{catDisplaced}, nil, "test", floorNowhere)
+	table := newTieredBuckets(1, 1, recordReserveInterval, []refusalCategory{catDisplaced}, nil, "test", floorNowhere)
 	table.setNow(func() time.Time { return at })
 	reserve := newKeyReserve([]refusalCategory{catDisplaced})
 
@@ -488,11 +488,11 @@ func TestReserveSlot_ReArmIsMonotonicAndHasNoEpochSentinel(t *testing.T) {
 		// same table kept refilling — the exact elision the floor exists to close.
 		var slot reserveSlot
 		now := time.Now()
-		require.True(t, slot.claim(now))
+		require.True(t, slot.claim(now, recordReserveInterval))
 		stepped := now.Add(-10 * time.Minute)
-		assert.False(t, slot.claim(stepped),
+		assert.False(t, slot.claim(stepped, recordReserveInterval),
 			"a step alone must not re-arm the reserve either")
-		assert.True(t, slot.claim(now.Add(reserveInterval)),
+		assert.True(t, slot.claim(now.Add(recordReserveInterval), recordReserveInterval),
 			"the monotonic reading is what decides; a wall-clock comparison would still be counting down from the step")
 	})
 
@@ -503,8 +503,8 @@ func TestReserveSlot_ReArmIsMonotonicAndHasNoEpochSentinel(t *testing.T) {
 		// elsewhere (time.Unix(0, ns)).
 		var slot reserveSlot
 		epoch := time.Unix(0, 0)
-		require.True(t, slot.claim(epoch))
-		assert.False(t, slot.claim(epoch), "the reserve is one write per interval, whatever the clock reads")
+		require.True(t, slot.claim(epoch, recordReserveInterval))
+		assert.False(t, slot.claim(epoch, recordReserveInterval), "the reserve is one write per interval, whatever the clock reads")
 	})
 }
 
@@ -530,7 +530,7 @@ func TestReserveSlot_OneReadingPerAdmission(t *testing.T) {
 	require.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sess, catDisplaced), "the floor delivers the first one")
 	assert.Nil(t, admitRefusalRecord(&fwdRecorder{}, sess, catDisplaced),
 		"a frozen entry tier must hold the reserve spent however long the wall clock runs")
-	at = at.Add(2 * reserveInterval)
+	at = at.Add(2 * recordReserveInterval)
 	sess.setNow(func() time.Time { return at })
 	assert.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sess, catDisplaced),
 		"and advancing that same tier is what re-arms it")

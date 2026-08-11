@@ -36,7 +36,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	const attempts = 5000
 	catBurst := int(perCategoryDenyBurst)
 	for i := 0; i < attempts; i++ {
-		if l.admit(catAuth).ok {
+		if l.admitRefusal(catAuth).ok {
 			admitted++
 		}
 	}
@@ -47,7 +47,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	// The suppressed refusals are not lost: the next admitted record carries the count, so
 	// an operator sees both that the attack happened and its scale.
 	now = base.Add(time.Second)
-	verdict := l.admit(catAuth)
+	verdict := l.admitRefusal(catAuth)
 	ok, suppressed := verdict.ok, verdict.suppressed
 	if !ok {
 		t.Fatal("a refill second must admit again")
@@ -57,7 +57,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	}
 
 	// And the count resets, so the following record does not double-report.
-	if v := l.admit(catAuth); !v.ok || v.suppressed != 0 {
+	if v := l.admitRefusal(catAuth); !v.ok || v.suppressed != 0 {
 		t.Fatalf("after reporting, the suppressed counter must reset; ok=%v suppressed=%d", v.ok, v.suppressed)
 	}
 }
@@ -246,11 +246,11 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 
 	// Drain the burst.
 	for i := 0; i < catBurst; i++ {
-		if !l.admit(catAuth).ok {
+		if !l.admitRefusal(catAuth).ok {
 			t.Fatalf("burst token %d should have been admitted", i)
 		}
 	}
-	if l.admit(catAuth).ok {
+	if l.admitRefusal(catAuth).ok {
 		t.Fatal("the bucket must be empty after the burst is drained")
 	}
 
@@ -258,7 +258,7 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	now = base.Add(time.Second)
 	admitted := 0
 	for i := 0; i < catRate*10; i++ {
-		if l.admit(catAuth).ok {
+		if l.admitRefusal(catAuth).ok {
 			admitted++
 		}
 	}
@@ -276,10 +276,10 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 	l := newRefusalRecordLimiter()
 	l.setNow(func() time.Time { return now })
 	for i := 0; i < int(perCategoryDenyBurst); i++ {
-		l.admit(catAuth)
+		l.admitRefusal(catAuth)
 	}
 	now = base.Add(-time.Hour)
-	if l.admit(catAuth).ok {
+	if l.admitRefusal(catAuth).ok {
 		t.Fatal("a backwards clock step must not refill the bucket")
 	}
 }

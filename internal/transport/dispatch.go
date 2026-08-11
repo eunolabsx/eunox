@@ -934,7 +934,10 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 		// account contradicts the contract policy was written against. Admitted before the
 		// arguments are built — an upstream returning an inconsistent receipt per call drives one
 		// of these per frame, and a discarded line still costs the join over its reason list, the
-		// sanitizing walk, and the variadic boxing of both (see admitNotice).
+		// sanitizing walk, and the variadic boxing of both (see admitNotice). The admission also
+		// collapses this site to one line per window per route, since the commonest cause is a
+		// stale effect.ref pin, which makes EVERY receipt on this route inconsistent until an
+		// operator fixes it; the per-call evidence stays on the tape either way.
 		if line, ok := d.limits.notices.admitNotice(siteReceiptInconsistent); ok {
 			line.writef("[eunox] WARN effect-receipt tool=%q — the upstream's signed receipt contradicts the effect contract this policy declares (%s); the call already ran, so this is evidence, not a refusal\n",
 				audit.SanitizeAuditField(tool), strings.Join(result.Reasons, ", "))

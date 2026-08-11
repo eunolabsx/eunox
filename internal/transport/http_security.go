@@ -497,22 +497,37 @@ type rolledUpRecorder struct {
 // now travels here directly when there is nothing to fold in — see foldDecisionDetail), and writing
 // two proxy annotations into that would corrupt what the tape says the engine decided.
 func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
-	details = mergeAuditDetails(details, nil)
+	details = stampRefusalRollup(mergeAuditDetails(details, nil), r.floored, r.suppressed, r.scope)
+	r.auditRecorder.RecordDeny(ctx, sessionID, identifier, method, denialCode, condType, details, observe)
+}
+
+// stampRefusalRollup writes the three keys a rolled-up refusal record carries, returning the map to
+// record (allocated when the caller had none).
+//
+// ONE writer for both spellings of a refusal record — the wrapper above and recordRefusal, which
+// stamps inline because it is already building the details map it hands to the sink. They were two
+// hand-copied branches, and they had already disagreed: the wrapper stamped the floored marker while
+// the inline path did not, so a floored pre-session record reached the tape byte-identical to one the
+// tier had room for. Copying the branch to fix that is how the next field added to the rollup
+// repeats it.
+//
+// scope empty falls back to the proxy-wide value, which is what a hand-built wrapper in a test gets;
+// every table's constructor sets one.
+func stampRefusalRollup(details map[string]interface{}, floored bool, suppressed uint64, scope string) map[string]interface{} {
 	if details == nil {
-		details = make(map[string]interface{}, 2)
+		details = make(map[string]interface{}, 3)
 	}
-	if r.floored {
+	if floored {
 		details[detailRefusalFloored] = true
 	}
 	// Always paired: a count whose scope a reader has to infer from the stamp beside it
 	// is a count that gets misread.
-	details[detailSuppressedRefusalCount] = r.suppressed
-	scope := r.scope
+	details[detailSuppressedRefusalCount] = suppressed
 	if scope == "" {
 		scope = suppressedScopeProxyCategory
 	}
 	details[detailSuppressedRefusalScope] = scope
-	r.auditRecorder.RecordDeny(ctx, sessionID, identifier, method, denialCode, condType, details, observe)
+	return details
 }
 
 // recordSessionCapDeny records a session-cap refusal — the pre-spawn slot reservation and
@@ -553,7 +568,13 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 	if rec == nil && p.preSessionDenies == nil {
 		return true
 	}
-	verdict := p.preSessionDenies.admit(category)
+	// Through the record half's ONE admission, which resolves whatever floor the table holds,
+	// rather than reaching for the buckets directly: this path serves every pre-session category
+	// — the whole set an unauthenticated caller can drive — and it charged the same table the
+	// per-session tables delegate INTO, so the day that table gains a holder (a per-tenant or
+	// per-source-IP floor is exactly what it would want) these ten would have skipped it in
+	// silence while the four upstream-driven ones did not.
+	verdict := p.preSessionDenies.admitRefusal(category)
 	if !verdict.ok {
 		return false
 	}
@@ -562,12 +583,14 @@ func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *U
 		// (and rate-limited) as the refusal's only surviving signal.
 		return true
 	}
-	if verdict.suppressed > 0 {
-		if extra == nil {
-			extra = make(map[string]interface{}, 2)
-		}
-		extra[detailSuppressedRefusalCount] = verdict.suppressed
-		extra[detailSuppressedRefusalScope] = verdict.scope
+	// Through the ONE stamper both spellings share, rather than a second copy of its branch. The
+	// copy is DEFENDED the same way too (mergeAuditDetails, never the caller's own map): every
+	// caller here happens to pass a fresh literal or nil today, so mutating in place was invisible —
+	// and the first caller to factor out a reusable base map would have carried a stale
+	// refusal_record_floored onto every later record built from it, corrupting exactly the field an
+	// auditor uses to tell a floored arrival from an ordinary one.
+	if verdict.suppressed > 0 || verdict.reserved {
+		extra = stampRefusalRollup(mergeAuditDetails(extra, nil), verdict.reserved, verdict.suppressed, verdict.scope)
 	}
 	rec.RecordDeny(ctx, "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
 	return true

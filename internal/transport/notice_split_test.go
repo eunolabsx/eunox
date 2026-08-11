@@ -50,7 +50,7 @@ func driveSession(w *strings.Builder, l *noticeLimiter, reserve *noticeReserve, 
 // claimAt spends the reserve a line from site (of class) would fall back on, as of at. The
 // assertion shape the floor's own tests want: "was it still armed" is only answerable by taking it.
 func claimAt(r *noticeReserve, site noticeSite, class noticeClass, at time.Time) bool {
-	return r.forSite(site, class).claim(at)
+	return r.forSite(site, class).claim(at, noticeReserveInterval)
 }
 
 // TestNoticeSplit_RefusalFloodCannotStarveAnUpstreamFailure pins the class split.
@@ -406,7 +406,7 @@ func TestNoticeReserve_SessionChannelCarriesItsOwnFloor(t *testing.T) {
 
 // TestNoticeReserve_NotClaimedWhenTheAggregateRefused pins which refusal the floor answers.
 //
-// tieredBuckets.admit says false two structurally different ways, and the floor may only answer one
+// tieredBuckets.admitWithFloor says false two structurally different ways, and the floor may only answer one
 // of them: the route's OWN bucket had nothing left. When the route had a token and the aggregate
 // above refused, the write is already paid for at this tier, both tiers have counted it, and the
 // pressure comes from other tenants this session cannot influence — claiming the floor there burned
@@ -504,7 +504,7 @@ func TestNoticeReserve_ReArmsPerIntervalRatherThanPerSession(t *testing.T) {
 	out.Reset()
 
 	// Still inside the interval, and the bucket still empty: no second arrival.
-	at = at.Add(reserveInterval / 2)
+	at = at.Add(noticeReserveInterval / 2)
 	frozen(route, at)
 	drive(&out, route, siteUpstreamError, 500)
 	out.Reset()
@@ -512,7 +512,7 @@ func TestNoticeReserve_ReArmsPerIntervalRatherThanPerSession(t *testing.T) {
 		"the floor is one line per interval; re-arming faster would double a flooding session's own rate")
 
 	// The incident an operator is actually watching, one interval on.
-	at = at.Add(reserveInterval)
+	at = at.Add(noticeReserveInterval)
 	frozen(route, at)
 	drive(&out, route, siteUpstreamError, 500)
 	out.Reset()
@@ -724,10 +724,16 @@ func TestNoticeAdmission_SuppressedPreGateStillCountsIntoTheRollup(t *testing.T)
 // a small part.
 func BenchmarkNotice_SuppressedPath(b *testing.B) {
 	limiter := newNoticeLimiter(1)
-	// With a session floor, since that is the shipped HTTP-session channel: a reserve-less channel
-	// measures a shape only stdio and the pre-session legs have, and skips take() entirely. The
-	// floor is spent by the first drained line, so every measured iteration is the steady state.
-	channel := noticeWriter{out: io.Discard, limits: limiter, reserve: newNoticeReserve(noticeClasses)}
+	// With a session floor AND a source's collapse windows, since that is the shipped HTTP-session
+	// channel: a channel missing either measures a shape no transport has — every stdio proxy and
+	// every routed HTTP leg carries both — and would keep reporting the pre-collapse number while
+	// production paid the extra probe. The floor is spent by the first drained line, so every
+	// measured iteration is the steady state.
+	channel := noticeWriter{
+		out: io.Discard, limits: limiter,
+		reserve:  newNoticeReserve(noticeClasses),
+		collapse: newNoticeCollapse(),
+	}
 	drain := func() {
 		for range perClassNoticeBurst + 1 {
 			if line, ok := channel.admitNotice(siteNotifyPoolSaturated); ok {
@@ -793,17 +799,17 @@ func BenchmarkNoticeReserve_Claim(b *testing.B) {
 	now := time.Unix(1_760_000_000, 0)
 	spent := newNoticeReserve(noticeClasses)
 	slot := spent.forSite(siteUpstreamError, classFailure)
-	require.True(b, slot.claim(now))
+	require.True(b, slot.claim(now, noticeReserveInterval))
 	b.Run("spent", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = slot.claim(now)
+			_ = slot.claim(now, noticeReserveInterval)
 		}
 	})
 	b.Run("spentParallel", func(b *testing.B) {
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
-				_ = slot.claim(now)
+				_ = slot.claim(now, noticeReserveInterval)
 			}
 		})
 	})
