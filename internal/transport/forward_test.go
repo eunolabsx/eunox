@@ -1235,9 +1235,9 @@ func TestAuditSink_RecordAfterClose_DropsWithoutPanic(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	before := sink.DroppedRecords()
+	before := sink.Health().Dropped
 	sink.RecordAllow(context.Background(), "sess", "read_file", "tools/call", nil, nil, false, nil, nil)
-	if got := sink.DroppedRecords(); got != before+1 {
+	if got := sink.Health().Dropped; got != before+1 {
 		t.Fatalf("record after close: dropped = %d, want %d", got, before+1)
 	}
 }
@@ -1330,7 +1330,7 @@ func TestAuditDroppedRecords_Initial(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sink.Close() })
 
-	if got := sink.DroppedRecords(); got != 0 {
+	if got := sink.Health().Dropped; got != 0 {
 		t.Errorf("expected 0 dropped records initially, got %d", got)
 	}
 }

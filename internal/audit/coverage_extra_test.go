@@ -359,7 +359,7 @@ func TestDrainFsyncSteadyState(t *testing.T) {
 	if err := sink.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if got := sink.WriteFailures(); got != 0 {
+	if got := sink.Health().WriteFailures; got != 0 {
 		t.Fatalf("WriteFailures = %d, want 0 on a healthy disk", got)
 	}
 

@@ -1259,6 +1259,15 @@ Section conventions:
 
 ### Removed
 
+- **`Sink.DroppedRecords()` and `Sink.WriteFailures()`.** Both are folded into
+  `Sink.Health()`, which was already the only production caller's route to them. Two accessors
+  beside a sample whose whole reason for existing is that a consumer must not take two readings
+  are the obvious API for taking two readings: composed, they emit a healthy verdict beside a
+  non-zero count, or the reverse, in one body that contradicts itself. **Migration:**
+  `sink.DroppedRecords()` becomes `sink.Health().Dropped` and `sink.WriteFailures()` becomes
+  `sink.Health().WriteFailures`; a consumer wanting the verdict too takes it from the same
+  sample rather than deriving one.
+
 - **The declassification undo, and the three `details` keys it wrote.**
   `PolicyDecisionPoint.RestoreDeclassified`, `Engine.RestoreDeclassifiedLabels` and the
   transport's compensating restore are deleted: with the clear deferred until after the call
@@ -1331,6 +1340,18 @@ Section conventions:
 
 ### Performance
 
+- **A diagnostic line pays one declaration lookup instead of two.** Whether a repeating fault
+  is collapsed to one stderr line per minute is part of each site's own declaration rather than
+  a second table keyed by the same site, so the window is consulted only by a site that declares
+  one. The probe it replaces ran on every diagnostic — returning nothing for thirteen of the
+  fifteen sites, including the per-frame ones a peer drives — and cost ~7% of the admission that
+  bounds them. The declaration also gains a completeness gate: every metered site now states
+  whether it collapses and why, so a site added later answers the question instead of inheriting
+  "no". The five failure-class sites that meet the collapsed sites' own criterion — an upstream
+  error, the two upstreamless forwards, the two failed notification POSTs — keep reporting per
+  occurrence, now as a recorded judgment: each names the failing call and the error behind it,
+  where a collapsed site reports a fault whose subject does not vary.
+
 - **The condition dispatch resolves each handler once per request instead of twice.** The first
   pass resolved a condition's registry entry to ask whether the type defers, then resolved it
   again to run it — a redundant string-keyed map lookup and `ConditionType()` call per pure
@@ -1347,6 +1368,29 @@ Section conventions:
 
 ### Fixed
 
+- **A subsystem wired as a typed nil is now refused where it is wired, naming the field.**
+  `NewHTTPProxyGateway` and `NewStdioProxy` normalize an omitted subsystem with `opts.X == nil`,
+  which compares the INTERFACE — so a caller passing `var ks *killswitch.Redis` walked straight
+  through the in-memory substitution and panicked inside the dependency's reconcile goroutine
+  before `Serve` was ever called. Both constructors now panic at the seam with
+  `HTTPGatewayOptions.KS holds a typed nil (*killswitch.Redis)`, which is a diagnosis rather
+  than a nil dereference three layers down. Substituting a working default was rejected: for
+  the kill switch it is a silent security downgrade, since revocation stops crossing replicas
+  with nothing said. A field left nil is unaffected — that is ABSENCE, which every constructor
+  here already answers deliberately (a deny-all PDP, an in-memory kill switch, `os.Stderr`) —
+  and the check reaches only interface-typed options, so an optional `*audit.Sink` still
+  constructs.
+
+- **A floored refusal record was counted as suppressed by every tier that carried it.** A tier
+  whose own bucket admitted a write, and whose parent then refused it, returns its token's
+  worth of tally on the way up — before any descendant's floor has decided whether to deliver
+  the write anyway. When one did, that tier had counted a delivered record as elided and its
+  next admitted record over-stated the flood by one. The delivery now takes that back from
+  every tier between the floor and the refusal, and from none of them a second token: they
+  admitted the write and already paid for it, so the debit stays on the tier that refused.
+  Latent in the shipped two-tier shape and fixed structurally rather than restated, because the
+  guarantee is meant to hold at any depth.
+
 - **The audit sink answers the health seam, so one degradation predicate is not written
   twice.** `/healthz` hand-coded "no sink, or a dropped record, or a failed write, or a
   stalled rotation" over the sink's getters while `internal/audit` already owned that
@@ -1359,8 +1403,12 @@ Section conventions:
   maintenance stall, which has lost no record and must never deny traffic. `/healthz` gains
   `auditHealthy` and `/metrics` gains `eunox_audit_healthy`, so alerting on "the audit trail
   is not operating normally" is one series rather than an OR that re-derives the carve-out.
-  Absence stays the proxy's own fact — a sink that never opened cannot report on itself, and
-  reports `auditConfigured: false` beside `auditHealthy: false`.
+  Absence is part of that same sample: a sink that never opened answers `Absent`, so
+  `auditConfigured: false` and `auditHealthy: false` come from one reading rather than from a
+  carve-out the endpoint holds beside it. It was the caller's fact to state, which meant the
+  sink documented a nil receiver as *healthy* while its only consumer overrode that by hand —
+  and the next consumer to follow the documentation would report a proxy writing no audit trail
+  at all as operating normally.
 - **A typed nil in the health seam panicked `/healthz` and `/metrics`.** The fold's `h == nil`
   compared the INTERFACE, so an interface holding a `(*killswitch.Redis)(nil)` passed it and
   the call behind it dereferenced a nil receiver — on the operational endpoints, which is where

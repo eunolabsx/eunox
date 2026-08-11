@@ -3663,9 +3663,9 @@ func TestAuditSink_CloseFlushesQueuedRecords(t *testing.T) {
 		t.Fatalf("reading audit log: %v", err)
 	}
 	lines := strings.Count(string(data), "\n")
-	if lines < n-int(sink.DroppedRecords()) {
+	if lines < n-int(sink.Health().Dropped) {
 		t.Errorf("regression: expected at least %d lines (minus dropped=%d), got %d",
-			n, sink.DroppedRecords(), lines)
+			n, sink.Health().Dropped, lines)
 	}
 }
 
@@ -3689,7 +3689,7 @@ func TestAuditSink_RotateKeepsWriting(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if dropped := sink.DroppedRecords(); dropped != 0 {
+	if dropped := sink.Health().Dropped; dropped != 0 {
 		t.Errorf("regression: %d records dropped (s.f was nil after rotation)", dropped)
 	}
 

@@ -845,8 +845,8 @@ func TestAuditRecord_DropsWhenQueueFull(t *testing.T) {
 		records: make(chan auditRecord), // zero-capacity → always full
 	}
 	s.RecordAllow(context.Background(), "sess", "tool", "tools/call", nil, nil, false, nil, nil)
-	if s.DroppedRecords() != 1 {
-		t.Errorf("expected 1 dropped record, got %d", s.DroppedRecords())
+	if s.Health().Dropped != 1 {
+		t.Errorf("expected 1 dropped record, got %d", s.Health().Dropped)
 	}
 }
 
@@ -3407,7 +3407,7 @@ func TestAuditSink_ConcurrentRecordDuringClose(t *testing.T) {
 	}
 	wg.Wait()
 
-	if d := sink.DroppedRecords(); d > producers*perProducer {
+	if d := sink.Health().Dropped; d > producers*perProducer {
 		t.Fatalf("dropped count %d exceeds %d attempted records", d, producers*perProducer)
 	}
 }
@@ -3506,7 +3506,7 @@ func TestAuditSink_AsyncWrite(t *testing.T) {
 	// auditChannelSize below `calls` would fail here loudly rather than silently
 	// turning the throughput check into a measurement of dropped, never-written
 	// sends.
-	if n := sink.DroppedRecords(); n != 0 {
+	if n := sink.Health().Dropped; n != 0 {
 		t.Errorf("regression: %d of %d records dropped; the %d-deep buffer must absorb them all",
 			n, calls, auditChannelSize)
 	}
@@ -3619,10 +3619,10 @@ func TestAuditSink_WriteFailuresCounted(t *testing.T) {
 
 	// The queue absorbed every send (nothing dropped under back-pressure), so the
 	// loss must surface as write failures, not as queue-full drops.
-	if got := sink.DroppedRecords(); got != 0 {
+	if got := sink.Health().Dropped; got != 0 {
 		t.Errorf("DroppedRecords() = %d; want 0 (the queue absorbed every send)", got)
 	}
-	if got := sink.WriteFailures(); got != int64(n) {
+	if got := sink.Health().WriteFailures; got != int64(n) {
 		t.Errorf("WriteFailures() = %d; want %d (every write failed)", got, n)
 	}
 	if attempts < n {
@@ -3748,7 +3748,7 @@ func TestAuditSink_DroppedRecordsCounter(t *testing.T) {
 
 	_ = sink.Close()
 
-	dropped := sink.DroppedRecords()
+	dropped := sink.Health().Dropped
 	if dropped < 0 {
 		t.Errorf("DroppedRecords() = %d; must be ≥ 0", dropped)
 	}

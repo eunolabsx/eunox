@@ -23,10 +23,12 @@ import (
 // frozen clock, sized so only the grandparent can be the tier that refuses.
 //
 // Three tiers do not exist in production and are not planned. They are built here because the
-// structure is recursive and the debit used to be positional: what this asserts is that the
-// invariant the whole floor design rests on — a floored arrival displaces the FLOODER's next write
-// rather than adding to the tier's total — is a property of the code rather than of there happening
-// to be exactly two tiers.
+// structure is recursive and both halves of a floored delivery — which bucket goes into debt for
+// it, and which tallies stop counting it as elided — were written for a chain that happened to be
+// two deep. What this asserts is that the invariant the whole floor design rests on — a floored
+// arrival displaces the FLOODER's next write rather than adding to the tier's total, and no tier
+// reports it as a write the reader did not see — is a property of the code rather than of the
+// depth.
 func threeTierChain(at time.Time) (child, middle, grand *tieredBuckets[refusalCategory]) {
 	g := newTieredBuckets(1, 1, recordReserveInterval, []refusalCategory{catDisplaced}, nil, "grand", floorOwnBucket)
 	m := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, &g, "middle", floorParentBucket)
@@ -74,15 +76,21 @@ func TestFlooredWrite_DebitsTheTierThatRefused(t *testing.T) {
 		"the middle tier pays only for its own admission — it already spent a token on this write, and debiting it again would charge one write twice")
 }
 
-// TestFlooredWrite_UnsuppressionLandsOnTheRefusingTier is the same defect one field over: borrow
-// also decrements a suppression tally, and taking it from a tier that had just PUSHED one back
-// under-states a flood on the next line that reports it.
-func TestFlooredWrite_UnsuppressionLandsOnTheRefusingTier(t *testing.T) {
+// TestFlooredWrite_UnsuppressionLandsOnEveryTierThatCountedIt is the same defect one field over:
+// borrow also decrements a suppression tally, and a floored delivery has to be taken off EVERY tier
+// that counted it as elided — the one that refused, and each one between that refusal and the floor
+// that pushed its own tally back on the way up believing the write would not happen.
+//
+// The refusing tier's half was structural already (bucketVerdict.refusedBy). The intermediate half
+// was not: an admitting tier's push-back is taken before any descendant's floor has decided, so a
+// chain three or more deep counted a DELIVERED write as suppressed and over-stated the flood by one
+// on the next record reporting it.
+func TestFlooredWrite_UnsuppressionLandsOnEveryTierThatCountedIt(t *testing.T) {
 	t.Parallel()
 	// Differential rather than absolute: every pass through a drained tier adds a suppression of
 	// its own, so what has to be isolated is the effect of the FLOORED delivery alone. The same
 	// sequence is run twice — once with a live floor, once without — and the difference between
-	// them is exactly what borrow did.
+	// them is exactly what the delivery did.
 	run := func(withFloor bool) (grandTally, middleTally uint64) {
 		at := time.Now()
 		child, middle, grand := threeTierChain(at)
@@ -100,16 +108,45 @@ func TestFlooredWrite_UnsuppressionLandsOnTheRefusingTier(t *testing.T) {
 
 	assert.Equal(t, refusedGrand-1, flooredGrand,
 		"the write happened, so it comes off the tally of the tier that ELIDED it — the rollup states what the reader did not see")
-	assert.Equal(t, refusedMiddle, flooredMiddle,
-		"and never off a tier that admitted it: that tally is writes this tier really did elide, and taking one under-states the flood on the next line reporting it")
+	assert.Equal(t, refusedMiddle-1, flooredMiddle,
+		"and off the tier between them too: it pushed its token's worth of tally back on the way up for a write that then happened, and a tally holding a delivered write over-states the flood on the next record reporting it")
 
-	// STATED RESIDUAL, so this assertion is not read as more than it is: an INTERMEDIATE tier that
-	// admitted still pushes its token's worth of tally back when the tier above refuses, and a
-	// descendant's floor may then deliver the write anyway — so in a chain three or more deep that
-	// tier counts one delivered write as suppressed. Unreachable in the two-tier shape that ships
-	// (the child reports its own tally rather than pushing it back) and left for the change that
-	// builds a third tier, which needs the verdict to carry every tier it passed rather than only
-	// the one that refused.
+	// The debit is deliberately NOT taken here: an intermediate tier spent a token on this write
+	// when it admitted it, and charging a second would count one write twice at the tier sized to
+	// hold the aggregate. TestFlooredWrite_DebitsTheTierThatRefused pins that half.
+}
+
+// TestFlooredWrite_ADelegatingTierIsLeftAlone is the other shape a chain can have: a middle tier
+// holding no bucket for the key forwards the admission wholly upward, so it counted nothing and
+// there is nothing to take back from it.
+//
+// The distinction matters because the correction walks the parent chain rather than a list carried
+// on the verdict: a walk that decremented every tier it passed would invent a suppression on a tier
+// that never admitted, never refused and never pushed a tally back — under-stating the next flood
+// it does report.
+func TestFlooredWrite_ADelegatingTierIsLeftAlone(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	grand := newTieredBuckets(1, 1, recordReserveInterval, []refusalCategory{catDisplaced}, nil, "grand", floorOwnBucket)
+	// No bucket for catDisplaced: this tier delegates the key wholly to its parent.
+	middle := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catKill}, &grand, "middle", floorParentBucket)
+	child := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, &middle, "child", floorParentBucket)
+	for _, tier := range []*tieredBuckets[refusalCategory]{&child, &middle, &grand} {
+		tier.setNow(func() time.Time { return at })
+	}
+
+	require.True(t, grand.admitWithFloor(catDisplaced, nil).ok) // drain the grandparent
+	require.False(t, child.admitWithFloor(catDisplaced, nil).ok)
+	killBefore := middle.buckets[catKill].suppressed
+
+	floor := newKeyReserve([]refusalCategory{catDisplaced}).forKey(catDisplaced)
+	verdict := child.admitWithFloor(catDisplaced, floor)
+	require.True(t, verdict.ok)
+	assert.True(t, verdict.reserved)
+	assert.Equal(t, float64(-1), grand.buckets[catDisplaced].tokens,
+		"the debit still reaches the tier that refused, through a tier that only forwarded the answer")
+	assert.Equal(t, killBefore, middle.buckets[catKill].suppressed,
+		"a delegating tier's OTHER buckets are untouched: the correction is per key, and this tier carried nothing under the key being delivered")
 }
 
 // TestFlooredWrite_ZeroIntervalIsRefusedRatherThanUnbounded pins the direction a missing sizing

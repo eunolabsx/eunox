@@ -72,12 +72,26 @@ func TestHealth_CoverageLossIsOnePredicate(t *testing.T) {
 	assert.Equal(t, int64(2), detail["write_failure_count"])
 }
 
-// TestHealth_NilSinkIsHealthyBecauseAbsenceIsTheCallersFact pins the nil answer and the reason for
-// it: a sink that never opened cannot report on itself, and folding "absent" into "degraded" here
-// would report every legitimately optional sink (--require-audit=off) as broken.
-func TestHealth_NilSinkIsHealthyBecauseAbsenceIsTheCallersFact(t *testing.T) {
+// TestHealth_AbsenceIsPartOfTheSample pins where "there is no trail at all" is answered.
+//
+// It was the caller's fact: a nil sink answered the zero value and every consumer had to override
+// that by hand — which the one production consumer did, so the type's documented verdict and the
+// shipped one disagreed, and a second consumer following the documentation would report a proxy
+// writing no audit records as operating normally. Absence is a statement about audit coverage like
+// the counters are, so it belongs to the same reading.
+func TestHealth_AbsenceIsPartOfTheSample(t *testing.T) {
 	t.Parallel()
 	var s *Sink
-	assert.Equal(t, Health{}, s.Health())
-	assert.NoError(t, s.Health().HealthStatus())
+	h := s.Health()
+	assert.True(t, h.Absent, "a nil sink is a reading taken of nothing, and says so")
+	assert.NotEqual(t, Health{}, h,
+		"and it is not the ZERO value: a zero Health is a healthy sink with nothing wrong, which is the opposite fact")
+	require.Error(t, h.HealthStatus())
+	assert.Contains(t, h.HealthStatus().Error(), "no audit sink")
+
+	// The counters stay zero because nothing was measured, not because nothing was lost. A
+	// consumer rendering them alongside the verdict needs Absent to tell those apart — which is
+	// why it is a field rather than a nil sample.
+	assert.Zero(t, h.Dropped+h.WriteFailures)
+	assert.False(t, h.MaintenanceStalled)
 }

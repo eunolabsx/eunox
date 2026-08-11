@@ -27,7 +27,6 @@
 package transport
 
 import (
-	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -767,6 +766,7 @@ func (t *tieredBuckets[K]) admitWithFloor(key K, floor *reserveSlot) bucketVerdi
 			// table's: the count being reported is this holder's own, and an ancestor's is
 			// deliberately never read here (the same writes are counted at every child).
 			parent.refusedBy.borrow()
+			t.unpushIntermediateTallies(key, parent.refusedBy)
 			return bucketVerdict{ok: true, suppressed: suppressed, scope: t.scope, reserved: true}
 		}
 		// The aggregate refused, so this write does not happen; give this table back the token's
@@ -775,10 +775,47 @@ func (t *tieredBuckets[K]) admitWithFloor(key K, floor *reserveSlot) bucketVerdi
 		// same writes are already counted here, and counting them twice would over-state a flood.
 		// The refusing bucket is carried on unchanged, so a child of THIS table floors against the
 		// tier that actually refused rather than against this one, which just pushed a tally back.
+		//
+		// The push-back is unconditional because it is taken on the way UP, before any descendant's
+		// floor has decided. A descendant that then delivers the write takes this one back — see
+		// unpushIntermediateTallies, which is what keeps "the write happened" and "this tier counted
+		// it as elided" from being simultaneously true at every tier between the floor and the
+		// refusal.
 		own.suppressN(suppressed + 1)
 		return bucketVerdict{scope: t.scope, refusedBy: parent.refusedBy}
 	}
 	return bucketVerdict{ok: true, suppressed: suppressed, scope: t.scope}
+}
+
+// unpushIntermediateTallies takes back the one write each tier BETWEEN this table and refused
+// pushed onto its own tally on the way up, for a write this table's floor then delivered.
+//
+// Those tiers pushed back before any descendant's floor had decided, which is right for a write
+// that does not happen and wrong for one that does: the tier then holds a DELIVERED write in its
+// count of what the reader did not see, and its next admitted record over-states the flood by one
+// — the same defect refusedBy fixed for the debit, one field over.
+//
+// A walk up the chain rather than a list of tiers carried on the verdict: the verdict is built on
+// every refusal, which is the flood path this whole file exists to keep cheap, and a slice there
+// allocates per refused frame in the two-tier shape that ships — where the list is always empty.
+// The walk runs only on a floored delivery, and in that shape it terminates on its first comparison
+// (the tier above IS the refuser), so the correction costs the shipped shape nothing.
+//
+// No token is debited here: these tiers ADMITTED the write and already spent one on it. The debit
+// belongs to the tier that refused, which borrow() has already taken.
+func (t *tieredBuckets[K]) unpushIntermediateTallies(key K, refused *recordRateLimiter) {
+	for tier := t.parent; tier != nil; tier = tier.parent {
+		own, registered := tier.buckets[key]
+		if !registered {
+			// A tier that delegates this key wholly upward never reached its own admit and pushed
+			// nothing back — it only forwarded the answer.
+			continue
+		}
+		if own == refused {
+			return
+		}
+		own.unsuppress()
+	}
 }
 
 // bucket returns the token bucket key actually charges — this table's own, or the parent's for a
@@ -995,6 +1032,24 @@ func (l *recordRateLimiter) borrowLocked() {
 	if l.tokens-1 >= -l.burst {
 		l.tokens--
 	}
+	l.unsuppressLocked()
+}
+
+// unsuppress takes one write back off this bucket's tally without debiting a token: a write this
+// bucket counted as elided that a descendant's floor then delivered (see
+// tieredBuckets.unpushIntermediateTallies). Borrow's other half, split out because the tier this
+// runs on ADMITTED the write and already paid a token for it — charging a second would count one
+// write twice at exactly the tier sized to hold the aggregate.
+func (l *recordRateLimiter) unsuppress() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.unsuppressLocked()
+}
+
+// unsuppressLocked is best-effort in one direction, for borrow's stated reason: a concurrent admit
+// that harvested the tally first leaves nothing to take, and the counter is unsigned — over-stating
+// by one beats wrapping to 2^64.
+func (l *recordRateLimiter) unsuppressLocked() {
 	if l.suppressed > 0 {
 		l.suppressed--
 	}
@@ -1089,31 +1144,4 @@ func (g *saturationGate) clear() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.recorded = false
-}
-
-// nilInterface reports whether v holds no value at all — the interface itself nil, or a typed nil
-// inside a non-nil interface. The ONE answer in this package to a question three call sites now ask
-// (a diagnostic seam's subsystem, a server-initiated leg's sink), because `x == nil` compares the
-// INTERFACE and passes for an interface holding a nil pointer, whose method then dereferences a nil
-// receiver.
-//
-// Reflection rather than a type switch, for redisutil.IsNilClient's reason one layer down: a list of
-// concrete types is a second thing to keep in agreement, and nilness is one question for every type
-// including one nobody has written yet. IsNil PANICS on any other kind, so the kinds are named
-// rather than tried — a guard must not become the crash it prevents. Interface is in the list for
-// completeness even though reflect.ValueOf unwraps to the dynamic type and never yields it.
-//
-// It answers for a value that IS nil, never for a wrapper AROUND one: reflecting into an embedded
-// field would refuse decorators that legitimately forward elsewhere.
-func nilInterface(v any) bool {
-	if v == nil {
-		return true
-	}
-	rv := reflect.ValueOf(v)
-	switch rv.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
-		return rv.IsNil()
-	default:
-		return false
-	}
 }

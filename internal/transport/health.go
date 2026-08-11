@@ -54,9 +54,9 @@ type healthSnapshot struct {
 	AuditConfigured  bool   `json:"auditConfigured"`  // false when the audit sink failed to open
 	// AuditHealthy is the sink's OWN verdict, folded through the health seam rather than
 	// recomputed here. False for a trail that has lost coverage (a dropped record or a failed
-	// write, the same predicate --require-audit=strict denies on) or whose log maintenance has
-	// stalled — and for a sink that never opened, which is the one part of the answer the sink
-	// cannot give: absence is the proxy's own fact.
+	// write, the same predicate --require-audit=strict denies on), for one whose log maintenance
+	// has stalled, and for a sink that never opened — all three answered by the sample, so this
+	// file holds no audit predicate of its own.
 	AuditHealthy      bool `json:"auditHealthy"`
 	KillSwitchHealthy bool `json:"killSwitchHealthy"` // false when a Redis backend is degraded
 	// AuditMaintenanceStalled is true when rotation/retention pruning has stopped making
@@ -140,29 +140,23 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 		Sessions:          p.sessionCount(),
 		MaxSessions:       p.maxSessions,
 		Routes:            len(p.routes),
-		AuditConfigured:   p.sink != nil,
 		AuditHealthy:      true,
 		KillSwitchHealthy: true,
 	}
-	if p.sink == nil {
-		// ABSENCE is the one part of the audit answer that stays here: a sink that never opened
-		// cannot report on itself, and only the proxy knows it wired none. Both effects are set
-		// together, for the reason fold takes a pointer to the field — a subsystem folded into the
-		// summary while its own field stays true is a discrepancy nothing downstream can detect.
-		snap.AuditHealthy, snap.Status = false, statusDegraded
-	} else {
-		// ONE sample, and its own verdict folded from it: the counters below and the health seam's
-		// answer come from the same reading, so a record dropped mid-scrape cannot put a zero count
-		// beside a degraded verdict in one body. The predicate itself belongs to the package that
-		// owns the state — including the carve-out that keeps a stalled rotation out of the gate
-		// that denies traffic while keeping it in this one (see audit.Health.HealthStatus), which
-		// the copy that used to live here had to remember by hand.
-		h := p.sink.Health()
-		snap.AuditDropped = h.Dropped
-		snap.AuditWriteFailed = h.WriteFailures
-		snap.AuditMaintenanceStalled, snap.AuditMaintenanceReason = h.MaintenanceStalled, h.MaintenanceReason
-		snap.fold(h, &snap.AuditHealthy)
-	}
+	// ONE sample — taken through a nil-safe call rather than past a nil test — and its own verdict
+	// folded from it: every audit field below and the health seam's answer come from the same
+	// reading, so a record dropped mid-scrape cannot put a zero count beside a degraded verdict in
+	// one body. The predicate belongs to the package that owns the state, including both carve-outs
+	// it holds (see audit.Health.HealthStatus): a stalled rotation is a readiness regression that
+	// must NOT deny traffic, and an absent sink is degraded here even though it has lost no record.
+	// ABSENCE used to be the one part this file answered for itself, which left the sink's
+	// documented verdict for a nil receiver ("healthy") contradicting its only consumer.
+	h := p.sink.Health()
+	snap.AuditConfigured = !h.Absent
+	snap.AuditDropped = h.Dropped
+	snap.AuditWriteFailed = h.WriteFailures
+	snap.AuditMaintenanceStalled, snap.AuditMaintenanceReason = h.MaintenanceStalled, h.MaintenanceReason
+	snap.fold(h, &snap.AuditHealthy)
 	// A degraded kill switch (e.g. a Redis partition) flips status to "degraded". The
 	// operational consequence depends on the configured degraded mode (fail-closed by
 	// default, fail-open opt-in) — either way it's not operating normally.

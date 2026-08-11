@@ -6350,12 +6350,12 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 		// record reaches the drainer but cannot be durably written. A configured
 		// sink with AuditWriteFailed > 0 must still flip Status to degraded.
 		sink, _ := newTempAuditSink(t)
-		for i := 0; i < 50 && sink.WriteFailures() == 0; i++ {
+		for i := 0; i < 50 && sink.Health().WriteFailures == 0; i++ {
 			sink.RecordAllow(context.Background(), "sess", "tool", "tools/call",
 				map[string]interface{}{"bad": math.Inf(1)}, nil, false, nil, nil)
 			time.Sleep(5 * time.Millisecond)
 		}
-		if sink.WriteFailures() == 0 {
+		if sink.Health().WriteFailures == 0 {
 			t.Skip("could not provoke an audit write failure on this platform; nil-sink case covers the verdict")
 		}
 		p := &HTTPProxy{ks: killswitch.NewInMemory(), sink: sink, sessions: map[string]*httpSession{}}

@@ -74,10 +74,11 @@ type UpstreamRoute struct {
 	// on a gateway means one route holding the budget sized for all of them.
 	notices *noticeLimiter
 
-	// noticeCollapse holds this UPSTREAM's per-site collapse windows (see collapsedNotices). Per
-	// route rather than per session or per proxy because that is what those faults are per: this
-	// route has one receipt verifier and one policy engine behind it, so "the pin is stale" and
-	// "the flow store is down" are facts about it rather than about whoever happened to call.
+	// noticeCollapse holds this UPSTREAM's per-site collapse windows (see collapseWindowed in
+	// meteredNotices). Per route rather than per session or per proxy because that is what those
+	// faults are per: this route has one receipt verifier and one policy engine behind it, so "the
+	// pin is stale" and "the flow store is down" are facts about it rather than about whoever
+	// happened to call.
 	// Assigned by BuildRoutes AND re-assigned by NewHTTPProxyGateway beside the notice table, so a
 	// route reaching a proxy some other way cannot arrive with a working bucket table and no
 	// windows — which would silently restore the per-frame flood with every guard still green.

@@ -352,7 +352,7 @@ Mechanics:
   background drainer goroutine owns serialization, HMAC-SHA256 signing, and
   file I/O — the policy hot path never waits on disk.
 - The queue is bounded (4096 records). When it is full, records are dropped
-  and counted (`DroppedRecords`), surfacing sustained disk pressure as a
+  and counted (`Health().Dropped`), surfacing sustained disk pressure as a
   metric rather than back-pressuring enforcement.
 - Audit availability is gated by `--require-audit`, which **defaults to
   `strict`**: a log that cannot be opened is fatal at startup, and once a record

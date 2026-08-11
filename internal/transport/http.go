@@ -390,7 +390,12 @@ type HTTPGatewayOptions struct {
 }
 
 // NewHTTPProxyGateway creates a gateway HTTPProxy from pre-built routes.
+//
+// It panics on an options field that is WIRED but holds a typed nil — see requireUsableOptions for
+// why that is refused here rather than substituted or reported later. Every normalization below
+// treats a nil field as ABSENT, which is a different fact and stays the caller's own.
 func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
+	requireUsableOptions(opts)
 	if opts.KS == nil {
 		opts.KS = killswitch.NewInMemory()
 	}

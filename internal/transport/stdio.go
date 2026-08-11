@@ -186,9 +186,9 @@ type StdioProxy struct {
 	// starved by, so it needs no per-class floor, but the line a class-mate's flood must not elide
 	// is written here exactly as it is on the HTTP transport. nil on a bare-struct-literal proxy.
 	noticeFloor *noticeReserve
-	// noticeCollapse holds this proxy's per-site collapse windows (see collapsedNotices). One per
-	// proxy because this transport serves ONE upstream, which is the scope those faults are per —
-	// the same reason the gateway holds them per route.
+	// noticeCollapse holds this proxy's per-site collapse windows (see collapseWindowed in
+	// meteredNotices). One per proxy because this transport serves ONE upstream, which is the scope
+	// those faults are per — the same reason the gateway holds them per route.
 	noticeCollapse *keyReserve[noticeSite]
 
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
@@ -331,7 +331,13 @@ type StdioProxyOptions struct {
 }
 
 // NewStdioProxy creates a StdioProxy ready to call Start.
+//
+// It panics on an options field that is WIRED but holds a typed nil — see requireUsableOptions.
+// That is not the same fault as an omitted one: a nil PDP is answered below by denying everything,
+// which is the fail-closed answer to "no policy was supplied", while a PDP interface holding a nil
+// pointer would dereference a nil receiver on the first request rather than deny it.
 func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
+	requireUsableOptions(opts)
 	// Fail closed: a caller that omits a PDP denies every request. Production
 	// always wires a concrete PDP; this guards the exported library seam.
 	// Wiretap/audit mode opts in explicitly with AlwaysAllowPDP.
