@@ -31,13 +31,13 @@ import (
 // depth.
 func threeTierChain(at time.Time) (child, middle, grand *tieredBuckets[refusalCategory]) {
 	g := newTieredBuckets(1, 1, recordReserveInterval, []refusalCategory{catDisplaced}, nil, "grand", floorOwnBucket)
-	m := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, &g, "middle", floorParentBucket)
-	c := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, &m, "child", floorParentBucket)
+	m := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, g, "middle", floorParentBucket)
+	c := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, m, "child", floorParentBucket)
 	// setNow deliberately does not descend, so each tier is frozen explicitly.
-	for _, t := range []*tieredBuckets[refusalCategory]{&c, &m, &g} {
+	for _, t := range []*tieredBuckets[refusalCategory]{c, m, g} {
 		t.setNow(func() time.Time { return at })
 	}
-	return &c, &m, &g
+	return c, m, g
 }
 
 // TestFlooredWrite_DebitsTheTierThatRefused pins the debit to the REFUSING tier rather than to the
@@ -129,9 +129,9 @@ func TestFlooredWrite_ADelegatingTierIsLeftAlone(t *testing.T) {
 	at := time.Now()
 	grand := newTieredBuckets(1, 1, recordReserveInterval, []refusalCategory{catDisplaced}, nil, "grand", floorOwnBucket)
 	// No bucket for catDisplaced: this tier delegates the key wholly to its parent.
-	middle := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catKill}, &grand, "middle", floorParentBucket)
-	child := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, &middle, "child", floorParentBucket)
-	for _, tier := range []*tieredBuckets[refusalCategory]{&child, &middle, &grand} {
+	middle := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catKill}, grand, "middle", floorParentBucket)
+	child := newTieredBuckets(50, 50, recordReserveInterval, []refusalCategory{catDisplaced}, middle, "child", floorParentBucket)
+	for _, tier := range []*tieredBuckets[refusalCategory]{child, middle, grand} {
 		tier.setNow(func() time.Time { return at })
 	}
 
@@ -157,6 +157,88 @@ func TestFlooredWrite_ADelegatingTierIsLeftAlone(t *testing.T) {
 		"the refuser's tally moves by its own refusal and borrow's correction only; a delegating tier must not deliver a second decrement of the bucket it forwards to")
 	assert.Equal(t, killBefore, middle.buckets[catKill].suppressed,
 		"and a delegating tier's OTHER buckets are untouched: the correction is per key, and this tier carried nothing under the key being delivered")
+}
+
+// TestExemptCategory_IsUnboundedOnBothSpellings pins the declaration against the admission, on the
+// axis where the two spellings of a refusal write disagreed.
+//
+// An exempt category is deliberately absent from refusalCategories, so it holds no bucket — and an
+// unregistered key on a parentless table falls to the floor-rate `unknown` fallback (1/s, burst 1).
+// forCategory read the exemption and short-circuited; recordRefusal's admission did not, so the
+// pre-session spelling throttled a DECLARED-EXEMPT refusal five times harder than a metered one.
+// The exemption rests on "a policy verdict may never be metered", which makes eliding 19 in 20 the
+// exact failure it was written to prevent.
+func TestExemptCategory_IsUnboundedOnBothSpellings(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	limiter := newRefusalRecordLimiter()
+	limiter.setNow(func() time.Time { return at })
+	require.Equal(t, meteringExempt, refusalDeclarations[catUnroutable].metering,
+		"this test is about a category the table declares exempt")
+	require.NotContains(t, limiter.buckets, catUnroutable, "which is therefore absent from the bucket table")
+
+	admitted := 0
+	for range 20 {
+		if limiter.admitRefusal(catUnroutable).ok {
+			admitted++
+		}
+	}
+	assert.Equal(t, 20, admitted,
+		"an exempt category charges no bucket on the admission both spellings share; falling to the unknown fallback made it the most throttled refusal in the tree")
+
+	// The control, on the same drained table: a METERED category is still bounded, so what the
+	// exemption buys is not a hole in the admission.
+	metered := 0
+	for range 20 {
+		if limiter.admitRefusal(catOrigin).ok {
+			metered++
+		}
+	}
+	assert.Positive(t, metered)
+	assert.Less(t, metered, 20, "a metered category is still bounded by its own bucket")
+
+	// And the recorder-resolving spelling agrees, which is the property that was only true because
+	// it read the declaration a second time.
+	assert.NotNil(t, refusalRecorders{rec: &fwdRecorder{}, limits: refusalLimits{records: limiter}}.forCategory(catUnroutable),
+		"the exemption resolves the same on either spelling, from one reader")
+}
+
+// TestFlooredWrite_WindowIsSizedByTheRefusingTiersBudget pins which table's interval a floored
+// write's window comes from.
+//
+// The delegation branch states the rule: the window a floored write buys is a property of the
+// BUDGET it is charged against. On the floorParentBucket arm that budget is the parent's — its
+// bucket refused and its bucket is debited — while the interval was read from the child, so a
+// per-holder table tuned with a shorter interval than the aggregate it charges would bypass the
+// aggregate's drained bucket at the HOLDER's rate. Inert today (both record tables pass
+// recordReserveInterval), which is exactly why the assertion has to exist: reserveEvery is a
+// per-table constructor parameter whose own doc says the two budgets are not interchangeable.
+func TestFlooredWrite_WindowIsSizedByTheRefusingTiersBudget(t *testing.T) {
+	t.Parallel()
+	at := time.Now()
+	// The aggregate re-arms a floor once an hour; the holder's table, once a millisecond. The
+	// holder floors against the AGGREGATE's refusal, so the hour is the window that applies.
+	aggregate := newTieredBuckets(1, 1, time.Hour, []refusalCategory{catDisplaced}, nil, "aggregate", floorOwnBucket)
+	session := newTieredBuckets(50, 50, time.Millisecond, []refusalCategory{catDisplaced}, aggregate, "session", floorParentBucket)
+	for _, tier := range []*tieredBuckets[refusalCategory]{session, aggregate} {
+		tier.setNow(func() time.Time { return at })
+	}
+	require.True(t, aggregate.admitWithFloor(catDisplaced, nil).ok) // drain the aggregate
+
+	floor := newKeyReserve([]refusalCategory{catDisplaced}).forKey(catDisplaced)
+	require.True(t, session.admitWithFloor(catDisplaced, floor).ok, "the holder's floor delivers the first one")
+
+	// Past the holder's own interval by three orders of magnitude, and nowhere near the
+	// aggregate's: the floor must still be spent.
+	at = at.Add(time.Second)
+	session.setNow(func() time.Time { return at })
+	assert.False(t, session.admitWithFloor(catDisplaced, floor).ok,
+		"a floored write past the AGGREGATE's drained bucket buys the aggregate's window; reading the holder's would let a per-holder knob loosen a bound sized for the whole process")
+
+	at = at.Add(time.Hour)
+	session.setNow(func() time.Time { return at })
+	assert.True(t, session.admitWithFloor(catDisplaced, floor).ok,
+		"and it re-arms on that same window, not on the one the flooring tier happens to carry")
 }
 
 // TestFlooredWrite_ZeroIntervalIsRefusedRatherThanUnbounded pins the direction a missing sizing

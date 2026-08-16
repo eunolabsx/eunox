@@ -149,3 +149,30 @@ func TestWiring_PositionalSubsystemsAreRefusedToo(t *testing.T) {
 		_, _, _, _, _ = LoadUpstreamPDP(&config.UpstreamConfig{Name: "u"}, config.HostTransportStdio, "", nil, nil, nil, false)
 	})
 }
+
+// TestWiring_ARouteBindsToOneProxy pins the refusal that keeps a caller-owned route map from being
+// silently taken over.
+//
+// NewHTTPProxyGateway re-parents each route's notice table and replaces its collapse windows IN
+// PLACE, on values the caller still holds. A second proxy over the same map therefore repointed the
+// first proxy's per-route buckets at its own aggregate — so a flood on one silenced the other's
+// diagnostics — and re-armed windows that were mid-incident, with every guard on both reading green.
+func TestWiring_ARouteBindsToOneProxy(t *testing.T) {
+	t.Parallel()
+	routes := map[string]*UpstreamRoute{"a": {name: "a"}}
+
+	first := NewHTTPProxyGateway(HTTPGatewayOptions{Routes: routes})
+	require.NotNil(t, first.routes["a"].notices, "the first proxy claims the route and wires it")
+
+	assert.PanicsWithValue(t,
+		"eunox: HTTPGatewayOptions.Routes[\"a\"] is already bound to another HTTPProxy: a route holds "+
+			"per-upstream diagnostic state that a second proxy would take over, silencing the first's "+
+			"lines and re-arming its collapse windows. Build routes per proxy.",
+		func() { NewHTTPProxyGateway(HTTPGatewayOptions{Routes: routes}) },
+		"the second construction must be refused rather than quietly repointing the first proxy's tables")
+
+	// And a nil VALUE in the same map is the other way that map reaches the loop unusable.
+	assert.Panics(t, func() {
+		NewHTTPProxyGateway(HTTPGatewayOptions{Routes: map[string]*UpstreamRoute{"b": nil}})
+	}, "a nil route was dereferenced one line under the guard that exists to name a wiring fault")
+}

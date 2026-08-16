@@ -74,6 +74,16 @@ type UpstreamRoute struct {
 	// on a gateway means one route holding the budget sized for all of them.
 	notices *noticeLimiter
 
+	// boundProxy records that a proxy has claimed this route's per-upstream diagnostic state, so a
+	// SECOND one is refused rather than silently taking it over. NewHTTPProxyGateway re-parents
+	// notices and replaces noticeCollapse in place, and Routes is a map the caller owns and can
+	// legitimately still hold: standing up a second proxy over it re-pointed every route's bucket
+	// table at proxy B's aggregate — so a flood on B silenced A's diagnostics — and re-armed A's
+	// in-flight collapse windows, restoring the per-frame flood they exist to remove, with every
+	// guard on both proxies still reading green. Written only during construction, which is
+	// single-threaded per proxy and happens before either serves.
+	boundProxy bool
+
 	// noticeCollapse holds this UPSTREAM's per-site collapse windows (see collapseWindowed in
 	// meteredNotices). Per route rather than per session or per proxy because that is what those
 	// faults are per: this route has one receipt verifier and one policy engine behind it, so "the

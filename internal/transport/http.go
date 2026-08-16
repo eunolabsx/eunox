@@ -466,6 +466,17 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		// on the next line — a diagnosis-free constructor panic three lines under the guard that
 		// exists to replace one.
 		requireUsable("HTTPGatewayOptions.Routes["+name+"]", route)
+		// And a route already claimed by another proxy is refused rather than taken over: the two
+		// assignments below are IN PLACE on a value the caller still holds, so a second proxy over
+		// the same map silently repoints the first's diagnostics and re-arms its collapse windows.
+		// See UpstreamRoute.boundProxy. Build a fresh set (BuildRoutes) per proxy.
+		if route.boundProxy {
+			panic(fmt.Sprintf(
+				"eunox: HTTPGatewayOptions.Routes[%q] is already bound to another HTTPProxy: a route holds "+
+					"per-upstream diagnostic state that a second proxy would take over, silencing the first's "+
+					"lines and re-arming its collapse windows. Build routes per proxy.", name))
+		}
+		route.boundProxy = true
 		route.notices = newRouteNoticeLimiter(p.notices)
 		route.noticeCollapse = newNoticeCollapse()
 	}

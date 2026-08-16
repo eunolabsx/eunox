@@ -528,9 +528,9 @@ const (
 
 // noticeLimiter is one leg's stderr-diagnostic admission control: a bucket per notice CLASS, and
 // optionally an aggregate parent it also charges. The same two-tier table the refusal RECORDS use,
-// one axis over — see tieredBuckets.
+// one axis over — see tieredBuckets, embedded by POINTER for the reason stated there.
 type noticeLimiter struct {
-	tieredBuckets[noticeClass]
+	*tieredBuckets[noticeClass]
 }
 
 // newNoticeLimiter builds a proxy's AGGREGATE notice table: one bucket per class, no parent, sized
@@ -565,7 +565,7 @@ func newNoticeLimiter(tenants int) *noticeLimiter {
 func newRouteNoticeLimiter(aggregate *noticeLimiter) *noticeLimiter {
 	var parent *tieredBuckets[noticeClass]
 	if aggregate != nil {
-		parent = &aggregate.tieredBuckets
+		parent = aggregate.tieredBuckets
 	}
 	return &noticeLimiter{tieredBuckets: newTieredBuckets(
 		perClassNoticeRatePerSec, perClassNoticeBurst, noticeReserveInterval, noticeClasses, parent,

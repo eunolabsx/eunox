@@ -1369,6 +1369,36 @@ Section conventions:
 
 ### Fixed
 
+- **A refusal declared exempt from admission control was the most throttled record in the tree.**
+  An exempt category is deliberately absent from the bucket table, so it holds no bucket — and an
+  unregistered key on the proxy-wide table falls to the floor-rate `unknown` fallback: 1 record/s,
+  burst 1, against a metered category's 2/s burst 5. Only one of the two spellings of a refusal
+  write read the exemption, and the pre-session path (every refusal an unauthenticated caller can
+  drive) was the other one. The exemption rests on *a policy verdict may never be metered*, which
+  makes eliding 19 records in 20 under a flood the exact failure it was written to prevent. The
+  declaration is now applied by the single admission both spellings go through, so there is one
+  reader of it on the admission path rather than one per entry point. Latent in that no category
+  reachable through that path is declared exempt today — the two that are reach the tape another
+  way — but nothing prevented it, which is what the declaration exists to do.
+
+- **A floored write's window was sized by the wrong table's budget.** When a per-holder table
+  floors a write past the *aggregate's* drained bucket, the aggregate is what refuses it and what
+  is debited for it — but the re-arm interval was read from the holder's own table. A per-holder
+  table tuned with a shorter interval than the aggregate it charges would therefore bypass a
+  process-wide bound at the holder's rate. Inert today (both record tables pass the same interval),
+  and fixed rather than documented because `reserveEvery` is a per-table constructor parameter
+  whose own doc says the two budgets are not interchangeable in either direction. The instant the
+  floor is measured against is deliberately unchanged: that is one reading per admission, which is
+  a different question and already had an answer.
+
+- **A route now binds to one proxy, and a second construction over the same map is refused.**
+  `NewHTTPProxyGateway` re-parents each route's notice table and replaces its collapse windows in
+  place, on values the caller still owns. Standing up a second proxy over the same `Routes` map
+  repointed the first proxy's per-route buckets at the second's aggregate — so a flood on one
+  silenced the other's diagnostics — and re-armed windows that were mid-incident, with every guard
+  on both reading green. A nil route value in that map is refused for the same reason it was
+  dereferenced one line later.
+
 - **A subsystem wired as a typed nil is now refused where it is wired, naming the field.**
   `NewHTTPProxyGateway` and `NewStdioProxy` normalize an omitted subsystem with `opts.X == nil`,
   which compares the INTERFACE — so a caller passing `var ks *killswitch.Redis` walked straight
