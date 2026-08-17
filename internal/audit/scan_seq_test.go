@@ -479,12 +479,12 @@ func TestWriteRecord_RefusesToWrapSeq(t *testing.T) {
 	// Open is single-threaded here and the drainer only touches seq from writeRecord,
 	// so driving the counter directly is safe before any record is enqueued.
 	sink.seq = ^uint64(0)
-	before := sink.WriteFailures()
+	before := sink.Health().WriteFailures
 	sink.writeRecord(&auditRecord{Decision: "allow", RequestID: "wrap-guard"})
 	if sink.seq != ^uint64(0) {
 		t.Fatalf("seq = %d, want the counter left untouched at the ceiling", sink.seq)
 	}
-	if got := sink.WriteFailures(); got != before+1 {
+	if got := sink.Health().WriteFailures; got != before+1 {
 		t.Fatalf("WriteFailures = %d, want %d — the refused record must be counted as a loss", got, before+1)
 	}
 	data, err := os.ReadFile(logPath) //nolint:gosec // G304: test-controlled path

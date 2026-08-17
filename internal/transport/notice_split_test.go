@@ -192,19 +192,19 @@ func TestNoticeSplit_SingleRouteKeepsThePreSplitBudget(t *testing.T) {
 // not chosen by the call site, which is what let "declared metered" and "charges a bucket" disagree.
 func TestNoticeMechanism_ClassComesFromTheDeclaration(t *testing.T) {
 	t.Parallel()
-	for site, class := range meteredNotices {
+	for site, decl := range meteredNotices {
 		// A FRESH table per site: one shared across the loop drains as sites accumulate, so the
 		// "admitted nothing on a full bucket" arm would eventually fail naming an arbitrary site
 		// (map order is randomized) for the crime of being visited last.
 		limiter := newNoticeLimiter(1)
 		frozen(limiter, time.Now())
-		before := limiter.bucket(class).tokens
+		before := limiter.bucket(decl.class).tokens
 		var out strings.Builder
 		if line, ok := (noticeWriter{out: &out, limits: limiter}).admitNotice(site); ok {
 			line.writef("line\n")
 		}
 		require.NotEmpty(t, out.String(), "site %q admitted nothing on a full bucket", site)
-		assert.Less(t, limiter.bucket(class).tokens, before,
+		assert.Less(t, limiter.bucket(decl.class).tokens, before,
 			"site %q must charge the class its declaration names; a site that charges another bucket is the disagreement the runtime lookup exists to remove", site)
 	}
 }
@@ -625,17 +625,17 @@ func TestNoticeReserve_ProtectedSiteFallsBackToNoClassFloor(t *testing.T) {
 	session := newNoticeReserve(noticeClasses)
 	require.NotEmpty(t, floorProtectedSites)
 	for _, site := range floorProtectedSites {
-		class, metered := meteredNotices[site]
+		decl, metered := meteredNotices[site]
 		require.True(t, metered, "a protected site must be metered; an unmetered one charges no bucket to be floored under")
-		assert.NotSame(t, session.forSite(site, class), session.byClass.forKey(class),
+		assert.NotSame(t, session.forSite(site, decl.class), session.byClass.forKey(decl.class),
 			"site %q must resolve to its own slot rather than the class slot it is protected from", site)
 		// And its class-mates resolve to the shared class slot, which is what makes the protection
 		// mean something: a flood of theirs spends that one and leaves this site's alone.
-		for mate, mateClass := range meteredNotices {
-			if mate == site || mateClass != class || siteFloors[mate].protected {
+		for mate, mateDecl := range meteredNotices {
+			if mate == site || mateDecl.class != decl.class || siteFloors[mate].protected {
 				continue
 			}
-			assert.Same(t, session.byClass.forKey(class), session.forSite(mate, mateClass),
+			assert.Same(t, session.byClass.forKey(decl.class), session.forSite(mate, mateDecl.class),
 				"site %q is declared elidable, so it must share its holder's class reserve rather than hold one of its own", mate)
 		}
 	}
@@ -726,8 +726,10 @@ func BenchmarkNotice_SuppressedPath(b *testing.B) {
 	limiter := newNoticeLimiter(1)
 	// With a session floor AND a source's collapse windows, since that is the shipped HTTP-session
 	// channel: a channel missing either measures a shape no transport has — every stdio proxy and
-	// every routed HTTP leg carries both — and would keep reporting the pre-collapse number while
-	// production paid the extra probe. The floor is spent by the first drained line, so every
+	// every routed HTTP leg carries both. The measured site is uncollapsed, which is now the
+	// interesting case rather than an omission: the window probe is reached only by a site that
+	// DECLARES one, so what thirteen of fifteen sites pay for the collapse is the comparison
+	// measured here and nothing more. The floor is spent by the first drained line, so every
 	// measured iteration is the steady state.
 	channel := noticeWriter{
 		out: io.Discard, limits: limiter,
@@ -774,11 +776,11 @@ func BenchmarkNotice_SuppressedPath(b *testing.B) {
 	// integer site indexing an array would be worth the constants' readable values.
 	b.Run("lookup", func(b *testing.B) {
 		b.ReportAllocs()
-		class := classUnclassified
+		decl := noticeSiteDeclaration{}
 		for b.Loop() {
-			class = meteredNotices[siteNotifyPoolSaturated]
+			decl = meteredNotices[siteNotifyPoolSaturated]
 		}
-		require.NotEqual(b, classUnclassified, class)
+		require.NotEqual(b, classUnclassified, decl.class)
 	})
 }
 

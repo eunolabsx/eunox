@@ -27,6 +27,14 @@
 // reconcile between them. Metered-ness is now membership in the first map rather than a field, so
 // noticeBound has no metered value to write in the second.
 //
+// Two tables, not three: everything a metered site declares — the class it charges and whether its
+// occurrences COLLAPSE at their source — is one value under one key. The collapse started as a
+// second map keyed by the same site, which cost admitNotice a second probe on every line for a
+// window two of fifteen sites hold, and — worse — was an opt-in list with no completeness gate, so
+// a site added to it answered the collapse question by default rather than by decision. Folding it
+// in removes both: the probe already being taken carries the answer, and a site with no disposition
+// fails the table test the way an unclassified one does.
+//
 // The bucket is no longer singular. It is split on the axes the shared one collapsed:
 //
 //   - by CLASS, so a flood of the cheapest peer-driven line cannot take the last token from the
@@ -51,7 +59,6 @@ package transport
 import (
 	"fmt"
 	"io"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -148,7 +155,21 @@ const (
 var noticeClasses = meteredNoticeClasses()
 
 func meteredNoticeClasses() []noticeClass {
-	return slices.Compact(slices.Sorted(maps.Values(meteredNotices)))
+	out := make([]noticeClass, 0, len(meteredNotices))
+	for _, decl := range meteredNotices {
+		// classUnclassified is filtered rather than registered, which is what makes the
+		// undeclared answer STRUCTURAL rather than a property of the table test: registering it
+		// would hand an entry that forgot its class a full class bucket and a reserve slot — and
+		// move every genuinely undeclared site off the floor-rate fallback onto it, since they
+		// all resolve to the same key. Easy to write now that the value is a struct literal with
+		// an omissible field, where the bare noticeClass it replaced had to be stated.
+		if decl.class == classUnclassified {
+			continue
+		}
+		out = append(out, decl.class)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // label names a class in the suppression rollup. A count that spans one class must say which,
@@ -166,64 +187,138 @@ func (c noticeClass) label() string {
 	}
 }
 
-// meteredNotices is the class each metered diagnostic site charges, read at WRITE time by
-// admitNotice — which is what makes "declared metered" and "charges that class's bucket" one fact
-// rather than two that a call site could put out of agreement.
+// collapseDisposition is whether a site's occurrences are folded to one line per
+// noticeCollapseInterval per SOURCE, or reported one per occurrence.
+//
+// The zero value is "undeclared", so a metered site added with no answer fails the table test
+// rather than inheriting the per-occurrence one — the shape siteFloors and refusalDeclarations use,
+// and the one thing the collapse's first form (an opt-in list) could not have: an absent site was
+// indistinguishable from an unexamined one, and five failure-class sites meeting the collapsed
+// sites' own stated criterion sat outside it with no recorded judgment either way.
+type collapseDisposition int
+
+const (
+	collapseUndeclared collapseDisposition = iota
+	// collapseWindowed: at most one line per window per source, the rest folded into the class
+	// bucket's tally. For a fault whose SUBJECT does not vary, where the occurrences after the
+	// first tell an operator nothing the first did not.
+	collapseWindowed
+	// collapsePerOccurrence: every occurrence its bucket admits is written. The ordinary answer,
+	// and the one a line whose occurrences carry different subjects must give.
+	collapsePerOccurrence
+)
+
+// noticeSiteDeclaration is what ONE metered diagnostic site declares. Both answers are required and
+// neither may be inherited: an unclassified site charges the floor-rate fallback rather than a real
+// class's share, and an undeclared collapse is an unexamined one.
+//
+// why carries the judgment behind the collapse disposition, on BOTH sides of it — unlike
+// refusalDeclaration's, where only the exemption has a reason to state. Here each answer costs
+// something a reader cannot infer from the code: collapsing loses every occurrence after the first
+// in the window, and not collapsing leaves a fault a broken deployment can drive at the request
+// rate charging its class's bucket per occurrence. A site that states neither has not decided.
+type noticeSiteDeclaration struct {
+	class    noticeClass
+	collapse collapseDisposition
+	why      string
+}
+
+// The reasons a collapse disposition rests on, stated once each where they are one argument shared
+// by several sites rather than per-site prose — the shape unmeteredNotices' exemption reasons use.
+const (
+	// collapsedOccurrencesAreOneFinding is what the two windowed sites have in common, kept here
+	// because the criterion is what a NEW site is judged against: a fault a merely broken
+	// deployment drives at the request rate, whose subject is the deployment rather than the call.
+	collapsedOccurrencesAreOneFinding = "a merely broken deployment drives it at the request rate and every occurrence reports the same fault, so an operator acts on it once"
+	// uncollapsedRateIsTheSignal covers the traffic lines. Each is an account of one MESSAGE a peer
+	// or an upstream sent, so what a window would remove is the RATE — which is the whole of what a
+	// reader watching per-frame traffic is reading them for, and which the class bucket's rollup
+	// reports as a count only after the fact.
+	uncollapsedRateIsTheSignal = "an account of one message the peer sent: the occurrences and their rate are the finding, so a window would report the first and reduce the incident to a count"
+	// uncollapsedNamesTheFailingCall covers the failure lines, and it is a TRADE rather than an
+	// obvious answer. They meet the windowed sites' criterion exactly — a dead upstream drives one
+	// per frame from a conforming peer, and classFailure's own doc calls that routine — so the
+	// flood is real and is deliberately not removed at the source. What differs is what an
+	// occurrence CARRIES: the failing call, its method, the error the upstream returned, where a
+	// windowed site reports a fault whose subject does not vary. Folding them would leave "an
+	// upstream is failing" and remove WHICH calls failed, which is what an operator reads during
+	// the incident. Its flood is answered by the bounds instead — the class bucket, the route split
+	// above it, and the holder's floor below — none of which lose a subject.
+	uncollapsedNamesTheFailingCall = "each occurrence names a different failing call and the error behind it, which is what an operator reads it for; the flood is bounded by the class bucket rather than removed at the source"
+)
+
+// meteredNotices is everything a metered diagnostic site DECLARES: the class whose bucket it
+// charges, whether its occurrences collapse at their source, and the judgment behind that. It is
+// read at WRITE time by admitNotice — which is what makes "declared metered" and "charges that
+// class's bucket" one fact rather than two that a call site could put out of agreement.
 //
 // Membership IS the metering declaration: there is no bound field to set here and no metered value
 // to set in unmeteredNotices, so the one disagreement a single table permitted — a metered entry
 // keyed by a Go function name, unreachable from this lookup and silently charging the floor bucket
 // — cannot be written.
-var meteredNotices = map[noticeSite]noticeClass{
+//
+// The collapse disposition lives HERE rather than in a table of its own for two reasons that point
+// the same way: admitNotice reads both in one probe (a second string-keyed lookup on every line,
+// for a window two of the fifteen sites hold — see admitNotice for what that measured), and a table
+// of its own could only ever be an opt-in list, where the thirteen sites outside it answer nothing
+// and "not collapsed" is a judgment with a cost like any other.
+var meteredNotices = map[noticeSite]noticeSiteDeclaration{
 	// (1) TRAFFIC: reachable at a peer's or an upstream's send rate, one line per frame, each with
 	// a record beside it on the tape.
-	siteUnmappedMethod:      classTraffic,
-	siteObserveDowngrade:    classTraffic,
-	siteSamplingDowngrade:   classTraffic,
-	siteNotifyPoolSaturated: classTraffic,
+	siteUnmappedMethod:      {class: classTraffic, collapse: collapsePerOccurrence, why: uncollapsedRateIsTheSignal},
+	siteObserveDowngrade:    {class: classTraffic, collapse: collapsePerOccurrence, why: uncollapsedRateIsTheSignal},
+	siteSamplingDowngrade:   {class: classTraffic, collapse: collapsePerOccurrence, why: uncollapsedRateIsTheSignal},
+	siteNotifyPoolSaturated: {class: classTraffic, collapse: collapsePerOccurrence, why: uncollapsedRateIsTheSignal},
 	// The host-initialized line is per `initialize` REQUEST: re-initialize is answered LOCALLY, so
 	// it creates no session and contacts no upstream — the exemption it used to carry was reasoned
 	// from a session's cost and did not apply.
-	siteHostInitialized: classTraffic,
+	siteHostInitialized: {class: classTraffic, collapse: collapsePerOccurrence, why: uncollapsedRateIsTheSignal},
 
 	// (2) FAILURE: an operator-facing account of something broken in transit. Metered because a
 	// peer or a dead upstream can drive them per frame, classed apart from traffic so that flood
-	// cannot take the last token from a class it does not belong to.
-	siteUpstreamlessForward:      classFailure,
-	siteUpstreamlessNotification: classFailure,
-	siteUpstreamError:            classFailure,
-	siteInitiatorUnanswerable:    classFailure,
-	siteUpstreamNotifyFailed:     classFailure,
-	siteUpstreamPostFailed:       classFailure,
+	// cannot take the last token from a class it does not belong to. All SIX meet the windowed
+	// sites' criterion — a dead upstream drives every one of them per frame, the unanswerable
+	// initiator included — and all six are deliberately reported per occurrence anyway; see
+	// uncollapsedNamesTheFailingCall, which is the whole of that judgment.
+	siteUpstreamlessForward:      {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
+	siteUpstreamlessNotification: {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
+	siteUpstreamError:            {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
+	siteInitiatorUnanswerable:    {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
+	siteUpstreamNotifyFailed:     {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
+	siteUpstreamPostFailed:       {class: classFailure, collapse: collapsePerOccurrence, why: uncollapsedNamesTheFailingCall},
 
 	// (3) OBLIGATION: a security obligation that did not hold. Still metered — an upstream returning
 	// a redaction-failing response per call drives one per frame — but never from the same bucket as
 	// the generic errors that same upstream can flood beside them. The two INFRASTRUCTURE-driven
-	// ones are additionally COLLAPSED at their source (see collapsedNotices), so the bucket they
-	// charge is not the bucket a persistent backend fault empties.
-	siteRedactionFault:         classObligation,
-	siteDeclassifyCommit:       classObligation,
-	siteDeclassifyDoubleCommit: classObligation,
-	siteReceiptInconsistent:    classObligation,
+	// ones are additionally COLLAPSED at their source, so the bucket they charge is not the bucket a
+	// persistent backend fault empties.
+	siteRedactionFault: {class: classObligation, collapse: collapsePerOccurrence,
+		why: "the line the class split and the site floor both exist to keep legible; each occurrence names the call whose redaction failed, so a window would hide every call after the first — the loss both of those mechanisms are built to prevent"},
+	siteDeclassifyCommit: {class: classObligation, collapse: collapseWindowed,
+		why: collapsedOccurrencesAreOneFinding + ": a downed flow store fails every approved declassification's commit, so the finding is 'the flow store is down' rather than one line per clear"},
+	siteDeclassifyDoubleCommit: {class: classObligation, collapse: collapsePerOccurrence,
+		why: "a proxy wiring fault nothing in the call graph reaches and no peer can drive, so there is no flood to collapse — and folding it into the store fault's window beside it would report it nowhere for as long as that store stayed down"},
+	siteReceiptInconsistent: {class: classObligation, collapse: collapseWindowed,
+		why: collapsedOccurrencesAreOneFinding + ": a stale effect.ref pin makes every receipt on the route inconsistent, so the finding is the pin; the per-call evidence stays on the tape, which is where a per-receipt reader should be looking"},
 }
 
-// collapseDeclaration is what a COLLAPSED site declares: why one line per interval is the whole of
-// what an operator needs from this fault, which is the judgment the collapse rests on. A site whose
-// occurrences are individually informative — different subjects, different causes — must not be
-// here, because what a reader loses is every occurrence after the first in the window.
-type collapseDeclaration struct {
-	why string
+// collapsedNoticeSites is the windowed subset as a stable slice, DERIVED from the declarations so a
+// site cannot be declared collapsed and hold no slot. Sorted for a deterministic build.
+var collapsedNoticeSites = windowedNoticeSites()
+
+func windowedNoticeSites() []noticeSite {
+	out := make([]noticeSite, 0, len(meteredNotices))
+	for site, decl := range meteredNotices {
+		if decl.collapse == collapseWindowed {
+			out = append(out, site)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
-// collapsedNotices declares which diagnostic sites are reported at most once per
-// noticeCollapseInterval per SOURCE, rather than once per occurrence.
-//
-// Only the two obligation failures a merely broken deployment drives at the request rate. A flow
-// store that is down fails every approved declassification's commit, and a stale effect.ref pin
-// makes every receipt inconsistent — no adversary involved in either — so both emptied the class
-// bucket that keeps `SECURITY: redaction failed` legible. Collapsing at the SOURCE means those
-// occurrences spend no token at all, which frees that bucket rather than sharing one the flood has
-// already emptied.
+// noticeCollapseInterval is how often a windowed site reports again: one line per site per
+// interval per SOURCE, with every occurrence in between folded into the class bucket's tally.
 //
 // A RE-ARMING interval, not an episode a success reopens. An episode was the first design and its
 // reopen condition is the part that does not survive contact with the scope available: the state
@@ -241,16 +336,8 @@ type collapseDeclaration struct {
 // the class bucket's tally and their SUBJECTS (the tool, the target) are not recorded anywhere on
 // stderr. The tape is unaffected — every one of these lines has a record beside it — so this is a
 // legibility trade, taken because the alternative is a bucket a broken deployment keeps empty.
-var collapsedNotices = map[noticeSite]collapseDeclaration{
-	siteDeclassifyCommit:    {why: "a downed flow store fails every approved declassification's commit, so the finding is 'the flow store is down' rather than one line per clear; an operator acts on it once"},
-	siteReceiptInconsistent: {why: "a stale effect.ref pin makes every receipt on the route inconsistent, so the finding is the pin; the per-call evidence is on the tape, which is where a per-receipt reader should be looking"},
-}
-
-// collapsedNoticeSites is the collapsed subset as a stable slice, DERIVED from the declarations so
-// a site cannot be declared collapsed and hold no slot. Sorted for a deterministic build.
-var collapsedNoticeSites = slices.Sorted(maps.Keys(collapsedNotices))
-
-// noticeCollapseInterval is how often a collapsed site reports again. A minute for the reason
+//
+// The interval itself is a minute. A minute for the reason
 // noticeReserveInterval is one: long enough that a persistent backend fault is a trickle rather than
 // a flood, short enough that a fault which returns after being fixed is not silent for an hour.
 //
@@ -441,9 +528,9 @@ const (
 
 // noticeLimiter is one leg's stderr-diagnostic admission control: a bucket per notice CLASS, and
 // optionally an aggregate parent it also charges. The same two-tier table the refusal RECORDS use,
-// one axis over — see tieredBuckets.
+// one axis over — see tieredBuckets, embedded by POINTER for the reason stated there.
 type noticeLimiter struct {
-	tieredBuckets[noticeClass]
+	*tieredBuckets[noticeClass]
 }
 
 // newNoticeLimiter builds a proxy's AGGREGATE notice table: one bucket per class, no parent, sized
@@ -478,7 +565,7 @@ func newNoticeLimiter(tenants int) *noticeLimiter {
 func newRouteNoticeLimiter(aggregate *noticeLimiter) *noticeLimiter {
 	var parent *tieredBuckets[noticeClass]
 	if aggregate != nil {
-		parent = &aggregate.tieredBuckets
+		parent = aggregate.tieredBuckets
 	}
 	return &noticeLimiter{tieredBuckets: newTieredBuckets(
 		perClassNoticeRatePerSec, perClassNoticeBurst, noticeReserveInterval, noticeClasses, parent,
@@ -519,10 +606,10 @@ var siteFloors = map[noticeSite]siteFloorDeclaration{
 	siteRedactionFault: {protected: true},
 	// The two that CAN be the flood. Each is a report that a backend the operator runs is broken,
 	// and a flood of either is itself the finding — which is what makes them the right side to be
-	// elided from, and why the answer is not a fourth budget. Both are now ALSO collapsed per
-	// episode at their source (episodeCollapsedSites), which removes the flood rather than
-	// surviving it; the declarations stay because collapsing is not a bound — a fault that flaps
-	// opens an episode per flap, and this is what answers for that one.
+	// elided from, and why the answer is not a fourth budget. Both are now ALSO collapsed at their
+	// source (collapseWindowed in meteredNotices), which removes the flood rather than surviving
+	// it; the declarations stay because collapsing is not a bound — the window is per source, so a
+	// gateway's routes each hold one, and this is what answers for their sum.
 	siteDeclassifyCommit:    {why: "a downed flow store drives it per frame, so it is the flood the protection is against rather than its victim; the first of them still arrives on the holder's class reserve"},
 	siteReceiptInconsistent: {why: "a stale effect.ref pin drives it per frame, same as the commit line beside it, and a flood of either is a finding about the deployment"},
 	// The double-commit line reports a fault in THIS proxy's wiring rather than in a backend, and
@@ -655,7 +742,7 @@ type noticeWriter struct {
 	// sites' own (see noticeReserve). Nil on a leg that is neither.
 	reserve *noticeReserve
 	// collapse is the SOURCE's per-site windows for the faults collapsed at their source (see
-	// collapsedNotices), consulted ABOVE the buckets rather than under them: an occurrence this
+	// collapseWindowed in meteredNotices), consulted ABOVE the buckets rather than under them: an occurrence this
 	// folds spends no token at all. Nil on a leg with no source to attribute one to.
 	collapse *keyReserve[noticeSite]
 }
@@ -760,11 +847,12 @@ func noticeTail(v bucketVerdict, class noticeClass) string {
 //
 // Where that ~110ns goes, since two of the three parts are decisions rather than givens: the
 // declaration lookup is ~11ns, the floor resolution two map probes at ~9ns, and an already-spent
-// slot's claim ~13ns (BenchmarkNoticeReserve_Claim), plus one more probe for the collapse window on
-// a leg that holds one — paid by all sites and spent on the two, which is the price of the collapse
-// being a per-site declaration rather than a class-shaped special case, and which
-// BenchmarkNotice_SuppressedPath now measures because its channel carries the windows the shipped
-// legs do. The lookup stays a map probe rather than an
+// slot's claim ~13ns (BenchmarkNoticeReserve_Claim). The collapse costs nothing here beyond a
+// comparison on a value already loaded: its disposition rides the declaration, so the window probe
+// is reached only by a site that DECLARES one. As a table of its own it was a second string-keyed
+// probe on every line — nil for thirteen of the fifteen sites — measured at ~7% of this admission
+// (BenchmarkNotice_SuppressedPath/admission), against the ~2ns the wider declaration value adds to
+// the one probe that remains. The lookup stays a map probe rather than an
 // integer site indexing a dense array because it is not the part that dominates, and the constants'
 // readable values are what the call-site walk resolves and what its failures name. None of the
 // three reads a clock: the admission's own sample is handed to the floor, which is what keeps a
@@ -788,13 +876,22 @@ func (n noticeWriter) admitNotice(site noticeSite) (noticeLine, bool) {
 	}
 	// A site with no declaration resolves to classUnclassified and charges the floor-rate fallback:
 	// the zero value means nobody has answered the question, and the safe answer to that is the
-	// bounded one. noticeReserve reserves no floor for that class for the same reason.
-	class := meteredNotices[site]
+	// bounded one. noticeReserve reserves no floor for that class for the same reason. It also
+	// resolves to collapseUndeclared, which collapses nothing — the bounded direction on that axis
+	// too, since a window an undeclared site fell into would mute a line nobody has classified.
+	decl := meteredNotices[site]
 	// The collapse window sits ABOVE the bucket, which is the whole point of collapsing at the
 	// source: a folded occurrence spends no token, so a persistent backend fault stops emptying the
 	// class bucket instead of sharing one it has already emptied. It is checked FIRST for the same
 	// reason the admission precedes the caller's arguments — the cheapest answer on the flood path
 	// the mechanism exists for.
+	//
+	// The disposition comes off the declaration just read rather than from a second string-keyed
+	// probe: the windows are keyed by site, so asking the map was asking every line to pay for a
+	// window two of fifteen sites hold. The slot lookup that remains is reached only by a site
+	// declaring one, and still returns nil on a leg with no SOURCE to attribute a window to (a
+	// pre-session HTTP arm), which is what keeps the disposition a property of the site and the
+	// window a property of the leg.
 	//
 	// The fold goes onto that bucket's own tally rather than a counter of its own, so the count
 	// reaches a reader through the tail every admitted line of the class already carries: one
@@ -808,15 +905,15 @@ func (n noticeWriter) admitNotice(site noticeSite) (noticeLine, bool) {
 	// class bucket is empty spends the window anyway, so that site's next report is delayed by at
 	// most one interval. Bounded, self-healing, and a line the bucket declined would not have been
 	// written under either shape.
-	if slot := n.collapse.forKey(site); slot != nil {
-		if !slot.claim(n.limits.clock(), noticeCollapseInterval) {
-			n.limits.bucket(class).suppress()
+	if decl.collapse == collapseWindowed {
+		if slot := n.collapse.forKey(site); slot != nil && !slot.claim(n.limits.clock(), noticeCollapseInterval) {
+			n.limits.bucket(decl.class).suppress()
 			return noticeLine{}, false
 		}
 	}
-	verdict := n.limits.admitWithFloor(class, n.reserve.forSite(site, class))
+	verdict := n.limits.admitWithFloor(decl.class, n.reserve.forSite(site, decl.class))
 	if !verdict.ok {
 		return noticeLine{}, false
 	}
-	return noticeLine{out: n.errOut(), tail: noticeTail(verdict, class)}, true
+	return noticeLine{out: n.errOut(), tail: noticeTail(verdict, decl.class)}, true
 }

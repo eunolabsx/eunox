@@ -56,13 +56,13 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 	// that assertion holds for any content whatsoever — including the entry it claims to catch.
 	// Naming a real class is the check, and it is what keeps an unclassified value from silently
 	// charging the floor-rate fallback.
-	for site, class := range meteredNotices {
-		assert.Greater(t, class, classUnclassified,
+	for site, decl := range meteredNotices {
+		assert.Greater(t, decl.class, classUnclassified,
 			"site %q is metered but names no notice class; an unclassified one charges the floor-rate fallback rather than its own share, and registering it as a bucket key would move every genuinely undeclared site off that fallback too", site)
 		// Through label()'s own default arm rather than a list of the class names, which would be
 		// the second hand-typed list this file's header argues against: every out-of-range value
 		// labels itself "unclassified", so one comparison covers both ways a class can be undeclared.
-		assert.NotEqual(t, classUnclassified.label(), class.label(),
+		assert.NotEqual(t, classUnclassified.label(), decl.class.label(),
 			"site %q names a class outside the declared set, so its lines would roll up under the label an unclassified line carries", site)
 	}
 	// Every site of a class one of whose members is PROTECTED has to answer which side it is on:
@@ -75,15 +75,15 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 		assert.Equal(t, decl.protected, decl.why == "",
 			"site %q must be protected, or declare WHY it is the one that may be elided — and never both", site)
 		if decl.protected {
-			protectedClasses[meteredNotices[site]] = true
+			protectedClasses[meteredNotices[site].class] = true
 		}
 	}
-	for site, class := range meteredNotices {
-		if !protectedClasses[class] {
+	for site, decl := range meteredNotices {
+		if !protectedClasses[decl.class] {
 			continue
 		}
 		assert.Contains(t, siteFloors, site,
-			"site %q shares class %q with a site that holds its own floor, so it must say whether it does too; undeclared means it is the one a class-mate's flood elides, which is a decision rather than an oversight", site, class.label())
+			"site %q shares class %q with a site that holds its own floor, so it must say whether it does too; undeclared means it is the one a class-mate's flood elides, which is a decision rather than an oversight", site, decl.class.label())
 	}
 
 	for fn, decl := range unmeteredNotices {

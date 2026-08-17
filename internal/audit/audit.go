@@ -170,7 +170,7 @@ const (
 )
 
 // auditChannelSize bounds the queue feeding the background drainer. When full,
-// records are dropped (counted by DroppedRecords) and the drainer emits an
+// records are dropped (counted by Health().Dropped) and the drainer emits an
 // in-chain AUDIT_RECORDS_DROPPED marker (see flushDropMarker) so the loss is
 // tamper-evident.
 const auditChannelSize = 4096
@@ -251,7 +251,7 @@ type Sink struct {
 	// records is the bounded channel of raw records awaiting the drainer.
 	records chan auditRecord
 
-	// dropped counts records discarded because records was full (see DroppedRecords).
+	// dropped counts records discarded because records was full (sampled by Health).
 	dropped atomic.Int64
 
 	// queuedBytes tracks the approximate heap held by records awaiting the drainer.
@@ -305,7 +305,7 @@ type Sink struct {
 	// drop, a write failure cannot be recorded in-chain (the target file is the
 	// thing failing), so it is surfaced out of band: this counter
 	// (eunox_audit_write_failures_total), a one-shot stderr warning, and a non-zero
-	// Close/exit. Atomic (read/written from any goroutine); exposed via WriteFailures.
+	// Close/exit. Atomic (read/written from any goroutine); sampled by Health.
 	writeFailures atomic.Int64
 
 	// rotationStallReason and retentionStallReason record why size-triggered rotation or
@@ -1635,7 +1635,7 @@ func (s *Sink) enqueue(rec auditRecord) string {
 		// drainer's terminal flushDropMarker, racily. A bucket recorded after that
 		// flush has already run is never read again, so per-method/target detail on
 		// this arm is best-effort; count only the aggregate (surfaced by Close's
-		// warning and DroppedRecords), which is not racy, without the queue-full
+		// warning and Health().Dropped), which is not racy, without the queue-full
 		// message, which would misattribute the cause.
 		s.dropped.Add(1)
 		return ""
@@ -2327,17 +2327,6 @@ func bareTargetName(tt capability.TargetType, identifier string) string {
 	return identifier
 }
 
-// DroppedRecords returns the number of records discarded because the write queue
-// was full. Expose as a metric to detect sustained disk pressure.
-//
-// One counter, one reading. A consumer that needs more than one fact about this sink — a counter
-// AND the verdict over it, or both counters together — takes Health() instead: composing these
-// getters is two readings of state that moves, which is how a body comes to carry a zero count
-// beside a degraded verdict.
-func (s *Sink) DroppedRecords() int64 {
-	return s.dropped.Load()
-}
-
 // setRotationStalled records why size-triggered rotation has stopped making progress (a
 // non-empty reason), or that it is healthy again (""), overwriting whatever was there —
 // the newest report always wins, so a transient fault (a directory briefly unreadable)
@@ -2397,16 +2386,6 @@ func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
 	return true, strings.Join(parts, "; ")
 }
 
-// WriteFailures returns the number of records that reached the drainer but could
-// not be durably written (full disk, EIO, a serialization error, or a file lost to
-// a failed rotation). Distinct from DroppedRecords: that is a "queue can't keep up"
-// signal on a healthy file, this is a "file is broken" signal. Expose as
-// eunox_audit_write_failures_total and alert on it. See DroppedRecords for why a consumer wanting
-// more than this one counter takes Health() rather than composing the getters.
-func (s *Sink) WriteFailures() int64 {
-	return s.writeFailures.Load()
-}
-
 // AuditDegraded reports whether the audit trail has lost coverage (a back-pressure
 // drop or a write failure). It is the runtime signal --require-audit=strict
 // consults to fail subsequent calls closed once a loss is observed. The signal is
@@ -2420,7 +2399,10 @@ func (s *Sink) WriteFailures() int64 {
 // that are non-zero ("dropped_count", "write_failure_count"), never prose, so the
 // structured audit field stays free of free-form text. A nil receiver reports
 // healthy (a strict proxy whose sink failed to open is refused at startup, so the
-// gate never sees one).
+// gate never sees one) — deliberately the OPPOSITE of what Health().Absent reports
+// for the same receiver, and the same carve-out one case further: readiness is
+// wider than enforcement, so "there is no trail" is a regression an operator must
+// see and never a reason to deny live traffic.
 func (s *Sink) AuditDegraded() (degraded bool, reason string, detail map[string]interface{}) {
 	if s == nil {
 		return false, "", nil
@@ -3088,7 +3070,7 @@ func (s *Sink) Close() error {
 		// Record() already in its read-locked critical section: a racing producer
 		// does dropped.Add(1) under the read lock, and the write lock waits for those
 		// to complete, so an unsynchronized Load cannot miss one. Drops arriving after
-		// this barrier are post-shutdown and remain visible via DroppedRecords().
+		// this barrier are post-shutdown and remain visible via Health().Dropped.
 		s.mu.Lock()
 		droppedAtClose := s.dropped.Load()
 		s.mu.Unlock()

@@ -140,8 +140,8 @@ func TestNoticeCollapse_IsPerSource(t *testing.T) {
 }
 
 // TestNoticeCollapse_OnlyDeclaredSitesCollapse is the control on both sides of the declaration: a
-// site outside collapsedNotices writes every line its bucket allows, and a channel with no windows
-// at all (a leg with no source, e.g. a pre-session HTTP arm) collapses nothing.
+// site declared collapsePerOccurrence writes every line its bucket allows, and a channel with no
+// windows at all (a leg with no source, e.g. a pre-session HTTP arm) collapses nothing.
 func TestNoticeCollapse_OnlyDeclaredSitesCollapse(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
@@ -155,6 +155,14 @@ func TestNoticeCollapse_OnlyDeclaredSitesCollapse(t *testing.T) {
 	assert.Positive(t, driveChannel(ch, siteDeclassifyDoubleCommit, 5),
 		"an open store-fault window must not swallow a wiring fault beside it")
 
+	// The failure class is the recorded decision, not an omission: a dead upstream drives these at
+	// the request rate — the windowed sites' own criterion — and they are still reported per
+	// occurrence, because each names the call that failed and the error behind it. Pinned here so
+	// the trade is visible if someone later folds them in.
+	require.Equal(t, collapsePerOccurrence, meteredNotices[siteUpstreamError].collapse)
+	assert.Equal(t, perClassNoticeBurst, driveChannel(ch, siteUpstreamError, 50),
+		"a failure line writes what its bucket allows; collapsing it would leave 'an upstream is failing' and remove which calls failed")
+
 	var ungated strings.Builder
 	route := newRouteNoticeLimiter(nil)
 	frozen(route, at)
@@ -163,20 +171,51 @@ func TestNoticeCollapse_OnlyDeclaredSitesCollapse(t *testing.T) {
 		"a leg with no source to attribute a window to writes what its bucket allows, exactly as before")
 }
 
-// TestNoticeCollapse_DeclarationsAreWellFormed is the table guard: a collapsed site must charge a
-// bucket (there is otherwise no flood to collapse and no tally to fold into) and must say why one
-// line per window is the whole of what an operator needs from it — which is the judgment the
-// collapse rests on, and the one thing that cannot be inferred from the code.
-func TestNoticeCollapse_DeclarationsAreWellFormed(t *testing.T) {
+// TestNoticeCollapse_EverySiteAnswersTheQuestion is the completeness gate, and it is the whole
+// reason the disposition moved into the site's own declaration.
+//
+// The collapse shipped as an opt-in list, which asked nothing of the sites outside it: a site was
+// collapsed by being written down and uncollapsed by being forgotten, and those two are
+// indistinguishable to a reader. Every classFailure site meets the collapsed sites' OWN stated
+// criterion — a fault a merely broken deployment drives at the request rate from a conforming peer
+// — and all six sat outside the list with no judgment recorded either way. This is the treatment siteFloors already had: every
+// metered site says which side it is on and why, so the next one added answers the question instead
+// of inheriting an answer.
+// sharedCollapseReasons maps each reason written for a whole CLASS to the class it argues from.
+// A per-site reason is absent here and answers only to the non-emptiness check: it is the sites
+// that share an argument that can silently inherit the wrong one.
+var sharedCollapseReasons = map[string]noticeClass{
+	uncollapsedRateIsTheSignal:     classTraffic,
+	uncollapsedNamesTheFailingCall: classFailure,
+}
+
+func TestNoticeCollapse_EverySiteAnswersTheQuestion(t *testing.T) {
 	t.Parallel()
-	for site, decl := range collapsedNotices {
-		assert.Contains(t, meteredNotices, site,
-			"site %q collapses but charges no bucket", site)
+	windowed := 0
+	for site, decl := range meteredNotices {
+		assert.NotEqual(t, collapseUndeclared, decl.collapse,
+			"site %q declares no collapse disposition; collapsing loses every occurrence after the first in the window and not collapsing leaves a per-frame fault charging its class bucket, so neither may be inherited", site)
+		// Required on BOTH sides, unlike an exemption reason: each answer costs something the code
+		// cannot state for itself, and the flood the collapse was built for still exists on the
+		// class whose sites answered "no" by omission.
 		assert.NotEmpty(t, decl.why,
-			"site %q must state why one line per window is enough; what a reader loses is every occurrence after the first, so an undeclared collapse is an unexamined one", site)
+			"site %q states no reason for its collapse disposition; what a reader loses either way is not inferable from the call site, which is what makes this a declaration rather than a switch", site)
+		// Non-emptiness alone cannot catch the mistake the field exists for: eleven of the fifteen
+		// rows carry one of two SHARED reasons, so a site pasted with its neighbour's — a failure
+		// line claiming to be "an account of one message the peer sent" — is a declaration
+		// contradicting its own class, with every assertion still green. A shared reason is
+		// therefore bound to the class whose argument it makes, the way siteFloors' reason is
+		// bound to its own disposition.
+		if class, shared := sharedCollapseReasons[decl.why]; shared {
+			assert.Equal(t, class, decl.class,
+				"site %q carries the reason written for class %q while declaring class %q; the two shared reasons argue from what a line of their own class CARRIES, so neither is true of the other", site, class.label(), decl.class.label())
+		}
+		if decl.collapse == collapseWindowed {
+			windowed++
+		}
 	}
-	assert.Len(t, collapsedNoticeSites, len(collapsedNotices),
-		"the derived slice and the declarations must describe the same set")
+	assert.Len(t, collapsedNoticeSites, windowed,
+		"the derived slice and the declarations must describe the same set; a site declared collapsed with no slot silently reports every occurrence")
 }
 
 // TestNoticeCollapse_WindowIsClaimedOnceUnderConcurrency pins the one-atomic-operation shape.

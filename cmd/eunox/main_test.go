@@ -3662,10 +3662,12 @@ func TestAuditSink_CloseFlushesQueuedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading audit log: %v", err)
 	}
-	lines := strings.Count(string(data), "\n")
-	if lines < n-int(sink.DroppedRecords()) {
-		t.Errorf("regression: expected at least %d lines (minus dropped=%d), got %d",
-			n, sink.DroppedRecords(), lines)
+	// ONE sample, used by both the predicate and the message it prints: two would be the composed
+	// reading the sample type exists to prevent, so a failure could report a count the assertion
+	// did not test.
+	lines, dropped := strings.Count(string(data), "\n"), sink.Health().Dropped
+	if lines < n-int(dropped) {
+		t.Errorf("regression: expected at least %d lines (minus dropped=%d), got %d", n, dropped, lines)
 	}
 }
 
@@ -3689,7 +3691,7 @@ func TestAuditSink_RotateKeepsWriting(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if dropped := sink.DroppedRecords(); dropped != 0 {
+	if dropped := sink.Health().Dropped; dropped != 0 {
 		t.Errorf("regression: %d records dropped (s.f was nil after rotation)", dropped)
 	}
 
