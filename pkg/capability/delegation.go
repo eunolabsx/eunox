@@ -437,16 +437,16 @@ func (g *DelegationGrant) Validate() error {
 	// taxonomy this route happens not to police. Neither list can widen — Labels FORCE
 	// taint onto the delegate's calls, AllowLabels only intersects the sink's allow-set —
 	// so an undeclared namespace over-blocks in both.
-	for _, l := range g.Labels {
-		if err := ValidateFlowLabel(l); err != nil {
-			return fmt.Errorf("delegation grant for %q: 'labels': %w", g.Subject, err)
-		}
+	// Count-bounded per hop for MaxExternalFlowLabels' reason, and per hop rather than per
+	// chain because MaxDelegationDepth already bounds the hops: this chain is
+	// attacker-influenced input the decision path walks once per enforced call, which is the
+	// same argument that cap rests on.
+	if err := checkExternalFlowLabels(g.Labels, fmt.Sprintf("delegation grant for %q: 'labels'", g.Subject)); err != nil {
+		return err
 	}
 	if g.AllowLabels != nil {
-		for _, l := range *g.AllowLabels {
-			if err := ValidateFlowLabel(l); err != nil {
-				return fmt.Errorf("delegation grant for %q: 'allowLabels': %w", g.Subject, err)
-			}
+		if err := checkExternalFlowLabels(*g.AllowLabels, fmt.Sprintf("delegation grant for %q: 'allowLabels'", g.Subject)); err != nil {
+			return err
 		}
 	}
 	for _, f := range g.RedactFields {

@@ -197,17 +197,21 @@ func unionLabels(present, declared []string) []string {
 	return capability.NormalizeDeclaredLabels(all)
 }
 
-// peekSessionLabels reports the session's accumulated flow-label set (vocabulary order) for
+// peekSessionLabels reports the session's accumulated flow-label set (canonical order) for
 // the audit record's carried_labels and handleFlowLabel's threaded snapshot. Fails closed on
 // a store error rather than dropping it silently, so a source-only constraint can't
 // under-report the accumulated set on the signed tape.
 //
-// A stored label OUTSIDE the closed vocabulary is an ERROR, not something to reorder past:
+// A stored label belonging to NEITHER axis is an ERROR, not something to reorder past:
 // dropping it would silently suppress a denial the sink rule ("present and not allowed =>
-// deny") depends on — e.g. two proxy versions with different vocabularies sharing one Redis
-// flow store. Every sibling path already fails closed on an unknown label; this makes the read
-// agree with them, over-denying during a mixed-version rollout rather than enforcing against a
-// blind spot.
+// deny") depends on — e.g. two proxy versions with different NATIVE vocabularies sharing one
+// Redis flow store, where the older build wrote a bare token this one cannot place. Every
+// sibling path already fails closed on such a label; this makes the read agree with them,
+// over-denying during a mixed-version rollout rather than enforcing against a blind spot.
+//
+// An imported label needs no such agreement: the axis has no closed value set to disagree
+// about, and the subset check treats it as an opaque set member, so any build that can parse
+// it enforces it identically.
 func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceRequest) ([]string, error) {
 	if e.skipFlow || e.flowStore == nil || req.SessionID == "" {
 		// skipFlow short-circuits here too, mirroring evaluateMatched's own gate, so the

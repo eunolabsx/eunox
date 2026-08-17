@@ -60,14 +60,14 @@ func ParseContextManifest(meta map[string]json.RawMessage) (*ContextManifest, er
 	if err := json.Unmarshal(raw, &cm); err != nil {
 		return nil, fmt.Errorf("_meta %s: %w", MetaKeyContextManifest, err)
 	}
-	for _, l := range cm.Labels {
-		// Both axes: a cooperating client may attribute an imported sensitivity class its
-		// own inputs carried. Structural validation only — this boundary holds no manifest,
-		// and a declaration union-only ADDS taint, so an undeclared namespace here can
-		// produce extra denials and never an allowance.
-		if err := ValidateFlowLabel(l); err != nil {
-			return nil, fmt.Errorf("_meta %s: %w", MetaKeyContextManifest, err)
-		}
+	// Both axes: a cooperating client may attribute an imported sensitivity class its own
+	// inputs carried. Structural validation only — this boundary holds no manifest, and a
+	// declaration union-only ADDS taint, so an undeclared namespace here can produce extra
+	// denials and never an allowance. COUNT-bounded because this is the one label list an
+	// untrusted peer writes directly, and the decision path sorts and walks it once per
+	// enforced call; see MaxExternalFlowLabels for the measured cost of leaving it open.
+	if err := checkExternalFlowLabels(cm.Labels, "_meta "+MetaKeyContextManifest); err != nil {
+		return nil, err
 	}
 	if len(cm.Labels) == 0 {
 		// A block that declares nothing tightens nothing. Returning nil rather than an

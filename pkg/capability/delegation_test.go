@@ -306,3 +306,33 @@ func TestDelegationChain_AllowLabelCapIntersectsAcrossHops(t *testing.T) {
 	require.True(t, capped)
 	assert.Equal(t, []string{capability.FlowLabelPublic}, allowed)
 }
+
+// TestDelegationGrant_LabelCountIsBounded pins the per-hop label bound. MaxDelegationDepth
+// bounds the hops on the argument that the chain is attacker-influenced input the decision
+// path walks once per enforced call; once a label may be an operator-open "namespace:value"
+// rather than one of five closed classes, each hop's own label lists need the same treatment
+// or the per-call work is unbounded again one level down. See MaxExternalFlowLabels.
+func TestDelegationGrant_LabelCountIsBounded(t *testing.T) {
+	labels := func(n int) []string {
+		out := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, fmt.Sprintf("purview:c-%d", i))
+		}
+		return out
+	}
+
+	atBound := capability.DelegationGrant{Subject: "agent", Labels: labels(capability.MaxExternalFlowLabels)}
+	assert.NoError(t, atBound.Validate(), "a hop exactly at the bound is admitted")
+
+	over := capability.DelegationGrant{Subject: "agent", Labels: labels(capability.MaxExternalFlowLabels + 1)}
+	err := over.Validate()
+	require.Error(t, err, "one over the bound is refused at the token boundary")
+	assert.Contains(t, err.Error(), "more than the maximum")
+
+	// The allow-cap takes the same bound: it is intersected per call the same way.
+	allowCap := labels(capability.MaxExternalFlowLabels + 1)
+	overCap := capability.DelegationGrant{Subject: "agent", AllowLabels: &allowCap}
+	err = overCap.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "allowLabels")
+}

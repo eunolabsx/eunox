@@ -178,6 +178,53 @@ func ValidateFlowLabel(label string) error {
 	return nil
 }
 
+// MaxExternalFlowLabels bounds how many labels ONE externally-supplied list may carry — a
+// client's attribution block, a delegation hop's forced labels or allow-cap, a declassify
+// approval.
+//
+// The native axis bounded these implicitly at five: the vocabulary was closed, so a list of
+// 300,000 labels was rejected at its first entry. Opening the imported axis removed that
+// ceiling — every entry is now well-formed — and these lists are normalized (deduped and
+// SORTED), unioned into the carried set, re-normalized, and walked, all on the decision path,
+// once per enforced call.
+//
+// Unbounded, that is a CPU amplifier a peer drives from one `_meta` block: measured on the
+// flowLabel sink, a decision costs ~20us at five declared labels, 8ms at ten thousand, and
+// ~440ms at three hundred thousand — the last still fitting a single request under the 4 MiB
+// body cap. Roughly 22,000x for bytes the caller chooses, which is a denial-of-service lever
+// rather than untidiness, and it is why the bound is a COUNT rather than a byte budget.
+//
+// It is NOT what keeps the audit record legible: a deny's details are already bounded whole
+// by enforcement.BoundDenialDetails (8 KiB, at the denyResponse funnel), which elides the
+// oversized array and leaves the `flow` discriminator and the record intact — verified at
+// 300,000 labels, ~4 KB of details. Elision of a long blocked-label list is that bound's
+// designed behavior at any count and is not this constant's business.
+//
+// Sixty-four is far above any real attribution (a call's inputs carry a handful of classes
+// across one or two taxonomies) and low enough to keep the decision in the tens of
+// microseconds.
+//
+// It bounds the EXTERNAL surfaces only. A manifest's own labelOutput/flowLabel lists are
+// operator-authored config, bounded like the rest of the manifest by maxManifestFileBytes,
+// and the accumulated store set is bounded by what those lists can write.
+const MaxExternalFlowLabels = 64
+
+// checkExternalFlowLabels validates one externally-supplied label list: bounded in COUNT,
+// every entry usable on one of the two axes. The single checker for every such boundary, so
+// a surface added later cannot pick up the per-label rule while missing the count bound —
+// which is exactly the pairing the closed vocabulary used to provide for free.
+func checkExternalFlowLabels(labels []string, what string) error {
+	if len(labels) > MaxExternalFlowLabels {
+		return fmt.Errorf("%s declares %d flow labels, more than the maximum of %d", what, len(labels), MaxExternalFlowLabels)
+	}
+	for _, l := range labels {
+		if err := ValidateFlowLabel(l); err != nil {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+	}
+	return nil
+}
+
 // ValidateFlowLabelNamespace reports whether ns is a well-formed imported-label namespace:
 // lowercase, alphanumeric-with-hyphens, leading letter, bounded.
 //

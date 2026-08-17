@@ -53,6 +53,17 @@ Section conventions:
   Native-only policies are unaffected — `labels_out` and `carried_labels` render
   byte-identically to before. See
   [capability-manifest-guide.md §5b](./docs/capability-manifest-guide.md).
+
+  Externally-supplied label lists — a client's `_meta` attribution block, a delegation hop's
+  forced labels or allow-cap, a declassify approval — are bounded at **64 labels**
+  (`capability.MaxExternalFlowLabels`). The closed native vocabulary bounded these implicitly
+  at five by rejecting the sixth distinct entry; with an open value space every entry is
+  well-formed, and the decision path sorts, unions and walks the list once per enforced call.
+  Measured on the `flowLabel` sink, an unbounded list took a decision from ~20us at five
+  labels to ~440ms at three hundred thousand — a caller-chosen ~22,000x, well inside one
+  request under the body cap. Denial records were never at risk: `BoundDenialDetails` already
+  caps a deny's whole details map at 8 KiB, so the `flow` discriminator and the record survive
+  regardless.
 - **`auditHealthy` on `/healthz` and `eunox_audit_healthy` on `/metrics`** — the audit
   subsystem's own verdict as one series, reported by the sink through the shared health seam
   rather than reassembled by the endpoint from the three counters beside it. `0` means the trail

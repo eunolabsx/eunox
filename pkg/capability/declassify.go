@@ -217,12 +217,12 @@ func (a *DeclassifyApproval) Validate() error {
 	if len(a.Labels) == 0 {
 		return fmt.Errorf("declassify approval must name at least one label in 'labels'")
 	}
-	for _, l := range a.Labels {
-		// Structural only, for ValidateFlowLabel's stated reason: an approval REMOVES an
-		// allowance, so a namespace this manifest never declared clears nothing.
-		if err := ValidateFlowLabel(l); err != nil {
-			return fmt.Errorf("declassify approval 'labels': %w", err)
-		}
+	// Structural only, for ValidateFlowLabel's stated reason: an approval REMOVES an
+	// allowance, so a namespace this manifest never declared clears nothing. Count-bounded
+	// with the other claim-borne lists, so one boundary rule covers every externally-supplied
+	// label list rather than each surface deciding for itself.
+	if err := checkExternalFlowLabels(a.Labels, "declassify approval 'labels'"); err != nil {
+		return err
 	}
 	target := strings.TrimSpace(a.Target)
 	if target == "" {

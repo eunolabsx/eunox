@@ -78,16 +78,22 @@ type auditRecord struct {
 	ConditionType   string          `json:"condition_type,omitempty"`
 	Details         json.RawMessage `json:"details,omitempty"` // marshaled once at record time (marshalAndBoundDetails); writeRecord embeds it verbatim rather than re-marshaling the map
 	Obligations     []string        `json:"obligations,omitempty"`
-	// LabelsOut and CarriedLabels are the information-flow-control fields: the native
-	// flow labels this call's output asserted into the session (labelsOut, from its
+	// LabelsOut and CarriedLabels are the information-flow-control fields: the flow
+	// labels this call's output asserted into the session (labelsOut, from its
 	// labelOutput directives) and the session's accumulated label set observed at
 	// decision time (carriedLabels), so a source->sink flow reconstructs from the tape
-	// alone. Both are drawn from the closed native vocabulary — never free-form, never
-	// IdP- or argument-sourced — so unlike Obligations they need no length bound.
+	// alone. Both span the two-axis vocabulary — a native provenance class, or an
+	// imported "namespace:value" sensitivity class — so they are no longer members of a
+	// five-element set; they still need no length bound of their own, for the reason that
+	// always carried the claim: every entry is written by the POLICY's own labelOutput
+	// directives, never free-form and never IdP- or argument-sourced, so the manifest
+	// bounds them. The externally-supplied lists that do NOT have that guarantee are
+	// bounded at their own boundary (capability.MaxExternalFlowLabels) and reach a
+	// denial's Details, not these fields.
 	// Present only on flow-relevant decisions; omitted otherwise.
 	LabelsOut     []string `json:"labels_out,omitempty"`
 	CarriedLabels []string `json:"carried_labels,omitempty"`
-	// LabelsCleared and Approver are the declassification fields: the native flow labels
+	// LabelsCleared and Approver are the declassification fields: the flow labels
 	// an APPROVED declassify directive removed from the session on this call, and the
 	// human who approved it. They appear together or not at all — the proxy performs no
 	// declassification without a named approver — and only on an allow, since an
@@ -95,9 +101,10 @@ type auditRecord struct {
 	//
 	// Their presence is what makes a declassification a distinguishable event on the
 	// tape rather than an ordinary allow that quietly dropped a label: no other record
-	// shape carries labels_cleared. LabelsCleared is drawn from the closed native
-	// vocabulary and needs no length bound; Approver is IdP-supplied free text and is
-	// bounded like the other envelope strings.
+	// shape carries labels_cleared. LabelsCleared spans the same two-axis vocabulary as
+	// LabelsOut and needs no length bound for the same reason — a clear can only name
+	// labels the manifest's own declassify directive listed, so the policy bounds it;
+	// Approver is IdP-supplied free text and is bounded like the other envelope strings.
 	// ApprovalID is the control plane's own identifier for the approval, echoed so a
 	// tape entry joins back to the workflow that produced it. It travels with the other
 	// two rather than in Details because a declassification's evidence must be one
@@ -1822,8 +1829,9 @@ const auditRecordEnvelopeEstimate = 512
 // identity claims, the route provenance triple, and the denial taxonomy an external
 // PolicyEvaluator supplies can together retain far more than a flat 512 saw. Under a
 // flood of such records the queue would hold many times the byte budget it is sized to
-// bound — the shed-instead-of-OOM guarantee the budget exists for. Labels are drawn
-// from the closed native vocabulary and are counted for completeness, not bounds.
+// bound — the shed-instead-of-OOM guarantee the budget exists for. Labels are written
+// by the policy's own directives (see LabelsOut) rather than by a caller, so they are
+// counted for completeness, not bounds.
 //
 // Fields writeRecord stamps (Seq, PrevHMAC, HMAC) must stay inside the flat
 // auditRecordEnvelopeEstimate and out of this walk; the stored charge makes that a
