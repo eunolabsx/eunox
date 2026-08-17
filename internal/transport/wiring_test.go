@@ -122,6 +122,12 @@ func interfaceFieldPaths(ty reflect.Type, path string) map[string][]int {
 	out := map[string][]int{}
 	for i := range ty.NumField() {
 		field := ty.Field(i)
+		// Unexported stops the walk here for the same reason it stops the guard: reflect will
+		// neither read such a field nor let this test SET one, and a field no caller can set is not
+		// wiring a caller handed over.
+		if !field.IsExported() {
+			continue
+		}
 		switch field.Type.Kind() {
 		case reflect.Struct:
 			for nested, index := range interfaceFieldPaths(field.Type, path+"."+field.Name) {
@@ -162,25 +168,38 @@ func TestWiring_GuardDescendsIntoNestedOptions(t *testing.T) {
 		"and an absent nested field is still absent")
 }
 
-// unreadableOptions holds the one shape the walk cannot answer for: a WIRED interface it may not
-// read. An unexported field left absent needs no reading and is not this refusal's subject.
-type unreadableOptions struct{ hidden io.Writer }
+// unreadableOptions holds the two shapes reflect will not let the walk read: an unexported
+// interface field, and an EXPORTED one nested under an unexported block — the read-only flag
+// propagates, so both are unreadable and neither is settable by an outside caller.
+type unreadableOptions struct {
+	hidden io.Writer
+	block  struct{ Stderr io.Writer }
+}
 
-// TestWiring_UnexportedInterfaceIsRefusedRatherThanSkipped is what makes the completeness claim
-// true rather than approximate.
+// TestWiring_UnreadableFieldsAreNotTheGuardsSubject pins the skip and, more importantly, pins that
+// it is a skip rather than a refusal.
 //
-// reflect can see an unexported field but not hand its value over, so the walk has two options and
-// only one of them is honest: skipping it is the silent "unchecked" the reflective shape exists to
-// remove, arriving through a nested block whose author had no reason to think about this file.
-func TestWiring_UnexportedInterfaceIsRefusedRatherThanSkipped(t *testing.T) {
+// Refusing was the first shape, on the argument that it kept the completeness claim exact. It does
+// not survive the propagation rule: an EXPORTED interface inside an unexported block is unreadable
+// too, so the refusal fired on valid wiring while telling its author to export a field that
+// already was — and a shared nested options block is the very refactor the descent was added to
+// support. The honest line is the one the guard draws everywhere else: what it refuses is wiring a
+// CALLER handed over, and a field an outside caller cannot set is not that.
+func TestWiring_UnreadableFieldsAreNotTheGuardsSubject(t *testing.T) {
 	t.Parallel()
-	assert.PanicsWithValue(t,
-		"eunox: unreadableOptions.hidden is a wired unexported interface field, which requireUsableOptions cannot read — "+
-			"it would inherit \"unchecked\" silently. Export it, or keep the subsystem out of the options struct.",
-		func() { requireUsableOptions(unreadableOptions{hidden: io.Discard}) },
-		"an unreadable field must be refused by name, not skipped")
-	assert.NotPanics(t, func() { requireUsableOptions(unreadableOptions{}) },
-		"an ABSENT unexported field is not the subject: there is nothing to read and nothing to refuse")
+	var deadWriter *strings.Builder
+
+	opts := unreadableOptions{hidden: deadWriter}
+	opts.block.Stderr = deadWriter
+	require.False(t, reflect.ValueOf(opts).Field(1).Field(0).CanInterface(),
+		"the premise: an exported field under an unexported one is read-only too, which is what makes refusing here fire on valid wiring")
+	assert.NotPanics(t, func() { requireUsableOptions(opts) },
+		"neither unreadable field is caller-supplied wiring, so neither is this guard's subject")
+
+	// And the residual that skip leaves, asserted rather than described: such a field is answered
+	// where this package hands it over instead (requireUsable), the way a route's PDP is.
+	assert.Panics(t, func() { requireUsable("X.hidden", deadWriter) },
+		"the seam that hands an in-package subsystem over is what covers what the walk cannot read")
 }
 
 // TestWiring_TheGuardStopsAtAPointer pins the OTHER side of the descent, which is a decision rather

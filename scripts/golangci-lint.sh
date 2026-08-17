@@ -22,12 +22,11 @@
 # version is EXACTLY the pin and it was built with a Go at least as new as go.mod targets,
 # and otherwise installs that exact version itself.
 #
-# The install pins GOTOOLCHAIN to go.mod's Go version as a FLOOR ("go1.26.6+auto")
-# deliberately. golangci-lint's own module names an older toolchain, and `go install` honors
-# THAT -- downloading an older Go and producing a correctly versioned binary that still
-# refuses this repo, even on a machine whose own Go is new enough. The "+auto" form is what
-# makes that a floor rather than a pin: a contributor already on a newer Go keeps it and
-# downloads nothing, which is why this is not the unconditional force it replaced.
+# The install forces GOTOOLCHAIN to go.mod's Go version when the LOCAL toolchain is older.
+# `go install pkg@version` ignores the current module, so it starts from the local toolchain
+# and then honors golangci-lint's OWN toolchain line -- producing a correctly versioned
+# binary that still refuses this repo. Forcing builds the pinned release with a Go new
+# enough to lint us. Which toolchain is "local" is the subtle part; see the install below.
 #
 # Usage: GOLANGCI_LINT_VERSION=vX.Y.Z ./scripts/golangci-lint.sh [run-args...]
 #
@@ -141,18 +140,31 @@ for cand in "${GOLANGCI_LINT:-}" "$(command -v golangci-lint 2>/dev/null || true
 done
 
 if [ -z "$BIN" ]; then
-	# A FLOOR rather than a pin, and never "auto". Auto honors the toolchain line in
-	# golangci-lint's OWN module, which names an older Go than this repo targets -- so a
-	# contributor on a perfectly new toolchain got a binary built with the older one and the
-	# usable() check below rejected the script's own install, ending in the "linter
-	# unavailable" state this file exists to remove. Pinning outright is the other wrong
-	# answer: it downgrades a contributor already on a newer Go into downloading a toolchain
-	# they do not need, which simply fails behind GOPROXY=off, an air gap, or a proxy that
-	# does not mirror golang.org/toolchain. "<name>+auto" is neither: at least this version,
-	# whatever is already there if it is newer.
-	toolchain="$(toolchain_name "$TARGET_GO")+auto"
-	echo "Installing golangci-lint $WANT (the version CI pins), built with $toolchain or newer..."
-	if ! GOTOOLCHAIN="$toolchain" $GO install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$WANT"; then
+	# Force the toolchain only when the local one is OLDER than this repo targets. Forcing
+	# unconditionally downgrades a contributor already on a newer Go into downloading an
+	# older toolchain they do not need -- which simply fails behind GOPROXY=off, an air gap,
+	# or a proxy that does not mirror golang.org/toolchain. GOTOOLCHAIN=<name>+auto is not a
+	# way out of that either: the "+auto" form makes <name> the DEFAULT toolchain and only
+	# upgrades from the target module's own requirements, so it downloads <name> on a newer
+	# machine exactly as the bare pin does.
+	#
+	# GOTOOLCHAIN=local for the reading, which is the whole correction. `go env GOVERSION`
+	# from the repo root reports the toolchain go.mod already selected -- by construction at
+	# least TARGET_GO -- so this test was always true and the force never fired. The install
+	# below is what the answer is FOR, and `go install pkg@version` ignores the current
+	# module: it starts from the local toolchain, which here was two minors older, and took
+	# golangci-lint's own toolchain line from there. usable() then rejected the script's own
+	# install, which is the "linter unavailable" state this file exists to remove, reached by
+	# the file itself.
+	local_go=$(GOTOOLCHAIN=local $GO env GOVERSION)
+	toolchain=""
+	if ! version_ge "$(lang_version "$local_go")" "$(lang_version "$TARGET_GO")"; then
+		toolchain=$(toolchain_name "$TARGET_GO")
+		echo "Installing golangci-lint $WANT (the version CI pins), built with $toolchain..."
+	else
+		echo "Installing golangci-lint $WANT (the version CI pins), built with $local_go..."
+	fi
+	if ! GOTOOLCHAIN="${toolchain:-auto}" $GO install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$WANT"; then
 		echo "" >&2
 		echo "golangci-lint.sh: could not install golangci-lint $WANT." >&2
 		echo "Install it manually (https://golangci-lint.run/docs/welcome/install/) and re-run," >&2

@@ -31,9 +31,11 @@
 // still does not look through is a POINTER, MAP or SLICE — deliberately for the first, since a
 // pointer field is a subsystem the caller built and its internals are its own package's business.
 // HTTPGatewayOptions.Routes is the live map, and it is closed at its own construction site:
-// NewHTTPProxyGateway refuses a nil route value AND the one interface a route holds. That leaves no
-// interface in either options graph outside a check, and the limit itself is asserted by
-// wiring_test.go rather than resting on this paragraph.
+// NewHTTPProxyGateway refuses a nil route value AND the one interface a route holds. Nor does the
+// walk read a field reachable only through an unexported name, which is a different kind of gap:
+// such a field is not caller-supplied wiring at all, so it is skipped rather than refused. That
+// leaves no CALLER-SETTABLE interface in either options graph outside a check, and both limits are
+// asserted by wiring_test.go rather than resting on this paragraph.
 
 package transport
 
@@ -95,10 +97,11 @@ func requireUsableOptions(opts any) {
 // whose own package deliberately holds a typed nil somewhere. The caller's wiring is what this
 // refuses; what a subsystem does inside itself is not this guard's business.
 //
-// What that leaves is the map/slice/pointer residual, which is ASSERTED by the test rather than
-// only described here: HTTPGatewayOptions.Routes is the live one, and it is closed at its own
-// construction site (NewHTTPProxyGateway checks each route's value AND its PDP, the one interface
-// held inside one).
+// What that leaves is the map/slice/pointer residual, and the fields reflect will not let it READ
+// (anything reachable only through an unexported name). Both are ASSERTED by the test rather than
+// only described here. HTTPGatewayOptions.Routes is the live map, closed at its own construction
+// site (NewHTTPProxyGateway checks each route's value AND its PDP, the one interface held inside
+// one), and the unreadable set is by definition not caller-supplied wiring.
 func requireUsableFields(path string, v reflect.Value) {
 	ty := v.Type()
 	for i := range ty.NumField() {
@@ -114,14 +117,19 @@ func requireUsableFields(path string, v reflect.Value) {
 				continue
 			}
 			if !field.CanInterface() {
-				// Refused rather than skipped, so the completeness claim stays TRUE: an unexported
-				// interface field is one this walk cannot read, and skipping it is precisely the
-				// silent "unchecked" the reflective shape exists to remove. Unreachable from either
-				// options struct today; it is the nested-block refactor that could introduce one.
-				panic(fmt.Sprintf(
-					"eunox: %s is a wired unexported interface field, which requireUsableOptions cannot read — "+
-						"it would inherit \"unchecked\" silently. Export it, or keep the subsystem out of the options struct.",
-					name))
+				// Not caller-supplied wiring, which is this guard's whole subject. reflect's
+				// read-only flag marks exactly the fields unreachable through exported names, and
+				// a field an outside caller cannot even SET is not one they can hand a typed nil
+				// to; this package's own wiring is answered where it is made instead, through
+				// requireUsable at the seam that hands the value over (a route's PDP is the live
+				// example).
+				//
+				// REFUSING here was the first shape and is wrong in the direction that matters:
+				// the read-only flag PROPAGATES, so an EXPORTED interface inside an unexported
+				// block is unreadable too — the refusal would fire on valid wiring while naming a
+				// field that is already exported, and the nested block is precisely the refactor
+				// the descent above exists to support.
+				continue
 			}
 			if !capability.IsTypedNil(field.Interface()) {
 				continue

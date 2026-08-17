@@ -113,13 +113,13 @@ type serverReqTracker struct {
 	ids map[string]trackedServerRequest
 	// nextSeq stamps each tracked entry's arrival order, for the oldest-first eviction.
 	nextSeq uint64
-	// evictions tallies every displacement, for an operator reading the count rather than the
-	// line. Guarded by mu.
-	evictions uint64
 	// warned is the noticeOnce bound below, taken through the package's one latch primitive: only
-	// the first displacement is logged, so a sustained flood doesn't spam stderr. Held apart from
-	// the tally because a count and a latch are different facts — deriving the latch from
-	// `evictions == 1` made the line's bound a property of an unrelated counter's arithmetic.
+	// the first displacement is logged, so a sustained flood doesn't spam stderr.
+	//
+	// It replaced an `evictions` tally compared against 1, and that tally is GONE rather than kept
+	// beside it: once the latch answered, nothing in production read the count — the per
+	// displacement fact an operator acts on is the catDisplaced audit record trackServerRequest
+	// writes, which carries the method and the leg a counter here never could.
 	warned noticeLatch
 }
 
@@ -157,15 +157,12 @@ func (t *serverReqTracker) track(msg mcp.RPCMsg, errOut io.Writer) (trackedServe
 	t.nextSeq++
 	entry := trackedServerRequest{id: msg.ID, method: method, seq: t.nextSeq}
 	t.ids, displaced, found = trackServerReqID(t.ids, key, entry)
-	if found {
-		t.evictions++
-	}
 	t.mu.Unlock()
 	// Claimed outside the lock: the latch carries its own CAS, and the write it gates is a syscall
 	// that must not happen under a mutex take() needs to route every host reply back.
 	if found && t.warned.admitOnce() {
 		_, _ = fmt.Fprintf(resolvedErrOut(errOut),
-			"[eunox] WARNING: server-initiated request tracker reached its %d-entry cap; the longest-waiting in-flight request is displaced to make room (its initiator is answered with an error, since nothing could route a reply to it afterwards). Further displacements are counted but not individually logged.\n",
+			"[eunox] WARNING: server-initiated request tracker reached its %d-entry cap; the longest-waiting in-flight request is displaced to make room (its initiator is answered with an error, since nothing could route a reply to it afterwards). Further displacements are recorded on the audit tape rather than logged individually.\n",
 			maxTrackedServerReqs)
 	}
 	return displaced, found
