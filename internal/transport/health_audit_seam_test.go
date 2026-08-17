@@ -56,9 +56,21 @@ func TestHealthSnapshot_AuditVerdictComesFromTheSink(t *testing.T) {
 	t.Run("a healthy sink touches nothing", func(t *testing.T) {
 		t.Parallel()
 		snap := healthSnapshot{Status: statusOK, AuditConfigured: true, AuditHealthy: true}
-		snap.fold(audit.Health{}, &snap.AuditHealthy)
+		snap.fold(audit.Health{Present: true}, &snap.AuditHealthy)
 		assert.True(t, snap.AuditHealthy)
 		assert.Equal(t, statusOK, snap.Status)
+	})
+
+	// The seam's fail-safe rule, asserted rather than described: a sample that reaches fold before
+	// being filled in must degrade. It is the property the two shipped samples used to disagree on
+	// — capability.KeyFetchHealth{} reported an outage while audit.Health{} was a healthy sink —
+	// and what the next optional subsystem folded here inherits.
+	t.Run("a zero sample degrades", func(t *testing.T) {
+		t.Parallel()
+		snap := healthSnapshot{Status: statusOK, AuditConfigured: true, AuditHealthy: true}
+		snap.fold(audit.Health{}, &snap.AuditHealthy)
+		assert.False(t, snap.AuditHealthy, "an unfilled sample must never report green")
+		assert.Equal(t, statusDegraded, snap.Status)
 	})
 }
 
@@ -66,7 +78,7 @@ func TestHealthSnapshot_AuditVerdictComesFromTheSink(t *testing.T) {
 //
 // It used to be the transport's own: a `p.sink == nil` arm set both fields by hand while the sink's
 // documented verdict for a nil receiver said healthy — two answers to one question, disagreeing.
-// The sample carries it now (audit.Health.Absent), so this file holds no audit predicate at all,
+// The sample carries it now (audit.Health.Present), so this file holds no audit predicate at all,
 // and the answer is DEGRADED: a trail that does not exist is not one an incident responder can read.
 func TestHealthSnapshot_AbsentSinkIsDegraded(t *testing.T) {
 	t.Parallel()
@@ -132,10 +144,10 @@ func TestHealthFold_WiredButNilSubsystemDegrades(t *testing.T) {
 	// And a struct-valued sample is never nil, so its verdict must still be read — the failure a
 	// kind-blind check would introduce while fixing the pointer one.
 	healthy := healthSnapshot{Status: statusOK, AuditHealthy: true}
-	healthy.fold(audit.Health{}, &healthy.AuditHealthy)
+	healthy.fold(audit.Health{Present: true}, &healthy.AuditHealthy)
 	assert.True(t, healthy.AuditHealthy)
 	degraded := healthSnapshot{Status: statusOK, AuditHealthy: true}
-	degraded.fold(audit.Health{Dropped: 1}, &degraded.AuditHealthy)
+	degraded.fold(audit.Health{Present: true, Dropped: 1}, &degraded.AuditHealthy)
 	assert.False(t, degraded.AuditHealthy)
 }
 

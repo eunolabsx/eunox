@@ -178,9 +178,10 @@ func TestNoticeCollapse_OnlyDeclaredSitesCollapse(t *testing.T) {
 // collapsed by being written down and uncollapsed by being forgotten, and those two are
 // indistinguishable to a reader. Every classFailure site meets the collapsed sites' OWN stated
 // criterion — a fault a merely broken deployment drives at the request rate from a conforming peer
-// — and all six sat outside the list with no judgment recorded either way. This is the treatment siteFloors already had: every
-// metered site says which side it is on and why, so the next one added answers the question instead
-// of inheriting an answer.
+// — and all six sat outside the list with no judgment recorded either way. The site floor beside it
+// had the same treatment applied for the same reason (see floorDisposition): every metered site says
+// which side it is on and why, so the next one added answers the question instead of inheriting an
+// answer.
 // sharedCollapseReasons maps each reason written for a whole CLASS to the class it argues from.
 // A per-site reason is absent here and answers only to the non-emptiness check: it is the sites
 // that share an argument that can silently inherit the wrong one.
@@ -198,15 +199,15 @@ func TestNoticeCollapse_EverySiteAnswersTheQuestion(t *testing.T) {
 		// Required on BOTH sides, unlike an exemption reason: each answer costs something the code
 		// cannot state for itself, and the flood the collapse was built for still exists on the
 		// class whose sites answered "no" by omission.
-		assert.NotEmpty(t, decl.why,
+		assert.NotEmpty(t, decl.collapseWhy,
 			"site %q states no reason for its collapse disposition; what a reader loses either way is not inferable from the call site, which is what makes this a declaration rather than a switch", site)
 		// Non-emptiness alone cannot catch the mistake the field exists for: eleven of the fifteen
 		// rows carry one of two SHARED reasons, so a site pasted with its neighbour's — a failure
 		// line claiming to be "an account of one message the peer sent" — is a declaration
 		// contradicting its own class, with every assertion still green. A shared reason is
-		// therefore bound to the class whose argument it makes, the way siteFloors' reason is
-		// bound to its own disposition.
-		if class, shared := sharedCollapseReasons[decl.why]; shared {
+		// therefore bound to the class whose argument it makes, the way the floor reason beside it
+		// is bound to its own disposition.
+		if class, shared := sharedCollapseReasons[decl.collapseWhy]; shared {
 			assert.Equal(t, class, decl.class,
 				"site %q carries the reason written for class %q while declaring class %q; the two shared reasons argue from what a line of their own class CARRIES, so neither is true of the other", site, class.label(), decl.class.label())
 		}

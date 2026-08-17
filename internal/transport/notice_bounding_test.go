@@ -65,26 +65,39 @@ func TestNoticeBounding_EveryDeclarationIsWellFormed(t *testing.T) {
 		assert.NotEqual(t, classUnclassified.label(), decl.class.label(),
 			"site %q names a class outside the declared set, so its lines would roll up under the label an unclassified line carries", site)
 	}
-	// Every site of a class one of whose members is PROTECTED has to answer which side it is on:
-	// an unanswered one lands on the flooding side by default, which is exactly the elision the
-	// site floor exists to close, arriving silently with the next obligation site somebody adds.
-	protectedClasses := map[noticeClass]bool{}
-	for site, decl := range siteFloors {
-		assert.Contains(t, meteredNotices, site,
-			"site %q declares a floor disposition but charges no bucket; an unmetered line has no tier to be floored under", site)
-		assert.Equal(t, decl.protected, decl.why == "",
-			"site %q must be protected, or declare WHY it is the one that may be elided — and never both", site)
-		if decl.protected {
-			protectedClasses[meteredNotices[site].class] = true
+	// EVERY metered site answers the floor question, not only those of a class that already holds a
+	// protected member. That conditional gate was the last opt-in list here: a class with no
+	// protected member asked nothing of its sites, so ten of the fifteen recorded no judgment and
+	// the first protection added to such a class would have moved every class-mate onto the
+	// flooding side silently.
+	protected, protectedClasses := 0, map[noticeClass]bool{}
+	for _, decl := range meteredNotices {
+		if decl.floor == floorSiteProtected {
+			protected++
+			protectedClasses[decl.class] = true
 		}
 	}
 	for site, decl := range meteredNotices {
-		if !protectedClasses[decl.class] {
-			continue
+		assert.NotEqual(t, floorUndeclared, decl.floor,
+			"site %q declares no floor disposition; undeclared means it is the one a class-mate's flood elides, which is a decision rather than an oversight", site)
+		// The MIRROR of the collapse reason's rule, and the reason the two are separate fields: here
+		// the reason IS the elision, so it is required exactly where the site is the one elided.
+		assert.Equal(t, decl.floor == floorElidable, decl.floorWhy != "",
+			"site %q must either be the one a class-mate's flood may elide and say WHY, or state no floor reason at all", site)
+		// Checked against the table's own content, which is what makes floorClassUnprotected a
+		// decision rather than a way of declining to answer: protecting a first site in some class
+		// fails the build for every one of its class-mates instead of silently demoting them.
+		switch decl.floor {
+		case floorElidable:
+			assert.True(t, protectedClasses[decl.class],
+				"site %q declares itself elidable in class %q, which holds no protected member — there is nothing for it to be elided in favour of", site, decl.class.label())
+		case floorClassUnprotected:
+			assert.False(t, protectedClasses[decl.class],
+				"site %q claims class %q holds no protected member, but one of its class-mates reserves a site floor; this site must say which side of that protection it is on", site, decl.class.label())
 		}
-		assert.Contains(t, siteFloors, site,
-			"site %q shares class %q with a site that holds its own floor, so it must say whether it does too; undeclared means it is the one a class-mate's flood elides, which is a decision rather than an oversight", site, decl.class.label())
 	}
+	assert.Len(t, floorProtectedSites, protected,
+		"the derived reserve and the declarations must describe the same set; a site declared protected with no slot falls back to its class floor, which a class-mate's flood is exactly what spends")
 
 	for fn, decl := range unmeteredNotices {
 		switch decl.bound {
@@ -199,6 +212,55 @@ func TestNoticeBounding_EverySiteIsDeclared(t *testing.T) {
 	}
 	for fn := range unmeteredNotices {
 		assert.True(t, seenFuncs[fn], "diagnostic site %q is declared but writes no line; a declaration nothing reaches is an answer to a question nobody asks", fn)
+	}
+}
+
+// noticeLatchEntryPoint is the one-shot half of the mechanism, named distinctively so this walk can
+// see it: noticeLatch.admitOnce, which every noticeOnce site takes its line through.
+const noticeLatchEntryPoint = "admitOnce"
+
+// TestNoticeBounding_EveryOneShotSiteUsesTheLatch is what turns noticeOnce from a LINT into a
+// mechanism, in both directions.
+//
+// It shipped as a declaration recording that a site was one-shot while each site implemented that
+// itself — an atomic.Bool at one, a counter compared against 1 at the other two — which is exactly
+// the shape the metered half's collapse had before it became a disposition admitNotice reads. Three
+// implementations of one idea is three places for the re-arm semantics to differ, and a declaration
+// nothing enforces is a claim about code somewhere else.
+//
+// Two-way on purpose. "Declared one-shot but hand-rolls its own latch" is the drift that already
+// happened; "latches without declaring it" is the same drift starting again from the other end,
+// where the walk's table stops describing the package's diagnostic surface.
+func TestNoticeBounding_EveryOneShotSiteUsesTheLatch(t *testing.T) {
+	t.Parallel()
+	latching := map[noticeFunc]bool{}
+	for _, src := range packageSources(t) {
+		for _, decl := range src.file.Decls {
+			fnDecl, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fnDecl.Body == nil {
+				continue
+			}
+			qualified := qualifiedFuncName(fnDecl)
+			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
+				call, isCall := n.(*ast.CallExpr)
+				if isCall && callName(call) == noticeLatchEntryPoint {
+					latching[qualified] = true
+				}
+				return true
+			})
+		}
+	}
+	require.NotEmpty(t, latching, "no %s call was found in any non-test file; this guard would pass vacuously", noticeLatchEntryPoint)
+	for fn := range latching {
+		assert.Equal(t, noticeOnce, unmeteredNotices[fn].bound,
+			"%s claims the one-shot latch but is not declared noticeOnce; the declaration is how a reader learns what bounds this line, and the mechanism is how it is actually bounded — neither stands in for the other", fn)
+	}
+	for fn, decl := range unmeteredNotices {
+		if decl.bound != noticeOnce {
+			continue
+		}
+		assert.True(t, latching[fn],
+			"%s is declared noticeOnce but reaches no %s; a hand-rolled latch is a fourth implementation of one idea, and the declaration would be describing it rather than enforcing it", fn, noticeLatchEntryPoint)
 	}
 }
 

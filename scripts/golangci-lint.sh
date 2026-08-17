@@ -13,7 +13,7 @@
 # repo targets does not lint anything at all -- it refuses to load the config:
 #
 #   Error: can't load config: the Go language version (go1.25) used to build golangci-lint
-#   is lower than the targeted Go version (1.26.5)
+#   is lower than the targeted Go version (1.26.6)
 #
 # That reads as "the linter is unavailable here", so a contributor falls back to `go vet`
 # (clean) and pushes, and CI then fails on findings no local run could surface. The version
@@ -22,10 +22,11 @@
 # version is EXACTLY the pin and it was built with a Go at least as new as go.mod targets,
 # and otherwise installs that exact version itself.
 #
-# The install forces GOTOOLCHAIN to go.mod's Go version deliberately. golangci-lint's own
-# go.mod may name an older toolchain, and `go install` honors THAT -- producing a correctly
-# versioned binary that still refuses this repo. Forcing the toolchain builds the pinned
-# release with a new enough Go to lint us.
+# The install forces GOTOOLCHAIN to go.mod's Go version when the LOCAL toolchain is older.
+# `go install pkg@version` ignores the current module, so it starts from the local toolchain
+# and then honors golangci-lint's OWN toolchain line -- producing a correctly versioned
+# binary that still refuses this repo. Forcing builds the pinned release with a Go new
+# enough to lint us. Which toolchain is "local" is the subtle part; see the install below.
 #
 # Usage: GOLANGCI_LINT_VERSION=vX.Y.Z ./scripts/golangci-lint.sh [run-args...]
 #
@@ -53,7 +54,7 @@ if [ -z "$TARGET_GO" ]; then
 	exit 2
 fi
 
-# The linter compares LANGUAGE versions (go1.26 vs 1.26.5 is fine), so both sides are
+# The linter compares LANGUAGE versions (go1.26 vs 1.26.6 is fine), so both sides are
 # truncated to major.minor before comparing.
 lang_version() { printf '%s\n' "${1#go}" | cut -d. -f1,2; }
 
@@ -78,7 +79,7 @@ version_ge() {
 }
 
 # toolchain_name VERSION — go.mod's directive as a resolvable GOTOOLCHAIN name. Releases are
-# always three-component (go1.26.5), while the directive may legally be two (go 1.27), and
+# always three-component (go1.26.6), while the directive may legally be two (go 1.27), and
 # GOTOOLCHAIN=go1.27 resolves to nothing — reported as "could not install golangci-lint",
 # which points the reader at the linter rather than at the toolchain name.
 toolchain_name() {
@@ -91,7 +92,7 @@ toolchain_name() {
 
 # binary_facts BIN — "<version> <goversion>" from ONE `version` invocation, or nothing.
 #
-# The long form carries both facts ("golangci-lint has version 2.12.2 built with go1.26.5
+# The long form carries both facts ("golangci-lint has version 2.12.2 built with go1.26.6
 # from ..."), so probing them separately spawns the binary twice per candidate for no gain,
 # and made the failure message compose to "built with gounknown" when the file was absent.
 # `version --short` is the fallback for an output shape that stops matching, so a future
@@ -141,9 +142,21 @@ done
 if [ -z "$BIN" ]; then
 	# Force the toolchain only when the local one is OLDER than this repo targets. Forcing
 	# unconditionally downgrades a contributor already on a newer Go into downloading an
-	# older toolchain they do not need — which simply fails behind GOPROXY=off, an air gap,
-	# or a proxy that does not mirror golang.org/toolchain.
-	local_go=$($GO env GOVERSION)
+	# older toolchain they do not need -- which simply fails behind GOPROXY=off, an air gap,
+	# or a proxy that does not mirror golang.org/toolchain. GOTOOLCHAIN=<name>+auto is not a
+	# way out of that either: the "+auto" form makes <name> the DEFAULT toolchain and only
+	# upgrades from the target module's own requirements, so it downloads <name> on a newer
+	# machine exactly as the bare pin does.
+	#
+	# GOTOOLCHAIN=local for the reading, which is the whole correction. `go env GOVERSION`
+	# from the repo root reports the toolchain go.mod already selected -- by construction at
+	# least TARGET_GO -- so this test was always true and the force never fired. The install
+	# below is what the answer is FOR, and `go install pkg@version` ignores the current
+	# module: it starts from the local toolchain, which here was two minors older, and took
+	# golangci-lint's own toolchain line from there. usable() then rejected the script's own
+	# install, which is the "linter unavailable" state this file exists to remove, reached by
+	# the file itself.
+	local_go=$(GOTOOLCHAIN=local $GO env GOVERSION)
 	toolchain=""
 	if ! version_ge "$(lang_version "$local_go")" "$(lang_version "$TARGET_GO")"; then
 		toolchain=$(toolchain_name "$TARGET_GO")

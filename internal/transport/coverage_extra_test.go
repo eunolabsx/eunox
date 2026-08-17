@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -799,24 +798,26 @@ func TestReapIdleSessions_TicksThenStopsOnCancel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// warnStrictAuditOnce (forward.go) — the one-shot stderr warning. The nil-guard
-// branch (test callers) is covered elsewhere; here we cover the real
-// CompareAndSwap path: it fires once and not again.
+// warnStrictAuditOnce (forward.go) — the one-shot stderr warning, now taken
+// through the package's shared latch rather than an atomic.Bool of its own.
+// The nil-latch branch (test callers) is covered elsewhere; here we cover the
+// claim itself: it fires once and not again.
 // ---------------------------------------------------------------------------
 
 func TestWarnStrictAuditOnce_FiresOnce(t *testing.T) {
 	t.Parallel()
-	var warned atomic.Bool
-	// First call swaps false->true.
-	warnStrictAuditOnce(io.Discard, &warned, "test reason")
-	if !warned.Load() {
-		t.Fatal("warnStrictAuditOnce must set the warned flag on first call")
+	var out strings.Builder
+	var warned noticeLatch
+	warnStrictAuditOnce(&out, &warned, "test reason")
+	first := out.Len()
+	if first == 0 {
+		t.Fatal("warnStrictAuditOnce must write its line on the first call")
 	}
-	// Second call is a no-op (CompareAndSwap fails); the flag stays set and nothing
-	// panics.
-	warnStrictAuditOnce(io.Discard, &warned, "test reason")
-	if !warned.Load() {
-		t.Fatal("warned flag must remain set after the second call")
+	// The line is what the latch bounds, so the line is what the assertion reads: a
+	// flag left set is the old spelling's internal state, not this site's contract.
+	warnStrictAuditOnce(&out, &warned, "test reason")
+	if out.Len() != first {
+		t.Fatal("the second call must write nothing: the latch is spent")
 	}
 }
 

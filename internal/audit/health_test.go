@@ -83,14 +83,14 @@ func TestHealth_AbsenceIsPartOfTheSample(t *testing.T) {
 	t.Parallel()
 	var s *Sink
 	h := s.Health()
-	assert.True(t, h.Absent, "a nil sink is a reading taken of nothing, and says so")
-	assert.NotEqual(t, Health{}, h,
-		"and it is not the ZERO value: a zero Health is a healthy sink with nothing wrong, which is the opposite fact")
+	assert.False(t, h.Present, "a nil sink is a reading taken of nothing, and says so")
+	assert.Equal(t, Health{}, h,
+		"and it IS the zero value: the polarity is chosen so a sample that reached a consumer before being filled in reports a degradation, which is the direction the health seam requires of every sample satisfying it")
 	require.Error(t, h.HealthStatus())
 	assert.Contains(t, h.HealthStatus().Error(), "no audit sink")
 
 	// The counters stay zero because nothing was measured, not because nothing was lost. A
-	// consumer rendering them alongside the verdict needs Absent to tell those apart — which is
+	// consumer rendering them alongside the verdict needs Present to tell those apart — which is
 	// why it is a field rather than a nil sample.
 	assert.Zero(t, h.Dropped+h.WriteFailures)
 	assert.False(t, h.MaintenanceStalled)

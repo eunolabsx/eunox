@@ -76,7 +76,7 @@ type StdioProxy struct {
 	requireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
 	// strictAuditWarned makes the strict-gate stderr warning one-shot (the gate is
 	// sticky); the durable per-call signal is the AUDIT_UNAVAILABLE record.
-	strictAuditWarned atomic.Bool
+	strictAuditWarned noticeLatch
 	driftCheck        drift.CheckFunc
 
 	// startupTimeout bounds the inline initialize + drift work in runBoundedStartup;

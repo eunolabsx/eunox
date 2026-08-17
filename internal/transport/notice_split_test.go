@@ -50,7 +50,19 @@ func driveSession(w *strings.Builder, l *noticeLimiter, reserve *noticeReserve, 
 // claimAt spends the reserve a line from site (of class) would fall back on, as of at. The
 // assertion shape the floor's own tests want: "was it still armed" is only answerable by taking it.
 func claimAt(r *noticeReserve, site noticeSite, class noticeClass, at time.Time) bool {
-	return r.forSite(site, class).claim(at, noticeReserveInterval)
+	return floorFor(r, site, class).claim(at, noticeReserveInterval)
+}
+
+// floorFor resolves the floor a line from site (of class) falls back on, the way production does:
+// forSite reads the floor disposition off the site's own DECLARATION rather than probing a table,
+// so a test naming a site by hand has to hand over the same declaration production would — one
+// synthesized here would be asserting on the test's answer instead of the table's.
+//
+// The class is the caller's rather than the declaration's, because two of the probes are for sites
+// that have no declaration at all (the undeclared-site fallback, an out-of-range class), which is
+// exactly what a zero declaration answers for.
+func floorFor(r *noticeReserve, site noticeSite, class noticeClass) *reserveSlot {
+	return r.forSite(site, noticeSiteDeclaration{class: class, floor: meteredNotices[site].floor})
 }
 
 // TestNoticeSplit_RefusalFloodCannotStarveAnUpstreamFailure pins the class split.
@@ -467,9 +479,9 @@ func TestNoticeReserve_UnclassifiedAndUndeclaredKeysGetNoFloor(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
 	session := newNoticeReserve(noticeClasses)
-	assert.Nil(t, session.forSite("undeclared-probe", classUnclassified),
+	assert.Nil(t, floorFor(session, "undeclared-probe", classUnclassified),
 		"an undeclared site's class must not carry a floor")
-	assert.Nil(t, session.forSite("undeclared-probe", noticeClass(99)),
+	assert.Nil(t, floorFor(session, "undeclared-probe", noticeClass(99)),
 		"nor may a class outside the declared set")
 	assert.True(t, claimAt(session, siteUpstreamError, classFailure, at), "and a real class is unaffected")
 
@@ -627,15 +639,15 @@ func TestNoticeReserve_ProtectedSiteFallsBackToNoClassFloor(t *testing.T) {
 	for _, site := range floorProtectedSites {
 		decl, metered := meteredNotices[site]
 		require.True(t, metered, "a protected site must be metered; an unmetered one charges no bucket to be floored under")
-		assert.NotSame(t, session.forSite(site, decl.class), session.byClass.forKey(decl.class),
+		assert.NotSame(t, session.forSite(site, decl), session.byClass.forKey(decl.class),
 			"site %q must resolve to its own slot rather than the class slot it is protected from", site)
 		// And its class-mates resolve to the shared class slot, which is what makes the protection
 		// mean something: a flood of theirs spends that one and leaves this site's alone.
 		for mate, mateDecl := range meteredNotices {
-			if mate == site || mateDecl.class != decl.class || siteFloors[mate].protected {
+			if mate == site || mateDecl.class != decl.class || mateDecl.floor == floorSiteProtected {
 				continue
 			}
-			assert.Same(t, session.byClass.forKey(decl.class), session.forSite(mate, mateDecl.class),
+			assert.Same(t, session.byClass.forKey(decl.class), session.forSite(mate, mateDecl),
 				"site %q is declared elidable, so it must share its holder's class reserve rather than hold one of its own", mate)
 		}
 	}
@@ -648,7 +660,7 @@ func TestNoticeReserve_SiteAxisIsPresentWithoutAHolder(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
 	reserve := newNoticeReserve(nil)
-	assert.Nil(t, reserve.forSite(siteUpstreamError, classFailure),
+	assert.Nil(t, floorFor(reserve, siteUpstreamError, classFailure),
 		"a proxy is not a holder among peers, so it gets no class floor")
 	assert.True(t, claimAt(reserve, siteRedactionFault, classObligation, at),
 		"the site axis is not about holders at all")
@@ -800,7 +812,7 @@ func eagerNoticef(n noticeWriter, site noticeSite, format string, args ...interf
 func BenchmarkNoticeReserve_Claim(b *testing.B) {
 	now := time.Unix(1_760_000_000, 0)
 	spent := newNoticeReserve(noticeClasses)
-	slot := spent.forSite(siteUpstreamError, classFailure)
+	slot := floorFor(spent, siteUpstreamError, classFailure)
 	require.True(b, slot.claim(now, noticeReserveInterval))
 	b.Run("spent", func(b *testing.B) {
 		b.ReportAllocs()
@@ -815,12 +827,13 @@ func BenchmarkNoticeReserve_Claim(b *testing.B) {
 			}
 		})
 	})
-	// The resolution beside it: two map probes on the flood path, which is what picking a floor by
-	// site rather than by class alone costs.
+	// The resolution beside it, on the protected site — the one case that probes the site table at
+	// all, and therefore the worst case for picking a floor by site rather than by class alone. The
+	// other fourteen sites reach the class probe directly off their declaration.
 	b.Run("resolve", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = spent.forSite(siteRedactionFault, classObligation)
+			_ = floorFor(spent, siteRedactionFault, classObligation)
 		}
 	})
 }

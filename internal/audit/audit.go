@@ -2399,7 +2399,7 @@ func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
 // that are non-zero ("dropped_count", "write_failure_count"), never prose, so the
 // structured audit field stays free of free-form text. A nil receiver reports
 // healthy (a strict proxy whose sink failed to open is refused at startup, so the
-// gate never sees one) — deliberately the OPPOSITE of what Health().Absent reports
+// gate never sees one) — deliberately the OPPOSITE of what Health() reports
 // for the same receiver, and the same carve-out one case further: readiness is
 // wider than enforcement, so "there is no trail" is a regression an operator must
 // see and never a reason to deny live traffic.

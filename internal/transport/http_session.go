@@ -143,6 +143,11 @@ type httpSession struct {
 	// tools/list_changed etc. is observable rather than silent. Atomic: no extra locking under
 	// broadcast's notifMu.
 	droppedNotifs atomic.Uint64
+	// notifDropWarned is the noticeOnce bound on the line beside that counter, through the
+	// package's one latch primitive. A separate field rather than `droppedNotifs.Add(1) == 1`,
+	// because a tally and a latch answer different questions and folding them made the diagnostic's
+	// bound a property of a counter that exists for an operator to read.
+	notifDropWarned noticeLatch
 
 	closeOnce sync.Once
 	// done signals the upstream's lifecycle end (distinct from sessCtx's teardown-cancellation):
@@ -1453,7 +1458,8 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 		default:
 			// Slow subscriber: channel full, notification dropped. Track and warn on the
 			// first drop so a lost tools/list_changed is observable, not silent.
-			if s.droppedNotifs.Add(1) == 1 {
+			s.droppedNotifs.Add(1)
+			if s.notifDropWarned.admitOnce() {
 				_, _ = fmt.Fprintf(s.errOut(),
 					"[eunox] WARNING: HTTP session %s dropped a notification (method=%q) to a slow SSE subscriber; further drops counted but not individually logged.\n",
 					s.id, msg.Method)

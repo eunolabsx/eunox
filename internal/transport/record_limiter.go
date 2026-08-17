@@ -27,7 +27,6 @@
 package transport
 
 import (
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -211,18 +210,12 @@ var refusalDeclarations = map[refusalCategory]refusalDeclaration{
 // refusalCategories is the METERED subset, sorted so the derived bucket table and every test
 // reading it are deterministic. A category declared exempt is deliberately absent: it charges no
 // bucket, and counting it would divide the aggregate budget by a share nothing spends.
-var refusalCategories = meteredRefusalCategories()
-
-func meteredRefusalCategories() []refusalCategory {
-	out := make([]refusalCategory, 0, len(refusalDeclarations))
-	for cat, decl := range refusalDeclarations {
-		if decl.metering == meteringMetered {
-			out = append(out, cat)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
+//
+// Through the package's one filter-and-sort derivation (see declarations.go) rather than a body of
+// its own: this was the fourth copy of it, and each copy sizes a table whose silently-missing key
+// looks like working code.
+var refusalCategories = sortedKeysWhere(refusalDeclarations,
+	func(d refusalDeclaration) bool { return d.metering == meteringMetered })
 
 // perBucketFloor keeps every bucket in a divided table alive even where plain division would
 // floor its share to 0 (possible past ~20 categories at today's rate) — a 0-rate bucket

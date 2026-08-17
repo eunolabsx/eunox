@@ -48,20 +48,43 @@ func (w *ConditionWrapper) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// IsTypedNil reports whether v is a non-nil interface wrapping a nil pointer — the
-// "typed nil" that slips past a plain v == nil check yet panics on any method call whose
-// receiver it dereferences (a value-receiver ConditionType/DirectiveType on a decoded
-// condition/directive). It is the one such predicate for the manifest, engine and config
-// layers, so the validation and marshaling guards that reject a typed nil before such a call
-// share one definition. (internal/redisutil answers the same question for a go-redis client
-// separately, because it depends on go-redis and the stdlib alone — importing this package for
-// two lines would put the whole manifest vocabulary in a kill-switch-only consumer's binary.)
+// IsTypedNil reports whether v is a non-nil interface wrapping a nil value — the "typed nil"
+// that slips past a plain v == nil check yet panics on any method call whose receiver it
+// dereferences (a value-receiver ConditionType/DirectiveType on a decoded condition/directive).
+// It is the one such predicate for the manifest, engine, config and transport layers, so the
+// validation, marshaling and wiring guards that reject a typed nil before such a call share one
+// definition. (internal/redisutil answers the same question for a go-redis client separately,
+// because it depends on go-redis and the stdlib alone — importing this package for two lines
+// would put the whole manifest vocabulary in a kill-switch-only consumer's binary.)
 // A plain-nil interface returns false (reflect.ValueOf(nil) has Kind Invalid),
-// so callers pair it with an explicit v == nil check where a plain nil is also rejected.
+// so callers pair it with an explicit v == nil check — IsNilValue — where a plain nil is also
+// rejected.
+//
+// EVERY nilable kind, not the pointer this package's own callers happen to hand it. The kinds
+// are named rather than tried because reflect's IsNil PANICS on any other one, and a guard must
+// not become the crash it prevents; the list is IsNil's whole panic set minus Interface, which
+// reflect.ValueOf never yields (it unwraps to the dynamic type, and Go does not let that be
+// another interface). Narrower was behaviour-preserving for a decoded condition and a silent
+// hole for the transport wiring guard that now shares this: the first func- or map-typed
+// subsystem handed over as a typed nil would have walked straight through it.
 func IsTypedNil(v any) bool {
-	rv := reflect.ValueOf(v)
-	return rv.Kind() == reflect.Pointer && rv.IsNil()
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Func, reflect.Slice, reflect.Chan, reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
+
+// IsNilValue reports whether v holds no value at all: the interface itself nil, or a typed nil
+// inside a non-nil interface. It is IsTypedNil paired with the plain-nil test its doc tells
+// callers to add, written once because three call sites had written it themselves — a manifest
+// token, a proxy's wired subsystem, a diagnostic seam's reporter — and the composition is the
+// half a reader gets wrong, not the reflection.
+//
+// It answers for a value that IS nil, never for a wrapper AROUND one: reflecting into an
+// embedded field would refuse decorators that legitimately forward elsewhere.
+func IsNilValue(v any) bool { return v == nil || IsTypedNil(v) }
 
 func marshalCondition(condition Condition) ([]byte, error) {
 	// A typed-nil pointer slips past ConditionWrapper.MarshalJSON's nil-interface

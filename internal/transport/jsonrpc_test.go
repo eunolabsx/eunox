@@ -669,38 +669,50 @@ func TestTrackServerReqID(t *testing.T) {
 	}
 }
 
-// TestServerReqTracker_TalliesEvictions pins the observability contract: the warn line states that
-// displacements past the first are "counted but not individually logged", so serverReqTracker must
-// actually tally every one (not just latch a logged-once bool). Each distinct ID tracked past the
-// cap forces exactly one; re-tracking an already-present ID displaces the entry it overwrites, and
-// is tallied too — that entry is equally unanswerable afterwards.
-func TestServerReqTracker_TalliesEvictions(t *testing.T) {
+// TestServerReqTracker_ReportsEveryDisplacement pins the observability contract at the place
+// production reads it: track's own return.
+//
+// It used to assert an `evictions` field, which is gone. That tally existed only to derive the
+// logged-once latch (`evictions == 1`); once the latch became a mechanism of its own, nothing in
+// production read the count, and a test asserting a write-only field asserts that the field still
+// exists. What an operator actually acts on is the catDisplaced audit record trackServerRequest
+// writes for each one — and what makes that record possible is precisely this `found`, so it is
+// the fact worth pinning. Each distinct ID tracked past the cap forces exactly one; re-tracking an
+// already-present ID displaces the entry it overwrites, which is equally unanswerable afterwards.
+func TestServerReqTracker_ReportsEveryDisplacement(t *testing.T) {
 	t.Parallel()
 
 	var tr serverReqTracker
-	// Fill exactly to the cap: every insert is new but none overflows yet.
-	for i := 0; i < maxTrackedServerReqs; i++ {
-		tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(fmt.Sprintf("fill-%d", i))), Method: "roots/list"}, io.Discard)
-	}
-	if tr.evictions != 0 {
-		t.Fatalf("evictions after filling to the cap = %d, want 0", tr.evictions)
+	displacements := 0
+	track := func(id string) {
+		if _, found := tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(id)), Method: "roots/list"}, io.Discard); found {
+			displacements++
+		}
 	}
 
-	// Each further distinct ID is one eviction, and every one is tallied (not just
-	// the first logged one).
+	// Fill exactly to the cap: every insert is new but none overflows yet.
+	for i := 0; i < maxTrackedServerReqs; i++ {
+		track(fmt.Sprintf("fill-%d", i))
+	}
+	if displacements != 0 {
+		t.Fatalf("displacements after filling to the cap = %d, want 0", displacements)
+	}
+
+	// Each further distinct ID displaces one, and every one is reported (not just the first
+	// logged one).
 	const overflow = 5
 	for i := 0; i < overflow; i++ {
-		tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(fmt.Sprintf("overflow-%d", i))), Method: "roots/list"}, io.Discard)
+		track(fmt.Sprintf("overflow-%d", i))
 	}
-	if tr.evictions != overflow {
-		t.Fatalf("evictions after %d overflow inserts = %d, want %d", overflow, tr.evictions, overflow)
+	if displacements != overflow {
+		t.Fatalf("displacements after %d overflow inserts = %d, want %d", displacements, overflow, overflow)
 	}
 
 	// Re-tracking a present ID overwrites its entry — the set does not grow, but the request that
-	// entry described can no longer be answered by any reply, so it is tallied like the rest.
-	tr.track(mcp.RPCMsg{ID: mcp.RawJSON(strconv.Quote(fmt.Sprintf("overflow-%d", overflow-1))), Method: "roots/list"}, io.Discard)
-	if tr.evictions != overflow+1 {
-		t.Fatalf("re-tracking a present ID left the tally at %d, want %d — an overwritten entry is a displacement too", tr.evictions, overflow+1)
+	// entry described can no longer be answered by any reply, so it is reported like the rest.
+	track(fmt.Sprintf("overflow-%d", overflow-1))
+	if displacements != overflow+1 {
+		t.Fatalf("re-tracking a present ID reported %d displacements, want %d — an overwritten entry is a displacement too", displacements, overflow+1)
 	}
 
 	// A message with no id is not tracked at all: its key would be "", which no reply can match

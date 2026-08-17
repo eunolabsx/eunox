@@ -95,7 +95,10 @@ func TokenStateAccumulation(token string) (StateAccumulation, bool) {
 // condition accumulates nothing. Both the pointer form the JSON loader builds and the value
 // form the JWT path builds are accepted, since the discriminator is read off the interface.
 func ConditionStateAccumulation(c Condition) (StateAccumulation, bool) {
-	if isNilToken(c) {
+	// The discriminator methods have value receivers, so calling one on a typed nil
+	// dereferences it — and a manifest is not the only source of these values
+	// (MergeManifests builds constraints programmatically), so this path must not panic.
+	if IsNilValue(c) {
 		return StateNone, true
 	}
 	return refinedStateAccumulation(c.ConditionType(), c)
@@ -103,7 +106,7 @@ func ConditionStateAccumulation(c Condition) (StateAccumulation, bool) {
 
 // DirectiveStateAccumulation is the directive-side twin of ConditionStateAccumulation.
 func DirectiveStateAccumulation(d Directive) (StateAccumulation, bool) {
-	if isNilToken(d) {
+	if IsNilValue(d) {
 		return StateNone, true
 	}
 	return refinedStateAccumulation(d.DirectiveType(), d)
@@ -127,9 +130,3 @@ func refinedStateAccumulation(token string, v any) (StateAccumulation, bool) {
 	}
 	return declared, true
 }
-
-// isNilToken reports whether v is a nil interface or a typed nil pointer. The discriminator
-// methods have value receivers, so calling one on a typed nil pointer dereferences it — and a
-// manifest is not the only source of these values (MergeManifests builds constraints
-// programmatically), so this path must not panic on one.
-func isNilToken(v any) bool { return v == nil || IsTypedNil(v) }

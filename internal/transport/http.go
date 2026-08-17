@@ -30,7 +30,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/audit"
@@ -230,7 +229,7 @@ type HTTPProxy struct {
 	upstreamTimeMs     int
 	requireAuditStrict bool // --require-audit=strict: deny forwards once the audit trail degrades
 	// strictAuditWarned makes the sticky strict-gate stderr warning one-shot.
-	strictAuditWarned atomic.Bool
+	strictAuditWarned noticeLatch
 	authToken         string
 	// controlToken authenticates POST /control/kill (loopback only) so a same-host process is
 	// not automatically trusted merely for being on loopback (SEC-07). Empty means fail closed.
@@ -465,7 +464,15 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		// interface FIELDS), so the nil value it may hold is refused here rather than dereferenced
 		// on the next line — a diagnosis-free constructor panic three lines under the guard that
 		// exists to replace one.
-		requireUsable("HTTPGatewayOptions.Routes["+name+"]", route)
+		requireUsable(fmt.Sprintf("HTTPGatewayOptions.Routes[%q]", name), route)
+		// The one interface held INSIDE a route, and the last one in either options graph outside a
+		// check. It used to be closed by visibility alone — UpstreamRoute's fields are unexported,
+		// so only BuildRoutes and WrapRoutesWithJWT can populate them and neither produces a typed
+		// nil today — which is an argument about the callers that exist rather than a rule. Named
+		// here rather than reached by descending the map, because the walk deliberately does not
+		// look through a pointer: what a caller-built subsystem holds inside itself is its own
+		// package's business, and a route is this package's.
+		requireUsable(fmt.Sprintf("HTTPGatewayOptions.Routes[%q].pdp", name), route.pdp)
 		// And a route already claimed by another proxy is refused rather than taken over: the two
 		// assignments below are IN PLACE on a value the caller still holds, so a second proxy over
 		// the same map silently repoints the first's diagnostics and re-arms its collapse windows.
