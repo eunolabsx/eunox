@@ -32,7 +32,7 @@ func TestDeclassify_Validation(t *testing.T) {
 		{
 			name:    "an unknown label is a load error",
 			caps:    "  - target: \"tool:sanitize\"\n    actions: [call]\n    directives:\n      - type: declassify\n        labels: [secret]\n",
-			wantErr: "unknown label \"secret\"",
+			wantErr: "unknown flow label \"secret\"",
 		},
 		{
 			// An empty list clears nothing while still requiring an approval, so the

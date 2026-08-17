@@ -431,15 +431,21 @@ func (g *DelegationGrant) Validate() error {
 			}
 		}
 	}
+	// Both label lists take structural validation only (see ValidateFlowLabel): a token is
+	// the IdP's artifact and this manifest's declared namespaces are the operator's, so
+	// requiring agreement would reject a correctly-issued narrowing token that names a
+	// taxonomy this route happens not to police. Neither list can widen — Labels FORCE
+	// taint onto the delegate's calls, AllowLabels only intersects the sink's allow-set —
+	// so an undeclared namespace over-blocks in both.
 	for _, l := range g.Labels {
-		if !IsFlowLabel(l) {
-			return fmt.Errorf("delegation grant for %q: 'labels' contains unknown flow label %q; valid native labels are %v", g.Subject, l, FlowLabelVocabulary())
+		if err := ValidateFlowLabel(l); err != nil {
+			return fmt.Errorf("delegation grant for %q: 'labels': %w", g.Subject, err)
 		}
 	}
 	if g.AllowLabels != nil {
 		for _, l := range *g.AllowLabels {
-			if !IsFlowLabel(l) {
-				return fmt.Errorf("delegation grant for %q: 'allowLabels' contains unknown flow label %q; valid native labels are %v", g.Subject, l, FlowLabelVocabulary())
+			if err := ValidateFlowLabel(l); err != nil {
+				return fmt.Errorf("delegation grant for %q: 'allowLabels': %w", g.Subject, err)
 			}
 		}
 	}

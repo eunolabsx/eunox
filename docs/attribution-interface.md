@@ -50,8 +50,12 @@ classifier.
 }
 ```
 
-`labels` are native flow labels (`public`, `internal`, `confidential`, `pii`, `untrusted`)
-the client asserts **this call's inputs** carry.
+`labels` are flow labels the client asserts **this call's inputs** carry, on either axis: a
+native provenance class (`public`, `internal`, `confidential`, `pii`, `untrusted`) or an
+imported `namespace:value` sensitivity class. A malformed label is rejected; an imported one
+is checked for shape only, since the union-only rule means a client's declaration can add
+denials and never an allowance, so a namespace this route's policy never declared costs
+nothing to accept.
 
 The key is reverse-DNS namespaced, so a non-supporting client, host, or upstream never sets
 it and nothing changes. The params are forwarded upstream verbatim regardless, so a `_meta`

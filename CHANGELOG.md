@@ -27,6 +27,32 @@ Section conventions:
 
 ### Added
 
+- **Flow labels have a second axis: imported sensitivity.** Alongside the closed native
+  provenance/integrity vocabulary, a label may now name a class from an external taxonomy
+  (Purview/MSIP/BigID) as `namespace:value` — `purview:highly-confidential`. eunox owns the
+  **algebra** (the join, the subset check, the canonical order) and never the **taxonomy or
+  the classifier**: to the decision path an imported label is an opaque set member, so eunox
+  enforces a value set it cannot enumerate and still reads no payload and runs no classifier.
+  Imported labels work everywhere native ones do — `labelOutput`, `flowLabel`, `declassify`,
+  the conservative join, delegation caps and forced labels, and the
+  [attribution interface](./docs/attribution-interface.md) — and the two axes never interact:
+  a sink admitting every native class still denies an imported taint, so adding one cannot
+  widen a policy written for the native axis.
+
+  A new top-level **`flowLabelNamespaces`** (`schemaVersion "0.2"`, refused under `0.1`)
+  declares the taxonomies a policy speaks, and an imported label naming an undeclared
+  namespace is a **load error**. That declaration is deliberate: eunox cannot own the
+  taxonomy's values, so the namespace is the only closure left, and it is what keeps a
+  misspelled taxonomy (`purvew:general`) from loading clean and then matching nothing. Value
+  typos stay fail-closed without it — the sink rule is *present and not allowed ⇒ deny*, so a
+  typo over-blocks at the source and admits nothing at the sink. Across a multi-file policy
+  the declaration is merged as a **union**, since two files each naming the taxonomy their own
+  capabilities use are composing rather than disagreeing. Namespaces are lowercase
+  letters/digits/hyphens; values are printable ASCII with no spaces (slugify the taxonomy's
+  own spelling), both length-bounded, so a label cannot become unbounded on the audit tape.
+  Native-only policies are unaffected — `labels_out` and `carried_labels` render
+  byte-identically to before. See
+  [capability-manifest-guide.md §5b](./docs/capability-manifest-guide.md).
 - **`auditHealthy` on `/healthz` and `eunox_audit_healthy` on `/metrics`** — the audit
   subsystem's own verdict as one series, reported by the sink through the shared health seam
   rather than reassembled by the endpoint from the three counters beside it. `0` means the trail

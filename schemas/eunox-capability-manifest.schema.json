@@ -52,6 +52,15 @@
     "effectCeiling": {
       "$ref": "#/$defs/effectCeiling",
       "description": "schemaVersion 0.2. The tool-agnostic consequence bound EVERY allowed action is additionally checked against, keyed on the action's effect properties rather than on which tool it is. It can only narrow \u2014 it runs after a constraint has already allowed the call."
+    },
+    "flowLabelNamespaces": {
+      "description": "schemaVersion 0.2. The external sensitivity taxonomies this policy speaks \u2014 the namespace half of an imported \"namespace:value\" flow label. eunox owns the algebra and never the taxonomy, so the label VALUES stay open; declaring the namespace is the closure it can own, and it is what makes a misspelled taxonomy name a load error rather than a label that silently matches nothing. An imported label naming an undeclared namespace is refused at load. Merged as a union across multiple manifest files.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{0,31}$"
+      },
+      "uniqueItems": true
     }
   },
   "$defs": {
@@ -142,7 +151,20 @@
       }
     },
     "flowLabel": {
-      "description": "A native flow label: the closed, flat provenance/integrity vocabulary. No lattice, no partial order \u2014 a label is a tag policy asserts, never a value inferred from content.",
+      "description": "A flow label on either of the two axes. NATIVE provenance/integrity is the closed, flat vocabulary eunox owns end to end. IMPORTED sensitivity is \"namespace:value\", where the namespace names an external taxonomy (Purview/MSIP/BigID) declared in the top-level `flowLabelNamespaces` and the value is that taxonomy's own class \u2014 eunox owns the algebra and never the taxonomy, so the values are open and only their shape is checked here. Both axes are flat: no lattice, no partial order. A label is a tag policy asserts, never a value inferred from content. The loader additionally rejects an imported label whose namespace this manifest did not declare, which JSON Schema cannot express.",
+      "oneOf": [
+        {
+          "title": "native provenance/integrity class",
+          "$ref": "#/$defs/nativeFlowLabel"
+        },
+        {
+          "title": "imported sensitivity class",
+          "$ref": "#/$defs/importedFlowLabel"
+        }
+      ]
+    },
+    "nativeFlowLabel": {
+      "description": "The closed native provenance/integrity vocabulary.",
       "enum": [
         "public",
         "internal",
@@ -150,6 +172,11 @@
         "pii",
         "untrusted"
       ]
+    },
+    "importedFlowLabel": {
+      "description": "An imported sensitivity label, \"namespace:value\". The namespace is lowercase letters, digits and hyphens with a leading letter; the value is printable ASCII with no spaces (slugify the taxonomy's own spelling, e.g. \"Highly Confidential\" \u2192 \"highly-confidential\"). The value set is the incumbent classifier's, not eunox's, so it is unconstrained beyond that shape.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}:[!-~]{1,96}$"
     },
     "condition": {
       "description": "One condition, discriminated by `type`. The vocabulary is CLOSED: an unrecognized type is a load error.",

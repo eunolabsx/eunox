@@ -3,6 +3,12 @@
 
 package capability
 
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
 // ConditionTypeFlowLabel is the discriminator for flowLabel conditions — the sink
 // half of information-flow control.
 const ConditionTypeFlowLabel = "flowLabel"
@@ -15,6 +21,33 @@ const DirectiveTypeLabelOutput = "labelOutput"
 // pkg/enforcement and internal/transport), so one filter finds them all on the tape. A rename
 // or typo on either producer silently splits the filter rather than failing anything.
 const FlowAuditDetailKey = "flow"
+
+// Flow labels have TWO AXES, and the difference between them is who owns the vocabulary:
+//
+//   - NATIVE provenance/integrity — a bare token from the closed set below. eunox owns it
+//     end to end, so a misspelled one is a load-time error rather than a
+//     silently-never-matching entry.
+//   - IMPORTED sensitivity — "namespace:value", where the namespace names an external
+//     taxonomy (Purview/MSIP/BigID) and the value is that taxonomy's own class. eunox owns
+//     the ALGEBRA (the join, the subset check, the canonical order) and never the taxonomy
+//     or the classifier: it consumes a classification some incumbent already produced and
+//     cannot enumerate, let alone derive, the value set.
+//
+// The axes are disjoint by SHAPE — a label carrying the separator is imported, one without
+// it is native — so neither can spell the other and no `eunox:pii` alias exists.
+//
+// What the open value set costs is nothing on the decision path, because the sink rule is
+// "present and not allowed => deny": a typo'd value taints where no sink admits it
+// (over-blocks) and, in a sink's allow list, admits nothing (over-blocks again). Both
+// directions fail closed, which is what makes an operator-owned value space safe here and
+// would not make it safe in a rule that GRANTED on a match. The closure eunox can still
+// honestly own is the NAMESPACE: a manifest declares the taxonomies it speaks
+// (LocalManifest.FlowLabelNamespaces), so a misspelled namespace is caught at load, where
+// the native axis catches a misspelled label. The value half is irreducibly the incumbent's.
+//
+// Both axes stay FLAT — a label is a tag, and there is no partial order between
+// "purview:confidential" and "purview:public" any more than between two native classes.
+// Adding a lattice waits on a partner forcing one.
 
 // The native flow-label vocabulary: a closed, flat set of provenance/integrity source
 // classes — an opaque tag the policy asserts, never inferred from content. The set is
@@ -34,9 +67,9 @@ const (
 	FlowLabelUntrusted = "untrusted"
 )
 
-// flowLabelVocabulary is the ordered closed set. Order is fixed so any derived
+// nativeFlowLabelVocabulary is the ordered closed set. Order is fixed so any derived
 // report (e.g. the accumulated-set audit field) is deterministic.
-var flowLabelVocabulary = []string{
+var nativeFlowLabelVocabulary = []string{
 	FlowLabelPublic,
 	FlowLabelInternal,
 	FlowLabelConfidential,
@@ -44,26 +77,168 @@ var flowLabelVocabulary = []string{
 	FlowLabelUntrusted,
 }
 
-var flowLabelSet = func() map[string]bool {
-	m := make(map[string]bool, len(flowLabelVocabulary))
-	for _, l := range flowLabelVocabulary {
+var nativeFlowLabelSet = func() map[string]bool {
+	m := make(map[string]bool, len(nativeFlowLabelVocabulary))
+	for _, l := range nativeFlowLabelVocabulary {
 		m[l] = true
 	}
 	return m
 }()
 
-// FlowLabelVocabulary returns a fresh copy of the ordered native flow-label set, so
+// NativeFlowLabelVocabulary returns a fresh copy of the ordered native flow-label set, so
 // callers (the engine's accumulated-set peek, validation error messages) enumerate
 // the same closed vocabulary without being able to mutate it.
-func FlowLabelVocabulary() []string {
-	return append([]string(nil), flowLabelVocabulary...)
+//
+// Named for its AXIS: it is not "the flow labels", only the half of them eunox owns, and a
+// caller rendering it as the complete vocabulary would tell an operator their imported
+// label was a typo.
+func NativeFlowLabelVocabulary() []string {
+	return append([]string(nil), nativeFlowLabelVocabulary...)
 }
 
-// IsFlowLabel reports whether s is a recognized native flow label. Validation and
+// IsNativeFlowLabel reports whether s is a recognized native flow label. Validation and
 // the engine both consult it, so the closed set is enforced identically at load and
 // at runtime.
-func IsFlowLabel(s string) bool {
-	return flowLabelSet[s]
+//
+// This answers about the NATIVE axis alone: an imported label is not one, and a caller
+// asking "may this label be used here" wants ValidateFlowLabel instead.
+func IsNativeFlowLabel(s string) bool {
+	return nativeFlowLabelSet[s]
+}
+
+// FlowLabelNamespaceSep separates an imported label's namespace from its value. Splitting
+// on the FIRST occurrence is what lets a taxonomy whose own classes contain a colon
+// ("purview:eu:pii") round-trip without an escape rule.
+const FlowLabelNamespaceSep = ":"
+
+// Bounds on an imported label's two halves. Generous against any real taxonomy and small
+// enough that a label cannot become an unbounded string on the audit tape or in the flow
+// store, which holds one set entry per label.
+const (
+	maxFlowLabelNamespaceLen = 32
+	maxFlowLabelValueLen     = 96
+)
+
+// SplitFlowLabel splits an imported label into its namespace and value; imported reports
+// whether label carries the separator at all. A native label returns ("", label, false).
+//
+// It SPLITS and does not validate — ValidateFlowLabel is the judgement — so a caller that
+// has already validated (the canonical sort, the namespace-declaration check) needs no
+// second error path.
+func SplitFlowLabel(label string) (namespace, value string, imported bool) {
+	i := strings.Index(label, FlowLabelNamespaceSep)
+	if i < 0 {
+		return "", label, false
+	}
+	return label[:i], label[i+len(FlowLabelNamespaceSep):], true
+}
+
+// ValidateFlowLabel reports whether label is usable on either axis: a member of the closed
+// native set, or a structurally well-formed "namespace:value" imported label.
+//
+// It deliberately does NOT check that the namespace is one the policy declared. That
+// closure is the manifest loader's (validateFlowLabelNamespaceUse), because it is the one
+// layer holding the declaration — and the layers that cannot see a manifest at all are
+// exactly the ones where an undeclared namespace is provably harmless: a token's
+// delegation labels and a client's attribution block only ever ADD taint, and a delegation
+// allowLabels cap and a declassify approval only ever REMOVE an allowance. Every one of
+// those directions over-blocks on a typo, so refusing them here would buy no safety and
+// would reject a legitimately-issued token naming a taxonomy this manifest happens not to
+// use.
+func ValidateFlowLabel(label string) error {
+	namespace, value, imported := SplitFlowLabel(label)
+	if !imported {
+		if IsNativeFlowLabel(label) {
+			return nil
+		}
+		return fmt.Errorf("unknown flow label %q: it names no native class (%s) and carries no %q namespace separator, so it belongs to neither axis",
+			label, strings.Join(nativeFlowLabelVocabulary, ", "), FlowLabelNamespaceSep)
+	}
+	if err := ValidateFlowLabelNamespace(namespace); err != nil {
+		return fmt.Errorf("imported flow label %q: %w", label, err)
+	}
+	switch {
+	case value == "":
+		return fmt.Errorf("imported flow label %q: the value after %q is empty; an imported label names a class in its taxonomy, not the taxonomy alone", label, FlowLabelNamespaceSep)
+	case len(value) > maxFlowLabelValueLen:
+		return fmt.Errorf("imported flow label %q: the value is %d bytes, over the %d-byte bound", label, len(value), maxFlowLabelValueLen)
+	}
+	for _, r := range value {
+		// Printable ASCII only, and no space: a set store cannot tell "confidential" from
+		// "confidential ", so whitespace would let two labels that read identically taint
+		// two different buckets. Non-ASCII is refused for the homoglyph version of the same
+		// hazard on a value that gates data egress. Operators slugify ("Highly
+		// Confidential" -> "highly-confidential"), which is what the crosswalk a taxonomy
+		// mapping produces anyway.
+		if r < '!' || r > '~' {
+			return fmt.Errorf("imported flow label %q: the value contains %q; imported label values are printable ASCII with no spaces (slugify the taxonomy's own spelling, e.g. %q -> %q)",
+				label, r, "Highly Confidential", "highly-confidential")
+		}
+	}
+	return nil
+}
+
+// ValidateFlowLabelNamespace reports whether ns is a well-formed imported-label namespace:
+// lowercase, alphanumeric-with-hyphens, leading letter, bounded.
+//
+// Lowercase is enforced rather than folded because a label is compared as a whole string
+// everywhere it matters (the store's set membership, the sink's subset check), so
+// "Purview:x" and "purview:x" would otherwise be two axes that print the same.
+func ValidateFlowLabelNamespace(ns string) error {
+	switch {
+	case ns == "":
+		return fmt.Errorf("the namespace before %q is empty; an imported label is %q", FlowLabelNamespaceSep, "namespace"+FlowLabelNamespaceSep+"value")
+	case len(ns) > maxFlowLabelNamespaceLen:
+		return fmt.Errorf("namespace %q is %d bytes, over the %d-byte bound", ns, len(ns), maxFlowLabelNamespaceLen)
+	case ns[0] < 'a' || ns[0] > 'z':
+		return fmt.Errorf("namespace %q must start with a lowercase letter", ns)
+	}
+	for _, r := range ns {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return fmt.Errorf("namespace %q contains %q; a namespace is lowercase letters, digits and hyphens (it is eunox's name for the taxonomy, not the taxonomy's own spelling)", ns, r)
+		}
+	}
+	return nil
+}
+
+// NormalizeFlowLabels returns labels in canonical order with duplicates collapsed, so an
+// effective set and the audit field derived from it are deterministic regardless of the
+// order they arrived in. It is the ONE renderer of a label set; a second copy would not
+// fail anything, it would just put a differently-ordered set on the tape.
+//
+// Canonical order is native-first in vocabulary order, then imported sorted as plain
+// strings. Native-first is what keeps a policy that uses only the native axis producing
+// byte-identical audit fields to before the second axis existed.
+//
+// Malformed entries are DROPPED rather than surfaced, matching the fail-safe direction the
+// declared-label path needs: every caller here is unioning taint IN, so dropping an entry
+// cannot manufacture an allowance, and the boundaries that parse untrusted input
+// (ParseContextManifest, the token claims) reject a malformed label before it reaches here.
+// The paths where a dropped label WOULD shrink an obligation — the engine's own store read
+// and label record — validate explicitly and fail closed instead.
+func NormalizeFlowLabels(labels []string) []string {
+	if len(labels) == 0 {
+		return nil
+	}
+	in := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		in[l] = true
+	}
+	var out []string
+	for _, l := range nativeFlowLabelVocabulary {
+		if in[l] {
+			out = append(out, l)
+			delete(in, l)
+		}
+	}
+	imported := make([]string, 0, len(in))
+	for l := range in {
+		if _, _, ok := SplitFlowLabel(l); ok && ValidateFlowLabel(l) == nil {
+			imported = append(imported, l)
+		}
+	}
+	sort.Strings(imported)
+	return append(out, imported...)
 }
 
 // AsValueOrPointer normalizes a polymorphic value that may be stored as either T or *T

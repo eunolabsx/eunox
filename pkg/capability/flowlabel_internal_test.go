@@ -17,7 +17,7 @@ import (
 // lattice, or renames a class is a deliberate, reviewed change rather than a silent
 // drift — the small flat vocabulary is a load-bearing stop-line, not an accident.
 func TestFlowLabelVocabulary_PinnedFlatSet(t *testing.T) {
-	got := FlowLabelVocabulary()
+	got := NativeFlowLabelVocabulary()
 
 	// Exactly these five, in this fixed order (the order backs deterministic audit
 	// fields and the subset-check enumeration).
@@ -33,18 +33,113 @@ func TestFlowLabelVocabulary_PinnedFlatSet(t *testing.T) {
 		FlowLabelPublic, FlowLabelInternal, FlowLabelConfidential, FlowLabelPII, FlowLabelUntrusted,
 	}, got)
 	for _, l := range got {
-		assert.True(t, IsFlowLabel(l), "%q is a recognized flow label", l)
+		assert.True(t, IsNativeFlowLabel(l), "%q is a recognized flow label", l)
 	}
 
 	// A label outside the closed set is rejected — the property that makes a misspelled
 	// label a load-time error rather than an inert entry.
-	assert.False(t, IsFlowLabel("secret"))
-	assert.False(t, IsFlowLabel("PUBLIC"), "labels are case-sensitive")
-	assert.False(t, IsFlowLabel(""))
+	assert.False(t, IsNativeFlowLabel("secret"))
+	assert.False(t, IsNativeFlowLabel("PUBLIC"), "labels are case-sensitive")
+	assert.False(t, IsNativeFlowLabel(""))
 
 	// The returned slice is a copy: a caller cannot mutate the package's set.
 	got[0] = "tampered"
-	assert.Equal(t, "public", FlowLabelVocabulary()[0], "vocabulary is defensively copied")
+	assert.Equal(t, "public", NativeFlowLabelVocabulary()[0], "vocabulary is defensively copied")
+}
+
+// TestValidateFlowLabel_TwoAxes covers the label grammar across both axes: which labels are
+// usable, and — for the imported axis, whose values eunox deliberately does not enumerate —
+// exactly which structural rules stand in for a closed vocabulary.
+func TestValidateFlowLabel_TwoAxes(t *testing.T) {
+	longNS := "a" + string(make([]byte, maxFlowLabelNamespaceLen))
+	for _, tc := range []struct {
+		name, label string
+		wantErr     string
+	}{
+		{name: "native class", label: "pii"},
+		{name: "native integrity class", label: "untrusted"},
+		{name: "imported label", label: "purview:confidential"},
+		{name: "imported with hyphens both halves", label: "ms-info:highly-confidential"},
+		{name: "imported with digits in namespace", label: "bigid2:pci"},
+		// Splitting on the FIRST separator is what lets a taxonomy whose own classes
+		// contain a colon round-trip with no escape rule.
+		{name: "value may contain the separator", label: "purview:eu:gdpr-pii"},
+
+		{name: "misspelled native", label: "untrused", wantErr: "belongs to neither axis"},
+		{name: "native is case-sensitive", label: "PII", wantErr: "belongs to neither axis"},
+		{name: "empty", label: "", wantErr: "belongs to neither axis"},
+		{name: "namespace absent", label: ":confidential", wantErr: "namespace before"},
+		{name: "value absent", label: "purview:", wantErr: "value after"},
+		{name: "uppercase namespace", label: "Purview:x", wantErr: "must start with a lowercase letter"},
+		{name: "namespace leading digit", label: "9purview:x", wantErr: "must start with a lowercase letter"},
+		{name: "namespace underscore", label: "ms_info:x", wantErr: "lowercase letters, digits and hyphens"},
+		{name: "namespace over bound", label: longNS + ":x", wantErr: "over the"},
+		// A set store cannot tell "confidential" from "confidential ", so whitespace would
+		// let two labels that read identically taint two different buckets.
+		{name: "value with a space", label: "purview:highly confidential", wantErr: "printable ASCII with no spaces"},
+		{name: "value with a tab", label: "purview:a\tb", wantErr: "printable ASCII with no spaces"},
+		{name: "value non-ASCII", label: "purview:confidentiaIİ", wantErr: "printable ASCII with no spaces"},
+		{name: "value over bound", label: "purview:" + string(make([]byte, maxFlowLabelValueLen+1)), wantErr: "over the"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateFlowLabel(tc.label)
+			if tc.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestSplitFlowLabel_AxisIsShape pins that the axes are told apart by SHAPE alone, so
+// neither can spell the other and no native-label alias under a namespace exists.
+func TestSplitFlowLabel_AxisIsShape(t *testing.T) {
+	ns, value, imported := SplitFlowLabel("purview:eu:pii")
+	assert.True(t, imported)
+	assert.Equal(t, "purview", ns)
+	assert.Equal(t, "eu:pii", value, "split on the FIRST separator only")
+
+	ns, value, imported = SplitFlowLabel("pii")
+	assert.False(t, imported)
+	assert.Empty(t, ns)
+	assert.Equal(t, "pii", value)
+
+	// A native class under a namespace is an IMPORTED label that merely looks native: it is
+	// a distinct set member, and nothing folds the two together.
+	assert.False(t, IsNativeFlowLabel("eunox:pii"))
+	assert.NoError(t, ValidateFlowLabel("eunox:pii"))
+}
+
+// TestNormalizeFlowLabels_CanonicalOrder pins the canonical order both axes share, and the
+// property that keeps it safe to have added a second axis at all: a native-only set renders
+// byte-identically to how it did before the imported axis existed, so no existing policy's
+// audit fields move.
+func TestNormalizeFlowLabels_CanonicalOrder(t *testing.T) {
+	// Native-first in VOCABULARY order (not alphabetical), then imported sorted as strings.
+	got := NormalizeFlowLabels([]string{
+		"purview:secret", "pii", "msip:confidential", "public", "purview:general", "untrusted",
+	})
+	assert.Equal(t, []string{
+		"public", "pii", "untrusted",
+		"msip:confidential", "purview:general", "purview:secret",
+	}, got)
+
+	// Order-independent and duplicate-collapsing: the same set in any arrival order renders
+	// identically, which is what makes the audit field deterministic.
+	assert.Equal(t, got, NormalizeFlowLabels([]string{
+		"untrusted", "purview:general", "msip:confidential", "public", "purview:secret", "pii", "pii",
+	}))
+
+	// Native-only sets are untouched by the second axis.
+	assert.Equal(t, []string{"public", "confidential", "untrusted"},
+		NormalizeFlowLabels([]string{"untrusted", "confidential", "public"}))
+	assert.Nil(t, NormalizeFlowLabels(nil))
+
+	// Malformed entries are dropped; every caller here is unioning taint IN, so a drop
+	// cannot manufacture an allowance.
+	assert.Equal(t, []string{"pii"}, NormalizeFlowLabels([]string{"pii", "not a label", "purview:"}))
 }
 
 // TestFlowLabelCondition_RoundTrip round-trips a flowLabel condition through the

@@ -56,6 +56,16 @@ type LocalManifest struct {
 	// which tool it is. It can only narrow (it runs after a constraint has already
 	// allowed the call). Merged with the same conflict check as Audience/serverVersion.
 	EffectCeiling *capability.EffectCeiling `json:"effectCeiling,omitempty"`
+	// FlowLabelNamespaces declares the external sensitivity taxonomies this policy speaks —
+	// the namespace half of an imported "namespace:value" flow label (Purview/MSIP/BigID).
+	// eunox owns the algebra and never the taxonomy, so the VALUES stay open; declaring the
+	// namespace is the closure it can still honestly own, which is what turns a misspelled
+	// taxonomy name into a load error rather than a label that silently matches nothing.
+	//
+	// Merged as a UNION rather than with Audience's conflict check: declaring a namespace
+	// grants nothing on its own (it only permits labels naming it), so two files each
+	// declaring their own compose, where a conflict check would reject the composition.
+	FlowLabelNamespaces []string `json:"flowLabelNamespaces,omitempty"`
 }
 
 // LoadManifest reads and validates a LocalManifest from a manifest file of any extension
@@ -502,6 +512,7 @@ func MergeManifests(ms []*LocalManifest) (*LocalManifest, error) {
 			return nil, err
 		}
 		merged.EffectCeiling = ceiling
+		merged.FlowLabelNamespaces = mergeFlowLabelNamespaces(merged.FlowLabelNamespaces, m.FlowLabelNamespaces)
 	}
 	// Re-validate the merged union: this is load-bearing, not defensive — two
 	// individually-valid files can each pin the SAME tool to a DIFFERENT descriptionHash,
@@ -716,10 +727,19 @@ func validateLocalManifest(m *LocalManifest) error {
 	if strings.TrimSpace(m.Name) == "" {
 		return fmt.Errorf("'name' must not be empty")
 	}
-	// The declared grammar revision, trimmed once. Only validateAllowedValues consults it
-	// (the ${task.*} surface is "0.2"-only); the authoritative version gate for
-	// discriminator tokens stays checkTokenGrammarVersion below.
-	declaredSchemaVersion := strings.TrimSpace(m.SchemaVersion)
+	// Checked BEFORE the scope is built from it, so a per-label check is never made against
+	// a declaration this manifest would have been rejected for.
+	if err := validateFlowLabelNamespaces(m.FlowLabelNamespaces); err != nil {
+		return err
+	}
+	// The manifest-level facts a per-token validator cannot see from the token's own value.
+	// The grammar revision is consulted only by validateAllowedValues (the ${task.*} surface
+	// is "0.2"-only); the authoritative version gate for discriminator tokens stays
+	// checkTokenGrammarVersion below.
+	scope := manifestScope{
+		schemaVersion:  strings.TrimSpace(m.SchemaVersion),
+		flowNamespaces: declaredFlowLabelNamespaces(m),
+	}
 	if err := validateEffectCeiling(m.EffectCeiling); err != nil {
 		return err
 	}
@@ -877,7 +897,7 @@ func validateLocalManifest(m *LocalManifest) error {
 				return fmt.Errorf("capability at index %d, directive %d: unrecognized directive type %q; the supported directives are %s",
 					i, j, dir.DirectiveType(), strings.Join(capability.KnownDirectiveTypes(), ", "))
 			}
-			if err := validate(i, j, c.Target, targetType, dir); err != nil {
+			if err := validate(i, j, c.Target, targetType, dir, scope); err != nil {
 				return err
 			}
 		}
@@ -913,7 +933,7 @@ func validateLocalManifest(m *LocalManifest) error {
 				return fmt.Errorf("capability at index %d, condition %d: unrecognized condition type %q; the supported conditions are %s",
 					i, j, cond.ConditionType(), strings.Join(capability.KnownConditionTypes(), ", "))
 			}
-			if err := validate(i, j, cond, declaredSchemaVersion); err != nil {
+			if err := validate(i, j, cond, scope); err != nil {
 				return err
 			}
 		}
@@ -927,11 +947,23 @@ func validateLocalManifest(m *LocalManifest) error {
 	return nil
 }
 
+// manifestScope carries the manifest-level facts a per-token validator needs but cannot read
+// off the token it is handed: the declared grammar revision, and the sensitivity namespaces
+// the policy declared. ONE struct rather than a parameter per fact, so the next
+// manifest-level input is a field here instead of a re-thread of every validator signature.
+type manifestScope struct {
+	// schemaVersion is the manifest's declared grammar revision, which exactly one type's
+	// rules turn on (${task.*} is "0.2"-only).
+	schemaVersion string
+	// flowNamespaces indexes flowLabelNamespaces — the imported-sensitivity taxonomies this
+	// policy speaks. Nil when it declares none, which correctly admits no imported label.
+	flowNamespaces map[string]bool
+}
+
 // conditionValidator is the per-type validation one condition needs: its own field checks
 // plus the type's load-time Compile. cond is guaranteed non-nil, non-typed-nil by
-// validateLocalManifest before dispatch; declaredSchemaVersion is the manifest's grammar
-// revision, which exactly one type's rules turn on.
-type conditionValidator func(i, j int, cond capability.Condition, declaredSchemaVersion string) error
+// validateLocalManifest before dispatch.
+type conditionValidator func(i, j int, cond capability.Condition, scope manifestScope) error
 
 // conditionValidators is the manifest loader's per-condition validation, keyed by the SAME
 // discriminator strings pkg/capability's conditionPrototypes registry holds — not a type
@@ -950,13 +982,13 @@ var conditionValidators = map[string]conditionValidator{
 	// The only per-type validator that needs the declared grammar revision: the ${task.*}
 	// surface exists in "0.2" and not in "0.1", so what counts as a malformed reference
 	// versus an ordinary literal differs between them.
-	capability.ConditionTypeAllowedValues: typedVersionedCondition(validateAllowedValues),
+	capability.ConditionTypeAllowedValues: typedScopedCondition(validateAllowedValues),
 	capability.ConditionTypeMaxCalls:      typedCondition(validateMaxCalls),
 	capability.ConditionTypeIPRange:       typedCondition(validateIPRange),
 	capability.ConditionTypeTimeWindow:    typedCondition(validateTimeWindow),
 	capability.ConditionTypeSequenceBlock: typedCondition(validateSequenceBlock),
-	capability.ConditionTypeFlowLabel: typedCondition(func(i, j int, c *capability.FlowLabelCondition) error {
-		return validateFlowLabel(i, j, c.Allow)
+	capability.ConditionTypeFlowLabel: typedScopedCondition(func(i, j int, c *capability.FlowLabelCondition, scope manifestScope) error {
+		return validateFlowLabel(i, j, c.Allow, scope.flowNamespaces)
 	}),
 	capability.ConditionTypeEffectClass: typedCondition(func(i, j int, c *capability.EffectClassCondition) error {
 		return validateEffectClass(i, j, c.Allow)
@@ -966,27 +998,28 @@ var conditionValidators = map[string]conditionValidator{
 	capability.ConditionTypeCustom:      typedCondition(validateCustomCondition),
 }
 
-// typedCondition adapts a per-type validator that does not depend on the grammar revision.
-// It is the common case; typedVersionedCondition is the one type that does.
+// typedCondition adapts a per-type validator that needs nothing from the manifest around it.
+// It is the common case; typedScopedCondition is for the types whose rules turn on a
+// manifest-level fact.
 func typedCondition[T any](check func(i, j int, v *T) error) conditionValidator {
-	return typedVersionedCondition(func(i, j int, v *T, _ string) error { return check(i, j, v) })
+	return typedScopedCondition(func(i, j int, v *T, _ manifestScope) error { return check(i, j, v) })
 }
 
-// typedVersionedCondition folds one condition type's value and pointer decode forms into a
+// typedScopedCondition folds one condition type's value and pointer decode forms into a
 // single table entry: normalizes cond to *T, then runs the type's load-time Compile. The
 // "Compile only on the POINTER form" rule is enforced by the type system — Compile has a
 // pointer receiver, so the VALUE form does not satisfy the interface at all. The type mismatch
 // is REPORTED rather than assumed away: under discriminator dispatch a programmatically built
 // condition whose ConditionType() disagrees with its concrete type reaches here, where a
 // discarded ok would be a nil dereference instead of a fail-closed load error.
-func typedVersionedCondition[T any](check func(i, j int, v *T, declaredSchemaVersion string) error) conditionValidator {
-	return func(i, j int, cond capability.Condition, declaredSchemaVersion string) error {
+func typedScopedCondition[T any](check func(i, j int, v *T, scope manifestScope) error) conditionValidator {
+	return func(i, j int, cond capability.Condition, scope manifestScope) error {
 		v, ok := capability.AsValueOrPointer[T](cond)
 		if !ok || v == nil {
 			return fmt.Errorf("capability at index %d, condition %d: condition reports type %q but is not one; refusing rather than validating it as a type it is not",
 				i, j, cond.ConditionType())
 		}
-		if err := check(i, j, v, declaredSchemaVersion); err != nil {
+		if err := check(i, j, v, scope); err != nil {
 			return err
 		}
 		if c, compilable := cond.(interface{ Compile() error }); compilable {
@@ -1175,7 +1208,7 @@ func validateAllowedExtensions(i, j int, v *capability.AllowedExtensionsConditio
 // validateAllowedValues rejects an allowedValues condition that fails closed: a
 // missing 'argument' or an empty 'values' list (both deny every call, typically
 // from an `arguments:`/`value:` typo), or a value that is a malformed glob.
-func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, declared string) error {
+func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, scope manifestScope) error {
 	if err := validateArgumentRef(i, j, v.Argument, "allowedValues requires an 'argument' field naming the tool parameter to check (e.g. argument: path)"); err != nil {
 		return err
 	}
@@ -1195,7 +1228,7 @@ func validateAllowedValues(i, j int, v *capability.AllowedValuesCondition, decla
 		// call. Gated on the revision that DEFINES the surface — under "0.1" a "${" is
 		// ordinary literal text — with a recognized reference under "0.1" still refused by
 		// checkTaskVarGrammarVersion.
-		if revisionAdmits(declared, ManifestSchemaVersion02) && capability.ContainsVariableRef(s) {
+		if revisionAdmits(scope.schemaVersion, ManifestSchemaVersion02) && capability.ContainsVariableRef(s) {
 			if err := capability.ValidateVariableRef(s); err != nil {
 				return fmt.Errorf("capability at index %d, condition %d, value %d: %w", i, j, k, err)
 			}
@@ -1452,7 +1485,7 @@ func validateSequenceBlock(i, j int, v *capability.SequenceBlockCondition) error
 // directiveValidator is the per-type validation one directive needs: its target restriction
 // and its own field checks. dir is guaranteed non-nil, non-typed-nil by validateLocalManifest
 // before dispatch.
-type directiveValidator func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error
+type directiveValidator func(i, j int, target string, targetType capability.TargetType, dir capability.Directive, scope manifestScope) error
 
 // directiveValidators is the manifest loader's per-directive validation, keyed by the SAME
 // discriminator strings pkg/capability's directivePrototypes registry holds — not a type
@@ -1463,7 +1496,7 @@ type directiveValidator func(i, j int, target string, targetType capability.Targ
 // the discriminator the directive REPORTS, not its Go type, so a mismatched DirectiveType()
 // is reported rather than dereferenced as a type it is not.
 var directiveValidators = map[string]directiveValidator{
-	capability.DirectiveTypeRedactFields: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.RedactFieldsDirective) error {
+	capability.DirectiveTypeRedactFields: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.RedactFieldsDirective, _ manifestScope) error {
 		// redactFields mutates the tools/call RESPONSE, so it applies only to tool: targets:
 		// a directive that never applies is a fail-open leak plus a false "discharged" audit
 		// record.
@@ -1472,22 +1505,22 @@ var directiveValidators = map[string]directiveValidator{
 		}
 		return validateRedactFields(i, j, d.Fields)
 	}),
-	capability.DirectiveTypeLabelOutput: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.LabelOutputDirective) error {
+	capability.DirectiveTypeLabelOutput: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.LabelOutputDirective, scope manifestScope) error {
 		// An enforce-time STATE directive rather than a response mutation, so it is valid on
 		// any flow SOURCE target.
 		if err := requireSourceDirectiveTarget(i, target, targetType, capability.DirectiveTypeLabelOutput); err != nil {
 			return err
 		}
-		return validateLabelOutput(i, j, d.Labels)
+		return validateLabelOutput(i, j, d.Labels, scope.flowNamespaces)
 	}),
-	capability.DirectiveTypeDeclassify: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.DeclassifyDirective) error {
+	capability.DirectiveTypeDeclassify: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.DeclassifyDirective, scope manifestScope) error {
 		// Same target restriction as labelOutput: a declassification is a TRANSFORM that sits
 		// where data is produced or read; clearing a label at an egress would launder it at
 		// exactly the point the flow layer exists to gate.
 		if err := requireSourceDirectiveTarget(i, target, targetType, capability.DirectiveTypeDeclassify); err != nil {
 			return err
 		}
-		return validateDeclassify(i, j, d.Labels)
+		return validateDeclassify(i, j, d.Labels, scope.flowNamespaces)
 	}),
 }
 
@@ -1496,14 +1529,14 @@ var directiveValidators = map[string]directiveValidator{
 // discriminator it was filed under, rather than dereferencing nil — a programmatically built
 // manifest (reachable through MergeManifests) can present a directive whose DirectiveType()
 // lies about its concrete type.
-func typedDirective[T any](check func(i, j int, target string, targetType capability.TargetType, d *T) error) directiveValidator {
-	return func(i, j int, target string, targetType capability.TargetType, dir capability.Directive) error {
+func typedDirective[T any](check func(i, j int, target string, targetType capability.TargetType, d *T, scope manifestScope) error) directiveValidator {
+	return func(i, j int, target string, targetType capability.TargetType, dir capability.Directive, scope manifestScope) error {
 		d, ok := capability.AsValueOrPointer[T](dir)
 		if !ok || d == nil {
 			return fmt.Errorf("capability at index %d, directive %d: directive reports type %q but is not one; refusing rather than validating it as a type it is not",
 				i, j, dir.DirectiveType())
 		}
-		return check(i, j, target, targetType, d)
+		return check(i, j, target, targetType, d, scope)
 	}
 }
 
@@ -1520,6 +1553,13 @@ func checkTokenGrammarVersion(m *LocalManifest) error {
 	// revision does not refuse its own token.
 	if m.EffectCeiling != nil && !revisionAdmits(declared, ManifestSchemaVersion02) {
 		return fmt.Errorf("the top-level effectCeiling was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersion02, declared)
+	}
+	// The imported-sensitivity axis is part of the flow layer, so its namespace declaration
+	// is gated with it: under "0.1" there is no flowLabel token to consume an imported label
+	// in the first place, and admitting the key there would let a "0.1" manifest carry a
+	// declaration whose only effect is to look enforced.
+	if len(m.FlowLabelNamespaces) > 0 && !revisionAdmits(declared, ManifestSchemaVersion02) {
+		return fmt.Errorf("the top-level flowLabelNamespaces was introduced in schemaVersion %q (the flow+effect grammar); this manifest declares schemaVersion %q, under which the key is not part of the grammar", ManifestSchemaVersion02, declared)
 	}
 	for i := range m.Capabilities {
 		c := &m.Capabilities[i]
@@ -1615,45 +1655,109 @@ func requireSourceDirectiveTarget(i int, target string, targetType capability.Ta
 	return nil
 }
 
-// validateFlowLabel checks a flowLabel condition's Allow set against the closed native
-// vocabulary, so a misspelled label is a load-time error rather than an inert entry. An
-// empty Allow is valid — it admits only an unlabeled, clean-context flow.
-func validateFlowLabel(i, j int, allow []string) error {
-	for _, l := range allow {
-		if !capability.IsFlowLabel(l) {
-			return fmt.Errorf("capability at index %d, condition %d: flowLabel 'allow' contains unknown label %q — valid native flow labels are %s", i, j, l, strings.Join(capability.FlowLabelVocabulary(), ", "))
+// validateFlowLabelSet checks one authored label list against BOTH axes: a native class
+// from the closed vocabulary, or an imported "namespace:value" whose namespace the manifest
+// declared. It is the single label check the three flow tokens share, so a label legal in a
+// labelOutput cannot be illegal in the flowLabel that reads it back.
+//
+// The declared-namespace half is what makes this the load-time closure the imported axis
+// otherwise lacks: eunox cannot know the taxonomy's values, but it does know which
+// taxonomies this policy said it speaks, so "purvew:confidential" fails here instead of
+// becoming a label that taints where nothing admits it and reads as a mysterious denial.
+func validateFlowLabelSet(where string, labels []string, declared map[string]bool) error {
+	for _, l := range labels {
+		if err := capability.ValidateFlowLabel(l); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
+		}
+		ns, _, imported := capability.SplitFlowLabel(l)
+		if imported && !declared[ns] {
+			return fmt.Errorf("%s: imported flow label %q names the sensitivity namespace %q, which this manifest does not declare — add it to the top-level 'flowLabelNamespaces' list (eunox does not own the taxonomy's values, so declaring the namespace is what makes a misspelled one a load error rather than a label that silently matches nothing)", where, l, ns)
 		}
 	}
 	return nil
+}
+
+// validateFlowLabel checks a flowLabel condition's Allow set. An empty Allow is valid — it
+// admits only an unlabeled, clean-context flow.
+func validateFlowLabel(i, j int, allow []string, declared map[string]bool) error {
+	return validateFlowLabelSet(fmt.Sprintf("capability at index %d, condition %d: flowLabel 'allow'", i, j), allow, declared)
 }
 
 // validateLabelOutput checks a labelOutput directive: a non-empty Labels list (an empty one
-// records nothing and is an authoring mistake), every entry from the closed native vocabulary.
-func validateLabelOutput(i, j int, labels []string) error {
+// records nothing and is an authoring mistake), every entry usable on one of the two axes.
+func validateLabelOutput(i, j int, labels []string, declared map[string]bool) error {
 	if len(labels) == 0 {
-		return fmt.Errorf("capability at index %d, directive %d: labelOutput requires a non-empty 'labels' list naming the native flow labels this call's output carries; an empty list records nothing", i, j)
+		return fmt.Errorf("capability at index %d, directive %d: labelOutput requires a non-empty 'labels' list naming the flow labels this call's output carries; an empty list records nothing", i, j)
 	}
-	for _, l := range labels {
-		if !capability.IsFlowLabel(l) {
-			return fmt.Errorf("capability at index %d, directive %d: labelOutput 'labels' contains unknown label %q — valid native flow labels are %s", i, j, l, strings.Join(capability.FlowLabelVocabulary(), ", "))
+	return validateFlowLabelSet(fmt.Sprintf("capability at index %d, directive %d: labelOutput 'labels'", i, j), labels, declared)
+}
+
+// validateDeclassify checks a declassify directive's label list. An empty list is rejected
+// for a sharper reason than labelOutput's: it clears nothing yet still ESCALATES every call
+// it sits on, leaving a permanently-refused capability.
+func validateDeclassify(i, j int, labels []string, declared map[string]bool) error {
+	if len(labels) == 0 {
+		return fmt.Errorf("capability at index %d, directive %d: declassify requires a non-empty 'labels' list naming the flow labels this action clears; an empty list clears nothing while still requiring an approval, so the capability could never be satisfied", i, j)
+	}
+	return validateFlowLabelSet(fmt.Sprintf("capability at index %d, directive %d: declassify 'labels'", i, j), labels, declared)
+}
+
+// mergeFlowLabelNamespaces unions one file's declared sensitivity namespaces into the merged
+// set, preserving first-seen order so the merged manifest renders deterministically.
+//
+// A UNION rather than mergeSingleValueField's conflict check, because a namespace
+// declaration is a vocabulary the file's own capabilities draw on and not a bound over
+// anyone else's: two files each declaring the taxonomy they use are composing, not
+// disagreeing, and rejecting that would make the flow layer unusable across a split policy.
+// Nothing widens — a namespace admits labels, and a label can only add taint or narrow an
+// allow-set — so the union grants no capability either file did not already have.
+func mergeFlowLabelNamespaces(merged, next []string) []string {
+	if len(next) == 0 {
+		return merged
+	}
+	seen := make(map[string]bool, len(merged)+len(next))
+	for _, ns := range merged {
+		seen[ns] = true
+	}
+	for _, ns := range next {
+		if !seen[ns] {
+			seen[ns] = true
+			merged = append(merged, ns)
 		}
+	}
+	return merged
+}
+
+// validateFlowLabelNamespaces checks the top-level declaration itself: each entry
+// well-formed, no duplicates. A duplicate is rejected rather than folded because a list that
+// repeats an entry is an edit that went wrong, and silently accepting it is how the second
+// spelling of a namespace survives review.
+func validateFlowLabelNamespaces(namespaces []string) error {
+	seen := make(map[string]bool, len(namespaces))
+	for _, ns := range namespaces {
+		if err := capability.ValidateFlowLabelNamespace(ns); err != nil {
+			return fmt.Errorf("flowLabelNamespaces: %w", err)
+		}
+		if seen[ns] {
+			return fmt.Errorf("flowLabelNamespaces declares %q twice", ns)
+		}
+		seen[ns] = true
 	}
 	return nil
 }
 
-// validateDeclassify checks a declassify directive's label list against the closed native
-// vocabulary. An empty list is rejected for a sharper reason than labelOutput's: it clears
-// nothing yet still ESCALATES every call it sits on, leaving a permanently-refused capability.
-func validateDeclassify(i, j int, labels []string) error {
-	if len(labels) == 0 {
-		return fmt.Errorf("capability at index %d, directive %d: declassify requires a non-empty 'labels' list naming the native flow labels this action clears; an empty list clears nothing while still requiring an approval, so the capability could never be satisfied", i, j)
+// declaredFlowLabelNamespaces indexes the manifest's declaration for the per-label checks.
+// Nil-safe and empty-safe: a policy declaring none simply admits no imported label, which is
+// the correct reading of a manifest that never mentioned a taxonomy.
+func declaredFlowLabelNamespaces(m *LocalManifest) map[string]bool {
+	if m == nil || len(m.FlowLabelNamespaces) == 0 {
+		return nil
 	}
-	for _, l := range labels {
-		if !capability.IsFlowLabel(l) {
-			return fmt.Errorf("capability at index %d, directive %d: declassify 'labels' contains unknown label %q — valid native flow labels are %s", i, j, l, strings.Join(capability.FlowLabelVocabulary(), ", "))
-		}
+	set := make(map[string]bool, len(m.FlowLabelNamespaces))
+	for _, ns := range m.FlowLabelNamespaces {
+		set[ns] = true
 	}
-	return nil
+	return set
 }
 
 // validateDeclassifyCoherence rejects the two constraint shapes a declassify directive cannot

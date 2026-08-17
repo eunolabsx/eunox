@@ -73,7 +73,7 @@ func TestPeekSessionLabels_KnownLabelsStillOrdered(t *testing.T) {
 	present, err := eng.peekSessionLabels(ctx, &capability.EnforceRequest{SessionID: "s"})
 	require.NoError(t, err)
 	want := []string{}
-	for _, l := range flowLabelVocab {
+	for _, l := range capability.NativeFlowLabelVocabulary() {
 		if l == capability.FlowLabelUntrusted || l == capability.FlowLabelConfidential {
 			want = append(want, l)
 		}

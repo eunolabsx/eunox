@@ -25,10 +25,12 @@ import (
 // Under WithTaskAnchoredState the same set is keyed on the validated task instead, so taint
 // crosses a hop between enforcement points rather than restarting clean. See anchor.go.
 
-// flowLabelVocab is the native flow-label vocabulary, cached once from
-// capability.FlowLabelVocabulary so the subset check and the accumulated-set peek do not
-// re-allocate it per request. Read-only.
-var flowLabelVocab = capability.FlowLabelVocabulary()
+// Labels span two axes (see capability/flowlabel.go): the closed native provenance set, and
+// imported "namespace:value" sensitivity classes whose taxonomy eunox does not own. The
+// algebra here is indifferent to which — a label is an opaque set member to the join and the
+// subset check — which is what lets the engine enforce a value set it cannot enumerate. The
+// axes are told apart in exactly two places, neither of them a decision: the canonical
+// ordering (capability.NormalizeFlowLabels) and the wording of a validation error.
 
 // flowKey builds the flow-label store key for a request's anchor. No per-label component: the
 // store holds the whole accumulated SET under one key (Add unions, Get returns the set).
@@ -75,11 +77,11 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	// condition can carry one — surfaced against the AUTHORED set so a manifest typo is still
 	// caught even if a delegation cap happened to remove the entry.
 	for _, l := range fl.Allow {
-		if !capability.IsFlowLabel(l) {
+		if err := capability.ValidateFlowLabel(l); err != nil {
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
 				ConditionType: capability.ConditionTypeFlowLabel,
-				Message:       fmt.Sprintf("flowLabel 'allow' contains unknown label %q; valid native labels are %v", l, flowLabelVocab),
+				Message:       fmt.Sprintf("flowLabel 'allow' is unusable: %v", err),
 			}
 		}
 	}
@@ -220,20 +222,18 @@ func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceR
 	if len(present) == 0 {
 		return nil, nil
 	}
-	inSet := make(map[string]bool, len(present))
 	for _, l := range present {
-		if !capability.IsFlowLabel(l) {
-			return nil, fmt.Errorf("session flow-label store holds %q, which is not in this build's flow-label vocabulary; refusing to evaluate an information-flow policy against a label set this build cannot interpret", l)
+		// Structural, not declaration-based: the imported axis has no closed value set to
+		// check against, so what this can still catch is a label belonging to NEITHER axis
+		// — which is the mixed-version case it exists for, since a build that predates a
+		// native class writes a bare token this one does not know. An imported label is
+		// interpretable by any build that can parse it: the subset check treats it as an
+		// opaque set member, so two versions cannot disagree about what it means.
+		if err := capability.ValidateFlowLabel(l); err != nil {
+			return nil, fmt.Errorf("session flow-label store holds a label this build cannot interpret (%w); refusing to evaluate an information-flow policy against it", err)
 		}
-		inSet[l] = true
 	}
-	var out []string
-	for _, label := range flowLabelVocab {
-		if inSet[label] {
-			out = append(out, label)
-		}
-	}
-	return out, nil
+	return capability.NormalizeFlowLabels(present), nil
 }
 
 // PeekSessionLabels is the exported form of peekSessionLabels, for the audit-mode antecedent
@@ -272,10 +272,10 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 			continue
 		}
 		for _, l := range lo.Labels {
-			if !capability.IsFlowLabel(l) {
+			if err := capability.ValidateFlowLabel(l); err != nil {
 				// Fail closed rather than silently drop, matching handleFlowLabel's Allow
 				// check.
-				return nil, fmt.Errorf("labelOutput contains unknown flow label %q; valid native labels are %v", l, flowLabelVocab)
+				return nil, fmt.Errorf("labelOutput: %w", err)
 			}
 			set[l] = true
 		}
@@ -289,14 +289,13 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 	if req.SessionID == "" {
 		return nil, fmt.Errorf("sessionId is required to record flow labels")
 	}
-	// Canonical vocabulary order for labels_out; the store's Add commits the whole set
-	// atomically, so order matters only for the deterministic audit field.
-	out := make([]string, 0, len(set))
-	for _, label := range flowLabelVocab {
-		if set[label] {
-			out = append(out, label)
-		}
+	// Canonical order for labels_out; the store's Add commits the whole set atomically, so
+	// order matters only for the deterministic audit field.
+	keys := make([]string, 0, len(set))
+	for l := range set {
+		keys = append(keys, l)
 	}
+	out := capability.NormalizeFlowLabels(keys)
 	if err := e.flowStore.Add(ctx, e.flowKey(req), out...); err != nil {
 		return nil, err
 	}
