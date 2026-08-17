@@ -69,14 +69,17 @@ func TestWiring_AbsentSubsystemIsNotAWiringFault(t *testing.T) {
 	assert.NotPanics(t, func() { NewHTTPProxyGateway(HTTPGatewayOptions{Sink: nil, JWTPDP: nil}) })
 }
 
-// typedNilOptions is one nilable stand-in per interface-typed option field, keyed by field name.
-// The guard needs no such list — it reflects over the struct — but a TEST does: nothing can
-// synthesize a value implementing an arbitrary interface at runtime, so each field's is named here
-// and the completeness check below is what makes the naming mandatory rather than optional.
+// typedNilOptions is one nilable stand-in per interface-typed option field, keyed by its dotted
+// PATH from the options struct — the same key the guard's own refusal names, so a field that moves
+// into a nested block needs a new entry rather than silently matching its old leaf name. The guard
+// needs no such list — it reflects over the struct — but a TEST does: nothing can synthesize a
+// value implementing an arbitrary interface at runtime, so each field's is named here and the
+// completeness check below is what makes the naming mandatory rather than optional.
 var typedNilOptions = map[string]any{
-	"KS":     (*killswitch.Redis)(nil),
-	"PDP":    (*pdp.JWTPDP)(nil),
-	"Stderr": (*strings.Builder)(nil),
+	"HTTPGatewayOptions.KS":     (*killswitch.Redis)(nil),
+	"HTTPGatewayOptions.Stderr": (*strings.Builder)(nil),
+	"StdioProxyOptions.PDP":     (*pdp.JWTPDP)(nil),
+	"StdioProxyOptions.Stderr":  (*strings.Builder)(nil),
 }
 
 // TestWiring_GuardCoversEveryInterfaceOption is the completeness half: every interface a caller can
@@ -86,29 +89,119 @@ var typedNilOptions = map[string]any{
 // with no edit to it — which is the property this asserts. A hand-listed guard would leave a later
 // field "unchecked" silently, which is precisely how the kill switch came to be the only subsystem
 // this question was ever asked about.
+//
+// The walk here DESCENDS the same way the guard does. Iterating one level while the guard iterated
+// one level was the shared blind spot: a field moved into a nested options block would leave both
+// green — the guard by not reaching it, the test by not asking about it — which is a completeness
+// claim asserted against its own limitation.
 func TestWiring_GuardCoversEveryInterfaceOption(t *testing.T) {
 	t.Parallel()
 	for _, opts := range []any{HTTPGatewayOptions{}, StdioProxyOptions{}} {
 		ty := reflect.TypeOf(opts)
-		interfaces := 0
-		for i := range ty.NumField() {
-			name := ty.Field(i).Name
-			if ty.Field(i).Type.Kind() != reflect.Interface {
-				continue
-			}
-			interfaces++
-			stand, named := typedNilOptions[name]
+		interfaces := interfaceFieldPaths(ty, ty.Name())
+		require.NotEmpty(t, interfaces, "%s declares no interface fields, so this guard would pass vacuously", ty.Name())
+		for path, index := range interfaces {
+			stand, named := typedNilOptions[path]
 			require.True(t, named,
-				"%s.%s is an interface a caller can hand a typed nil, and this test has no stand-in for it; name one in typedNilOptions so the guard is actually exercised on it", ty.Name(), name)
+				"%s is an interface a caller can hand a typed nil, and this test has no stand-in for it; name one in typedNilOptions so the guard is actually exercised on it", path)
 			v := reflect.New(ty).Elem()
-			v.Field(i).Set(reflect.ValueOf(stand))
+			v.FieldByIndex(index).Set(reflect.ValueOf(stand))
 			assert.PanicsWithValue(t,
-				wiringFault(ty.Name()+"."+name, reflect.TypeOf(stand)),
+				wiringFault(path, reflect.TypeOf(stand)),
 				func() { requireUsableOptions(v.Interface()) },
-				"%s.%s must be refused, naming itself", ty.Name(), name)
+				"%s must be refused, naming itself", path)
 		}
-		require.Positive(t, interfaces, "%s declares no interface fields, so this guard would pass vacuously", ty.Name())
 	}
+}
+
+// interfaceFieldPaths collects every interface-typed field reachable from ty by descending into
+// struct-kind fields, as dotted path -> field index chain. It mirrors requireUsableFields' own
+// traversal — the same descent, the same stopping rule at a pointer, map or slice — so the test
+// asks about exactly the set the guard covers.
+func interfaceFieldPaths(ty reflect.Type, path string) map[string][]int {
+	out := map[string][]int{}
+	for i := range ty.NumField() {
+		field := ty.Field(i)
+		switch field.Type.Kind() {
+		case reflect.Struct:
+			for nested, index := range interfaceFieldPaths(field.Type, path+"."+field.Name) {
+				out[nested] = append([]int{i}, index...)
+			}
+		case reflect.Interface:
+			out[path+"."+field.Name] = []int{i}
+		}
+	}
+	return out
+}
+
+// nestedOptions is the refactor the depth-1 walk would have stopped covering: the two options
+// structs already share ~8 fields, so folding them into a common block is ordinary. Neither ships
+// one today, which is exactly why the descent needs a subject here — otherwise the recursion is
+// asserted only by never being taken.
+type nestedOptions struct {
+	Common struct {
+		Deeper struct{ Stderr io.Writer }
+	}
+}
+
+// TestWiring_GuardDescendsIntoNestedOptions pins the descent itself, at a depth no accidental
+// single `continue` covers, and pins the path the refusal names: "which field" is the whole
+// difference between this panic and the nil dereference it replaces, and a nested field named by
+// its leaf alone is ambiguous the moment two blocks carry a Stderr.
+func TestWiring_GuardDescendsIntoNestedOptions(t *testing.T) {
+	t.Parallel()
+	var deadWriter *strings.Builder
+	opts := nestedOptions{}
+	opts.Common.Deeper.Stderr = deadWriter
+
+	assert.PanicsWithValue(t,
+		wiringFault("nestedOptions.Common.Deeper.Stderr", reflect.TypeOf(deadWriter)),
+		func() { requireUsableOptions(opts) },
+		"a nested options block must not inherit \"unchecked\" — that is the shape the reflective walk exists to keep covered")
+	assert.NotPanics(t, func() { requireUsableOptions(nestedOptions{}) },
+		"and an absent nested field is still absent")
+}
+
+// unreadableOptions holds the one shape the walk cannot answer for: a WIRED interface it may not
+// read. An unexported field left absent needs no reading and is not this refusal's subject.
+type unreadableOptions struct{ hidden io.Writer }
+
+// TestWiring_UnexportedInterfaceIsRefusedRatherThanSkipped is what makes the completeness claim
+// true rather than approximate.
+//
+// reflect can see an unexported field but not hand its value over, so the walk has two options and
+// only one of them is honest: skipping it is the silent "unchecked" the reflective shape exists to
+// remove, arriving through a nested block whose author had no reason to think about this file.
+func TestWiring_UnexportedInterfaceIsRefusedRatherThanSkipped(t *testing.T) {
+	t.Parallel()
+	assert.PanicsWithValue(t,
+		"eunox: unreadableOptions.hidden is a wired unexported interface field, which requireUsableOptions cannot read — "+
+			"it would inherit \"unchecked\" silently. Export it, or keep the subsystem out of the options struct.",
+		func() { requireUsableOptions(unreadableOptions{hidden: io.Discard}) },
+		"an unreadable field must be refused by name, not skipped")
+	assert.NotPanics(t, func() { requireUsableOptions(unreadableOptions{}) },
+		"an ABSENT unexported field is not the subject: there is nothing to read and nothing to refuse")
+}
+
+// TestWiring_TheGuardStopsAtAPointer pins the OTHER side of the descent, which is a decision rather
+// than a limit: a pointer field is a subsystem the CALLER built, and judging its internals by this
+// guard's rule would refuse a construct whose own package deliberately holds a typed nil somewhere.
+// What this guard refuses is the caller's wiring.
+func TestWiring_TheGuardStopsAtAPointer(t *testing.T) {
+	t.Parallel()
+	type held struct{ W io.Writer }
+	type opts struct{ Sub *held }
+
+	var deadWriter *strings.Builder
+	assert.NotPanics(t, func() { requireUsableOptions(opts{Sub: &held{W: deadWriter}}) },
+		"the walk must not look through a pointer into a subsystem the caller built")
+	// The live example of that residual is closed at its own construction site instead.
+	assert.PanicsWithValue(t,
+		wiringFault(`HTTPGatewayOptions.Routes["a"].pdp`, reflect.TypeOf((*pdp.JWTPDP)(nil))),
+		func() {
+			NewHTTPProxyGateway(HTTPGatewayOptions{Routes: map[string]*UpstreamRoute{"a": {name: "a", pdp: (*pdp.JWTPDP)(nil)}}})
+		},
+		"a route's PDP is the one interface held inside a map value, and it must be refused by name rather than left to visibility")
 }
 
 // TestWiring_NonStructArgumentIsRefusedByName pins the guard against becoming the crash it

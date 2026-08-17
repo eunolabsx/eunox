@@ -24,21 +24,24 @@
 // completeness — adding a parameter changes the signature, which a struct field does not).
 //
 // The residual, stated rather than implied, because the first version of this paragraph claimed a
-// coverage that does not exist. requireUsableOptions reaches TOP-LEVEL interface fields only, and
-// StdioProxyOptions carries no kill switch, counter or flow store at all — they reach that
-// transport through LoadUpstreamPDP, which is why that seam and BuildRoutes check their own. A
-// field that is a map, slice or struct is not descended into: HTTPGatewayOptions.Routes is the live
-// example, so NewHTTPProxyGateway checks its values for nil where it walks them, and what stays
-// outside every check is an interface held INSIDE an UpstreamRoute — closed today by visibility
-// rather than by rule (those fields are unexported, so only BuildRoutes and WrapRoutesWithJWT can
-// populate them). Worth knowing before a nested options struct is added, since that is the shape
-// the reflective walk would silently stop covering.
+// coverage that does not exist. requireUsableOptions descends into struct-kind fields (so a nested
+// options block cannot inherit "unchecked" — see requireUsableFields for why that terminates), but
+// StdioProxyOptions carries no kill switch, counter or flow store at all: they reach that transport
+// through LoadUpstreamPDP, which is why that seam and BuildRoutes check their own. What the walk
+// still does not look through is a POINTER, MAP or SLICE — deliberately for the first, since a
+// pointer field is a subsystem the caller built and its internals are its own package's business.
+// HTTPGatewayOptions.Routes is the live map, and it is closed at its own construction site:
+// NewHTTPProxyGateway refuses a nil route value AND the one interface a route holds. That leaves no
+// interface in either options graph outside a check, and the limit itself is asserted by
+// wiring_test.go rather than resting on this paragraph.
 
 package transport
 
 import (
 	"fmt"
 	"reflect"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // requireUsableOptions refuses an options struct carrying a WIRED-but-nil interface field, naming
@@ -65,25 +68,66 @@ import (
 // It refuses a non-struct argument by name rather than reaching NumField and dying inside reflect:
 // the parameter is `any`, so a caller passing &opts compiles, and "reflect: NumField of non-struct
 // type *transport.HTTPGatewayOptions" names neither the field nor the fault — which is the crash
-// this whole file exists to replace, one level up. Same rule nilValue states for its kind list.
+// this whole file exists to replace, one level up.
 func requireUsableOptions(opts any) {
 	v := reflect.ValueOf(opts)
 	if v.Kind() != reflect.Struct {
 		panic(fmt.Sprintf("eunox: requireUsableOptions needs an options struct by value, got %T", opts))
 	}
+	requireUsableFields(v.Type().Name(), v)
+}
+
+// requireUsableFields is the walk itself, over one struct and every struct NESTED in it by value.
+//
+// It descends because a depth-1 walk contradicted the completeness claim above in exactly the shape
+// the reflection was chosen to prevent: the two options structs already share ~8 fields, so folding
+// them into a `Common CommonOptions` block is an ordinary refactor that moves Stderr — and any
+// future subsystem — one level down, where a depth-1 walk stops seeing it and the test asserting
+// the walk's coverage stops asserting on it. Both would still pass, which is the failure mode a
+// hand-listed set has.
+//
+// Descending needs no visited set and no depth cap, and that is a property of the type system
+// rather than of today's structs: Go forbids a struct type from containing itself by value,
+// directly or transitively, so the value-struct graph reachable from here is finite and acyclic.
+// Only VALUE structs are descended into for that reason — and for a second one that matters more:
+// a POINTER field is a subsystem the caller built (an *audit.Sink, an *pdp.JWTPDP), and walking
+// into one would judge that subsystem's internal wiring by this guard's rule, refusing a construct
+// whose own package deliberately holds a typed nil somewhere. The caller's wiring is what this
+// refuses; what a subsystem does inside itself is not this guard's business.
+//
+// What that leaves is the map/slice/pointer residual, which is ASSERTED by the test rather than
+// only described here: HTTPGatewayOptions.Routes is the live one, and it is closed at its own
+// construction site (NewHTTPProxyGateway checks each route's value AND its PDP, the one interface
+// held inside one).
+func requireUsableFields(path string, v reflect.Value) {
 	ty := v.Type()
 	for i := range ty.NumField() {
-		field := v.Field(i)
-		if field.Kind() != reflect.Interface || field.IsNil() {
-			// A nil interface is ABSENT, which is the caller's own business: every constructor here
-			// already decides what an omitted subsystem means (a deny-all PDP, an in-memory kill
-			// switch, os.Stderr), and those decisions are deliberate.
-			continue
+		field, name := v.Field(i), path+"."+ty.Field(i).Name
+		switch field.Kind() {
+		case reflect.Struct:
+			requireUsableFields(name, field)
+		case reflect.Interface:
+			if field.IsNil() {
+				// A nil interface is ABSENT, which is the caller's own business: every constructor
+				// here already decides what an omitted subsystem means (a deny-all PDP, an
+				// in-memory kill switch, os.Stderr), and those decisions are deliberate.
+				continue
+			}
+			if !field.CanInterface() {
+				// Refused rather than skipped, so the completeness claim stays TRUE: an unexported
+				// interface field is one this walk cannot read, and skipping it is precisely the
+				// silent "unchecked" the reflective shape exists to remove. Unreachable from either
+				// options struct today; it is the nested-block refactor that could introduce one.
+				panic(fmt.Sprintf(
+					"eunox: %s is a wired unexported interface field, which requireUsableOptions cannot read — "+
+						"it would inherit \"unchecked\" silently. Export it, or keep the subsystem out of the options struct.",
+					name))
+			}
+			if !capability.IsTypedNil(field.Interface()) {
+				continue
+			}
+			panic(wiringFault(name, field.Elem().Type()))
 		}
-		if !nilValue(field.Elem()) {
-			continue
-		}
-		panic(wiringFault(ty.Name()+"."+ty.Field(i).Name, field.Elem().Type()))
 	}
 }
 
@@ -100,7 +144,7 @@ func requireUsableOptions(opts any) {
 // an unwired backend denies rather than panics. A TYPED nil defeats that guard — it is the case
 // those `== nil` tests cannot see — and reaches AdmitAll on the enforcement goroutine.
 func requireUsable(field string, v any) {
-	if v == nil || !nilInterface(v) {
+	if v == nil || !capability.IsNilValue(v) {
 		return
 	}
 	panic(wiringFault(field, reflect.TypeOf(v)))
@@ -120,36 +164,11 @@ func wiringFault(field string, held reflect.Type) string {
 		field, held)
 }
 
-// nilInterface reports whether v holds no value at all — the interface itself nil, or a typed nil
-// inside a non-nil interface. The ONE answer in this package to a question several call sites ask
-// (a diagnostic seam's subsystem, a server-initiated leg's sink), because `x == nil` compares the
-// INTERFACE and passes for an interface holding a nil pointer, whose method then dereferences a nil
-// receiver.
-//
-// It answers for a value that IS nil, never for a wrapper AROUND one: reflecting into an embedded
-// field would refuse decorators that legitimately forward elsewhere.
-func nilInterface(v any) bool {
-	if v == nil {
-		return true
-	}
-	return nilValue(reflect.ValueOf(v))
-}
-
-// nilValue reports whether rv is a nil of a kind that HAS a nil. The kinds are named rather than
-// tried because IsNil panics on any other one — a guard must not become the crash it prevents — and
-// reflection rather than a type switch for redisutil.IsNilClient's reason one layer down: a list of
-// concrete types is a second thing to keep in agreement, while nilness is one question for every
-// type including one nobody has written yet.
-//
-// Interface is in the list for completeness and is unreachable from both callers: reflect.ValueOf
-// unwraps to the dynamic type, and Value.Elem() on an interface field yields its DYNAMIC value,
-// which Go never lets be another interface. It is here so the list enumerates IsNil's whole panic
-// set rather than the subset today's callers happen to reach.
-func nilValue(rv reflect.Value) bool {
-	switch rv.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
-		return rv.IsNil()
-	default:
-		return false
-	}
-}
+// The nilness question this file asks — "the interface itself nil, or a typed nil inside a non-nil
+// one" — is capability.IsNilValue's, not a predicate of this package's own. It used to be both: a
+// kind switch here and a composition over it, against a shared answer this package already links in
+// dozens of files. The dependency-weight argument that licenses internal/redisutil's separate copy
+// (go-redis and the stdlib alone) does not apply here, so the copy existed for no stated reason —
+// and its kind list had drifted WIDER than the shared one, which is the direction that hides the
+// divergence: every current field is pointer-shaped, so the two agreed until the first func- or
+// map-typed subsystem. The shared predicate is now the wide one and this file has none.

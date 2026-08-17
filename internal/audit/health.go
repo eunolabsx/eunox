@@ -33,20 +33,29 @@ import "errors"
 // documented answer and the shipped one disagreed, and the next consumer to follow the documented
 // one would report a proxy writing no audit trail at all as operating normally. "There is no trail
 // to read" is a statement about audit coverage like the two counters are, so it is answered here,
-// once. The verdict below therefore reports an absent sink, which is what the one production
-// consumer already did by hand; a consumer that wants the OPPOSITE for a deployment where no sink
-// is expected (--require-audit=off wires none) reads the Absent field rather than re-deriving the
-// fact from wiring it holds separately.
+// once. The verdict below therefore reports a sink that is not present, which is what the one
+// production consumer already did by hand; a consumer that wants the OPPOSITE for a deployment
+// where no sink is expected (--require-audit=off wires none) reads the Present field rather than
+// re-deriving the fact from wiring it holds separately.
+//
+// The ZERO value is therefore a DEGRADED reading, not a healthy one, and that is the fail-safe
+// direction the health seam requires of every sample that satisfies it (see the rule stated on
+// internal/transport's healthReporter). Stated as Present rather than Absent for exactly that: with
+// the polarity the other way a Health{} that reached a consumer before being filled in — a future
+// second sink, a sample built by a test double — reported a healthy audit trail, while the sibling
+// subsystem answering the same seam reported an outage from ITS zero value. One seam whose two
+// implementations fail in opposite directions is a seam with no rule.
 type Health struct {
-	// Absent reports that there is no sink: this is a reading taken of nothing. The counters below
-	// are zero because nothing was measured, not because nothing was lost, which is the distinction
-	// a consumer rendering them needs — and the reason this is a field rather than a nil sample.
+	// Present reports that there IS a sink behind this reading. False means the sample was taken of
+	// nothing: the counters below are zero because nothing was measured, not because nothing was
+	// lost, which is the distinction a consumer rendering them needs — and the reason this is a
+	// field rather than a nil sample.
 	//
 	// Not the kind of field the doc below refuses. That argument is about carrying a VERDICT beside
 	// the counters it should be derived from; this is an input to the verdict, and the only
-	// constructor is Sink.Health, which sets it exactly when there is no sink to read the counters
-	// from — so an Absent sample with non-zero counters is unreachable rather than merely unwritten.
-	Absent bool
+	// constructor is Sink.Health, which sets it exactly when there is a sink to read the counters
+	// from — so an absent sample with non-zero counters is unreachable rather than merely unwritten.
+	Present bool
 	// Dropped and WriteFailures are the two coverage counters, sampled together. They are distinct
 	// findings for an operator: Dropped is back-pressure on a healthy file (the write queue could
 	// not keep up), WriteFailures is the backing file itself refusing (full disk, EIO, a file lost
@@ -67,7 +76,8 @@ type Health struct {
 	MaintenanceReason  string
 }
 
-// Health samples this sink's operational state. A nil sink answers Absent, for the reason stated on
+// Health samples this sink's operational state. A nil sink answers the zero value — not present,
+// and therefore degraded — for the reason stated on
 // the type — nil-safe deliberately, so a consumer holding an optional sink takes one reading
 // through the same call rather than branching before it and answering for absence itself.
 //
@@ -76,9 +86,9 @@ type Health struct {
 // to read them.
 func (s *Sink) Health() Health {
 	if s == nil {
-		return Health{Absent: true}
+		return Health{}
 	}
-	h := Health{Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
+	h := Health{Present: true, Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
 	h.MaintenanceStalled, h.MaintenanceReason = s.MaintenanceStalled()
 	return h
 }
@@ -99,7 +109,7 @@ func (s *Sink) Health() Health {
 // string can still tell them apart — which is the whole content of the carve-out.
 func (h Health) HealthStatus() error {
 	var causes []error
-	if h.Absent {
+	if !h.Present {
 		causes = append(causes, errors.New("no audit sink: this proxy writes no audit trail"))
 	}
 	if degraded, reason := coverageLost(h.Dropped, h.WriteFailures); degraded {

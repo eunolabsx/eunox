@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/circuitbreaker"
 )
 
@@ -32,6 +33,23 @@ import (
 // independent reading and can report a servable key set beside a verdict saying every token fails
 // closed. Splitting verdict from detail this way is also what lets ONE seam serve subsystems whose
 // details have nothing in common — an `error` has no room for a breaker state plus two counters.
+//
+// ABSENCE is the third part of the rule, and it is two conventions rather than one because the
+// subsystems are answering two different questions:
+//
+//   - Absence that is itself a FINDING belongs IN the sample. A proxy writing no audit trail is a
+//     readiness regression, so audit.Health carries Present and its verdict reports the lack.
+//   - Absence that merely means "there is nothing wired to report on" belongs in an `ok` result the
+//     caller honours, and nothing is folded. A proxy with no JWT layer folds no JWKS verdict; there
+//     is no key fetching to be healthy or unhealthy about.
+//
+// What the two must NOT differ on is the direction their ZERO value fails: a sample that reaches
+// fold before being filled in must report a degradation. That is a seam contract nothing reaches
+// today and the reason to state it is the next optional subsystem (a second sink, an effect-receipt
+// verifier): it arrives with two shipped precedents, and until this was written they failed in
+// OPPOSITE directions — capability.KeyFetchHealth{} reported an outage while audit.Health{} was a
+// healthy sink with nothing wrong. Either choice above is defensible; a zero value that reports
+// green is not, whichever one is made.
 //
 // What differs per subsystem is only how the proxy REACHES it, which is a property of what it
 // holds rather than a second pattern: every killswitch.Manager answers the seam live (in-memory
@@ -118,7 +136,7 @@ func (s *healthSnapshot) fold(h healthReporter, healthy *bool) {
 	if h == nil {
 		return
 	}
-	if !nilInterface(h) && h.HealthStatus() == nil {
+	if !capability.IsNilValue(h) && h.HealthStatus() == nil {
 		return
 	}
 	*healthy = false
@@ -152,7 +170,7 @@ func (p *HTTPProxy) snapshot() healthSnapshot {
 	// ABSENCE used to be the one part this file answered for itself, which left the sink's
 	// documented verdict for a nil receiver ("healthy") contradicting its only consumer.
 	h := p.sink.Health()
-	snap.AuditConfigured = !h.Absent
+	snap.AuditConfigured = h.Present
 	snap.AuditDropped = h.Dropped
 	snap.AuditWriteFailed = h.WriteFailures
 	snap.AuditMaintenanceStalled, snap.AuditMaintenanceReason = h.MaintenanceStalled, h.MaintenanceReason

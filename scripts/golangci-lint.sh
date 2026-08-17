@@ -13,7 +13,7 @@
 # repo targets does not lint anything at all -- it refuses to load the config:
 #
 #   Error: can't load config: the Go language version (go1.25) used to build golangci-lint
-#   is lower than the targeted Go version (1.26.5)
+#   is lower than the targeted Go version (1.26.6)
 #
 # That reads as "the linter is unavailable here", so a contributor falls back to `go vet`
 # (clean) and pushes, and CI then fails on findings no local run could surface. The version
@@ -22,10 +22,12 @@
 # version is EXACTLY the pin and it was built with a Go at least as new as go.mod targets,
 # and otherwise installs that exact version itself.
 #
-# The install forces GOTOOLCHAIN to go.mod's Go version deliberately. golangci-lint's own
-# go.mod may name an older toolchain, and `go install` honors THAT -- producing a correctly
-# versioned binary that still refuses this repo. Forcing the toolchain builds the pinned
-# release with a new enough Go to lint us.
+# The install pins GOTOOLCHAIN to go.mod's Go version as a FLOOR ("go1.26.6+auto")
+# deliberately. golangci-lint's own module names an older toolchain, and `go install` honors
+# THAT -- downloading an older Go and producing a correctly versioned binary that still
+# refuses this repo, even on a machine whose own Go is new enough. The "+auto" form is what
+# makes that a floor rather than a pin: a contributor already on a newer Go keeps it and
+# downloads nothing, which is why this is not the unconditional force it replaced.
 #
 # Usage: GOLANGCI_LINT_VERSION=vX.Y.Z ./scripts/golangci-lint.sh [run-args...]
 #
@@ -53,7 +55,7 @@ if [ -z "$TARGET_GO" ]; then
 	exit 2
 fi
 
-# The linter compares LANGUAGE versions (go1.26 vs 1.26.5 is fine), so both sides are
+# The linter compares LANGUAGE versions (go1.26 vs 1.26.6 is fine), so both sides are
 # truncated to major.minor before comparing.
 lang_version() { printf '%s\n' "${1#go}" | cut -d. -f1,2; }
 
@@ -78,7 +80,7 @@ version_ge() {
 }
 
 # toolchain_name VERSION — go.mod's directive as a resolvable GOTOOLCHAIN name. Releases are
-# always three-component (go1.26.5), while the directive may legally be two (go 1.27), and
+# always three-component (go1.26.6), while the directive may legally be two (go 1.27), and
 # GOTOOLCHAIN=go1.27 resolves to nothing — reported as "could not install golangci-lint",
 # which points the reader at the linter rather than at the toolchain name.
 toolchain_name() {
@@ -91,7 +93,7 @@ toolchain_name() {
 
 # binary_facts BIN — "<version> <goversion>" from ONE `version` invocation, or nothing.
 #
-# The long form carries both facts ("golangci-lint has version 2.12.2 built with go1.26.5
+# The long form carries both facts ("golangci-lint has version 2.12.2 built with go1.26.6
 # from ..."), so probing them separately spawns the binary twice per candidate for no gain,
 # and made the failure message compose to "built with gounknown" when the file was absent.
 # `version --short` is the fallback for an output shape that stops matching, so a future
@@ -139,19 +141,18 @@ for cand in "${GOLANGCI_LINT:-}" "$(command -v golangci-lint 2>/dev/null || true
 done
 
 if [ -z "$BIN" ]; then
-	# Force the toolchain only when the local one is OLDER than this repo targets. Forcing
-	# unconditionally downgrades a contributor already on a newer Go into downloading an
-	# older toolchain they do not need — which simply fails behind GOPROXY=off, an air gap,
-	# or a proxy that does not mirror golang.org/toolchain.
-	local_go=$($GO env GOVERSION)
-	toolchain=""
-	if ! version_ge "$(lang_version "$local_go")" "$(lang_version "$TARGET_GO")"; then
-		toolchain=$(toolchain_name "$TARGET_GO")
-		echo "Installing golangci-lint $WANT (the version CI pins), built with $toolchain..."
-	else
-		echo "Installing golangci-lint $WANT (the version CI pins), built with $local_go..."
-	fi
-	if ! GOTOOLCHAIN="${toolchain:-auto}" $GO install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$WANT"; then
+	# A FLOOR rather than a pin, and never "auto". Auto honors the toolchain line in
+	# golangci-lint's OWN module, which names an older Go than this repo targets -- so a
+	# contributor on a perfectly new toolchain got a binary built with the older one and the
+	# usable() check below rejected the script's own install, ending in the "linter
+	# unavailable" state this file exists to remove. Pinning outright is the other wrong
+	# answer: it downgrades a contributor already on a newer Go into downloading a toolchain
+	# they do not need, which simply fails behind GOPROXY=off, an air gap, or a proxy that
+	# does not mirror golang.org/toolchain. "<name>+auto" is neither: at least this version,
+	# whatever is already there if it is newer.
+	toolchain="$(toolchain_name "$TARGET_GO")+auto"
+	echo "Installing golangci-lint $WANT (the version CI pins), built with $toolchain or newer..."
+	if ! GOTOOLCHAIN="$toolchain" $GO install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$WANT"; then
 		echo "" >&2
 		echo "golangci-lint.sh: could not install golangci-lint $WANT." >&2
 		echo "Install it manually (https://golangci-lint.run/docs/welcome/install/) and re-run," >&2

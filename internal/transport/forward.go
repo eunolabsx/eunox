@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sync/atomic"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/audit"
@@ -359,7 +358,7 @@ type strictAuditState struct {
 	requireAuditStrict bool
 	// strictAuditWarned makes the strict-gate stderr warning one-shot — the gate is sticky, so
 	// it would otherwise log on every forward. nil disables the warning (tests).
-	strictAuditWarned *atomic.Bool
+	strictAuditWarned *noticeLatch
 }
 
 // auditGateTripped reports whether --require-audit=strict should fail a forward closed.
@@ -374,8 +373,8 @@ func auditGateTripped(rec auditRecorder, strict bool) (tripped bool, reason stri
 
 // warnStrictAuditOnce emits the "strict mode is now denying forwards" diagnostic line once
 // per process, on the first trip; later denials remain visible as AUDIT_UNAVAILABLE records.
-func warnStrictAuditOnce(w io.Writer, warned *atomic.Bool, reason string) {
-	if warned != nil && warned.CompareAndSwap(false, true) {
+func warnStrictAuditOnce(w io.Writer, warned *noticeLatch, reason string) {
+	if warned.admitOnce() {
 		_, _ = fmt.Fprintf(w,
 			"[eunox] SECURITY: --require-audit=strict is now denying forwards (AUDIT_UNAVAILABLE) until restart — %s. "+
 				"Each denied call is recorded as an AUDIT_UNAVAILABLE audit record.\n",
