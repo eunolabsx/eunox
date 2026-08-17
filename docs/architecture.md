@@ -395,6 +395,16 @@ Mechanics:
   earlier rotated file.
 - In gateway mode, `routeSink` stamps `upstream`, `policy_version`, and
   `policy_sha256` onto every record.
+- `--audit-pep` / `audit.pep` names this enforcement point, stamped as `pep`
+  (`"mcp:<name>"` — the binding it enforces at, plus the name) on every record
+  including the synthetic integrity markers, since those are written by the
+  enforcement point about its own tape and no request produces them. Each
+  instance signs its own chain over its own tape, so a sequence crossing two of
+  them is reconstructed by reading both and joining on `task_id`; the field is
+  what keeps each line attributable once they are merged. Unset stamps nothing.
+  Resuming a tape whose tail names a different enforcement point warns at
+  startup — the chain resumes normally, and the boundary needs no marker because
+  every record already names its own writer.
 - Each record carries a structured `target_type`/`target`/`method` taken from the
   MCP method, so consumers classify a decision exactly — even an opaque resource
   URI or an oddly-named tool — rather than guessing from a single overloaded

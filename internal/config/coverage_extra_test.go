@@ -446,6 +446,34 @@ func TestGatewayConfig_ValidateRejections(t *testing.T) {
 			wantSubstr: "rotateSizeBytes",
 		},
 		{
+			// The name lands on a signed, append-only tape, so it is refused at load rather
+			// than sanitized at the sink.
+			name: "unusable audit.pep",
+			cfg: func() GatewayConfig {
+				c := GatewayConfig{
+					SchemaVersion: "0.1",
+					Upstreams:     []UpstreamConfig{{Name: "a", Transport: "stdio", Command: "echo"}},
+				}
+				c.Audit.PEP = "edge 1"
+				return c
+			}(),
+			wantSubstr: "audit.pep",
+		},
+		{
+			// An unset ${VAR} survives expansion as literal text; stamping it would name an
+			// enforcement point that does not exist.
+			name: "audit.pep left an unexpanded env reference",
+			cfg: func() GatewayConfig {
+				c := GatewayConfig{
+					SchemaVersion: "0.1",
+					Upstreams:     []UpstreamConfig{{Name: "a", Transport: "stdio", Command: "echo"}},
+				}
+				c.Audit.PEP = "${EUNOX_PEP}"
+				return c
+			}(),
+			wantSubstr: "audit.pep",
+		},
+		{
 			name: "negative defaults.upstreamTimeoutMs",
 			cfg: func() GatewayConfig {
 				c := GatewayConfig{

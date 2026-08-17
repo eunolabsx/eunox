@@ -207,6 +207,7 @@ type proxyCLIFlags struct {
 	trustFwdFor          *bool
 	auditLog             *string
 	auditKeyPath         *string
+	auditPEP             *string
 	controlTokenPath     *string
 	auditRotateSize      *int64
 	auditRetainRotated   *int
@@ -319,6 +320,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		trustFwdFor:        fs.Bool("trust-forwarded-for", false, "Trust X-Forwarded-For header for source IP. Only use when a trusted reverse proxy always sets this header; direct clients can spoof it."),
 		auditLog:           fs.String("audit-log", "", "Path to the OCSF audit JSONL file (default: ~/.eunox/audit.jsonl). Overridden by the config's audit.log."),
 		auditKeyPath:       fs.String("audit-key-path", "", "Path to the HMAC signing key for the audit log (default: ~/.eunox/audit.key).\nOverrides EUNOX_AUDIT_KEY_PATH. Overridden by the config's audit.keyPath."),
+		auditPEP:           fs.String("audit-pep", "", "Name this enforcement point on every audit record ('pep', stamped as\n\"mcp:<name>\"), so a sequence that crosses more than one eunox instance can be\nattributed once their tapes are read together. Names may use letters, digits,\n'.', '_' and '-'. Unset stamps nothing, which is what a single-enforcement-point\ndeployment wants. Overridden by the config's audit.pep."),
 		controlTokenPath:   fs.String("control-token-path", "", "Path to write the auto-generated loopback control token for POST /control/kill\n(default: ~/.eunox/control.token, mode 0600). The token authenticates the\nemergency-stop endpoint independently of listen.authToken / JWT mode; the\n'eunox kill' HTTP path reads it from here. HTTP transport only."),
 		auditRotateSize:    fs.Int64("audit-rotate-size", 0, "Rotate the audit log when it reaches this size in bytes (default: 100 MiB). Overridden by the config's audit.rotateSizeBytes."),
 		auditRetainRotated: fs.Int("audit-retain", 0, "Keep at most this many rotated audit files (audit.jsonl.<timestamp>); the oldest\nbeyond this count are deleted after each rotation so the log directory cannot grow\nwithout bound. 0 = keep all. Overridden by the config's audit.retainRotated."),
@@ -516,6 +518,7 @@ func cmdProxy(args []string) (exitCode int) {
 		maxSessions:          *f.maxSessions,
 		sessionIdleTimeoutMs: *f.sessionIdleTimeout,
 		redisConfigured:      *f.redisAddr != "",
+		auditPEP:             *f.auditPEP,
 		controlTokenPath:     *f.controlTokenPath,
 		httpOnlyFlagsSet:     httpOnlyFlagsSetOnStdio(fs),
 	}
@@ -561,7 +564,7 @@ func cmdProxy(args []string) (exitCode int) {
 
 	// Open the shared audit sink. The config's audit block takes precedence over
 	// the CLI flags so every route shares one tape.
-	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditRotateSize, *f.auditRetainRotated, flagWasSet(fs, "audit-retain"), cfg, f.requireAudit.required())
+	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditPEP, *f.auditRotateSize, *f.auditRetainRotated, flagWasSet(fs, "audit-retain"), cfg, f.requireAudit.required())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
@@ -823,11 +826,25 @@ func warnAuditFlagOverridden(flagName, flagRepr, cfgField, cfgRepr string) {
 	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %s is overridden by the config's %s %s; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", flagName, flagRepr, cfgField, cfgRepr)
 }
 
+// resolveAuditPEP applies the audit block's precedence to the enforcement-point name alone,
+// without opening anything.
+//
+// Split out of openConfiguredAuditSink because two other callers need the resolved value and
+// neither may open a sink to get it: the task-anchoring advisory, which fires per serve
+// path, and its stdio twin. Pure selection, so calling it three times costs nothing and the
+// three cannot disagree about which name this instance runs under.
+func resolveAuditPEP(auditPEP string, cfg *config.GatewayConfig) string {
+	if cfg.Audit.PEP != "" {
+		return cfg.Audit.PEP
+	}
+	return auditPEP
+}
+
 // openConfiguredAuditSink resolves the audit-sink settings (config's audit block takes
 // precedence over the CLI flags so every route shares one tape) and opens the sink. Under
 // --require-audit an open failure is returned as an error to exit on (fail closed);
 // otherwise it warns and returns a nil sink with a nil error.
-func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
+func openConfiguredAuditSink(auditLog, auditKeyPath, auditPEP string, auditRotateSize int64, auditRetainRotated int, auditRetainSet bool, cfg *config.GatewayConfig, requireAudit bool) (*audit.Sink, error) {
 	auditLogPath, auditKey, auditRotate := auditLog, auditKeyPath, auditRotateSize
 	auditRetain := auditRetainRotated
 	// The config's audit block takes precedence over an explicit flag here (unlike the
@@ -861,7 +878,23 @@ func openConfiguredAuditSink(auditLog, auditKeyPath string, auditRotateSize int6
 		warnAuditFlagOverridden("--audit-retain", fmt.Sprintf("%d", auditRetain), "audit.retainRotated", fmt.Sprintf("%d", *cfg.Audit.RetainRotated))
 	}
 	auditRetain = config.ResolveInt(cfg.Audit.RetainRotated, auditRetain)
-	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, audit.WithIdentity(auditIdentity))
+	// Same precedence, same warning as the four above.
+	if cfg.Audit.PEP != "" && auditPEP != "" && auditPEP != cfg.Audit.PEP {
+		warnAuditFlagOverridden("--audit-pep", fmt.Sprintf("%q", auditPEP), "audit.pep", fmt.Sprintf("%q", cfg.Audit.PEP))
+	}
+	opts := []audit.Option{audit.WithIdentity(auditIdentity)}
+	if resolved := resolveAuditPEP(auditPEP, cfg); resolved != "" {
+		// Refused unconditionally, not folded into the --require-audit stance below: an
+		// unusable name is an operator error with a one-line fix, where that stance decides
+		// what to do about a tape that cannot be opened. Config values already failed
+		// Validate, so what this catches is a bad --audit-pep.
+		ep, err := capability.NewEnforcementPoint(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("audit enforcement-point name: %w", err)
+		}
+		opts = append(opts, audit.WithEnforcementPoint(ep))
+	}
+	sink, err := audit.Open(auditLogPath, auditKey, auditRotate, auditRetain, opts...)
 	if err != nil {
 		if requireAudit {
 			return nil, fmt.Errorf("audit sink could not be opened and --require-audit is not 'off' (it defaults to 'strict'); set a writable audit path or pass --require-audit=off to run unaudited: %w", err)
@@ -1145,6 +1178,7 @@ type proxyFlags struct {
 	maxSessions          int    // global --max-sessions override (0 = unlimited); HTTP only
 	sessionIdleTimeoutMs int    // global --session-idle-timeout override (0 = no reaping); HTTP only
 	redisConfigured      bool   // --redis-addr was set; drives the multi-instance state advisory
+	auditPEP             string // --audit-pep: this enforcement point's name, before the config's audit.pep takes precedence
 	controlTokenPath     string // --control-token-path: where to write the /control/kill control token; HTTP only
 
 	// httpOnlyFlagsSet holds the "--"-prefixed names of every HTTP-only flag the operator
@@ -1379,6 +1413,22 @@ func warnTaskAnchoringWithoutRedis(redisConfigured, taskAnchored bool) {
 	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: taskAnchoredState is enabled but no --redis-addr is set — task-anchored flow labels, budgets and antecedents live in this process only, and a task key outlives the session that created it (nothing tears it down; in this mode the in-memory stores reclaim one idle for %s). A single instance is bounded; more than one will not share a task's state. Configure --redis-addr for multi-instance deployments.\n", flowlabelstore.DefaultIdleTTL)
 }
 
+// warnTaskAnchoringWithoutPEP prints the advisory for task-anchored state on an instance
+// that stamps no enforcement-point name. Task anchoring is the one configurable statement
+// that an operator INTENDS a task to cross enforcement points; with no name on the records,
+// the tapes of the instances it crosses are attributable only by which file they came out
+// of, which does not survive being merged into a SIEM.
+//
+// A notice rather than a refusal, for the reason the redis one is: the combination is
+// legitimate (the second enforcement point may not be standing yet), and an unnamed tape
+// loses attribution rather than enforcement.
+func warnTaskAnchoringWithoutPEP(pepConfigured, taskAnchored bool) {
+	if pepConfigured || !taskAnchored {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[eunox] NOTICE: taskAnchoredState is enabled but no enforcement-point name is set — records carry no 'pep' field, so a task's calls handled by two instances cannot be told apart once their tapes are read together. Set --audit-pep / audit.pep to a distinct name per instance.\n")
+}
+
 // resolveOAuthMetadata builds the RFC 9728 protected-resource metadata document (and its
 // URL), or returns (nil, "", nil) when no resource URI is configured. Fails closed on an
 // invalid URI or an authorization server configured with no resource. Config takes
@@ -1517,6 +1567,7 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	warnNoRedisSharedState(pf.redisConfigured, transport.AnyRouteAccumulatesSharedState(routes))
 	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", anyRouteTaskAnchored(cfg))
 	warnTaskAnchoringWithoutRedis(pf.redisConfigured, anyRouteTaskAnchored(cfg))
+	warnTaskAnchoringWithoutPEP(resolveAuditPEP(pf.auditPEP, cfg) != "", anyRouteTaskAnchored(cfg))
 
 	bind := cfg.Listen.Bind
 	if bind == "" {
@@ -1669,6 +1720,7 @@ func serveStdioHost(ctx context.Context, cfg *config.GatewayConfig, sink *audit.
 	// upstream, so scanning the whole file would advise about a route not being served here.
 	warnTaskAnchoringWithoutJWT(pf.jwksURI != "", cfg.ResolvedTaskAnchoredState(u))
 	warnTaskAnchoringWithoutRedis(pf.redisConfigured, cfg.ResolvedTaskAnchoredState(u))
+	warnTaskAnchoringWithoutPEP(resolveAuditPEP(pf.auditPEP, cfg) != "", cfg.ResolvedTaskAnchoredState(u))
 
 	// Absent (the default) leaves the verifier nil; a configured-but-unreadable key set is
 	// fatal, since a path typo degrading to "no receipt ever verifies" is indistinguishable

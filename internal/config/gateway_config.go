@@ -353,8 +353,14 @@ type GatewayConfig struct {
 	} `yaml:"listen"`
 
 	Audit struct {
-		Log             string `yaml:"log"`
-		KeyPath         string `yaml:"keyPath"`
+		Log     string `yaml:"log"`
+		KeyPath string `yaml:"keyPath"`
+		// PEP names this enforcement point on every record of the tape, so a sequence
+		// spanning more than one of them can be attributed once the tapes are read
+		// together. Empty (the default) stamps nothing, which is honest for the
+		// single-enforcement-point deployment. See capability.NewEnforcementPoint for the
+		// accepted names.
+		PEP             string `yaml:"pep"`
 		RotateSizeBytes int64  `yaml:"rotateSizeBytes"`
 		// RetainRotated bounds how many rotated audit files are kept; the oldest beyond
 		// this count are deleted. 0 ⟹ keep every rotated file. The active log is never
@@ -955,6 +961,14 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 	}
 	if cfg.Audit.RetainRotated != nil && *cfg.Audit.RetainRotated < 0 {
 		return fmt.Errorf("audit.retainRotated %d must not be negative (0 = keep all rotated files)", *cfg.Audit.RetainRotated)
+	}
+	// Refused at load rather than sanitized at the sink: the name goes onto a signed,
+	// append-only tape, so a value eunox had to repair is one the operator cannot join
+	// against whatever they configured elsewhere. Absent stays valid — it stamps nothing.
+	if cfg.Audit.PEP != "" {
+		if _, err := capability.NewEnforcementPoint(cfg.Audit.PEP); err != nil {
+			return fmt.Errorf("audit.pep: %w", err)
+		}
 	}
 	// Defaults posture: validate the enforcement value.
 	if !validEnforcementValue(cfg.Defaults.Enforcement) {
