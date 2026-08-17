@@ -343,8 +343,11 @@ Every decision — allow or deny — is appended to a local **OCSF-inspired JSON
 | Signing key | `~/.eunox/audit.key` (32-byte key, generated on first run, mode `0600`)       | `--audit-key-path <path>` or `EUNOX_AUDIT_KEY_PATH`   |
 | Rotation    | rotates at 100 MiB → `audit.jsonl.<timestamp>`                                | `--audit-rotate-size <bytes>`                         |
 | Retention   | keeps every rotated file by default                                           | `--audit-retain <n>` / `audit.retainRotated`          |
+| Enforcement point | not stamped                                                             | `--audit-pep <name>` / `audit.pep`                    |
 
 The signing key is created once and never silently overwritten: if the key file exists but is unreadable or corrupt, the proxy fails fast rather than re-keying and invalidating every prior record.
+
+Each eunox instance signs its own chain over its own tape, so a sequence that crosses two of them is reconstructed by reading both tapes and joining on the task. Naming each instance with `--audit-pep` puts that name in every record's signed `pep` field (`"mcp:<name>"` — the binding it enforces at, plus the name), so the attribution survives being merged into a SIEM, where the file a record came out of is gone. Unset stamps nothing, which is what a single-instance deployment wants.
 
 ```bash
 eunox stats           # per-tool allow/deny histogram from the log

@@ -1729,7 +1729,7 @@ func TestOpenConfiguredAuditSink_ConfigOverridesFlags(t *testing.T) {
 	var sink *audit.Sink
 	var openErr error
 	stderr := captureStderr(t, func() {
-		sink, openErr = openConfiguredAuditSink("/flag-log.jsonl", "/flag-key", 1, 1, true, cfg, false)
+		sink, openErr = openConfiguredAuditSink("/flag-log.jsonl", "/flag-key", "", 1, 1, true, cfg, false)
 	})
 	if openErr != nil {
 		t.Fatalf("unexpected error: %v", openErr)
@@ -1774,7 +1774,7 @@ func TestOpenConfiguredAuditSink_NoRetainWarningWhenFlagUnset(t *testing.T) {
 	var sink *audit.Sink
 	var openErr error
 	stderr := captureStderr(t, func() {
-		sink, openErr = openConfiguredAuditSink("", "", 0, 0, false, cfg, false)
+		sink, openErr = openConfiguredAuditSink("", "", "", 0, 0, false, cfg, false)
 	})
 	if openErr != nil {
 		t.Fatalf("unexpected error: %v", openErr)
@@ -1798,7 +1798,7 @@ func TestOpenConfiguredAuditSink_NoWarningWhenFlagUnset(t *testing.T) {
 	var sink *audit.Sink
 	var openErr error
 	stderr := captureStderr(t, func() {
-		sink, openErr = openConfiguredAuditSink("", "", 0, 0, false, cfg, false)
+		sink, openErr = openConfiguredAuditSink("", "", "", 0, 0, false, cfg, false)
 	})
 	if openErr != nil {
 		t.Fatalf("unexpected error: %v", openErr)
@@ -1817,7 +1817,7 @@ func TestOpenConfiguredAuditSink_Success(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 
-	sink, err := openConfiguredAuditSink(logPath, keyPath, 0, 0, false, &config.GatewayConfig{}, true)
+	sink, err := openConfiguredAuditSink(logPath, keyPath, "", 0, 0, false, &config.GatewayConfig{}, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1837,7 +1837,7 @@ func TestOpenConfiguredAuditSink_NonFatalFailure(t *testing.T) {
 	}
 	logPath := filepath.Join(blocker, "subdir", "audit.jsonl")
 
-	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, false, &config.GatewayConfig{}, false)
+	sink, err := openConfiguredAuditSink(logPath, "", "", 0, 0, false, &config.GatewayConfig{}, false)
 	if err != nil {
 		t.Fatalf("an open failure without --require-audit must not be an error: %v", err)
 	}
@@ -1858,7 +1858,7 @@ func TestOpenConfiguredAuditSink_FatalFailureReturnsError(t *testing.T) {
 	}
 	logPath := filepath.Join(blocker, "subdir", "audit.jsonl")
 
-	sink, err := openConfiguredAuditSink(logPath, "", 0, 0, false, &config.GatewayConfig{}, true)
+	sink, err := openConfiguredAuditSink(logPath, "", "", 0, 0, false, &config.GatewayConfig{}, true)
 	if err == nil {
 		t.Fatal("expected an error when the sink cannot be opened under --require-audit")
 	}

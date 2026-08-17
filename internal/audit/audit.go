@@ -64,20 +64,39 @@ type auditRecord struct {
 	// Delegate is IdP-supplied (structure-validated, not length-bounded at the source) and is
 	// bounded exactly like AgentID/TaskID/UserID. Both are omitted for the overwhelming
 	// majority of records, which carry no delegation at all.
-	Delegate        string          `json:"delegate,omitempty"`
-	DelegationDepth int             `json:"delegation_depth,omitempty"`
-	Upstream        string          `json:"upstream,omitempty"`       // gateway route name (empty in single-upstream mode)
-	PolicyVersion   string          `json:"policy_version,omitempty"` // manifest.Version in force for this decision
-	PolicySHA256    string          `json:"policy_sha256,omitempty"`  // digest of the canonical policy document
-	TargetType      string          `json:"target_type,omitempty"`    // "tool" | "resource" | "prompt" | "system"; namespace taken from the MCP method, not the raw identifier
-	Target          string          `json:"target,omitempty"`         // canonical bare target: tool name, resource URI, prompt name, or "sampling/createMessage"
-	Method          string          `json:"method,omitempty"`         // MCP method that produced the decision, e.g. "tools/call"
-	Decision        string          `json:"decision"`                 // "allow" | "deny" | "escalate"
-	AuditOnly       bool            `json:"audit_only,omitempty"`     // true when the decision was observed, not enforced (audit mode)
-	DenialCode      string          `json:"denial_code,omitempty"`
-	ConditionType   string          `json:"condition_type,omitempty"`
-	Details         json.RawMessage `json:"details,omitempty"` // marshaled once at record time (marshalAndBoundDetails); writeRecord embeds it verbatim rather than re-marshaling the map
-	Obligations     []string        `json:"obligations,omitempty"`
+	Delegate        string `json:"delegate,omitempty"`
+	DelegationDepth int    `json:"delegation_depth,omitempty"`
+	// PEP names the policy-enforcement point that WROTE this record: the protocol binding
+	// it enforces at plus the operator's name for the instance ("mcp:edge-1"), from
+	// --audit-pep / audit.pep.
+	//
+	// Every other provenance field on the record answers a question about the decision;
+	// this one answers a question about the writer, which is why it is stamped from the
+	// Sink rather than passed per record — a synthetic marker no request produced (a
+	// dropped-records or chain-resume marker) belongs to the enforcement point exactly as
+	// a decision does, and a per-call parameter would leave those blank.
+	//
+	// It is per RECORD rather than a header the file carries once because that is what
+	// makes a tape self-describing: a log resumed by a differently-named instance stays
+	// legible record by record, and a cross-boundary sequence assembled from several
+	// enforcement points' tapes (join on task_id, partition on this) needs the attribution
+	// to survive being split apart and re-sorted. Bounded once, at WithEnforcementPoint,
+	// because it cannot change for the process's lifetime — the same treatment the route
+	// provenance triple gets. Omitted when no enforcement point is configured, which is
+	// honest: a single-PEP deployment has nothing to disambiguate.
+	PEP           string          `json:"pep,omitempty"`
+	Upstream      string          `json:"upstream,omitempty"`       // gateway route name (empty in single-upstream mode)
+	PolicyVersion string          `json:"policy_version,omitempty"` // manifest.Version in force for this decision
+	PolicySHA256  string          `json:"policy_sha256,omitempty"`  // digest of the canonical policy document
+	TargetType    string          `json:"target_type,omitempty"`    // "tool" | "resource" | "prompt" | "system"; namespace taken from the MCP method, not the raw identifier
+	Target        string          `json:"target,omitempty"`         // canonical bare target: tool name, resource URI, prompt name, or "sampling/createMessage"
+	Method        string          `json:"method,omitempty"`         // MCP method that produced the decision, e.g. "tools/call"
+	Decision      string          `json:"decision"`                 // "allow" | "deny" | "escalate"
+	AuditOnly     bool            `json:"audit_only,omitempty"`     // true when the decision was observed, not enforced (audit mode)
+	DenialCode    string          `json:"denial_code,omitempty"`
+	ConditionType string          `json:"condition_type,omitempty"`
+	Details       json.RawMessage `json:"details,omitempty"` // marshaled once at record time (marshalAndBoundDetails); writeRecord embeds it verbatim rather than re-marshaling the map
+	Obligations   []string        `json:"obligations,omitempty"`
 	// LabelsOut and CarriedLabels are the information-flow-control fields: the flow
 	// labels this call's output asserted into the session (labelsOut, from its
 	// labelOutput directives) and the session's accumulated label set observed at
@@ -246,6 +265,12 @@ type Sink struct {
 	// request context. Injected via WithIdentity so the audit subsystem need not depend on
 	// the JWT/PDP layer; nil leaves every identity field empty.
 	identity func(ctx context.Context) Identity
+
+	// pep is this enforcement point's stamp, already bounded, written onto every record
+	// including the synthetic markers. Empty when none is configured. Injected via
+	// WithEnforcementPoint; see auditRecord.PEP for why it is held here rather than passed
+	// per record.
+	pep string
 
 	// activePath is the file the current fd (s.f) writes to. It equals logPath
 	// normally, but a rotation whose reopen of logPath fails keeps writing to the
@@ -494,6 +519,19 @@ type Identity struct {
 // the audit subsystem need not import the JWT/PDP layer.
 func WithIdentity(fn func(ctx context.Context) Identity) Option {
 	return func(s *Sink) { s.identity = fn }
+}
+
+// WithEnforcementPoint stamps every record this sink writes — decisions and synthetic
+// markers alike — with the identity of the policy-enforcement point writing them. The zero
+// EnforcementPoint stamps nothing.
+//
+// Bounded HERE rather than per record: the value is fixed for the process's lifetime, so
+// re-deriving the bound on every allow/deny would be pure waste on the enforced-request
+// path, exactly as it would be for the route provenance triple (see Record). A caller that
+// built its EnforcementPoint through capability.NewEnforcementPoint is already well inside
+// the cap; the bound is the backstop for one assembled by hand.
+func WithEnforcementPoint(ep capability.EnforcementPoint) Option {
+	return func(s *Sink) { s.pep = BoundEnvelopeField(ep.String()) }
 }
 
 // auditReasonTailReadFailed is the structured, OS-independent sentinel stored in the
@@ -792,6 +830,25 @@ func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
 		// Mark it in-band too (stderr is lost to log rotation and not in the
 		// tamper-evident trail); the signed marker is written by the caller.
 		return tailResumeResult{tailFailKind: tailFailHMACMismatch, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
+	}
+	// A tape has exactly one writer at a time (Open holds the lock across the whole
+	// process's life), so a VERIFIED tail naming a different enforcement point means this
+	// file was written by another one before this process started: an instance renamed, or
+	// two enforcement points pointed at one path in turn. Nothing about the chain is wrong
+	// — it resumes normally, and because the stamp is per record rather than a file-level
+	// header, the boundary stays legible on the tape with no marker to write — but the log
+	// as a whole has stopped answering "which enforcement point produced this", and the
+	// usual cause is a copied config, which is worth one line at startup. Only a tail that
+	// NAMES one is compared: a tape predating the stamp, or written before the operator
+	// configured one, is an ordinary first-time configuration, not a change.
+	if prev.PEP != "" && prev.PEP != s.pep {
+		// Rendered rather than %q'd straight: an unset stamp prints as an empty pair of
+		// quotes, which reads as a name that is the empty string rather than as none.
+		mine := "no enforcement point at all"
+		if s.pep != "" {
+			mine = fmt.Sprintf("%q", s.pep)
+		}
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: the audit log tail was written by enforcement point %q, but this instance stamps %s; the chain resumes normally and every record still names its own writer, but this log has stopped belonging to a single enforcement point — give each one its own audit.log, or reconcile the names.\n", prev.PEP, mine)
 	}
 	// Chain onto the tail only when it verified (handled above by returning
 	// early on any failure). A failed tail is attacker-controllable (a
@@ -1123,7 +1180,12 @@ func (s *Sink) syntheticDenyMarker(code string, details map[string]interface{}) 
 		Decision:    "deny",
 		DenialCode:  code,
 		Details:     marshalAndBoundDetails(details),
-		KeyID:       s.keyID,
+		// A marker is written BY this enforcement point about its own tape, so it carries
+		// the same stamp a decision does — a lost-coverage marker that named no writer
+		// would be the one record in a merged, multi-PEP reconstruction that could not be
+		// attributed, which is precisely the record an auditor needs to place.
+		PEP:   s.pep,
+		KeyID: s.keyID,
 	}
 }
 
@@ -1554,6 +1616,9 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// once rather than per call. Sink.RecordAllow/RecordDeny (the
 		// single-upstream path with no route) leave all three "", which is already
 		// within any cap, so the invariant holds there for free.
+		// The writer's own identity, from the Sink rather than the params: see
+		// auditRecord.PEP. Already bounded at WithEnforcementPoint.
+		PEP:           s.pep,
 		Upstream:      p.Upstream,
 		PolicyVersion: p.PolicyVersion,
 		PolicySHA256:  p.PolicySHA256,
@@ -1831,7 +1896,8 @@ const auditRecordEnvelopeEstimate = 512
 // flood of such records the queue would hold many times the byte budget it is sized to
 // bound — the shed-instead-of-OOM guarantee the budget exists for. Labels are written
 // by the policy's own directives (see LabelsOut) rather than by a caller, so they are
-// counted for completeness, not bounds.
+// counted for completeness, not bounds; so is the enforcement-point stamp, which this
+// process chooses once and repeats on every record.
 //
 // Fields writeRecord stamps (Seq, PrevHMAC, HMAC) must stay inside the flat
 // auditRecordEnvelopeEstimate and out of this walk; the stored charge makes that a
@@ -1843,7 +1909,7 @@ func (rec *auditRecord) queueSize() int64 {
 	}
 	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.Delegate))
 	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
-	n += int64(len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
+	n += int64(len(rec.PEP) + len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
 	n += int64(len(rec.DenialCode) + len(rec.ConditionType) + len(rec.ProtocolRevision))
 	for _, l := range rec.LabelsOut {
 		n += int64(len(l))

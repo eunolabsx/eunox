@@ -108,6 +108,12 @@
           "type": "string",
           "description": "Path to the HMAC signing key. Generated with mode 0600 on first run if absent. Defaults to ~/.eunox/audit.key."
         },
+        "pep": {
+          "type": "string",
+          "description": "Name this policy-enforcement point on every audit record, stamped in the record's 'pep' field as \"mcp:<name>\" (the protocol binding it enforces at, plus this name), so a sequence that crosses more than one eunox instance can be attributed once their tapes are read together. Unset (the default) stamps nothing, which is what a single-enforcement-point deployment wants. Refused at load rather than sanitized: the name lands on a signed, append-only tape.",
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "maxLength": 128
+        },
         "rotateSizeBytes": {
           "type": "integer",
           "description": "Rotate the audit log once it exceeds this size, in bytes. Defaults to 104857600 (100 MiB). 0 (default) uses the built-in size; a negative value is rejected at load.",
