@@ -27,6 +27,29 @@ Section conventions:
 
 ### Added
 
+- **`pep` on every audit record** (signed, `omitempty`): the policy-enforcement point that
+  wrote it — the protocol binding it enforces at plus the operator's name for the instance,
+  stamped as `"mcp:<name>"` — set with `--audit-pep` or the gateway config's `audit.pep`.
+  Each eunox instance signs its own hash chain over its own tape, so a sequence that crosses
+  two of them is reconstructed by reading both tapes and joining on `task_id`; once those
+  lines are merged into a SIEM the file each came out of is gone, and without the writer
+  named on the record a call the far side handled is indistinguishable from one this side
+  did. It is stamped from the sink rather than passed per decision, so the synthetic
+  integrity/coverage markers carry it too — those are written by the enforcement point about
+  its own tape, and no request produces them. Unset stamps nothing, which is honest for a
+  single-enforcement-point deployment: eunox will not invent an instance identity (a hostname
+  collides for two instances on one host, and a pid changes every restart, which would make
+  one enforcement point look like many). The name is refused at load rather than repaired —
+  letters, digits, `.`, `_` and `-`, up to 128 bytes, so an unexpanded `${VAR}` or a stray
+  `:` fails startup instead of landing on the signed tape. A reference that expands to the
+  *empty* string is refused too: it is indistinguishable from the field being omitted, so the
+  name rule never sees it and the tape would go unattributed in silence. Both the flag and the
+  config value are validated with the rest of the startup checks, before the Redis dial and
+  before an audit key or log is minted. Enabling `taskAnchoredState`
+  without a name prints a startup notice, and resuming a tape whose tail names a *different*
+  enforcement point warns (the chain resumes normally — every record already names its own
+  writer, so the boundary needs no marker).
+
 - **`auditHealthy` on `/healthz` and `eunox_audit_healthy` on `/metrics`** — the audit
   subsystem's own verdict as one series, reported by the sink through the shared health seam
   rather than reassembled by the endpoint from the three counters beside it. `0` means the trail

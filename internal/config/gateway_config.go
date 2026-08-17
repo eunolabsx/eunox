@@ -250,6 +250,7 @@ var (
 	listenAuthTokenEnvGrammar    = declaredEnvGrammarAt("listen.authToken")
 	auditLogEnvGrammar           = declaredEnvGrammarAt("audit.log")
 	auditKeyPathEnvGrammar       = declaredEnvGrammarAt("audit.keyPath")
+	auditPEPEnvGrammar           = declaredEnvGrammarAt("audit.pep")
 )
 
 // gatewayNumericKeys are the gateway-config scalar fields holding a bare number that yaml.v3
@@ -353,8 +354,14 @@ type GatewayConfig struct {
 	} `yaml:"listen"`
 
 	Audit struct {
-		Log             string `yaml:"log"`
-		KeyPath         string `yaml:"keyPath"`
+		Log     string `yaml:"log"`
+		KeyPath string `yaml:"keyPath"`
+		// PEP names this enforcement point on every record of the tape, so a sequence
+		// spanning more than one of them can be attributed once the tapes are read
+		// together. Empty (the default) stamps nothing, which is honest for the
+		// single-enforcement-point deployment. See capability.NewEnforcementPoint for the
+		// accepted names.
+		PEP             string `yaml:"pep"`
 		RotateSizeBytes int64  `yaml:"rotateSizeBytes"`
 		// RetainRotated bounds how many rotated audit files are kept; the oldest beyond
 		// this count are deleted. 0 ⟹ keep every rotated file. The active log is never
@@ -484,6 +491,7 @@ type gatewayConfigRawFields struct {
 	authToken      string
 	auditLog       string
 	auditKeyPath   string
+	auditPEP       string
 	allowedOrigins []string
 	// upstreamAuth/upstreamURL/command/args are per-upstream, indexed like cfg.Upstreams.
 	upstreamAuth []string
@@ -499,6 +507,7 @@ func captureGatewayConfigRawFields(cfg *GatewayConfig) gatewayConfigRawFields {
 		authToken:      cfg.Listen.AuthToken,
 		auditLog:       cfg.Audit.Log,
 		auditKeyPath:   cfg.Audit.KeyPath,
+		auditPEP:       cfg.Audit.PEP,
 		allowedOrigins: slices.Clone(cfg.Listen.AllowedOrigins),
 		upstreamAuth:   make([]string, len(cfg.Upstreams)),
 		upstreamURL:    make([]string, len(cfg.Upstreams)),
@@ -650,6 +659,26 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	} {
 		if err := failOnUnsetEnvRefUnder(path, f.label, f.raw, f.grammar); err != nil {
 			return nil, err
+		}
+	}
+
+	// audit.pep's fail-closed case is the SET-BUT-BLANK one, which the two fields above do
+	// not have: an unset reference there survives as a literal path that opens, where an
+	// unset reference here survives as literal text the accepted-name rule refuses ('$' is
+	// outside it). What that rule cannot see is a variable set to the empty string — the
+	// ordinary shape of a Kubernetes configMap key or an EnvironmentFile line that is
+	// present but blank. It expands to "", which is byte-identical to the field being
+	// omitted, so validation is skipped and the proxy writes its entire signed tape with no
+	// enforcement point named and nothing on stderr. An operator who WROTE a reference asked
+	// for a name, so a reference producing none is a refusal — the same rule the credential
+	// fields apply, keyed on the expanded RESULT rather than on every reference being blank,
+	// since a name is one value where a credential is a header a literal prefix can pad.
+	if refs := recognizedEnvRefs(rawFields.auditPEP, auditPEPEnvGrammar); len(refs) > 0 {
+		if err := failOnUnsetEnvRefUnder(path, "audit.pep", rawFields.auditPEP, auditPEPEnvGrammar); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(cfg.Audit.PEP) == "" {
+			return nil, fmt.Errorf("invalid gateway config %q: audit.pep is written as an environment reference (%q) that expanded to the empty string, so this instance would stamp no enforcement point on any audit record and its tape would be silently unattributed — set the variable to a name, or remove audit.pep to stamp none deliberately", path, rawFields.auditPEP)
 		}
 	}
 
@@ -955,6 +984,14 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 	}
 	if cfg.Audit.RetainRotated != nil && *cfg.Audit.RetainRotated < 0 {
 		return fmt.Errorf("audit.retainRotated %d must not be negative (0 = keep all rotated files)", *cfg.Audit.RetainRotated)
+	}
+	// Refused at load rather than sanitized at the sink: the name goes onto a signed,
+	// append-only tape, so a value eunox had to repair is one the operator cannot join
+	// against whatever they configured elsewhere. Absent stays valid — it stamps nothing.
+	if cfg.Audit.PEP != "" {
+		if _, err := capability.NewEnforcementPoint(cfg.Audit.PEP); err != nil {
+			return fmt.Errorf("audit.pep: %w", err)
+		}
 	}
 	// Defaults posture: validate the enforcement value.
 	if !validEnforcementValue(cfg.Defaults.Enforcement) {
