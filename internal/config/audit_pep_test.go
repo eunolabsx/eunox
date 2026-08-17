@@ -55,9 +55,7 @@ upstreams:
 }
 
 // And an UNSET reference is refused rather than stamped: it survives expansion as literal
-// "${VAR}" text, which would put a name no enforcement point answers to onto the signed
-// tape. The accepted-name rule catches it (a '$' is outside the set), so this needs no guard
-// of its own — but the load must still fail, which is what this pins.
+// "${VAR}" text, which would put a name no enforcement point answers to onto the signed tape.
 func TestLoadGatewayConfig_RejectsUnsetEnvRefInAuditPEP(t *testing.T) {
 	_, err := LoadGatewayConfig(writeConfig(t, `
 schemaVersion: "0.1"
@@ -73,7 +71,62 @@ upstreams:
 	if err == nil {
 		t.Fatal("expected a load error for an unset ${VAR} in audit.pep")
 	}
-	if !strings.Contains(err.Error(), "audit.pep") {
-		t.Errorf("error = %q, want it to name audit.pep", err)
+	for _, want := range []string{"audit.pep", "EUNOX_TEST_NO_SUCH_PEP", "unset"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to mention %q", err, want)
+		}
+	}
+}
+
+// The fail-closed case the accepted-name rule cannot see: a variable that is SET but blank —
+// a configMap key or EnvironmentFile line that is present and empty. It expands to "", which
+// is byte-identical to the field being omitted, so nothing downstream can tell that a name
+// was asked for; the proxy would write its whole signed tape unattributed with nothing said.
+func TestLoadGatewayConfig_RejectsBlankEnvRefInAuditPEP(t *testing.T) {
+	for _, blank := range []string{"", "   "} {
+		t.Setenv("EUNOX_TEST_BLANK_PEP", blank)
+		_, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: stdio
+audit:
+  pep: ${EUNOX_TEST_BLANK_PEP}
+upstreams:
+  - name: fs
+    transport: stdio
+    command: /usr/bin/server
+    policy: ["fs.yaml"]
+`))
+		if err == nil {
+			t.Fatalf("value %q: expected a load error for an env ref that expanded to nothing", blank)
+		}
+		for _, want := range []string{"audit.pep", "empty string"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("value %q: error = %q, want it to mention %q", blank, err, want)
+			}
+		}
+	}
+}
+
+// A reference is refused only when it produces NO name. One that merely contributes part of
+// a name still yields something the operator can join their tapes on, so it loads: refusing
+// there would reject a perfectly usable "edge-" that the operator wrote themselves.
+func TestLoadGatewayConfig_AcceptsAuditPEPWhoseRefIsBlankButLeavesAName(t *testing.T) {
+	t.Setenv("EUNOX_TEST_PEP_SUFFIX", "")
+	cfg, err := LoadGatewayConfig(writeConfig(t, `
+schemaVersion: "0.1"
+transport: stdio
+audit:
+  pep: edge-${EUNOX_TEST_PEP_SUFFIX}
+upstreams:
+  - name: fs
+    transport: stdio
+    command: /usr/bin/server
+    policy: ["fs.yaml"]
+`))
+	if err != nil {
+		t.Fatalf("LoadGatewayConfig: %v", err)
+	}
+	if cfg.Audit.PEP != "edge-" {
+		t.Errorf("audit.pep = %q, want %q", cfg.Audit.PEP, "edge-")
 	}
 }

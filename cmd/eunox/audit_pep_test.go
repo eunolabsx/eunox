@@ -5,10 +5,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/stretchr/testify/require"
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
@@ -78,6 +82,76 @@ func TestOpenConfiguredAuditSink_RefusesAnUnusablePEPRegardlessOfRequireAudit(t 
 		}
 		if openErr == nil || !strings.Contains(openErr.Error(), "enforcement-point name") {
 			t.Errorf("requireAudit=%v: error = %v, want a refusal naming the enforcement-point name", requireAudit, openErr)
+		}
+	}
+}
+
+// TestValidateProxyAuditPEPFlag is the flag-side half of the accepted-name rule, run with the
+// rest of the flag checks. An empty flag is not a rejection — it is how an operator spells
+// "stamp no enforcement point".
+func TestValidateProxyAuditPEPFlag(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		pep     string
+		wantErr bool
+	}{
+		{name: "unset", pep: ""},
+		{name: "usable", pep: "edge-1"},
+		{name: "whitespace", pep: "edge 1", wantErr: true},
+		{name: "unexpanded env reference", pep: "${EUNOX_PEP}", wantErr: true},
+		{name: "carries the separator", pep: "mcp:edge-1", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pep := tc.pep
+			err := validateProxyAuditPEPFlag(&proxyCLIFlags{auditPEP: &pep})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateProxyAuditPEPFlag(%q) error = %v, wantErr %v", tc.pep, err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "--audit-pep") {
+				t.Errorf("error = %v, want it to name the flag", err)
+			}
+		})
+	}
+}
+
+// TestCmdProxy_AuditPEPRejectionPrecedesEverySideEffect: an unusable name was rejected only
+// where the stamp is CONSTRUCTED, which is after the Redis dial and beside the audit key/log
+// creation — so the most trivially-fixable startup error there is still cost a dial and could
+// mint a key and log on its way to dying. It now runs with the other flag checks, and this
+// pins that ordering the way the transport-conditional rejection is pinned.
+func TestCmdProxy_AuditPEPRejectionPrecedesEverySideEffect(t *testing.T) {
+	mr := miniredis.RunT(t)
+	require.NoError(t, mr.Set(publishedTTLKey, "1h30m0s"))
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdProxy([]string{
+			"--redis-addr", mr.Addr(),
+			"--killswitch-session-ttl", "-1s",
+			"--audit-log", logPath,
+			"--audit-key-path", keyPath,
+			"--audit-pep", "edge 1",
+			"--audit", "--", "cat",
+		})
+	})
+
+	require.Equal(t, 1, code, "an unusable --audit-pep must fail startup")
+	require.Contains(t, stderr, "--audit-pep")
+
+	got, err := mr.Get(publishedTTLKey)
+	require.NoError(t, err)
+	require.Equal(t, "1h30m0s", got, "a doomed process must not overwrite a running proxy's published session-kill TTL")
+
+	for _, p := range []string{logPath, keyPath} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%q was created before the flag rejection fired; validation must precede every side effect (stat err: %v)", p, err)
 		}
 	}
 }

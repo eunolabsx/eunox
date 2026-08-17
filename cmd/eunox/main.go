@@ -468,6 +468,14 @@ func cmdProxy(args []string) (exitCode int) {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
+	// Here rather than at the sink, where the name is CONSTRUCTED: every check between the
+	// parse and the first side effect exists so a trivially-fixable flag typo cannot cost a
+	// Redis dial or mint an audit key and log on its way to dying. The config's own audit.pep
+	// is validated at load, so this covers the flag.
+	if err := validateProxyAuditPEPFlag(f); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
+		return 1
+	}
 	cfg, err := resolveProxyConfig(fs, f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
@@ -884,10 +892,12 @@ func openConfiguredAuditSink(auditLog, auditKeyPath, auditPEP string, auditRotat
 	}
 	opts := []audit.Option{audit.WithIdentity(auditIdentity)}
 	if resolved := resolveAuditPEP(auditPEP, cfg); resolved != "" {
-		// Refused unconditionally, not folded into the --require-audit stance below: an
-		// unusable name is an operator error with a one-line fix, where that stance decides
-		// what to do about a tape that cannot be opened. Config values already failed
-		// Validate, so what this catches is a bad --audit-pep.
+		// The construction site's own guard, and the reason a stamp is only ever minted by
+		// the validating constructor. Both inputs are already checked before any side effect
+		// runs — the config's at load, the flag's by validateProxyAuditPEPFlag — so this is
+		// unreachable in production rather than the operator's diagnostic. It is refused
+		// unconditionally, not folded into the --require-audit stance below, because that
+		// stance decides what to do about a tape that cannot be OPENED.
 		ep, err := capability.NewEnforcementPoint(resolved)
 		if err != nil {
 			return nil, fmt.Errorf("audit enforcement-point name: %w", err)
@@ -1081,6 +1091,19 @@ func validateTransportConditionalFlags(hostTransport string, pf proxyFlags) erro
 	// covered automatically.
 	if len(pf.httpOnlyFlagsSet) > 0 {
 		return fmt.Errorf("%s requires transport: http (a stdio host has no HTTP listener)", strings.Join(pf.httpOnlyFlagsSet, ", "))
+	}
+	return nil
+}
+
+// validateProxyAuditPEPFlag rejects an unusable --audit-pep with the rest of the flag checks,
+// before the Redis dial and the audit key/log creation. A pure function so the guard is
+// unit-testable, matching validateProxyNumericFlags beside it.
+func validateProxyAuditPEPFlag(f *proxyCLIFlags) error {
+	if *f.auditPEP == "" {
+		return nil
+	}
+	if _, err := capability.NewEnforcementPoint(*f.auditPEP); err != nil {
+		return fmt.Errorf("--audit-pep: %w", err)
 	}
 	return nil
 }

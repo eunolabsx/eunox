@@ -41,7 +41,11 @@ Section conventions:
   collides for two instances on one host, and a pid changes every restart, which would make
   one enforcement point look like many). The name is refused at load rather than repaired —
   letters, digits, `.`, `_` and `-`, up to 128 bytes, so an unexpanded `${VAR}` or a stray
-  `:` fails startup instead of landing on the signed tape. Enabling `taskAnchoredState`
+  `:` fails startup instead of landing on the signed tape. A reference that expands to the
+  *empty* string is refused too: it is indistinguishable from the field being omitted, so the
+  name rule never sees it and the tape would go unattributed in silence. Both the flag and the
+  config value are validated with the rest of the startup checks, before the Redis dial and
+  before an audit key or log is minted. Enabling `taskAnchoredState`
   without a name prints a startup notice, and resuming a tape whose tail names a *different*
   enforcement point warns (the chain resumes normally — every record already names its own
   writer, so the boundary needs no marker).
