@@ -961,6 +961,55 @@ func TestDoMCPHTTP_NonOKReturnsError(t *testing.T) {
 	}
 }
 
+// TestDoMCPHTTP_NonOKBodyIsBoundedAndControlStripped is the regression for an operator's
+// console being driven by the threat model's central adversary.
+//
+// A compromised remote upstream answers any enforced call with a non-2xx body of its choosing,
+// and that body reaches stderr through %v — the session-create failure line, the upstream-error
+// notice, the CLI probe. It was length-bounded (64 KiB) and nothing else: ANSI/C0 sequences in
+// it drove the terminal, a bare newline forged what reads as a second eunox log line, and 64 KiB
+// per failed call at the classFailure notice rate is a log-flooding primitive. Sanitized at the
+// one place the bytes become a string, so every consumer inherits it.
+func TestDoMCPHTTP_NonOKBodyIsBoundedAndControlStripped(t *testing.T) {
+	t.Parallel()
+
+	// An escape sequence that repaints the terminal, a forged log line, and a Unicode line
+	// separator plenty of log splitters honour — then far more bytes than any diagnostic needs.
+	hostile := "\x1b[2J\x1b]0;pwned\x07real detail\n[eunox] ALL CLEAR\u2028also forged" + strings.Repeat("A", 8<<10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(hostile))
+	}))
+	t.Cleanup(srv.Close)
+
+	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Method: "tools/list"}
+	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "", capability.Revision20251125)
+	if err == nil {
+		t.Fatal("a non-2xx upstream response must return an error")
+	}
+	got := err.Error()
+
+	for _, bad := range []string{"\x1b", "\x07", "\n", "\r", "\u2028", "\u2029"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("error carries %q: an upstream must not reach the console with control or line-terminating runes", bad)
+		}
+	}
+	if len(got) > maxUpstreamErrSnippetBytes+256 {
+		t.Errorf("error is %d bytes, want the snippet bounded near %d", len(got), maxUpstreamErrSnippetBytes)
+	}
+	// Neutralized, not discarded: the operator still needs to read what the upstream said, and
+	// the truncation is visible rather than silent.
+	if !strings.Contains(got, "real detail") {
+		t.Errorf("error = %q, want the upstream's actual message preserved", got)
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("error = %q, want a visible truncation marker rather than a silent cut", got)
+	}
+	if !strings.Contains(got, "502") {
+		t.Errorf("error = %q, want it to still report the status", got)
+	}
+}
+
 func TestDoMCPHTTP_AcceptedReturnsEmpty(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

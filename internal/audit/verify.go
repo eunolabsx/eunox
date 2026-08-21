@@ -15,7 +15,8 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // errKeyIDNotInRing is returned by keysToTry (and propagated by the signature check) when
@@ -262,26 +263,18 @@ func (r VerifyResult) OK() bool {
 	return r.Invalid == 0 && r.ChainBreaks == 0 && r.UnknownKey == 0 && r.Unverifiable == 0
 }
 
-// SanitizeAuditField replaces every line-breaking rune with a space before an
+// SanitizeAuditField neutralizes every control and line-terminating rune before an
 // attacker-influenceable field (target from a tool/resource/prompt name, session_id
 // from the Mcp-Session-Id header — both length-bounded but not control-char-
 // sanitized at storage) is interpolated into a single-line diagnostic. A field with
 // a literal newline would otherwise inject a spurious finding line that misleads a
 // SIEM parsing the output line by line.
 //
-// unicode.IsControl covers only category Cc (C0/C1 controls), so it misses U+2028
-// (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) — line terminators recognized by
-// many parsers, terminals, and SIEM line-splitters. Neutralize those too, matching
-// isYAMLLineBreak in cmd/eunox/init_manifest.go, which already treats both as
-// line breaks; otherwise a raw U+2028/U+2029 in target/session_id/key_id would inject
-// the very spurious finding line this guard exists to prevent.
+// The walk itself is capability.SanitizeControlRunes, shared with the transport's bound on a
+// remote upstream's error body — the same question about a string this proxy did not author,
+// and the U+2028/U+2029 half of the answer is exactly the kind that gets fixed in one copy.
 func SanitizeAuditField(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
-			return ' '
-		}
-		return r
-	}, s)
+	return capability.SanitizeControlRunes(s)
 }
 
 // VerifyLog scans r and verifies the audit log. Every record's HMAC is recomputed

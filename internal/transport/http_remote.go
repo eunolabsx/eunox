@@ -95,7 +95,39 @@ const (
 	// MaxUpstreamErrBodyBytes bounds how much of a non-2xx upstream body is read for
 	// the operator-facing error/log. A diagnostic snippet, not the payload, so small.
 	MaxUpstreamErrBodyBytes = 64 << 10
+	// maxUpstreamErrSnippetBytes bounds how much of that body is actually EMBEDDED in the
+	// error a human reads. Much smaller than what is read, because the two answer different
+	// questions: the read bound stops an unbounded upstream body from being pulled into
+	// memory, while this one decides how many bytes of a hostile upstream's choosing land on
+	// an operator's console per failed call. 64 KiB per failure, at the classFailure notice
+	// rate, is a log-flooding primitive; no genuine diagnostic needs more than the first
+	// couple of KiB.
+	maxUpstreamErrSnippetBytes = 2 << 10
 )
+
+// boundUpstreamErrBody makes a non-2xx upstream body safe to put in front of an operator: cut
+// to maxUpstreamErrSnippetBytes with a visible truncation marker, and every control and
+// line-terminating rune neutralized.
+//
+// The sanitization is the point, and it is this package's standard everywhere else — a
+// reflected protocol version goes through mcp.BoundReflectedRevision ("an unbounded one would
+// put an upstream in control of the console"), a refused Origin through boundedRefusalDetail,
+// an audit envelope field through audit.BoundEnvelopeField. This string had the bound and not
+// the strip, on the one input authored by the threat model's central adversary: a compromised
+// remote upstream answers any enforced call with a body of its choosing, and that body reaches
+// stderr through %v. ANSI/C0 sequences in it drive the terminal, and a bare newline forges what
+// looks like a second eunox log line.
+//
+// Applied HERE, at the one place the body is turned into a string, rather than at each printer:
+// the error travels to the session-create stderr line, the upstream-error notice, and the CLI
+// probe, and a sanitizer placed on one of those is one the next consumer does not inherit.
+//
+// Not stripped down to printable ASCII the way a reflected revision is: a revision name comes
+// from a closed set, while an upstream's error message legitimately carries non-English text
+// that a reader needs.
+func boundUpstreamErrBody(body []byte) string {
+	return capability.SanitizeControlRunes(capability.BoundString(strings.TrimSpace(string(body)), maxUpstreamErrSnippetBytes))
+}
 
 // buildUpstreamTransport builds the *http.Transport for a remote upstream. When
 // tlsSkipVerify is true it accepts any TLS certificate (development only; callers warn).
@@ -386,7 +418,7 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxUpstreamErrBodyBytes))
-		return mcp.RPCMsg{}, resp.Header, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return mcp.RPCMsg{}, resp.Header, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, boundUpstreamErrBody(body))
 	}
 	// A 200 OK may carry a JSON or SSE body; for SSE, extract the matching JSON-RPC payload.
 	// A lenient upstream may answer a notification with an empty body/no matching event

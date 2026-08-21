@@ -4,8 +4,10 @@
 package transport
 
 import (
+	"context"
 	"encoding/json"
-	"github.com/eunolabs/eunox/pkg/capability"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // deadlineRecorder is a ResponseWriter that records every write deadline armed on it, in
@@ -200,5 +203,56 @@ func TestHandleMCPPost_SessionStartDeadlineFloorsAtHTTPWriteTimeout(t *testing.T
 		if got := d.Sub(start); got < httpWriteTimeout {
 			t.Errorf("write deadline %d armed a %v window, shorter than httpWriteTimeout (%v)", i, got, httpWriteTimeout)
 		}
+	}
+}
+
+// TestWriteSessionCreateError_ReArmsForTheTeardownItMayHaveJustPaid is the regression for the
+// one teardown-shaped write the teardown re-arm missed.
+//
+// The session-creating initialize arm arms a window covering ESTABLISHMENT. Its failure paths
+// then spend time that window does not budget for: a startup drift refusal runs sess.close
+// synchronously, whose worst case is two sequential --shutdown-timeout bounds (SIGTERM, then
+// SIGKILL), and the ctx-expiry arm adds another bounded wait after that. Nothing re-armed
+// before http.Error, so at a large shutdown budget against a SIGTERM-ignoring subprocess the
+// 500 carrying the drift refusal — the FM-5 rug-pull event the check exists to deliver —
+// reached the host as a connection error instead. Every arm re-arms now, because which arm was
+// taken says nothing about how long the failing establishment ran.
+func TestWriteSessionCreateError_ReArmsForTheTeardownItMayHaveJustPaid(t *testing.T) {
+	t.Parallel()
+
+	const shutdownMs = 40_000
+	// Two sequential shutdown budgets, the same worst case the teardown spelling covers.
+	want := 2*msToDuration(shutdownMs) + writeSlack
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		// The drift refusal and any other upstream-start failure land here, and this is the
+		// arm that pays a full sess.close before it writes.
+		{name: "upstream start failure (the drift refusal's arm)", err: errors.New("drift: upstream tool set changed")},
+		{name: "session limit", err: errSessionLimit},
+		{name: "raced reap", err: errRacedReap},
+		{name: "shutting down", err: errShuttingDown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// No sink and no route: writeSessionCreateError's recording leg tolerates both, and
+			// what is under test is the deadline, not the record.
+			proxy := &HTTPProxy{sessions: make(map[string]*httpSession), shutdownMs: shutdownMs, stderr: io.Discard}
+			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader("{}"))
+			w := newDeadlineRecorder()
+			start := time.Now()
+			proxy.writeSessionCreateError(context.Background(), w, req, nil, tc.err)
+
+			armed := w.armed()
+			if len(armed) != 1 {
+				t.Fatalf("armed %d write deadlines, want exactly the teardown re-arm", len(armed))
+			}
+			if got := armed[0].Sub(start); got < want-2*time.Second {
+				t.Errorf("armed a %v window, want at least %v: a failure path that just paid a full session teardown must not write under the establishment window", got, want)
+			}
+		})
 	}
 }

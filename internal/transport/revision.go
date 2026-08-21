@@ -261,8 +261,11 @@ func checkDeclarationReachesUpstream(resolved, legRev capability.Revision, msg m
 	if !declaresPerRequestRevision(resolved) {
 		return nil
 	}
-	return fmt.Errorf("%w: %s requires io.modelcontextprotocol/protocolVersion in every request's _meta, and eunox forwards params verbatim rather than adding one",
-		errUndeclaredOnDeclaringLeg, resolved)
+	// The key is named from capability's own constant rather than spelled out: this text is
+	// echoed to the peer verbatim (revisionRefusalReason allowlists it), and a message telling a
+	// host which member to add is worthless if the spelling drifts from the one the decoder reads.
+	return fmt.Errorf("%w: %s requires %s in every request's _meta, and eunox forwards params verbatim rather than adding one",
+		errUndeclaredOnDeclaringLeg, resolved, capability.MetaKeyProtocolVersion)
 }
 
 // upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg: the one
@@ -325,7 +328,7 @@ func revisionRefusalReason(err error) string {
 	// an unreviewed message.
 	if errors.Is(err, errRevisionMismatch) || errors.Is(err, mcp.ErrUnknownRevision) ||
 		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUnhonorableUpstreamRevision) ||
-		errors.Is(err, errUndecodableForwardedParams) {
+		errors.Is(err, errUndecodableForwardedParams) || errors.Is(err, errUndeclaredOnDeclaringLeg) {
 		return err.Error()
 	}
 	return "protocol revision could not be established"
