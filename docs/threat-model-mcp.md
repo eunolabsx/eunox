@@ -719,6 +719,33 @@ opened at another (a mid-context flip).
   them is translation, which the mismatched-pair boundary governs and this release does not
   implement. That keeps the refusal above meaningful: a declaration that reaches the upstream
   is the host's own, so refusing an unhonorable one is the only way the pair stays consistent.
+- **"eunox could not read it" is never "it declares nothing" for bytes that travel.** The
+  declaration is read by DECODING the message rather than scanning it for the key, because JSON
+  permits escaping any character of an object key and a byte probe missed spellings the upstream
+  reading the same forwarded bytes still saw. That decode rejects a duplicate key at any depth —
+  eunox's own strictness, and so the one rejection meaning a body every conforming peer reads
+  fine — which leaves a third answer beside "declared" and "absent": a body eunox alone refuses.
+  (The other decode failures are not this and stay plain absences: invalid JSON, which no
+  decoder accepts, and a shape with no `_meta` object for anyone to read a declaration out of.
+  Reporting those as unreadable would refuse well-formed JSON-RPC carrying nothing to smuggle.)
+  Reading the third answer as "absent" is safe only where something re-decodes the same bytes
+  and denies them — a request routed to an enforced (`Decide`) handler, which answers a target-bearing
+  `INVALID_REQUEST` rather than having every malformed request relabelled a version failure.
+  Three shapes have no such handler and their bytes reach the upstream untouched: a host
+  RESPONSE (relayed verbatim, never dispatched), a forwarded NOTIFICATION, and a `*/list`
+  REQUEST (whose handler forwards the request and filters only the reply). For those, a peer
+  adds any throwaway duplicate key so eunox's decoder bails — eunox then inherits the context,
+  and both the mid-context-flip and upstream-honorability gates compare that inherited value and
+  pass — while a clean `io.modelcontextprotocol/protocolVersion` in `_meta` names another
+  revision to the upstream's own last-wins parser, with eunox's `MCP-Protocol-Version` header on
+  a remote leg contradicting the body it heads. Such a message is therefore refused
+  `UNSUPPORTED_PROTOCOL_VERSION` and recorded, on exactly those framings and only where a live
+  upstream leg exists for the bytes to reach. Where it is instead read as absent, that absence
+  is eunox's own reading rather than the peer's, so it does not feed the separate refusal for a
+  request reaching a declaring upstream with no version member — the handler denies those bytes
+  before that upstream ever sees them. This is the same enforcement-versus-upstream
+  parser differential the duplicate-key rejection exists to close, so the one framing-blind
+  fallback in front of it does not get to reopen it.
 
 **Residual risk.** The revision a peer declares is still the peer's own claim; eunox
 constrains which table that claim can select and records the choice, but does not
@@ -729,8 +756,13 @@ not permit.
 **Test coverage.** `internal/transport/dispatch_revision_test.go` (per-revision exact
 table sets; the undeclared-membership build gate; an unspoken revision dispatching
 nothing; the registry-derived handshake revision), `internal/transport/revision_test.go`
-(the negotiation table, including both flip directions and the malformed-params case that
-must NOT be relabeled as a version failure),
+(the negotiation table, including both flip directions, the malformed-params case that must
+NOT be relabeled as a version failure, and the three verbatim-forwarded framings where an
+undecodable body must be),
+`internal/transport/revision_regression_test.go` (the same smuggling driven through a real
+serve loop per framing: nothing of the host's reaches the upstream writer, and a decodable
+declaration is still judged on its merits), `internal/mcp/revision_escape_test.go` (the
+escaped-key spelling of the same differential),
 `internal/transport/enforcement_gaps_test.go` (the per-revision method cells: which peer's
 revision dispatches a method and which denies it fail-closed, in both framings),
 `internal/transport/gate_order_test.go` (the gate order and its labelling exception, on

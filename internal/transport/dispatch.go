@@ -205,6 +205,38 @@ func paramsReachUpstream(msg mcp.RPCMsg) bool {
 	return forwardsHostParams(msg.Method)
 }
 
+// unreadParamsReachUpstream narrows paramsReachUpstream to the messages whose bytes travel on
+// with NOTHING in this proxy re-decoding them first — the exact class for which
+// mcp.DeclaredRevision's "the method handler denies these bytes moments later" argument does
+// not hold, and therefore the class an unreadable body may not be read as an undeclared one.
+//
+// A request routed to a Decide handler is the one message that argument covers: the handler
+// runs mcp.DecodeParams over the same bytes and answers a target-bearing malformedDeny. Three
+// shapes it does not, and the registry cannot merge them because two are not per-method facts
+// at all: a host RESPONSE (relayed verbatim, never dispatched), a notifyForward NOTIFICATION,
+// and a LocalForwards REQUEST — the */list methods, whose handler hands msg to the upstream
+// untouched and filters only the reply.
+//
+// DERIVED from paramsReachUpstream so it can never claim a message that gate does not, then
+// narrowed by FRAMING within it. The narrowing is load-bearing rather than tidiness: that gate
+// asks its per-method half as one OR over the three handler fields, so it reports true for a
+// Decide method in notification framing and for a notifyForward method in request framing —
+// two pairings this proxy REFUSES rather than forwards, whose bytes therefore reach nobody to
+// disagree with.
+func unreadParamsReachUpstream(msg mcp.RPCMsg) bool {
+	if !paramsReachUpstream(msg) {
+		return false
+	}
+	if msg.IsResponse() {
+		return true
+	}
+	spec := methodRegistry[msg.Method]
+	if msg.IsRequest() {
+		return spec.Decide == nil && spec.LocalForwards
+	}
+	return spec.Notification == notifyForward
+}
+
 // forwardsHostParams reports whether method's own params reach the upstream, in either
 // framing — the per-METHOD half of paramsReachUpstream, which is the question a request or a
 // notification answers and the wrong shape for a message with no method.

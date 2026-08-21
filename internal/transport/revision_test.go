@@ -105,9 +105,17 @@ func TestResolveHostRevision(t *testing.T) {
 }
 
 // TestResolveHostRevision_MalformedParamsAreNotAVersionFailure: a params body that cannot be
-// decoded must NOT be relabeled as a version problem. The method handler decodes the same
-// bytes moments later and denies them as INVALID_REQUEST with a target-bearing record; a
+// decoded must NOT be relabeled as a version problem for the one message shape whose bytes are
+// re-read before they go anywhere — a request routed to a Decide handler, which decodes the
+// same bytes moments later and denies them as INVALID_REQUEST with a target-bearing record. A
 // -32022 here would replace that with a misleading refusal for every malformed request.
+//
+// Asserted on a LIVE leg as well as on none, because that is the whole remaining exception: the
+// unreadable body reaches a real upstream here and is still admitted, on the strength of the
+// handler that stops it. TestResolveHostRevision_UndecodableParamsReachingTheUpstream covers
+// the shapes with no such handler, and
+// TestResolveHostRevision_UnreadableIsNotAStatedAbsenceOnADeclaringLeg the leg revision whose
+// own per-request rule would otherwise relabel the very refusal this one protects.
 func TestResolveHostRevision_MalformedParamsAreNotAVersionFailure(t *testing.T) {
 	t.Parallel()
 	for _, params := range []string{
@@ -115,14 +123,167 @@ func TestResolveHostRevision_MalformedParamsAreNotAVersionFailure(t *testing.T) 
 		`{"_meta":"io.modelcontextprotocol/protocolVersion"}`,                           // key name as a value
 		`{"_meta":[{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}]}`,          // wrong shape
 	} {
-		msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: json.RawMessage(params)}
-		got, err := resolveHostRevision(capability.Revision20251125, "", msg)
-		if err != nil {
-			t.Errorf("params %s: got version error %v, want the request to fall through to its handler", params, err)
+		for _, legRev := range []capability.Revision{"", capability.Revision20251125} {
+			msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: json.RawMessage(params)}
+			got, err := resolveHostRevision(capability.Revision20251125, legRev, msg)
+			if err != nil {
+				t.Errorf("params %s (leg %q): got version error %v, want the request to fall through to its handler", params, legRev, err)
+			}
+			if got != capability.Revision20251125 {
+				t.Errorf("params %s (leg %q): revision = %q, want the context's %q", params, legRev, got, capability.Revision20251125)
+			}
 		}
-		if got != capability.Revision20251125 {
-			t.Errorf("params %s: revision = %q, want the context's %q", params, got, capability.Revision20251125)
-		}
+	}
+}
+
+// TestResolveHostRevision_UndecodableParamsReachingTheUpstream is the regression for
+// revision-declaration smuggling on the framings eunox forwards verbatim.
+//
+// mcp.DeclaredRevision cannot decode a body carrying a duplicate key, and reading that as
+// "nothing declared" is only safe where something re-decodes the bytes and denies them. For a
+// host RESPONSE, a forwarded NOTIFICATION, and a */list REQUEST, nothing does: the bytes travel
+// to the upstream untouched. A peer therefore adds any throwaway duplicate key to make this
+// decoder bail — eunox inherits the context, errRevisionMismatch and checkUpstreamHonorable
+// both pass, and on a remote leg eunox stamps an MCP-Protocol-Version header naming the leg's
+// revision — while a clean io.modelcontextprotocol/protocolVersion in `_meta` names another one
+// to the upstream's own last-wins parser. Both peers agree the message is well-formed; only
+// eunox is looking at a different revision than the one it forwards.
+func TestResolveHostRevision_UndecodableParamsReachingTheUpstream(t *testing.T) {
+	t.Parallel()
+	// The declaration itself is clean and names the revision the leg is NOT addressed as; the
+	// duplicate is a throwaway that has nothing to do with it.
+	const smuggled = `{"progressToken":1,"x":1,"x":1,"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`
+	cases := []struct {
+		name    string
+		msg     mcp.RPCMsg
+		refused bool
+	}{
+		{
+			name:    "forwarded notification",
+			msg:     mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress, Params: json.RawMessage(smuggled)},
+			refused: true,
+		},
+		{
+			// A response is the framing with no method at all, relayed straight through by the
+			// serve loops, and MCP puts a result's metadata in `result._meta`.
+			name:    "host response, declaration in the result",
+			msg:     mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(smuggled)},
+			refused: true,
+		},
+		{
+			name:    "host response, declaration in the params",
+			msg:     mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{}`), Params: json.RawMessage(smuggled)},
+			refused: true,
+		},
+		{
+			// LocalForwards: dispatchList hands msg to the upstream untouched and filters only
+			// the reply, so a */list request is as unread as the two framings above.
+			name:    "*/list request, whose handler forwards params verbatim",
+			msg:     mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsList, Params: json.RawMessage(smuggled)},
+			refused: true,
+		},
+		{
+			// The surviving exception: dispatchToolsCall re-decodes and answers a malformedDeny.
+			name: "Decide request, re-decoded and denied by its own handler",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: json.RawMessage(smuggled)},
+		},
+		{
+			// A locally answered method contacts no upstream, so the bytes are read by nobody
+			// else and there is no differential to have.
+			name: "locally answered method",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: methodPing, Params: json.RawMessage(smuggled)},
+		},
+		{
+			// The three pairings paramsReachUpstream's per-method OR reports true for and this
+			// proxy nonetheless never forwards: an enforced method in notification framing is
+			// rejected, and a notification-only method in request framing — plus a */list in
+			// notification framing — fall to the fail-closed routing default. Their bytes reach
+			// nobody, so refusing them HERE would relabel a refusal they already earn.
+			name: "enforced method in notification framing",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodToolsCall, Params: json.RawMessage(smuggled)},
+		},
+		{
+			name: "notification-only method in request framing",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: methodNotificationsProgress, Params: json.RawMessage(smuggled)},
+		},
+		{
+			name: "*/list in notification framing",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodToolsList, Params: json.RawMessage(smuggled)},
+		},
+		// The decode failures that are NOT this differential. Each reaches the upstream on a
+		// framing nothing re-decodes, and each must still be admitted: none can carry the
+		// `_meta` object a last-wins parser would read a declaration out of, so refusing them
+		// would deny well-formed JSON-RPC (params are optional and need not be an object) for
+		// a smuggle that cannot exist.
+		{
+			name: "*/list request with array params",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsList, Params: json.RawMessage(`[]`)},
+		},
+		{
+			name: "forwarded notification with a non-object _meta",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress, Params: json.RawMessage(`{"progressToken":1,"_meta":5}`)},
+		},
+		{
+			// A scalar result decodes fine as JSON and cannot hold `_meta`. Refusing it also
+			// aborted the upstream request it was answering, for nothing.
+			name: "host response with a scalar result",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(`true`)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := resolveHostRevision(capability.Revision20251125, capability.Revision20251125, tc.msg)
+			if got := errors.Is(err, errUndecodableForwardedParams); got != tc.refused {
+				t.Fatalf("refused = %v (err %v), want %v", got, err, tc.refused)
+			}
+			if tc.refused {
+				// The refusal must be echoable: its text is eunox's own and names no caller
+				// value, so collapsing it to the fixed fallback would tell a peer nothing.
+				if reason := revisionRefusalReason(err); reason != err.Error() {
+					t.Errorf("refusal reason = %q, want the sentinel's own text %q", reason, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+	// A leg with no revision has no upstream for the bytes to reach — the sessionless arms —
+	// which is the same window checkUpstreamHonorable declines to judge.
+	msg := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress, Params: json.RawMessage(smuggled)}
+	if got, err := resolveHostRevision(capability.Revision20251125, "", msg); err != nil {
+		t.Errorf("no upstream leg: err = %v, want the message to resolve to %q", err, got)
+	}
+}
+
+// TestResolveHostRevision_UnreadableIsNotAStatedAbsenceOnADeclaringLeg pins the half of the
+// carve-out that only shows on a 2026-07-28 leg.
+//
+// Reading an unreadable body as "nothing declared" is safe for a request whose handler
+// re-decodes and denies it — but that reading is this decoder's, not the peer's, and
+// checkDeclarationReachesUpstream refuses a message for carrying NO declaration on a leg whose
+// revision requires one every time. Handing it the manufactured absence refused a malformed
+// tools/call -32022 as errUndeclaredOnDeclaringLeg, which is the exact relabelling of the
+// target-bearing INVALID_REQUEST the carve-out exists to prevent. Nothing is lost by skipping
+// it: the handler denies these bytes long before the upstream that wanted the member sees them.
+func TestResolveHostRevision_UnreadableIsNotAStatedAbsenceOnADeclaringLeg(t *testing.T) {
+	t.Parallel()
+	const dupKey = `{"name":"read_file","x":1,"x":1}`
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: json.RawMessage(dupKey)}
+	got, err := resolveHostRevision(capability.Revision20260728, capability.Revision20260728, msg)
+	if err != nil {
+		t.Fatalf("err = %v, want the request to fall through to the handler that denies it", err)
+	}
+	if got != capability.Revision20260728 {
+		t.Errorf("revision = %q, want the context's %q", got, capability.Revision20260728)
+	}
+	// The rule itself is untouched: a peer that really states no declaration is still refused
+	// on the same leg.
+	undeclared := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: json.RawMessage(`{"name":"read_file"}`)}
+	if _, err := resolveHostRevision(capability.Revision20260728, capability.Revision20260728, undeclared); !errors.Is(err, errUndeclaredOnDeclaringLeg) {
+		t.Errorf("err = %v, want %v for a message that genuinely carries no declaration", err, errUndeclaredOnDeclaringLeg)
 	}
 }
 

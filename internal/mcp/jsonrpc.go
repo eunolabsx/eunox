@@ -24,6 +24,19 @@ import (
 // unlike io.EOF or scanner errors, which lose framing and are terminal.
 var ErrParse = errors.New("mcp: malformed JSON-RPC message")
 
+// errDuplicateObjectKey marks the duplicate/fold-collision half of rejectDuplicateJSONKeys,
+// apart from its tokenizer half.
+//
+// It is the ONE decode rejection that is eunox's OWN strictness — a body every conforming
+// parser reads fine, which this one refuses whole — so it is the only decode failure that can
+// hide something a peer downstream still reads. Every other one is either invalid JSON, which
+// no decoder accepts, or a shape mismatch, which by definition carries no object where the
+// member being looked for could be.
+//
+// Unexported: the distinction is this package's to draw (see DeclaredRevision, its one
+// consumer), and every caller outside it wants the fail-closed DecodeParams error unchanged.
+var errDuplicateObjectKey = errors.New("duplicate object key")
+
 // RPCMsg is a JSON-RPC 2.0 message — a request, response, or notification depending on
 // which fields are populated.
 //
@@ -386,11 +399,11 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 				key := foldJSONKey(t)
 				if prior, dup := stack[n-1].seen[key]; dup {
 					if prior == t {
-						return fmt.Errorf("%w: duplicate object key %q", ErrParse, t)
+						return fmt.Errorf("%w: %w %q", ErrParse, errDuplicateObjectKey, t)
 					}
 					// Not byte-identical, but encoding/json would fold both onto one
 					// struct field and keep the last — the smuggling shape.
-					return fmt.Errorf("%w: object keys %q and %q differ only by case fold", ErrParse, prior, t)
+					return fmt.Errorf("%w: %w: %q and %q differ only by case fold", ErrParse, errDuplicateObjectKey, prior, t)
 				}
 				if stack[n-1].seen == nil {
 					stack[n-1].seen = make(map[string]string, 1)
