@@ -208,10 +208,19 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
 		return 1
 	}
-	// config.OpenNoFollow closes the Lstat->open race the refusal above cannot.
-	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
+	// config.OpenNoFollow closes the Lstat->open race the refusal above cannot for a symlink;
+	// config.OpenNonBlock closes it for a FIFO, whose write-only open would otherwise block
+	// inside open(2) until a reader arrives, leaving no post-open check reachable at all.
+	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
+		return 1
+	}
+	// Asked through the HANDLE, ahead of the re-tighten, so a substituted object is refused
+	// rather than re-moded and written with a support bundle.
+	if err := config.RefuseNonRegularHandle(f, "output file", outPath); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
+		_ = f.Close()
 		return 1
 	}
 	// Re-tighten on the open fd: O_CREATE applies 0600 only on creation, so a pre-existing

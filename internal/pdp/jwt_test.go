@@ -6205,3 +6205,58 @@ func TestJWT_OnceGrantRefusedWhenTokenOutlivesLedger(t *testing.T) {
 		t.Fatalf("a standing grant on a long-lived token must still validate: %v", err)
 	}
 }
+
+// TestParseV2Claim_NonHTTPURIQueryBelongsToTheURI is the inert-grant regression. The
+// "the '?' belongs to the URI" rule was scoped to http(s), so a claim naming any other
+// scheme with a host had its URI query read as a condition list: `resource:doc://guide?lang=en`
+// validated as a grant on `doc://guide` conditioned on an argument a resource read never
+// carries, and could therefore never match — the shape this file rejects everywhere else.
+//
+// The line is the AUTHORITY, not the scheme: a `file:///data/*` claim has an empty authority
+// and is path-like, so its '?' still introduces conditions.
+func TestParseV2Claim_NonHTTPURIQueryBelongsToTheURI(t *testing.T) {
+	for _, tc := range []struct {
+		name, claim, wantBare string
+		wantConds             int
+	}{
+		{name: "authority-bearing non-http scheme", claim: "resource:doc://guide?lang=en", wantBare: "doc://guide?lang=en"},
+		{name: "http keeps its query", claim: "resource:http://api/search?q=widget", wantBare: "http://api/search?q=widget"},
+		{name: "empty authority still takes conditions", claim: "resource:file:///data/*?uri=file:///data/q3.pdf", wantBare: "file:///data/*", wantConds: 1},
+		{name: "opaque scheme is not a URI authority", claim: "resource:urn:x?maxCalls=3", wantBare: "urn:x", wantConds: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, bare, conds, err := parseV2Claim(tc.claim)
+			if err != nil {
+				t.Fatalf("parseV2Claim(%q): %v", tc.claim, err)
+			}
+			if bare != tc.wantBare {
+				t.Errorf("bare = %q, want %q", bare, tc.wantBare)
+			}
+			if len(conds) != tc.wantConds {
+				t.Errorf("conds = %+v, want %d", conds, tc.wantConds)
+			}
+		})
+	}
+}
+
+// TestJWTPDP_CheckKill_FallsBackToTheInnerPDP pins that a wrapper built with an inner PDP but
+// no kill switch of its own does not silently disarm the emergency stop on the paths that
+// route through CheckKill (the */list handlers, initialize, the notification gate). The
+// shipped binary wires both, so this is a library-seam property — which is exactly the kind
+// that goes unnoticed.
+func TestJWTPDP_CheckKill_FallsBackToTheInnerPDP(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	if err := ks.KillSession(context.Background(), "sess-1"); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	inner := NewManifestPDP(nil, enforcement.New(), ks)
+
+	// KillSwitch deliberately unset on the wrapper: the library wiring the fix is about.
+	wrapper := NewJWTPDP(JWTPDPOptions{Inner: inner, AllowAnyAudience: true, Issuer: "https://issuer.example"})
+	if deny := wrapper.CheckKill(context.Background(), "sess-1"); deny == nil {
+		t.Fatal("a killed session must be refused through the inner PDP's kill switch when the wrapper has none")
+	}
+	if deny := wrapper.CheckKill(context.Background(), "sess-live"); deny != nil {
+		t.Errorf("a live session must not be refused; got %+v", deny)
+	}
+}

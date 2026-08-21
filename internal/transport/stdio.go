@@ -209,6 +209,14 @@ type StdioProxy struct {
 	// drained — the common case for a notification-heavy host.
 	fwdHostInFlight atomic.Int64
 
+	// upstreamTornDown marks that teardown has begun forcing the upstream down, so the
+	// reader can tell an upstream fault from the consequence of this proxy's own shutdown.
+	// Set only after the graceful drain has already given up: os/exec's cmd.Wait closes the
+	// StdoutPipe under a reader still parked in a read, so on that branch the reader's next
+	// error IS the teardown, and reporting it as an upstream read error is a line an
+	// operator has to rule out on every forced shutdown.
+	upstreamTornDown atomic.Bool
+
 	// decideGate serializes this proxy's enforced-request decisions in proxy-receipt order,
 	// per state anchor, when the policy accumulates state one call writes and a later one
 	// reads. nil keeps full intra-session decision parallelism.
@@ -709,6 +717,11 @@ func (p *StdioProxy) awaitUpstreamDrain() {
 		return
 	case <-time.After(p.killDelay()):
 		_, _ = fmt.Fprintf(p.errOut(), "[eunox] Upstream did not exit after host disconnect; forcing shutdown.\n")
+		// Set BEFORE the kill: from here the reader's pipe can be closed by this teardown
+		// (the kill, or the cmd.Wait that follows a timed-out drain), and the line it would
+		// write about that names no fault of the upstream's. This one line already says the
+		// shutdown was forced.
+		p.upstreamTornDown.Store(true)
 		p.killUpstream()
 		// Bound the post-kill wait independently: the kill EOFs the pipe almost immediately
 		// in the ordinary case, but a descendant that escaped the process group can still
@@ -1737,8 +1750,9 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 		if err != nil {
 			// io.EOF is a normal upstream exit. Any other error (oversized or
 			// malformed message) is abnormal; log it so it is diagnosable rather
-			// than a silent reader exit.
-			if !errors.Is(err, io.EOF) {
+			// than a silent reader exit — unless this proxy is already forcing the
+			// upstream down, where the error is this teardown's own doing.
+			if !errors.Is(err, io.EOF) && !p.upstreamTornDown.Load() {
 				_, _ = fmt.Fprintf(p.errOut(), "[eunox] upstream read error: %v\n", err)
 			}
 			return

@@ -109,3 +109,32 @@ func TestRotatedPath_OrdinalCertainSkipsReseed(t *testing.T) {
 		t.Errorf("rotateOrdinal = %d, want 3 — a trusted seed must not be re-derived from disk", s.rotateOrdinal)
 	}
 }
+
+// TestMaxRotatedOrdinal_ClampsAnImplausibleSeed is the wrap regression, the seq seed's clamp
+// applied to the counter seeded from sibling FILENAMES — which nothing signs. One planted
+// sibling named with ordinal MaxUint64 seeded the counter at the maximum, so the next
+// rotation's ++ wrapped to 0: 0 sorts FIRST, which makes retention delete the newest real
+// evidence while retaining the decoy, and feeds chain verification its files out of order.
+func TestMaxRotatedOrdinal_ClampsAnImplausibleSeed(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatalf("write base: %v", err)
+	}
+	planted := logPath + ".18446744073709551615.20260101T000000.000000000Z"
+	if err := os.WriteFile(planted, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write planted sibling: %v", err)
+	}
+
+	got, ok := maxRotatedOrdinal(logPath)
+	if !ok {
+		t.Fatal("the sibling directory is readable; the seed must be authoritative")
+	}
+	if got != maxSeedableOrdinal {
+		t.Fatalf("seed = %d, want the clamp %d — an unsigned filename must not push the counter into the wrap zone", got, maxSeedableOrdinal)
+	}
+	// The clamp still lands past every genuine sibling, so the monotonic guarantee holds.
+	if got <= 1 {
+		t.Fatalf("the clamped seed (%d) must still order after real rotation history", got)
+	}
+}

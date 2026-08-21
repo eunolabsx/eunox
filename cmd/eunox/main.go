@@ -1906,7 +1906,10 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 		}
 		// config.OpenNoFollow closes the Lstat->open race the guard above cannot; O_EXCL
 		// already refuses a symlink for free, which is why only the force path needs it.
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow
+		// OpenNonBlock is the FIFO half of that race: a symlink is refused by O_NOFOLLOW,
+		// but a FIFO swapped in after the Lstat is opened directly and a write-only open of
+		// a reader-less FIFO blocks inside open(2) forever, so no post-open check would run.
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow | config.OpenNonBlock
 	}
 	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
 	if err != nil {
@@ -1923,6 +1926,12 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 		}
 	}()
 	if force {
+		// Asked through the HANDLE, so it describes what is about to be written rather than
+		// what the name resolved to before the open — the one question with no window after
+		// it. Ahead of the re-tighten, which would otherwise re-mode a substituted object.
+		if rerr := config.RefuseNonRegularHandle(f, "output file", path); rerr != nil {
+			return rerr
+		}
 		// Re-tighten BEFORE writing so a regenerated credential-bearing config never lands
 		// at a loose mode; on the open fd rather than os.Chmod(path), which would re-resolve
 		// and could follow a symlink.

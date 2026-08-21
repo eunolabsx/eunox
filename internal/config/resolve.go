@@ -111,6 +111,25 @@ func RefuseNonRegularPath(path, subject string) error {
 	return nil
 }
 
+// RefuseNonRegularHandle refuses an already-OPEN file that is not a regular file. It is the
+// third guard in the substitution set, and none of the three subsumes another:
+// RefuseNonRegularPath refuses what the PATH names, OpenNoFollow/OpenNonBlock make the open
+// itself safe to attempt, and this one asks through the HANDLE — the only question with no
+// TOCTOU window after it, since it describes the object the caller is about to read or write
+// rather than whatever the name resolved to a syscall ago.
+//
+// subject names what the file is, for the error message, matching RefuseNonRegularPath's.
+func RefuseNonRegularHandle(f *os.File, subject, path string) error {
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("refusing %s %q: cannot stat the open file (%v)", subject, path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing a non-regular %s %q (mode %v): it must be a regular file, not a symlink or other special file", subject, path, info.Mode())
+	}
+	return nil
+}
+
 // BoundedRead is one bounded whole-file read's parameters — a struct rather than
 // positional args, since Path/What are both strings that read identically at a call site
 // and swapping them would garble every error message ReadBoundedFile produces.
@@ -134,12 +153,21 @@ type BoundedRead struct {
 // data file or disk image must produce an error, not an OOM. Reads one byte past the bound
 // so a file exactly at the limit still loads and anything larger is detectable without
 // reading it all.
+//
+// It carries the FIFO half of the substitution guard for every caller, rather than leaving
+// each to remember it: a caller's RefuseNonRegularPath runs against the PATH, so a FIFO
+// swapped in after that Lstat is opened directly, and a read-only open of a reader-less FIFO
+// blocks inside open(2) forever — no size bound and no O_NOFOLLOW reaches that. OpenNonBlock
+// makes the open return, and RefuseNonRegularHandle then refuses through the fd.
 func ReadBoundedFile(rd BoundedRead) ([]byte, error) {
-	f, err := os.OpenFile(rd.Path, os.O_RDONLY|rd.Flags, 0) //nolint:gosec // G304: operator-supplied path
+	f, err := os.OpenFile(rd.Path, os.O_RDONLY|OpenNonBlock|rd.Flags, 0) //nolint:gosec // G304: operator-supplied path
 	if err != nil {
 		return nil, fmt.Errorf("reading %s %q: %w", rd.What, rd.Path, err)
 	}
 	defer func() { _ = f.Close() }()
+	if err := RefuseNonRegularHandle(f, rd.What, rd.Path); err != nil {
+		return nil, err
+	}
 	data, err := io.ReadAll(io.LimitReader(f, rd.Max+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading %s %q: %w", rd.What, rd.Path, err)

@@ -478,7 +478,8 @@ Flags:
 	transportSet := flagWasSet(fs, "transport")
 	// Computed once and referenced at both guard sites below so the two copies of this
 	// predicate cannot drift out of lockstep.
-	upstreamFlagsGiven := *upstreamURL != "" || *authHeader != "" || *tlsSkipVerify || transportSet || len(stdioCmd) > 0
+	upstreamFlagsGiven := *upstreamURL != "" || *authHeader != "" || *tlsSkipVerify || transportSet ||
+		len(stdioCmd) > 0 || *protocolVersion != ""
 
 	// Mode selection: --config is mutually exclusive with positional manifests
 	// and per-upstream flags — the config carries that wiring.
@@ -488,7 +489,7 @@ Flags:
 			return 2
 		}
 		if upstreamFlagsGiven {
-			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify / a stdio command; each route's transport and upstream wiring is declared in the config\n")
+			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with --transport / --upstream-url / --upstream-auth-header / --upstream-protocol-version / --upstream-tls-skip-verify / a stdio command; each route's transport and upstream wiring is declared in the config\n")
 			return 2
 		}
 		cfg, err := config.LoadGatewayConfig(*configPath)
@@ -507,9 +508,11 @@ Flags:
 	}
 
 	// These flags only select how to reach a live upstream, so meaningless without
-	// --live; reject rather than silently dropping them.
+	// --live; reject rather than silently dropping them. --upstream-protocol-version is one
+	// of them: it was the single exception to that rule, so a typo'd revision validated
+	// clean under both --config and a bare `validate` while selecting nothing.
 	if !*live && upstreamFlagsGiven {
-		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
+		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-protocol-version / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
 		return 2
 	}
 

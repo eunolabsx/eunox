@@ -752,8 +752,25 @@ func maxRotatedOrdinal(logPath string) (highest uint64, ok bool) {
 			highest = ord
 		}
 	}
+	if highest > maxSeedableOrdinal {
+		// The seq seed's clamp, applied to the other counter seeded from unverified
+		// on-disk bytes. A single planted sibling named with ordinal MaxUint64 seeds the
+		// counter at the maximum, so the next rotation's ++ wraps to 0 — and 0 sorts
+		// FIRST, which makes retention delete the newest real evidence while retaining the
+		// decoy, and feeds verify the chain out of order. The clamped seed still lands past
+		// every genuine sibling, so the monotonic guarantee holds for real history.
+		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log %q has a rotated sibling with an implausible rotation ordinal (%d); it is corrupt or planted. Seeding the rotation counter at %d instead — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath, highest, maxSeedableOrdinal)
+		highest = maxSeedableOrdinal
+	}
 	return highest, true
 }
+
+// maxSeedableOrdinal caps the rotation ordinal seeded from sibling FILENAMES, which nothing
+// signs — the same reasoning, and the same value, as maxSeedableSeq: 2^62 is unreachable by
+// any real rotation history while leaving rotatedPath's `s.rotateOrdinal++` far below the
+// uint64 wrap, and a wrapped ordinal inverts the ORDER retention and chain verification both
+// depend on.
+const maxSeedableOrdinal uint64 = 1 << 62
 
 // maxRotateSuffix bounds the ".N" collision-backstop search. Reaching it requires
 // this many siblings sharing one nanosecond base (unreachable in normal operation),
