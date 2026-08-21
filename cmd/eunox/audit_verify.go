@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -128,8 +129,9 @@ func openAuditChainOrExit(name, logPath string, usageExit int) (r io.Reader, clo
 }
 
 // auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution, or
-// log-read failure. Exit 1 is reserved for a log that fails verification (like validate
-// reserves it for findings), so a cron/CI job can tell tampering from a misconfigured flag.
+// log-read failure, and for a pass a rotation raced (no verdict was reached). Exit 1 is
+// reserved for a log that fails verification (like validate reserves it for findings), so
+// a cron/CI job can tell tampering from a misconfigured flag or an inconclusive run.
 // parseAuditReaderFlags reports usage errors as 1, so this command translates at the call site.
 const auditVerifyUsageExit = 2
 
@@ -152,7 +154,8 @@ Exit codes:
   1  The log failed verification (an invalid record, a chain break, an
      unverifiable or unknown-key record). Reserved for findings, so a cron or
      CI job can gate on it; never used for usage errors.
-  2  Usage error, or a config, key-resolution, or log-read failure.
+  2  Usage error, a config, key-resolution, or log-read failure, or a pass that
+     a rotation raced (inconclusive — re-run).
 
 Flags:
 `)
@@ -189,12 +192,16 @@ Flags:
 	verifier := audit.NewVerifier(keys)
 
 	// Verify the whole rotated set as one chain, not just the base file — deletion of an
-	// entire interior rotated file would otherwise go undetected.
-	chainFiles, err := audit.LogChainFiles(logPath)
+	// entire interior rotated file would otherwise go undetected. Snapshot rather than a
+	// bare LogChainFiles: this runs against a live proxy under traffic (audit-verify takes
+	// no lock by design), so the pass has to be bracketed against a rotation moving the
+	// files under it.
+	snap, err := audit.SnapshotLogChain(logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: discovering rotated audit logs: %v\n", err)
 		return auditVerifyUsageExit
 	}
+	chainFiles := snap.Files
 	if len(chainFiles) == 0 {
 		fmt.Fprint(os.Stderr, auditLogMissingHint("audit-verify", logPath))
 		return auditVerifyUsageExit
@@ -212,9 +219,25 @@ Flags:
 	if len(chainFiles) > 1 {
 		fmt.Printf("Verifying %d audit log files as one chain (oldest rotated to current base).\n", len(chainFiles))
 	}
-	res, err := audit.VerifyLogFiles(chainFiles, verifier, *requestID, sinceTime, os.Stdout)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log: %v\n", err)
+	// Findings are HELD rather than streamed: a rotation racing the pass fabricates a
+	// CHAIN BREAK at the seam, and printing it before the bracket has run puts a tamper
+	// alarm on the operator's terminal that the next line then retracts.
+	held := &heldFindings{out: os.Stdout}
+	res, verifyErr := audit.VerifyLogFiles(chainFiles, verifier, *requestID, sinceTime, held)
+	// Checked before the read error and before any verdict, because a rotation landing
+	// mid-pass produces those too: a pruned sibling reads as an open failure, a re-pointed
+	// base as a PASS over an incomplete chain or a spurious CHAIN BREAK. "Re-run" is the
+	// only honest answer to any of them, and it is NOT a finding, so it exits 2 not 1.
+	// The held findings are DISCARDED with it — they describe a chain that was never read
+	// as a whole, and the re-run reports the real ones.
+	if err := snap.CheckUnchanged(); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: %v; no verdict was reached — re-run "+
+			"(against a quiescent log, or a copy of the chain)\n", err)
+		return auditVerifyUsageExit
+	}
+	held.release()
+	if verifyErr != nil {
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log: %v\n", verifyErr)
 		return auditVerifyUsageExit
 	}
 
@@ -232,6 +255,48 @@ Flags:
 		return 1
 	}
 	return 0
+}
+
+// heldFindingsCap bounds what a bracketed pass withholds. A rotation racing the pass
+// fabricates a handful of lines at one seam (a CHAIN BREAK plus a SEQ GAP), so a pass
+// past this volume is reporting the LOG's findings, which an operator should see even if
+// the bracket goes on to call the run inconclusive. Without a cap a wholly-tampered log
+// would buffer a line per record.
+const heldFindingsCap = 64 << 10
+
+// heldFindings withholds VerifyLogFiles' finding lines until the rotation bracket has
+// decided whether the pass covered a coherent chain, then either releases them or drops
+// them with the inconclusive verdict. Past heldFindingsCap it gives up and streams: see
+// the constant. A clean pass writes nothing here, so the common case buffers nothing.
+type heldFindings struct {
+	out       io.Writer
+	buf       bytes.Buffer
+	streaming bool
+}
+
+// Write never reports an error to the verifier: a findings line that cannot be shown must
+// not abort a verification pass, and the verifier discards write errors anyway.
+func (h *heldFindings) Write(p []byte) (int, error) {
+	if h.streaming {
+		_, _ = h.out.Write(p)
+		return len(p), nil
+	}
+	h.buf.Write(p)
+	if h.buf.Len() >= heldFindingsCap {
+		h.streaming = true
+		h.release()
+	}
+	return len(p), nil
+}
+
+// release writes out whatever is still held. Idempotent: the buffer is emptied, so the
+// cap-exceeded flush and the end-of-pass release cannot print the same line twice.
+func (h *heldFindings) release() {
+	if h.buf.Len() == 0 {
+		return
+	}
+	_, _ = h.out.Write(h.buf.Bytes())
+	h.buf.Reset()
 }
 
 // printVerifySummary writes the tallies and the operator notes a non-empty pass produces.

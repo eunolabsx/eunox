@@ -333,6 +333,11 @@ func VerifyLog(r io.Reader, verifier *Sink, requestID string, since time.Time, o
 // where the sibling count is unbounded. An open error is surfaced (as a VerifyLog
 // read error), not skipped: an unreadable chain file cannot be certified, so
 // audit-verify fails closed.
+//
+// Opening lazily means the paths are resolved across the whole pass rather than at
+// discovery, so a rotation landing inside it re-points the base after the siblings are
+// already verified. Callers verifying a LIVE log bracket the pass with ChainSnapshot,
+// whose doc states both outcomes; this function reads the names it is given.
 func VerifyLogFiles(paths []string, verifier *Sink, requestID string, since time.Time, out io.Writer) (VerifyResult, error) {
 	r, lazies := buildLazyChain(paths)
 	// Backstop: if VerifyLog returns before draining (e.g. a scanner error), close
