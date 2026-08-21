@@ -1300,7 +1300,11 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 	// hard-denied call leaves NEITHER a phantom antecedent nor a stranded flow label. A
 	// transport that serializes its decision phase orders this against other decisions on
 	// the same anchor; see rollbackLabels for when no such ordering can be assumed.
-	labelsOut, cerr := e.recordSourceCall(ctx, ec.req, ec.matched, flowRelevant, carriedLabels, decl)
+	labelsOut, cerr := e.recordSourceCall(ctx, ec.req, ec.matched,
+		// The allow tail always wants the antecedent: unlike the PDP's forwarded no-match
+		// deny, the target here is one the manifest names, so recording it mints no key the
+		// policy could not already have.
+		SourceCommitScope{Flow: flowRelevant, Antecedent: true}, carriedLabels, decl)
 	if cerr != nil {
 		if cerr.Declassify {
 			// Reached AFTER the burn on the antecedent-fault path, so the grant may already

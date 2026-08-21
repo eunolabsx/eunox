@@ -2232,6 +2232,14 @@ On an **allowed** call, the labels are unioned into the session's accumulated
 set. It is a state write, not a response mutation: the response is untouched.
 Valid on `tool:` and `resource:` targets — an egress is not a source.
 
+Under `--audit` a *denied* call is forwarded and therefore runs, so the taint is
+committed there too — including when the deny was a **no-match** (nothing was
+selected for this caller, e.g. every entry naming the target is scoped to another
+principal). Selection for that case is deliberately principal-blind: any entry
+declaring the target a source is enough, because the data really was produced.
+Without it, an enforce route sharing the anchor would see a clean set and its
+sink would fail open.
+
 ### `flowLabel` — the information-flow sink
 
 ```yaml

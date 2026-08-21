@@ -314,6 +314,15 @@ It is a **hard** refusal with the audit-mode downgrade deliberately unavailable:
 running `--audit` cannot turn "needs human approval" into "performed anyway, logged". That
 is the one downgrade that would defeat the control entirely.
 
+`onExceed: deny` is **equally hard**, for the same reason. `onExceed` chooses what an
+operator gets to *read* — a `CONDITION_FAILED` deny record, or the `decision: escalate`
+approval-queue entry below — never whether the over-ceiling action happens. Both arms are
+built with the downgrade unavailable, so neither a route running `--audit` nor a constraint
+carrying `enforcement: audit` forwards a call the ceiling refused. Without that, choosing
+the plainer record would have quietly bought the softer control, and the wrapper's
+non-committing consultation (above) — which exists precisely so an `--audit` route cannot
+perform what the ceiling flagged — would itself have been soft under `onExceed: deny`.
+
 What escalate buys over a plain deny is the **record**:
 
 ```

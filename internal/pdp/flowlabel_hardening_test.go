@@ -155,7 +155,7 @@ func TestFlowHardening_AuditModePeekFailsClosed(t *testing.T) {
 	// A downgradable deny with no carried labels stamped yet (the structural early-return
 	// shape), so recordAuditModeAntecedent must do the pre-write peek — which faults.
 	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}
-	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, src, resp)
+	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, src, true, resp)
 
 	require.NotNil(t, override, "a peek fault must hard-deny, not forward with unreliable flow state")
 	require.NotNil(t, override.Denial)
@@ -163,4 +163,91 @@ func TestFlowHardening_AuditModePeekFailsClosed(t *testing.T) {
 		"a store fault is not a policy verdict; the tape has to separate the two, and this is the code an observing route never downgrades")
 	assert.True(t, override.Denial.BlockOverride, "the peek-fault deny must be non-downgradable even under audit")
 	assert.Contains(t, override.Denial.Message, "audit-mode flow-label peek failed")
+}
+
+// TestFlowHardening_ForwardedNoMatchCommitsTaint is the no-match counterpart of the
+// principal-scoped-miss leak the redaction fill closes. A source entry scoped to ANOTHER
+// principal is skipped by findConstraint, so the call takes the no-match deny — which a
+// route running --audit FORWARDS, and the tool actually runs, producing exactly the data the
+// manifest declares confidential. With no taint committed for it, a later ENFORCED flowLabel
+// sink on the same session Peeked an empty set and failed OPEN.
+func TestFlowHardening_ForwardedNoMatchCommitsTaint(t *testing.T) {
+	t.Parallel()
+
+	caps := []capability.Constraint{
+		{
+			Target:     "tool:read_secret",
+			Actions:    []string{"call"},
+			Principal:  map[string][]string{"agent_id": {"admin-bot"}},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
+		},
+		{
+			Target:     "tool:send_email",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic, capability.FlowLabelInternal}}},
+		},
+	}
+	p := newFlowManifestPDP(caps...)
+	enforced := ctxWithAgent("other-bot")
+	observed := enforcement.WithSkipQuota(enforced)
+
+	src := callTool(p, observed, "read_secret", nil)
+	require.Equal(t, capability.DecisionDeny, src.Decision)
+	require.NotNil(t, src.Denial)
+	require.Equal(t, capability.ErrCodeAuthorizationFailed, src.Denial.Code)
+	require.True(t, src.Denial.Downgradable(), "the no-match deny must still be the forwarded one this test is about")
+	assert.Equal(t, []string{capability.FlowLabelConfidential}, src.LabelsOut,
+		"the forwarded read produced confidential data, so the tape must say so")
+
+	// The sink runs ENFORCED: the whole point is that an observe route beside an enforce
+	// route cannot launder taint through a no-match forward.
+	sink := callTool(p, enforced, "send_email", nil)
+	require.Equal(t, capability.DecisionDeny, sink.Decision)
+	require.NotNil(t, sink.Denial)
+	assert.Equal(t, capability.FlowLabelConfidential, sink.Denial.Details["blockedLabel"])
+}
+
+// TestFlowHardening_ForwardedNoMatchTaintMintsNoAntecedentKeys pins the bound the two halves
+// of that commit are gated by separately. The flow write is keyed on the state anchor, so
+// any name may commit taint; the sequenceBlock antecedent is keyed on the TARGET NAME, and
+// this branch is the one place that name is not bounded by the manifest — recording every
+// unlisted name lets a caller on an observe route mint one counter key per made-up target
+// until the counter caps and the record starts hard-denying an observe route outright.
+func TestFlowHardening_ForwardedNoMatchTaintMintsNoAntecedentKeys(t *testing.T) {
+	t.Parallel()
+
+	counter := newCountingCallCounter()
+	eng := enforcement.New(
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+		enforcement.WithCallCounter(counter),
+	)
+	// A principal-scoped wildcard source (so nothing matches this caller and every call takes
+	// the no-match branch) beside a sequenceBlock naming exactly one antecedent.
+	p := NewManifestPDP([]capability.Constraint{
+		{
+			Target:     "tool:*",
+			Actions:    []string{"call"},
+			Principal:  map[string][]string{"agent_id": {"admin-bot"}},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
+		},
+		{
+			Target:     "tool:sink",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"known"}}},
+		},
+	}, eng, killswitch.NewInMemory())
+	observed := enforcement.WithSkipQuota(ctxWithAgent("other-bot"))
+
+	madeUp := callTool(p, observed, "made_up_"+t.Name(), nil)
+	require.Equal(t, capability.DecisionDeny, madeUp.Decision)
+	assert.Equal(t, []string{capability.FlowLabelConfidential}, madeUp.LabelsOut,
+		"a forwarded call the manifest declares a source must commit its taint whatever its name")
+	assert.Zero(t, counter.writes(),
+		"an unqueryable name must mint no antecedent key; the taint commit must not smuggle one in")
+
+	// The queryable name still records, so the split gate did not disable the antecedent
+	// half it was factored out of.
+	known := callTool(p, observed, "known", nil)
+	require.Equal(t, capability.DecisionDeny, known.Decision)
+	assert.NotZero(t, counter.writes(), "a name some sequenceBlock queries must still record its antecedent")
 }
