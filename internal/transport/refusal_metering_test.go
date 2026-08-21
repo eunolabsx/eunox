@@ -208,9 +208,9 @@ func TestRefusalMetering_SizedLimiterKeepsTheAggregateShare(t *testing.T) {
 	t.Parallel()
 	one := newRefusalRecordLimiterFor(catRevision)
 	assert.Len(t, one.buckets, 1, "a transport charging one category must not retain buckets it can never spend")
-	assert.Equal(t, perCategoryDenyRate, one.bucket(catRevision).ratePerSec,
+	assert.Equal(t, float64(perCategoryDenyRatePerSec), one.bucket(catRevision).ratePerSec,
 		"a subset limiter's bucket must hold the same share as the full table's, or a transport charging fewer categories would get a larger budget per category")
-	assert.Equal(t, perCategoryDenyBurst, one.bucket(catRevision).burst)
+	assert.Equal(t, float64(perCategoryDenyBurstSize), one.bucket(catRevision).burst)
 	// An unregistered category is bounded rather than unbounded — the safe direction for the
 	// fallback the guards above keep unreachable.
 	assert.Equal(t, one.unknown, one.bucket(catAuth))

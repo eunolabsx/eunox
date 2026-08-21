@@ -36,27 +36,19 @@ import (
 // unbounded, a dropped audit write can latch AUDIT_UNAVAILABLE and deny every call under
 // --require-audit=strict, so an attacker could take the data plane down by spraying bad
 // bearer tokens. Suppressed refusals fold into the next admitted record's
-// suppressed_refusal_count rather than vanishing; buckets are per-CATEGORY (see below) so
-// one cheap flood cannot silence another category's records, and per-category shares
-// divide (not replicate) the aggregate so the reachable rate an attacker can drive stays
-// bounded regardless of category count.
-// Sized as a per-category share times the category count, so ADDING a category costs one
-// category's worth of aggregate rather than silently halving every existing category's share
-// — which is what plain division does at the integer boundary (20/10 = 2/s, 20/11 = 1/s).
-// The aggregate is still what bounds the reachable rate; it just grows with the set it
-// divides rather than being a fixed number the set erodes.
+// suppressed_refusal_count rather than vanishing, and buckets are per-CATEGORY (see below)
+// so one cheap flood cannot silence another category's records.
+//
+// The budget is PER CATEGORY and the aggregate grows with the set, rather than a fixed
+// aggregate the set divides: adding a category costs one category's worth rather than
+// silently eroding every existing share — which is what plain division does at the integer
+// boundary (20/10 = 2/s, 20/11 = 1/s). The rate a PEER can drive is unchanged either way,
+// since a peer drives at most one category's bucket; what grows is the process-wide total,
+// which is an operator's ceiling rather than an attacker's lever. Same treatment as the
+// notice classes, which state the measured version of this argument at their own constants.
 const (
 	perCategoryDenyRatePerSec = 2
 	perCategoryDenyBurstSize  = 5
-)
-
-// The aggregate budget, DERIVED from the metered set rather than a hand-typed count of it. A count
-// written out separately had to be reconciled by a test with a map literal sixty lines away, and
-// it moved for two different reasons — adding a category, and flipping an existing one's one-word
-// metering — only one of which the test's message named.
-var (
-	preSessionDenyRatePerSec = perCategoryDenyRatePerSec * len(refusalCategories)
-	preSessionDenyBurst      = perCategoryDenyBurstSize * len(refusalCategories)
 )
 
 // refusalCategory is a distinct type (not a bare string) because a METERED category's value
@@ -217,38 +209,13 @@ var refusalDeclarations = map[refusalCategory]refusalDeclaration{
 var refusalCategories = sortedKeysWhere(refusalDeclarations,
 	func(d refusalDeclaration) bool { return d.metering == meteringMetered })
 
-// perBucketFloor keeps every bucket in a divided table alive even where plain division would
-// floor its share to 0 (possible past ~20 categories at today's rate) — a 0-rate bucket
-// never refills and would permanently suppress that key's writes.
+// perBucketFloor is the rate the unreachable-in-production "unknown" fallback bucket gets:
+// a bucket no declared call site uses must still refill (a 0-rate bucket never does, and
+// would permanently suppress whatever reached it), without being sized like a real category.
 const perBucketFloor = 1
 
-// perBucketShare divides total evenly across keys, floored at perBucketFloor.
-// Integer division (not float) keeps each share a whole token count and lands the sum at
-// or slightly UNDER the aggregate when it doesn't divide evenly — the safe direction.
-//
-// One consumer today, the refusal categories: the notice classes were the second and now multiply a
-// per-key budget UP instead, on measured grounds stated at their sizing constants. Kept as a
-// function rather than inlined because the floor is the part worth not re-deriving — a share that
-// divides to zero never refills and silently stops a key's writes for good.
-func perBucketShare(total, keys int) float64 {
-	share := total / keys
-	if share < perBucketFloor {
-		share = perBucketFloor
-	}
-	return float64(share)
-}
-
-// perCategoryDenyRate and perCategoryDenyBurst are each registered category's even share
-// of the aggregate budget. The unreachable-in-production "unknown" fallback bucket is
-// deliberately NOT sized from these — it gets perBucketFloor instead, so it doesn't
-// dilute every real category's share for a bucket no call site actually uses.
-var (
-	perCategoryDenyRate  = perBucketShare(preSessionDenyRatePerSec, len(refusalCategories))
-	perCategoryDenyBurst = perBucketShare(preSessionDenyBurst, len(refusalCategories))
-)
-
 // newRefusalRecordLimiter builds a bucket for every METERED category, each holding an equal
-// share of the aggregate rate/burst (see perCategoryDenyRate/perCategoryDenyBurst). The HTTP
+// share of the per-category rate/burst (see perCategoryDenyRatePerSec). The HTTP
 // proxy's, since that transport charges nearly all of them.
 func newRefusalRecordLimiter() *categoryRecordLimiter {
 	return newRefusalRecordLimiterFor(refusalCategories...)
@@ -269,7 +236,7 @@ func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter 
 	// DELEGATES a category it holds no bucket for wholly upward, floor included, and for such a
 	// category this tier is where that session contends with its peers.
 	return &categoryRecordLimiter{tieredBuckets: newTieredBuckets(
-		perCategoryDenyRate, perCategoryDenyBurst, recordReserveInterval, cats, nil,
+		perCategoryDenyRatePerSec, perCategoryDenyBurstSize, recordReserveInterval, cats, nil,
 		suppressedScopeProxyCategory, floorOwnBucket)}
 }
 
@@ -337,7 +304,7 @@ func newUpstreamRefusalLimiter(aggregate *categoryRecordLimiter, cats []refusalC
 	}
 	return &categoryRecordLimiter{
 		tieredBuckets: newTieredBuckets(
-			perCategoryDenyRate, perCategoryDenyBurst, recordReserveInterval, cats, parent,
+			perCategoryDenyRatePerSec, perCategoryDenyBurstSize, recordReserveInterval, cats, parent,
 			suppressedScopeSessionCategory, floorParentBucket),
 		// Over the whole upstream-driven set rather than over cats, which is what makes the
 		// aggregate's own floorOwnBucket reachable: a category this table holds no bucket for is

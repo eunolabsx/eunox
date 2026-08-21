@@ -139,14 +139,8 @@ type httpSession struct {
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg
 
-	// droppedNotifs counts notifications dropped by a full subscriber SSE channel, so a lost
-	// tools/list_changed etc. is observable rather than silent. Atomic: no extra locking under
-	// broadcast's notifMu.
-	droppedNotifs atomic.Uint64
-	// notifDropWarned is the noticeOnce bound on the line beside that counter, through the
-	// package's one latch primitive. A separate field rather than `droppedNotifs.Add(1) == 1`,
-	// because a tally and a latch answer different questions and folding them made the diagnostic's
-	// bound a property of a counter that exists for an operator to read.
+	// notifDropWarned bounds the line reporting a notification dropped to a slow SSE
+	// subscriber, through the package's one latch primitive.
 	notifDropWarned noticeLatch
 
 	closeOnce sync.Once
@@ -1453,12 +1447,12 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 		select {
 		case ch <- msg:
 		default:
-			// Slow subscriber: channel full, notification dropped. Track and warn on the
-			// first drop so a lost tools/list_changed is observable, not silent.
-			s.droppedNotifs.Add(1)
+			// Slow subscriber: channel full, notification dropped. Warned once so a lost
+			// tools/list_changed is observable rather than silent, and a subscriber that
+			// stays behind cannot turn every dropped frame into a write syscall.
 			if s.notifDropWarned.admitOnce() {
 				_, _ = fmt.Fprintf(s.errOut(),
-					"[eunox] WARNING: HTTP session %s dropped a notification (method=%q) to a slow SSE subscriber; further drops counted but not individually logged.\n",
+					"[eunox] WARNING: HTTP session %s dropped a notification (method=%q) to a slow SSE subscriber; further drops on this session are not reported individually.\n",
 					s.id, msg.Method)
 			}
 		}

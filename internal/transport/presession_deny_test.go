@@ -34,7 +34,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 
 	admitted := 0
 	const attempts = 5000
-	catBurst := int(perCategoryDenyBurst)
+	catBurst := perCategoryDenyBurstSize
 	for i := 0; i < attempts; i++ {
 		if l.admitRefusal(catAuth).ok {
 			admitted++
@@ -111,7 +111,7 @@ func TestRefusalRollup_NamesItsScopeOnARouteStampedRecord(t *testing.T) {
 		t.Fatal("expected an admitted record carrying the rollup")
 	}
 	details, _ := rec["details"].(map[string]interface{})
-	want := float64(attempts - int(perCategoryDenyBurst))
+	want := float64(attempts - perCategoryDenyBurstSize)
 	if got := details[detailSuppressedRefusalCount]; got != want {
 		t.Fatalf("%s = %v, want %v — the suppressed refusals must be folded into the next admitted record", detailSuppressedRefusalCount, got, want)
 	}
@@ -172,7 +172,7 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 	// The control-token attempts that follow must still be recorded in full — kept
 	// comfortably under catControl's own per-category burst so this stays a test of
 	// cross-category fairness, not a second bound-exhaustion test.
-	controlAttempts := int(perCategoryDenyBurst) - 1
+	controlAttempts := perCategoryDenyBurstSize - 1
 	for i := 0; i < controlAttempts; i++ {
 		proxy.recordPreSessionDeny(req, codeControlAuthFailed, catControl, nil)
 	}
@@ -195,7 +195,7 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 			origin++
 		}
 	}
-	if want := int(perCategoryDenyBurst); origin != want {
+	if want := perCategoryDenyBurstSize; origin != want {
 		t.Errorf("wrote %d origin refusal records, want the burst size %d — the flood must still be bounded", origin, want)
 	}
 }
@@ -241,8 +241,8 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	l := newRefusalRecordLimiter()
 	l.setNow(func() time.Time { return now })
 
-	catBurst := int(perCategoryDenyBurst)
-	catRate := int(perCategoryDenyRate)
+	catBurst := perCategoryDenyBurstSize
+	catRate := perCategoryDenyRatePerSec
 
 	// Drain the burst.
 	for i := 0; i < catBurst; i++ {
@@ -275,7 +275,7 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 	now := base
 	l := newRefusalRecordLimiter()
 	l.setNow(func() time.Time { return now })
-	for i := 0; i < int(perCategoryDenyBurst); i++ {
+	for i := 0; i < perCategoryDenyBurstSize; i++ {
 		l.admitRefusal(catAuth)
 	}
 	now = base.Add(-time.Hour)

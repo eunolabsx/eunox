@@ -1076,7 +1076,9 @@ func TestJWTPDP_ValidateToken_ConfigurableLeeway(t *testing.T) {
 }
 
 // TestEffectiveLeeway and TestJWTLeewayOption pin the leeway resolution rules so
-// the zero-as-default / negative-as-disabled contract cannot drift.
+// the zero-as-default / negative-as-disabled contract cannot drift. Asserted through
+// capability.EffectiveLeeway directly, which is what this package now calls: the one-line
+// pass-through it used to go through was a second name for the same function.
 func TestEffectiveLeeway(t *testing.T) {
 	cases := []struct {
 		in, want time.Duration
@@ -1087,8 +1089,8 @@ func TestEffectiveLeeway(t *testing.T) {
 		{5 * time.Second, 5 * time.Second},
 	}
 	for _, tc := range cases {
-		if got := effectiveLeeway(tc.in); got != tc.want {
-			t.Errorf("effectiveLeeway(%v) = %v, want %v", tc.in, got, tc.want)
+		if got := capability.EffectiveLeeway(tc.in); got != tc.want {
+			t.Errorf("capability.EffectiveLeeway(%v) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
@@ -4985,7 +4987,7 @@ func TestDecodeJWTClaimsPreservingNumbers_SegmentGuard(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			claims, err := decodeJWTClaimsPreservingNumbers(tc.token)
+			claims, err := decodeJWTClaimsFromToken(tc.token)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %q, got claims %v", tc.token, claims)
@@ -6259,4 +6261,15 @@ func TestJWTPDP_CheckKill_FallsBackToTheInnerPDP(t *testing.T) {
 	if deny := wrapper.CheckKill(context.Background(), "sess-live"); deny != nil {
 		t.Errorf("a live session must not be refused; got %+v", deny)
 	}
+}
+
+// decodeJWTClaimsFromToken is the test-side composition of the two steps ValidateToken now
+// performs separately: the payload segment is decoded once there and threaded to both
+// readers, so the whole-token form no longer exists in production.
+func decodeJWTClaimsFromToken(tokenStr string) (map[string]interface{}, error) {
+	payloadBytes, err := jwtPayloadSegment(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	return decodeJWTClaimsPreservingNumbers(payloadBytes)
 }
