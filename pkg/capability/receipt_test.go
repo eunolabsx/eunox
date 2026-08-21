@@ -359,6 +359,16 @@ func TestNewEffectReceiptVerifierRefusesAmbiguousKeySetMembers(t *testing.T) {
 	_, err := capability.NewEffectReceiptVerifier(ambiguous, 0, 0)
 	require.ErrorContains(t, err, "same name to a JSON decoder")
 
+	// A member the unmarshal below skips without range-checking must not end the scan
+	// either: the substitution is still there behind it.
+	padded := []byte(fmt.Sprintf(`{"pad":1e999,"keys":%s,"Keys":%s}`,
+		keysArray(t, reviewed.jwks), keysArray(t, substituted.jwks)))
+	var padDecoded jose.JSONWebKeySet
+	require.NoError(t, json.Unmarshal(padded, &padDecoded), "the premise: the decoder reads it happily")
+	require.Equal(t, "substituted", padDecoded.Keys[0].KeyID)
+	_, err = capability.NewEffectReceiptVerifier(padded, 0, 0)
+	require.ErrorContains(t, err, "same name to a JSON decoder")
+
 	// A key set whose members are merely REPEATED across sibling key objects is ordinary
 	// and must still load.
 	both, err := json.Marshal(map[string]json.RawMessage{"keys": json.RawMessage(

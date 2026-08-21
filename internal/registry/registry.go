@@ -358,18 +358,26 @@ func checkPinnableNumbers(e *capability.EffectContract) error {
 	return nil
 }
 
-// checkPinnableBlastRadius applies checkPinnableNumbers' rule to one magnitude.
+// checkPinnableBlastRadius applies checkPinnableNumbers' rule to one magnitude. The two
+// refusals are worded differently because only one of them has a spelling to recommend: a
+// literal the loader merely RE-SPELLS has a canonical form to write, while one it ROUNDS has
+// none at all — and offering the rounded form as the fix would tell the author to declare a
+// magnitude they did not write, which is the ceiling's and the cumulative bound's own input.
 func checkPinnableBlastRadius(where string, s *capability.BlastRadiusSpec) error {
 	if s == nil || s.Value == nil {
 		return nil
 	}
 	lit := s.Value.String()
-	canonical, ok := config.CanonicalNumberLiteral(lit)
-	if !ok || canonical == lit {
+	canonical, exact, ok := config.CanonicalNumberLiteral(lit)
+	switch {
+	case !ok || canonical == lit:
 		// Not a number at all is ValidateEffectContract's report to make, not this one's.
 		return nil
+	case !exact:
+		return fmt.Errorf("%s 'value' %s is past the precision the manifest loader keeps: it renormalizes to %s, a DIFFERENT magnitude, so no spelling of this number can be copied into a manifest and pinned — declare a magnitude the loader carries exactly", where, lit, canonical)
+	default:
+		return fmt.Errorf("%s 'value' is written %s, which a manifest copying this block renormalizes to %s; the copy would digest differently and its 'effect.ref' pin could never match this entry, so write %s here", where, lit, canonical, canonical)
 	}
-	return fmt.Errorf("%s 'value' is written %s, which a manifest copying this block renormalizes to %s; the copy would digest differently and its 'effect.ref' pin could never match this entry, so write %s here", where, lit, canonical, canonical)
 }
 
 // maxContractFileBytes bounds one corpus entry's read against a MISDIRECTED --dir path

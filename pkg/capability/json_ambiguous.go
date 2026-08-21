@@ -49,10 +49,28 @@ func (e *ambiguityRefusal) Error() string { return e.msg }
 // maxAmbiguousKeyScanDepth — come back as errors.
 func RefuseAmbiguousJSONKeys(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	// UseNumber so a literal outside float64's range (1e999) is carried as TEXT rather than
+	// parsed. Token() otherwise fails on it and the walk stops there, leaving every member
+	// after that number unscanned — while the decoders this guard protects read the same
+	// bytes without complaint (the corpus loader uses UseNumber itself, and a plain
+	// Unmarshal skips an unknown member without range-checking it), so one padding number
+	// in front of the substitution bought a silent pass.
+	dec.UseNumber()
 	err := scanAmbiguousKeys(dec, "", 0)
+	if err == nil {
+		return nil
+	}
 	var refusal *ambiguityRefusal
 	if errors.As(err, &refusal) {
 		return err
+	}
+	// Any OTHER walk failure on a document that PARSES is this reader disagreeing with the
+	// decoder about the same bytes — which is the class of divergence this guard exists to
+	// refuse, not one to wave through on the strength of the decode succeeding. Only
+	// genuinely malformed input is left to the decode that follows, which reports it with
+	// the offset and the expected type.
+	if json.Valid(data) {
+		return &ambiguityRefusal{msg: fmt.Sprintf("could not be walked for ambiguous member names (%v) although it parses as JSON; refusing rather than decoding the part the walk never read", err)}
 	}
 	return nil
 }

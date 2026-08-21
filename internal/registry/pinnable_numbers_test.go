@@ -71,12 +71,64 @@ func TestValidateRefusesAnUnpinnableNumberLiteral(t *testing.T) {
 // manifest loader leaves alone, including an integer past float64's exact range (yaml.v3
 // resolves it through uint64, which round-trips).
 func TestValidateAcceptsPinnableNumberLiterals(t *testing.T) {
-	for _, literal := range []string{"1", "0", "1000", "1.5", "12345678901234567890"} {
+	for _, literal := range []string{"1", "0", "1000", "1.5", "12345678901234567890", "1e999"} {
 		t.Run(literal, func(t *testing.T) {
 			c := numberedContract(t, literal)
 			assert.NoError(t, c.Validate())
 		})
 	}
+}
+
+// TestValidateRefusesAnUnrepresentableMagnitudeWithoutRenamingIt: a literal the manifest
+// loader ROUNDS (or cannot carry at all) has no faithful spelling, so the refusal must say
+// so rather than name its renormalized form — following that advice would declare a
+// different magnitude, and a blast radius is the ceiling's and the cumulative bound's own
+// input.
+func TestValidateRefusesAnUnrepresentableMagnitudeWithoutRenamingIt(t *testing.T) {
+	for name, tc := range map[string]struct{ literal, rounded string }{
+		// Rounds through float64: 1.2345678901234568e+29, ~1.2e13 away from what was written.
+		"past float64's exact range": {"123456789012345678901234567890", "1.2345678901234568e+29"},
+		// Underflows to zero, which is a bound that admits no quantified call at all.
+		"below float64's smallest": {"1e-999", "0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := numberedContract(t, tc.literal)
+			err := c.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.literal, "the refusal must name the literal it is refusing")
+			// The rounded form may be REPORTED — it is what would be enforced — but never
+			// recommended, which is the form the re-spelling case ("so write 1 here") uses.
+			assert.NotContains(t, err.Error(), "write "+tc.rounded+" here",
+				"a magnitude the author did not write must not be offered as the correction")
+			assert.NotContains(t, err.Error(), "so write",
+				"there is no faithful spelling of this literal to recommend")
+		})
+	}
+}
+
+// TestValidateAcceptsALiteralTheLoaderStoresVerbatim guards the over-refusal direction on
+// the case that is easiest to get wrong: yaml.v3 declines to resolve an exponent past
+// float64's range and leaves the scalar a STRING, which the manifest loader re-marshals
+// quoted and encoding/json accepts into the json.Number field verbatim — so the literal
+// reaches the policy unchanged and IS pinnable, though a check reading the yaml kind alone
+// would call it unusable. Asserted end to end rather than on the helper, since the property
+// is about what the loader stores.
+func TestValidateAcceptsALiteralTheLoaderStoresVerbatim(t *testing.T) {
+	c := numberedContract(t, "1e999")
+	require.NoError(t, c.Validate())
+
+	block, err := json.Marshal(map[string]json.RawMessage{
+		"class":       json.RawMessage(`"reversible"`),
+		"blastRadius": json.RawMessage(`{"value":1e999,"unit":"rows"}`),
+		"ref":         json.RawMessage(fmt.Sprintf("%q", c.Ref())),
+	})
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	body := fmt.Sprintf(`{"schemaVersion":"0.2","name":"m","version":"1.0.0",
+	  "capabilities":[{"target":"tool:t","actions":["call"],"effect":%s}]}`, block)
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+	_, loadErr := config.LoadManifest(path)
+	require.NoError(t, loadErr, "the literal reaches the manifest verbatim, so its pin must verify")
 }
 
 // TestValidateChecksEveryMagnitudeInATable: a case row and the default carry the same

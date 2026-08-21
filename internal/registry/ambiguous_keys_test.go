@@ -96,6 +96,26 @@ func TestLoadCorpus_RefusesAmbiguityInsideTheEffectBlock(t *testing.T) {
 	assert.Contains(t, loadErr.Error(), `"effect"`, "the refusal must name the block the ambiguity is in")
 }
 
+// TestLoadCorpus_RefusesAmbiguityBehindAnUnparseableNumber: the scan and the loader must
+// agree about how much of the file they read. A magnitude outside float64's range is a
+// perfectly good blastRadius value here (the corpus decodes with UseNumber), so a walk that
+// stopped on it left the substitution after it unexamined while the entry loaded and
+// enforced the second block.
+func TestLoadCorpus_RefusesAmbiguityBehindAnUnparseableNumber(t *testing.T) {
+	dir := t.TempDir()
+	body := fmt.Sprintf(`{"schemaVersion":%q,"id":"acme/mcp.send_email","tool":"send_email",
+	  "server":{"name":"@acme/mcp"},
+	  "attestation":{"author":"acme","source":"authored","review":"pending"},
+	  "digest":"sha256:0",
+	  "effect":{"class":"irreversible","blastRadius":{"value":1e999,"unit":"recipients"}},
+	  "Effect":{"class":"reversible","idempotent":true}}`, registry.SchemaVersion)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "e.json"), []byte(body), 0o600))
+
+	_, loadErr := registry.LoadCorpus(dir)
+	require.Error(t, loadErr)
+	assert.Contains(t, loadErr.Error(), "same name to a JSON decoder")
+}
+
 // TestLoadCorpus_AcceptsRepeatedNamesInSiblingBlocks guards the other direction: "class"
 // appears once per case row of an argument-parameterized table, which is not a duplicate of
 // anything. Over-refusing would reject the corpus's most useful shape.

@@ -100,6 +100,48 @@ func TestRefuseAmbiguousJSONKeys_LeavesMalformedInputToTheDecoder(t *testing.T) 
 	}
 }
 
+// TestRefuseAmbiguousJSONKeys_ScansPastANumberItCannotParse is the walk's own
+// divergence-with-the-decoder case, which is the class it exists to close rather than a
+// parser detail: a literal outside float64's range makes a value-parsing Token() fail, and a
+// walk that stopped there would leave everything after the number unscanned while the
+// decoders reading the same bytes carry on happily — so one padding number in front of a
+// substitution bought a silent pass. The assertion pairs both halves again: the document is
+// first shown to decode cleanly to the substituted member.
+func TestRefuseAmbiguousJSONKeys_ScansPastANumberItCannotParse(t *testing.T) {
+	t.Parallel()
+	for name, doc := range map[string]string{
+		"padded ahead of the ambiguity": `{"pad":1e999,"effect":{"class":"irreversible"},"Effect":{"class":"reversible"}}`,
+		"padded inside the object":      `{"outer":{"pad":-1e999,"kty":"OKP","KTY":"oct"}}`,
+		"padded in an array":            `{"keys":[1e999,{"x":"a","X":"b"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			require.True(t, json.Valid([]byte(doc)), "the premise: the document parses")
+			var decoded map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal([]byte(doc), &decoded),
+				"the premise: a decoder reads it without complaint, out-of-range literal and all")
+
+			require.Error(t, capability.RefuseAmbiguousJSONKeys([]byte(doc)),
+				"an ambiguity behind an unparseable number must be found, not skipped with the rest of the document")
+		})
+	}
+}
+
+// TestRefuseAmbiguousJSONKeys_RefusesAWalkItCannotComplete is the backstop under the case
+// above: any walk failure on a document that PARSES is this reader disagreeing with the
+// decoder about the same bytes, and is refused rather than waved through on the strength of
+// the decode succeeding — a document the walk did not finish reading is one whose ambiguity
+// it cannot have ruled out. Asserted through the depth bound, the one such disagreement
+// reachable from a document a decoder still accepts.
+func TestRefuseAmbiguousJSONKeys_RefusesAWalkItCannotComplete(t *testing.T) {
+	t.Parallel()
+	deep := strings.Repeat(`{"a":`, 200) + `1` + strings.Repeat(`}`, 200)
+	require.True(t, json.Valid([]byte(deep)), "the premise: the document parses")
+	var decoded map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(deep), &decoded), "the premise: a decoder accepts it")
+	require.Error(t, capability.RefuseAmbiguousJSONKeys([]byte(deep)))
+}
+
 // TestRefuseAmbiguousJSONKeys_RefusesUnwalkableNesting: the walk is recursive and the Token
 // API imposes no depth limit of its own, so a deeply-nested document would recurse until the
 // stack overflows — an uncatchable fatal error on operator-supplied input. Exceeding the
