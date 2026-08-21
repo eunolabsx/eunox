@@ -218,6 +218,24 @@ func TestEffectCeiling_OnExceedDeny(t *testing.T) {
 	resp := eng.ValidateAction(context.Background(), effectReq("send_email", nil), caps)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+
+	// The deny arm is as HARD as the escalate arm: onExceed chooses the record an operator
+	// reads, never whether the irreversible action happens. Both observing postures are
+	// pinned — the route-level --audit (SkipQuota) and a per-constraint audit-only entry —
+	// since Downgradable() is the whole gate and each posture reaches it differently.
+	assert.True(t, resp.Denial.BlockOverride)
+	assert.False(t, resp.Denial.Downgradable(), "an over-ceiling call must not be forwarded")
+
+	observed := eng.ValidateAction(enforcement.WithSkipQuota(context.Background()), effectReq("send_email", nil), caps)
+	require.Equal(t, capability.DecisionDeny, observed.Decision)
+	assert.False(t, observed.Denial.Downgradable(), "--audit must not downgrade the ceiling's deny arm to a forward")
+
+	auditOnly := []capability.Constraint{{Target: "tool:send_email", Actions: []string{"call"},
+		Enforcement: capability.EnforcementAudit,
+		Effect:      &capability.EffectContract{Class: capability.EffectIrreversible}}}
+	perEntry := eng.ValidateAction(context.Background(), effectReq("send_email", nil), auditOnly)
+	require.Equal(t, capability.DecisionDeny, perEntry.Decision)
+	assert.False(t, perEntry.Denial.Downgradable(), "an audit-only entry must not downgrade the ceiling's deny arm")
 }
 
 // TestEffectCeiling_RequiresCompensationIsTheThirdGateInput pins the third input of the

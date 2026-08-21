@@ -15,6 +15,7 @@ import (
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
@@ -284,11 +285,11 @@ func (c *countingCallCounter) AdmitAll(ctx context.Context, buckets []capability
 	return c.InMemory.AdmitAll(ctx, buckets)
 }
 
-// TestCeilingHardeningNeverSoftensTheRefusal pins the two ways the composed verdict could
-// come back WEAKER than the JWT deny it replaces. The ceiling's onExceed:deny arm is built
-// with the matched constraint's own audit posture and carries no obligations, so taking it
-// wholesale both downgraded a blocking refusal into a forwarded one and dropped the
-// redaction that forward then needed.
+// TestCeilingHardeningNeverSoftensTheRefusal pins the ways the composed verdict could come
+// back WEAKER than the JWT deny it replaces. The ceiling's onExceed:deny arm is built with
+// the matched constraint's own audit posture, so taking it wholesale downgraded a blocking
+// refusal into a forwarded one — on an entry the operator put in observe mode, which is the
+// posture that makes the inheritance invisible.
 func TestCeilingHardeningNeverSoftensTheRefusal(t *testing.T) {
 	key := newTestKey(t, "k1")
 	ceiling := &capability.EffectCeiling{MaxEffectClass: capability.EffectReversible, OnExceed: capability.OnExceedDeny}
@@ -314,10 +315,21 @@ func TestCeilingHardeningNeverSoftensTheRefusal(t *testing.T) {
 	require.NotNil(t, got.Denial)
 	assert.False(t, got.AuditOnly,
 		"the JWT's own refusal blocked on this enforce route; the ceiling must not downgrade it to a forward")
-	// The refusal is still downgradable by a ROUTE running --audit, and such a forward
-	// must carry the manifest's redaction or the response reaches the host unmasked.
-	assert.NotEmpty(t, got.Obligations,
-		"a forwardable refusal must keep the redactFields obligations the same call gets without a ceiling")
+	// Both ceiling arms are hard, so the composed refusal is forwarded by no posture — which
+	// is also why it carries no obligations: an obligation on a refusal that never reaches a
+	// response is a claim that a redaction ran.
+	assert.False(t, got.Denial.Downgradable(),
+		"the ceiling's deny arm must not inherit the entry's observe posture")
+	assert.Empty(t, got.Obligations,
+		"a refusal no posture forwards must not claim a redaction")
+
+	// The route-level observe posture reaches the same verdict by a different gate, so it is
+	// pinned separately.
+	observed := jp.Decide(enforcement.WithSkipQuota(ctx), "sess-soft-audit",
+		EnforceTarget{Type: capability.TargetTypeTool, Name: "wire_transfer"}, nil, "")
+	require.NotNil(t, observed.Denial)
+	assert.False(t, observed.Denial.Downgradable(),
+		"--audit must not forward the over-ceiling call the ceiling flagged")
 }
 
 // TestHardeningReachesANonManifestInner is the regression for the composition seam itself.
@@ -369,4 +381,49 @@ func TestHardeningReachesANonManifestInner(t *testing.T) {
 	assert.Equal(t, "sess-nonmanifest", gotSessionID)
 	assert.Equal(t, "wire_transfer", gotTarget)
 	assert.Equal(t, args, gotArgs)
+}
+
+// TestJWTShortCircuitCommitsForwardedSourceState is the state half of what a short-circuiting
+// JWT deny owes the inner manifest. The redaction half is covered above; this is the same
+// shape in the other currency. The JWT refuses a target its claims do not name, so
+// ManifestPDP.Decide never runs — but the refusal is downgradable, an --audit route FORWARDS
+// it, and the tool runs. With no taint committed for it, a later ENFORCED flowLabel sink
+// Peeked a clean set and allowed the egress the label existed to stop: turning a JWT on
+// removed a guarantee, the inversion this seam exists to prevent.
+func TestJWTShortCircuitCommitsForwardedSourceState(t *testing.T) {
+	key := newTestKey(t, "k1")
+	inner := NewManifestPDP(
+		[]capability.Constraint{
+			{
+				Target:     "tool:read_secret",
+				Actions:    []string{"call"},
+				Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
+			},
+			{
+				Target:     "tool:send_email",
+				Actions:    []string{"call"},
+				Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}},
+			},
+		},
+		enforcement.New(enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory())),
+		killswitch.NewInMemory(),
+	)
+	jp, cleanup := makeJWTPDPWithInner(t, key, inner)
+	defer cleanup()
+
+	// The token names send_email only, so read_secret short-circuits at the JWT layer.
+	ctx := makeJWTCtx(t, jp, makeJWTToken(t, key, []string{"tool:send_email"}))
+
+	src := jp.Decide(enforcement.WithSkipQuota(ctx), "sess-jwt-flow",
+		EnforceTarget{Type: capability.TargetTypeTool, Name: "read_secret"}, nil, "")
+	require.NotNil(t, src.Denial)
+	require.True(t, src.Denial.Downgradable(), "the JWT deny this test is about is the forwarded one")
+	assert.Equal(t, []string{capability.FlowLabelConfidential}, src.LabelsOut,
+		"a forwarded refusal runs the tool, so the manifest's taint for it must reach the tape")
+
+	// The sink runs ENFORCED, which is the posture the laundering targeted.
+	sink := jp.Decide(ctx, "sess-jwt-flow", EnforceTarget{Type: capability.TargetTypeTool, Name: "send_email"}, nil, "")
+	require.Equal(t, capability.DecisionDeny, sink.Decision)
+	require.NotNil(t, sink.Denial)
+	assert.Equal(t, capability.FlowLabelConfidential, sink.Denial.Details["blockedLabel"])
 }

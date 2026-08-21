@@ -349,6 +349,15 @@ func (e *Engine) checkEffectCeiling(ec evalCtx, eff *capability.ResolvedEffect, 
 			Code:          capability.ErrCodeConditionFailed,
 			ConditionType: ceilingConditionType,
 			Message:       message,
+			// BlockOverride: the escalate arm's rationale verbatim. CONDITION_FAILED is a
+			// policy code, so without the override an observing route (--audit, or an
+			// audit-only constraint) forwards the call and PERFORMS the irreversible action
+			// the ceiling flagged — the one outcome no posture makes right, and the reason
+			// escalateResponse sets the same bit. onExceed picks what an operator gets to
+			// READ (a deny record or an approval-queue escalation), not whether the action
+			// happens; a soft deny arm would also make CeilingVerdictFor's composition soft
+			// for exactly the configuration it exists to harden.
+			BlockOverride: true,
 			Details:       details,
 		})
 	}

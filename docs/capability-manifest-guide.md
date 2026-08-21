@@ -2244,6 +2244,21 @@ On an **allowed** call, the labels are unioned into the session's accumulated
 set. It is a state write, not a response mutation: the response is untouched.
 Valid on `tool:` and `resource:` targets — an egress is not a source.
 
+Selection is by **target**, not by caller: the labels of every entry naming the
+target are unioned, principal scoping ignored. `labelOutput` describes the data a
+target produces, and the target produces the same data whoever calls it — so a
+broad sibling that grants the call (a `tool:*` entry with no `labelOutput`) cannot
+shadow a principal-scoped source entry and drop the taint. A policy that
+differentiates labels per principal on one target therefore taints every caller
+with the widest set; differentiate by naming distinct targets, or clear the label
+with an approved [`declassify`](#declassify--clearing-a-label-under-human-approval).
+
+Under `--audit` a *denied* call is forwarded and therefore runs, so the taint is
+committed there too — including when the deny was a **no-match** (nothing was
+selected for this caller) and when a JWT layer refused above the manifest without
+ever consulting it. Without that, an enforce route sharing the anchor would see a
+clean set and its sink would fail open.
+
 ### `flowLabel` — the information-flow sink
 
 ```yaml

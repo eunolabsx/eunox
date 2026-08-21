@@ -1417,6 +1417,37 @@ Section conventions:
 
 ### Fixed
 
+- **The effect ceiling's `onExceed: deny` arm is as hard as its `escalate` arm.** The escalate
+  arm is built non-downgradable so a route running `--audit` cannot turn "needs human approval"
+  into "performed anyway, logged"; the deny arm carried a plain `CONDITION_FAILED`, which is a
+  policy code, so an observing route — whole-route `--audit`, or a constraint marked
+  `enforcement: audit` — downgraded it and FORWARDED the call, performing the irreversible
+  action the ceiling flagged. `onExceed` chooses the record an operator reads, never whether
+  the action happens, so choosing the plainer record quietly bought the softer control. It also
+  made the non-committing seam a JWT-wrapped route composes the ceiling through soft for
+  exactly the configuration that seam exists to harden. An over-ceiling call is now forwarded
+  by no posture. Operators running `--audit` to preview an `onExceed: deny` ceiling will see
+  those calls blocked rather than forwarded — which is what the ceiling always documented.
+
+- **A forwarded refusal commits the flow taint of the call it lets run.** A no-match deny is
+  downgradable, so `--audit` forwards it and the target actually RUNS — including on the
+  principal-scoped-miss shape, where a `tool:read_secret` entry declaring
+  `labelOutput: [confidential]` is skipped for being scoped to another principal. No taint was
+  committed and no `labels_out` reached the tape, so a later ENFORCED `flowLabel` sink sharing
+  the anchor peeked a clean set and failed OPEN. The same drop had two further shapes: a
+  SELECTED constraint read a principal-scoped union, so a broad sibling that grants the call (a
+  `tool:*` entry with no `labelOutput`) shadowed a principal-scoped source entry and the call
+  was ALLOWED on an enforce route with no taint at all — no `--audit` required; and a `JWTPDP`
+  short-circuit deny never runs the inner PDP, so an `--audit` route forwarded it and ran the
+  tool while committing neither the taint nor the `sequenceBlock` antecedent (the redaction
+  half of that seam was closed, the state half was not). All three now read one principal-blind
+  selection: `labelOutput` describes the data a target produces, and the target produces the
+  same data whoever calls it. A policy differentiating labels per principal on one target now
+  taints every caller with the widest set, which over-blocks — differentiate by naming distinct
+  targets, or clear the label with an approved `declassify`. The `sequenceBlock` antecedent
+  stays gated on the target being one some `afterTools` queries, since that key is the
+  target's and a made-up name would otherwise mint one per call.
+
 - **Refusals with no policy decision behind them no longer fabricate a target.** Every kill drop,
   kill denial, and pre-PDP malformed-input deny passed its method name through as the record
   *identifier*, so for a method that resolves a target type the sink synthesized `target_type` and
