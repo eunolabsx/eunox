@@ -50,6 +50,21 @@ var errUnhonorableUpstreamRevision = errors.New("request revision cannot be hono
 // peer inherited a revision whose own rule is that inheritance is not enough.
 var errUndeclaredOnDeclaringLeg = errors.New("request inherited a revision that requires a per-request declaration, and carries none")
 
+// errUndecodableForwardedParams marks a message this build could not decode whose bytes
+// nevertheless travel to the upstream with nothing re-reading them.
+//
+// mcp.DeclaredRevision cannot say what such a body declares, and "eunox could not decode it"
+// is not "it declares nothing": every conforming decoder disagrees about a duplicate key, so a
+// peer adds a throwaway one to make this proxy's decoder bail while leaving a clean
+// io.modelcontextprotocol/protocolVersion in `_meta` for the upstream's last-wins parser to
+// read. Every gate downstream then compares an INHERITED revision the forwarded bytes
+// contradict — errRevisionMismatch and checkUpstreamHonorable both pass, and on a remote leg
+// eunox stamps an MCP-Protocol-Version header naming a revision other than the one the body it
+// is carrying declares. That is the enforcement-versus-upstream parser differential
+// mcp.DecodeParams exists to close, so the framing-blind fallback must not reopen it for the
+// framings DecodeParams never gets a second look at.
+var errUndecodableForwardedParams = errors.New("params this proxy forwards verbatim could not be decoded, so the protocol revision they declare to the upstream cannot be established")
+
 // hostLeg is what revision negotiation needs to know about the connection a message arrived on.
 //
 // A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
@@ -160,6 +175,16 @@ func (g hostMessageGate) negotiate(ctx context.Context, msg mcp.RPCMsg) (capabil
 // checkUpstreamHonorable for what it gates.
 func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg) (capability.Revision, error) {
 	declared, present, err := mcp.DeclaredRevisionOf(msg)
+	if errors.Is(err, mcp.ErrUndecodableDeclaration) {
+		if fwdErr := checkUndecodableForwarded(legRev, msg); fwdErr != nil {
+			return "", fwdErr
+		}
+		// Nothing this build can read declared anything, and these bytes are re-decoded and
+		// denied before they go anywhere — so the malformed body chooses no table, and the
+		// target-bearing INVALID_REQUEST its handler writes is not replaced by a version
+		// failure. See mcp.ErrUndecodableDeclaration for why that reading is the caller's.
+		declared, present, err = "", false, nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -186,6 +211,21 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 		}
 	}
 	return resolved, nil
+}
+
+// checkUndecodableForwarded refuses a message whose members this build could not decode and
+// whose bytes reach the upstream unread. See errUndecodableForwardedParams for what such a
+// message can otherwise smuggle past enforcement, and unreadParamsReachUpstream for why the
+// question is asked of three framings rather than of every message whose params travel.
+//
+// A leg with no revision ("") has no upstream for the bytes to reach — the sessionless arms —
+// which is the same window checkUpstreamHonorable declines to judge, and for the same reason:
+// refusing there would deny a message on the strength of a forward that never happens.
+func checkUndecodableForwarded(legRev capability.Revision, msg mcp.RPCMsg) error {
+	if legRev == "" || !unreadParamsReachUpstream(msg) {
+		return nil
+	}
+	return errUndecodableForwardedParams
 }
 
 // checkDeclarationReachesUpstream refuses a message that would arrive at a declaring upstream
@@ -269,12 +309,13 @@ func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
 // other caller-supplied value.
 func revisionRefusalReason(err error) string {
 	// One condition, not an arm per sentinel: what this function protects is the ALLOWLIST of
-	// errors whose text is safe to echo, and all of these are (each names only the failure
-	// class and version strings — the peer's own, already matched against a closed set, and
-	// this proxy's own leg revisions). Anything else collapses to a fixed string rather than
-	// leaking an unreviewed message.
+	// errors whose text is safe to echo, and all of these are (each names the failure class and
+	// at most version strings — the peer's own, already matched against a closed set, and this
+	// proxy's own leg revisions). Anything else collapses to a fixed string rather than leaking
+	// an unreviewed message.
 	if errors.Is(err, errRevisionMismatch) || errors.Is(err, mcp.ErrUnknownRevision) ||
-		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUnhonorableUpstreamRevision) {
+		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUnhonorableUpstreamRevision) ||
+		errors.Is(err, errUndecodableForwardedParams) {
 		return err.Error()
 	}
 	return "protocol revision could not be established"

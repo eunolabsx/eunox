@@ -402,6 +402,96 @@ func TestHonorabilityGate_CoversTheHostResponseFraming(t *testing.T) {
 	}
 }
 
+// TestSmuggledDeclaration_NeverReachesTheUpstream is the regression for a declaration hidden
+// behind an undecodable body on the framings eunox forwards VERBATIM.
+//
+// The escaped-key regression above closed the differential for a declaration eunox's decoder
+// could read; this is the same differential from the other side. A peer adds any throwaway
+// duplicate key so mcp.DecodeParams bails, which used to read as "nothing declared" — eunox
+// inherits the context, the mismatch and honorability gates both compare that inherited value
+// and pass, and the bytes go upstream carrying a clean
+// io.modelcontextprotocol/protocolVersion naming a different revision for the upstream's own
+// last-wins parser to act on. On a remote leg eunox even stamps an MCP-Protocol-Version header
+// contradicting the body it heads.
+//
+// Driven through the real serve loop per framing, because what the fix has to produce is not a
+// verdict but an absence: nothing of the host's on the upstream writer.
+func TestSmuggledDeclaration_NeverReachesTheUpstream(t *testing.T) {
+	t.Parallel()
+	// Clean declaration, throwaway duplicate: nothing about the version member is malformed, so
+	// an upstream reading these bytes sees a well-formed 2026-07-28 declaration.
+	const smuggled = `{"progressToken":1,"x":1,"x":1,"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`
+	cases := []struct {
+		name       string
+		line       string
+		recordedAs string
+		// tracked plants the server-initiated request a host RESPONSE would answer, so the
+		// refusal is reached rather than the message being discarded as a stray.
+		tracked bool
+	}{
+		{
+			name:       "forwarded notification",
+			line:       `{"jsonrpc":"2.0","method":"notifications/progress","params":` + smuggled + `}`,
+			recordedAs: methodNotificationsProgress,
+		},
+		{
+			// dispatchList forwards msg untouched and filters only the reply, so a */list
+			// request is as unread as a notification — the half of this seam that is a REQUEST.
+			name:       "*/list request",
+			line:       `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":` + smuggled + `}`,
+			recordedAs: capability.MethodToolsList,
+		},
+		{
+			name:       "host response",
+			line:       `{"jsonrpc":"2.0","id":5,"result":` + smuggled + `}`,
+			recordedAs: methodLabelServerResponse,
+			tracked:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			up := &blockingUpWriter{gate: make(chan struct{})}
+			close(up.gate) // do not hold writes; the test asserts what does and does not happen
+			sink, logPath := newTempAuditSink(t)
+			cfg := stdioServe{sink: sink, upSink: up}
+			if tc.tracked {
+				cfg.setup = func(p *StdioProxy) {
+					p.serverReqs.track(mcp.RPCMsg{ID: mcp.RawJSON(`5`), Method: "sampling/createMessage"}, io.Discard)
+				}
+			}
+			serveHostLines(t, cfg, tc.line)
+			_ = sink.Close()
+
+			if tc.tracked {
+				// The reply is not relayed, and the request it would have answered is answered
+				// by eunox rather than left blocked — a protocol refusal is not an emergency
+				// stop (see server_request_unblock.go).
+				assertUnblockedNotRelayed(t, up.messages(), mcp.RawJSON(`5`))
+			} else if got := up.messages(); len(got) != 0 {
+				t.Fatalf("the upstream received %+v; the smuggled declaration travelled with it", got)
+			}
+			rec := findAuditRecordByMethod(readAuditRecords(t, logPath), tc.recordedAs, "deny")
+			if rec == nil {
+				t.Fatal("the refusal left no record; a refusal the tape does not carry is the blind spot the framing guards exist to close")
+			}
+			if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnsupportedProtocolVersion {
+				t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeUnsupportedProtocolVersion)
+			}
+		})
+	}
+	// The control: the SAME declaration without the duplicate key is decodable, so it is judged
+	// on its merits — here, refused as unhonorable for a leg addressed as the older revision.
+	// What must not change is that a well-formed body is read rather than blanket-refused.
+	up := &blockingUpWriter{gate: make(chan struct{})}
+	close(up.gate)
+	serveHostLines(t, stdioServe{upSink: up},
+		`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}`)
+	if got := up.methods(); len(got) != 1 || got[0] != methodNotificationsProgress {
+		t.Errorf("upstream methods = %v, want the decodable notification forwarded", got)
+	}
+}
+
 // assertUnblockedNotRelayed checks the two halves of what a refused host reply does to the
 // upstream leg: the reply itself is NOT relayed, and the request it would have answered is
 // answered by eunox instead of left blocked.
