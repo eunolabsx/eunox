@@ -332,17 +332,6 @@ func TestPreSessionLimiterAndSaturationGate_DoNotShareABucket(t *testing.T) {
 	}
 }
 
-// TestPerCategoryShare_DividesTheAggregateEvenly keeps each category's bucket at the share the
-// design intends. The aggregate is derived from len(refusalCategories) now rather than mirrored in
-// a hand-typed count, so the failure this guards is no longer a stale constant but an uneven
-// division: the floor would silently round a category's share down.
-func TestPerCategoryShare_DividesTheAggregateEvenly(t *testing.T) {
-	t.Parallel()
-	if int(perCategoryDenyRate) != perCategoryDenyRatePerSec || int(perCategoryDenyBurst) != perCategoryDenyBurstSize {
-		t.Errorf("per-category share = %v/%v, want %d/%d", perCategoryDenyRate, perCategoryDenyBurst, perCategoryDenyRatePerSec, perCategoryDenyBurstSize)
-	}
-}
-
 // TestUpstreamRefusalFloor_SiblingKeepsItsFirstRecord is the gap the per-session TABLE alone left,
 // one axis over from the notice half's.
 //
@@ -374,7 +363,7 @@ func TestUpstreamRefusalFloor_SiblingKeepsItsFirstRecord(t *testing.T) {
 
 	a := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
 	require.Positive(t, drain(a, 200), "A's leading edge reaches the tape")
-	require.Zero(t, aggregate.bucket(catDisplaced).tokens > 1,
+	require.LessOrEqual(t, aggregate.bucket(catDisplaced).tokens, 1.0,
 		"A's flood must have drained the shared parent; otherwise this test proves nothing")
 
 	b := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
@@ -428,11 +417,11 @@ func TestUpstreamRefusalFloor_AggregateStillHoldsTheTotal(t *testing.T) {
 			}
 		}
 	}
-	assert.LessOrEqual(t, admitted, int(perCategoryDenyBurst)+sessions,
+	assert.LessOrEqual(t, admitted, perCategoryDenyBurstSize+sessions,
 		"N sessions must not multiply the sustained audit-write rate by N: the parent bounds the total and the floor adds at most one record per session per interval")
 	assert.GreaterOrEqual(t, admitted, sessions,
 		"every session's first record is the whole point; a bound that elides it is the gap this closes")
-	assert.GreaterOrEqual(t, aggregate.bucket(catDisplaced).tokens, -perCategoryDenyBurst,
+	assert.GreaterOrEqual(t, aggregate.bucket(catDisplaced).tokens, -float64(perCategoryDenyBurstSize),
 		"the debt the floors ran up is clamped at one burst, so the aggregate recovers rather than staying shut")
 }
 
@@ -453,7 +442,7 @@ func TestRecordFloor_NotClaimedWhenTheHoldersOwnBucketRefused(t *testing.T) {
 			admitted++
 		}
 	}
-	assert.LessOrEqual(t, admitted, int(perCategoryDenyBurst),
+	assert.LessOrEqual(t, admitted, perCategoryDenyBurstSize,
 		"a holder's own budget is the whole answer to its own flood; a floor on top is a second budget")
 }
 

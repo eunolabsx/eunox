@@ -74,7 +74,7 @@ func TestPreSessionGate_DeclaredExemptRefusalsSpendNoKillToken(t *testing.T) {
 	}
 
 	// The kill bucket must be untouched: its whole burst still admits.
-	for i := range int(perCategoryDenyBurst) {
+	for i := range perCategoryDenyBurstSize {
 		assert.NotNil(t, proxy.preSessionKillRecorder(route),
 			"kill record %d was suppressed: a refusal DECLARED exempt drained the bucket bounding the records an emergency stop depends on", i)
 	}
@@ -95,17 +95,17 @@ func TestRefusalRecorders_ApplyTheDeclarationNotTheLegsDefault(t *testing.T) {
 	for cat, decl := range refusalDeclarations {
 		charged := 0
 		// A metered category runs out; an exempt one never does.
-		for range int(perCategoryDenyBurst) + 50 {
+		for range perCategoryDenyBurstSize + 50 {
 			if recs.forCategory(cat) != nil {
 				charged++
 			}
 		}
 		if decl.metering == meteringExempt {
-			assert.Equal(t, int(perCategoryDenyBurst)+50, charged,
+			assert.Equal(t, perCategoryDenyBurstSize+50, charged,
 				"category %q is declared exempt but its resolved recorder was suppressed; the wiring is metering what the declaration does not", cat)
 			continue
 		}
-		assert.LessOrEqual(t, charged, int(perCategoryDenyBurst)+1,
+		assert.LessOrEqual(t, charged, perCategoryDenyBurstSize+1,
 			"category %q is declared metered but its resolved recorder was never suppressed; the wiring is exempting what the declaration meters", cat)
 		assert.Positive(t, charged,
 			"category %q resolved to nil for EVERY record; a bucket that never admits is not metering, it is silence", cat)
@@ -122,7 +122,7 @@ func TestRouteRefusalRecorders_EstablishedSessionKillIsUnbounded(t *testing.T) {
 	defer func() { _ = sink.Close() }()
 	route := &UpstreamRoute{name: "up1", sink: &routeSink{sink: sink, upstream: "up1"}}
 	recs := newTestHTTPProxy().routeRefusalRecorders(&httpSession{route: route}, route)
-	for i := range int(perCategoryDenyBurst) + 50 {
+	for i := range perCategoryDenyBurstSize + 50 {
 		require.NotNil(t, recs.forCategory(catKill),
 			"kill record %d was suppressed on an ESTABLISHED session; that record is the one an operator most needs during an emergency stop", i)
 	}
@@ -730,7 +730,7 @@ func TestServerRequestRefusal_DestroyedAnswerRecordIsMetered(t *testing.T) {
 		require.NotEmpty(t, rec.records, "the policy DENY is a verdict and is never metered")
 		drops += len(rec.records) - 1
 	}
-	assert.LessOrEqual(t, drops, int(perCategoryDenyBurst)+1,
+	assert.LessOrEqual(t, drops, perCategoryDenyBurstSize+1,
 		"a sustained flood of destroyed answers must be bounded by its own bucket")
 	assert.Positive(t, drops, "the leading edge of the flood must still reach the tape")
 }
@@ -898,10 +898,10 @@ func TestAdmitRefusalRecord_NeverWrapsANilRecorder(t *testing.T) {
 	now := time.Now()
 	lim := newRefusalRecordLimiter()
 	lim.setNow(func() time.Time { return now })
-	for i := range int(perCategoryDenyBurst) + 5 {
+	for i := range perCategoryDenyBurstSize + 5 {
 		require.Nil(t, admitRefusalRecord(nil, lim, catDisplaced),
 			"resolution %d wrapped a nil recorder; the wrapper is a non-nil interface, so every nil guard below it passes and the delegation panics", i)
-		if i == int(perCategoryDenyBurst) {
+		if i == perCategoryDenyBurstSize {
 			now = now.Add(10 * time.Second) // refill, so the next admit carries suppressed > 0
 		}
 	}

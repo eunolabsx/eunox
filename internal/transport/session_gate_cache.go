@@ -171,7 +171,8 @@ func (c *gateCache) lookup(anchor enforcement.StateAnchor) (entry *cachedGate, a
 	}
 	e, present := c.entries[anchor]
 	if !present {
-		return nil, c.admitsLocked()
+		_, _, admits := c.admitsLocked()
+		return nil, admits
 	}
 	c.touchLocked(e)
 	return e, true
@@ -196,12 +197,18 @@ func (c *gateCache) lookup(anchor enforcement.StateAnchor) (entry *cachedGate, a
 // means "passes of the cache" rather than "requests". A session resolving each anchor
 // exactly once fills the cache and freezes: bounded at the cap, paying one map lookup over
 // the registry path per request — the honest cost of a workload no cache can help.
-func (c *gateCache) admitsLocked() bool {
+// It returns the entry admission would have to SHED along with the verdict, so the one scan
+// it already performs answers both questions — the insert path used to re-run coldestLocked
+// under the same lock to find the entry this call had just looked at.
+func (c *gateCache) admitsLocked() (victimKey enforcement.StateAnchor, victim *cachedGate, ok bool) {
 	if len(c.entries) < maxCachedSessionGates {
-		return true
+		return victimKey, nil, true
 	}
-	_, coldest := c.coldestLocked()
-	return coldest != nil && c.tick-coldest.used > uint64(maxCachedSessionGates)
+	coldestKey, coldest := c.coldestLocked()
+	if coldest == nil || c.tick-coldest.used <= uint64(maxCachedSessionGates) {
+		return victimKey, nil, false
+	}
+	return coldestKey, coldest, true
 }
 
 // coldestLocked returns the least recently used entry and its key, or the zero anchor and
@@ -244,15 +251,14 @@ func (c *gateCache) insert(anchor enforcement.StateAnchor, gate *anchorGate, dro
 	}
 	// Re-asked under this lock: acquire asked before releasing it to take the registry
 	// reference, and a concurrent request may have filled the last slot since.
-	if !c.admitsLocked() {
+	victimKey, victim, ok := c.admitsLocked()
+	if !ok {
 		return nil, false
 	}
 	// Shed BEFORE filing, so the entry that just arrived is never its own victim and
-	// the map never exceeds the cap even transiently.
-	if len(c.entries) >= maxCachedSessionGates {
-		if k, coldest := c.coldestLocked(); coldest != nil {
-			c.retireLocked(k, coldest)
-		}
+	// the map never exceeds the cap even transiently. victim is nil below the cap.
+	if victim != nil {
+		c.retireLocked(victimKey, victim)
 	}
 	if c.entries == nil {
 		c.entries = make(map[enforcement.StateAnchor]*cachedGate, maxCachedSessionGates)

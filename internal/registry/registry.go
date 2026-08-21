@@ -274,8 +274,12 @@ func LoadCorpus(dir string) ([]Contract, error) {
 			// file's content into the corpus, or reintroduce the FIFO hang the check
 			// above exists to close. O_NOFOLLOW closes it the same way readTrustStoreFile
 			// does for the trust store.
-			Flags:     config.OpenNoFollow,
-			OverLimit: "refusing to buffer it rather than decoding a corpus entry that cannot be one",
+			Flags: config.OpenNoFollow,
+			// The directory listing above chose this path, not the operator: whoever can
+			// write the corpus directory chooses what the scan finds, which is what the
+			// FIFO guard is for. See BoundedRead.Discovered.
+			Discovered: true,
+			OverLimit:  "refusing to buffer it rather than decoding a corpus entry that cannot be one",
 		})
 		if err != nil {
 			return nil, err

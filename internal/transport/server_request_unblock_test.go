@@ -244,7 +244,7 @@ func TestServerRequestDisplacement_RecordIsMetered(t *testing.T) {
 		trackServerRequest(context.Background(), u,
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(jsonNumber(maxTrackedServerReqs + i)), Method: "roots/list"})
 	}
-	assert.LessOrEqual(t, len(rec.records), int(perCategoryDenyBurst)+1,
+	assert.LessOrEqual(t, len(rec.records), perCategoryDenyBurstSize+1,
 		"a sustained displacement flood must be bounded by its own bucket, not written once per request")
 	assert.NotEmpty(t, rec.records, "the leading edge of the flood must still reach the tape")
 }

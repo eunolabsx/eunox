@@ -188,7 +188,7 @@ type JWTPDP struct {
 	routeAudience string
 	inner         PolicyDecisionPoint // optional manifest PDP for intersection
 	ks            killswitch.Checker  // kill switch enforced even in JWT-only mode
-	leeway        time.Duration       // clock-skew grace, resolved via effectiveLeeway
+	leeway        time.Duration       // clock-skew grace, resolved via capability.EffectiveLeeway
 	// clock supplies "now"; nil falls back to the wall clock. Shared type with the
 	// engine and JWKS cache so a frozen test clock stays consistent across all three.
 	clock enforcement.Clock
@@ -257,12 +257,6 @@ type JWTPDPOptions struct {
 // Aliases capability.DefaultTokenLeeway, the source of truth for every JWKS-verified
 // token-validation path in the binary.
 const DefaultJWTLeeway = capability.DefaultTokenLeeway
-
-// effectiveLeeway resolves configured leeway (zero -> default, negative -> disabled,
-// positive -> as-is) via capability.EffectiveLeeway so the two token paths agree.
-func effectiveLeeway(configured time.Duration) time.Duration {
-	return capability.EffectiveLeeway(configured)
-}
 
 // jwtLogger pins JWT/JWKS logging to stderr, since stdout is the JSON-RPC channel in
 // stdio mode. Package-level so parseCapHeads (which has no receiver) and the
@@ -366,7 +360,7 @@ func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 		inner:                    opts.Inner,
 		ks:                       opts.KillSwitch,
 		clock:                    opts.Clock,
-		leeway:                   effectiveLeeway(opts.Leeway),
+		leeway:                   capability.EffectiveLeeway(opts.Leeway),
 		experimentalCapabilities: opts.ExperimentalCapabilities,
 	}
 	return p
@@ -440,11 +434,7 @@ func jwtPayloadSegment(tokenStr string) ([]byte, error) {
 // integers above 2^53 survive exactly for input.claims, instead of rounding through
 // float64 as go-jose's UnsafeClaimsWithoutVerification would. The signature is
 // already verified by the caller, so these bytes are known authentic.
-func decodeJWTClaimsPreservingNumbers(tokenStr string) (map[string]interface{}, error) {
-	payloadBytes, err := jwtPayloadSegment(tokenStr)
-	if err != nil {
-		return nil, err
-	}
+func decodeJWTClaimsPreservingNumbers(payloadBytes []byte) (map[string]interface{}, error) {
 	dec := json.NewDecoder(bytes.NewReader(payloadBytes))
 	dec.UseNumber()
 	var claims map[string]interface{}
@@ -457,6 +447,28 @@ func decodeJWTClaimsPreservingNumbers(tokenStr string) (map[string]interface{}, 
 		return nil, fmt.Errorf("trailing data in JWT claims payload")
 	}
 	return claims, nil
+}
+
+// readTokenPayload base64-decodes the payload segment ONCE and returns the
+// number-preserving raw claim map, having first rejected an ambiguous top-level or mcp-block
+// claim collision. Both readers want the same bytes, and this is the pre-auth flood path the
+// surrounding code otherwise memoizes — decoding twice per cold validation put a second
+// base64 pass and a second JSON scan on it for no new information.
+func readTokenPayload(tokenStr string) (map[string]interface{}, error) {
+	payloadBytes, err := jwtPayloadSegment(tokenStr)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, err))
+	}
+	rawClaims, err := decodeJWTClaimsPreservingNumbers(payloadBytes)
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", err)))
+	}
+	// The caller's struct unmarshal resolves an "act"/"Act" (or mcp-block) collision
+	// silently; confirm there was only one candidate before trusting either.
+	if err := rejectAmbiguousTopLevelClaims(payloadBytes); err != nil {
+		return nil, err
+	}
+	return rawClaims, nil
 }
 
 // Stable JWT-failure category codes for the JWT_INVALID audit record's error_type
@@ -606,11 +618,7 @@ var watchedTopLevelClaims = []string{
 // whichever identity sorts last, a value neither side of the exchange controls,
 // potentially widening a narrowly-scoped agent's token to a broader identity's
 // constraints.
-func rejectAmbiguousTopLevelClaims(tokenStr string) error {
-	payloadBytes, err := jwtPayloadSegment(tokenStr)
-	if err != nil {
-		return capability.Terminal(jwtErr(jwtErrMalformedToken, err))
-	}
+func rejectAmbiguousTopLevelClaims(payloadBytes []byte) error {
 	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", watchedTopLevelClaims...)
 	if err != nil {
 		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
@@ -794,14 +802,9 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		if err := tok.UnsafeClaimsWithoutVerification(&payload); err != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt payload unmarshal: %w", err)))
 		}
-		rawClaims, rawErr := decodeJWTClaimsPreservingNumbers(tokenStr)
-		if rawErr != nil {
-			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", rawErr)))
-		}
-		// The struct unmarshal above resolves an "act"/"Act" (or mcp-block) collision
-		// silently; confirm there was only one candidate before trusting either.
-		if err := rejectAmbiguousTopLevelClaims(tokenStr); err != nil {
-			return nil, err
+		rawClaims, payloadErr := readTokenPayload(tokenStr)
+		if payloadErr != nil {
+			return nil, payloadErr
 		}
 		exp, stdErr := p.validateStandardClaims(stdClaims, now)
 		if stdErr != nil {
@@ -900,7 +903,16 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 // CheckKill consults the kill switch, returning non-nil when the session is killed
 // (or the kill store errors, fail closed). The */list handlers call it before
 // contacting the upstream so a killed session cannot enumerate the catalog.
+//
+// With no kill switch of its own it delegates to the wrapped PDP rather than answering
+// "not killed": a wrapper built with Inner set but KillSwitch nil is a legitimate library
+// wiring (the shipped binary passes both), and answering nil there silently disarmed the
+// emergency stop on every path that routes through this method — the */list handlers,
+// initialize, and the notification gate.
 func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
+	if p.ks == nil && p.inner != nil {
+		return p.inner.CheckKill(ctx, sessionID)
+	}
 	return killCheck(ctx, p.clock, p.ks, sessionID)
 }
 
@@ -915,11 +927,11 @@ func (p *JWTPDP) CheckAudience(ctx context.Context) *capability.EnforceResponse 
 		return nil
 	}
 	claims, ok := jwtClaimsFromContext(ctx)
-	if !ok || !p.routeAudienceSatisfied(claims) {
+	if !ok {
 		resp := p.audienceDeny("token audience does not satisfy the route's required audience")
 		return &resp
 	}
-	return nil
+	return p.audienceDenial(claims)
 }
 
 // DecideResourceRead delegates to Decide with a resource target so JWT claims gate
@@ -946,8 +958,8 @@ func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourc
 		// An authentication boundary, exactly as in Decide: the token was never validated.
 		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
 	}
-	if !p.routeAudienceSatisfied(claims) {
-		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
+	if deny := p.audienceDenial(claims); deny != nil {
+		return *deny
 	}
 	target := EnforceTarget{Type: capability.TargetTypeResource, Name: uri}
 	// Mirrors Decide's delegation gate: this method can resolve entirely inside the
@@ -1050,6 +1062,18 @@ func (p *JWTPDP) routeAudienceSatisfied(claims *JWTClaims) bool {
 	return false
 }
 
+// audienceDenial is the per-route audience REFUSAL: nil when the token carries this route's
+// audience, the deny otherwise. One producer for the message as well as the predicate — the
+// decision methods each hand-placed the pin, so the fourth one had to remember to, and the
+// three spellings of the message were already free to drift.
+func (p *JWTPDP) audienceDenial(claims *JWTClaims) *capability.EnforceResponse {
+	if p.routeAudienceSatisfied(claims) {
+		return nil
+	}
+	resp := p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
+	return &resp
+}
+
 // audienceDeny carries the producer's BlockOverride override so a route running under --audit does
 // NOT downgrade it to a logged forward: audience is an authentication/tenancy boundary (like
 // the kill switch), not the per-call policy decision its AUTHORIZATION_FAILED code names.
@@ -1114,8 +1138,8 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// Per-route audience pin: the shared validator accepted this token for SOME
 	// route's audience (the union); narrow to THIS route's before the
 	// capability/manifest logic runs at all.
-	if !p.routeAudienceSatisfied(claims) {
-		return p.audienceDeny(fmt.Sprintf("token audience %v does not satisfy the route's required audience %q", claims.Audiences, p.routeAudience))
+	if deny := p.audienceDenial(claims); deny != nil {
+		return *deny
 	}
 
 	// Applied HERE rather than left to the inner PDP: a JWT-only route has no
@@ -1365,6 +1389,11 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 		if parseErr != nil {
 			return "", "", nil, fmt.Errorf("JWT capability claim %q: %w", claim, parseErr)
 		}
+		// Before the glob validation below: a key that can never match makes the grant
+		// inert whatever its value globs to, so it is the more actionable error.
+		if err := rejectInertConditionKeys(claim, p, conds); err != nil {
+			return "", "", nil, err
+		}
 		// Every non-"op" pair becomes an AllowedValues glob at runtime; validate it
 		// here (as the manifest path does) so a malformed pattern is rejected up
 		// front instead of silently matching nothing (VALUE_NOT_PERMITTED).
@@ -1388,10 +1417,17 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 	return p, bare, conds, nil
 }
 
-// splitV2Claim splits a v0.2 claim at the first '?', except for an http(s) resource
-// claim, where '?' begins the URL's own query rather than a condition list — such a
-// claim cannot also carry conditions. hadSep distinguishes an unconditioned claim
-// from a malformed trailing-'?' one ("tool:read_file?", hadSep=true, condpart="").
+// splitV2Claim splits a v0.2 claim at the first '?', except for an http(s) resource claim,
+// where '?' begins the URL's own query rather than a condition list — such a claim cannot
+// also carry conditions. hadSep distinguishes an unconditioned claim from a malformed
+// trailing-'?' one ("tool:read_file?", hadSep=true, condpart="").
+//
+// Scoped to http(s) deliberately, and NOT widened to every "<scheme>://" value. Widening it
+// looks like the fix for a claim whose URI query was read as conditions, but it silently
+// REVERSES the meaning of every conditioned non-http claim that already worked
+// (`resource:s3://reports/*?uri=...` stops matching anything), trading one silent failure for
+// another. The claim that motivated the widening — `resource:doc://guide?lang=en` — is inert
+// for a different reason entirely, closed at its root by rejectInertConditionKeys.
 func splitV2Claim(claim string) (namepart, condpart string, hadSep bool) {
 	if i := strings.IndexByte(claim, '?'); i >= 0 && !isHTTPResourceClaim(claim[:i]) {
 		return claim[:i], claim[i+1:], true
@@ -1399,9 +1435,8 @@ func splitV2Claim(claim string) (namepart, condpart string, hadSep bool) {
 	return claim, "", false
 }
 
-// isHTTPResourceClaim reports whether head (a claim with any condition suffix
-// already removed) is a resource claim whose value is an http(s) URL — i.e.
-// "resource:http://…" or "resource:https://…".
+// isHTTPResourceClaim reports whether head (a claim with any condition suffix already
+// removed) is a resource claim whose value is an http(s) URL.
 func isHTTPResourceClaim(head string) bool {
 	const ns = "resource:"
 	if !strings.HasPrefix(head, ns) {
@@ -1410,12 +1445,52 @@ func isHTTPResourceClaim(head string) bool {
 	return isHTTPResourceValue(head[len(ns):])
 }
 
-// isHTTPResourceValue reports whether a bare resource value (the part after the
-// "resource:" prefix) is an http(s) URL. URI schemes are case-insensitive
-// (RFC 3986 §3.1), so detection is on a lowercased copy.
+// isHTTPResourceValue reports whether a bare resource value (the part after the "resource:"
+// prefix) is an http(s) URL. URI schemes are case-insensitive (RFC 3986 §3.1), so detection
+// is on a lowercased copy.
 func isHTTPResourceValue(bareName string) bool {
 	v := strings.ToLower(bareName)
 	return strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://")
+}
+
+// conditionArgumentFor names the ONE argument a target type's decision actually carries, or
+// "" for a type carrying real arguments. It is the read side of jwtConditionArgs — keep the
+// two in lockstep, since a key this admits that jwtConditionArgs does not synthesize is a
+// grant that validates and can never match.
+func conditionArgumentFor(prefix capability.TargetType) string {
+	switch prefix {
+	case capability.TargetTypeResource:
+		return "uri"
+	case capability.TargetTypePrompt:
+		return "name"
+	default:
+		return ""
+	}
+}
+
+// rejectInertConditionKeys refuses a condition naming an argument the decision for this
+// target type never carries.
+//
+// resources/read and prompts/get carry NO real arguments: jwtConditionArgs synthesizes the
+// target name under "uri"/"name" and nothing else, so every other key becomes an
+// AllowedValues condition on an argument that is always absent, which denies with
+// MISSING_CONTEXT on every call. The grant validates, the operator believes it was issued,
+// and it authorizes nothing — the inert-grant shape this file rejects everywhere else, and
+// the actual root of `resource:doc://guide?lang=en`. "op" is exempt: it scans whatever
+// arguments exist rather than naming one.
+func rejectInertConditionKeys(claim string, prefix capability.TargetType, conds []jwtCondPair) error {
+	want := conditionArgumentFor(prefix)
+	if want == "" {
+		return nil
+	}
+	for _, cp := range conds {
+		if cp.key == "op" || cp.key == want {
+			continue
+		}
+		return fmt.Errorf("JWT capability claim %q: condition %q names an argument a %s decision never carries, so this grant could never match — %s: accepts only %q (the target it addresses) and \"op\"",
+			claim, cp.key, prefix, prefix, want)
+	}
+	return nil
 }
 
 // claimGlobParts is the single source of the glob/literal split parseV2Claim

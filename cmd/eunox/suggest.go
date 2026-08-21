@@ -660,7 +660,9 @@ Flags:
 	}
 	if err := writeGeneratedFile(*output, manifest, *force); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox suggest: %v\n", err)
-		return 1
+		// 2, matching init's identical failure and every other reader's file-error code:
+		// a refused --output is not a finding about the tape.
+		return suggestUsageExit
 	}
 	fmt.Fprintf(os.Stderr, "Generated draft manifest %s from %d audit record(s) — review and tighten each entry, then run: eunox validate %s\n",
 		*output, suggestions.records, *output)

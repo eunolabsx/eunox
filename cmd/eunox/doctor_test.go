@@ -924,8 +924,8 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 
 	t.Run("stray positional", func(t *testing.T) {
 		code := cmdDoctor([]string{"unexpected.txt"})
-		if code != 1 {
-			t.Errorf("exit code = %d, want 1 for a stray positional", code)
+		if code != 2 {
+			t.Errorf("exit code = %d, want 2 for a stray positional — every sibling reader's usage code, and doctor reserves 1 for its one finding", code)
 		}
 	})
 
@@ -936,7 +936,7 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 		}
 		code := cmdDoctor([]string{"--config", bad, "--audit-tail", "0"})
 		if code != 1 {
-			t.Errorf("exit code = %d, want 1 for an unloadable --config", code)
+			t.Errorf("exit code = %d, want 1 for an unloadable --config — doctor's one FINDING, which is what keeps `doctor --config X && restart` a usable gate", code)
 		}
 	})
 
@@ -947,15 +947,15 @@ func TestCmdDoctor_ExitCodes(t *testing.T) {
 			t.Fatal(err)
 		}
 		code := cmdDoctor([]string{"--output", filepath.Join(notDir, "bundle.txt"), "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
-		if code != 1 {
-			t.Errorf("exit code = %d, want 1 when the bundle cannot be opened for writing", code)
+		if code != 2 {
+			t.Errorf("exit code = %d, want 2 when the bundle cannot be opened for writing — an I/O failure, not a finding about the deployment", code)
 		}
 	})
 
 	t.Run("bad flag", func(t *testing.T) {
 		code := cmdDoctor([]string{"--no-such-flag"})
-		if code != 1 {
-			t.Errorf("exit code = %d, want 1 for an unknown flag (ContinueOnError, not a process exit)", code)
+		if code != 2 {
+			t.Errorf("exit code = %d, want 2 for an unknown flag — the same usage code as a stray positional and every sibling reader's", code)
 		}
 	})
 

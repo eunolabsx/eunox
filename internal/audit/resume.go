@@ -58,7 +58,18 @@ func interpretAuditTail(buf []byte, n int, readErr error, size, start int64) (st
 	if n < len(buf) && errors.Is(readErr, io.EOF) {
 		return "", fmt.Errorf("audit tail read: file shrank from %d bytes (read %d of %d tail bytes) between stat and read: %w", size, n, len(buf), errAuditFileShrunk)
 	}
-	line, _ := lastCompleteLineFromTail(buf[:n])
+	line, bounded := lastCompleteLineFromTail(buf[:n])
+	if !bounded && line != "" && start != 0 {
+		// The line begins at the window's first byte and the window did not begin at file
+		// offset 0, so its LEADING boundary is outside the bytes in hand: what came back is
+		// a record clipped at the window edge, not a record. This caller has no handle to
+		// re-read through (the active-log path does, and re-anchors), so it fails closed
+		// exactly as the whitespace case below does. Discarding bounded instead let a
+		// rotated sibling's over-window newline-less tail through as a genuine record, which
+		// then reads as unparseable and takes the DESTRUCTIVE genesis-restart branch — the
+		// same input the active log refuses.
+		return "", fmt.Errorf("%w (%d bytes scanned from offset %d, the last record's leading boundary is outside the window)", errAuditTailUnbounded, n, start)
+	}
 	if line == "" && start != 0 {
 		// The entire tail window trimmed away as whitespace (a run of blank lines/spaces
 		// filling the whole scan window) and the window did not begin at file offset 0: a

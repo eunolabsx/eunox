@@ -284,14 +284,36 @@ func numericPolicyScalarKeyApplies(enclosingKey, key string) bool {
 }
 
 func rejectCoercedValueScalars(n *yaml.Node, isJSON bool) error {
-	return rejectCoercedScalarsUnder(n, isJSON, "")
+	return rejectCoercedScalarsUnder(n, isJSON, "", make(map[coercionVisit]bool))
+}
+
+// coercionVisit keys the walk's visited set. The KEY is part of it, not just the node: an
+// anchored mapping is checked once per enclosing key it is referenced under, because the
+// enclosing key is what decides whether a numeric field applies there. Keying on the node
+// alone would check `&a {value: 010}` at whichever reference the walk reached first and skip
+// it under `effect: {blastRadius: *a}`; keying on nothing (visit-and-forget) makes a
+// billion-laughs alias graph expand exponentially. Node x key is bounded by the document.
+type coercionVisit struct {
+	node *yaml.Node
+	key  string
 }
 
 // rejectCoercedScalarsUnder is rejectCoercedValueScalars' walk, carrying the mapping key the
 // current node hangs off so a scoped numeric key is recognized only inside its own block.
-func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) error {
+//
+// An ALIAS is resolved here, not only at the pairwise checks below: an aliased MAPPING was
+// otherwise descended into as an AliasNode, whose Content is empty, so its fields were
+// checked only at the anchor's definition site — under whatever key sat there, which is not
+// the key that decides whether they are numeric policy fields.
+func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string, visited map[coercionVisit]bool) error {
+	n = resolveYAMLAlias(n)
 	if n == nil {
 		return nil
+	}
+	if v := (coercionVisit{node: n, key: enclosingKey}); visited[v] {
+		return nil
+	} else {
+		visited[v] = true
 	}
 	if n.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(n.Content); i += 2 {
@@ -319,21 +341,21 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) e
 		// Recurse pairwise so each value carries the key it hangs off; a key node is walked
 		// too, with no enclosing key.
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			if err := rejectCoercedScalarsUnder(n.Content[i], isJSON, ""); err != nil {
+			if err := rejectCoercedScalarsUnder(n.Content[i], isJSON, "", visited); err != nil {
 				return err
 			}
 			childKey := ""
 			if k := resolveYAMLAlias(n.Content[i]); k.Kind == yaml.ScalarNode {
 				childKey = k.Value
 			}
-			if err := rejectCoercedScalarsUnder(n.Content[i+1], isJSON, childKey); err != nil {
+			if err := rejectCoercedScalarsUnder(n.Content[i+1], isJSON, childKey, visited); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, child := range n.Content {
-		if err := rejectCoercedScalarsUnder(child, isJSON, enclosingKey); err != nil {
+		if err := rejectCoercedScalarsUnder(child, isJSON, enclosingKey, visited); err != nil {
 			return err
 		}
 	}

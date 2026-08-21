@@ -1316,9 +1316,9 @@ func (e *Engine) handleCustom(_ context.Context, cond capability.Condition, _ *c
 //	map{"table": s, "columns": [...]}        → [{Table: s, Columns: [...]}]
 //	[]interface{} of the above maps          → [{Table, Columns}, ...]
 //
-// A non-string item, non-string column entry, or a map with no non-empty "table" entry is
-// structurally malformed: returns a non-nil error so the caller denies fail-closed rather
-// than silently evaluating the valid subset.
+// An item that is neither a table name nor a table object, a non-string column entry, or a
+// map with no non-empty "table" entry is structurally malformed: returns a non-nil error so
+// the caller denies fail-closed rather than silently evaluating the valid subset.
 func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
 	// Both array shapes share ONE arm (see asInterfaceSlice). Checked before the type
 	// switch so a native []string reaches the same blank-element and non-string-item
@@ -1341,7 +1341,10 @@ func parseTableArgument(v interface{}) ([]capability.TableAccess, error) {
 				}
 				out = append(out, parsed...)
 			default:
-				return nil, fmt.Errorf("array contains a non-string item: %T", item)
+				// Names the accepted shapes rather than only the one it is not: an
+				// element may be a string OR a table object (the case above), and this
+				// message lands on the signed tape as the reason the call was refused.
+				return nil, fmt.Errorf("array contains an item that is neither a table name nor a table object: %T", item)
 			}
 		}
 		return out, nil

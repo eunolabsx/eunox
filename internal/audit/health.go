@@ -89,7 +89,7 @@ func (s *Sink) Health() Health {
 		return Health{}
 	}
 	h := Health{Present: true, Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
-	h.MaintenanceStalled, h.MaintenanceReason = s.MaintenanceStalled()
+	h.MaintenanceStalled, h.MaintenanceReason = s.maintenanceStalled()
 	return h
 }
 
