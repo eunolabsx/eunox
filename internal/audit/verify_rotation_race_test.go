@@ -11,6 +11,7 @@ package audit
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,53 @@ func TestChainSnapshot_RotationDuringPassIsReported(t *testing.T) {
 	err = snap.CheckUnchanged()
 	if !errors.Is(err, ErrChainRotated) {
 		t.Fatalf("CheckUnchanged after a rotation must report ErrChainRotated; got %v", err)
+	}
+}
+
+// TestChainSnapshot_EqualFileCountStillNamesWhatMoved is the message regression: at the
+// retention cap a rotation publishes one sibling and prunes another, so the chain holds
+// the same NUMBER of files before and after. A report phrased in counts renders as "3
+// file(s) when the pass started and 3 now" while asserting a rotation — the names are the
+// only thing that carries the change.
+func TestChainSnapshot_EqualFileCountStillNamesWhatMoved(t *testing.T) {
+	dir := t.TempDir()
+	logPath, _ := writeChainLog(t, dir, "a")
+
+	oldest := logPath + ".00000000000000000001.20260101T000000.000000000Z"
+	if err := os.WriteFile(oldest, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write oldest sibling: %v", err)
+	}
+
+	snap, err := SnapshotLogChain(logPath)
+	if err != nil {
+		t.Fatalf("SnapshotLogChain: %v", err)
+	}
+	if len(snap.Files) != 2 {
+		t.Fatalf("expected sibling + base; got %v", snap.Files)
+	}
+
+	// A rotation at retain=1: the base becomes a new sibling, the oldest is pruned, and a
+	// fresh base opens — two files before, two after.
+	newest := logPath + ".00000000000000000002.20260101T000001.000000000Z"
+	if err := os.Rename(logPath, newest); err != nil {
+		t.Fatalf("rotate base: %v", err)
+	}
+	if err := os.Remove(oldest); err != nil {
+		t.Fatalf("prune oldest: %v", err)
+	}
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatalf("open fresh base: %v", err)
+	}
+
+	err = snap.CheckUnchanged()
+	if !errors.Is(err, ErrChainRotated) {
+		t.Fatalf("an equal-count rotation must still report ErrChainRotated; got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"gained", filepath.Base(newest), "lost", filepath.Base(oldest)} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("the report must name what moved; %q is missing %q", msg, want)
+		}
 	}
 }
 

@@ -385,6 +385,38 @@ func TestRedis_ObserveRevocations_ReentrantRefreshDoesNotDeadlock(t *testing.T) 
 	assert.True(t, reentered.Load(), "the observer must have run")
 }
 
+// TestRedis_ObserveRevocations_StartTimeRevocationDoesNotDeadlockStop pins the same
+// "may call back in" contract at the OTHER lifecycle lock. Start holds lifeMu across its
+// whole body — including the initial snapshot — and Stop takes lifeMu, so an observer
+// reacting to a kill already present at startup by stopping the switch deadlocked against
+// the Start that was notifying it.
+//
+// The kill is written straight into miniredis with no publish, so only the initial
+// snapshot can find it: the delivery under test is Start's, not the listener's.
+func TestRedis_ObserveRevocations_StartTimeRevocationDoesNotDeadlockStop(t *testing.T) {
+	t.Parallel()
+	r, mr := newTestRedis(t)
+	require.NoError(t, mr.Set(redisAgentPrefix+"agent-at-start", "1"))
+
+	var stopped atomic.Bool
+	r.ObserveRevocations(func(Revocation) {
+		r.Stop()
+		stopped.Store(true)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Start(context.Background())
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start deadlocked delivering a startup revocation to an observer that called Stop")
+	}
+	assert.True(t, stopped.Load(), "the observer must have run")
+}
+
 // TestRedis_ObserveRevocations_UnregisterIdempotent mirrors the InMemory case
 // for the Redis backend.
 func TestRedis_ObserveRevocations_UnregisterIdempotent(t *testing.T) {

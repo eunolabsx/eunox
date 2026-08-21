@@ -847,8 +847,7 @@ func (c *ChainSnapshot) CheckUnchanged() error {
 		return fmt.Errorf("re-reading the audit log chain: %w", err)
 	}
 	if !slices.Equal(files, c.Files) {
-		return fmt.Errorf("%w: the chain held %d file(s) when the pass started and %d now",
-			ErrChainRotated, len(c.Files), len(files))
+		return fmt.Errorf("%w: %s", ErrChainRotated, describeChainDelta(c.Files, files))
 	}
 	base, err := chainBaseIdentity(c.logPath)
 	if err != nil {
@@ -883,4 +882,50 @@ func sameChainBase(before, after os.FileInfo) bool {
 		return before == nil && after == nil
 	}
 	return os.SameFile(before, after)
+}
+
+// describeChainDelta names what moved between two chain listings. It reports the NAMES
+// rather than the count because a rotation at the retention cap publishes one sibling and
+// prunes another, leaving the count identical — "3 files before and 3 now" would assert a
+// rotation while showing nothing that changed.
+func describeChainDelta(before, after []string) string {
+	gained := chainNamesMissingFrom(after, before)
+	lost := chainNamesMissingFrom(before, after)
+	switch {
+	case len(gained) > 0 && len(lost) > 0:
+		return "the chain gained " + summarizeChainNames(gained) + " and lost " + summarizeChainNames(lost)
+	case len(gained) > 0:
+		return "the chain gained " + summarizeChainNames(gained)
+	case len(lost) > 0:
+		return "the chain lost " + summarizeChainNames(lost)
+	default:
+		// Same members in a different order: the ordinal ordering was re-derived over a
+		// sibling set that changed and changed back, or a name was rewritten in place.
+		return "the chain files were reordered"
+	}
+}
+
+// chainNamesMissingFrom returns the entries of want that have does not contain.
+func chainNamesMissingFrom(have, want []string) []string {
+	present := make(map[string]struct{}, len(have))
+	for _, p := range have {
+		present[p] = struct{}{}
+	}
+	var missing []string
+	for _, p := range want {
+		if _, ok := present[p]; !ok {
+			missing = append(missing, p)
+		}
+	}
+	return missing
+}
+
+// summarizeChainNames renders a delta as one quoted base name plus a count, so a retention
+// prune that dropped hundreds of siblings does not put hundreds of paths in one error.
+func summarizeChainNames(paths []string) string {
+	first := strconv.Quote(filepath.Base(paths[0]))
+	if len(paths) == 1 {
+		return first
+	}
+	return fmt.Sprintf("%s and %d more", first, len(paths)-1)
 }

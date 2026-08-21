@@ -465,15 +465,29 @@ func (r *Redis) resolveTopology(nilClient bool) error {
 // It is idempotent: repeated calls launch the listener and reconcile loop only once (a
 // second call would otherwise overwrite r.cancel and run duplicate loops).
 func (r *Redis) Start(ctx context.Context) {
-	// Hold lifeMu across the whole Start body so a concurrent Stop blocks until cancel is
-	// published and both goroutines are registered, ordering every wg.Add before Stop's
-	// wg.Wait.
+	gained := r.startUnderLifeMu(ctx)
+	// The initial snapshot's revocations are delivered with lifeMu RELEASED, for the reason
+	// refreshState releases refreshMu first: a callback may call back into the Manager, and
+	// Stop takes lifeMu — an observer reacting to a startup-time kill by stopping the switch
+	// would otherwise deadlock against the Start that is notifying it. Delivering after the
+	// whole body also means such a callback sees a started switch rather than the
+	// fail-closed unstarted answer.
+	r.notifyRevocations(gained)
+}
+
+// startUnderLifeMu is Start's body, run under lifeMu, returning the initial snapshot's
+// revocations for Start to deliver once the lock is released.
+//
+// lifeMu is held across the WHOLE body so a concurrent Stop blocks until cancel is
+// published and both goroutines are registered, ordering every wg.Add before Stop's
+// wg.Wait.
+func (r *Redis) startUnderLifeMu(ctx context.Context) []Revocation {
 	r.lifeMu.Lock()
 	defer r.lifeMu.Unlock()
 	// Start at most once. If Stop already ran, do not start either: launching
 	// goroutines now would orphan them beyond Stop's reach.
 	if r.startedOnce || r.stopped {
-		return
+		return nil
 	}
 	// A latched wiring fault means this backend can never confirm its kill set — the client
 	// would panic on every command, or the servers holding the keyspace cannot be enumerated —
@@ -486,7 +500,7 @@ func (r *Redis) Start(ctx context.Context) {
 			r.logger.Error("kill switch: wiring fault; the switch is permanently degraded and every check fails closed",
 				slog.String("error", r.wiringErr.Error()))
 		}
-		return
+		return nil
 	}
 	r.startedOnce = true
 
@@ -537,7 +551,10 @@ func (r *Redis) Start(ctx context.Context) {
 
 	// Load initial state. On failure the switch starts degraded (blocking in
 	// fail-closed, allowing the empty cache in fail-open) and self-corrects later.
-	if err := r.refreshState(subCtx); err != nil {
+	// serializedRefresh, not refreshState: the revocations it finds are returned to Start
+	// and delivered outside lifeMu (see there).
+	gained, err := r.serializedRefresh(subCtx)
+	if err != nil {
 		if r.logger != nil {
 			mode := "blocking all traffic until Redis is reachable (fail-closed)"
 			if r.failOpen {
@@ -573,6 +590,8 @@ func (r *Redis) Start(ctx context.Context) {
 		defer r.wg.Done()
 		r.drainRefreshTrigger(subCtx)
 	}()
+
+	return gained
 }
 
 // reconcileLoop periodically refreshes the local cache from Redis so kill events lost by
