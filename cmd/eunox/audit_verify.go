@@ -128,8 +128,9 @@ func openAuditChainOrExit(name, logPath string, usageExit int) (r io.Reader, clo
 }
 
 // auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution, or
-// log-read failure. Exit 1 is reserved for a log that fails verification (like validate
-// reserves it for findings), so a cron/CI job can tell tampering from a misconfigured flag.
+// log-read failure, and for a pass a rotation raced (no verdict was reached). Exit 1 is
+// reserved for a log that fails verification (like validate reserves it for findings), so
+// a cron/CI job can tell tampering from a misconfigured flag or an inconclusive run.
 // parseAuditReaderFlags reports usage errors as 1, so this command translates at the call site.
 const auditVerifyUsageExit = 2
 
@@ -152,7 +153,8 @@ Exit codes:
   1  The log failed verification (an invalid record, a chain break, an
      unverifiable or unknown-key record). Reserved for findings, so a cron or
      CI job can gate on it; never used for usage errors.
-  2  Usage error, or a config, key-resolution, or log-read failure.
+  2  Usage error, a config, key-resolution, or log-read failure, or a pass that
+     a rotation raced (inconclusive — re-run).
 
 Flags:
 `)
@@ -189,12 +191,16 @@ Flags:
 	verifier := audit.NewVerifier(keys)
 
 	// Verify the whole rotated set as one chain, not just the base file — deletion of an
-	// entire interior rotated file would otherwise go undetected.
-	chainFiles, err := audit.LogChainFiles(logPath)
+	// entire interior rotated file would otherwise go undetected. Snapshot rather than a
+	// bare LogChainFiles: this runs against a live proxy under traffic (audit-verify takes
+	// no lock by design), so the pass has to be bracketed against a rotation moving the
+	// files under it.
+	snap, err := audit.SnapshotLogChain(logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: discovering rotated audit logs: %v\n", err)
 		return auditVerifyUsageExit
 	}
+	chainFiles := snap.Files
 	if len(chainFiles) == 0 {
 		fmt.Fprint(os.Stderr, auditLogMissingHint("audit-verify", logPath))
 		return auditVerifyUsageExit
@@ -212,9 +218,18 @@ Flags:
 	if len(chainFiles) > 1 {
 		fmt.Printf("Verifying %d audit log files as one chain (oldest rotated to current base).\n", len(chainFiles))
 	}
-	res, err := audit.VerifyLogFiles(chainFiles, verifier, *requestID, sinceTime, os.Stdout)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log: %v\n", err)
+	res, verifyErr := audit.VerifyLogFiles(chainFiles, verifier, *requestID, sinceTime, os.Stdout)
+	// Checked before the read error and before any verdict, because a rotation landing
+	// mid-pass produces those too: a pruned sibling reads as an open failure, a re-pointed
+	// base as a PASS over an incomplete chain or a spurious CHAIN BREAK. "Re-run" is the
+	// only honest answer to any of them, and it is NOT a finding, so it exits 2 not 1.
+	if err := snap.CheckUnchanged(); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: %v; no verdict was reached — re-run "+
+			"(against a quiescent log, or a copy of the chain)\n", err)
+		return auditVerifyUsageExit
+	}
+	if verifyErr != nil {
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log: %v\n", verifyErr)
 		return auditVerifyUsageExit
 	}
 

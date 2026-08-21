@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -140,6 +141,10 @@ func rotatedStampParts(name, logPath string) (ordinal uint64, hasOrdinal bool, t
 // concurrent rotate() w.r.t. the kernel's directory view: a rotation completing before
 // the read shows the new rotated name; one completing after still shows the original
 // base. Either way no file falls through the gap.
+//
+// The guarantee is scoped to the ENUMERATION. It says nothing about what happens to those
+// names afterwards: a reader that opens them later (VerifyLogFiles opens lazily, base
+// last) can still have the base re-pointed under it, which is what ChainSnapshot brackets.
 //
 // Only regular files participate. A directory or symlink named like a rotated log would
 // otherwise reach pruneRotated (os.Remove fails on a non-empty dir, or burns a retention
@@ -786,4 +791,96 @@ func uniqueRotatedPathBounded(base string, maxSuffix int) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no free rotated name for %q after %d attempts", base, maxSuffix+1)
+}
+
+// ErrChainRotated reports that logPath's chain moved under a verification pass — a
+// rotation, or the retention prune that follows one, landed between the snapshot and the
+// re-check. The pass then covered an unknown set of files, so neither of its outcomes
+// means anything: callers report "re-run", never a verdict.
+var ErrChainRotated = errors.New("audit log rotated during verification")
+
+// ChainSnapshot pins the identity of logPath's chain at one instant — the discovered file
+// set AND the active base's directory entry — so a verification pass can prove afterwards
+// that nothing re-pointed the files under it.
+//
+// The single directory read scanLogDir documents makes the ENUMERATION atomic and nothing
+// more: VerifyLogFiles opens each path LAZILY by name, base last, so over a multi-GB
+// (possibly minutes-long) pass a rotate() re-points the base path after every rotated
+// sibling is already verified. Either the fresh base is still empty — the pass ends on the
+// siblings and reports PASS while every record of the old base now sits in a sibling
+// outside the snapshot, a whole file escaping the chain check and indistinguishable from
+// the trailing truncation the scope note documents — or it already carries records, whose
+// head chains onto the previous sibling's tail as a spurious CHAIN BREAK + SEQ GAP.
+// Bracketing the pass with CheckUnchanged turns both into ErrChainRotated.
+type ChainSnapshot struct {
+	// Files is the chain in verification order, exactly as LogChainFiles returns it.
+	Files []string
+
+	logPath string
+	base    os.FileInfo // nil when the base was absent, as LogChainFiles omits it
+}
+
+// SnapshotLogChain discovers logPath's chain (see LogChainFiles) and pins its identity for
+// a later CheckUnchanged.
+func SnapshotLogChain(logPath string) (*ChainSnapshot, error) {
+	files, err := LogChainFiles(logPath)
+	if err != nil {
+		return nil, err
+	}
+	base, err := chainBaseIdentity(logPath)
+	if err != nil {
+		return nil, err
+	}
+	return &ChainSnapshot{Files: files, logPath: logPath, base: base}, nil
+}
+
+// CheckUnchanged re-reads the chain and reports ErrChainRotated if either the file set or
+// the base's directory entry moved since the snapshot. Both halves are needed: a rotation
+// publishes a new sibling name (caught by the set), while a base swapped in place under
+// the same name is only visible in the entry's identity.
+//
+// Appended records are NOT a change — the pass verified a prefix of the chain, which is
+// exactly what a verifier reading a live log can certify.
+func (c *ChainSnapshot) CheckUnchanged() error {
+	files, err := LogChainFiles(c.logPath)
+	if err != nil {
+		return fmt.Errorf("re-reading the audit log chain: %w", err)
+	}
+	if !slices.Equal(files, c.Files) {
+		return fmt.Errorf("%w: the chain held %d file(s) when the pass started and %d now",
+			ErrChainRotated, len(c.Files), len(files))
+	}
+	base, err := chainBaseIdentity(c.logPath)
+	if err != nil {
+		return err
+	}
+	if !sameChainBase(c.base, base) {
+		return fmt.Errorf("%w: %s was replaced during the pass", ErrChainRotated, c.logPath)
+	}
+	return nil
+}
+
+// chainBaseIdentity lstats the active base, reporting a nil FileInfo when it is absent —
+// the same case LogChainFiles omits the base for (just-rotated, or a fresh install).
+// Lstat rather than Stat: the directory ENTRY is what a rotation re-points, and a symlink
+// swapped in for the base is a change of the same kind (openDiscoveredAuditFile refuses to
+// read one, but a pass that raced it still owes "re-run" rather than a verdict).
+func chainBaseIdentity(logPath string) (os.FileInfo, error) {
+	fi, err := os.Lstat(logPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat audit log %q: %w", logPath, err)
+	}
+	return fi, nil
+}
+
+// sameChainBase compares two chainBaseIdentity results, treating "absent" as an identity
+// of its own so a base that appeared or vanished during a pass counts as a change.
+func sameChainBase(before, after os.FileInfo) bool {
+	if before == nil || after == nil {
+		return before == nil && after == nil
+	}
+	return os.SameFile(before, after)
 }

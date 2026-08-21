@@ -1073,9 +1073,10 @@ func (r *Redis) publish(ctx context.Context, msg string) error {
 	return r.client.Publish(ctx, redisPubSubChan, msg).Err()
 }
 
-// recordRefreshErr stores err as the last refresh error and returns it, so refreshState's
-// three failure paths share one stamp-and-return. Only ever called within refreshState,
-// which holds refreshMu for its whole body, so lastRefreshErr has a single serialized writer.
+// recordRefreshErr stores err as the last refresh error and returns it, so the refresh's
+// failure paths share one stamp-and-return. Every scan-time caller is inside
+// serializedRefresh, which holds refreshMu for its whole body, so lastRefreshErr has a
+// single serialized writer.
 func (r *Redis) recordRefreshErr(err error) error {
 	r.mu.Lock()
 	r.lastRefreshErr = err
@@ -1087,6 +1088,20 @@ func (r *Redis) refreshState(ctx context.Context) error {
 	if r.wiringErr != nil {
 		return r.recordRefreshErr(r.wiringErr)
 	}
+	gained, err := r.serializedRefresh(ctx)
+	// Observers run with refreshMu RELEASED, matching the pub/sub delivery path: the
+	// contract says a callback may call back in, and refreshMu is neither reentrant nor
+	// ctx-aware, so a callback reaching any refresh-taking method (Reset re-seeds through
+	// refreshState) would self-deadlock — wedging the reconcile goroutine for the
+	// process's life, on the emergency-stop path, and hanging a later Stop on wg.Wait.
+	r.notifyRevocations(gained)
+	return err
+}
+
+// serializedRefresh is refreshState's scan-and-commit half, run under refreshMu. It
+// RETURNS the revocations its commit added rather than delivering them, so the lock is
+// released before any observer runs.
+func (r *Redis) serializedRefresh(ctx context.Context) ([]Revocation, error) {
 	// Serialize refreshes so two scans cannot interleave and commit out of order: a
 	// cacheGen match only guards against a racing cache MUTATION, not against a
 	// second refresh that captured the same generation, so without this an older
@@ -1111,18 +1126,18 @@ func (r *Redis) refreshState(ctx context.Context) error {
 
 		val, err := r.client.Get(ctx, redisGlobalKey).Result()
 		if err != nil && !errors.Is(err, redis.Nil) {
-			return r.recordRefreshErr(err)
+			return nil, r.recordRefreshErr(err)
 		}
 		newGlobal := err == nil && val == "1"
 
 		newAgents := make(map[string]bool)
 		if err := r.scanPrefix(ctx, redisAgentPrefix, newAgents); err != nil {
-			return r.recordRefreshErr(err)
+			return nil, r.recordRefreshErr(err)
 		}
 
 		newSessions := make(map[string]bool)
 		if err := r.scanPrefix(ctx, redisSessionPfx, newSessions); err != nil {
-			return r.recordRefreshErr(err)
+			return nil, r.recordRefreshErr(err)
 		}
 
 		r.mu.Lock()
@@ -1130,8 +1145,7 @@ func (r *Redis) refreshState(ctx context.Context) error {
 			// No cache mutation raced the scan: the snapshot is consistent.
 			gained := r.commitRefreshLocked(newGlobal, newAgents, newSessions)
 			r.mu.Unlock()
-			r.notifyRevocations(gained)
-			return nil
+			return gained, nil
 		}
 		if attempt+1 < maxRefreshAttempts {
 			// A kill/revive/global toggle landed during the scan; the snapshot may
@@ -1151,13 +1165,13 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		}
 		gained := r.commitRefreshLocked(newGlobal || r.globalActive, newAgents, newSessions)
 		r.mu.Unlock()
-		r.notifyRevocations(gained)
-		return nil
+		return gained, nil
 	}
 }
 
 // notifyRevocations calls the observers for every revocation a refresh added. Always
-// OUTSIDE r.mu, since an observer's documented response is to re-ask ShouldBlock.
+// OUTSIDE both r.mu and refreshMu, since an observer's documented response is to call back
+// into the Manager.
 func (r *Redis) notifyRevocations(gained []Revocation) {
 	for _, ev := range gained {
 		r.observers.notify(ev)
@@ -1170,9 +1184,9 @@ func (r *Redis) notifyRevocations(gained []Revocation) {
 // staleness gate denies ALL traffic in fail-closed mode when it is not maintained.
 //
 // It returns the revocations the snapshot ADDS, for the caller to notify after releasing
-// r.mu. The reconcile loop fires observers too, not just pub/sub, because a publish that
-// never arrives would otherwise leave a consumer with nothing to reclaim on (and the
-// sessionIdleTimeoutMs: 0 case has no sweep at all).
+// r.mu AND refreshMu. The reconcile loop fires observers too, not just pub/sub, because a
+// publish that never arrives would otherwise leave a consumer with nothing to reclaim on
+// (and the sessionIdleTimeoutMs: 0 case has no sweep at all).
 func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) []Revocation {
 	var gained []Revocation
 	if global && !r.globalActive {

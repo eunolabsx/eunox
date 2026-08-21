@@ -348,6 +348,43 @@ func TestRedis_ObserveRevocations_ReconcileDelivers(t *testing.T) {
 	assert.Equal(t, "agent-reconciled", ev.AgentID)
 }
 
+// TestRedis_ObserveRevocations_ReentrantRefreshDoesNotDeadlock pins the contract's "called
+// OUTSIDE the backend's lock so it may call back in" for refreshMu, not just mu. A kill
+// discovered by the reconcile scan used to be delivered with refreshMu still held, so an
+// observer re-entering any refresh-taking method self-deadlocked: the reconcile goroutine
+// wedged for the process's life (the cache goes stale, so fail-closed denies all traffic
+// and fail-open stops learning of new kills) and a later Stop hung forever on wg.Wait.
+//
+// Reset is the re-entry used because it is the shipped method that reaches refreshMu (its
+// post-clear re-seed goes through refreshState); the pre-existing re-entrancy test only
+// exercises ShouldBlock, which takes mu alone.
+func TestRedis_ObserveRevocations_ReentrantRefreshDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+	r, mr := newStartedTestRedis(t)
+
+	var reentered atomic.Bool
+	r.ObserveRevocations(func(Revocation) {
+		// Reset deletes the kill keys first, so its re-seed gains nothing and this
+		// cannot recurse; under the pre-fix delivery it simply never returns.
+		_ = r.Reset(context.Background())
+		reentered.Store(true)
+	})
+
+	require.NoError(t, mr.Set(redisAgentPrefix+"agent-reentrant", "1"))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = r.refreshState(context.Background())
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("refreshState deadlocked delivering a revocation to an observer that re-entered the Manager")
+	}
+	assert.True(t, reentered.Load(), "the observer must have run")
+}
+
 // TestRedis_ObserveRevocations_UnregisterIdempotent mirrors the InMemory case
 // for the Redis backend.
 func TestRedis_ObserveRevocations_UnregisterIdempotent(t *testing.T) {
