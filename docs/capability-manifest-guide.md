@@ -784,6 +784,18 @@ argument explicitly.
 > restrict a non-SQL operation, use the structured manifest form that names the
 > operation argument explicitly (`allowedOperations` with an `argument`).
 
+> **A `resource:` or `prompt:` claim may condition only on its own target.**
+> `resources/read` and `prompts/get` carry no call arguments: the only value in
+> scope is the target itself, matched under `uri` for a resource and `name` for a
+> prompt (`op` is also accepted, since it scans whatever values exist rather than
+> naming one). A condition on any other key names an argument the decision never
+> carries, so it could never match and the grant would authorize nothing — an
+> **inert grant**, which is rejected at the token boundary (HTTP 401) rather than
+> issued. `resource:doc://guide?lang=en` and `resource:s3://reports/*?maxCalls=5`
+> are both refused; `resource:s3://reports/*?uri=s3://reports/q3.pdf` is the form
+> that works. Only `tool:` claims carry real arguments, so only they may condition
+> on arbitrary keys.
+
 A `&` or `=` that is part of a *value* MUST itself be percent-encoded (`%26`,
 `%3D`) so it is not read as a delimiter. The `mcp.v` value stays `"0.2"`: the
 grammar extends compatibly, so single-condition v0.2 tokens are unaffected.

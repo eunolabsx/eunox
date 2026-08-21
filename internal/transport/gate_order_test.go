@@ -548,7 +548,7 @@ var hostMessageDispositions = map[string]int{
 	"dispatchRequest":       3,
 	"admit":                 2,
 	"recordKillDenial":      5,
-	"recordKillDrop":        7,
+	"recordKillDrop":        6,
 	"recordSessionGateDeny": 5,
 }
 

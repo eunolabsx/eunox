@@ -2609,8 +2609,9 @@ func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
 	req := newTestRequestWithSession("victim-real-session-id")
 
 	verifiedRec := &fwdRecorder{}
+	cancelled := mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/cancelled"}
 	recordKillDrop(context.Background(), verifiedRec, killDeny(), verifiedSession("sess-1"),
-		"notifications/cancelled", "notifications/cancelled", legHTTPNotification)
+		cancelled, legHTTPNotification)
 	require.Len(t, verifiedRec.records, 1)
 	assert.Equal(t, "sess-1", verifiedRec.records[0].sessionID)
 	assert.Equal(t, string(legHTTPNotification), verifiedRec.records[0].details["transport"])
@@ -2618,7 +2619,7 @@ func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
 
 	claimedRec := &fwdRecorder{}
 	recordKillDrop(context.Background(), claimedRec, killDeny(), claimedSession(req),
-		"notifications/cancelled", "notifications/cancelled", legHTTPNotification)
+		cancelled, legHTTPNotification)
 	require.Len(t, claimedRec.records, 1)
 	assert.Empty(t, claimedRec.records[0].sessionID,
 		"a claimed id must not be forgeable into the signed session_id field")

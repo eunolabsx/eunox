@@ -1389,6 +1389,11 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 		if parseErr != nil {
 			return "", "", nil, fmt.Errorf("JWT capability claim %q: %w", claim, parseErr)
 		}
+		// Before the glob validation below: a key that can never match makes the grant
+		// inert whatever its value globs to, so it is the more actionable error.
+		if err := rejectInertConditionKeys(claim, p, conds); err != nil {
+			return "", "", nil, err
+		}
 		// Every non-"op" pair becomes an AllowedValues glob at runtime; validate it
 		// here (as the manifest path does) so a malformed pattern is rejected up
 		// front instead of silently matching nothing (VALUE_NOT_PERMITTED).
@@ -1412,83 +1417,88 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 	return p, bare, conds, nil
 }
 
-// splitV2Claim splits a v0.2 claim at the first '?', except for a resource claim whose
-// value is a URI with an authority, where '?' begins the URI's own query rather than a
-// condition list — such a claim cannot also carry conditions. hadSep distinguishes an
-// unconditioned claim from a malformed trailing-'?' one ("tool:read_file?", hadSep=true,
-// condpart="").
+// splitV2Claim splits a v0.2 claim at the first '?', except for an http(s) resource claim,
+// where '?' begins the URL's own query rather than a condition list — such a claim cannot
+// also carry conditions. hadSep distinguishes an unconditioned claim from a malformed
+// trailing-'?' one ("tool:read_file?", hadSep=true, condpart="").
+//
+// Scoped to http(s) deliberately, and NOT widened to every "<scheme>://" value. Widening it
+// looks like the fix for a claim whose URI query was read as conditions, but it silently
+// REVERSES the meaning of every conditioned non-http claim that already worked
+// (`resource:s3://reports/*?uri=...` stops matching anything), trading one silent failure for
+// another. The claim that motivated the widening — `resource:doc://guide?lang=en` — is inert
+// for a different reason entirely, closed at its root by rejectInertConditionKeys.
 func splitV2Claim(claim string) (namepart, condpart string, hadSep bool) {
-	if i := strings.IndexByte(claim, '?'); i >= 0 && !isURIResourceClaim(claim[:i]) {
+	if i := strings.IndexByte(claim, '?'); i >= 0 && !isHTTPResourceClaim(claim[:i]) {
 		return claim[:i], claim[i+1:], true
 	}
 	return claim, "", false
 }
 
-// isURIResourceClaim reports whether head (a claim with any condition suffix already
-// removed) is a resource claim whose value is a "<scheme>://…" URI.
-//
-// ANY scheme, not http(s) alone: the rule is about the URI, not the scheme it names. Scoped
-// to http(s), `resource:doc://guide?lang=en` had the URI's own '?' read as the condition
-// separator, so the claim validated as `resource:doc://guide` with a condition named `lang`
-// and could then never match anything — an inert grant, the shape this file rejects
-// everywhere else. The cost is that a non-http URI claim can no longer carry conditions,
-// which is exactly the trade http(s) already made.
-func isURIResourceClaim(head string) bool {
+// isHTTPResourceClaim reports whether head (a claim with any condition suffix already
+// removed) is a resource claim whose value is an http(s) URL.
+func isHTTPResourceClaim(head string) bool {
 	const ns = "resource:"
 	if !strings.HasPrefix(head, ns) {
 		return false
 	}
-	return isURIResourceValue(head[len(ns):])
+	return isHTTPResourceValue(head[len(ns):])
 }
 
-// isURIResourceValue reports whether a bare resource value (the part after the "resource:"
-// prefix) is a URI with a NON-EMPTY authority — "<scheme>://<host>…".
-//
-// The authority is the line, not the scheme, and it is what separates the two conventions
-// this grammar already carries. A `file:///data/*` claim has an EMPTY authority and is
-// path-like: its '?' introduces conditions, which is the shape the shorthand exists for. A
-// claim naming a host — `http://api/x`, `doc://guide` — carries a URI whose own query the
-// upstream will read, so a '?' there belongs to the URI. Restricting that to http(s) is what
-// made `resource:doc://guide?lang=en` parse as a condition on an argument a resource read
-// never carries: an inert grant, the shape this file rejects everywhere else.
-//
-// Schemes are case-insensitive (RFC 3986 §3.1) and their grammar is
-// ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), so a leading run that leaves that alphabet
-// before "://" is not a scheme at all.
-func isURIResourceValue(bareName string) bool {
-	for i := 0; i < len(bareName); i++ {
-		c := bareName[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-			continue
-		case i > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
-			continue
-		case c == ':':
-			// A scheme is at least one character, and only "://" (not the opaque
-			// "scheme:value" form) can introduce an authority.
-			if i == 0 || !strings.HasPrefix(bareName[i:], "://") {
-				return false
-			}
-			return hasNonEmptyAuthority(bareName[i+len("://"):])
-		}
-		return false
+// isHTTPResourceValue reports whether a bare resource value (the part after the "resource:"
+// prefix) is an http(s) URL. URI schemes are case-insensitive (RFC 3986 §3.1), so detection
+// is on a lowercased copy.
+func isHTTPResourceValue(bareName string) bool {
+	v := strings.ToLower(bareName)
+	return strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://")
+}
+
+// conditionArgumentFor names the ONE argument a target type's decision actually carries, or
+// "" for a type carrying real arguments. It is the read side of jwtConditionArgs — keep the
+// two in lockstep, since a key this admits that jwtConditionArgs does not synthesize is a
+// grant that validates and can never match.
+func conditionArgumentFor(prefix capability.TargetType) string {
+	switch prefix {
+	case capability.TargetTypeResource:
+		return "uri"
+	case capability.TargetTypePrompt:
+		return "name"
+	default:
+		return ""
 	}
-	return false
 }
 
-// hasNonEmptyAuthority reports whether rest — everything after "://" — begins with at least
-// one authority character, i.e. the authority component is not empty. RFC 3986 ends the
-// authority at the first '/', '?' or '#'.
-func hasNonEmptyAuthority(rest string) bool {
-	return rest != "" && rest[0] != '/' && rest[0] != '?' && rest[0] != '#'
+// rejectInertConditionKeys refuses a condition naming an argument the decision for this
+// target type never carries.
+//
+// resources/read and prompts/get carry NO real arguments: jwtConditionArgs synthesizes the
+// target name under "uri"/"name" and nothing else, so every other key becomes an
+// AllowedValues condition on an argument that is always absent, which denies with
+// MISSING_CONTEXT on every call. The grant validates, the operator believes it was issued,
+// and it authorizes nothing — the inert-grant shape this file rejects everywhere else, and
+// the actual root of `resource:doc://guide?lang=en`. "op" is exempt: it scans whatever
+// arguments exist rather than naming one.
+func rejectInertConditionKeys(claim string, prefix capability.TargetType, conds []jwtCondPair) error {
+	want := conditionArgumentFor(prefix)
+	if want == "" {
+		return nil
+	}
+	for _, cp := range conds {
+		if cp.key == "op" || cp.key == want {
+			continue
+		}
+		return fmt.Errorf("JWT capability claim %q: condition %q names an argument a %s decision never carries, so this grant could never match — %s: accepts only %q (the target it addresses) and \"op\"",
+			claim, cp.key, prefix, prefix, want)
+	}
+	return nil
 }
 
 // claimGlobParts is the single source of the glob/literal split parseV2Claim
-// validates and matchClaimBare enforces (so the two cannot drift): a URI resource's
-// query is compared literally, so there the glob is only the path before '?'; every
-// other claim globs its whole bare name.
+// validates and matchClaimBare enforces (so the two cannot drift): an http(s)
+// resource's query is compared literally, so there the glob is only the path
+// before '?'; every other claim globs its whole bare name.
 func claimGlobParts(prefix capability.TargetType, bareName string) (globPart, query string, hasQuery bool) {
-	if prefix == capability.TargetTypeResource && isURIResourceValue(bareName) {
+	if prefix == capability.TargetTypeResource && isHTTPResourceValue(bareName) {
 		if pPath, pQuery, pHasQuery := strings.Cut(bareName, "?"); pHasQuery {
 			return pPath, pQuery, true
 		}
@@ -1498,7 +1508,7 @@ func claimGlobParts(prefix capability.TargetType, bareName string) (globPart, qu
 
 // matchClaimBare matches a JWT capability claim's bare name against a target name.
 //
-// A query-bearing URI resource claim would otherwise have its '?' misread by
+// A query-bearing http(s) resource claim would otherwise have its '?' misread by
 // matchBare's path.Match as a single-char wildcard (".../search?q=widget" matching
 // ".../searchXq=widget"), so it is split: the path keeps glob semantics, the query is
 // compared literally. A query-less claim matches as one whole string, identical to the

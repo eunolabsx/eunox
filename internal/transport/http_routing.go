@@ -654,14 +654,15 @@ func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request
 		writeJSONMsg(w, recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg, claimedSession(r)))
 		return
 	}
-	// Fire-and-forget: record the drop and ack with a bodyless 202. A response carries no
-	// method, so it's identified as "server-response" (distinct from "http-notification") so an
-	// operator can tell the two drop SITES apart.
-	label, leg := msg.Method, legHTTPNotification
+	// Fire-and-forget: record the drop and ack with a bodyless 202. Only the LEG is chosen
+	// here — recordKillDrop names the message itself through auditIdentity, which already
+	// labels a response "server-response"; the leg is what an operator tells the two drop
+	// SITES apart by, and it is the half a message cannot carry.
+	leg := legHTTPNotification
 	if msg.IsResponse() {
-		label, leg = methodLabelServerResponse, legHTTPServerResponse
+		leg = legHTTPServerResponse
 	}
-	recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), label, label, leg)
+	recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), msg, leg)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -810,7 +811,7 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	// must not OPEN an SSE stream. A targeted kill tears the session down proactively, but
 	// this still matters for a GLOBAL stop (no session named) and a re-open racing teardown.
 	if deny := route.pdp.CheckKill(r.Context(), sessionID); deny != nil {
-		recordKillDrop(r.Context(), asRecorder(route.sink), deny, verifiedSession(sess.id), "", "", legSSEGet)
+		recordKillDrop(r.Context(), asRecorder(route.sink), deny, verifiedSession(sess.id), mcp.RPCMsg{}, legSSEGet)
 		http.Error(w, "session terminated", http.StatusForbidden)
 		return
 	}
@@ -1226,7 +1227,7 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 		// A kill doesn't tear the upstream down; its blocked server-initiated request is
 		// intentionally left unanswered and reclaimed later by the idle reaper's hard
 		// ceiling. Record the dropped reply so it's visible on the tape.
-		recordKillDrop(ctx, asRecorder(route.sink), deny, verifiedSession(sess.id), methodLabelServerResponse, methodLabelServerResponse, legHTTPServerResponse)
+		recordKillDrop(ctx, asRecorder(route.sink), deny, verifiedSession(sess.id), msg, legHTTPServerResponse)
 		return true
 	}
 	// Through the shared seam for the nil-writer disposition alone: this relays the host's OWN

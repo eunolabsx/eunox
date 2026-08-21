@@ -204,9 +204,19 @@ const (
 // originating transport leg into the audit detail, but returns nothing to send — the caller
 // owns the drop control flow. rec may be nil (skipped). Folds ~8 hand-mirrored sites so the
 // record shape can't drift apart.
-func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, subj killSubject, identifier, method string, leg transportLeg) {
+func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, subj killSubject, msg mcp.RPCMsg, leg transportLeg) {
 	if rec == nil {
 		return
+	}
+	// The MESSAGE rather than a name, so auditIdentity decides — a kill drop is a refusal with
+	// no policy decision behind it, exactly the class that rule governs, and every site passing
+	// its own method name meant a notification-framed `tools/list` stamped a tool literally
+	// named `tools/list` onto the signed tape. Six call sites, one of which is reached with no
+	// JSON-RPC message at all (an SSE GET): a ZERO message names neither field, which
+	// deriveTargetFields collapses to no target at all, leaving the leg to identify the site.
+	var identifier, method string
+	if !msg.IsZero() {
+		identifier, method = auditIdentity(msg)
 	}
 	denial := normalizeDenial(deny.Denial)
 	details := subj.auditDetails(map[string]interface{}{detailTransport: string(leg)})

@@ -1133,7 +1133,7 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				// does not tear the upstream down, so the blocked request is simply left
 				// unanswered and reclaimed on teardown.
 				if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), methodLabelServerResponse, methodLabelServerResponse, legStdioServerResponse)
+					recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg, legStdioServerResponse)
 				} else {
 					// Through the shared seam, like its HTTP twin: this is the fifth site of the
 					// take-then-write sequence, and leaving it bare is how the two transports came
@@ -1768,7 +1768,7 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			// could be resolved" — false for a connection that has already negotiated one.
 			killCtx := ensureProtocolRevision(ctx, p.hostRevision())
 			if deny := p.pdp.CheckKill(killCtx, p.sessionID); deny != nil {
-				recordKillDrop(killCtx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
+				recordKillDrop(killCtx, p.rec(), deny, verifiedSession(p.sessionID), msg, legStdioUpstreamNotification)
 				continue
 			}
 			_ = p.hostWriter.Write(msg)

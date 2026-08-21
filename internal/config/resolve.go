@@ -145,6 +145,22 @@ type BoundedRead struct {
 	// OverLimit completes the over-size error; each caller states what refusing buys IT,
 	// since a truncated read means something different for a key set than a manifest.
 	OverLimit string
+	// Discovered marks a path eunox found by SCANNING a directory rather than one the
+	// operator named, which is what decides whether the FIFO guard applies.
+	//
+	// A discovered path is attacker-influenceable: whoever can write the directory chooses
+	// what the scan finds, and RefuseNonRegularPath runs against the NAME, so a FIFO swapped
+	// in after that Lstat is opened directly — and a read-only open of a reader-less FIFO
+	// blocks inside open(2) forever, which no size bound and no O_NOFOLLOW reaches. Such a
+	// read takes OpenNonBlock so the open returns, plus RefuseNonRegularHandle through the
+	// fd, which is the only check with no window after it.
+	//
+	// A path the OPERATOR named is theirs to point wherever they like, and pointing it at a
+	// non-regular file is a supported spelling rather than an attack: `--config
+	// <(envsubst < t.yaml)` is a FIFO, and `--config /dev/stdin` is a pipe. Refusing those
+	// bought nothing — an operator who can pass --config can pass anything — and broke a
+	// working invocation, so the guard is scoped to the paths whose CHOICE is not theirs.
+	Discovered bool
 }
 
 // ReadBoundedFile reads Path whole, refusing anything past Max bytes rather than
@@ -154,19 +170,22 @@ type BoundedRead struct {
 // so a file exactly at the limit still loads and anything larger is detectable without
 // reading it all.
 //
-// It carries the FIFO half of the substitution guard for every caller, rather than leaving
-// each to remember it: a caller's RefuseNonRegularPath runs against the PATH, so a FIFO
-// swapped in after that Lstat is opened directly, and a read-only open of a reader-less FIFO
-// blocks inside open(2) forever — no size bound and no O_NOFOLLOW reaches that. OpenNonBlock
-// makes the open return, and RefuseNonRegularHandle then refuses through the fd.
+// The FIFO half of the substitution guard is applied for a DISCOVERED path only (see
+// BoundedRead.Discovered), never for one the operator named.
 func ReadBoundedFile(rd BoundedRead) ([]byte, error) {
-	f, err := os.OpenFile(rd.Path, os.O_RDONLY|OpenNonBlock|rd.Flags, 0) //nolint:gosec // G304: operator-supplied path
+	flags := rd.Flags
+	if rd.Discovered {
+		flags |= OpenNonBlock
+	}
+	f, err := os.OpenFile(rd.Path, os.O_RDONLY|flags, 0) //nolint:gosec // G304: operator-supplied path
 	if err != nil {
 		return nil, fmt.Errorf("reading %s %q: %w", rd.What, rd.Path, err)
 	}
 	defer func() { _ = f.Close() }()
-	if err := RefuseNonRegularHandle(f, rd.What, rd.Path); err != nil {
-		return nil, err
+	if rd.Discovered {
+		if err := RefuseNonRegularHandle(f, rd.What, rd.Path); err != nil {
+			return nil, err
+		}
 	}
 	data, err := io.ReadAll(io.LimitReader(f, rd.Max+1))
 	if err != nil {

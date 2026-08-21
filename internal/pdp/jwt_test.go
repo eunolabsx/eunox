@@ -3051,7 +3051,7 @@ func TestJWTPDP_Decide_MatchingClaimConditionEnforcedAmongNoise(t *testing.T) {
 	token := makeJWTToken(t, key, []string{
 		"tool:noise_a?path=/a/*",
 		"tool:noise_b?region=eu",
-		"resource:db://x?foo=bar",
+		"resource:db://x?uri=db://y",
 		"tool:read_db?table=sales",
 	})
 	ctx := makeJWTCtx(t, pdp, token)
@@ -6208,36 +6208,64 @@ func TestJWT_OnceGrantRefusedWhenTokenOutlivesLedger(t *testing.T) {
 	}
 }
 
-// TestParseV2Claim_NonHTTPURIQueryBelongsToTheURI is the inert-grant regression. The
-// "the '?' belongs to the URI" rule was scoped to http(s), so a claim naming any other
-// scheme with a host had its URI query read as a condition list: `resource:doc://guide?lang=en`
-// validated as a grant on `doc://guide` conditioned on an argument a resource read never
-// carries, and could therefore never match — the shape this file rejects everywhere else.
+// TestParseV2Claim_InertConditionKeyRejected is the inert-grant regression. A resources/read
+// or prompts/get decision carries NO real arguments — jwtConditionArgs synthesizes the target
+// name under "uri"/"name" and nothing else — so any other condition key becomes an
+// AllowedValues condition on an argument that is always absent, denying with MISSING_CONTEXT
+// on every call. `resource:doc://guide?lang=en` validated and authorized nothing.
 //
-// The line is the AUTHORITY, not the scheme: a `file:///data/*` claim has an empty authority
-// and is path-like, so its '?' still introduces conditions.
-func TestParseV2Claim_NonHTTPURIQueryBelongsToTheURI(t *testing.T) {
+// Rejecting the KEY is what closes it at the root. Widening the "the '?' belongs to the URI"
+// rule past http(s) looks like the same fix and is not: it leaves the key unexamined and
+// silently reverses every conditioned non-http claim that already worked.
+func TestParseV2Claim_InertConditionKeyRejected(t *testing.T) {
 	for _, tc := range []struct {
-		name, claim, wantBare string
-		wantConds             int
+		name, claim string
+		wantErr     bool
 	}{
-		{name: "authority-bearing non-http scheme", claim: "resource:doc://guide?lang=en", wantBare: "doc://guide?lang=en"},
-		{name: "http keeps its query", claim: "resource:http://api/search?q=widget", wantBare: "http://api/search?q=widget"},
-		{name: "empty authority still takes conditions", claim: "resource:file:///data/*?uri=file:///data/q3.pdf", wantBare: "file:///data/*", wantConds: 1},
-		{name: "opaque scheme is not a URI authority", claim: "resource:urn:x?maxCalls=3", wantBare: "urn:x", wantConds: 1},
+		{name: "resource key a read never carries", claim: "resource:doc://guide?lang=en", wantErr: true},
+		{name: "resource budget-looking key is equally inert", claim: "resource:s3://reports/*?maxCalls=5", wantErr: true},
+		{name: "prompt key a get never carries", claim: "prompt:summarize?lang=en", wantErr: true},
+		{name: "resource uri is the one key in scope", claim: "resource:s3://reports/*?uri=s3://reports/q3.pdf"},
+		{name: "prompt name is the one key in scope", claim: "prompt:summarize?name=summarize"},
+		{name: "op scans whatever arguments exist", claim: "resource:db://x?op=select"},
+		{name: "a tool carries real arguments, so any key may match", claim: "tool:read_db?table=sales"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, bare, conds, err := parseV2Claim(tc.claim)
-			if err != nil {
+			_, _, _, err := parseV2Claim(tc.claim)
+			if tc.wantErr && err == nil {
+				t.Fatalf("parseV2Claim(%q) = nil error, want the inert grant refused at the token boundary", tc.claim)
+			}
+			if !tc.wantErr && err != nil {
 				t.Fatalf("parseV2Claim(%q): %v", tc.claim, err)
 			}
-			if bare != tc.wantBare {
-				t.Errorf("bare = %q, want %q", bare, tc.wantBare)
-			}
-			if len(conds) != tc.wantConds {
-				t.Errorf("conds = %+v, want %d", conds, tc.wantConds)
-			}
 		})
+	}
+}
+
+// TestParseV2Claim_ConditionedNonHTTPClaimKeepsItsConditions is the other half: the '?' in a
+// non-http resource claim introduces CONDITIONS, as it always has. Widening the URI-query rule
+// to any "<scheme>://" made this claim's condition part of the name, so matchClaimBare compared
+// the target's empty query against the literal "uri=..." and the grant matched nothing —
+// trading the inert grant above for a silently inert one here.
+func TestParseV2Claim_ConditionedNonHTTPClaimKeepsItsConditions(t *testing.T) {
+	_, bare, conds, err := parseV2Claim("resource:s3://reports/*?uri=s3://reports/q3.pdf")
+	if err != nil {
+		t.Fatalf("parseV2Claim: %v", err)
+	}
+	if bare != "s3://reports/*" {
+		t.Errorf("bare = %q, want the condition split off", bare)
+	}
+	if len(conds) != 1 || conds[0].key != "uri" {
+		t.Fatalf("conds = %+v, want one uri condition", conds)
+	}
+
+	// The http(s) exemption is unchanged: there the query is the URL's own.
+	_, httpBare, httpConds, err := parseV2Claim("resource:http://api/search?q=widget")
+	if err != nil {
+		t.Fatalf("parseV2Claim(http): %v", err)
+	}
+	if httpBare != "http://api/search?q=widget" || len(httpConds) != 0 {
+		t.Errorf("http claim = (%q, %+v), want the query kept on the name", httpBare, httpConds)
 	}
 }
 

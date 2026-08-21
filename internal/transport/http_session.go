@@ -1152,7 +1152,7 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			// a guard here would mean silently failing open instead.
 			killCtx := s.withSessionRecordContext(ctx)
 			if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
-				recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
+				recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg, legHTTPUpstreamNotification)
 				continue
 			}
 			s.broadcast(msg)

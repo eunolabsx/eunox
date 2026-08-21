@@ -14,12 +14,11 @@ import (
 	"time"
 )
 
-// TestReadBoundedFile_RefusesAFIFO is the FIFO half of the substitution guard. A caller's
-// RefuseNonRegularPath runs against the PATH, so a FIFO swapped in after that Lstat is opened
-// directly — and a read-only open of a reader-less FIFO blocks inside open(2) forever, which
-// no size bound and no O_NOFOLLOW reaches. Every ReadBoundedFile caller (the corpus loader,
-// the attestation trust store, the manifest and config loaders) inherits this.
-func TestReadBoundedFile_RefusesAFIFO(t *testing.T) {
+// TestReadBoundedFile_RefusesADiscoveredFIFO is the FIFO half of the substitution guard, on
+// the paths it is scoped to. A caller's RefuseNonRegularPath runs against the PATH, so a FIFO
+// swapped in after that Lstat is opened directly — and a read-only open of a reader-less FIFO
+// blocks inside open(2) forever, which no size bound and no O_NOFOLLOW reaches.
+func TestReadBoundedFile_RefusesADiscoveredFIFO(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "planted.json")
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
@@ -28,7 +27,9 @@ func TestReadBoundedFile_RefusesAFIFO(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := ReadBoundedFile(BoundedRead{Path: path, What: "contract", Max: 1 << 20, OverLimit: "refusing"})
+		_, err := ReadBoundedFile(BoundedRead{
+			Path: path, What: "contract", Max: 1 << 20, OverLimit: "refusing", Discovered: true,
+		})
 		done <- err
 	}()
 
@@ -42,6 +43,55 @@ func TestReadBoundedFile_RefusesAFIFO(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("ReadBoundedFile blocked on a reader-less FIFO; the open must not wait for a writer")
+	}
+}
+
+// TestReadBoundedFile_OperatorNamedFIFOStillReads is the bound on that guard. A path the
+// operator NAMED is theirs to point wherever they like, and pointing it at a FIFO is a
+// supported spelling rather than an attack — `--config <(envsubst < t.yaml)` is exactly this
+// shape, and `--config /dev/stdin` is a pipe. Applying the guard to every caller refused both
+// and bought nothing: an operator who can pass --config can pass anything.
+func TestReadBoundedFile_OperatorNamedFIFOStillReads(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "substituted.yaml")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	// A writer, as process substitution supplies: the open blocks until one arrives, so this
+	// also pins that the operator-named path takes no O_NONBLOCK (which would read EAGAIN
+	// before the data lands).
+	go func() {
+		w, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return
+		}
+		defer func() { _ = w.Close() }()
+		_, _ = w.WriteString("schemaVersion: \"0.1\"\n")
+	}()
+
+	done := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	go func() {
+		data, err := ReadBoundedFile(BoundedRead{Path: path, What: "gateway config", Max: 1 << 20, OverLimit: "refusing"})
+		done <- struct {
+			data []byte
+			err  error
+		}{data, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("an operator-named FIFO must still read: %v", got.err)
+		}
+		if !strings.Contains(string(got.data), "schemaVersion") {
+			t.Errorf("read %q, want the substituted content", got.data)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("reading an operator-named FIFO with a live writer must complete")
 	}
 }
 

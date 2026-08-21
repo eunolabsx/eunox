@@ -107,11 +107,14 @@ func TestEstablishedSessionLegsStampTheSessionRevision(t *testing.T) {
 		t.Errorf("withSessionRecordContext left protocol_revision %q, want the session's pin %q", got, handshakeRevision)
 	}
 
-	// A session that never pinned one still records a revision rather than the absence:
-	// resolveRevision's empty-carrier rule is the surface eunox already shipped.
+	// A leg with NO pin stamps nothing: on this tape an absent protocol_revision means
+	// "written before one could be resolved", which is the truth for a connection that has
+	// not negotiated yet (stdio pins only on its first dispatched message). Defaulting here
+	// would put a revision on the tape for a negotiation that never happened — the same false
+	// claim, in the other direction, that the stamp exists to remove.
 	bare := &httpSession{id: "sess-2"}
-	if got := capability.ProtocolRevisionFromContext(bare.withSessionRecordContext(context.Background())); got != capability.DefaultRevision {
-		t.Errorf("an unpinned session resolved %q, want %q", got, capability.DefaultRevision)
+	if got := capability.ProtocolRevisionFromContext(bare.withSessionRecordContext(context.Background())); got != "" {
+		t.Errorf("an unpinned leg stamped %q, want no revision at all", got)
 	}
 }
 
@@ -125,5 +128,52 @@ func TestEnsureProtocolRevision_NeverOverwritesTheRequestsOwn(t *testing.T) {
 	got := capability.ProtocolRevisionFromContext(ensureProtocolRevision(ctx, "2026-07-28"))
 	if got != capability.DefaultRevision {
 		t.Errorf("ensureProtocolRevision overwrote a resolved revision with %q", got)
+	}
+}
+
+// TestKillDrop_NoSiteCanNameItsOwnTarget is the follow-up regression. Fixing the two refusals
+// the review named left four sibling kill-DROP sites each passing their own method name, so a
+// notification-framed tools/list on a revoked session still stamped a tool named tools/list.
+// The rule is structural now — recordKillDrop takes the message — so this walks the call sites
+// to keep it that way: none may pass a name of its own.
+func TestKillDrop_NoSiteCanNameItsOwnTarget(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		msg  mcp.RPCMsg
+		want string
+	}{
+		{
+			name: "a target-resolving method names no target",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodToolsList},
+			want: "",
+		},
+		{
+			name: "a method that resolves none keeps its identifier",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/cancelled"},
+			want: "notifications/cancelled",
+		},
+		{
+			name: "a host response is labelled, not left blank",
+			msg:  mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{}`)},
+			want: methodLabelServerResponse,
+		},
+		{
+			name: "a leg with no message at all names neither field",
+			msg:  mcp.RPCMsg{},
+			want: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rec := &fwdRecorder{}
+			recordKillDrop(context.Background(), rec, killDeny(), verifiedSession("sess-1"), tc.msg, legHTTPNotification)
+			if len(rec.records) != 1 {
+				t.Fatalf("expected one record, got %d", len(rec.records))
+			}
+			if got := rec.records[0].identifier; got != tc.want {
+				t.Errorf("identifier = %q, want %q — the identifier is what the sink derives target_type/target from", got, tc.want)
+			}
+		})
 	}
 }

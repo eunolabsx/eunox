@@ -580,11 +580,18 @@ func resolveRevision(rev capability.Revision) capability.Revision {
 // ensureProtocolRevision stamps rev onto ctx unless the carrier already holds one, so a leg that
 // stamps defensively for a direct caller costs the production path nothing and cannot overwrite
 // the revision the request was actually decided under with a session-level pin.
+//
+// An EMPTY rev stamps nothing, deliberately: it is not resolveRevision's empty-carrier rule
+// spelled a second time. That rule answers "which method table routes this message", where the
+// surface eunox already shipped is the only safe default; this one answers "what did the record
+// say was negotiated", where an absent revision MEANS "written before one could be resolved" —
+// so defaulting here would put a revision on the tape for a connection that never negotiated
+// one, which is exactly the false claim the stamp was added to remove.
 func ensureProtocolRevision(ctx context.Context, rev capability.Revision) context.Context {
-	if capability.ProtocolRevisionFromContext(ctx) != "" {
+	if rev == "" || capability.ProtocolRevisionFromContext(ctx) != "" {
 		return ctx
 	}
-	return capability.WithProtocolRevision(ctx, resolveRevision(rev))
+	return capability.WithProtocolRevision(ctx, rev)
 }
 
 // tablesFromContext returns the routing tables for the revision the request was negotiated
@@ -700,7 +707,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 		return notificationSwallowed
 	}
 	if kill := g.checkKill(); kill != nil {
-		recordKillDrop(ctx, g.recorders.forCategory(catKill), kill, g.subject, msg.Method, msg.Method, g.leg)
+		recordKillDrop(ctx, g.recorders.forCategory(catKill), kill, g.subject, msg, g.leg)
 		return notificationRefused
 	}
 	if swallowed {
