@@ -2955,8 +2955,8 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 	badOutput := filepath.Join(blocker, "manifest.yaml")
 
 	code := cmdSuggest([]string{"--audit-log", logPath, "--output", badOutput})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (WriteFile failed), got %d", code)
+	if code != suggestUsageExit {
+		t.Errorf("expected exit code %d (a refused --output is a file error, not a finding about the tape — init exits the same way for the identical failure), got %d", suggestUsageExit, code)
 	}
 }
 

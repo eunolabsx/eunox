@@ -132,6 +132,14 @@ func parseDoctorReaderFlags(fs *flag.FlagSet, args []string, configPath, logPath
 	return cfg, 0, false, cfgErr
 }
 
+// doctorUsageExit is doctor's exit code for a usage error or a failure to write the bundle,
+// matching every sibling reader (stats/suggest/audit-verify all use 2). Exit 1 is reserved
+// for doctor's one FINDING — a config that would not load — so `doctor --config X && restart`
+// stays a usable pre-flight gate rather than conflating a broken config with a typo'd flag
+// and an unwritable --output under one code. parseReaderArgs reports usage errors as 1, so
+// this command translates at the call site, as audit-verify does.
+const doctorUsageExit = 2
+
 // cmdDoctor runs the `doctor` subcommand, returning the exit code (rather than calling
 // os.Exit) so tests can drive every branch in-process.
 func cmdDoctor(args []string) int {
@@ -170,6 +178,9 @@ Flags:
 	// path is reported INSIDE the bundle, since printing what it can beats refusing to print.
 	cfg, code, done, cfgErr := parseDoctorReaderFlags(fs, args, configPath, auditLog, auditKey)
 	if done {
+		if code == 1 {
+			return doctorUsageExit
+		}
 		return code
 	}
 	// An unloadable config is NOT fatal here: it's carried into the bundle and every other
@@ -206,7 +217,7 @@ Flags:
 	// unconditional — otherwise a planted link's TARGET would be truncated and re-moded.
 	if err := refuseNonRegularOutput(outPath); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
-		return 1
+		return doctorUsageExit
 	}
 	// config.OpenNoFollow closes the Lstat->open race the refusal above cannot for a symlink;
 	// config.OpenNonBlock closes it for a FIFO, whose write-only open would otherwise block
@@ -214,21 +225,21 @@ Flags:
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
-		return 1
+		return doctorUsageExit
 	}
 	// Asked through the HANDLE, ahead of the re-tighten, so a substituted object is refused
 	// rather than re-moded and written with a support bundle.
 	if err := config.RefuseNonRegularHandle(f, "output file", outPath); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
 		_ = f.Close()
-		return 1
+		return doctorUsageExit
 	}
 	// Re-tighten on the open fd: O_CREATE applies 0600 only on creation, so a pre-existing
 	// looser-mode file would otherwise keep that mode.
 	if err := f.Chmod(0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: tightening mode of %q: %v\n", outPath, err)
 		_ = f.Close()
-		return 1
+		return doctorUsageExit
 	}
 	// Track write errors AND the close (which flushes) so a truncated bundle is reported
 	// rather than announced as complete.
@@ -237,11 +248,11 @@ Flags:
 	closeErr := f.Close()
 	if writeErr := tw.err; writeErr != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: writing %q: %v\n", outPath, writeErr)
-		return 1
+		return doctorUsageExit
 	}
 	if closeErr != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: writing %q: %v\n", outPath, closeErr)
-		return 1
+		return doctorUsageExit
 	}
 	fmt.Fprintf(os.Stderr, "Wrote support bundle to %s\n", outPath)
 	fmt.Fprintln(os.Stderr, "Review for any remaining sensitive values before sharing.")

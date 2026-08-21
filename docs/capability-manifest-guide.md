@@ -2955,19 +2955,20 @@ contract:
 | ---- | ------- |
 | `0`  | Manifests valid. With `--live`, every entry also matches a live tool. |
 | `1`  | Drift warnings or stale entries — operator review required. **`--live` only**: a syntax-only run never returns 1. |
-| `2`  | Connection, parse, or **usage** error (an unreadable upstream, a malformed manifest, a bad flag, or an invalid flag combination). |
+| `2`  | Connection, parse, or **usage** error (an unreadable upstream, a malformed manifest, a bad flag, or an invalid flag combination — including `--upstream-protocol-version` and its `--live` siblings passed where they cannot take effect). |
 
 The usage class deliberately shares `2` with parse failures rather than `1`: a
 typo'd flag is not drift, and a CI gate that treats `1` as "review the diff"
 must not be handed that code for a run that validated nothing at all. With
 `--config`, the exit code is the maximum across all routes.
 
-`2` means the same thing across `proxy`, `validate`, `suggest`, `stats`, and
-`audit-verify`: you asked for something the command could not act on (a bad
-flag, an unreadable config, a log it could not open). `1` is reserved per
-command for a *finding* — drift for `validate`, a failed chain for
-`audit-verify` — so a gate can tell "the check ran and found something" from
-"the check never ran". `eunox kill` is the one deliberate exception and returns
+`2` means the same thing across `proxy`, `validate`, `suggest`, `stats`,
+`audit-verify`, and `doctor`: you asked for something the command could not act
+on (a bad flag, an unreadable config, a log it could not open, an `--output`
+it could not write). `1` is reserved per command for a *finding* — drift for
+`validate`, a failed chain or an inconclusive one for `audit-verify`, a config
+that will not load for `doctor` (the bundle is still written) — so a gate can
+tell "the check ran and found something" from "the check never ran". `eunox kill` is the one deliberate exception and returns
 `1` for every failure: under an emergency stop the only question is whether the
 revocation landed, and a second failure code invites a script that treats one of
 them as success.
