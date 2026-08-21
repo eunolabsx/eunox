@@ -1076,7 +1076,9 @@ func TestJWTPDP_ValidateToken_ConfigurableLeeway(t *testing.T) {
 }
 
 // TestEffectiveLeeway and TestJWTLeewayOption pin the leeway resolution rules so
-// the zero-as-default / negative-as-disabled contract cannot drift.
+// the zero-as-default / negative-as-disabled contract cannot drift. Asserted through
+// capability.EffectiveLeeway directly, which is what this package now calls: the one-line
+// pass-through it used to go through was a second name for the same function.
 func TestEffectiveLeeway(t *testing.T) {
 	cases := []struct {
 		in, want time.Duration
@@ -1087,8 +1089,8 @@ func TestEffectiveLeeway(t *testing.T) {
 		{5 * time.Second, 5 * time.Second},
 	}
 	for _, tc := range cases {
-		if got := effectiveLeeway(tc.in); got != tc.want {
-			t.Errorf("effectiveLeeway(%v) = %v, want %v", tc.in, got, tc.want)
+		if got := capability.EffectiveLeeway(tc.in); got != tc.want {
+			t.Errorf("capability.EffectiveLeeway(%v) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
@@ -3049,7 +3051,7 @@ func TestJWTPDP_Decide_MatchingClaimConditionEnforcedAmongNoise(t *testing.T) {
 	token := makeJWTToken(t, key, []string{
 		"tool:noise_a?path=/a/*",
 		"tool:noise_b?region=eu",
-		"resource:db://x?foo=bar",
+		"resource:db://x?uri=db://y",
 		"tool:read_db?table=sales",
 	})
 	ctx := makeJWTCtx(t, pdp, token)
@@ -4985,7 +4987,7 @@ func TestDecodeJWTClaimsPreservingNumbers_SegmentGuard(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			claims, err := decodeJWTClaimsPreservingNumbers(tc.token)
+			claims, err := decodeJWTClaimsFromToken(tc.token)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %q, got claims %v", tc.token, claims)
@@ -6204,4 +6206,98 @@ func TestJWT_OnceGrantRefusedWhenTokenOutlivesLedger(t *testing.T) {
 	if _, err := p.ValidateToken(context.Background(), "Bearer "+standing); err != nil {
 		t.Fatalf("a standing grant on a long-lived token must still validate: %v", err)
 	}
+}
+
+// TestParseV2Claim_InertConditionKeyRejected is the inert-grant regression. A resources/read
+// or prompts/get decision carries NO real arguments — jwtConditionArgs synthesizes the target
+// name under "uri"/"name" and nothing else — so any other condition key becomes an
+// AllowedValues condition on an argument that is always absent, denying with MISSING_CONTEXT
+// on every call. `resource:doc://guide?lang=en` validated and authorized nothing.
+//
+// Rejecting the KEY is what closes it at the root. Widening the "the '?' belongs to the URI"
+// rule past http(s) looks like the same fix and is not: it leaves the key unexamined and
+// silently reverses every conditioned non-http claim that already worked.
+func TestParseV2Claim_InertConditionKeyRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name, claim string
+		wantErr     bool
+	}{
+		{name: "resource key a read never carries", claim: "resource:doc://guide?lang=en", wantErr: true},
+		{name: "resource budget-looking key is equally inert", claim: "resource:s3://reports/*?maxCalls=5", wantErr: true},
+		{name: "prompt key a get never carries", claim: "prompt:summarize?lang=en", wantErr: true},
+		{name: "resource uri is the one key in scope", claim: "resource:s3://reports/*?uri=s3://reports/q3.pdf"},
+		{name: "prompt name is the one key in scope", claim: "prompt:summarize?name=summarize"},
+		{name: "op scans whatever arguments exist", claim: "resource:db://x?op=select"},
+		{name: "a tool carries real arguments, so any key may match", claim: "tool:read_db?table=sales"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, err := parseV2Claim(tc.claim)
+			if tc.wantErr && err == nil {
+				t.Fatalf("parseV2Claim(%q) = nil error, want the inert grant refused at the token boundary", tc.claim)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("parseV2Claim(%q): %v", tc.claim, err)
+			}
+		})
+	}
+}
+
+// TestParseV2Claim_ConditionedNonHTTPClaimKeepsItsConditions is the other half: the '?' in a
+// non-http resource claim introduces CONDITIONS, as it always has. Widening the URI-query rule
+// to any "<scheme>://" made this claim's condition part of the name, so matchClaimBare compared
+// the target's empty query against the literal "uri=..." and the grant matched nothing —
+// trading the inert grant above for a silently inert one here.
+func TestParseV2Claim_ConditionedNonHTTPClaimKeepsItsConditions(t *testing.T) {
+	_, bare, conds, err := parseV2Claim("resource:s3://reports/*?uri=s3://reports/q3.pdf")
+	if err != nil {
+		t.Fatalf("parseV2Claim: %v", err)
+	}
+	if bare != "s3://reports/*" {
+		t.Errorf("bare = %q, want the condition split off", bare)
+	}
+	if len(conds) != 1 || conds[0].key != "uri" {
+		t.Fatalf("conds = %+v, want one uri condition", conds)
+	}
+
+	// The http(s) exemption is unchanged: there the query is the URL's own.
+	_, httpBare, httpConds, err := parseV2Claim("resource:http://api/search?q=widget")
+	if err != nil {
+		t.Fatalf("parseV2Claim(http): %v", err)
+	}
+	if httpBare != "http://api/search?q=widget" || len(httpConds) != 0 {
+		t.Errorf("http claim = (%q, %+v), want the query kept on the name", httpBare, httpConds)
+	}
+}
+
+// TestJWTPDP_CheckKill_FallsBackToTheInnerPDP pins that a wrapper built with an inner PDP but
+// no kill switch of its own does not silently disarm the emergency stop on the paths that
+// route through CheckKill (the */list handlers, initialize, the notification gate). The
+// shipped binary wires both, so this is a library-seam property — which is exactly the kind
+// that goes unnoticed.
+func TestJWTPDP_CheckKill_FallsBackToTheInnerPDP(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	if err := ks.KillSession(context.Background(), "sess-1"); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	inner := NewManifestPDP(nil, enforcement.New(), ks)
+
+	// KillSwitch deliberately unset on the wrapper: the library wiring the fix is about.
+	wrapper := NewJWTPDP(JWTPDPOptions{Inner: inner, AllowAnyAudience: true, Issuer: "https://issuer.example"})
+	if deny := wrapper.CheckKill(context.Background(), "sess-1"); deny == nil {
+		t.Fatal("a killed session must be refused through the inner PDP's kill switch when the wrapper has none")
+	}
+	if deny := wrapper.CheckKill(context.Background(), "sess-live"); deny != nil {
+		t.Errorf("a live session must not be refused; got %+v", deny)
+	}
+}
+
+// decodeJWTClaimsFromToken is the test-side composition of the two steps ValidateToken now
+// performs separately: the payload segment is decoded once there and threaded to both
+// readers, so the whole-token form no longer exists in production.
+func decodeJWTClaimsFromToken(tokenStr string) (map[string]interface{}, error) {
+	payloadBytes, err := jwtPayloadSegment(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+	return decodeJWTClaimsPreservingNumbers(payloadBytes)
 }

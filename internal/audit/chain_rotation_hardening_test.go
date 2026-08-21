@@ -5,6 +5,7 @@ package audit
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -334,4 +335,33 @@ func TestOpenNoFollow_RefusesSymlinkWithoutTheLstatGuard(t *testing.T) {
 		t.Fatalf("config.OpenNoFollow must not block a regular path: %v", err)
 	}
 	_ = g.Close()
+}
+
+// TestInterpretAuditTail_RefusesAnUnboundedLeadingRecord is the discarded-flag regression.
+// lastCompleteLineFromTail reports whether the returned line's LEADING boundary was inside
+// the window; interpretAuditTail threw that away, so a rotated sibling whose tail window
+// starts mid-record handed back a CLIPPED record as if it were whole. That then reads as an
+// unparseable tail and takes the DESTRUCTIVE genesis-restart branch — on the same input the
+// active-log path (which can re-anchor through its handle) fails closed for.
+func TestInterpretAuditTail_RefusesAnUnboundedLeadingRecord(t *testing.T) {
+	// A window that begins mid-record: no newline before the returned line, and start != 0.
+	buf := []byte(`ecision":"allow","seq":9}` + "\n")
+	got, err := interpretAuditTail(buf, len(buf), nil, 4096, 4096-int64(len(buf)))
+	if err == nil {
+		t.Fatalf("interpretAuditTail = (%q, nil), want errAuditTailUnbounded for a record clipped at the window edge", got)
+	}
+	if !errors.Is(err, errAuditTailUnbounded) {
+		t.Fatalf("error = %v, want it to wrap errAuditTailUnbounded", err)
+	}
+
+	// The contrast leg: the same window with the record's leading boundary inside it is
+	// bounded and must still return the record.
+	whole := []byte(`{"seq":8}` + "\n" + `{"decision":"allow","seq":9}` + "\n")
+	line, err := interpretAuditTail(whole, len(whole), nil, 4096, 4096-int64(len(whole)))
+	if err != nil {
+		t.Fatalf("a bounded tail must still resolve: %v", err)
+	}
+	if line != `{"decision":"allow","seq":9}` {
+		t.Fatalf("interpretAuditTail = %q, want the last complete record", line)
+	}
 }

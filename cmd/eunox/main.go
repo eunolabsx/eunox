@@ -486,9 +486,10 @@ func cmdProxy(args []string) (exitCode int) {
 	if sessionIDSet && *f.sessionID == "" {
 		// An explicitly-empty value (e.g. a unit file pinning --session-id "$SID" for a
 		// later `eunox kill "$SID"` where $SID turned out unset) must not silently fall
-		// through to a random UUID: kill.go:276-279 already refuses the identical mistake
-		// on the kill side ("a supplied-but-empty target must not silently fall through …
-		// or a default"), and both killswitch backends reject empty ids outright. Minting a
+		// through to a random UUID: resolveKillTarget already refuses the identical mistake
+		// on the kill side ("a supplied target with an empty id … must not silently fall
+		// through to the positional or a default"), and both killswitch backends reject
+		// empty ids outright. Minting a
 		// fresh id here instead would make the pinned emergency kill match nothing.
 		fmt.Fprintf(os.Stderr, "eunox proxy: --session-id was passed but empty; unset the flag entirely for a random UUID, or pass a non-empty id\n")
 		return 1
@@ -545,6 +546,16 @@ func cmdProxy(args []string) (exitCode int) {
 	// the first side effect — these checks used to sit inside the serve functions, firing
 	// only after the Redis dial and audit key/log creation had already happened.
 	if err := validateTransportConditionalFlags(cfg.HostTransport(), pf); err != nil {
+		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		return 1
+	}
+
+	// The rest of the PURE JWT checks, for the same reason: they used to run inside
+	// gatewayJWTLayer, which is reached only after the Redis dial and the audit key/log
+	// have been minted. Below the transport gate deliberately — a flag that cannot take
+	// effect on this transport at all should be reported as that, not critiqued for its
+	// combination with flags that equally cannot take effect.
+	if err := validateJWTFlagCombinations(pf); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
 	}
@@ -1517,6 +1528,26 @@ func resolveOAuthMetadata(cfg *config.GatewayConfig, pf proxyFlags) (*transport.
 	}, transport.BuildOAuthMetadataURL(oauthResource), nil
 }
 
+// validateJWTFlagCombinations runs the PURE JWT flag checks — the audience and issuer
+// combinations and the JWKS URI scheme. A no-op without --jwks-uri, where the JWT layer does
+// not stand up at all.
+//
+// Hoisted out of gatewayJWTLayer, which is reached only after the Redis dial and the audit
+// key and log have been minted: a typo'd --jwt-issuer is exactly the trivially-fixable flag
+// error cmdProxy's own guards run before any side effect for.
+func validateJWTFlagCombinations(pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
+	if pf.jwksURI == "" {
+		return nil
+	}
+	if err := validateJWTAudienceConfig(pf.jwksURI, pf.jwtAudience, pf.jwtAllowAnyAudience); err != nil {
+		return err
+	}
+	if err := validateJWTIssuerConfig(pf.jwksURI, pf.jwtIssuer, pf.jwtAllowAnyIssuer); err != nil {
+		return err
+	}
+	return validateJWKSURIScheme(pf.jwksURI, pf.jwksAllowInsecure)
+}
+
 // gatewayJWTLayer stands up the gateway's JWT layer from the flags: validates JWT-adjacent
 // flag combinations, emits bypass warnings, and wraps every route's manifest PDP in a
 // pdp.JWTPDP sharing one JWKS validator. Returns a nil PDP when --jwks-uri is unset. routes
@@ -1525,13 +1556,10 @@ func gatewayJWTLayer(routes map[string]*transport.UpstreamRoute, ks killswitch.M
 	if pf.jwksURI == "" {
 		return nil, nil
 	}
-	if err := validateJWTAudienceConfig(pf.jwksURI, pf.jwtAudience, pf.jwtAllowAnyAudience); err != nil {
-		return nil, err
-	}
-	if err := validateJWTIssuerConfig(pf.jwksURI, pf.jwtIssuer, pf.jwtAllowAnyIssuer); err != nil {
-		return nil, err
-	}
-	if err := validateJWKSURIScheme(pf.jwksURI, pf.jwksAllowInsecure); err != nil {
+	// Already run before the first side effect (see cmdProxy); repeated here so this
+	// function stays self-contained for a caller that reaches it directly. One helper, so
+	// the two sites cannot disagree about what a valid JWT flag combination is.
+	if err := validateJWTFlagCombinations(pf); err != nil {
 		return nil, err
 	}
 	if w := jwtAudienceBypassWarning(pf.jwtAllowAnyAudience, pf.jwtAudience); w != "" {
@@ -1906,7 +1934,10 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 		}
 		// config.OpenNoFollow closes the Lstat->open race the guard above cannot; O_EXCL
 		// already refuses a symlink for free, which is why only the force path needs it.
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow
+		// OpenNonBlock is the FIFO half of that race: a symlink is refused by O_NOFOLLOW,
+		// but a FIFO swapped in after the Lstat is opened directly and a write-only open of
+		// a reader-less FIFO blocks inside open(2) forever, so no post-open check would run.
+		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow | config.OpenNonBlock
 	}
 	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
 	if err != nil {
@@ -1923,6 +1954,12 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 		}
 	}()
 	if force {
+		// Asked through the HANDLE, so it describes what is about to be written rather than
+		// what the name resolved to before the open — the one question with no window after
+		// it. Ahead of the re-tighten, which would otherwise re-mode a substituted object.
+		if rerr := config.RefuseNonRegularHandle(f, "output file", path); rerr != nil {
+			return rerr
+		}
 		// Re-tighten BEFORE writing so a regenerated credential-bearing config never lands
 		// at a loose mode; on the open fd rather than os.Chmod(path), which would re-resolve
 		// and could follow a symlink.

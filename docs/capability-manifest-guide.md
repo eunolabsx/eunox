@@ -784,6 +784,18 @@ argument explicitly.
 > restrict a non-SQL operation, use the structured manifest form that names the
 > operation argument explicitly (`allowedOperations` with an `argument`).
 
+> **A `resource:` or `prompt:` claim may condition only on its own target.**
+> `resources/read` and `prompts/get` carry no call arguments: the only value in
+> scope is the target itself, matched under `uri` for a resource and `name` for a
+> prompt (`op` is also accepted, since it scans whatever values exist rather than
+> naming one). A condition on any other key names an argument the decision never
+> carries, so it could never match and the grant would authorize nothing — an
+> **inert grant**, which is rejected at the token boundary (HTTP 401) rather than
+> issued. `resource:doc://guide?lang=en` and `resource:s3://reports/*?maxCalls=5`
+> are both refused; `resource:s3://reports/*?uri=s3://reports/q3.pdf` is the form
+> that works. Only `tool:` claims carry real arguments, so only they may condition
+> on arbitrary keys.
+
 A `&` or `=` that is part of a *value* MUST itself be percent-encoded (`%26`,
 `%3D`) so it is not read as a delimiter. The `mcp.v` value stays `"0.2"`: the
 grammar extends compatibly, so single-condition v0.2 tokens are unaffected.
@@ -2970,19 +2982,20 @@ contract:
 | ---- | ------- |
 | `0`  | Manifests valid. With `--live`, every entry also matches a live tool. |
 | `1`  | Drift warnings or stale entries — operator review required. **`--live` only**: a syntax-only run never returns 1. |
-| `2`  | Connection, parse, or **usage** error (an unreadable upstream, a malformed manifest, a bad flag, or an invalid flag combination). |
+| `2`  | Connection, parse, or **usage** error (an unreadable upstream, a malformed manifest, a bad flag, or an invalid flag combination — including `--upstream-protocol-version` and its `--live` siblings passed where they cannot take effect). |
 
 The usage class deliberately shares `2` with parse failures rather than `1`: a
 typo'd flag is not drift, and a CI gate that treats `1` as "review the diff"
 must not be handed that code for a run that validated nothing at all. With
 `--config`, the exit code is the maximum across all routes.
 
-`2` means the same thing across `proxy`, `validate`, `suggest`, `stats`, and
-`audit-verify`: you asked for something the command could not act on (a bad
-flag, an unreadable config, a log it could not open). `1` is reserved per
-command for a *finding* — drift for `validate`, a failed chain for
-`audit-verify` — so a gate can tell "the check ran and found something" from
-"the check never ran". `eunox kill` is the one deliberate exception and returns
+`2` means the same thing across `proxy`, `validate`, `suggest`, `stats`,
+`audit-verify`, and `doctor`: you asked for something the command could not act
+on (a bad flag, an unreadable config, a log it could not open, an `--output`
+it could not write). `1` is reserved per command for a *finding* — drift for
+`validate`, a failed chain or an inconclusive one for `audit-verify`, a config
+that will not load for `doctor` (the bundle is still written) — so a gate can
+tell "the check ran and found something" from "the check never ran". `eunox kill` is the one deliberate exception and returns
 `1` for every failure: under an emergency stop the only question is whether the
 revocation landed, and a second failure code invites a script that treats one of
 them as success.

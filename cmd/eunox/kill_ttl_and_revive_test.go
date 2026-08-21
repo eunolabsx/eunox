@@ -629,3 +629,53 @@ func TestSessionKillTTLNotice_PointsAtARealCommand(t *testing.T) {
 	require.Contains(t, notice, "--redis-addr", "revive is Redis-only; the banner must not imply otherwise")
 	require.Contains(t, strings.ToLower(notice), "never expire")
 }
+
+// TestCmdProxy_PureJWTFlagRejectionPrecedesEverySideEffect is the third instance of the same
+// ordering rule. The audience/issuer/JWKS-scheme checks are PURE, but they lived inside
+// gatewayJWTLayer, which is reached only after the Redis dial and the audit key and log have
+// been minted — so a typo'd --jwt-issuer, the most trivially-fixable startup error there is,
+// still clobbered a running instance's published TTL and left an audit key and log behind.
+func TestCmdProxy_PureJWTFlagRejectionPrecedesEverySideEffect(t *testing.T) {
+	mr := miniredis.RunT(t)
+	require.NoError(t, mr.Set(publishedTTLKey, "1h30m0s"))
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+	cfgPath := filepath.Join(dir, "eunox.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(`schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+upstreams:
+  - name: u1
+    transport: http
+    upstreamUrl: https://host/x
+`), 0o600))
+
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdProxy([]string{
+			"--config", cfgPath,
+			"--redis-addr", mr.Addr(),
+			"--killswitch-session-ttl", "-1s",
+			"--audit-log", logPath,
+			"--audit-key-path", keyPath,
+			// --jwks-uri with neither --jwt-audience nor --jwt-allow-any-audience: a pure
+			// flag-combination error, decidable with no side effect at all.
+			"--jwks-uri", "https://idp.example.com/jwks.json",
+		})
+	})
+
+	require.Equal(t, 1, code, "an unusable JWT flag combination must fail startup")
+	require.Contains(t, stderr, "--jwt-audience")
+
+	got, err := mr.Get(publishedTTLKey)
+	require.NoError(t, err)
+	require.Equal(t, "1h30m0s", got, "a doomed process must not overwrite a running proxy's published session-kill TTL")
+
+	for _, p := range []string{logPath, keyPath} {
+		_, statErr := os.Stat(p)
+		require.True(t, os.IsNotExist(statErr), "%s must not exist: the flag error is decidable before any audit state is minted", p)
+	}
+}

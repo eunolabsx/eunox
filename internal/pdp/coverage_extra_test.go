@@ -597,25 +597,25 @@ func TestDecodeJWTClaimsPreservingNumbers_Malformed(t *testing.T) {
 	t.Parallel()
 
 	// Not 3 segments.
-	_, err := decodeJWTClaimsPreservingNumbers("only.two")
+	_, err := decodeJWTClaimsFromToken("only.two")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expected 3 segments")
 
 	// 3 segments but the payload is not valid base64url.
-	_, err = decodeJWTClaimsPreservingNumbers("aaa.!!!notbase64!!!.ccc")
+	_, err = decodeJWTClaimsFromToken("aaa.!!!notbase64!!!.ccc")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decoding JWT payload segment")
 
 	// 3 segments, valid base64url, but the payload is not a JSON object.
 	// base64url("not json") with no padding.
 	badPayload := "header." + b64url("not json") + ".sig"
-	_, err = decodeJWTClaimsPreservingNumbers(badPayload)
+	_, err = decodeJWTClaimsFromToken(badPayload)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decoding claims")
 
 	// Happy path: a JSON object decodes, preserving a large integer as json.Number.
 	okPayload := "header." + b64url(`{"big":9007199254740993}`) + ".sig"
-	claims, err := decodeJWTClaimsPreservingNumbers(okPayload)
+	claims, err := decodeJWTClaimsFromToken(okPayload)
 	require.NoError(t, err)
 	n, ok := claims["big"].(json.Number)
 	require.True(t, ok, "large integer must decode as json.Number, got %T", claims["big"])

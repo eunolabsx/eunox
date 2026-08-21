@@ -442,12 +442,13 @@ func bucketTotal(counted bool, ts []time.Time, weights []float64) float64 {
 // bucketRetryAfter estimates when a blocked bucket frees enough for THIS call. Advisory;
 // the caller clamps and falls back to the full window.
 func bucketRetryAfter(b *capability.QuotaBucket, valid []time.Time, weights []float64, cur float64, window time.Duration, now time.Time) time.Duration {
-	needed := cur + bucketWeight(b) - b.Limit
 	if b.Counted {
 		// Counting: the last entry to age out is at index cur-limit, read directly rather
 		// than walked. Redis takes the same rank pivot for a counted bucket.
 		return retryAfterFromPivot(valid, int64(cur), int64(b.Limit), window, now)
 	}
+	// Below the counted branch, which never reads it.
+	needed := cur + bucketWeight(b) - b.Limit
 	if len(weights) != len(valid) {
 		// Weighted bucket over a key that holds only counted entries: each weighs 1.
 		weights = make([]float64, len(valid))

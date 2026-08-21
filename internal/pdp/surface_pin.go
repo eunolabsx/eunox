@@ -77,6 +77,11 @@ const (
 // At the ceiling the session fails closed (sticky-broken whole) rather than dropping
 // entries (fail-open: an unpinned tool) or evicting the oldest (an upstream could drive
 // that to evict exactly the tool it means to rewrite). 100k names is far past any real catalog.
+//
+// It bounds the BROKEN set on the same terms (see sessionSurface.markBroken), which is fed
+// with names an adversarial upstream chooses even more directly: a listing whose bytes cannot
+// be trusted breaks every name it could be presenting, baselined or not, so fresh names on
+// every response grew that map forever while the one beside it was capped for this threat.
 const maxSessionSurfaceEntries = 100_000
 
 // SurfaceChange is one Tier-2 finding. Baseline and Observed are the surface hashes
@@ -117,6 +122,29 @@ type sessionSurface struct {
 	// vanished tool doesn't log on every later listing; dropped from the set when
 	// seen again, so a second disappearance reports.
 	reportedGone map[string]struct{}
+}
+
+// markBroken sticky-breaks name, or — at the cap — breaks the WHOLE session instead of growing
+// an unbounded set. It reports whether THIS call was the one that overflowed, so a caller with
+// a findings channel can say so once.
+//
+// The disposition Observe already uses for hashes, applied to the map that needs it more: an
+// upstream serving untrustworthy-by-construction listing entries under fresh names every
+// response feeds this one directly. Widening to allBroken is strictly stronger than any entry
+// it declines to store, so the overflow can only ever over-block.
+//
+// Caller must hold the baseline's write lock.
+func (s *sessionSurface) markBroken(name string) (overflowed bool) {
+	if _, already := s.broken[name]; already {
+		return false
+	}
+	if len(s.broken) >= maxSessionSurfaceEntries {
+		wasBroken := s.allBroken
+		s.allBroken = true
+		return !wasBroken
+	}
+	s.broken[name] = struct{}{}
+	return false
 }
 
 // NewSurfaceBaseline creates an empty Tier-2 baseline.
@@ -179,7 +207,10 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 		case baseline != t.Hash:
 			// Sticky: marked before returning, so the call leg denies even if a
 			// later list re-advertises the baseline surface.
-			s.broken[t.Name] = struct{}{}
+			if s.markBroken(t.Name) && !s.overflowed {
+				s.overflowed = true
+				changes = append(changes, SurfaceChange{Tool: t.Name, Kind: SurfaceOverflow})
+			}
 			changes = append(changes, SurfaceChange{
 				Tool: t.Name, Kind: SurfaceChanged, Baseline: baseline, Observed: t.Hash,
 			})
@@ -219,7 +250,10 @@ func (b *SurfaceBaseline) MarkBroken(sessionID string, tools ...string) {
 	defer b.mu.Unlock()
 	s := b.session(sessionID)
 	for _, t := range tools {
-		s.broken[t] = struct{}{}
+		// An overflow here is not reported as a finding: this call has no findings channel,
+		// and what it sets — allBroken — is observable as every call on the session denying,
+		// which is the stronger signal anyway.
+		s.markBroken(t)
 	}
 }
 

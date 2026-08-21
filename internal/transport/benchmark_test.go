@@ -1059,7 +1059,7 @@ func benchmarkDecisionTurn(b *testing.B, tier turnTier) {
 // would be a second copy of the answer this package exists to have one of.
 //
 // The metered arm holds its bucket FULL by advancing an injected clock each iteration. Sharing one
-// bucket across the run measured the opposite of the intended path: perCategoryDenyBurst is 5, so
+// bucket across the run measured the opposite of the intended path: float64(perCategoryDenyBurstSize) is 5, so
 // after five iterations admit() refuses and forCategory returns nil for the rest — reporting the
 // drained path's cost and never once allocating the rolledUpRecorder the admitted path boxes when
 // something was suppressed. The three arms are the probe alone, the admitted path, and the admitted

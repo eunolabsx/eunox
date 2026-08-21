@@ -1085,10 +1085,10 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 // publish broadcasts msg on the kill-switch channel. The durable write and cache update
 // already happened, so a publish failure does NOT undo the kill — it only delays remote
 // convergence to the next reconcile. Publish is part of redis.Cmdable, so no assertion needed.
+//
+// No wiringErr check of its own: every caller returns on it before reaching a durable write,
+// so one here could only ever be dead code that reads as a live guard.
 func (r *Redis) publish(ctx context.Context, msg string) error {
-	if r.wiringErr != nil {
-		return r.wiringErr
-	}
 	return r.client.Publish(ctx, redisPubSubChan, msg).Err()
 }
 

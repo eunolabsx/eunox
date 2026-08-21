@@ -110,7 +110,7 @@
         },
         "pep": {
           "type": "string",
-          "description": "Name this policy-enforcement point on every audit record, stamped in the record's 'pep' field as \"mcp:<name>\" (the protocol binding it enforces at, plus this name), so a sequence that crosses more than one eunox instance can be attributed once their tapes are read together. Unset (the default) stamps nothing, which is what a single-enforcement-point deployment wants. Refused at load rather than sanitized: the name lands on a signed, append-only tape.",
+          "description": "Name this policy-enforcement point on every audit record, stamped in the record's 'pep' field as \"mcp:<name>\" (the protocol binding it enforces at, plus this name), so a sequence that crosses more than one eunox instance can be attributed once their tapes are read together. Unset (the default) stamps nothing, which is what a single-enforcement-point deployment wants. Refused at load rather than sanitized: the name lands on a signed, append-only tape. The pattern describes the EXPANDED value: like upstreams[].name, this field also accepts a \"${VAR}\" environment reference, which the loader expands (and refuses when unset or empty) before the accepted-character rule applies — so a config written that way does not validate against this schema even though eunox loads it.",
           "pattern": "^[A-Za-z0-9._-]+$",
           "maxLength": 128
         },

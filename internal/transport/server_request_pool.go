@@ -131,7 +131,10 @@ func dispatchServerRequest(ctx context.Context, pool *serverRequestPool, msg mcp
 // leg leaves a trace on the tamper-evident tape rather than only a stream of error replies.
 func (p *serverRequestPool) dispatch(ctx context.Context, msg mcp.RPCMsg, d serverRequestDispatch) {
 	p.semOnce.Do(func() { p.sem = make(chan struct{}, maxConcurrentServerRequests) })
-	ctx = capability.WithProtocolRevision(ctx, resolveRevision(d.revision))
+	// A courtesy for a caller that reaches dispatch directly (all of them are tests):
+	// dispatchServerRequest already stamped this, so the production path pays nothing and the
+	// request's own revision is never overwritten by the session-level pin.
+	ctx = ensureProtocolRevision(ctx, d.revision)
 	select {
 	case p.sem <- struct{}{}:
 		// A free slot means any saturation episode is over: re-arm the gate so the next

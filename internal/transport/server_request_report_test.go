@@ -174,7 +174,7 @@ func TestUpstreamRefusalBuckets_ArePerSession(t *testing.T) {
 	a, aLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
 	drain(a, aLim, 200)
 	require.NotEmpty(t, a.records)
-	assert.LessOrEqual(t, len(a.records), int(perCategoryDenyBurst)+1, "A's own flood is still bounded by A's bucket")
+	assert.LessOrEqual(t, len(a.records), perCategoryDenyBurstSize+1, "A's own flood is still bounded by A's bucket")
 
 	// Session B, with one lost in-flight refusal, must still be recorded.
 	b, bLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
@@ -205,7 +205,7 @@ func TestUpstreamRefusalBuckets_StillChargeTheAggregate(t *testing.T) {
 			}
 		}
 	}
-	assert.LessOrEqual(t, admitted, int(perCategoryDenyBurst)+1,
+	assert.LessOrEqual(t, admitted, perCategoryDenyBurstSize+1,
 		"N sessions must not multiply the aggregate audit-write rate by N; the per-session tier bounds fairness, the parent bounds the total")
 	assert.Positive(t, admitted, "the leading edge must still reach the tape")
 }
@@ -221,7 +221,7 @@ func TestUpstreamRefusalBuckets_RollupNamesItsOwnScope(t *testing.T) {
 	rec := &fwdRecorder{}
 	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
 	// Exhaust the burst so the next admitted record carries a rollup.
-	for range int(perCategoryDenyBurst) + 20 {
+	for range perCategoryDenyBurstSize + 20 {
 		_ = admitRefusalRecord(rec, lim, catDisplaced)
 	}
 	lim.setNow(func() time.Time { return time.Now().Add(time.Hour) })
@@ -249,7 +249,7 @@ func TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory(t *testing.T) {
 	}
 	// The share is still a share of the AGGREGATE, not of the four this table happens to hold —
 	// splitting a bucket per session must not also widen each one.
-	assert.Equal(t, perCategoryDenyRate, lim.bucket(catDisplaced).ratePerSec)
+	assert.Equal(t, float64(perCategoryDenyRatePerSec), lim.bucket(catDisplaced).ratePerSec)
 }
 
 // TestInitiatorWriter_AnswersTheConcreteWriterByName pins the half of the nil-writer question that
