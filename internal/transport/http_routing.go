@@ -228,7 +228,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			// Rate-limited: an unauthenticated caller reaches this record, so an unbounded
 			// write here is an audit-queue flooding primitive; a suppressed record elides
 			// only the RECORD, the request is denied either way.
-			resp := recordKillDenial(ctx, p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), mcp.MethodInitialize)
+			resp := recordKillDenial(ctx, p.preSessionKillRecorder(route), deny, msg, claimedSession(r))
 			writeJSONMsg(w, resp)
 			return
 		}
@@ -651,7 +651,7 @@ func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if msg.IsRequest() {
-		writeJSONMsg(w, recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg.ID, claimedSession(r), msg.Method))
+		writeJSONMsg(w, recordKillDenial(r.Context(), p.preSessionKillRecorder(route), deny, msg, claimedSession(r)))
 		return
 	}
 	// Fire-and-forget: record the drop and ack with a bodyless 202. A response carries no

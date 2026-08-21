@@ -1156,10 +1156,7 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			// rely solely on the local /control/kill path's SSE eviction. s.route is
 			// dereferenced unconditionally: production never builds a route-less session, and
 			// a guard here would mean silently failing open instead.
-			killCtx := ctx
-			if s.claims != nil {
-				killCtx = pdp.WithJWTClaims(killCtx, s.claims)
-			}
+			killCtx := s.withSessionRecordContext(ctx)
 			if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
 				recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
 				continue
@@ -1572,7 +1569,7 @@ func (s *httpSession) removeSubAndDrain(ctx context.Context, ch chan mcp.RPCMsg)
 // on the unblock having actually CONSUMED the request. That is what makes it exactly-once: both
 // callers (the SSE write loop and the drain) can see the same message, and only one take succeeds.
 func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPCMsg, reason string) {
-	ctx = s.withSessionClaims(ctx)
+	ctx = s.withSessionRecordContext(ctx)
 	if !s.unblocker().unblock(ctx, msg.ID, reason) {
 		return
 	}
@@ -1609,4 +1606,14 @@ func (s *httpSession) withSessionClaims(ctx context.Context) context.Context {
 		return ctx
 	}
 	return pdp.WithJWTClaims(ctx, s.claims)
+}
+
+// withSessionRecordContext is withSessionClaims plus this session's negotiated revision, for the
+// upstream-driven legs that write a record from a context no host request ever passed through.
+// The sink OMITS protocol_revision when the context carries none, which on this tape means
+// "written before a revision could be resolved" — false for any established session, which pinned
+// hostRev at creation. Same rule, and same fix, as dispatchServerRequest's stamp on the sibling
+// server-request arm.
+func (s *httpSession) withSessionRecordContext(ctx context.Context) context.Context {
+	return ensureProtocolRevision(s.withSessionClaims(ctx), s.hostRev)
 }

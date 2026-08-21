@@ -547,7 +547,7 @@ var negotiationPrimitives = map[string]string{
 var hostMessageDispositions = map[string]int{
 	"dispatchRequest":       3,
 	"admit":                 2,
-	"recordKillDenial":      6,
+	"recordKillDenial":      5,
 	"recordKillDrop":        7,
 	"recordSessionGateDeny": 5,
 }

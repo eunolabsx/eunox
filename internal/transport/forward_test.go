@@ -2585,14 +2585,14 @@ func TestRecordKillDenial_SubjectRoutesTheSessionID(t *testing.T) {
 	req := newTestRequestWithSession("victim-real-session-id")
 
 	verifiedRec := &fwdRecorder{}
-	resp := recordKillDenial(context.Background(), verifiedRec, killDeny(), mcp.RawJSON(`1`), verifiedSession("sess-1"), "tools/call")
+	resp := recordKillDenial(context.Background(), verifiedRec, killDeny(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}, verifiedSession("sess-1"))
 	require.NotNil(t, resp.Error, "the host still gets a structured denial either way")
 	require.Len(t, verifiedRec.records, 1)
 	assert.Equal(t, "sess-1", verifiedRec.records[0].sessionID)
 	assert.Nil(t, verifiedRec.records[0].details)
 
 	claimedRec := &fwdRecorder{}
-	resp = recordKillDenial(context.Background(), claimedRec, killDeny(), mcp.RawJSON(`1`), claimedSession(req), "tools/call")
+	resp = recordKillDenial(context.Background(), claimedRec, killDeny(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}, claimedSession(req))
 	require.NotNil(t, resp.Error)
 	require.Len(t, claimedRec.records, 1)
 	assert.Empty(t, claimedRec.records[0].sessionID,

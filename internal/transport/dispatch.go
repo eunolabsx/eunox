@@ -117,7 +117,7 @@ func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
 // method's own refusal.
 func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if deny := d.pdp.CheckKill(ctx, d.sessionID); deny != nil {
-		return recordKillDenial(ctx, d.rec, deny, msg.ID, verifiedSession(d.sessionID), msg.Method), true
+		return recordKillDenial(ctx, d.rec, deny, msg, verifiedSession(d.sessionID)), true
 	}
 	return mcp.RPCMsg{}, false
 }
@@ -577,6 +577,16 @@ func resolveRevision(rev capability.Revision) capability.Revision {
 	return capability.DefaultRevision
 }
 
+// ensureProtocolRevision stamps rev onto ctx unless the carrier already holds one, so a leg that
+// stamps defensively for a direct caller costs the production path nothing and cannot overwrite
+// the revision the request was actually decided under with a session-level pin.
+func ensureProtocolRevision(ctx context.Context, rev capability.Revision) context.Context {
+	if capability.ProtocolRevisionFromContext(ctx) != "" {
+		return ctx
+	}
+	return capability.WithProtocolRevision(ctx, resolveRevision(rev))
+}
+
 // tablesFromContext returns the routing tables for the revision the request was negotiated
 // under. Re-derived from the single carrier at each lookup rather than resolved once and
 // passed alongside it: a carried copy is exactly the second carrier this seam exists to
@@ -821,8 +831,11 @@ func dispatchPing(msg mcp.RPCMsg) mcp.RPCMsg {
 // malformedDeny records a fail-closed audit deny for an enforced request rejected BEFORE the
 // PDP (unparseable params, empty target), so a probe with malformed input isn't invisible to
 // an auditor. Uses codeInvalidRequest, not capability.ErrCodeInvalidParams — the real target
-// never parsed, so IsInfraDenialCode lets suggest skip it rather than fabricate a phantom
-// target like "tool:tools/call".
+// never parsed, so IsInfraDenialCode lets suggest skip it.
+//
+// The identifier comes from auditIdentity for the same reason: every method reaching here
+// RESOLVES a target type (they are the enforced ones), so passing the method through made the
+// sink synthesize the phantom `tool:tools/call` this comment used to claim it avoided.
 func (d dispatchParams) malformedDeny(ctx context.Context, msg mcp.RPCMsg, reason string) mcp.RPCMsg {
 	// Kill gate FIRST: the malformed path is a Decide* method (skips the boundary gate) that's
 	// rejected before the PDP (never reaches enforcedForwardCore's own check), so without this
@@ -832,7 +845,8 @@ func (d dispatchParams) malformedDeny(ctx context.Context, msg mcp.RPCMsg, reaso
 		return resp
 	}
 	if d.rec != nil {
-		d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, codeInvalidRequest, "", nil, false)
+		identifier, method := auditIdentity(msg)
+		d.rec.RecordDeny(ctx, d.sessionID, identifier, method, codeInvalidRequest, "", nil, false)
 	}
 	return mcp.ErrorResponse(msg.ID, jsonRPCCodeInvalidParams, reason)
 }

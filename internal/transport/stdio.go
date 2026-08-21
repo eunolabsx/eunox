@@ -1749,8 +1749,12 @@ func (p *StdioProxy) readUpstream(ctx context.Context) {
 			// stdio's equivalent of the HTTP transport gating its SSE relay on the kill.
 			// Recording the drop keeps a killed session's suppressed notifications visible on
 			// the tape rather than silently swallowed.
-			if deny := p.pdp.CheckKill(ctx, p.sessionID); deny != nil {
-				recordKillDrop(ctx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
+			// Stamped with this connection's pin: the sink OMITS protocol_revision for a
+			// context that carries none, which on this tape means "written before a revision
+			// could be resolved" — false for a connection that has already negotiated one.
+			killCtx := ensureProtocolRevision(ctx, p.hostRevision())
+			if deny := p.pdp.CheckKill(killCtx, p.sessionID); deny != nil {
+				recordKillDrop(killCtx, p.rec(), deny, verifiedSession(p.sessionID), msg.Method, msg.Method, legStdioUpstreamNotification)
 				continue
 			}
 			_ = p.hostWriter.Write(msg)

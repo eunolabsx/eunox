@@ -116,15 +116,22 @@ func (k killSubject) auditDetails(base map[string]interface{}) map[string]interf
 
 // recordKillDenial records a kill-switch denial and builds the host-facing denial response.
 // Non-enforced paths call CheckKill themselves then funnel the deny here so the record shape
-// and response envelope are defined once. rec may be nil (skipped then). A kill addresses no
-// sub-target, so one method name serves as identifier/method/target alike. subj decides
-// whether the session id is recorded as fact or an unverified claim — see killSubject.
-func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, id *json.RawMessage, subj killSubject, method string) mcp.RPCMsg {
+// and response envelope are defined once. rec may be nil (skipped then). subj decides whether
+// the session id is recorded as fact or an unverified claim — see killSubject.
+//
+// It takes the MESSAGE rather than a method name so the record's identifier comes from
+// auditIdentity: a kill is a refusal with no policy decision behind it, exactly the class that
+// rule governs. A method name passed straight through made the sink synthesize target_type and
+// target from it, stamping a tool literally named `tools/list` onto the signed tape. The
+// host-facing error still names the method — that field is a diagnostic for the caller, not a
+// claim about a target that exists.
+func recordKillDenial(ctx context.Context, rec auditRecorder, deny *capability.EnforceResponse, msg mcp.RPCMsg, subj killSubject) mcp.RPCMsg {
 	denial := normalizeDenial(deny.Denial)
+	identifier, method := auditIdentity(msg)
 	if rec != nil {
-		rec.RecordDeny(ctx, subj.auditSessionID(), method, method, denial.Code, denial.ConditionType, subj.auditDetails(nil), false)
+		rec.RecordDeny(ctx, subj.auditSessionID(), identifier, method, denial.Code, denial.ConditionType, subj.auditDetails(nil), false)
 	}
-	return denialResult(id, denial.Code, denial.ConditionType, method, "")
+	return denialResult(msg.ID, denial.Code, denial.ConditionType, method, "")
 }
 
 // Fixed labels for the two host framings that carry no method of their own. An empty method
