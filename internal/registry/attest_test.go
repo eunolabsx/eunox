@@ -284,6 +284,35 @@ func TestLoadTrustStore_RejectsMalformed(t *testing.T) {
 	})
 }
 
+// TestUntrimmedKeyIDsAreRefused: a keyId is matched VERBATIM in both directions, so a
+// copy-pasted " acme-2026" on either side loads clean and matches nothing — every signature
+// the operator added the key to verify then reports as unverified(N), which reads as "signed
+// by strangers" rather than as the configuration mistake it is. The repo's answer to a value
+// that can never match is a loud refusal, not a silent one.
+func TestUntrimmedKeyIDsAreRefused(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	t.Run("trust store", func(t *testing.T) {
+		_, loadErr := registry.LoadTrustStore(writeTrustStore(t, trusted(" acme-2026", "Acme", pub)))
+		require.ErrorContains(t, loadErr, "whitespace")
+	})
+
+	t.Run("signature", func(t *testing.T) {
+		c, _, _ := signedEntry(t)
+		sign(t, &c, "acme-2026\n", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+		require.ErrorContains(t, c.Validate(), "whitespace")
+	})
+
+	// What the refusal replaces: the trimmed spelling on both sides verifies, so the
+	// untrimmed one is a mistake with no legitimate reading.
+	t.Run("trimmed verifies", func(t *testing.T) {
+		c, _, priv := signedEntry(t)
+		sign(t, &c, "acme-2026", registry.AttestRoleVendor, registry.AttestStatementAttests, priv)
+		require.NoError(t, c.Validate())
+	})
+}
+
 // TestVerifyAttestations_NilStoreTrustsNothing is the default posture: without --trust-keys
 // every signature is inert, and nothing errors.
 func TestVerifyAttestations_NilStoreTrustsNothing(t *testing.T) {

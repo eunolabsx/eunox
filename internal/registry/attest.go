@@ -132,6 +132,9 @@ func (s *Signature) Validate(contractID string) error {
 	if strings.TrimSpace(s.KeyID) == "" {
 		return fmt.Errorf("contract %q: a signature is missing 'keyId'", contractID)
 	}
+	if s.KeyID != strings.TrimSpace(s.KeyID) {
+		return fmt.Errorf("contract %q: signature keyId %q has leading or trailing whitespace; a keyId is matched verbatim against the trust store, so this one would never match a trusted key and the signature would silently report as unverified — remove the surrounding whitespace", contractID, s.KeyID)
+	}
 	if s.Algorithm != AttestAlgorithmEd25519 {
 		return fmt.Errorf("contract %q: signature %q declares algorithm %q; this build verifies only %q", contractID, s.KeyID, s.Algorithm, AttestAlgorithmEd25519)
 	}
@@ -232,6 +235,13 @@ func LoadTrustStore(path string) (*TrustStore, error) {
 		k := doc.Keys[i]
 		if strings.TrimSpace(k.KeyID) == "" {
 			return nil, fmt.Errorf("attestation trust store %q: key %d is missing 'keyId'", resolved, i)
+		}
+		// lookup matches a signature's keyId verbatim, so a copy-pasted " acme-vendor"
+		// loads as a trusted key that can never be reached: every signature it was added
+		// to verify reports unverified(N), which reads as "signed by strangers" rather
+		// than as the configuration mistake it is.
+		if k.KeyID != strings.TrimSpace(k.KeyID) {
+			return nil, fmt.Errorf("attestation trust store %q: key %q has leading or trailing whitespace in 'keyId'; a keyId is matched verbatim against a signature's, so this key would never match one and the signatures it was added to verify would silently report as unverified — remove the surrounding whitespace", resolved, k.KeyID)
 		}
 		if k.Algorithm != AttestAlgorithmEd25519 {
 			return nil, fmt.Errorf("attestation trust store %q: key %q declares algorithm %q; this build verifies only %q", resolved, k.KeyID, k.Algorithm, AttestAlgorithmEd25519)

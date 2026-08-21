@@ -93,7 +93,11 @@ capabilities:
   the decision path takes no network I/O — but the pin is **verified locally at load** by
   recomputing the digest of the inline block. Editing a pinned contract therefore fails
   until the author re-pins. `eunox contracts --ref <id>` prints the exact string to paste,
-  so the digest is never hand-computed. See [`registry/README.md`](../registry/README.md).
+  so the digest is never hand-computed. The digest covers a number as SPELLED while the
+  manifest loader renormalizes one as it reads it (`1.0` becomes `1`), so a corpus entry
+  whose `blastRadius` `value` is written in a form that does not survive that is refused
+  when it loads rather than published unpinnable. See
+  [`registry/README.md`](../registry/README.md).
 
 ## Operator surface
 
@@ -482,7 +486,15 @@ deliberately separate, because they answer different questions and, more importa
 
 Neither posture is right for the other surface, which is why one shared format would have
 to pick a wrong answer for one of them. What they do share is the rule that matters: no key
-is ever fetched, and nothing here is on the decision path.
+is ever fetched, and nothing here is on the decision path — and one more: **an ambiguous
+member name is refused, not resolved**. `encoding/json` matches member names
+case-insensitively and keeps the last of them, so `{"publicKey": <the key you reviewed>,
+"PublicKey": <another>}` loads a trust root that is not the one on screen, and `{"keys":
+[...], "Keys": [...]}` does the same to a receipt key domain. Both files are read by a human
+before they are read by a decoder, which is precisely the review this substitution defeats,
+so either spelling stops the load — at any depth, and in a corpus entry too, where a
+case-variant `"Effect"` block otherwise self-validates against its own digest while a
+reviewer reads the class above it.
 
 ## Worked example
 

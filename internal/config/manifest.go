@@ -438,6 +438,54 @@ func scalarCoercion(item *yaml.Node) (src, canonical string, coerced, ok bool) {
 	return src, canonical, src != canonical, true
 }
 
+// CanonicalNumberLiteral returns the spelling a numeric literal ends up with after the
+// manifest loader's YAML-node -> interface{} -> JSON renormalization above, whether that
+// spelling denotes the SAME number, and whether lit is a number that pipeline reads as one
+// at all.
+//
+// Exported because a REGISTRY corpus entry is copied into a manifest verbatim and pinned by
+// the digest of its own bytes: the corpus loader decodes with UseNumber and keeps the
+// literal, this loader re-marshals it, so a literal whose spelling does not survive the
+// round trip (1.0 -> 1, 1e3 -> 1000) digests to two different values and the copy can never
+// match its pin. The renormalization is this file's, so the answer about what survives it
+// has to be this file's too — a second implementation elsewhere would be a place for the
+// two to disagree about exactly the literals that matter.
+//
+// exact is reported separately because a renormalization that ROUNDS (an integer past
+// float64's exact range) has no faithful spelling at all: naming its canonical form as the
+// correction to write would hand the author a different magnitude than the one they
+// declared, which for a blast radius is the input to the ceiling and the cumulative bound.
+func CanonicalNumberLiteral(lit string) (canonical string, exact, ok bool) {
+	var v interface{}
+	if err := yaml.Unmarshal([]byte(lit), &v); err != nil {
+		return "", false, false
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", false, false
+	}
+	// The LAST step of the pipeline decides, not the yaml kind: the field is a json.Number,
+	// and encoding/json accepts a quoted literal into one. So a scalar yaml.v3 declined to
+	// resolve as a number (an exponent past float64's range, which its ParseFloat reports
+	// out of range and it leaves a plain string) is re-marshaled quoted and reaches the
+	// policy VERBATIM — pinnable, where reading the yaml kind alone called it unusable.
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return "", false, false
+	}
+	if n.String() == "" {
+		// A JSON null unmarshals into a string kind by leaving it untouched rather than
+		// failing, so an empty or null scalar arrives here looking like a canonical form.
+		return "", false, false
+	}
+	if n.String() == lit {
+		// Identical spelling needs no arbitrary-precision comparison, which is the only
+		// expensive step here and is what a large literal would pay it on.
+		return lit, true, true
+	}
+	return n.String(), numericallyEqual(lit, n.String()), true
+}
+
 // numericallyEqual reports whether src and canonical denote the same number, compared exactly
 // via big.Rat so a beyond-float64-precision integer is judged correctly.
 func numericallyEqual(src, canonical string) bool {
