@@ -208,7 +208,7 @@ func paramsReachUpstream(msg mcp.RPCMsg) bool {
 // unreadParamsReachUpstream narrows paramsReachUpstream to the messages whose bytes travel on
 // with NOTHING in this proxy re-decoding them first — the exact class for which
 // mcp.DeclaredRevision's "the method handler denies these bytes moments later" argument does
-// not hold, and therefore the class an undecodable body may not be read as an undeclared one.
+// not hold, and therefore the class an unreadable body may not be read as an undeclared one.
 //
 // A request routed to a Decide handler is the one message that argument covers: the handler
 // runs mcp.DecodeParams over the same bytes and answers a target-bearing malformedDeny. Three

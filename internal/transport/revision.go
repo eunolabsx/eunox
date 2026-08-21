@@ -50,14 +50,14 @@ var errUnhonorableUpstreamRevision = errors.New("request revision cannot be hono
 // peer inherited a revision whose own rule is that inheritance is not enough.
 var errUndeclaredOnDeclaringLeg = errors.New("request inherited a revision that requires a per-request declaration, and carries none")
 
-// errUndecodableForwardedParams marks a message this build could not decode whose bytes
-// nevertheless travel to the upstream with nothing re-reading them.
+// errUndecodableForwardedParams marks a message this build refused whole — a duplicate object
+// key, the one rejection a conforming peer does not share — whose bytes nevertheless travel to
+// the upstream with nothing re-reading them.
 //
-// mcp.DeclaredRevision cannot say what such a body declares, and "eunox could not decode it"
-// is not "it declares nothing": every conforming decoder disagrees about a duplicate key, so a
-// peer adds a throwaway one to make this proxy's decoder bail while leaving a clean
-// io.modelcontextprotocol/protocolVersion in `_meta` for the upstream's last-wins parser to
-// read. Every gate downstream then compares an INHERITED revision the forwarded bytes
+// mcp.DeclaredRevision cannot say what such a body declares, and "eunox could not read it" is
+// not "it declares nothing": a peer adds a throwaway duplicate key to make this proxy's decoder
+// bail while leaving a clean io.modelcontextprotocol/protocolVersion in `_meta` for the
+// upstream's last-wins parser to read. Every gate downstream then compares an INHERITED revision the forwarded bytes
 // contradict — errRevisionMismatch and checkUpstreamHonorable both pass, and on a remote leg
 // eunox stamps an MCP-Protocol-Version header naming a revision other than the one the body it
 // is carrying declares. That is the enforcement-versus-upstream parser differential
@@ -175,14 +175,17 @@ func (g hostMessageGate) negotiate(ctx context.Context, msg mcp.RPCMsg) (capabil
 // checkUpstreamHonorable for what it gates.
 func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg) (capability.Revision, error) {
 	declared, present, err := mcp.DeclaredRevisionOf(msg)
-	if errors.Is(err, mcp.ErrUndecodableDeclaration) {
+	// UNREADABLE is a third answer, not an absence: this build refused a body a conforming peer
+	// reads fine, so what it declares is unknown. Refused outright where those bytes travel
+	// unread (checkUndecodableForwarded); otherwise the message is on its way to a handler that
+	// re-decodes and denies it, so it resolves as an undeclared one does — the malformed body
+	// chooses no table, and the target-bearing INVALID_REQUEST its handler writes is not
+	// replaced by a version failure.
+	unreadable := errors.Is(err, mcp.ErrUndecodableDeclaration)
+	if unreadable {
 		if fwdErr := checkUndecodableForwarded(legRev, msg); fwdErr != nil {
 			return "", fwdErr
 		}
-		// Nothing this build can read declared anything, and these bytes are re-decoded and
-		// denied before they go anywhere — so the malformed body chooses no table, and the
-		// target-bearing INVALID_REQUEST its handler writes is not replaced by a version
-		// failure. See mcp.ErrUndecodableDeclaration for why that reading is the caller's.
 		declared, present, err = "", false, nil
 	}
 	if err != nil {
@@ -206,15 +209,22 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 		if err := checkUpstreamHonorable(resolved, legRev); err != nil {
 			return "", err
 		}
-		if err := checkDeclarationReachesUpstream(resolved, legRev, msg, present); err != nil {
+		// present || unreadable, not present: that check refuses a message for carrying NO
+		// declaration, and an unreadable body has not been established to carry none — the
+		// absence above is this decoder's, not the peer's. Passing the manufactured one made a
+		// malformed tools/call on a declaring leg refuse -32022 as errUndeclaredOnDeclaringLeg,
+		// which is the exact relabelling the unreadable arm exists to avoid, on the one leg
+		// revision the tests for it did not cover. Nothing is lost by skipping: the handler
+		// denies these bytes before they reach the upstream that would have wanted the member.
+		if err := checkDeclarationReachesUpstream(resolved, legRev, msg, present || unreadable); err != nil {
 			return "", err
 		}
 	}
 	return resolved, nil
 }
 
-// checkUndecodableForwarded refuses a message whose members this build could not decode and
-// whose bytes reach the upstream unread. See errUndecodableForwardedParams for what such a
+// checkUndecodableForwarded refuses a message whose members this build alone refused and whose
+// bytes reach the upstream unread. See errUndecodableForwardedParams for what such a
 // message can otherwise smuggle past enforcement, and unreadParamsReachUpstream for why the
 // question is asked of three framings rather than of every message whose params travel.
 //

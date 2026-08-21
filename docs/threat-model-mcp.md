@@ -722,10 +722,14 @@ opened at another (a mid-context flip).
 - **"eunox could not read it" is never "it declares nothing" for bytes that travel.** The
   declaration is read by DECODING the message rather than scanning it for the key, because JSON
   permits escaping any character of an object key and a byte probe missed spellings the upstream
-  reading the same forwarded bytes still saw. That decode rejects a duplicate key at any depth,
-  which leaves a third answer beside "declared" and "absent": a body eunox cannot read at all.
-  Reading that as "absent" is safe only where something re-decodes the same bytes and denies
-  them — a request routed to an enforced (`Decide`) handler, which answers a target-bearing
+  reading the same forwarded bytes still saw. That decode rejects a duplicate key at any depth —
+  eunox's own strictness, and so the one rejection meaning a body every conforming peer reads
+  fine — which leaves a third answer beside "declared" and "absent": a body eunox alone refuses.
+  (The other decode failures are not this and stay plain absences: invalid JSON, which no
+  decoder accepts, and a shape with no `_meta` object for anyone to read a declaration out of.
+  Reporting those as unreadable would refuse well-formed JSON-RPC carrying nothing to smuggle.)
+  Reading the third answer as "absent" is safe only where something re-decodes the same bytes
+  and denies them — a request routed to an enforced (`Decide`) handler, which answers a target-bearing
   `INVALID_REQUEST` rather than having every malformed request relabelled a version failure.
   Three shapes have no such handler and their bytes reach the upstream untouched: a host
   RESPONSE (relayed verbatim, never dispatched), a forwarded NOTIFICATION, and a `*/list`
@@ -736,7 +740,10 @@ opened at another (a mid-context flip).
   revision to the upstream's own last-wins parser, with eunox's `MCP-Protocol-Version` header on
   a remote leg contradicting the body it heads. Such a message is therefore refused
   `UNSUPPORTED_PROTOCOL_VERSION` and recorded, on exactly those framings and only where a live
-  upstream leg exists for the bytes to reach. This is the same enforcement-versus-upstream
+  upstream leg exists for the bytes to reach. Where it is instead read as absent, that absence
+  is eunox's own reading rather than the peer's, so it does not feed the separate refusal for a
+  request reaching a declaring upstream with no version member — the handler denies those bytes
+  before that upstream ever sees them. This is the same enforcement-versus-upstream
   parser differential the duplicate-key rejection exists to close, so the one framing-blind
   fallback in front of it does not get to reopen it.
 

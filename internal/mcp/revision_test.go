@@ -81,11 +81,14 @@ func TestDeclaredRevision(t *testing.T) {
 			params:  `{"progressToken":1,"x":1,"x":1,"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`,
 			wantErr: ErrUndecodableDeclaration,
 		},
-		{
-			name:    "params that are not an object are undecodable",
-			params:  `[1,2,3]`,
-			wantErr: ErrUndecodableDeclaration,
-		},
+		// The decode failures that are NOT the differential, and so stay plain absences: a
+		// shape with no `_meta` object for anyone to read a declaration out of, and a body no
+		// conforming decoder accepts either. Reporting these as unreadable would have the
+		// forwarding gate refuse messages carrying nothing to smuggle.
+		{name: "params that are not an object read as absent", params: `[1,2,3]`},
+		{name: "a non-object _meta reads as absent", params: `{"_meta":5}`},
+		{name: "an array _meta reads as absent", params: `{"_meta":[]}`},
+		{name: "invalid JSON reads as absent", params: `{"_meta":{"io.modelcontextprotocol/protocolVersion":`},
 		{
 			name:   "the key appearing as a string VALUE is not a declaration",
 			params: `{"note":"io.modelcontextprotocol/protocolVersion"}`,
