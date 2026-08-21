@@ -438,6 +438,36 @@ func scalarCoercion(item *yaml.Node) (src, canonical string, coerced, ok bool) {
 	return src, canonical, src != canonical, true
 }
 
+// CanonicalNumberLiteral returns the spelling a numeric literal ends up with after the
+// manifest loader's YAML-node -> interface{} -> JSON renormalization above, and whether lit
+// is a number that pipeline reads as one at all.
+//
+// Exported because a REGISTRY corpus entry is copied into a manifest verbatim and pinned by
+// the digest of its own bytes: the corpus loader decodes with UseNumber and keeps the
+// literal, this loader re-marshals it, so a literal whose spelling does not survive the
+// round trip (1.0 -> 1, 1e3 -> 1000) digests to two different values and the copy can never
+// match its pin. The renormalization is this file's, so the answer about what survives it
+// has to be this file's too — a second implementation elsewhere would be a place for the
+// two to disagree about exactly the literals that matter.
+func CanonicalNumberLiteral(lit string) (string, bool) {
+	var v interface{}
+	if err := yaml.Unmarshal([]byte(lit), &v); err != nil {
+		return "", false
+	}
+	// yaml.v3 resolves an integer through int -> uint64 -> float64, and only the last of
+	// those rounds; anything that lands outside the numeric kinds is not a number here.
+	switch v.(type) {
+	case int, int64, uint64, float64:
+	default:
+		return "", false
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
 // numericallyEqual reports whether src and canonical denote the same number, compared exactly
 // via big.Rat so a beyond-float64-precision integer is judged correctly.
 func numericallyEqual(src, canonical string) bool {

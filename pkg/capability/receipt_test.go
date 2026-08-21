@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -336,6 +337,52 @@ func TestNewEffectReceiptVerifierRejectsUnusableKeySets(t *testing.T) {
 	require.NoError(t, err)
 	_, err = capability.NewEffectReceiptVerifier(privJWKS, 0, 0)
 	require.ErrorContains(t, err, "not a public key")
+}
+
+// TestNewEffectReceiptVerifierRefusesAmbiguousKeySetMembers: an operator configures this
+// key set for one upstream and reads it before doing so, and encoding/json binds member
+// names case-insensitively keeping the LAST — so a second, case-variant "keys" hands the
+// verifier a key domain the operator never reviewed, in a file that reads correctly.
+// Refused rather than decoded, the same answer the registry's trust store gives.
+func TestNewEffectReceiptVerifierRefusesAmbiguousKeySetMembers(t *testing.T) {
+	reviewed := newReceiptSigner(t, "reviewed")
+	substituted := newReceiptSigner(t, "substituted")
+
+	// The premise: the substituted set is the one a plain unmarshal keeps.
+	var decoded jose.JSONWebKeySet
+	ambiguous := []byte(fmt.Sprintf(`{"keys":%s,"Keys":%s}`,
+		keysArray(t, reviewed.jwks), keysArray(t, substituted.jwks)))
+	require.NoError(t, json.Unmarshal(ambiguous, &decoded))
+	require.Len(t, decoded.Keys, 1)
+	require.Equal(t, "substituted", decoded.Keys[0].KeyID)
+
+	_, err := capability.NewEffectReceiptVerifier(ambiguous, 0, 0)
+	require.ErrorContains(t, err, "same name to a JSON decoder")
+
+	// A key set whose members are merely REPEATED across sibling key objects is ordinary
+	// and must still load.
+	both, err := json.Marshal(map[string]json.RawMessage{"keys": json.RawMessage(
+		"[" + keysArrayInner(t, reviewed.jwks) + "," + keysArrayInner(t, substituted.jwks) + "]")})
+	require.NoError(t, err)
+	_, err = capability.NewEffectReceiptVerifier(both, 0, 0)
+	require.NoError(t, err)
+}
+
+// keysArray returns the "keys" array of a JWKS document, and keysArrayInner its contents
+// without the brackets, so a test can build a document carrying two of them.
+func keysArray(t *testing.T, jwks []byte) string {
+	t.Helper()
+	var doc struct {
+		Keys json.RawMessage `json:"keys"`
+	}
+	require.NoError(t, json.Unmarshal(jwks, &doc))
+	return string(doc.Keys)
+}
+
+func keysArrayInner(t *testing.T, jwks []byte) string {
+	t.Helper()
+	arr := keysArray(t, jwks)
+	return strings.TrimSuffix(strings.TrimPrefix(arr, "["), "]")
 }
 
 // TestEffectReceiptSilentAboutAQuantifiedDimension pins that silence is not agreement. A
