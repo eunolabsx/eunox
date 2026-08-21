@@ -460,8 +460,12 @@ func killWriteOutcome(what string, err error) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, killswitch.ErrPublishFailed):
-		fmt.Fprintf(os.Stderr, "eunox kill: %s: the revocation IS written to the shared Redis state, but the real-time notification to running proxies failed (%v). Live instances converge on their next reconcile tick (default %s), so the kill still takes effect and this does not need re-running.\n",
-			what, err, killswitch.DefaultReconcileInterval)
+		// The tick is named by its FLAG rather than by a duration. Convergence happens on each
+		// running PROXY's own --killswitch-reconcile-interval, and this command has no proxy's
+		// configuration in hand — printing its own default would state a number that is wrong
+		// for exactly the deployment that tuned it, in the message an operator acts on.
+		fmt.Fprintf(os.Stderr, "eunox kill: %s: the revocation IS written to the shared Redis state, but the real-time notification to running proxies failed (%v). Each running proxy converges on its next reconcile tick (--killswitch-reconcile-interval), so the kill still takes effect and this does not need re-running.\n",
+			what, err)
 		return nil
 	default:
 		return fmt.Errorf("%s: %w", what, err)

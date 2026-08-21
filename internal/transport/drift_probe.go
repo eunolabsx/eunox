@@ -49,7 +49,10 @@ func (sess *httpSession) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMes
 			return nil, fmt.Errorf("tools/list: %w", err)
 		}
 		if resp.Error != nil {
-			return nil, fmt.Errorf("tools/list: upstream error %d: %s", resp.Error.Code, resp.Error.Message)
+			// The message is the upstream's own text and reaches stderr through the drift
+			// layer's WARN line on every glob-only session start; bound and strip it here,
+			// where it becomes part of the error, not at that printer.
+			return nil, fmt.Errorf("tools/list: upstream error %d: %s", resp.Error.Code, BoundConsoleDetail(resp.Error.Message))
 		}
 		return resp.Result, nil
 	})
@@ -98,7 +101,7 @@ func (p *StdioProxy) fetchUpstreamToolsRaw(ctx context.Context) (json.RawMessage
 			return nil, fmt.Errorf("tools/list read: %w", err)
 		}
 		if msg.Error != nil {
-			return nil, fmt.Errorf("tools/list: upstream error %d: %s", msg.Error.Code, msg.Error.Message)
+			return nil, fmt.Errorf("tools/list: upstream error %d: %s", msg.Error.Code, BoundConsoleDetail(msg.Error.Message))
 		}
 		return msg.Result, nil
 	})

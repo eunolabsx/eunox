@@ -320,7 +320,7 @@ func openerResult(method string, resp mcp.RPCMsg) (json.RawMessage, error) {
 		return nil, fmt.Errorf("upstream %s response carried neither result nor error (or both)", method)
 	}
 	if resp.Error != nil {
-		return nil, fmt.Errorf("upstream %s rejected: %s (code %d)", method, resp.Error.Message, resp.Error.Code)
+		return nil, fmt.Errorf("upstream %s rejected: %s (code %d)", method, BoundConsoleDetail(resp.Error.Message), resp.Error.Code)
 	}
 	return resp.Result, nil
 }

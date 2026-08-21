@@ -1120,7 +1120,10 @@ func (p *HTTPProxy) killWriteLanded(what string, err error) bool {
 	case err == nil:
 		return true
 	case errors.Is(err, killswitch.ErrPublishFailed):
-		_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch %s is written durably, but real-time propagation to other instances failed: %v. They converge on their next reconcile tick (default %s).\n", what, err, killswitch.DefaultReconcileInterval)
+		// The tick is named by its FLAG, not by a duration: convergence happens on each OTHER
+		// instance's own --killswitch-reconcile-interval, which this process does not know and
+		// which is not this process's default merely because the default is what it would print.
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch %s is written durably, but real-time propagation to other instances failed: %v. Each converges on its next reconcile tick (--killswitch-reconcile-interval).\n", what, err)
 		return true
 	default:
 		_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch %s failed: %v\n", what, err)

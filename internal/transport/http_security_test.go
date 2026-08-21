@@ -1144,6 +1144,17 @@ func TestHandleKill_PublishOnlyFailureIsStillAKill(t *testing.T) {
 			if !strings.Contains(stderr.String(), tc.wantNote) {
 				t.Errorf("stderr = %q, want it to carry %q", stderr.String(), tc.wantNote)
 			}
+			if tc.wantCode == http.StatusOK {
+				// Named by its FLAG, never by a duration: each OTHER instance converges on its
+				// own --killswitch-reconcile-interval, which this process does not know and
+				// which is not its own default merely because that is what it could print.
+				if !strings.Contains(stderr.String(), "--killswitch-reconcile-interval") {
+					t.Errorf("stderr = %q, want the convergence bound named by its flag", stderr.String())
+				}
+				if strings.Contains(stderr.String(), killswitch.DefaultReconcileInterval.String()) {
+					t.Errorf("stderr = %q must not state this process's default as another instance's interval", stderr.String())
+				}
+			}
 		})
 	}
 }

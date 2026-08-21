@@ -568,6 +568,12 @@ func TestReviveViaRedis_PublishOnlyFailureIsSuccessWithAWarning(t *testing.T) {
 				require.Contains(t, stderr, tc.verb, "the warning must name the operation it is about")
 				require.Contains(t, stderr, "IS written", "the warning's whole job is to say the revocation landed")
 				require.Contains(t, stderr, errPublishOnly.Error(), "the cause stays reachable for an operator diagnosing the ACL")
+				// The FLAG, never a duration: convergence happens on each running proxy's own
+				// --killswitch-reconcile-interval, and this command holds no proxy's config,
+				// so printing its own default would state a number that is wrong for exactly
+				// the deployment that tuned it.
+				require.Contains(t, stderr, "--killswitch-reconcile-interval")
+				require.NotContains(t, stderr, killswitch.DefaultReconcileInterval.String())
 			})
 			require.NoError(t, err, "a lost pub/sub notification is not a failed revocation")
 			require.Contains(t, stdout, `"ok":true`, "stdout stays the machine-readable result line")
@@ -637,6 +643,8 @@ func TestKillWriteOutcome_SeparatesALostNotificationFromALostKill(t *testing.T) 
 				require.Contains(t, stderr, tc.verb)
 				require.Contains(t, stderr, "IS written")
 				require.Contains(t, stderr, errPublishOnly.Error())
+				require.Contains(t, stderr, "--killswitch-reconcile-interval")
+				require.NotContains(t, stderr, killswitch.DefaultReconcileInterval.String())
 			})
 			require.NoError(t, err, "a lost pub/sub notification is not a failed kill")
 			require.Contains(t, stdout, `"ok":true`)

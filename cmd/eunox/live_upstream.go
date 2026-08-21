@@ -93,7 +93,9 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 			return nil, fmt.Errorf("tools/list: %w", err)
 		}
 		if listResp.Error != nil {
-			return nil, fmt.Errorf("tools/list: server error %d: %s", listResp.Error.Code, listResp.Error.Message)
+			// Through the transport's bound rather than printed raw: this probe points at the
+			// same upstream the proxy talks to, and its rejection lands on the same console.
+			return nil, fmt.Errorf("tools/list: server error %d: %s", listResp.Error.Code, transport.BoundConsoleDetail(listResp.Error.Message))
 		}
 		return listResp.Result, nil
 	})
@@ -246,7 +248,7 @@ func runStdioHandshake(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader, 
 			return nil, fmt.Errorf("tools/list: %w", err)
 		}
 		if listResp.Error != nil {
-			return nil, fmt.Errorf("tools/list: server error %d: %s", listResp.Error.Code, listResp.Error.Message)
+			return nil, fmt.Errorf("tools/list: server error %d: %s", listResp.Error.Code, transport.BoundConsoleDetail(listResp.Error.Message))
 		}
 		return listResp.Result, nil
 	})
