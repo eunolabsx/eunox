@@ -251,3 +251,42 @@ func TestFlowHardening_ForwardedNoMatchTaintMintsNoAntecedentKeys(t *testing.T) 
 	require.Equal(t, capability.DecisionDeny, known.Decision)
 	assert.NotZero(t, counter.writes(), "a name some sequenceBlock queries must still record its antecedent")
 }
+
+// TestFlowHardening_BroadSiblingCannotShadowAPrincipalScopedSource is the ALLOW-path
+// counterpart of the no-match leak above, and the wider of the two. A source entry scoped to
+// one principal declares the target confidential; a broad `tool:*` sibling with no
+// labelOutput is what actually grants the call to everyone else. Selecting that sibling used
+// to drop the taint entirely — the call was ALLOWED on an enforce route with no labels, and
+// the later sink allowed too. labelOutput describes the DATA a target produces, and the
+// target produces the same data whoever calls it.
+func TestFlowHardening_BroadSiblingCannotShadowAPrincipalScopedSource(t *testing.T) {
+	t.Parallel()
+
+	caps := []capability.Constraint{
+		{
+			Target:     "tool:read_secret",
+			Actions:    []string{"call"},
+			Principal:  map[string][]string{"agent_id": {"admin-bot"}},
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
+		},
+		// The entry that actually selects for every other principal, declaring no taint.
+		{Target: "tool:*", Actions: []string{"call"}},
+		{
+			Target:     "tool:send_email",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}},
+		},
+	}
+	p := newFlowManifestPDP(caps...)
+	ctx := ctxWithAgent("other-bot")
+
+	src := callTool(p, ctx, "read_secret", nil)
+	require.Equal(t, capability.DecisionAllow, src.Decision, "the broad sibling still grants the call")
+	assert.Equal(t, []string{capability.FlowLabelConfidential}, src.LabelsOut,
+		"the taint of a target the manifest declares confidential must not turn on who called it")
+
+	sink := callTool(p, ctx, "send_email", nil)
+	require.Equal(t, capability.DecisionDeny, sink.Decision)
+	require.NotNil(t, sink.Denial)
+	assert.Equal(t, capability.FlowLabelConfidential, sink.Denial.Details["blockedLabel"])
+}

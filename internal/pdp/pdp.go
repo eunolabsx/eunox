@@ -1348,48 +1348,11 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		resp := p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
 			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target,
 			func() []capability.Directive { return p.directivesNamingTarget(target) }, req.Delegation)
-		// Record this call's state here too, matching every other downgradable deny branch.
-		// Under --audit this deny is forwarded and the manifest-absent tool actually RUNS,
-		// so omitting the record left a later enforced sequenceBlock naming it Peeking an
-		// empty history and failing OPEN — "observe predicts enforce" broken for exactly
-		// the targets an observe run exists to discover. The two namespaces are gated
-		// separately below because the manifest bounds them differently.
-		//
-		// The sequenceBlock half is gated on the name being one some sequenceBlock actually
-		// lists in afterTools. This branch is the ONLY antecedent site whose target name is
-		// not bounded by the manifest, and the record costs a call-counter key that lives for
-		// the history window: recording every unlisted name let a caller on an observe route
-		// mint one key per made-up tool name until the counter hit its cap, at which point
-		// the record FAILS and recordAuditModeAntecedent returns a hard deny —
-		// non-downgradable even under --audit. An observe route whose whole contract is
-		// "log, never block" would then start hard-denying every call, listed tools included.
-		// A name no sequenceBlock can query has no history worth keeping, so skipping it
-		// costs the guarantee nothing and bounds the key space to manifest-authored names.
-		_, queryable := p.sequenceAntecedents[target.Name]
-		// The labelOutput half is gated on the manifest declaring this target a SOURCE, and
-		// the selection is principal-blind for the redaction fill's reason: findConstraint
-		// selected nothing, so a `tool:read_secret` entry scoped to another principal is the
-		// only thing that knows this forwarded call produces confidential data. The tool
-		// really runs under --audit, so its taint must be committed or a later ENFORCED
-		// flowLabel sink Peeks an empty set and fails OPEN — the flow-tracking analogue of
-		// the leak directivesNamingTarget closes on exactly this shape. No key-minting risk
-		// to bound here: flow labels are keyed on the state anchor, never on the target name.
-		//
-		// Resolved past the forwardability gate, exactly as the redaction fill's thunk is:
-		// this walks every capability, and an ENFORCE route's no-match deny — the whole of a
-		// deny-all posture's traffic — forwards nothing and so must resolve nothing.
-		var sourceLabels []string
-		if p.anyLabelOutput && willForwardDeny(ctx, nil) {
-			sourceLabels = p.labelOutputNamingTarget(target)
-		}
-		if queryable || len(sourceLabels) > 0 {
-			// A synthetic source constraint rather than nil, so the engine reads the taint of
-			// a call no constraint governs off the same labelOutput directive shape it reads
-			// on every other path.
-			if override := recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req,
-				namingSourceConstraint(target, sourceLabels), queryable, &resp); override != nil {
-				return *override
-			}
+		// Under --audit this deny is FORWARDED and the manifest-absent tool actually runs, so
+		// the state that call leaves behind has to be committed even though no constraint was
+		// selected to read it off. See recordUnmatchedForwardedState.
+		if override := p.recordUnmatchedForwardedState(ctx, req, target, &resp); override != nil {
+			return *override
 		}
 		return resp
 	}
@@ -1400,7 +1363,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// policy with no sources, and for the common single-source case. Only the recorded
 	// labelOutput changes; conditions, actions, and argumentSchema all read matched's own
 	// (unchanged) properties, and obligations skip labelOutput.
-	matched = p.constraintWithUnionLabelOutput(matched, target, claims)
+	matched = p.constraintWithUnionLabelOutput(matched, target)
 
 	// Stray-argumentSchema fail-closed guard. argumentSchema is tool-only by spec
 	// (§ 3.2.2) and the loader rejects it on resource:/prompt: targets, but a
@@ -1509,6 +1472,59 @@ func targetOperationPhrase(t capability.TargetType) string {
 	default:
 		return string(t)
 	}
+}
+
+// recordUnmatchedForwardedState commits the session state a downgradable refusal leaves
+// behind on the two paths where NO constraint of this manifest was selected to read it off:
+// decideTarget's no-match branch, and HardenRefusal, where a wrapping PDP refused above this
+// one and its own decision never ran. Both are forwarded by a route running --audit, and a
+// forwarded refusal means the target RAN — so omitting the record broke "observe predicts
+// enforce" in the fail-OPEN direction for exactly the calls an observe run exists to
+// discover. Returns the hard override a commit fault produces, or nil.
+//
+// The two namespaces are gated SEPARATELY, because the manifest bounds them differently.
+//
+// The sequenceBlock half is gated on the name being one some sequenceBlock actually lists in
+// afterTools. These are the only antecedent sites whose target name is not bounded by the
+// manifest, and the record costs a call-counter key that lives for the history window:
+// recording every unlisted name let a caller on an observe route mint one key per made-up
+// tool name until the counter hit its cap, at which point the record FAILS and the refusal
+// becomes a hard deny — non-downgradable even under --audit. An observe route whose whole
+// contract is "log, never block" would then start hard-denying every call, listed tools
+// included. A name no sequenceBlock can query has no history worth keeping, so skipping it
+// costs the guarantee nothing and bounds the key space to manifest-authored names.
+//
+// The labelOutput half is gated on the manifest declaring this target a SOURCE, over a
+// selection that ignores principal scoping (see labelOutputNamingTarget): nothing was
+// selected, so an entry scoped to another principal is the only thing that knows this
+// forwarded call produces confidential data. Without it a later ENFORCED flowLabel sink
+// Peeks an empty set and fails OPEN — the flow-tracking analogue of the leak the redaction
+// fill closes on this same shape. It carries no key-minting bound because it needs none:
+// flow labels are keyed on the state ANCHOR, never on the target name.
+//
+// What it DOES carry, stated rather than left implicit: a flow-store fault here is a hard,
+// non-downgradable ENFORCEMENT_ERROR, so with a source entry naming a wide pattern an outage
+// blocks this path on an observe route. That is the same posture every flow-relevant MATCHED
+// call on the same route already takes for the same outage, and unlike the counter cap above
+// it is not caller-driven — a caller cannot mint anchor-keyed keys. Forwarding instead would
+// run the call with its taint unrecorded, which is the fail-open this commit exists to close.
+//
+// The naming walk is resolved past the forwardability gate, exactly as the redaction fill's
+// thunk is: it walks every capability, and an ENFORCE route's no-match deny — the whole of a
+// deny-all posture's traffic — forwards nothing and so must resolve nothing.
+func (p *ManifestPDP) recordUnmatchedForwardedState(ctx context.Context, req *capability.EnforceRequest, target EnforceTarget, resp *capability.EnforceResponse) *capability.EnforceResponse {
+	_, queryable := p.sequenceAntecedents[target.Name]
+	var sourceLabels []string
+	if p.anyLabelOutput && willForwardDeny(ctx, nil) {
+		sourceLabels = p.labelOutputNamingTarget(target)
+	}
+	if !queryable && len(sourceLabels) == 0 {
+		return nil
+	}
+	// A synthetic source constraint rather than nil, so the engine reads the taint of a call
+	// no constraint governs off the same labelOutput directive shape it reads everywhere else.
+	return recordAuditModeAntecedent(ctx, p.engine, p.engineClock(), req,
+		namingSourceConstraint(target, sourceLabels), queryable, resp)
 }
 
 // recordAuditModeAntecedent records session state when an audit-mode constraint OR a
@@ -1765,16 +1781,17 @@ func containsAction(actions []string, act string) bool {
 }
 
 // constraintWithUnionLabelOutput returns matched augmented so its labelOutput carries the
-// UNION of labelOutput labels across every entry matching this request — so a source read's
+// UNION of labelOutput labels across every entry NAMING this target — so a source read's
 // taint is not dropped when a sibling (a more-specific or principal-scoped entry) lacking
 // labelOutput wins selection over one that has it (mirrors the
-// pinnedTools "enforce off any matching entry" rule). It returns matched UNCHANGED when the
+// pinnedTools "enforce off any matching entry" rule, and see labelOutputNamingTarget for why
+// the selection ignores principal scoping). It returns matched UNCHANGED when the
 // policy declares no labelOutput, when no matching entry adds a label matched lacks, or when
 // matched already asserts the full union — so the common single-source case allocates
 // nothing. Only labelOutput changes; the shallow copy shares matched's conditions, actions,
 // argumentSchema, principal, and every other property, so selection, condition evaluation,
 // the descriptionHash pin, and obligations (which skip labelOutput) are all unaffected.
-func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constraint, target EnforceTarget, claims map[string]interface{}) *capability.Constraint {
+func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constraint, target EnforceTarget) *capability.Constraint {
 	if !p.anyLabelOutput {
 		return matched
 	}
@@ -1789,7 +1806,7 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 	if len(capability.DeclassifyLabelsOf(matched)) > 0 {
 		return matched
 	}
-	union := p.matchingLabelOutputUnion(target, claims)
+	union := p.labelOutputNamingTarget(target)
 	if len(union) == 0 || labelSetContainsAll(labelOutputLabels(matched), union) {
 		return matched
 	}
@@ -2225,8 +2242,12 @@ func (p *ManifestPDP) selectForHardening(ctx context.Context, target EnforceTarg
 // an approval request. The obligations fill is what remains for a refusal that is still
 // forwardable.
 //
-// Nothing here commits: both pin reads are pure lookups against state an earlier tools/list
-// armed, and the ceiling goes through the engine's non-committing CeilingVerdictFor.
+// None of the VERDICT legs commits: both pin reads are pure lookups against state an earlier
+// tools/list armed, and the ceiling goes through the engine's non-committing
+// CeilingVerdictFor. Each produces a refusal that is never forwarded, so committing state for
+// it would attribute a call that never ran. What DOES commit is the tail, and only for a
+// refusal still forwardable past every leg above: that call runs, and this PDP's own decision
+// never did — see recordUnmatchedForwardedState.
 func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow {
 		return r
@@ -2257,7 +2278,23 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, capped := p.hardenOnDelegatedEffectClass(ctx, sessionID, r, target, args, sel); capped {
 		return hardened
 	}
-	return p.withForwardObligations(ctx, r, target, sel.naming, sel.delegation)
+	out := p.withForwardObligations(ctx, r, target, sel.naming, sel.delegation)
+	// The state half of the same forward. The obligations above keep an --audit downgrade from
+	// reaching the host unmasked; without this the same downgrade ran the target and committed
+	// neither its labelOutput taint nor its sequenceBlock antecedent, because the wrapping
+	// layer short-circuited above this PDP and decideTarget never ran — so a later ENFORCED
+	// sink or sequenceBlock read state a forwarded call should have written and failed OPEN.
+	// Turning a JWT on removed a guarantee, the inversion this whole seam exists to prevent,
+	// in the one currency it had not yet been closed in.
+	//
+	// The request is built from the SAME selection the legs above were judged under, so the
+	// state this commits and the verdict it rides on speak about one call. Last, past every
+	// leg: a hard verdict returns above and commits nothing, as it must.
+	if override := p.recordUnmatchedForwardedState(ctx,
+		hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation), target, &out); override != nil {
+		return *override
+	}
+	return out
 }
 
 // EvaluateClaimCondition dispatches through THIS PDP's engine, so an embedder's
@@ -2361,19 +2398,26 @@ func (p *ManifestPDP) directivesNamingTarget(target EnforceTarget) []capability.
 }
 
 // labelOutputNamingTarget collects the union of labelOutput labels declared by every
-// capability whose target type + pattern match target, ignoring principal scoping — the same
-// "what did the manifest declare about this target" question directivesNamingTarget asks for
-// redaction, asked for taint. Used only to commit the source taint of a forwarded no-match
-// deny, where there is no selected constraint to read it off.
+// capability whose target type + pattern match target — the same "what did the manifest
+// declare about this target" question directivesNamingTarget asks for redaction, asked for
+// taint, and the ONE answer both the selected-constraint path and the forwarded no-match
+// path read. Deduplicated in manifest order; nil when nothing names the target.
 //
-// Deliberately wider than matchingLabelOutputUnion, which applies the caller's claims: that
-// one augments a constraint findConstraint ALREADY selected for this caller, so principal
-// scoping has already been satisfied. Here nothing was selected, the call is about to run
-// anyway, and any entry declaring this target a source is reason enough to record its taint.
-// nil when nothing names it.
+// Principal scoping is deliberately NOT applied. labelOutput is a statement about the DATA a
+// target produces, and the target produces the same data whoever calls it — the reason the
+// redaction fill beside it is principal-blind too. Applying the caller's claims here meant a
+// broad sibling that grants the call (a `tool:*` entry with no labelOutput) SHADOWED a
+// principal-scoped source entry for every other principal, so the call was allowed with no
+// taint and a later sink failed OPEN: the same shadowing this union exists to close, with
+// the principal filter as the surviving hole.
+//
+// The cost is stated rather than hidden: a policy differentiating labels per principal on
+// one target now taints every caller with the widest set. That over-blocks, which is the
+// direction every flow token but declassify fails in; differentiate by naming distinct
+// targets, or clear the label with an approved declassify.
 func (p *ManifestPDP) labelOutputNamingTarget(target EnforceTarget) []string {
 	var out []string
-	seen := map[string]struct{}{}
+	var seen map[string]struct{}
 	for i := range p.caps {
 		if pt := p.parsedTargetAt(i); pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
 			continue
@@ -2381,6 +2425,9 @@ func (p *ManifestPDP) labelOutputNamingTarget(target EnforceTarget) []string {
 		for _, l := range labelOutputLabels(&p.caps[i]) {
 			if _, dup := seen[l]; dup {
 				continue
+			}
+			if seen == nil {
+				seen = make(map[string]struct{})
 			}
 			seen[l] = struct{}{}
 			out = append(out, l)
@@ -2400,37 +2447,6 @@ func namingSourceConstraint(target EnforceTarget, labels []string) *capability.C
 		Target:     string(target.Type) + ":" + target.Name,
 		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: labels}},
 	}
-}
-
-// matchingLabelOutputUnion collects the union of labelOutput labels from every capability
-// whose target type + pattern match target AND whose principal scoping the caller's claims
-// satisfy — the same "applies to this request" test findConstraint uses, minus the
-// specificity/action tie-break, because ANY matching source entry's taint applies. Order is
-// unspecified (the engine reorders into the canonical vocabulary). nil when nothing matches.
-func (p *ManifestPDP) matchingLabelOutputUnion(target EnforceTarget, claims map[string]interface{}) []string {
-	var set map[string]struct{}
-	for i := range p.caps {
-		if pt := p.parsedTargetAt(i); pt.parseErr || pt.typ != target.Type || !matchBare(pt.bare, target.Name) {
-			continue
-		}
-		if !p.caps[i].PrincipalMatches(claims) {
-			continue
-		}
-		for _, l := range labelOutputLabels(&p.caps[i]) {
-			if set == nil {
-				set = make(map[string]struct{})
-			}
-			set[l] = struct{}{}
-		}
-	}
-	if len(set) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(set))
-	for l := range set {
-		out = append(out, l)
-	}
-	return out
 }
 
 // labelOutputLabels returns the flow labels a constraint's labelOutput directives assert
