@@ -1267,7 +1267,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			audit:            p.audit,
 			sessionID:        p.sessionID,
 			upstreamTimeMs:   p.upstreamTimeMs,
-			callUpstream:     withResultShape(p.callUpstream),
+			callUpstream:     withResultShape(p.audit, p.callUpstream),
 			strictAuditState: p.strictAudit(),
 			limits:           p.refusalLimits(),
 		},

@@ -54,7 +54,7 @@ func TestResultShape_SweepEveryResultBearingMethod(t *testing.T) {
 			// A bare upstream result: exactly what a server that predates the member sends, and
 			// what the supply half exists for.
 			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{"content":[]}`)}
-			got, err := applyResultShape(capability.Revision20260728, method, resp)
+			got, err := applyResultShape(capability.Revision20260728, method, false, resp)
 			if err != nil {
 				t.Fatalf("applyResultShape: %v", err)
 			}
@@ -84,7 +84,7 @@ func TestResultShape_SweepEveryResultBearingMethod(t *testing.T) {
 			t.Parallel()
 			body := json.RawMessage(`{"content":[],"tools":[]}`)
 			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: body}
-			got, err := applyResultShape(capability.Revision20251125, method, resp)
+			got, err := applyResultShape(capability.Revision20251125, method, false, resp)
 			if err != nil {
 				t.Fatalf("applyResultShape: %v", err)
 			}
@@ -102,7 +102,7 @@ func TestResultShape_ConformingResultIsNotRewritten(t *testing.T) {
 	t.Parallel()
 	body := json.RawMessage(`{"tools":[],"resultType":"complete","cacheScope":"private","ttlMs":60000,"x":"<&>"}`)
 	resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: body}
-	got, err := applyResultShape(capability.Revision20260728, capability.MethodToolsList, resp)
+	got, err := applyResultShape(capability.Revision20260728, capability.MethodToolsList, false, resp)
 	if err != nil {
 		t.Fatalf("applyResultShape: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestResultShape_ResultTypeOpenUnion(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(tc.result)}
-			got, err := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, resp)
+			got, err := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, false, resp)
 			switch {
 			case tc.wantRefus && err == nil:
 				t.Fatalf("a result this build cannot enforce was forwarded: %s", got.Result)
@@ -158,6 +158,171 @@ func TestResultShape_ResultTypeOpenUnion(t *testing.T) {
 	}
 }
 
+// A duplicate-key guard that reaches every nesting depth is right for host params forwarded
+// verbatim into a struct-binding upstream, and WRONG for a result body eunox reads two members
+// out of and hands to a host. A conforming upstream carrying two legal case-variant siblings in
+// its OWN payload was hard-refused after the tool had already run — a proxy turning itself into
+// a compatibility hazard over a differential it does not have.
+func TestResultShape_NestedCaseVariantSiblingsAreTheUpstreamsBusiness(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"content":[],"structuredContent":{"id":1,"ID":2}}`,
+		`{"content":[{"type":"text","text":"x"}],"meta":{"a":{"Key":1,"key":2}}}`,
+		`{"tools":[{"name":"t","annotations":{"Title":"a","title":"b"}}]}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(body)}
+			got, err := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, false, resp)
+			if err != nil {
+				t.Fatalf("a legal nested sibling pair was refused: %v", err)
+			}
+			// The upstream's own payload must survive intact, not merely be accepted.
+			if !strings.Contains(string(got.Result), strings.TrimPrefix(body, "{")[:20]) {
+				t.Errorf("result = %s, want the upstream's own bytes preserved", got.Result)
+			}
+		})
+	}
+}
+
+// The differential eunox DOES have is at the top level, in the two members it reads and writes:
+// an upstream sending both spellings shows this proxy one variant and a case-insensitive host
+// another.
+func TestResultShape_TopLevelDuplicateOfAReadMemberIsRefused(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"resultType":"complete","ResultType":"input_required"}`,
+		`{"cacheScope":"private","CacheScope":"public","tools":[]}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(body)}
+			if _, err := applyResultShape(capability.Revision20260728, capability.MethodToolsList, false, resp); !errors.Is(err, errUnenforceableResultShape) {
+				t.Errorf("err = %v, want a refusal: the two spellings could be read differently by this proxy and the host", err)
+			}
+		})
+	}
+}
+
+// The host-facing reason must not be sizeable by an upstream. It reached the strict decoder's
+// error, which quotes the offending member NAME verbatim, so a 4 KiB key produced a 4 KiB
+// reason — contradicting upstreamErrInfo's contract that the reason never embeds the underlying
+// error text.
+func TestResultShape_RefusalReasonIsNotSizeableByTheUpstream(t *testing.T) {
+	t.Parallel()
+	huge := strings.Repeat("k", 4096)
+	for _, body := range []string{
+		`{"` + huge + `":1,"` + huge + `":2}`,
+		`{"resultType":"` + huge + `"}`,
+		`{"` + huge + `":[1,2,3]}`,
+	} {
+		resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(body)}
+		_, err := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, false, resp)
+		if err == nil {
+			continue // nothing refused, nothing reflected
+		}
+		_, reason, _ := upstreamErrInfo(noticeWriter{}, err, 0)
+		if len(reason) > 1024 {
+			t.Errorf("host-facing reason is %d bytes for a %d-byte upstream member; an upstream must not size it",
+				len(reason), len(huge))
+		}
+		if strings.Contains(reason, huge) {
+			t.Error("the reason quoted the upstream's member verbatim")
+		}
+	}
+}
+
+// The `--audit` wiretap forwards the upstream's WHOLE catalog, identical for every caller, so
+// nothing about the response depended on who asked and an upstream `public` is a true statement
+// about it. pdp.passThroughList, the conformance table and threat-model L-6 all say so; the
+// supply half must not contradict them by stamping `private` where the upstream said nothing.
+func TestResultShape_WiretapCatalogKeepsItsCacheScope(t *testing.T) {
+	t.Parallel()
+	bare := json.RawMessage(`{"tools":[{"name":"t"}]}`)
+	resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: bare}
+
+	observed, err := applyResultShape(capability.Revision20260728, capability.MethodToolsList, true, resp)
+	if err != nil {
+		t.Fatalf("applyResultShape: %v", err)
+	}
+	if strings.Contains(string(observed.Result), capability.ResultKeyCacheScope) {
+		t.Errorf("result = %s, want no cacheScope: the wiretap catalog is identical for every caller", observed.Result)
+	}
+	// resultType is NOT exempt: it describes the exchange, not who the response was for, and a
+	// peer on this revision requires it either way.
+	if !strings.Contains(string(observed.Result), capability.ResultTypeComplete) {
+		t.Errorf("result = %s, want resultType even under the wiretap", observed.Result)
+	}
+
+	enforcing, err := applyResultShape(capability.Revision20260728, capability.MethodToolsList, false, resp)
+	if err != nil {
+		t.Fatalf("applyResultShape: %v", err)
+	}
+	if !strings.Contains(string(enforcing.Result), capability.CacheScopePrivate) {
+		t.Errorf("result = %s, want cacheScope private on an ENFORCING route", enforcing.Result)
+	}
+}
+
+// The upstream's own bytes must survive verbatim through a supply — member order, whitespace
+// and escaping included. Splicing in front of them is what buys that; a decode-and-re-marshal
+// reorders members and re-escapes strings on every call.
+func TestResultShape_SupplyPreservesTheUpstreamsOwnBytes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, body, want string
+	}{
+		{"members are spliced in front, body untouched",
+			`{"zebra":1,"alpha":"<&>","nested":{"b":2,"a":1}}`,
+			`{"resultType":"complete","zebra":1,"alpha":"<&>","nested":{"b":2,"a":1}}`},
+		{"an empty object needs no separating comma", `{}`, `{"resultType":"complete"}`},
+		{"whitespace the upstream chose is preserved", `{ "a" : 1 }`, `{"resultType":"complete", "a" : 1 }`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(tc.body)}
+			got, err := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, false, resp)
+			if err != nil {
+				t.Fatalf("applyResultShape: %v", err)
+			}
+			if string(got.Result) != tc.want {
+				t.Errorf("result =\n %s\nwant %s", got.Result, tc.want)
+			}
+		})
+	}
+}
+
+// A member present as an explicit null is absent by this package's reading, so it is
+// OVERWRITTEN rather than having a second copy spliced in front of it — which would leave the
+// body carrying the member twice and a last-wins host reading the null.
+func TestResultShape_NullVariantIsReplacedNotDuplicated(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"resultType":null,"a":1}`,
+		`{"a":1,"resultType":null}`,
+		`{ "resultType" : null }`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			t.Parallel()
+			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(body)}
+			got, err := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, false, resp)
+			if err != nil {
+				t.Fatalf("applyResultShape: %v", err)
+			}
+			if n := strings.Count(string(got.Result), capability.ResultKeyResultType); n != 1 {
+				t.Errorf("result = %s carries the member %d times, want exactly 1", got.Result, n)
+			}
+			if strings.Contains(string(got.Result), "null") {
+				t.Errorf("result = %s still carries the null the revision does not define", got.Result)
+			}
+			// Re-readable and terminal, which is the point of overwriting it at all.
+			if decodeResultFields(t, got)["resultType"] != capability.ResultTypeComplete {
+				t.Errorf("result = %s, want the terminal variant", got.Result)
+			}
+		})
+	}
+}
+
 // An upstream must not be able to size or style the operator's console through a member eunox
 // quotes back at it.
 func TestResultShape_ReflectedVariantIsBounded(t *testing.T) {
@@ -170,7 +335,7 @@ func TestResultShape_ReflectedVariantIsBounded(t *testing.T) {
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`),
 		Result: json.RawMessage(`{"resultType":` + string(hostile) + `}`),
 	}
-	_, shapeErr := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, resp)
+	_, shapeErr := applyResultShape(capability.Revision20260728, capability.MethodToolsCall, false, resp)
 	if shapeErr == nil {
 		t.Fatal("a hostile variant was forwarded")
 	}
@@ -212,7 +377,7 @@ func TestWithResultShape(t *testing.T) {
 		// nil is a MODE both the forward core and dispatchList read; wrapping it into a non-nil
 		// func that fails on use turns a fail-closed refusal naming the wiring fault into an
 		// upstream error naming nothing.
-		if got := withResultShape(nil); got != nil {
+		if got := withResultShape(false, nil); got != nil {
 			t.Error("a nil upstream call was wrapped; the absent-upstream mode must survive")
 		}
 	})
@@ -220,7 +385,7 @@ func TestWithResultShape(t *testing.T) {
 	t.Run("the upstream's own error is relayed unchanged", func(t *testing.T) {
 		t.Parallel()
 		sentinel := errors.New("upstream is down")
-		call := withResultShape(func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+		call := withResultShape(false, func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 			return mcp.RPCMsg{}, sentinel
 		})
 		ctx := capability.WithProtocolRevision(context.Background(), capability.Revision20260728)
@@ -239,7 +404,7 @@ func TestWithResultShape(t *testing.T) {
 		// result on a context that negotiated nothing is left alone rather than gaining members
 		// for a revision nobody chose.
 		body := json.RawMessage(`{"content":[]}`)
-		call := withResultShape(func(_ context.Context, m mcp.RPCMsg) (mcp.RPCMsg, error) {
+		call := withResultShape(false, func(_ context.Context, m mcp.RPCMsg) (mcp.RPCMsg, error) {
 			return mcp.RPCMsg{JSONRPC: "2.0", ID: m.ID, Result: body}, nil
 		})
 		got, err := call(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall})

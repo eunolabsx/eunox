@@ -44,10 +44,12 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -66,47 +68,185 @@ var errUnenforceableResultShape = errors.New("upstream result carries a variant 
 // result rev makes eunox responsible for enforcing and eunox cannot.
 //
 // method selects the members that apply: only the list-shaped results carry cache directives.
-func applyResultShape(rev capability.Revision, method string, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
+// observe marks the `--audit` wiretap posture, which exempts the cache scope (see
+// supplyCacheScope).
+//
+// # Why this reads the body itself rather than decoding it
+//
+// The obvious implementation — decode to a map, add what is missing, re-marshal — is wrong
+// twice over, and both were live before this comment existed.
+//
+// It over-refuses. eunox's strict decoder rejects fold-equal duplicate keys at EVERY nesting
+// depth, which is right for host params forwarded verbatim into a struct-binding upstream and
+// wrong here: a conforming upstream answering `{"structuredContent":{"id":1,"ID":2}}` is
+// carrying two legal sibling fields in ITS OWN payload, and hard-refusing that after the tool
+// has already run turns a proxy into a compatibility hazard. The differential eunox actually
+// has to care about is at the TOP level, in the two members it reads and writes — so that is
+// where the duplicate check sits, and nothing below it is eunox's business.
+//
+// And it rewrites payloads gratuitously. Re-marshalling reorders members, re-escapes strings
+// and costs a full walk of a body that may be megabytes, on every call, for the sake of one
+// short member. Splicing the member in front of the upstream's own bytes preserves them
+// exactly and costs one copy.
+func applyResultShape(rev capability.Revision, method string, observe bool, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 	// A revision that does not define these members gets a byte-identical reply. See the file
 	// comment: supplying them would be inventing wire content for a peer that cannot read it.
 	if !declaresPerRequestRevision(rev) || len(resp.Result) == 0 {
 		return resp, nil
 	}
-	fields := map[string]json.RawMessage{}
-	if err := mcp.DecodeParams(resp.Result, &fields); err != nil {
-		// Fails closed on the two shapes a plain Unmarshal reads as successes: a duplicate key
-		// (which mcp.DecodeParams refuses, where last-wins would let an upstream show eunox one
-		// `resultType` and its host another) and anything that is not an object.
-		return mcp.RPCMsg{}, fmt.Errorf("%w: the %s result is not a readable JSON object: %w",
-			errUnenforceableResultShape, method, err)
+	members, err := scanResultMembers(resp.Result)
+	if err != nil {
+		return mcp.RPCMsg{}, fmt.Errorf("%w: the %s result %s", errUnenforceableResultShape, method, err)
 	}
-	// A JSON `null` result decodes into a NIL map with no error. Refused rather than replaced
-	// with an object: manufacturing a result shape around a value the upstream sent as null
-	// invents content, which is the half of this file's rule that does not apply to it.
-	if fields == nil {
-		return mcp.RPCMsg{}, fmt.Errorf("%w: the %s result is JSON null, which has no place to carry the members %s requires",
-			errUnenforceableResultShape, method, rev)
-	}
-	if err := checkResultTypeEnforceable(rev, method, fields); err != nil {
+	if err := checkResultTypeEnforceable(rev, method, members); err != nil {
 		return mcp.RPCMsg{}, err
 	}
-	changed := supplyResultType(fields)
-	if listShapedResult(method) && supplyCacheScope(fields) {
-		changed = true
+	body := resp.Result
+	var add []string
+	// Three cases for the variant, and the middle one is the reason this is not a bare
+	// "is the key there" test: a member present as an explicit JSON null is ABSENT by this
+	// package's reading, but its bytes are still on the wire, so it is OVERWRITTEN where it
+	// sits. Splicing a second copy in front of it would leave the body carrying the member
+	// twice, with a last-wins host reading the null. The overwrite shifts nothing before
+	// bodyStart, so the splice below still works on unchanged offsets.
+	switch _, stated, _ := members.resultType(); {
+	case stated:
+		// The upstream said something this build models; its bytes stand.
+	case members.resultTypePresent:
+		body = replaceRange(body, members.resultTypeAt, `"`+capability.ResultTypeComplete+`"`)
+	default:
+		add = append(add, memberLiteral(capability.ResultKeyResultType, capability.ResultTypeComplete))
 	}
-	if !changed {
-		// The upstream already conforms. Return its own bytes rather than a re-encoding of
-		// them: re-marshalling reorders members and re-escapes strings, and a proxy that
-		// rewrites a conforming payload for no gain is a proxy whose output a peer cannot
-		// diff against its upstream's.
+	if supplyCacheScope(method, observe, members) {
+		add = append(add, memberLiteral(capability.ResultKeyCacheScope, capability.CacheScopePrivate))
+	}
+	if len(add) == 0 {
+		// Either the upstream already conformed — its own bytes go on untouched — or the only
+		// change was the null overwrite above.
+		resp.Result = body
 		return resp, nil
 	}
-	encoded, err := json.Marshal(fields)
-	if err != nil {
-		return mcp.RPCMsg{}, fmt.Errorf("%w: re-encoding the %s result: %w", errUnenforceableResultShape, method, err)
-	}
-	resp.Result = encoded
+	resp.Result = spliceMembers(body, members, add)
 	return resp, nil
+}
+
+// replaceRange returns body with the half-open byte range at replaced by value, leaving every
+// other byte of the upstream's payload exactly as it arrived.
+func replaceRange(body json.RawMessage, at [2]int, value string) json.RawMessage {
+	out := make([]byte, 0, len(body)-(at[1]-at[0])+len(value))
+	out = append(out, body[:at[0]]...)
+	out = append(out, value...)
+	return append(out, body[at[1]:]...)
+}
+
+// resultMembers is what one top-level pass over a result body establishes: whether each member
+// eunox reads or writes is present, what `resultType` says, and where the upstream's own
+// members begin so a splice can go in front of them.
+type resultMembers struct {
+	resultTypePresent bool
+	// resultTypeRaw is the member's value bytes, empty when absent, and resultTypeAt is the
+	// half-open byte range those bytes occupy in the original body — so a member present with a
+	// value the revision does not define (a JSON null) can be REPLACED in place rather than
+	// having a second copy spliced in front of it, which would leave the body carrying the
+	// member twice and a last-wins host reading the null.
+	resultTypeRaw     json.RawMessage
+	resultTypeAt      [2]int
+	cacheScopePresent bool
+	// bodyStart indexes the byte after the opening brace; empty reports an object with no
+	// members, which needs no separating comma when a member is spliced in.
+	bodyStart int
+	empty     bool
+}
+
+// scanResultMembers walks the TOP LEVEL of a result object once, without descending into any
+// value.
+//
+// Duplicates are refused for the two members eunox acts on, in FOLD space — an upstream sending
+// both `resultType` and `ResultType` is showing eunox one variant and a case-insensitive host
+// another, which is the parser differential the strict decoder exists to close. It is checked
+// here rather than by that decoder because the decoder's version reaches every nesting depth,
+// and a duplicate three levels down inside `structuredContent` is the upstream's own payload
+// rather than anything eunox reads.
+//
+// Errors are phrased as sentence fragments that complete "the <method> result …" and NEVER
+// embed the offending key or the decoder's message: an upstream must not be able to size or
+// style a host-facing error through a name it chose.
+func scanResultMembers(result json.RawMessage) (resultMembers, error) {
+	var m resultMembers
+	dec := json.NewDecoder(bytes.NewReader(result))
+	tok, err := dec.Token()
+	if err != nil {
+		return m, errors.New("is not readable JSON")
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return m, errors.New("is not a JSON object")
+	}
+	m.bodyStart = int(dec.InputOffset())
+	m.empty = true
+	// One buffer for every member's value. json.RawMessage's decoder appends into the existing
+	// slice, so after the first member this reuses capacity instead of allocating per member —
+	// which on a catalog with many top-level fields was most of the pass's cost. The one value
+	// that outlives the loop is COPIED out below, since the next member overwrites this.
+	var raw json.RawMessage
+	for dec.More() {
+		m.empty = false
+		keyTok, err := dec.Token()
+		if err != nil {
+			return m, errors.New("has an unreadable member name")
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return m, errors.New("has a non-string member name")
+		}
+		// The value is consumed as RAW bytes: this is what keeps the pass shallow, and what
+		// keeps a legal duplicate inside a nested object out of eunox's way.
+		if err := dec.Decode(&raw); err != nil {
+			return m, errors.New("has an unreadable member value")
+		}
+		// InputOffset lands exactly past the value, and Decode captured exactly the value's
+		// bytes, so the difference is where they start — true regardless of the whitespace the
+		// upstream chose around the colon.
+		end := int(dec.InputOffset())
+		// strings.EqualFold rather than capability.FoldJSONKey: that function's own contract is
+		// that the two agree exactly ("canonicalCaseFold(a) == canonicalCaseFold(b) exactly when
+		// strings.EqualFold(a, b) reports true"), and EqualFold allocates nothing where folding
+		// a key mints a string per member on a path every call takes.
+		switch {
+		case strings.EqualFold(key, capability.ResultKeyResultType):
+			if m.resultTypePresent {
+				return m, errors.New("declares its result variant twice, so this proxy and the host could read different ones")
+			}
+			// Copied, not aliased: the buffer above is reused by the next member.
+			m.resultTypePresent = true
+			m.resultTypeRaw = append(json.RawMessage(nil), raw...)
+			m.resultTypeAt = [2]int{end - len(raw), end}
+		case strings.EqualFold(key, capability.ResultKeyCacheScope):
+			if m.cacheScopePresent {
+				return m, errors.New("declares its cache scope twice, so this proxy and the host could read different ones")
+			}
+			m.cacheScopePresent = true
+		}
+	}
+	return m, nil
+}
+
+// spliceMembers inserts add in front of the upstream's own members, leaving every byte of the
+// original body after the opening brace untouched — no reordering, no re-escaping, one copy.
+func spliceMembers(result json.RawMessage, m resultMembers, add []string) json.RawMessage {
+	joined := strings.Join(add, ",")
+	out := make([]byte, 0, len(result)+len(joined)+1)
+	out = append(out, result[:m.bodyStart]...)
+	out = append(out, joined...)
+	if !m.empty {
+		out = append(out, ',')
+	}
+	return append(out, result[m.bodyStart:]...)
+}
+
+// memberLiteral renders one JSON object member from this build's own closed vocabulary, which
+// is why it needs no escaping and no error return.
+func memberLiteral(key, value string) string {
+	return `"` + key + `":"` + value + `"`
 }
 
 // checkResultTypeEnforceable refuses a result whose `resultType` names a variant eunox does not
@@ -114,12 +254,12 @@ func applyResultShape(rev capability.Revision, method string, resp mcp.RPCMsg) (
 //
 // The refusal is the point of the open union. `input_required` is the variant that exists today
 // and the one that shows why: it means the upstream is WAITING, with `inputRequests` the caller
-// must answer, and forwarding it as though the call had finished desynchronizes the exchange
+// must answer, so forwarding it as though the call had finished desynchronizes the exchange
 // with no error anywhere. eunox has no response-path enforcement for it yet, so it cannot be
 // carried; a variant published after this build has the same property and is refused for the
 // same reason rather than being read as complete.
-func checkResultTypeEnforceable(rev capability.Revision, method string, fields map[string]json.RawMessage) error {
-	variant, present, err := resultTypeOf(fields)
+func checkResultTypeEnforceable(rev capability.Revision, method string, m resultMembers) error {
+	variant, present, err := m.resultType()
 	if err != nil {
 		return fmt.Errorf("%w: the %s result's %s member is not a JSON string",
 			errUnenforceableResultShape, method, capability.ResultKeyResultType)
@@ -132,70 +272,46 @@ func checkResultTypeEnforceable(rev capability.Revision, method string, fields m
 		capability.BoundResultType(variant), rev)
 }
 
-// resultTypeOf reads the `resultType` member, reporting absence for a member that is missing,
-// empty, or an explicit JSON null.
+// resultType decodes the scanned member, reporting absence for a member that is missing or an
+// explicit JSON null.
 //
 // Null reads as ABSENT because that is what every other decoder in this codebase does with it —
 // `"cursor": null` asks for the first page exactly as an omitted key does, and a null protocol
-// declaration inherits its context rather than naming a revision. Treating it as a present
-// value instead would leave the member on the wire as null, which is not a value the revision
-// defines, so the peer would get a result eunox had declared conforming.
-func resultTypeOf(fields map[string]json.RawMessage) (variant string, present bool, err error) {
-	raw, ok := fields[capability.ResultKeyResultType]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
+// declaration inherits its context. Treating it as a present value instead would leave the
+// member on the wire as null, which is not a value the revision defines, so the peer would get
+// a result eunox had declared conforming.
+func (m resultMembers) resultType() (variant string, present bool, err error) {
+	if !m.resultTypePresent || len(m.resultTypeRaw) == 0 || string(m.resultTypeRaw) == "null" {
 		return "", false, nil
 	}
-	if err := json.Unmarshal(raw, &variant); err != nil {
+	if err := json.Unmarshal(m.resultTypeRaw, &variant); err != nil {
 		return "", false, err
 	}
 	return variant, true, nil
 }
 
-// supplyResultType adds the terminal variant where the upstream omitted it, reporting whether
-// it changed anything.
-//
-// `complete` is the honest value and the only one available: a reply that reached here is one
-// eunox is about to hand the host, and any variant meaning otherwise was refused above.
-func supplyResultType(fields map[string]json.RawMessage) bool {
-	if _, present, _ := resultTypeOf(fields); present {
-		return false
-	}
-	// Through resultTypeOf, not a bare key probe: a member present as JSON null is ABSENT by
-	// this package's reading, and a key probe would leave that null on the wire — a value the
-	// revision does not define, in a result eunox had just declared conforming. The error is
-	// discarded because an unreadable member was already refused above; reaching here means it
-	// is absent or a string.
-	fields[capability.ResultKeyResultType] = jsonStringConst(capability.ResultTypeComplete)
-	return true
-}
-
-// supplyCacheScope adds `private` to a list result that carries no scope, reporting whether it
-// changed anything.
+// supplyCacheScope reports whether `private` should be added to this result.
 //
 // This is the SET half of the clamp in internal/pdp, which narrows a scope an upstream DID
 // state. The two are split because they need different things: the clamp needs the one encoder
 // every filter path reaches, and this needs the revision — which the filter layer does not
-// hold. Together they are the whole property: every list eunox emits to a peer on a revision
-// that defines the member says `private`, whether the upstream over-shared, under-shared, or
-// said nothing.
+// hold. Together they are the whole property: every list eunox FILTERS says `private`, whether
+// the upstream over-shared, under-shared, or said nothing.
 //
 // `private` because eunox filters every list it emits per caller identity, so the entries are
 // the ones THIS caller may see. `ttlMs` is deliberately not supplied: it is a freshness hint the
 // upstream did not offer, and inventing a lifetime for someone else's data is the fabrication
 // the supply half of this file's rule stops short of.
-func supplyCacheScope(fields map[string]json.RawMessage) bool {
-	if _, present := fields[capability.ResultKeyCacheScope]; present {
-		return false
-	}
-	fields[capability.ResultKeyCacheScope] = jsonStringConst(capability.CacheScopePrivate)
-	return true
-}
-
-// jsonStringConst encodes a build-time constant as a JSON string. Only ever called with values
-// from this build's own closed vocabulary, which is why it can skip the error return every
-// general-purpose encoder needs.
-func jsonStringConst(value string) json.RawMessage {
-	return json.RawMessage(`"` + value + `"`)
+//
+// The `--audit` wiretap is EXEMPT, matching pdp.passThroughList: that posture forwards the
+// upstream's whole catalog, identical for every caller, so nothing about the response depended
+// on who asked and there is no narrowed view for a shared cache to leak. Stamping `private`
+// there would contradict the exemption the clamp, the conformance table and threat-model L-6 all
+// state — and it is a claim about the response that would not be true. `resultType` is NOT
+// exempt: it describes the exchange, not who the response was for, and a peer on this revision
+// requires it either way.
+func supplyCacheScope(method string, observe bool, m resultMembers) bool {
+	return listShapedResult(method) && !observe && !m.cacheScopePresent
 }
 
 // listShapedResult reports whether method's result carries the cache directives 2026-07-28
@@ -209,7 +325,17 @@ func listShapedResult(method string) bool {
 
 // withResultShape wraps a leg's upstream call so every result a host receives crosses the shape
 // rules once. See the file comment for why this is the seam.
-func withResultShape(inner func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)) func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+//
+// observe is the leg's `--audit` posture, which the wrapper must be TOLD: it sits at the
+// upstream call, below the dispatcher that knows it, and the one member the wiretap exempts
+// would otherwise be stamped onto a catalog that is identical for every caller.
+//
+// Built per message rather than hoisted onto the session, deliberately. Hoisting would save a
+// closure — tens of bytes against the ~2 KB the shape pass itself moves on the same call — at
+// the cost of the source guard that keeps every construction site wrapped, which would have to
+// start reasoning about a stored field's provenance instead of a call it can see. The
+// invariant is worth more than the allocation.
+func withResultShape(observe bool, inner func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)) func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 	if inner == nil {
 		// nil is a MODE the forward core and dispatchList both read (a leg with no upstream), so
 		// it must survive wrapping rather than becoming a non-nil func that fails on use.
@@ -220,6 +346,6 @@ func withResultShape(inner func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)
 		if err != nil {
 			return resp, err
 		}
-		return applyResultShape(requestRevision(ctx), msg.Method, resp)
+		return applyResultShape(requestRevision(ctx), msg.Method, observe, resp)
 	}
 }
