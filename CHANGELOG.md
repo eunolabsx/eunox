@@ -1453,6 +1453,37 @@ Section conventions:
 
 ### Fixed
 
+- **Three invocations the stated contract calls incoherent are refused rather than resolved
+  silently.** `/control/kill` got its trailing-token refusal precisely so the kill EXECUTED
+  cannot differ from the one a reviewer of the body reads, but that guard sees only a
+  smuggled second JSON *value*. One valid object could express the same half-described kill
+  three ways — naming both `sessionId` and `"all":true` (the handler ran the `all` arm and
+  discarded the session id), repeating `sessionId` after `"all":true` (`encoding/json` keeps
+  the LAST duplicate and matches names case-insensitively, so `SESSIONID` did it too), or
+  misspelling it as `session_id` (dropped in silence). All three read to a human as a
+  targeted kill and executed a deployment-wide stop, with the signed activation record naming
+  a scope the body only half-describes. Fail-safe in blast radius, but each resolves the
+  ambiguity by a rule no reviewer of the body can see, which is exactly what the
+  trailing-token guard exists to deny. The endpoint's body is now decoded as a CLOSED schema:
+  ambiguous member names are refused through the same primitive the reviewed-document loaders
+  use, unmodelled members are refused, and the field pair is refused — all `400`, all before
+  the kill. `/mcp`'s JSON-RPC envelope stays open, since MCP may carry members this build does
+  not model and those bytes are forwarded verbatim. Separately, `eunox init` and
+  `eunox suggest` accepted `--force` with no `--output`, where it names no file to overwrite
+  and does nothing; the binary-wide rule, enforced everywhere else, is that an unpaired flag
+  is rejected rather than left inert, so an operator who believed they had named an output
+  file got the manifest on stdout with nothing saying otherwise. Both now exit 2, before the
+  live introspection and before the tape read respectively, and `--force`'s own help states
+  the requirement.
+
+- **Three exit-code and flag-help contracts corrected to what the code does.** `suggest`'s
+  usage block and its exit-code constant both documented exit 1 for a failed `--output`
+  write while every failure path returns 2 (and a test pinned 2), so the one code a script
+  could branch on was unreachable — worse than an undocumented one, because it reads as
+  deliberate. `validate --upstream-protocol-version` help said "Ignored under `--config`"
+  where the combination is in fact refused with exit 2. `openAuditChain`'s doc named exit 1
+  where both callers exit with their own usage code.
+
 - **The effect ceiling's `onExceed: deny` arm is as hard as its `escalate` arm.** The escalate
   arm is built non-downgradable so a route running `--audit` cannot turn "needs human approval"
   into "performed anyway, logged"; the deny arm carried a plain `CONDITION_FAILED`, which is a

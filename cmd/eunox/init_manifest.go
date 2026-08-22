@@ -377,7 +377,7 @@ Flags:
 	upstreamURL := fs.String("upstream-url", "", "Base URL of the MCP HTTP server (required with --transport http).")
 	output := fs.String("output", "", "Path to write the generated manifest YAML (default: stdout).")
 	configOutput := fs.String("config-output", "", "Also write a runnable eunox config to this path that fronts the introspected\nupstream and enforces the generated manifest. Requires --output (the config references it).")
-	force := fs.Bool("force", false, "Overwrite --output / --config-output if they already exist (default: refuse to\nclobber). An overwrite also re-tightens the file mode to 0600.")
+	force := fs.Bool("force", false, "Overwrite --output / --config-output if they already exist (default: refuse to\nclobber). An overwrite also re-tightens the file mode to 0600. Requires --output\n(there is no file to overwrite when the manifest goes to stdout).")
 	name := fs.String("name", "generated-manifest", "Value for the manifest name field.")
 	authHeader := fs.String("upstream-auth-header", "", `Header forwarded to the HTTP upstream in "Name: Value" format.`)
 	protocolVersion := fs.String("upstream-protocol-version", "", "MCP protocol revision to open the upstream leg at, which selects the opener:\n\"auto\" (the default) opens with the `initialize` handshake, or name a revision.\nThe same key an eunox config sets per upstream — pass it so `init` introspects\nthe upstream the way `eunox proxy` would open it.")

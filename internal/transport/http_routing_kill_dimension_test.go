@@ -82,3 +82,65 @@ func TestHandleKill_RejectsSessionIDWithAll(t *testing.T) {
 		t.Error("an incoherent body must not activate the global kill switch")
 	}
 }
+
+// TestHandleKill_RejectsSmuggledSessionIDInsideOneObject covers the two shapes that express
+// the half-described kill INSIDE one valid JSON object, which the post-decode field guard
+// alone cannot see: it reads values encoding/json has already resolved. A duplicate member
+// is kept last-wins and an unmodelled one is dropped, so both bodies read to a human as a
+// targeted kill and reach the guard as a bare {"all":true}.
+func TestHandleKill_RejectsSmuggledSessionIDInsideOneObject(t *testing.T) {
+	t.Parallel()
+	for name, body := range map[string]string{
+		// Last duplicate wins, so SessionID decodes empty and All survives.
+		"duplicate sessionId": `{"sessionId":"s1","all":true,"sessionId":""}`,
+		// Case-insensitive member matching: the second spelling is the one that binds.
+		"case-variant sessionId": `{"sessionId":"s1","all":true,"SESSIONID":""}`,
+		// Unmodelled member, silently dropped without DisallowUnknownFields.
+		"misspelled sessionId": `{"session_id":"s1","all":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken})
+			req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", CTJSON)
+			req.Header.Set(ControlTokenHeader, testControlToken)
+			req.RemoteAddr = "127.0.0.1:9999"
+			req.Host = "127.0.0.1:9999"
+			rr := httptest.NewRecorder()
+			proxy.handleKill(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400 (body=%q)", rr.Code, rr.Body.String())
+			}
+			if status := killStatusForTest(t, proxy); status.GlobalActive {
+				t.Error("a body a reviewer reads as a targeted kill must not activate the global switch")
+			}
+		})
+	}
+}
+
+// TestHandleKill_AcceptsTheTwoCoherentBodies is the other side of the closed-schema guard:
+// tightening the decode must not have narrowed the two bodies the endpoint exists to serve.
+func TestHandleKill_AcceptsTheTwoCoherentBodies(t *testing.T) {
+	t.Parallel()
+	for name, body := range map[string]string{
+		"global":   `{"all":true}`,
+		"targeted": `{"sessionId":"s1"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken})
+			req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", CTJSON)
+			req.Header.Set(ControlTokenHeader, testControlToken)
+			req.RemoteAddr = "127.0.0.1:9999"
+			req.Host = "127.0.0.1:9999"
+			rr := httptest.NewRecorder()
+			proxy.handleKill(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200 (body=%q)", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}

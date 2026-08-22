@@ -634,7 +634,7 @@ Flags:
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	name := fs.String("name", "suggested-manifest", "Value for the manifest name field.")
 	output := fs.String("output", "", "Path to write the draft manifest (default: stdout).")
-	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
+	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600. Requires --output (there is no\nfile to overwrite when the draft goes to stdout).")
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
 	logPath, code, done := parseAndResolveAuditLog("suggest", fs, args, configPath, auditLogPath, nil, suggestUsageExit)
