@@ -28,6 +28,7 @@ import (
 	"go/ast"
 	"io/fs"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -74,7 +75,20 @@ type healthSeamImpl struct {
 	// reaches fold through ONE interface, rather than through whichever pattern its author read
 	// first — the JWT layer answers with a sample and the kill switch answers live, and both had
 	// to be reachable from the same call.
+	//
+	// It is checked against name and kind before it is exercised: a row naming one implementation
+	// while holding another's value satisfies both halves of the source guard below — the name is
+	// what that guard compares — while the implementation it names is never folded at all, which
+	// is the one way the table can be complete and still test nothing.
 	unfilled healthReporter
+	// unconstructible is the stated reason this package cannot hold that value, for an
+	// implementation in a package it may not import: package main, or one importing this
+	// transport. The row is still REQUIRED — the guard below is what makes that so — because the
+	// alternative reading of an unimportable implementation is a test that fails with nothing its
+	// author can do about it, which ends as an exclusion in the walk and takes every future
+	// implementation in that package with it. What is given up is the fold assertion for that one
+	// row, written down here rather than inferred from a missing value.
+	unconstructible string
 }
 
 func healthSeamImpls() []healthSeamImpl {
@@ -97,6 +111,19 @@ func TestHealthSeam_UnfilledReporterNeverReportsGreen(t *testing.T) {
 	for _, impl := range healthSeamImpls() {
 		t.Run(impl.name, func(t *testing.T) {
 			t.Parallel()
+			// The INTERFACE, compared directly: testify's nil predicates unwrap a typed nil, which
+			// is exactly what a live row is required to hold.
+			if impl.unconstructible != "" {
+				require.True(t, impl.unfilled == nil, "a row that states it cannot be constructed must not also hold a value")
+				t.Skipf("not folded here: %s", impl.unconstructible)
+			}
+			require.False(t, impl.unfilled == nil, "a row must hold the value it is about, or state why it cannot")
+			name, isPointer := healthSeamValueName(impl.unfilled)
+			require.Equal(t, impl.name, name,
+				"the row must hold the implementation it NAMES: the source guard compares names, so a copy-pasted value leaves the named implementation folded by nothing")
+			require.Equal(t, impl.kind == seamLive, isPointer,
+				"a live row holds the nil POINTER and a sample row the zero struct; the kind decides which half of fold is under test")
+
 			snap := healthSnapshot{Status: statusOK}
 			healthy := true
 			require.NotPanics(t, func() { snap.fold(impl.unfilled, &healthy) },
@@ -114,10 +141,14 @@ func TestHealthSeam_UnfilledReporterNeverReportsGreen(t *testing.T) {
 	}
 }
 
-// healthSeamGuardedDirs is every package directory in this module. The guard fails OPEN — a
-// package it does not parse contributes no implementations and the table still balances — so the
-// walk is over the whole module rather than over the three packages that happen to answer the seam
-// today, which is the list that would have gone stale first.
+// healthSeamGuardedDirs is every package directory in this module — the whole module rather than
+// the three packages that answer the seam today, which is the list that would have gone stale
+// first.
+//
+// A package the walk never reaches contributes no implementations, so an UNDECLARED one there goes
+// unchecked; that is the guard's one open edge, and it is why the walk is not narrowed. Its own
+// gaps are loud rather than open: a parse error is fatal in packageSourcesIn, and a package holding
+// a DECLARED implementation that went unparsed fails the table's equality.
 func healthSeamGuardedDirs(t *testing.T) []string {
 	t.Helper()
 	const moduleRoot = "../.."
@@ -201,6 +232,18 @@ func isHealthVerdictSignature(fn *ast.FuncType) bool {
 	}
 	id, ok := fn.Results.List[0].Type.(*ast.Ident)
 	return ok && id.Name == "error"
+}
+
+// healthSeamValueName names the dynamic type of a row's unfilled value in the guard's own spelling
+// ("<package>.<Type>"), and reports whether the row holds a pointer. reflect's own rendering IS
+// that spelling — the package's short name, the same one the receiver walk reads off the package
+// clause — so the two sides cannot disagree about how a type is written down.
+func healthSeamValueName(v healthReporter) (name string, isPointer bool) {
+	t := reflect.TypeOf(v)
+	if t.Kind() == reflect.Pointer {
+		return t.Elem().String(), true
+	}
+	return t.String(), false
 }
 
 // healthSeamReceiver names fn's receiver as "<pkg>.<Type>" and reports whether it is a pointer.
