@@ -27,6 +27,32 @@ Section conventions:
 
 ### Added
 
+- **The 2026-07-28 result shape: supplied where eunox can, refused where it cannot.** A result
+  eunox hands a peer on that revision now carries `resultType` — the upstream's own value where
+  it sent one, `"complete"` where it did not — and a list result carries `cacheScope: "private"`
+  where the upstream omitted it. That last is the SET half of the clamp that shipped earlier;
+  the two are split because they need different things (the clamp needs the one encoder every
+  filter path reaches, the supply needs the revision the filter layer does not hold), and
+  together they cover every list eunox emits to such a peer, whether the upstream over-shared,
+  under-shared, or said nothing. `ttlMs` is never invented — a freshness hint the upstream did
+  not offer is not one eunox can supply.
+
+  The other half is a refusal. `resultType` is an OPEN union, so a value that is present and is
+  neither `complete` nor a variant this build models is refused before it reaches the host,
+  recorded `ENFORCEMENT_ERROR` and answered `-32603`. `input_required` is the variant that shows
+  why: it means the upstream is still WAITING, with `inputRequests` the caller must answer, so
+  forwarding it as though the call had finished desynchronizes the exchange with no error at
+  either end — and eunox cannot enforce a result shape it does not model. Absence reads as
+  complete (the spec's rule for servers predating the member, and the shape every 2025-11-25
+  upstream produces), and an explicit JSON null reads as absent, matching every other decoder in
+  this build. Threat model L-9.
+
+  Applied at the upstream call — the one seam both the enforced forward core and the `*/list`
+  dispatcher cross — so no forward path has to remember it, and so a refusal is recorded as a
+  refusal rather than as an allow followed by a contradiction. A 2025-11-25 peer's results are
+  untouched, structurally: the first branch returns before reading anything, because these are
+  members its revision does not define.
+
 - **`--protocol-version` on both demo mocks, and a stateless demo walkthrough.**
   `demo/mock-mcp-server` and `demo/mock-mcp-server-stdio` each take the revision they serve
   (`2025-11-25` or `2026-07-28`) and answer the other revision's opener `-32601`, so the

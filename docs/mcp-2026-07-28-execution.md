@@ -315,7 +315,7 @@ Exit criteria:
 - [ ] Kill-gate test green.
 - [ ] Old-upstream synthesis cell green in the e2e matrix (new host × old upstream).
 
-### W5 — Result shape and caching invariants (plan §5) — M
+### W5 — Result shape and caching invariants (plan §5) — M — **LANDED**
 
 **Depends on:** W1.
 
@@ -337,17 +337,27 @@ Scope:
   `filterListResult` path. Closes threat-model finding L-6. *The clamp half has
   landed, at `encodeOrderedObjectWithList` — the one encoder all three filter paths
   reach, so the property is structural rather than per call site. The SET half has
-  not: the filter layer holds no revision, so supplying the member where a declaring
-  upstream omitted it belongs with the `resultType` synthesis above, which does.*
+  landed too, at `applyResultShape`: the filter layer holds no revision, so supplying the member
+  where a declaring upstream omitted it went with the `resultType` synthesis above, which does.*
 - Assertion test that filtering preserves upstream list ordering (deterministic
   ordering is a spec SHOULD that eunox must not break).
 
 Exit criteria:
 
-- [ ] Sweep test: no builder emits a 2026-07-28 result without `resultType`; old-revision output byte-stable.
-- [ ] Unknown-`resultType` result refused fail-closed and recorded; absent-means-complete asserted as a separate case.
+- [x] Sweep test: no builder emits a 2026-07-28 result without `resultType`; old-revision output byte-stable.
+      (`internal/transport/result_shape_test.go` `TestResultShape_SweepEveryResultBearingMethod`, whose
+      method set is DERIVED from `methodRegistry` so a method added for a revision is covered the day it
+      is added; both directions asserted, including that a conforming result is not re-encoded at all.)
+- [x] Unknown-`resultType` result refused fail-closed and recorded; absent-means-complete asserted as a separate case.
+      (`applyResultShape`; recorded `ENFORCEMENT_ERROR` via `upstreamErrInfo`, answered `-32603`.
+      `TestResultShape_ResultTypeOpenUnion` covers absent, `complete`, `input_required`, a
+      post-dating variant, a non-string, an explicit null, a duplicate member and a null result.
+      Threat model L-9.)
 - [x] Property test across all filter paths: a filtered response never carries `cacheScope: public`. *(`internal/pdp/cache_scope_test.go`, over the manifest, JWT-claim, JWT-intersection and deny-all filters x three list flavors x every upstream spelling of the member.)*
-- [ ] Ordering-preservation test green.
+- [x] Ordering-preservation test green. (`internal/pdp/list_ordering_test.go`, over the same
+      manifest/JWT/deny-all x three-list-flavor table the cache-scope property uses, plus the JWT
+      intersection splice — whose catalog is deliberately not in claim order, so a filter emitting
+      in claim order fails it. Mutation-checked by reversing the kept entries.)
 - [x] L-6 marked mitigated in `docs/threat-model-mcp.md` (for `*/list`; the residual and the passthrough exemption are stated there).
 
 ### W6 — Multi round-trip requests (plan §6) — XL

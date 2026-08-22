@@ -122,6 +122,59 @@ const (
 	CacheScopePrivate   = "private"
 )
 
+// ResultKeyResultType is the result member a 2026-07-28 server states the variant of its reply
+// under, and ResultTypeComplete is the terminal variant — the exchange finished in this reply.
+//
+// The member is an OPEN union (`"complete" | "input_required" | string`), which is why only the
+// terminal value is named here rather than a closed set. Three readings follow from that, and
+// they are deliberately not the same:
+//
+//   - ABSENT means complete. That is the spec's own rule for a server on an earlier revision,
+//     and it is the shape every 2025-11-25 upstream produces, so any other reading would refuse
+//     ordinary traffic.
+//   - `complete` is the variant eunox can forward, because there is nothing left of the
+//     exchange to enforce.
+//   - Any OTHER present value is an ambiguity, not a parse detail. Reading it as complete would
+//     let an upstream carry a result variant past response-path enforcement, and eunox cannot
+//     enforce a result shape it does not model — so it is refused where it would have to be
+//     acted on.
+//
+// Here rather than in internal/mcp for ResultKeyCacheScope's reason: it is part of a revision's
+// result shape, and the layers that read or write it may not import the transport package that
+// owns the rest of the revision vocabulary.
+const (
+	ResultKeyResultType = "resultType"
+	ResultTypeComplete  = "complete"
+)
+
+// ResultTypeForwardable reports whether a result carrying this `resultType` is one eunox can
+// hand to a peer without modelling what it means.
+//
+// present is a SEPARATE parameter rather than being inferred from an empty variant, because the
+// two are different facts and conflating them is a fail-open: an upstream sending
+// `"resultType": ""` states a variant that names nothing, and reading that as absence would
+// forward it under the permissive rule meant for servers that predate the member entirely.
+//
+// A predicate rather than a set membership test, so the "absent means complete" rule has one
+// home instead of being restated by each caller that has to distinguish absent from present.
+func ResultTypeForwardable(variant string, present bool) bool {
+	return !present || variant == ResultTypeComplete
+}
+
+// BoundResultType renders a peer-supplied `resultType` for an operator-facing message.
+//
+// The value reaches eunox from an upstream and can be any string the JSON permits, so it takes
+// the same treatment every other foreign value that becomes part of an error string takes: a
+// length bound and the control-and-line-terminator strip, so an upstream cannot forge log lines
+// or drive the operator's terminal through a member eunox quotes back.
+func BoundResultType(variant string) string {
+	return SanitizeControlRunes(TruncateUTF8(variant, maxReflectedResultTypeBytes))
+}
+
+// maxReflectedResultTypeBytes bounds a reflected `resultType`. Generous for any plausible
+// variant name and far below anything that would flood a console.
+const maxReflectedResultTypeBytes = 64
+
 // revisionCtxKey is the unexported context key the decided revision travels under, so no
 // package outside this one can plant a revision the transports did not resolve.
 type revisionCtxKey struct{}
