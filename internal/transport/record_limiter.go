@@ -223,10 +223,10 @@ func newRefusalRecordLimiter() *categoryRecordLimiter {
 
 // newRefusalRecordLimiterFor builds buckets for the categories ONE transport actually charges.
 //
-// stdio charges exactly one (catRevision), so the full table left it holding ten buckets it can
-// never spend — on a proxy that may have no audit sink at all. The per-bucket SHARE is still
-// computed from the whole declared set, never from len(cats): a transport's budget is its share of
-// the aggregate, not the aggregate.
+// stdio charges only what stdioRefusalCategories declares, so the full table left it holding a
+// bucket for every category it can never spend — on a proxy that may have no audit sink at all.
+// The per-bucket SHARE is still computed from the whole declared set, never from len(cats): a
+// transport's budget is its share of the aggregate, not the aggregate.
 //
 // A category outside cats falls to the shared `unknown` bucket, which is bounded rather than
 // unbounded — the safe direction — and each transport's charged set is held to what it declares,
@@ -1110,7 +1110,8 @@ const (
 )
 
 // saturationGate is the admission control over ONE concurrency pool's RESOURCE_EXHAUSTED
-// records: the stdio host-handler pool, or an HTTP session's request or notification pool.
+// records: the stdio host-handler pool, an HTTP session's request or notification pool, or a
+// server-initiated request pool (proxy-wide on stdio, per session on HTTP).
 // Zero value usable and is how every pool holds one, lazily initialized like the
 // semaphores it guards.
 //
