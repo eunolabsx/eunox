@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -231,11 +230,18 @@ func killViaControlEndpoint(host string, port int, controlToken, controlTokenPat
 	}
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, transport.MaxUpstreamErrBodyBytes))
 	_ = resp.Body.Close()
+	// Both prints are bounded and stripped: --host/--port address whatever is listening
+	// there, so these bytes are not necessarily the operator's own proxy — a typo'd host, a
+	// local process that grabbed the port first, or a proxy the upstream it fronts has
+	// compromised. 64 KiB through %s drives the terminal and forges log lines, and this
+	// command is run under pressure with the operator reading the output. A no-op on what
+	// the endpoint actually answers with: JSON escapes control runes, and the response names
+	// one session id, itself bounded well under the truncation point.
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "eunox kill: proxy returned %d: %s\n", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		fmt.Fprintf(os.Stderr, "eunox kill: proxy returned %d: %s\n", resp.StatusCode, transport.BoundConsoleDetail(string(respBody)))
 		return 1
 	}
-	fmt.Println(string(respBody))
+	fmt.Println(transport.BoundConsoleDetail(string(respBody)))
 	return 0
 }
 

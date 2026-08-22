@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/alicebob/miniredis/v2"
 
@@ -2605,6 +2606,69 @@ func TestCmdKill_ProxyReturnsError(t *testing.T) {
 	code := cmdKill([]string{"--port", portStr, "--control-token", tok, "all"})
 	if code != 1 {
 		t.Errorf("expected exit code 1 (proxy returned 403), got %d", code)
+	}
+}
+
+// TestCmdKill_ProxyResponseIsBoundedAndStripped pins that whatever answers --host/--port
+// cannot drive the operator's terminal or forge an eunox log line. The endpoint is addressed
+// by flags, so the responder is not necessarily this operator's proxy — a typo'd host, a local
+// process holding the port, or a proxy the upstream it fronts has compromised — and this is a
+// command run under pressure with the operator reading the output.
+//
+// Both framings are asserted: the failure branch prints to stderr, and the success branch
+// prints the same body to stdout, so fixing one and leaving the other is exactly the artifact
+// the source guard behind BoundConsoleDetail exists to prevent.
+func TestCmdKill_ProxyResponseIsBoundedAndStripped(t *testing.T) {
+	// Escape sequence, a bare newline forging a second eunox line, and enough padding to
+	// exceed the console bound while staying inside the read limit.
+	hostile := "\x1b[2Jcleared\neunox kill: ok, nothing was revoked\n" + strings.Repeat("A", 8<<10)
+
+	for _, tc := range []struct {
+		name    string
+		status  int
+		wantExi int
+	}{
+		{"failure branch", http.StatusForbidden, 1},
+		{"success branch", http.StatusOK, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(hostile))
+			}))
+			defer srv.Close()
+
+			tok := "test-token-xyz"
+			addr := srv.Listener.Addr().String()
+			portStr := addr[strings.LastIndex(addr, ":")+1:]
+			args := []string{"--port", portStr, "--control-token", tok, "all"}
+
+			var out string
+			code := -1
+			run := func() { code = cmdKill(args) }
+			if tc.status == http.StatusOK {
+				out = captureStdout(t, run)
+			} else {
+				out = captureStderr(t, run)
+			}
+			if code != tc.wantExi {
+				t.Errorf("exit code = %d, want %d", code, tc.wantExi)
+			}
+			// One trailing newline is the printer's own; everything the responder sent is on
+			// one line, so no bare newline of its choosing survives to forge a log line.
+			body := strings.TrimSuffix(out, "\n")
+			for _, r := range body {
+				if unicode.IsControl(r) {
+					t.Fatalf("control rune %q reached the console: %q", r, body)
+				}
+			}
+			if !strings.Contains(body, "eunox: truncated") {
+				t.Errorf("an 8 KiB body reached the console without a truncation marker: %d bytes", len(body))
+			}
+			if len(body) > 4<<10 {
+				t.Errorf("console line is %d bytes; the bound is 2 KiB plus this command's own prefix", len(body))
+			}
+		})
 	}
 }
 
