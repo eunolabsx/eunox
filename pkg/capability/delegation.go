@@ -427,6 +427,23 @@ func (c *DelegationChain) EffectClassCap() (class, subject string, ok bool) {
 	return c.computeEffectClassCap()
 }
 
+// normalize brings a grant to the ONE spelling every comparison downstream assumes: the values
+// matched against a manifest name are space-trimmed, and a slice-valued field applies its own
+// empty-collapse rule. Shared by both boundary entry points rather than inlined at the decoding
+// one, because the two normalizing differently is a silent divergence: a redactFields entry the
+// claim parser trims to "ssn" and the other boundary leaves as " ssn" matches no key, so the
+// delegator's masking obligation evaporates instead of failing loudly.
+//
+// Labels/AllowLabels are deliberately left alone. They are matched against the closed flow-label
+// vocabulary, which Validate refuses anything outside — so a padded entry rejects the grant at
+// both boundaries alike rather than going silently inert, and trimming would ACCEPT a spelling
+// the claim path rejects.
+func (g *DelegationGrant) normalize() {
+	g.Subject = strings.TrimSpace(g.Subject)
+	g.Targets = trimmedListPtr(g.Targets)
+	g.RedactFields = trimmedList(g.RedactFields)
+}
+
 // Validate checks one grant in isolation: the fields it declares must be ones this build can
 // enforce as written. Every failure is an error the caller turns into a rejected TOKEN, for
 // the reason every other claim-borne grant in this package is validated at the boundary — a
@@ -637,9 +654,7 @@ func ParseDelegationGrants(raw json.RawMessage) ([]DelegationGrant, error) {
 		if err := decodeClaimObject(m, &g, fmt.Sprintf("mcp.%s grant %d", ClaimDelegation, i)); err != nil {
 			return nil, err
 		}
-		g.Subject = strings.TrimSpace(g.Subject)
-		g.Targets = trimmedListPtr(g.Targets)
-		g.RedactFields = trimmedList(g.RedactFields)
+		g.normalize()
 		if err := g.Validate(); err != nil {
 			return nil, fmt.Errorf("mcp.%s grant %d: %w", ClaimDelegation, i, err)
 		}
@@ -677,14 +692,35 @@ func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*Delega
 	if len(grants) > MaxDelegationDepth {
 		return nil, fmt.Errorf("mcp.%s claim declares %d grant(s), more than the maximum of %d", ClaimDelegation, len(grants), MaxDelegationDepth)
 	}
-	// Re-asserted for the reason the grants cap above is: this is an exported boundary, and
-	// ParseDelegationGrants' own per-grant check only covers a chain that came from a claim. A
-	// chain an embedder assembles directly would otherwise reach the engine having passed no
-	// well-formedness check at all — and one axis of that is fail-open, since an unrecognized
-	// forced label normalizes away and REMOVES taint the delegators imposed. The decision
-	// path's UnknownForcedLabels check is the belt to this brace, not a substitute for it: the
-	// other malformed shapes (a '*' in a target, an unknown allowLabels entry, an invalid
-	// maxEffectClass) each grant nothing and so are invisible rather than refused.
+	// Actors are trimmed on the rule ParseActorChain applies, because the hop-agreement check
+	// below compares them against grant subjects the line after this one trims: normalizing one
+	// side alone would report a padded but self-consistent chain as a mis-mint.
+	if len(actors) > 0 {
+		trimmed := make([]string, len(actors))
+		for i, a := range actors {
+			trimmed[i] = strings.TrimSpace(a)
+			if trimmed[i] == "" {
+				return nil, fmt.Errorf("%s chain carries no identity at hop %d; an actor with no identity cannot be attributed or scoped", ClaimActor, i)
+			}
+		}
+		actors = trimmed
+	}
+	// Normalized and then re-asserted, both for the reason the grants cap above is: this is an
+	// exported boundary, and ParseDelegationGrants covers only a chain that came from a claim.
+	// A chain an embedder assembles directly would otherwise reach the engine spelled however
+	// it was authored and having passed no per-grant check at all. Both halves matter, and the
+	// normalization is the one with a fail-open axis of its own: an untrimmed redactFields
+	// entry composes into the obligation and matches no key, so a delegator's masking silently
+	// does nothing. On the checking half only `labels` is fail-open (an unrecognized forced
+	// label normalizes away, REMOVING taint), and the decision path's UnknownForcedLabels is
+	// the belt to that brace; the other malformed shapes (a '*' in a target, an unknown
+	// allowLabels entry, an invalid maxEffectClass) each grant nothing, so re-asserting is what
+	// makes them loud rather than merely inert.
+	//
+	// Written into a COPY: the caller keeps ownership of the slice it passed, and the chain the
+	// decision path shares read-only across every request on the token must not be reachable
+	// for mutation through it.
+	grants = normalizedGrants(grants)
 	for i := range grants {
 		if err := grants[i].Validate(); err != nil {
 			return nil, fmt.Errorf("delegation grant %d: %w", i, err)
@@ -724,6 +760,21 @@ func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*Delega
 	chain := &DelegationChain{Actors: actors, Grants: grants}
 	chain.memoize()
 	return chain, nil
+}
+
+// normalizedGrants returns a normalized COPY of grants, preserving the NIL/present-empty
+// distinction the hop-agreement check reads: make() is never nil, so an absent claim must
+// short-circuit rather than round-trip through it.
+func normalizedGrants(grants []DelegationGrant) []DelegationGrant {
+	if grants == nil {
+		return nil
+	}
+	out := make([]DelegationGrant, len(grants))
+	copy(out, grants)
+	for i := range out {
+		out[i].normalize()
+	}
+	return out
 }
 
 // trimEach returns a copy of list with each entry space-trimmed, so a padded claim value

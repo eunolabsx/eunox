@@ -294,6 +294,65 @@ func TestValidateDelegationChain_ReassertsPerGrantWellFormedness(t *testing.T) {
 	}
 }
 
+// TestValidateDelegationChain_NormalizesLikeTheClaimParser pins the two boundary entry points
+// to ONE spelling. Re-asserting Validate closed half the divergence and left the other half:
+// ParseDelegationGrants trims before it checks, so an embedder-assembled grant kept whatever
+// padding it was authored with. redactFields is the fail-open axis — " ssn" composes into the
+// obligation, matches no key, and the delegator's masking silently does nothing — and targets
+// is the fail-closed one, where padding locks the delegate out of everything it named.
+func TestValidateDelegationChain_NormalizesLikeTheClaimParser(t *testing.T) {
+	padded := []capability.DelegationGrant{{
+		Subject:      " agent-a ",
+		Targets:      list(" tool:read "),
+		RedactFields: []string{" ssn"},
+	}}
+	direct, err := capability.ValidateDelegationChain(nil, padded)
+	require.NoError(t, err)
+	require.NotNil(t, direct)
+
+	fromClaim, err := capability.ParseDelegationGrants(json.RawMessage(
+		`[{"subject":" agent-a ","targets":[" tool:read "],"redactFields":[" ssn"]}]`))
+	require.NoError(t, err)
+	viaClaim, err := capability.ValidateDelegationChain(nil, fromClaim)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"ssn"}, direct.RedactFields(), "a padded redaction path masks no key at all")
+	assert.Equal(t, viaClaim.RedactFields(), direct.RedactFields())
+
+	ok, _ := direct.PermitsTarget("tool:read")
+	assert.True(t, ok, "a padded target must not lock the delegate out of the action it names")
+	okViaClaim, _ := viaClaim.PermitsTarget("tool:read")
+	assert.Equal(t, okViaClaim, ok)
+
+	// The subject is trimmed too, so the hop-agreement check below compares like with like and
+	// the blocking hop a refusal names is spelled the way the operator authored it.
+	require.Len(t, direct.Grants, 1)
+	assert.Equal(t, "agent-a", direct.Grants[0].Subject)
+
+	// The caller keeps its own slice: the chain the decision path shares read-only must not be
+	// reachable for mutation through the argument that built it.
+	assert.Equal(t, " agent-a ", padded[0].Subject, "normalizing must not write back through the caller's slice")
+	assert.Equal(t, []string{" ssn"}, padded[0].RedactFields)
+}
+
+// TestValidateDelegationChain_TrimsBothSidesOfTheHopComparison is the shape trimming one side
+// alone would have broken: a padded but self-consistent chain, which must stay accepted.
+func TestValidateDelegationChain_TrimsBothSidesOfTheHopComparison(t *testing.T) {
+	chain, err := capability.ValidateDelegationChain(
+		[]string{" agent-a", "agent-b "},
+		[]capability.DelegationGrant{{Subject: "agent-a "}, {Subject: " agent-b"}})
+	require.NoError(t, err, "the two halves name the same hops; only their padding differs")
+	require.NotNil(t, chain)
+	assert.Equal(t, "agent-b", chain.Delegate())
+
+	// An actor with no identity is refused here as ParseActorChain refuses it, rather than
+	// leaving the chain with a hop nothing can attribute.
+	_, err = capability.ValidateDelegationChain([]string{"agent-a", "  "},
+		[]capability.DelegationGrant{{Subject: "agent-a"}, {Subject: "agent-b"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no identity")
+}
+
 // TestValidateDelegationChain_RefusesMalformedBeforeWalkingTheChain keeps the re-assertion
 // above the hop-agreement and narrowing loops: those read the very fields Validate is what
 // rejects, so a chain that never passed it must not reach them.
