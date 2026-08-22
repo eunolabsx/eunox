@@ -294,7 +294,7 @@ func TestHTTPHandleKill_RejectsTrailingJSONTokens(t *testing.T) {
 // unreachable when an operator issues an emergency stop.
 type killWriteErrSwitch struct{}
 
-func (killWriteErrSwitch) ShouldBlock(_ context.Context, _, _ string) (bool, error) {
+func (killWriteErrSwitch) ShouldBlock(_ context.Context, _ killswitch.Subject) (bool, error) {
 	return false, nil
 }
 
@@ -309,6 +309,9 @@ func (killWriteErrSwitch) KillAgent(_ context.Context, _ string) error {
 }
 func (killWriteErrSwitch) ReviveAgent(_ context.Context, _ string) error { return nil }
 func (killWriteErrSwitch) KillSession(_ context.Context, _ string) error {
+	return errKillSwitchFailed
+}
+func (killWriteErrSwitch) RevokeJTI(_ context.Context, _ string) error {
 	return errKillSwitchFailed
 }
 func (killWriteErrSwitch) ReviveSession(_ context.Context, _ string) error { return nil }
@@ -6010,7 +6013,7 @@ type unreachableKillSwitch struct {
 	down atomic.Bool
 }
 
-func (k *unreachableKillSwitch) ShouldBlock(context.Context, string, string) (bool, error) {
+func (k *unreachableKillSwitch) ShouldBlock(context.Context, killswitch.Subject) (bool, error) {
 	if k.down.Load() {
 		return false, errors.New("kill store unreachable")
 	}

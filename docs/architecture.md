@@ -337,6 +337,7 @@ class 6003) JSONL, one object per line:
 {"class_uid":6003, "category_uid":6, "activity_id":2,
  "time":"...", "seq":42, "request_id":"...", "session_id":"...",
  "agent_id":"agent-xyz", "task_id":"task-abc", "user_id":"user-7",
+ "token_id":"jti-9f2c",
  "upstream":"github", "policy_version":"0.1.0", "policy_sha256":"...",
  "target_type":"tool", "target":"delete_repo", "method":"tools/call",
  "decision":"deny", "denial_code":"AUTHORIZATION_FAILED",
@@ -344,7 +345,12 @@ class 6003) JSONL, one object per line:
  "prev_hmac":"sha256:...", "_hmac":"sha256:..."}
 ```
 
-`agent_id` / `task_id` / `user_id` (the JWT `sub` subject) are stamped from a validated JWT when one is present.
+`agent_id` / `task_id` / `user_id` (the JWT `sub` subject) are stamped from a validated JWT when one is present, and `token_id` is its `jti`.
+
+`token_id` answers a different question from the three beside it: which CREDENTIAL authorized
+the call, not which identity it speaks for. After a token is revoked it is the only field that
+separates the calls that credential made from the same agent's calls on a token that was never
+compromised. Omitted when the token carries no `jti`, and for every request with no token.
 
 Mechanics:
 
@@ -426,12 +432,18 @@ opaque resource URI or an oddly-named tool maps to the right namespace — and
 ## Operational controls
 
 - **Kill switch** (`pkg/killswitch`) — immediately blocks a session, an
-  agent (by JWT `agent_id`), or everything. Checked first on every decision;
-  a backend error denies. Activated via `eunox kill` against the HTTP
+  agent (by JWT `agent_id`), one issued token (by JWT `jti`), or everything.
+  Checked first on every decision; a backend error denies. The four dimensions
+  are declared once (`pkg/killswitch/dimension.go`) and every Redis path —
+  the writer, the pub/sub handler, the reconcile scan, `Reset`, `Status` —
+  iterates that declaration, so a dimension cannot be handled on some paths
+  and quietly missed on others. Activated via `eunox kill` against the HTTP
   proxy's loopback control endpoint, or directly through Redis. The Redis
   transport also carries the undo (`eunox kill --revive`) and the session-
   tombstone lifetime the proxy publishes at startup so the CLI stamps the
   same expiry the proxy would; the loopback endpoint is kill-only.
+  Token revocations never expire — a credential revoked for cause must not be
+  re-admitted by a clock — so `--revive --jti` is the only way to lift one.
 - **Call counter** (`pkg/callcounter`) — backs `maxCalls` rate conditions
   (`AdmitAll`) and `sequenceBlock` session-history
   lookups (`Peek`).

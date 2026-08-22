@@ -432,9 +432,9 @@ type SamplingAuthorizer interface {
 }
 
 // killCheck consults the kill switch and returns a non-nil deny response when
-// the call must be blocked: an active kill matching the agent/session/global
-// dimension, or a kill-store error (fail closed).  A nil ks imposes no check
-// (JWT-only mode).  The agent dimension is taken from JWT claims in ctx.
+// the call must be blocked: an active kill matching the global dimension or any of the
+// subject's, or a kill-store error (fail closed).  A nil ks imposes no check
+// (JWT-only mode).  The agent and token-id dimensions are taken from JWT claims in ctx.
 //
 // clock is the caller's decision clock, passed through to denyResponse so a kill
 // deny stamps DecidedAt from the same source as every other deny (and as the allow
@@ -443,7 +443,7 @@ func killCheck(ctx context.Context, clock enforcement.Clock, ks killswitch.Check
 	if ks == nil {
 		return nil
 	}
-	blocked, err := ks.ShouldBlock(ctx, agentIDFromContext(ctx), sessionID)
+	blocked, err := ks.ShouldBlock(ctx, killSubjectFromContext(ctx, sessionID))
 	if err != nil {
 		deny := denyResponse(clock, capability.ErrCodeKillSwitchError, "", "kill switch check failed: "+err.Error())
 		return &deny
@@ -4193,6 +4193,27 @@ func agentIDFromContext(ctx context.Context) string {
 		return c.AgentID
 	}
 	return ""
+}
+
+// killSubjectFromContext builds the identity a kill check is asked about, from the request's
+// validated claims plus the session the transport knows.
+//
+// Every dimension comes from ONE place, which is what keeps the finest one honest: reading the
+// token id anywhere else — a header, a caller-supplied field — would let the presenter choose
+// which credential the revocation set is consulted about. Here it is the `jti` of the token
+// whose signature this request was already admitted on.
+//
+// An absent claim leaves its dimension empty, which is not evaluated (see killswitch.Subject).
+// That is the stdio and no-JWT case, and it is a narrowing rather than a bypass: the session
+// and global dimensions still apply, and a token that carries no jti had no per-token
+// revocation available to dodge in the first place.
+func killSubjectFromContext(ctx context.Context, sessionID string) killswitch.Subject {
+	subj := killswitch.Subject{SessionID: sessionID}
+	if c, ok := jwtClaimsFromContext(ctx); ok {
+		subj.AgentID = c.AgentID
+		subj.JTI = c.TokenID
+	}
+	return subj
 }
 
 // reservedClaimKeys are the input.claims keys whose values come exclusively from

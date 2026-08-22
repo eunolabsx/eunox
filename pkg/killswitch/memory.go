@@ -18,6 +18,7 @@ type InMemory struct {
 	globalActive   bool
 	killedAgents   map[string]bool
 	killedSessions map[string]bool
+	revokedJTIs    map[string]bool
 
 	// observers receive a Revocation the moment this backend gains one — a consumer
 	// calling Kill* directly on the Manager needs it too, not just one reclaiming at its
@@ -37,7 +38,7 @@ func NewInMemory() *InMemory {
 // ensureSetsLocked creates the kill sets if this InMemory was written as a zero value rather
 // than built by NewInMemory. Caller must hold m.mu for writing.
 //
-// Reads already tolerate nil maps, so only the two Kill* assignments were affected — and they
+// Reads already tolerate nil maps, so only the revoking assignments were affected — and they
 // PANICKED, taking down an admin handler mid-request instead of recording the kill. A
 // library-facing zero value must fail no worse than an unusable one.
 func (m *InMemory) ensureSetsLocked() {
@@ -47,6 +48,9 @@ func (m *InMemory) ensureSetsLocked() {
 	if m.killedSessions == nil {
 		m.killedSessions = make(map[string]bool)
 	}
+	if m.revokedJTIs == nil {
+		m.revokedJTIs = make(map[string]bool)
+	}
 }
 
 // HealthStatus implements [Manager]: an in-process kill set is always confirmable, so there
@@ -54,18 +58,25 @@ func (m *InMemory) ensureSetsLocked() {
 // question without a type switch on which backend it holds.
 func (m *InMemory) HealthStatus() error { return nil }
 
-// ShouldBlock checks if the global, agent, or session kill switch is active.
-func (m *InMemory) ShouldBlock(_ context.Context, agentID, sessionID string) (bool, error) {
+// ShouldBlock checks whether any dimension of subj is killed.
+//
+// Order is broadest-first and is not load-bearing for the ANSWER — a match on any dimension
+// blocks — but it keeps the cheapest check first and mirrors the Redis backend's gate chain, so
+// the two cannot disagree about which revocation a given request is attributed to.
+func (m *InMemory) ShouldBlock(_ context.Context, subj Subject) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	if m.globalActive {
 		return true, nil
 	}
-	if agentID != "" && m.killedAgents[agentID] {
+	if subj.AgentID != "" && m.killedAgents[subj.AgentID] {
 		return true, nil
 	}
-	if sessionID != "" && m.killedSessions[sessionID] {
+	if subj.SessionID != "" && m.killedSessions[subj.SessionID] {
+		return true, nil
+	}
+	if subj.JTI != "" && m.revokedJTIs[subj.JTI] {
 		return true, nil
 	}
 	return false, nil
@@ -154,6 +165,38 @@ func (m *InMemory) ReviveSession(_ context.Context, sessionID string) error {
 	return nil
 }
 
+// RevokeJTI blocks every request presenting the bearer token with this id.
+func (m *InMemory) RevokeJTI(_ context.Context, jti string) error {
+	// Reject an empty id: ShouldBlock skips an empty dimension, so recording one would be a
+	// silent no-op leaving a phantom "" entry in Status.
+	if jti == "" {
+		return fmt.Errorf("killswitch: RevokeJTI: jti must not be empty")
+	}
+	m.mu.Lock()
+	m.ensureSetsLocked()
+	gained := !m.revokedJTIs[jti]
+	m.revokedJTIs[jti] = true
+	m.mu.Unlock()
+	// Notified outside the lock, and only on a state CHANGE, as the other revocations are:
+	// re-revoking reclaims nothing new, and an observer may re-enter this backend.
+	if gained {
+		m.observers.notify(Revocation{JTI: jti})
+	}
+	return nil
+}
+
+// ReviveJTI removes the revocation on the specified token id.
+func (m *InMemory) ReviveJTI(_ context.Context, jti string) error {
+	// Reject an empty id to keep the call-site contract uniform with the Redis backend.
+	if jti == "" {
+		return fmt.Errorf("killswitch: ReviveJTI: jti must not be empty")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.revokedJTIs, jti)
+	return nil
+}
+
 // Reset clears all kill-switch state.
 func (m *InMemory) Reset(_ context.Context) error {
 	m.mu.Lock()
@@ -161,6 +204,7 @@ func (m *InMemory) Reset(_ context.Context) error {
 	m.globalActive = false
 	m.killedAgents = make(map[string]bool)
 	m.killedSessions = make(map[string]bool)
+	m.revokedJTIs = make(map[string]bool)
 	return nil
 }
 
@@ -168,7 +212,7 @@ func (m *InMemory) Reset(_ context.Context) error {
 func (m *InMemory) Status(_ context.Context) (*Status, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return buildStatus(m.globalActive, m.killedAgents, m.killedSessions), nil
+	return buildStatus(m.globalActive, m.killedAgents, m.killedSessions, m.revokedJTIs), nil
 }
 
 // ObserveRevocations implements [Manager]. Every revocation is issued in-process, so an

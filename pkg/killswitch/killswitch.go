@@ -11,19 +11,54 @@ import (
 	"sync"
 )
 
+// Subject is the identity a kill check is asked about: every dimension a revocation can name,
+// in one value.
+//
+// A STRUCT rather than a parameter list, and the reason is the axis that was just added. Each
+// dimension used to be a positional string, so adding one meant editing every implementation,
+// every caller and every test in lockstep — and the failure mode of getting that wrong is
+// silent, since the arguments are all strings and a transposed pair still compiles. Adding JTI
+// here changed no signature at all.
+//
+// Passed and stored BY VALUE. It is three strings on the hot path — the kill check runs first
+// in decision order, ahead of every policy evaluation — so a pointer would put it on the heap
+// for nothing. The killswitch benchmarks assert ShouldBlock stays allocation-free.
+//
+// An empty field means that dimension is NOT evaluated, which is what lets a leg that knows
+// only some of the identity ask anyway: a stdio proxy has no bearer token and leaves JTI empty,
+// and a pre-authentication refusal has only the session. It is never a wildcard — an empty
+// field matches nothing rather than everything, so a revocation cannot be dodged by omitting
+// the dimension it names.
+type Subject struct {
+	// AgentID is the acting agent, from the token's `mcp.agent_id` or the transport's own
+	// per-connection identity.
+	AgentID string
+	// SessionID is the proxy's internal session, which is a CONNECTION on stdio and an
+	// `Mcp-Session-Id` worker on HTTP.
+	SessionID string
+	// JTI is the bearer token's RFC 7519 `jti`, the FINEST revocation unit: it names one
+	// issued credential rather than everything an agent or a session holds. Revoking it stops
+	// exactly the token that leaked, leaving the same agent's other tokens serving.
+	//
+	// It is a revocation key only, never a scope key — a manifest's `principal:` scoping reads
+	// `sub`, and keying policy state on a per-token value would split an agent's accumulated
+	// budgets across every token it was ever issued. See ADR-0004.
+	JTI string
+}
+
 // Checker is the minimal read-only interface for components that only query
 // whether a request should be blocked. The hot enforcement path accepts this
 // rather than the full Manager, which it never needs.
 type Checker interface {
-	// ShouldBlock returns true if the given agent/session combination is killed.
-	// An empty agentID or sessionID means the field is not evaluated for that dimension.
+	// ShouldBlock returns true if any dimension of subj is killed.
+	// An empty field means that dimension is not evaluated — see [Subject].
 	//
 	// A non-nil error means the backend could not CONFIRM its kill set, not that the answer
 	// is "no": (false, err) must be treated as a denial, since an unconfirmable non-match is
 	// indistinguishable from a confirmed all-clear. See the rule on [Manager], which binds
 	// this method too — a backend reaches the hot path through this interface, so a consumer
 	// that only ever sees a Checker still has to fail closed on the error.
-	ShouldBlock(ctx context.Context, agentID, sessionID string) (bool, error)
+	ShouldBlock(ctx context.Context, subj Subject) (bool, error)
 }
 
 // Manager is the full kill-switch interface that embeds Checker and adds the
@@ -95,6 +130,19 @@ type Manager interface {
 	// ReviveSession removes the kill on the specified session.
 	ReviveSession(ctx context.Context, sessionID string) error
 
+	// RevokeJTI blocks every request presenting the bearer token with this `jti`.
+	// An empty jti is an error for KillAgent's reason.
+	//
+	// The FINEST revocation unit, and the one an operator reaches for when a credential
+	// leaks: killing the agent stops everything it holds, killing the session stops one
+	// connection, and revoking the jti stops exactly the token that got out. A token is
+	// presented on every request, so the revocation takes effect on the next one rather than
+	// waiting for the credential to expire.
+	RevokeJTI(ctx context.Context, jti string) error
+
+	// ReviveJTI removes the revocation on the specified token id.
+	ReviveJTI(ctx context.Context, jti string) error
+
 	// Reset clears all kill-switch state.
 	Reset(ctx context.Context) error
 
@@ -139,6 +187,8 @@ type Revocation struct {
 	AgentID string
 	// SessionID names a killed session.
 	SessionID string
+	// JTI names a revoked bearer token id.
+	JTI string
 }
 
 // revocationObservers is the shared observer registry both backends embed, so registration,
@@ -200,15 +250,20 @@ type Status struct {
 	GlobalActive   bool     `json:"globalActive"`
 	KilledAgents   []string `json:"killedAgents"`
 	KilledSessions []string `json:"killedSessions"`
+	// RevokedJTIs lists the revoked bearer token ids. A token id is a credential
+	// identifier, not a secret — it is carried in the clear in every token that presents
+	// it — so a snapshot naming one leaks nothing the holder did not already send.
+	RevokedJTIs []string `json:"revokedJtis"`
 }
 
 // buildStatus assembles a *Status from the raw cache maps, sorting both id slices for
 // deterministic output. Shared by both backends so the two cannot drift.
-func buildStatus(globalActive bool, killedAgents, killedSessions map[string]bool) *Status {
+func buildStatus(globalActive bool, killedAgents, killedSessions, revokedJTIs map[string]bool) *Status {
 	return &Status{
 		GlobalActive:   globalActive,
 		KilledAgents:   sortedKeys(killedAgents),
 		KilledSessions: sortedKeys(killedSessions),
+		RevokedJTIs:    sortedKeys(revokedJTIs),
 	}
 }
 

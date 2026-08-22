@@ -34,6 +34,8 @@ func TestResolveKillTarget(t *testing.T) {
 		sessionSet  bool
 		agent       string
 		agentSet    bool
+		jti         string
+		jtiSet      bool
 		want        killTarget
 		wantErrPart string
 	}{
@@ -75,11 +77,50 @@ func TestResolveKillTarget(t *testing.T) {
 			agentSet:    true,
 			wantErrPart: "more than one target",
 		},
+		{name: "jti flag", jti: "tok-1", jtiSet: true, want: killTarget{kind: killTargetJTI, id: "tok-1"}},
+		{
+			// The finest dimension is still exactly one target: naming it beside another is
+			// a body whose meaning depends on which arm the code happens to check first.
+			name:        "jti conflicts with a session flag",
+			session:     "sess-1",
+			sessionSet:  true,
+			jti:         "tok-1",
+			jtiSet:      true,
+			wantErrPart: "more than one target",
+		},
+		{
+			name:        "jti conflicts with an agent flag",
+			agent:       "agent-1",
+			agentSet:    true,
+			jti:         "tok-1",
+			jtiSet:      true,
+			wantErrPart: "more than one target",
+		},
+		{
+			name:        "jti conflicts with a positional",
+			pos:         []string{"sess-1"},
+			jti:         "tok-1",
+			jtiSet:      true,
+			wantErrPart: "more than one target",
+		},
+		{
+			// An explicitly empty --jti is a target that names nothing, refused for the
+			// reason the empty --agent case above is: it reads as "revoke", and silently
+			// treating it as "no flag given" would run whichever other target was passed.
+			name:        "explicitly empty jti flag conflicts with a positional",
+			pos:         []string{"sess-1"},
+			jti:         "",
+			jtiSet:      true,
+			wantErrPart: "more than one target",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := resolveKillTarget(tc.pos, tc.session, tc.sessionSet, tc.agent, tc.agentSet)
+			got, err := resolveKillTarget(tc.pos,
+				killFlagTarget{kind: killTargetSession, value: tc.session, set: tc.sessionSet},
+				killFlagTarget{kind: killTargetAgent, value: tc.agent, set: tc.agentSet},
+				killFlagTarget{kind: killTargetJTI, value: tc.jti, set: tc.jtiSet})
 			if tc.wantErrPart != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tc.wantErrPart)
@@ -260,7 +301,7 @@ func TestKillTargetZeroValueIsUnset(t *testing.T) {
 		t.Error("the zero value must never be the deployment-wide switch")
 	}
 	// Every error path hands back the zero value; none of them may be actionable.
-	if got, err := resolveKillTarget(nil, "", false, "", false); err == nil || got.kind != killTargetUnset {
+	if got, err := resolveKillTarget(nil); err == nil || got.kind != killTargetUnset {
 		t.Errorf("no-target error must return an unset target, got kind %d err %v", got.kind, err)
 	}
 }

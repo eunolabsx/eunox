@@ -137,7 +137,7 @@ func TestInMemory_ObserveRevocations_CalledOutsideLock(t *testing.T) {
 
 	done := make(chan bool, 1)
 	m.ObserveRevocations(func(ev Revocation) {
-		blocked, err := m.ShouldBlock(ctx, ev.AgentID, "")
+		blocked, err := m.ShouldBlock(ctx, Subject{AgentID: ev.AgentID})
 		done <- err == nil && blocked
 	})
 

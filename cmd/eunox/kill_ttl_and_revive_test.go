@@ -410,7 +410,7 @@ func TestCmdKill_ReviveConvergesOnARunningProxy(t *testing.T) {
 		})
 	})
 	require.Eventually(t, func() bool {
-		blocked, err := proxyKS.ShouldBlock(ctx, "", "sess-live")
+		blocked, err := proxyKS.ShouldBlock(ctx, killswitch.Subject{SessionID: "sess-live"})
 		return err == nil && blocked
 	}, 2*time.Second, 10*time.Millisecond, "the proxy must observe the kill")
 
@@ -418,7 +418,7 @@ func TestCmdKill_ReviveConvergesOnARunningProxy(t *testing.T) {
 		require.Zero(t, cmdKill([]string{"--redis-addr", mr.Addr(), "--revive", "sess-live"}))
 	})
 	require.Eventually(t, func() bool {
-		blocked, err := proxyKS.ShouldBlock(ctx, "", "sess-live")
+		blocked, err := proxyKS.ShouldBlock(ctx, killswitch.Subject{SessionID: "sess-live"})
 		return err == nil && !blocked
 	}, 2*time.Second, 10*time.Millisecond, "the proxy must observe the revive")
 }

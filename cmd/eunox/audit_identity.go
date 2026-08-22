@@ -26,6 +26,7 @@ func auditIdentity(ctx context.Context) audit.Identity {
 		AgentID:  c.AgentID,
 		TaskID:   c.TaskID,
 		UserID:   c.Subject,
+		TokenID:  c.TokenID,
 		Delegate: c.Delegation.Delegate(),
 		// len(Actors), not len(Grants): actors are the identities the token passed through,
 		// which is what a depth means to a reader tracing user -> a -> b.

@@ -27,7 +27,7 @@ func TestInMemory_ConcurrentShouldBlock(t *testing.T) {
 	for i := range goroutines {
 		go func(idx int) {
 			defer wg.Done()
-			blocked, err := m.ShouldBlock(context.Background(), "agent-1", "session-1")
+			blocked, err := m.ShouldBlock(context.Background(), Subject{AgentID: "agent-1", SessionID: "session-1"})
 			assert.NoError(t, err)
 			assert.True(t, blocked, "goroutine %d: should be blocked", idx)
 		}(i)
@@ -93,7 +93,7 @@ func TestInMemory_ConcurrentGlobalToggle(t *testing.T) {
 	wg.Wait()
 
 	// Final state is either activated or deactivated — no panic.
-	_, err := m.ShouldBlock(ctx, "agent-1", "session-1")
+	_, err := m.ShouldBlock(ctx, Subject{AgentID: "agent-1", SessionID: "session-1"})
 	assert.NoError(t, err)
 }
 
@@ -127,7 +127,7 @@ func TestInMemory_ConcurrentSessionOperations(t *testing.T) {
 	for i := range goroutines {
 		go func(idx int) {
 			defer wg.Done()
-			_, _ = m.ShouldBlock(ctx, "agent-1", "sess-"+itoa(idx%20))
+			_, _ = m.ShouldBlock(ctx, Subject{AgentID: "agent-1", SessionID: "sess-" + itoa(idx%20)})
 		}(i)
 	}
 	wg.Wait()
@@ -160,13 +160,13 @@ func TestInMemory_ConcurrentReset(t *testing.T) {
 	for range goroutines {
 		go func() {
 			defer wg.Done()
-			_, _ = m.ShouldBlock(ctx, "agent-1", "session-1")
+			_, _ = m.ShouldBlock(ctx, Subject{AgentID: "agent-1", SessionID: "session-1"})
 		}()
 	}
 	wg.Wait()
 
 	// After all resets, nothing should be blocked.
-	blocked, err := m.ShouldBlock(ctx, "agent-1", "session-1")
+	blocked, err := m.ShouldBlock(ctx, Subject{AgentID: "agent-1", SessionID: "session-1"})
 	assert.NoError(t, err)
 	assert.False(t, blocked)
 }

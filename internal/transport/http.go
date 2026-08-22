@@ -207,6 +207,11 @@ type killActivator interface {
 	ActivateGlobal(ctx context.Context) error
 	// KillSession revokes one session. There is no ReviveSession here.
 	KillSession(ctx context.Context, sessionID string) error
+	// RevokeJTI revokes one issued bearer token. There is no ReviveJTI here — and this is
+	// the dimension where the one-way rule bites hardest, since a token revocation does not
+	// expire on its own the way a session tombstone does. An undo reachable from the same
+	// host that just leaked the credential is exactly the reach this interface keeps shut.
+	RevokeJTI(ctx context.Context, jti string) error
 }
 
 // HTTPProxy implements the MCP Streamable HTTP transport.

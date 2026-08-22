@@ -121,18 +121,18 @@ func managerBackends() []managerBackend {
 // point: passing lastErr as a format ARG evaluates it at the call, before the first poll, so
 // the message would report the zero error forever and send a reader after a wrong boolean when
 // the backend was erroring.
-func awaitBlock(t *testing.T, m Manager, agentID, sessionID string, want bool, msg string) {
+func awaitBlock(t *testing.T, m Manager, subj Subject, want bool, msg string) {
 	t.Helper()
 	var lastErr error
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		blocked, err := m.ShouldBlock(context.Background(), agentID, sessionID)
+		blocked, err := m.ShouldBlock(context.Background(), subj)
 		lastErr = err
 		if err == nil && blocked == want {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: ShouldBlock(%q, %q) = (%v, %v), want (%v, nil)", msg, agentID, sessionID, blocked, lastErr, want)
+			t.Fatalf("%s: ShouldBlock(%+v) = (%v, %v), want (%v, nil)", msg, subj, blocked, lastErr, want)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -166,16 +166,29 @@ func TestManagerConformance_ReadyBackendsAgreeOnRefusalsAndRevive(t *testing.T) 
 			require.Error(t, m.KillSession(ctx, ""), "KillSession(\"\") must be refused, not recorded as a no-op kill")
 			require.Error(t, m.ReviveAgent(ctx, ""), "ReviveAgent(\"\") must be refused for the same reason")
 			require.Error(t, m.ReviveSession(ctx, ""), "ReviveSession(\"\") must be refused for the same reason")
+			require.Error(t, m.RevokeJTI(ctx, ""), "RevokeJTI(\"\") must be refused for the same reason")
+			require.Error(t, m.ReviveJTI(ctx, ""), "ReviveJTI(\"\") must be refused for the same reason")
 
 			require.NoError(t, m.KillAgent(ctx, "agent-1"))
-			awaitBlock(t, m, "agent-1", "", true, "a killed agent must block")
+			awaitBlock(t, m, Subject{AgentID: "agent-1"}, true, "a killed agent must block")
 			require.NoError(t, m.ReviveAgent(ctx, "agent-1"))
-			awaitBlock(t, m, "agent-1", "", false, "a revived agent must stop blocking")
+			awaitBlock(t, m, Subject{AgentID: "agent-1"}, false, "a revived agent must stop blocking")
 
 			require.NoError(t, m.KillSession(ctx, "sess-1"))
-			awaitBlock(t, m, "", "sess-1", true, "a killed session must block")
+			awaitBlock(t, m, Subject{SessionID: "sess-1"}, true, "a killed session must block")
 			require.NoError(t, m.ReviveSession(ctx, "sess-1"))
-			awaitBlock(t, m, "", "sess-1", false, "a revived session must stop blocking")
+			awaitBlock(t, m, Subject{SessionID: "sess-1"}, false, "a revived session must stop blocking")
+
+			require.NoError(t, m.RevokeJTI(ctx, "tok-1"))
+			awaitBlock(t, m, Subject{JTI: "tok-1"}, true, "a revoked token must block")
+			// The dimension is INDEPENDENT: revoking one credential must not block the same
+			// agent's other tokens, which is the whole reason the finest unit exists. A
+			// backend that keyed the revocation on anything coarser passes the line above
+			// and fails this one.
+			awaitBlock(t, m, Subject{AgentID: "agent-1", JTI: "tok-2"}, false,
+				"revoking one token must leave the same agent's other tokens serving")
+			require.NoError(t, m.ReviveJTI(ctx, "tok-1"))
+			awaitBlock(t, m, Subject{JTI: "tok-1"}, false, "a revived token must stop blocking")
 		})
 	}
 }
@@ -202,7 +215,7 @@ func TestManagerConformance_UnconfirmedBackendNeverAllClears(t *testing.T) {
 
 					require.Error(t, m.HealthStatus(), "an unconfirmable backend must report the cause to a probe")
 
-					blocked, err := m.ShouldBlock(context.Background(), "agent-1", "sess-1")
+					blocked, err := m.ShouldBlock(context.Background(), Subject{AgentID: "agent-1", SessionID: "sess-1"})
 					require.Error(t, err, "a non-match must carry the cause rather than read as a confirmed all-clear")
 					require.False(t, blocked, "the refusal is the error; a synthetic match would deny for the wrong stated reason")
 
@@ -224,7 +237,7 @@ func TestManagerConformance_FailOpenIsTheStatedException(t *testing.T) {
 	t.Parallel()
 	var m Manager = newDegradedRedis(t, true)
 
-	blocked, err := m.ShouldBlock(context.Background(), "agent-1", "sess-1")
+	blocked, err := m.ShouldBlock(context.Background(), Subject{AgentID: "agent-1", SessionID: "sess-1"})
 	require.NoError(t, err, "fail-open serves the last-known cache rather than denying")
 	require.False(t, blocked)
 
@@ -247,10 +260,10 @@ func TestInMemory_ZeroValueRecordsKillsRatherThanPanicking(t *testing.T) {
 		require.NoError(t, m.KillSession(ctx, "sess-1"))
 	})
 
-	blocked, err := m.ShouldBlock(ctx, "agent-1", "")
+	blocked, err := m.ShouldBlock(ctx, Subject{AgentID: "agent-1"})
 	require.NoError(t, err)
 	require.True(t, blocked)
-	blocked, err = m.ShouldBlock(ctx, "", "sess-1")
+	blocked, err = m.ShouldBlock(ctx, Subject{SessionID: "sess-1"})
 	require.NoError(t, err)
 	require.True(t, blocked)
 }

@@ -5010,9 +5010,9 @@ type countingKillSwitch struct {
 	calls atomic.Int64
 }
 
-func (c *countingKillSwitch) ShouldBlock(ctx context.Context, agentID, sessionID string) (bool, error) {
+func (c *countingKillSwitch) ShouldBlock(ctx context.Context, subj killswitch.Subject) (bool, error) {
 	c.calls.Add(1)
-	return c.Manager.ShouldBlock(ctx, agentID, sessionID)
+	return c.Manager.ShouldBlock(ctx, subj)
 }
 
 // TestJWTPDP_Decide_KillSwitchAlwaysCheckedInWrapper documents the behavior:

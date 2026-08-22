@@ -18,7 +18,9 @@ import (
 // These decide more than the custom claims do. `sub` is what a manifest's `principal:`
 // scoping reads, so the collision picks which constraints govern the call — up to
 // resolving a narrowly-scoped agent's token to a broader identity. `exp`/`nbf` decide
-// whether the token is live at all, and `aud`/`iss` whether it was minted for this proxy.
+// whether the token is live at all, `aud`/`iss` whether it was minted for this proxy, and
+// `jti` whether the credential has been revoked — the one where the party who benefits from
+// the ambiguity is the one holding the revoked token.
 //
 // Not third-party forgeable (the signature covers the whole payload), which is exactly
 // why the test signs the ambiguous payload with a real key: the realistic producer is the
@@ -46,6 +48,12 @@ func TestJWT_AmbiguousStandardClaimRejected(t *testing.T) {
 		// ambiguity fails OPEN rather than merely picking wrong. See the cnf-specific test
 		// below for why that makes it the sharpest entry in the list.
 		"cnf pair": {"cnf": map[string]interface{}{"jkt": "abc"}, "Cnf": map[string]interface{}{"jkt": "def"}},
+		// jti is the sharpest entry after cnf, and for the same shape of reason: its
+		// ambiguity is not a mis-pick, it is a BYPASS. Per-token revocation is keyed on jti,
+		// so a token naming it twice binds whichever spelling sorts last — and the holder of
+		// a revoked credential controls the payload. `{"jti":"revoked","JTI":"clean"}` is a
+		// revoked token that keeps serving, with the revocation still listed as active.
+		"jti pair": {"jti": "revoked-token", "JTI": "clean-token"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			claims := map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion}}
@@ -77,16 +85,15 @@ func TestJWT_UnambiguousStandardClaimsAccepted(t *testing.T) {
 		"mcp": map[string]interface{}{"v": mcpClaimVersion},
 		"nbf": time.Now().Add(-time.Minute).Unix(),
 		// An ambiguity among claims this build never reads stays none of its business,
-		// exactly as for the mcp/act gate.
+		// exactly as for the mcp/act gate. `email` is the standing example: a registered
+		// claim is not what qualifies one for the watch list, being READ is.
 		"email": "a@example.com",
 		"Email": "b@example.com",
-		// jti is the same case, and it is a REGISTERED claim — which is the point. The
-		// watch list is scoped to what eunox reads, not to what RFC 7519 defines: nothing
-		// in this binary decodes jti (newValidatedClaims copies sub/iss/aud/exp and never
-		// jwt.Claims.ID), so refusing a token over two spellings of it would deny every
-		// request from an IdP whose template emits both, buying no security at all.
+		// jti used to sit here for exactly that reason, and it MOVED to the rejected table
+		// when revocation started reading it. That is the watch list's criterion working:
+		// membership follows what this build decodes, and jti now decides whether a
+		// credential is revoked.
 		"jti": "token-1",
-		"JTI": "token-2",
 	})
 	ctx, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
 	if err != nil {

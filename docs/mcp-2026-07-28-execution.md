@@ -1,18 +1,18 @@
 # MCP 2026-07-28 execution plan
 
-**Status:** in progress — W1 and W13 have landed, and W11 its upstream-opener half;
-every other workstream is still planning.
+**Status:** in progress — W1, W5, W9 and W13 have landed, D1 is ratified, and W11 and W2
+have landed a half each; every other workstream is still planning.
 Companion to [mcp-2026-07-28-plan.md](mcp-2026-07-28-plan.md), which states what
 changes and why. This document states the work as workstreams — concrete
 deliverables, the tests each one owes, and the exit criteria that say when it is
 done. Workstream sections are keyed to the plan's numbered items.
-**Verified against:** eunox @ `a0227a9`.
+**Verified against:** eunox @ `0d496d0`.
 
 A landed workstream says so in its heading; an unmarked heading is still planning.
 A workstream is **landed** only when every exit criterion below it is ticked or
 explicitly accounted for — W1 is landed with two criteria open, and says which.
-W11 is the one partial: its heading is unmarked because only the opener landed, and
-its section says what did not. W13 is landed on its criteria with scope deferred, which
+Two are partial and say so in their headings: W11 (only the upstream opener landed) and
+W2 (everything but the D3-gated session-creation half). Each section says what did not. W13 is landed on its criteria with scope deferred, which
 its section lists.
 
 References name a **file and a symbol, never a line number**.
@@ -59,12 +59,13 @@ criterion is the ADR reaching **Final** under the ADR lifecycle
 |---|---|---|---|
 | D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (**Final**, ratified 2026-08-22) | W3, W4, W13's mismatch cells — **unblocked**. The boundary is implemented and ratified; what remains under D1 is the discovery-filter parity property, the `x-mcp-header` allowlist and the `Mcp-Session-Id` retirement, each decided in the ADR and built in its own workstream. |
 | D2 | MRTR metering: the signed continuation — key sourcing, anchor binding, lifetime, replay bound, what re-evaluates per retry, and the commit-once quota rule. | [ADR-0007](adr/0007-mrtr-signed-continuation.md) (Draft) | W6 |
-| D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (updated: session-creation addendum) | W2, and through it W6/W7 |
+| D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (Draft; the session-creation addendum is written and awaiting ratification) | W2's session-creation half, and through it W6/W7. **Does not block W2's revocation half**, which is D3-independent and has landed — see W2. |
 | D4 | Stream and deferred-effect enforcement: `subscriptions/listen` open/deny semantics, notification filtering, cancel rehoming; tasks anchor binding and the kill×tasks interaction. | [ADR-0008](adr/0008-stream-and-task-enforcement.md) (Draft) | W7, W8 |
 
 W1's table refactor and W2's subject-struct reshape are behavior-neutral and may
 land while their ADRs are still Draft; anything that changes wire behavior waits
-for Final.
+for Final. Both have since landed on that basis, and W2 carried the rest of its
+revocation half with them — see that section for why none of it is D3's to gate.
 
 W1 has since landed on that basis, negotiation included. What made it admissible
 under a Draft D1 is that each revision's table is deny-by-default over the same
@@ -222,9 +223,23 @@ As landed, differing from the scope above in three places:
   deny fail-closed rather than routing to a handler that does not exist. W4/W7/W8 add
   each declaration when its responder lands.
 
-### W2 — Bearer identity, session creation, revocation (plan §2) — XL
+### W2 — Bearer identity, session creation, revocation (plan §2) — XL — **PARTIALLY LANDED**
 
 **Depends on:** D3. **Blocks:** W6, W7; the HTTP transport for 2026-07-28 entirely.
+
+**What has landed:** everything except session creation on first request. The revocation half
+— the subject struct, `jti` decoding, `RevokeJTI`/`ReviveJTI` on both backends, the operator
+surface, the audit field and the reclaim path — is D3-independent: D3 decides what mints an
+HTTP session without `initialize`, and none of that touches it. Under the plan's own rule
+(behavior-neutral work may land under a Draft ADR; wire behavior waits for `Final`) the subject
+struct is explicitly admissible, and the rest changes no existing deployment's behavior — a new
+revocation dimension alters nothing until an operator revokes something.
+
+**What has NOT landed, and why:** session creation on the first enforced request. That IS D3,
+it is the half ADR-0004's addendum was written for, and ADR-0004 is still `Draft` — `Final` is
+maintainer consensus and never a lone merge. It is also the half with real wire consequences (a
+2026-07-28 HTTP peer being served at all, and what happens to an unauthenticated one), which is
+exactly what the plan says waits.
 
 Scope:
 
@@ -269,12 +284,26 @@ Tests:
 
 Exit criteria:
 
-- [ ] ADR-0004 updated with the session-creation half and graduated to Final.
-- [ ] jti revocation end-to-end in e2e: CLI flag → control endpoint → next request denied `KILL_SWITCH` → audit record carries the token id.
-- [ ] Subject struct landed; adding JTI required no signature change beyond the struct field (demonstrated by the diff itself).
-- [ ] A 2026-07-28 host's first HTTP request serves with no `initialize`, on both auth postures D3 admits.
-- [ ] Token-id audit field: threat model + sign/verify roundtrip.
-- [ ] Benchmarks within noise; no new hot-path allocations.
+- [ ] ADR-0004 updated with the session-creation half and graduated to Final. *(The addendum is
+      WRITTEN — ADR-0004 §Addendum (2026-08-07) — so what remains is ratification, which is not a
+      criterion an implementing PR can close for itself.)*
+- [x] Subject struct landed; adding JTI required no signature change beyond the struct field
+      (demonstrated by the diff itself). *(`killswitch.Subject`; `ShouldBlock` benchmarked
+      allocation-free at 0 B/op. The Redis backend's dimensions became a declaration too —
+      `pkg/killswitch/dimension.go` — since its writer, pub/sub handler, reconcile scan, `Reset`
+      and `Status` hand-mirrored the pair across six sites.)*
+- [x] Token-id audit field: threat model + sign/verify roundtrip.
+      (`internal/audit/token_id_test.go`, including the tamper leg and the envelope bound;
+      threat model under "Per-token revocation".)
+- [x] Benchmarks within noise; no new hot-path allocations.
+      (`BenchmarkShouldBlock_SubjectIsAllocationFree`: 0 B/op, 0 allocs/op.)
+- [~] jti revocation end-to-end: CLI flag → control endpoint → next request denied `KILL_SWITCH`
+      → audit record carries the token id. *(Each leg is covered by its own test — the CLI
+      target resolver, the `/control/kill` field, the kill check's per-token match, the reclaim
+      sweep, the audit roundtrip — but they are not yet driven as one pass in `demo/e2e`, which
+      has no JWT-issuing leg to mint a `jti` with. Left for the e2e JWT leg rather than faked.)*
+- [ ] A 2026-07-28 host's first HTTP request serves with no `initialize`, on both auth postures
+      D3 admits. *(Not started: this is the D3-gated half.)*
 
 ### W3 — Header verification and emission (plan §3) — M
 
