@@ -349,17 +349,36 @@ func openerResult(rev capability.Revision, method string, resp mcp.RPCMsg) (json
 // registry exists: a third published revision must appear here without this function being
 // edited, and the candidates it names are exactly the revisions whose opener is a DIFFERENT
 // method — a revision sharing this one's opener is no remedy for the opener being absent.
+//
+// With ONE candidate the remedy is unambiguous and the line spells the pin out. With several
+// it names them all and asks the operator which the upstream implements: eunox has just
+// learned one thing about this upstream — that it lacks the opener it was handed — which is
+// not enough to pick among the rest, and picking anyway would send an operator to a second
+// revision the upstream may also lack. Deriving the list generally while recommending its
+// first element arbitrarily is the shape that reads as general and is not.
 func openerMissingHint(rev capability.Revision, code int) string {
 	if code != mcp.CodeMethodNotFound {
 		return ""
 	}
 	opened := UpstreamOpenRevision(rev)
-	candidates := alternativeOpenerRevisions(opened)
-	if len(candidates) == 0 {
-		return ""
+	return formatOpenerMissingHint(opened, alternativeOpenerRevisions(opened))
+}
+
+// formatOpenerMissingHint is openerMissingHint's wording, taking the candidate set rather
+// than deriving it — so the multi-candidate branch is reachable from a test while this build
+// still publishes exactly two revisions.
+func formatOpenerMissingHint(opened capability.Revision, candidates []string) string {
+	prefix := fmt.Sprintf("; this upstream does not implement the opener for %s", opened)
+	switch len(candidates) {
+	case 0:
+		return prefix
+	case 1:
+		return fmt.Sprintf("%s. If it speaks %s, pin `protocolVersion: %q` on this upstream — eunox opens with the pinned revision's opener and does not probe for one (see docs/conformance.md)",
+			prefix, candidates[0], candidates[0])
+	default:
+		return fmt.Sprintf("%s. Pin `protocolVersion` to whichever revision it does implement — this build also opens %s — since eunox opens with the pinned revision's opener and does not probe for one (see docs/conformance.md)",
+			prefix, strings.Join(candidates, ", "))
 	}
-	return fmt.Sprintf("; this upstream does not implement the opener for %s. If it speaks %s, pin `protocolVersion: %q` on this upstream — eunox opens with the pinned revision's opener and does not probe for one (see docs/conformance.md)",
-		opened, strings.Join(candidates, " or "), candidates[0])
 }
 
 // alternativeOpenerRevisions returns the published revisions whose opener is a different

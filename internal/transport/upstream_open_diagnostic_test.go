@@ -112,6 +112,42 @@ func TestOpenerRejection_OtherCodesCarryNoPinHint(t *testing.T) {
 	}
 }
 
+// TestOpenerMissingHint_DoesNotRecommendOneOfSeveral pins the shape the hint takes when this
+// build opens more than two revisions. eunox has learned exactly one thing about the upstream
+// — that it lacks the opener it was handed — which does not identify which of the remaining
+// revisions it speaks, so the line names them all rather than recommending the first
+// alphabetically. Driven through the registry rather than the live two-revision set, since the
+// case this guards against does not exist yet.
+func TestOpenerMissingHint_DoesNotRecommendOneOfSeveral(t *testing.T) {
+	t.Parallel()
+
+	// Driven through the wording function with a synthetic candidate set: this build
+	// publishes exactly two revisions, so the branch cannot be reached from the live
+	// registry — and a wording that only reads as general is what this guards against.
+	got := formatOpenerMissingHint(capability.Revision20251125, []string{"2026-07-28", "2027-01-01"})
+	for _, want := range []string{"2026-07-28", "2027-01-01", "whichever revision it does implement"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("hint = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, `protocolVersion: "2026-07-28"`) {
+		t.Errorf("hint = %q, must not single out one of several candidates as THE remedy", got)
+	}
+
+	// The one-candidate case — what this build actually reaches — still spells the pin out,
+	// since there the remedy is unambiguous.
+	one := formatOpenerMissingHint(capability.Revision20251125, []string{"2026-07-28"})
+	if !strings.Contains(one, `protocolVersion: "2026-07-28"`) {
+		t.Errorf("hint = %q, want the pin spelled out when there is only one candidate", one)
+	}
+
+	// No candidate at all: the line still says what went wrong, and promises nothing.
+	none := formatOpenerMissingHint(capability.Revision20251125, nil)
+	if !strings.Contains(none, "does not implement the opener") || strings.Contains(none, "protocolVersion") {
+		t.Errorf("hint = %q, want the cause with no remedy when no other revision has a different opener", none)
+	}
+}
+
 // TestAlternativeOpenerRevisions_NamesOnlyADifferentOpener pins the derivation the hint rests
 // on. A revision that shares this one's opener is no remedy for the opener being absent, and a
 // third published revision must reach the hint without this code being edited.

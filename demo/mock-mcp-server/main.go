@@ -150,8 +150,7 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 	// Gate on isRequest(): an opener *notification* (no id) must not allocate a session,
 	// or an invalid notification would leak one resident session each time.
 	if msg.Method == openerMethod() && msg.isRequest() {
-		if errMsg := checkDeclaration(msg.Params); errMsg != "" {
-			writeRPCError(w, msg.ID, -32600, errMsg)
+		if !declarationOK(w, msg) {
 			return
 		}
 		// Only the handshake revision carries a protocol session; the declaring revision
@@ -193,15 +192,22 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if errMsg := checkDeclaration(msg.Params); errMsg != "" {
-		writeRPCError(w, msg.ID, -32600, errMsg)
-		return
-	}
-
+	// Per SERVED method, never before the switch. A method this revision does not have —
+	// the other revision's opener above all — must reach the -32601 default, which is the
+	// answer that says "absent" rather than "malformed". Checking first answered a bare
+	// `initialize` -32600, which is exactly what an unpinned eunox leg sends and exactly the
+	// negative its startup diagnostic keys on, so the boundary this mock exists to show was
+	// unobservable through it.
 	switch msg.Method {
 	case "tools/list":
+		if !declarationOK(w, msg) {
+			return
+		}
 		s.handleToolsList(w, msg)
 	case "tools/call":
+		if !declarationOK(w, msg) {
+			return
+		}
 		s.handleToolsCall(w, msg)
 	default:
 		writeRPCError(w, msg.ID, -32601, "method not found: "+msg.Method)
@@ -367,6 +373,17 @@ func writeResult(w http.ResponseWriter, id *json.RawMessage, result interface{})
 	resp := rpcMsg{JSONRPC: "2.0", ID: id, Result: res}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// declarationOK writes the refusal and reports false when msg does not carry the
+// per-request protocol declaration the served revision requires. Only ever called for a
+// method this revision SERVES; see the switch in handlePost for why that ordering matters.
+func declarationOK(w http.ResponseWriter, msg rpcMsg) bool { //nolint:gocritic // hugeParam: rpcMsg passed by value intentionally (mirrors the rest of this file)
+	if errMsg := checkDeclaration(msg.Params); errMsg != "" {
+		writeRPCError(w, msg.ID, -32600, errMsg)
+		return false
+	}
+	return true
 }
 
 func writeRPCError(w http.ResponseWriter, id *json.RawMessage, code int, message string) {

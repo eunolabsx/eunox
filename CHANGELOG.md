@@ -2725,8 +2725,12 @@ Section conventions:
   that cannot leak. `ttlMs` is preserved verbatim as a freshness hint. Two deliberate limits,
   both stated where they are taken: the clamp never ADDS the member (2025-11-25 does not define
   it, and old-revision output stays byte-identical), and the `--audit` wiretap passthrough keeps
-  the upstream's own scope, since it forwards a catalog identical for every caller. No
-  2025-11-25 deployment is affected — that revision has no `cacheScope`.
+  the upstream's own scope, since it forwards a catalog identical for every caller. What the
+  clamp does not cover is stated on the finding: a `resources/read` reply masked by a
+  delegation chain's composed `redactFields` is caller-specific and still carries its
+  upstream `cacheScope`, because the clamp sits on the list-filter encoder and that reply
+  does not pass through one. No 2025-11-25 deployment is affected — that revision has no
+  `cacheScope`.
 
 - **A request the engine cannot anchor writes no state, on every path — not only the ones
   that reach a decision.** Under `taskAnchoredState` an authenticated caller whose token

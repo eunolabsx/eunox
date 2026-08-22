@@ -55,17 +55,32 @@ func TestOpenerBoundary(t *testing.T) {
 		if w.Code != http.StatusOK || decodeMsg(t, w).Error != nil {
 			t.Fatalf("the declaring revision must serve server/discover: %d %s", w.Code, w.Body.String())
 		}
-		refused := decodeMsg(t, post(t, srv, declaringBody(2, "initialize", ""), ""))
-		if refused.Error == nil || refused.Error.Code != -32601 {
-			t.Fatalf("the declaring revision must answer initialize -32601, got %+v", refused.Error)
+		// BOTH spellings of the other revision's opener must answer -32601. The bare one is
+		// the load-bearing case: it is exactly what an unpinned eunox leg sends, and it
+		// carries no declaration — so a mock that checked the declaration before dispatch
+		// answered -32600 and the boundary was invisible through the one message that
+		// actually probes it. Testing only the declared spelling masked precisely that.
+		for _, body := range []string{
+			declaringBody(2, "initialize", ""),
+			`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"eunox","version":"1"}}}`,
+		} {
+			refused := decodeMsg(t, post(t, srv, body, ""))
+			if refused.Error == nil || refused.Error.Code != -32601 {
+				t.Fatalf("the declaring revision must answer initialize -32601, got %+v (body: %s)", refused.Error, body)
+			}
 		}
 	})
 	withRevision(t, revisionHandshake, func() {
 		srv := newServer()
 		sid := initSession(t, srv)
-		refused := decodeMsg(t, post(t, srv, `{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}`, sid))
-		if refused.Error == nil || refused.Error.Code != -32601 {
-			t.Fatalf("the handshake revision must answer server/discover -32601, got %+v", refused.Error)
+		for _, body := range []string{
+			`{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}`,
+			declaringBody(2, "server/discover", ""),
+		} {
+			refused := decodeMsg(t, post(t, srv, body, sid))
+			if refused.Error == nil || refused.Error.Code != -32601 {
+				t.Fatalf("the handshake revision must answer server/discover -32601, got %+v (body: %s)", refused.Error, body)
+			}
 		}
 	})
 }
