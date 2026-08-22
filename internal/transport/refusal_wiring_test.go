@@ -315,7 +315,7 @@ func TestUpstreamlessLeg_AnAllowRefusesRatherThanNilCalling(t *testing.T) {
 	resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall},
 		capability.EnforceResponse{Decision: capability.DecisionAllow},
-		capability.MethodToolsCall, "t", "t", "tool", false, func(mcp.RPCMsg) map[string]interface{} { return nil })
+		capability.MethodToolsCall, "t", "t", "tool", false, func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 
 	require.Len(t, rec.records, 1)
 	assert.Equal(t, "deny", rec.records[0].decision)

@@ -27,6 +27,43 @@ Section conventions:
 
 ### Added
 
+- **The 2026-07-28 JSON-RPC error-code partition, held structurally.** That revision splits what
+  was one free range: -32000..-32019 stays implementation-defined, and -32020..-32099 becomes the
+  specification's to assign as the protocol grows. Every code eunox mints now sits in the
+  implementation-defined band, is one of JSON-RPC's own pre-defined codes used for what it means,
+  or is a reserved code the spec has ALREADY assigned and eunox is emitting that assigned meaning
+  — today exactly one, `-32022`, and adding a second is a reviewed claim rather than a range check.
+
+  Held by a build-time guard rather than a list: it walks every package in the module and fails on
+  any integer constant, or bare error `Code` literal, landing in a band eunox may not mint into.
+  The failure it exists to catch is a code that does not exist yet — a reserved integer ships, the
+  spec later assigns it a meaning, and every host that learns that meaning silently reads an eunox
+  denial as the protocol error. There is no version to notice it and no error anywhere. The same
+  collision was already live in the other direction under 2025-11-25, where eunox's
+  `-32001`/`-32002`/`-32003` met that revision's own HeaderMismatch, resource-not-found and
+  MissingRequiredClientCapability.
+
+- **An upstream's resource-not-found is re-spelled across a mismatched revision pair.** 2025-11-25
+  assigns `-32002`; 2026-07-28 moves that meaning to `-32602` and frees `-32002` into the
+  implementation-defined band. An upstream ERROR was crossing the boundary untouched — every gate
+  in the result translation tests the result body, which an error response does not carry, so it
+  matched the "nothing to do" branch — and a 2026-07-28 host was reading `-32002` as some
+  implementation's private code, losing the one fact the upstream reported.
+
+  Translated in ONE direction, and the asymmetry is deliberate. Old to new is a widening: under
+  2025-11-25 the spec gives `-32002` exactly one meaning. New to old is a narrowing and is
+  refused, because 2026-07-28 puts resource-not-found on `-32602` alongside JSON-RPC's own
+  invalid-params, so remapping would assert a missing resource about what may have been a
+  malformed request. Scoped to methods that address a resource, derived from the same mapping the
+  audit layer stamps `target_type` from: an upstream is entitled to its own implementation-defined
+  codes, and a `-32002` from `tools/call` is not reporting a missing resource. `ttlMs`'s rule, one
+  layer down — never fabricate on a peer's behalf.
+
+  The audit record names the **upstream's** code, not the forwarded one: `_eunox_upstream_error_code`
+  reads `-32002` even where the host was handed `-32602`. The field names the upstream, a signed
+  record must not say otherwise, and the two are indistinguishable after the rewrite — while the
+  forwarded value stays derivable from the method, the revisions and that code.
+
 - **The mismatched-revision translation boundary (ADR-0006, ratified 2026-08-22 — the first
   `Final` ADR under the current lifecycle).** A host and an upstream on
   different MCP revisions were refused wholesale; the stateless-safe subset now crosses.

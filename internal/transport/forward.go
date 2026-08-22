@@ -844,7 +844,7 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 // two must be the same PDP" cannot silently drift — every call site is a dispatchParams
 // handler already holding it. nil means no decision point is in hand (session-creating
 // initialize, a test), so no clear can be committed.
-func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declassifyCommitter, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(mcp.RPCMsg) map[string]interface{}) (reply mcp.RPCMsg) {
+func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declassifyCommitter, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(context.Context, mcp.RPCMsg) map[string]interface{}) (reply mcp.RPCMsg) {
 	// A message with NO ID has no reply channel — JSON-RPC forbids answering it — and the zero
 	// RPCMsg is how this package spells "nothing to send" (see refusalResponse).
 	//
@@ -1019,7 +1019,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, committer declas
 		// Through mergeAuditDetails, never a write into allowDetails' return: the tools/call
 		// closure's base under --audit is the caller's live parsed argument map, so writing
 		// into whatever that chain hands back would rewrite the request being described.
-		details := mergeAuditDetails(allowDetails(upResp), declDetail)
+		details := mergeAuditDetails(allowDetails(ctx, upResp), declDetail)
 		// A call that CLEARED flow labels takes the recorder that carries the approval; every
 		// other call takes the plain one. The branch is on what the commit actually CHANGED,
 		// not on what was authorized — a no-op clear would otherwise record an approver for a
@@ -1206,11 +1206,26 @@ func auditObligationNames(obligs []capability.Obligation) []string {
 // upstreamErrorDetail returns a structured audit detail noting that the upstream returned a
 // JSON-RPC error on an otherwise-allowed call, or nil for a clean success. The numeric code
 // is recorded — never the message, which can carry sensitive content.
-func upstreamErrorDetail(upResp mcp.RPCMsg) map[string]interface{} {
+func upstreamErrorDetail(ctx context.Context, upResp mcp.RPCMsg) map[string]interface{} {
 	if upResp.Error == nil {
 		return nil
 	}
-	return map[string]interface{}{audit.UpstreamErrorCodeKey: upResp.Error.Code}
+	return map[string]interface{}{audit.UpstreamErrorCodeKey: auditedUpstreamErrorCode(ctx, upResp)}
+}
+
+// auditedUpstreamErrorCode is the code the UPSTREAM sent, which is what a field named for the
+// upstream must carry.
+//
+// upResp.Error.Code is the code bound for the HOST, and on a mismatched revision pair the two can
+// differ: the boundary re-spells resource-not-found, below this record and on the same object.
+// Recording the forwarded value made the tape state something the upstream never said, with
+// nothing on the record to distinguish it from an upstream that really said it. See
+// upstreamCodeRewrite for why the fact travels by context rather than by moving the rewrite.
+func auditedUpstreamErrorCode(ctx context.Context, upResp mcp.RPCMsg) int {
+	if original, rewritten := upstreamCodeBeforeRewrite(ctx); rewritten {
+		return original
+	}
+	return upResp.Error.Code
 }
 
 // serverRequestParams bundles the per-transport bits the shared server-initiated request core
