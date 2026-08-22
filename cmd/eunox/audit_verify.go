@@ -158,10 +158,11 @@ Each is verified as its OWN chain, with its own key and its own verdict — reco
 from different enforcement points do not form one chain, since seq and prev_hmac
 are per writer. With --task-id, the records those tapes share for one task are
 then printed as one sequence, each attributed by the ` + "`pep`" + ` it was written with.
-That sequence is a reconstruction, not a verdict: it is ordered by each writer's
-own clock (eunox neither requires nor checks clock sync), and a call missing from
-an enforcement point that never handled it is expected rather than evidence of
-loss. Only the per-tape verdicts gate the exit code.
+That sequence is a reconstruction, not a verdict: within a tape it follows the
+order the tape proves, across tapes it rests on each writer's own clock (eunox
+neither requires nor checks clock sync), and a call missing from an enforcement
+point that never handled it is expected rather than evidence of loss. Only the
+per-tape verdicts gate the exit code.
 
 Exit codes:
   0  Every record verified and the tamper-evident chain is intact, on every tape.
@@ -189,7 +190,7 @@ func cmdAuditVerify(args []string) int {
 	fs.Var(&logs, "audit-log", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl). Repeatable:\neach occurrence names one enforcement point's tape, verified as its own\nchain with its own verdict.")
 	fs.Var(&keys, "audit-key-path", "Path to the HMAC signing key for the audit log (default: ~/.eunox/audit.key).\nOverrides EUNOX_AUDIT_KEY_PATH environment variable. Repeatable: pass one\n(every tape shares a key) or exactly one per --audit-log, in the same order.")
 	requestID := fs.String("request-id", "", "Report (count and print) only the record with this request ID. Every record\nis still HMAC-verified and the tamper-evident chain is always checked; this\nfilter narrows the report, not the verification.")
-	taskID := fs.String("task-id", "", "Print the sequence of records carrying this task ID, joined across every\n--audit-log and attributed by the pep field each record was written\nwith. The join is a reconstruction, not a verdict: see the notes it prints.")
+	taskID := fs.String("task-id", "", "Print the sequence of records carrying this task ID, joined across every\n--audit-log and attributed by the pep field each record was written with.\nLike --request-id, it also narrows which records are counted and printed\n(others fall to the skipped tally); every record is still HMAC-verified and\nthe tamper-evident chain is always checked. The join is a reconstruction,\nnot a verdict: see the notes it prints.")
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
 	if code, done := parseReaderArgs("audit-verify", fs, args); done {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,31 +53,106 @@ func TestOrderJoinedRecords_OrdersByWriterClockAndBreaksTiesDeterministically(t 
 	if recs[0].Tape != 2 || recs[0].Seq != 7 {
 		t.Fatalf("OrderJoinedRecords must not reorder its input: %+v", recs[0])
 	}
-	if len(ord.ClockSkewedTapes) != 0 || len(ord.UnattributedTapes) != 0 || len(ord.Unordered) != 0 {
+	if len(ord.NonMonotonicTapes) != 0 || len(ord.UnattributedTapes) != 0 || len(ord.Unordered) != 0 {
 		t.Fatalf("clean input must produce no caveats: %+v", ord)
 	}
 }
 
-// TestOrderJoinedRecords_ReportsClockSkewWithinATape covers the one part of the ordering
-// assumption a local reader can FALSIFY. Across tapes nothing is provable — the clocks are
-// independent — but within one tape seq order is signed and contiguity-checked, so a later
-// seq carrying an earlier time is that writer disagreeing with itself, which makes every
-// cross-tape position resting on that clock unreliable.
-func TestOrderJoinedRecords_ReportsClockSkewWithinATape(t *testing.T) {
+// TestOrderJoinedRecords_KeepsATapesProvenOrder is the ordering rule's load-bearing half.
+// A tape's own `time` is NOT monotonic in its `seq` even when nothing is wrong — the sink
+// stamps `time` on the calling goroutine and assigns `seq` in its drainer, so concurrent
+// recorders are stamped in one order and sequenced in the other. Sorting on the raw
+// timestamp would print a tape's records out of the only order that tape PROVES, so a
+// record is never placed before a same-tape record its seq says came first.
+func TestOrderJoinedRecords_KeepsATapesProvenOrder(t *testing.T) {
 	recs := []JoinedRecord{
 		{Tape: 1, Seq: 1, At: at(t, "2026-08-22T10:00:05Z"), TimeOK: true, PEP: "mcp:edge-1"},
 		{Tape: 1, Seq: 2, At: at(t, "2026-08-22T10:00:01Z"), TimeOK: true, PEP: "mcp:edge-1"},
-		{Tape: 2, Seq: 1, At: at(t, "2026-08-22T10:00:02Z"), TimeOK: true, PEP: "mcp:edge-2"},
-		{Tape: 2, Seq: 2, At: at(t, "2026-08-22T10:00:03Z"), TimeOK: true, PEP: "mcp:edge-2"},
+		{Tape: 2, Seq: 1, At: at(t, "2026-08-22T10:00:06Z"), TimeOK: true, PEP: "mcp:edge-2"},
 	}
 	ord := OrderJoinedRecords(recs)
-	if !reflect.DeepEqual(ord.ClockSkewedTapes, []int{1}) {
-		t.Fatalf("tape 1's clock moved backwards and must be named: got %v", ord.ClockSkewedTapes)
+	got := make([][2]int, 0, len(ord.Ordered))
+	for _, r := range ord.Ordered {
+		got = append(got, [2]int{r.Tape, int(r.Seq)})
 	}
-	// A tape whose records simply INTERLEAVE with another's is not skew: that is the
-	// normal shape of a task crossing a hop, and reporting it would make the note noise.
-	if len(ord.Ordered) != 4 {
+	if want := [][2]int{{1, 1}, {1, 2}, {2, 1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("tape 1's seq order must survive its own non-monotonic clock: got %v, want %v", got, want)
+	}
+	// And the reader is told, since the TIME column then reads backwards down the table.
+	if !reflect.DeepEqual(ord.NonMonotonicTapes, []int{1}) {
+		t.Fatalf("tape 1 must be named as non-monotonic: got %v", ord.NonMonotonicTapes)
+	}
+}
+
+// TestOrderJoinedRecords_InterleavingIsNotNonMonotonic guards the note against becoming
+// noise: two tapes whose records interleave is the NORMAL shape of a task crossing a hop,
+// and only a tape disagreeing with ITSELF is reported.
+func TestOrderJoinedRecords_InterleavingIsNotNonMonotonic(t *testing.T) {
+	recs := []JoinedRecord{
+		{Tape: 1, Seq: 1, At: at(t, "2026-08-22T10:00:01Z"), TimeOK: true, PEP: "mcp:edge-1"},
+		{Tape: 2, Seq: 1, At: at(t, "2026-08-22T10:00:02Z"), TimeOK: true, PEP: "mcp:edge-2"},
+		{Tape: 1, Seq: 2, At: at(t, "2026-08-22T10:00:03Z"), TimeOK: true, PEP: "mcp:edge-1"},
+	}
+	ord := OrderJoinedRecords(recs)
+	if len(ord.NonMonotonicTapes) != 0 {
+		t.Fatalf("interleaving tapes must not be reported: %v", ord.NonMonotonicTapes)
+	}
+	if len(ord.Ordered) != 3 {
 		t.Fatalf("every record with a parseable time is orderable: %+v", ord.Ordered)
+	}
+}
+
+// TestOrderJoinedRecords_ConcurrentlyWrittenTapeIsNotAccused is the regression this rule
+// exists for: an intact tape written by concurrent recorders has a `time` that does not
+// track its `seq`, and the report must neither reorder its records nor tell the operator
+// a clock moved backwards. Verified end to end through a real sink rather than with
+// hand-built records, since the stamping split that causes it is the sink's.
+func TestOrderJoinedRecords_ConcurrentlyWrittenTapeIsNotAccused(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	sink, err := Open(logPath, keyPath, 0, 0,
+		WithIdentity(func(context.Context) Identity { return Identity{TaskID: "task-A"} }))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 25; i++ {
+				sink.RecordAllow(context.Background(), "s", "read_file", "tools/call", nil, nil, false, nil, nil)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var got []JoinedRecord
+	res, err := VerifyLog(strings.NewReader(string(mustReadFile(t, logPath))), verifierFor(t, keyPath), VerifyOptions{
+		TaskID:  "task-A",
+		Collect: func(r JoinedRecord) { r.Tape = 1; got = append(got, r) },
+	})
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if !res.OK() || res.Total != 100 {
+		t.Fatalf("the tape is intact: %+v", res)
+	}
+	// The proven order is seq order, and that is what the sequence must print — whatever
+	// the timestamps say.
+	ord := OrderJoinedRecords(got)
+	if len(ord.Ordered) != 100 {
+		t.Fatalf("every record must be placed: %d", len(ord.Ordered))
+	}
+	for i, r := range ord.Ordered {
+		if r.Seq != uint64(i+1) {
+			t.Fatalf("record %d out of the tape's proven order: seq %d", i, r.Seq)
+		}
 	}
 }
 

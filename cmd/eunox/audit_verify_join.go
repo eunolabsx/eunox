@@ -15,6 +15,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -90,12 +91,15 @@ func resolveAuditTapes(logs, keys repeatedPath) ([]auditTape, error) {
 		}
 		// A tape named twice would be verified twice and would contribute every one of
 		// its records to the join twice, which reads as a duplicated sequence rather
-		// than as the operator's typo it is.
-		if prev, dup := seen[logPath]; dup {
+		// than as the operator's typo it is. Compared on the NORMALIZED path, because
+		// the typo this catches is `./audit.jsonl` beside `audit.jsonl` at least as
+		// often as the same string twice, and ResolveLogPath only expands "~".
+		tapeKey := normalizedTapeKey(logPath)
+		if prev, dup := seen[tapeKey]; dup {
 			return nil, fmt.Errorf("eunox audit-verify: --audit-log %s names the same tape as tape %d; "+
 				"each tape may be named once", logPath, prev)
 		}
-		seen[logPath] = i + 1
+		seen[tapeKey] = i + 1
 
 		key := ""
 		switch {
@@ -111,6 +115,22 @@ func resolveAuditTapes(logs, keys repeatedPath) ([]auditTape, error) {
 		tapes = append(tapes, auditTape{num: i + 1, logPath: logPath, keyPath: keyPath})
 	}
 	return tapes, nil
+}
+
+// normalizedTapeKey is the identity two --audit-log values are compared on: the path made
+// absolute and lexically clean, so `./audit.jsonl` and `audit.jsonl` are one tape.
+//
+// Lexical only. Two paths reaching one file through a symlink or a hard link still read as
+// two tapes and are verified (and joined) twice — closing that needs the file to exist to
+// stat, and a tape that does not exist yet has its own report (auditLogMissingHint) that a
+// stat error would replace with something less useful. Abs failing (no working directory)
+// falls back to Clean rather than refusing: a lexical comparison is what this had before,
+// and losing the whole run over a cwd lookup is worse than losing the `./` case.
+func normalizedTapeKey(logPath string) string {
+	if abs, err := filepath.Abs(logPath); err == nil {
+		return abs
+	}
+	return filepath.Clean(logPath)
 }
 
 // verifiedRings caches one verification ring per resolved key path, so the shared-key
@@ -155,9 +175,11 @@ func printTapeVerdict(t auditTape, res audit.VerifyResult) {
 func printJoinHeader(taskID string, tapes int, ord audit.JoinOrdering) {
 	fmt.Printf("\nSequence for task_id=%s: %d record(s) across %d tape(s).\n",
 		audit.SanitizeAuditField(taskID), len(ord.Ordered)+len(ord.Unordered), tapes)
-	fmt.Println("Ordering rests on each writer's own clock: `time` is stamped by the enforcement point that")
-	fmt.Println("wrote the record, and eunox neither requires nor checks clock sync between enforcement")
-	fmt.Println("points. `seq` is per tape and orders nothing across tapes, so records from different tapes")
+	fmt.Println("Within a tape the order is proven and is what this follows: `seq` is signed and its")
+	fmt.Println("contiguity is checked, so a record is never placed before a same-tape record its `seq`")
+	fmt.Println("says came first. ACROSS tapes nothing is proven — `seq` orders nothing between writers, and")
+	fmt.Println("the tapes are interleaved by `time`, which each enforcement point stamps from its own clock;")
+	fmt.Println("eunox neither requires nor checks clock sync between them. Records from different tapes")
 	fmt.Println("bearing the same instant are printed in the order the tapes were named, not a proven one.")
 	fmt.Println("Absence is not loss: a call an enforcement point never handled is expected to be missing")
 	fmt.Println("from its tape. Only a gap INSIDE one chain is evidence, and that is the per-tape verdict")
@@ -167,13 +189,18 @@ func printJoinHeader(taskID string, tapes int, ord audit.JoinOrdering) {
 // printJoinCaveats reports what the ordering could not establish and what the local
 // files DO falsify about it.
 func printJoinCaveats(ord audit.JoinOrdering, tapes []auditTape) {
-	if len(ord.ClockSkewedTapes) > 0 {
-		// The one part of the clock assumption a local reader can disprove: within a
-		// tape, seq order is signed and contiguity-checked, so a later seq carrying an
-		// earlier time is that writer disagreeing with itself.
-		fmt.Printf("Note: tape(s) %s carry a later seq with an EARLIER time — that writer's clock moved "+
-			"backwards, so the ordering above cannot be trusted for their records (order them by seq "+
-			"within each tape instead).\n", tapeList(ord.ClockSkewedTapes, tapes))
+	if len(ord.NonMonotonicTapes) > 0 {
+		// Why the TIME column can read backwards down the table: those rows are placed in
+		// the order their tape PROVES, which the timestamps do not reproduce. Stated
+		// without naming a cause, because this cannot establish one — see
+		// audit.JoinOrdering.NonMonotonicTapes.
+		fmt.Printf("Note: on tape(s) %s the recorded `time` does not increase with `seq`, so the TIME "+
+			"column above does not increase down the table: within a tape `seq` is the proven order "+
+			"(it is signed and contiguity-checked) and the sequence follows it. That is not by itself "+
+			"a clock fault — a writer stamps `time` on the calling goroutine and assigns `seq` in its "+
+			"drainer, so concurrent recorders on a busy tape are stamped in one order and sequenced in "+
+			"the other — but a clock that did move backwards looks the same from here.\n",
+			tapeList(ord.NonMonotonicTapes, tapes))
 	}
 	if len(ord.UnattributedTapes) > 0 {
 		fmt.Printf("Note: tape(s) %s contributed record(s) carrying no `pep`, so they are attributed by "+

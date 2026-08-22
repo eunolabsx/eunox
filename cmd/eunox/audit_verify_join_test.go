@@ -90,7 +90,8 @@ func TestCmdAuditVerify_CrossPEP_JoinsOnTaskAndAttributesByPEP(t *testing.T) {
 	// The assumption the join rests on has to be on the page, above the table: an
 	// ordering presented bare reads as an order that was established.
 	for _, want := range []string{
-		"Ordering rests on each writer's own clock",
+		"Within a tape the order is proven",
+		"ACROSS tapes nothing is proven",
 		"neither requires nor checks clock sync",
 		"Absence is not loss",
 		"never a verdict",
@@ -99,7 +100,7 @@ func TestCmdAuditVerify_CrossPEP_JoinsOnTaskAndAttributesByPEP(t *testing.T) {
 			t.Errorf("the join must state %q:\n%s", want, out)
 		}
 	}
-	if strings.Index(out, "Ordering rests on") > strings.Index(out, "TIME") {
+	if strings.Index(out, "Within a tape the order is proven") > strings.Index(out, "TIME") {
 		t.Error("the ordering assumption must be stated BEFORE the table, not under it")
 	}
 }
@@ -242,6 +243,67 @@ func TestCmdAuditVerify_CrossPEP_DuplicateTapeRefused(t *testing.T) {
 	if !strings.Contains(errOut, "names the same tape as tape 1") {
 		t.Errorf("the refusal must say which tape it duplicates: %q", errOut)
 	}
+
+	// The same tape spelled two ways is the commoner form of that typo, and a lexical
+	// comparison of the raw --audit-log values misses it: ResolveLogPath only expands
+	// "~", so `./x.jsonl` and `x.jsonl` reached the guard as different strings and the
+	// tape was verified twice and joined twice.
+	t.Chdir(dir)
+	code, _, errOut = runAuditVerifyCapturing(t,
+		"--audit-log", "edge.jsonl", "--audit-log", "./edge.jsonl",
+		"--audit-key-path", keyA, "--task-id", "task-A")
+	if code != auditVerifyUsageExit {
+		t.Fatalf("the same tape spelled two ways is still one tape (exit %d), got %d", auditVerifyUsageExit, code)
+	}
+	if !strings.Contains(errOut, "names the same tape as tape 1") {
+		t.Errorf("the refusal must name the duplicate: %q", errOut)
+	}
+}
+
+// TestCmdAuditVerify_TaskIDNarrowsTheReportedTallies pins what --task-id does BESIDES
+// printing a sequence: like --request-id it narrows what is counted, so the tape's other
+// records fall to the skipped tally. The help says so; this is what makes that true.
+// Verification is unaffected — every record is still checked.
+func TestCmdAuditVerify_TaskIDNarrowsTheReportedTallies(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "mixed.jsonl")
+	keyPath := filepath.Join(dir, "mixed.key")
+	task := "task-A"
+	sink, err := audit.Open(logPath, keyPath, 0, 0,
+		audit.WithIdentity(func(context.Context) audit.Identity { return audit.Identity{TaskID: task} }))
+	if err != nil {
+		t.Fatalf("audit.Open: %v", err)
+	}
+	sink.RecordAllow(context.Background(), "s", "read_file", "tools/call", nil, nil, false, nil, nil)
+	task = "task-B"
+	sink.RecordAllow(context.Background(), "s", "list_dir", "tools/call", nil, nil, false, nil, nil)
+	sink.RecordAllow(context.Background(), "s", "stat", "tools/call", nil, nil, false, nil, nil)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("sink.Close: %v", err)
+	}
+
+	code, out, errOut := runAuditVerifyCapturing(t,
+		"--audit-log", logPath, "--audit-key-path", keyPath, "--task-id", "task-A")
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	if !strings.Contains(out, "Checked 3 record(s): 1 valid, 0 invalid, 2 skipped") {
+		t.Errorf("--task-id must narrow the tallies as --request-id does:\n%s", out)
+	}
+	// And the help must say so, or the skipped tally reads as records that went unchecked.
+	if !strings.Contains(auditVerifyHelp(t), "narrows which records are counted and printed") {
+		t.Error("--task-id's help must state that it narrows counting, not only printing")
+	}
+}
+
+// auditVerifyHelp renders the subcommand's --help text.
+func auditVerifyHelp(t *testing.T) string {
+	t.Helper()
+	var out string
+	_ = captureStderr(t, func() {
+		out = captureStdout(t, func() { _ = cmdAuditVerify([]string{"--help"}) })
+	})
+	return out
 }
 
 // TestCmdAuditVerify_CrossPEP_UnknownTaskSaysSo asserts the fourth design point: a task

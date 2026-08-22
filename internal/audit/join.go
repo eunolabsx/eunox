@@ -86,26 +86,32 @@ type JoinedRecord struct {
 //
 // The distinction the type exists to keep: Ordered is a PRESENTATION, not a verdict.
 // Within one tape, order is proven — seq is inside the signature and its contiguity is
-// checked. Across tapes nothing is proven: the records carry each writer's own clock,
-// and eunox neither requires nor checks clock sync between enforcement points. So a
-// consumer must not read Ordered as "this is what happened in this order"; it is "this
-// is what each writer said the time was". ClockSkewedTapes names the tapes that
-// disagree with themselves, which is the one part of that assumption a local reader CAN
-// falsify.
+// checked — and the ordering FOLLOWS it. Across tapes nothing is proven: the records
+// carry each writer's own clock, and eunox neither requires nor checks clock sync
+// between enforcement points. So a consumer must not read Ordered as "this is what
+// happened in this order"; it is "this is each tape's proven order, interleaved by what
+// each writer said the time was".
 type JoinOrdering struct {
-	// Ordered holds every record whose time parsed, oldest first by that time. Ties
-	// break on (tape, seq) so the output is deterministic — never so it is right: two
-	// records stamped the same instant by different writers have no established order.
+	// Ordered holds every record whose time parsed, oldest first by that time — except
+	// that a record is never placed before a same-tape record its seq proves came
+	// first (see clampedPlacement). Ties break on (tape, seq) so the output is
+	// deterministic, never so it is right: two records stamped the same instant by
+	// different writers have no established order.
 	Ordered []JoinedRecord
 	// Unordered holds the records whose signed `time` does not parse, in collection
 	// order. They belong to the sequence but have no position in it.
 	Unordered []JoinedRecord
-	// ClockSkewedTapes names (1-based) the tapes whose OWN records disagree with
-	// themselves: a later seq carrying an earlier time. seq order is signed and
-	// contiguity-checked, so within a tape it is authoritative — a disagreement means
-	// that writer's clock moved backwards, and the cross-tape ordering, which rests on
-	// nothing BUT these clocks, cannot be trusted for those records.
-	ClockSkewedTapes []int
+	// NonMonotonicTapes names (1-based) the tapes whose recorded `time` does not
+	// increase with `seq`, so the sequence had to place at least one of their records
+	// later than its own timestamp to keep the order that tape PROVES.
+	//
+	// It is deliberately not called clock skew, because it does not establish one: the
+	// sink stamps `time` on the CALLING goroutine and assigns `seq` in its drainer, so
+	// two concurrent recorders on a busy tape are routinely stamped in one order and
+	// sequenced in the other, on a tape whose clock never moved. A writer whose clock
+	// really did move backwards is indistinguishable from here. What the name does say
+	// is the thing a reader needs: for these tapes the TIME column is not the order.
+	NonMonotonicTapes []int
 	// UnattributedTapes names (1-based) the tapes that contributed records carrying no
 	// `pep`. Their records are attributed by file path instead, which does not survive
 	// the merge into a SIEM that the field exists for.
@@ -121,63 +127,96 @@ type JoinOrdering struct {
 // the per-tape sections print.
 func OrderJoinedRecords(recs []JoinedRecord) JoinOrdering {
 	var out JoinOrdering
-	// Skew is computed over COLLECTION order, before the sort: that order is file
-	// order within each tape, which is the order the seq contiguity check ran in.
-	// Sorting first would destroy exactly the sequence being tested.
-	out.ClockSkewedTapes = skewedTapes(recs)
 	out.UnattributedTapes = unattributedTapes(recs)
+
+	placed, nonMonotonic := clampedPlacement(recs)
 	for i := range recs {
-		if recs[i].TimeOK {
-			out.Ordered = append(out.Ordered, recs[i])
-			continue
+		if !recs[i].TimeOK {
+			out.Unordered = append(out.Unordered, recs[i])
 		}
-		out.Unordered = append(out.Unordered, recs[i])
 	}
+	out.NonMonotonicTapes = nonMonotonic
 	// Stable, and with an explicit total order on the tie: two writers stamping the same
 	// instant is common at low resolution, and a report whose line order changes between
-	// two runs over the same bytes is one an auditor cannot diff.
-	sort.SliceStable(out.Ordered, func(i, j int) bool {
-		a, b := out.Ordered[i], out.Ordered[j]
-		if !a.At.Equal(b.At) {
-			return a.At.Before(b.At)
+	// two runs over the same bytes is one an auditor cannot diff. Sorted on the CLAMPED
+	// instant — which is what makes the tie-break on seq restore a tape's own order
+	// rather than merely make an arbitrary one repeatable — so the sort runs over the
+	// placements and the records are extracted after, never the other way round: sorting
+	// the records while indexing a parallel slice reads a different record's instant the
+	// moment the first swap lands.
+	sort.SliceStable(placed, func(i, j int) bool {
+		a, b := &placed[i], &placed[j]
+		if !a.at.Equal(b.at) {
+			return a.at.Before(b.at)
 		}
-		if a.Tape != b.Tape {
-			return a.Tape < b.Tape
+		if a.rec.Tape != b.rec.Tape {
+			return a.rec.Tape < b.rec.Tape
 		}
-		return a.Seq < b.Seq
+		return a.rec.Seq < b.rec.Seq
 	})
+	out.Ordered = make([]JoinedRecord, 0, len(placed))
+	for i := range placed {
+		out.Ordered = append(out.Ordered, placed[i].rec)
+	}
 	return out
 }
 
-// skewedTapes reports which tapes carry a record whose time precedes that of an earlier
-// record on the SAME tape. Only records with a parseable time and an advancing seq are
-// compared: a repeated or lower seq within one tape is that tape's own chain finding,
-// already reported by its verdict, and reading it as clock skew would report one fault
-// twice under the wrong name.
-func skewedTapes(recs []JoinedRecord) []int {
+// placement pairs a record with the instant the sequence places it at: its own `time`,
+// raised to that of any earlier-seq record on the same tape.
+type placement struct {
+	rec JoinedRecord
+	at  time.Time
+}
+
+// clampedPlacement computes each orderable record's placement instant and reports which
+// tapes needed raising.
+//
+// The clamp is what keeps a tape's PROVEN order intact inside a presentation that
+// otherwise rests on unproven clocks. Within a tape `seq` is authoritative — it is
+// signed and its contiguity is checked — while `time` is not monotonic in it even on a
+// healthy tape: the sink stamps `time` on the calling goroutine and assigns `seq` in its
+// drainer, so two concurrent recorders are routinely stamped in one order and sequenced
+// in the other. Sorting on the raw timestamp would then print a tape's own records out
+// of the order that tape proves, which is the one ordering claim this report CAN make.
+//
+// Raising rather than substituting seq outright, because the instant is still what
+// interleaves the tapes; the clamp only forbids a record from being placed before a
+// same-tape record that provably preceded it.
+//
+// It walks COLLECTION order, which is file order within each tape — the order the seq
+// contiguity check ran in — and only advances on a record whose seq actually increases.
+// A repeated or lower seq within one tape is that tape's own chain finding, already
+// reported by its verdict, and letting it move the high-water mark would report one
+// fault twice under a second name.
+func clampedPlacement(recs []JoinedRecord) (placed []placement, nonMonotonic []int) {
 	type mark struct {
 		at  time.Time
 		seq uint64
 	}
-	last := map[int]mark{}
-	seen := map[int]bool{}
-	var out []int
+	high := map[int]mark{}
+	raised := map[int]bool{}
+	placed = make([]placement, 0, len(recs))
 	for i := range recs {
 		r := &recs[i]
 		if !r.TimeOK {
 			continue
 		}
-		prev, ok := last[r.Tape]
-		if ok && r.Seq > prev.seq && r.At.Before(prev.at) && !seen[r.Tape] {
-			seen[r.Tape] = true
-			out = append(out, r.Tape)
+		at := r.At
+		prev, ok := high[r.Tape]
+		if ok && r.Seq > prev.seq && at.Before(prev.at) {
+			at = prev.at
+			if !raised[r.Tape] {
+				raised[r.Tape] = true
+				nonMonotonic = append(nonMonotonic, r.Tape)
+			}
 		}
 		if !ok || r.Seq > prev.seq {
-			last[r.Tape] = mark{at: r.At, seq: r.Seq}
+			high[r.Tape] = mark{at: at, seq: r.Seq}
 		}
+		placed = append(placed, placement{rec: *r, at: at})
 	}
-	sort.Ints(out)
-	return out
+	sort.Ints(nonMonotonic)
+	return placed, nonMonotonic
 }
 
 // unattributedTapes reports which tapes contributed a record carrying no `pep`.

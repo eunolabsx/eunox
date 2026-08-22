@@ -685,10 +685,11 @@ each row attributed by the `pep` its writer stamped. Pass one `--audit-key-path`
 when the enforcement points share a signing key; the rings are never merged, so a record
 signed by one enforcement point never verifies on another's tape.
 
-That sequence is a reconstruction, not a verdict. It is ordered by each writer's own
-clock — eunox neither requires nor checks clock sync between enforcement points — and a
-call missing from an enforcement point that never handled it is expected rather than
-evidence of loss. Only the per-tape verdicts gate the exit code.
+That sequence is a reconstruction, not a verdict. Within a tape the order is proven and is
+what it follows (`seq` is signed and its contiguity checked); across tapes it rests on each
+writer's own clock, and eunox neither requires nor checks clock sync between enforcement
+points. A call missing from an enforcement point that never handled it is expected rather
+than evidence of loss. Only the per-tape verdicts gate the exit code.
 
 ---
 
