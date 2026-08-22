@@ -249,6 +249,65 @@ func TestValidateDelegationChain_ReassertsGrantsDepthCap(t *testing.T) {
 	assert.Contains(t, err.Error(), "more than the maximum")
 }
 
+// TestValidateDelegationChain_ReassertsPerGrantWellFormedness pins the same defense-in-depth
+// stance the depth caps take, one case per axis Validate covers. ParseDelegationGrants asserts
+// each grant as it decodes a claim, so on the shipped path this is a duplicate; it is not one
+// for an embedder that assembles a []DelegationGrant itself, which reached the engine having
+// passed no per-grant check at all while this function's own doc called itself the whole
+// token-boundary check. The labels axis is the reason it matters rather than merely reads
+// wrong: an unrecognized forced label normalizes away, REMOVING taint the delegators imposed.
+func TestValidateDelegationChain_ReassertsPerGrantWellFormedness(t *testing.T) {
+	for name, tc := range map[string]struct {
+		grant capability.DelegationGrant
+		want  string
+	}{
+		"names no delegate": {
+			capability.DelegationGrant{Targets: list("tool:read")},
+			"'subject'",
+		},
+		"forces an unknown flow label": {
+			capability.DelegationGrant{Subject: "a", Labels: []string{"quarantined"}},
+			"quarantined",
+		},
+		"patterns a delegated target": {
+			capability.DelegationGrant{Subject: "a", Targets: list("tool:*")},
+			"matched literally",
+		},
+		"admits an unknown flow label": {
+			capability.DelegationGrant{Subject: "a", AllowLabels: list("confidential-ish")},
+			"confidential-ish",
+		},
+		"redacts an empty field path": {
+			capability.DelegationGrant{Subject: "a", RedactFields: []string{" "}},
+			"'redactFields'",
+		},
+		"caps at an unknown effect class": {
+			capability.DelegationGrant{Subject: "a", MaxEffectClass: "mostly-reversible"},
+			"mostly-reversible",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := capability.ValidateDelegationChain(nil, []capability.DelegationGrant{tc.grant})
+			require.Error(t, err, "a malformed grant must reject the chain, not be accepted unchecked")
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// TestValidateDelegationChain_RefusesMalformedBeforeWalkingTheChain keeps the re-assertion
+// above the hop-agreement and narrowing loops: those read the very fields Validate is what
+// rejects, so a chain that never passed it must not reach them.
+func TestValidateDelegationChain_RefusesMalformedBeforeWalkingTheChain(t *testing.T) {
+	_, err := capability.ValidateDelegationChain(
+		[]string{"a", "b"},
+		[]capability.DelegationGrant{
+			{Subject: "a", Targets: list("tool:read")},
+			{Subject: "b", Targets: list("tool:*")},
+		})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "matched literally", "the malformed target must be named, not laundered into a widening report")
+}
+
 // TestValidateDelegationChain_PresentEmptyGrantsDisagreeWithActors is the mis-mint most likely
 // to come out of an IdP template: the act chain is right and the grant array came out empty.
 // Zero hops beside two actors is a disagreement like any other, and collapsing present-empty

@@ -648,9 +648,10 @@ func ParseDelegationGrants(raw json.RawMessage) ([]DelegationGrant, error) {
 	return out, nil
 }
 
-// ValidateDelegationChain is the whole token-boundary check on a decoded chain: the grants
-// must line up with the actor chain, and each hop must narrow its delegator. It returns the
-// assembled chain or an error the caller turns into a rejected token.
+// ValidateDelegationChain is the whole token-boundary check on a decoded chain: every grant
+// must be well-formed, the grants must line up with the actor chain, and each hop must narrow
+// its delegator. It returns the assembled chain or an error the caller turns into a rejected
+// token.
 //
 // Grants without an actor chain are accepted (an IdP that does not emit RFC 8693 `act` can
 // still express attenuation, and a grant can only narrow), but an actor chain and a grant
@@ -675,6 +676,19 @@ func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*Delega
 	// attacker-controlled, unbounded grants slice before either cap fires.
 	if len(grants) > MaxDelegationDepth {
 		return nil, fmt.Errorf("mcp.%s claim declares %d grant(s), more than the maximum of %d", ClaimDelegation, len(grants), MaxDelegationDepth)
+	}
+	// Re-asserted for the reason the grants cap above is: this is an exported boundary, and
+	// ParseDelegationGrants' own per-grant check only covers a chain that came from a claim. A
+	// chain an embedder assembles directly would otherwise reach the engine having passed no
+	// well-formedness check at all — and one axis of that is fail-open, since an unrecognized
+	// forced label normalizes away and REMOVES taint the delegators imposed. The decision
+	// path's UnknownForcedLabels check is the belt to this brace, not a substitute for it: the
+	// other malformed shapes (a '*' in a target, an unknown allowLabels entry, an invalid
+	// maxEffectClass) each grant nothing and so are invisible rather than refused.
+	for i := range grants {
+		if err := grants[i].Validate(); err != nil {
+			return nil, fmt.Errorf("delegation grant %d: %w", i, err)
+		}
 	}
 	if len(actors) > 0 && grants != nil {
 		if len(actors) != len(grants) {
