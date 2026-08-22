@@ -399,14 +399,15 @@ func TestReserveCeiling_IsDerivedFromTheLiveSets(t *testing.T) {
 
 	recordKeys := len(upstreamRefusalCategories)
 	noticeKeys := len(noticeClasses) + len(floorProtectedSites)
-	require.Equal(t, 4, recordKeys, "recordReserveInterval's doc states 512x4; a session reserves one slot per upstream-driven category")
+	require.Equal(t, 5, recordKeys, "recordReserveInterval's doc states 512x5; a session reserves one slot per upstream-driven category")
 	require.Equal(t, 4, noticeKeys, "noticeReserveInterval's doc states 512x4; a session reserves one slot per notice class plus one per protected site")
 
-	assert.Equal(t, 2048, documentedHolders*recordKeys, "the record half's documented leading-edge burst")
+	assert.Equal(t, 2560, documentedHolders*recordKeys, "the record half's documented leading-edge burst")
 	assert.Equal(t, 2048, documentedHolders*noticeKeys, "the notice half's documented leading-edge burst")
-	assert.Equal(t, 34, int(float64(documentedHolders*recordKeys)/recordReserveInterval.Seconds()),
-		"and the sustained rate after that burst, ~34/s")
-	assert.Equal(t, 34, int(float64(documentedHolders*noticeKeys)/noticeReserveInterval.Seconds()))
+	assert.Equal(t, 42, int(float64(documentedHolders*recordKeys)/recordReserveInterval.Seconds()),
+		"and the sustained rate after that burst, ~42/s")
+	assert.Equal(t, 34, int(float64(documentedHolders*noticeKeys)/noticeReserveInterval.Seconds()),
+		"the notice half is unchanged: its keys are classes and protected sites, not refusal categories")
 
 	// The property the record-side figure exists to establish, rather than the figure itself: the
 	// leading edge of a fleet-wide incident must not by itself overflow the audit queue, since an

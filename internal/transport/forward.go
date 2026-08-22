@@ -1428,13 +1428,30 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // declassification's signed triple. The non-sampling leg passes the zero decision (commits no
 // clear today). detail carries the decision-side annotations (decisionDetail): a clear that did
 // not land, and a repaired handler fault.
+//
+// The not-delivered arm is a REFUSAL record and resolves its recorder like every other one on this
+// leg. It used to write straight through fp.rec, reaching neither the declaration nor the walk that
+// keeps refusals honest — while being drivable by an HTTP upstream alone, at one audit deny per
+// request with no host cooperation (outrun the SSE buffer, or hold no GET stream open), which is the
+// very axis catDisplaced and catServerRequestFailed's writers are metered on.
+//
+// On catUndeliveredForward rather than the catServerRequestFailed its async counterpart charges,
+// because that flood would otherwise spend the tokens bounding failServerRequestDelivery's
+// correction — the record that repairs a standing ALLOW, without which that allow stands on the
+// tamper-evident tape claiming a delivery that never happened.
 func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method string, delivered, auditOnly bool, dec capability.EnforceResponse, cleared []string, detail map[string]interface{}) {
 	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, method, func() {
-		if fp.rec == nil {
+		if !delivered {
+			// Through the unblocker's own wiring — this leg's tape paired with its buckets — rather
+			// than fp.rec beside a bucket looked up separately, which is the two-copies-of-the-sink
+			// fault refusalLimits exists to prevent. Nil when the leg has no tape, or when the
+			// bucket suppressed this record.
+			if rec := fp.unblocker.report.recs.forCategory(catUndeliveredForward); rec != nil {
+				rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeEnforcementError, "", detail, false)
+			}
 			return
 		}
-		if !delivered {
-			fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeEnforcementError, "", detail, false)
+		if fp.rec == nil {
 			return
 		}
 		if len(cleared) > 0 {
