@@ -701,8 +701,44 @@ opened at another (a mid-context flip).
   this" from "this method does not exist in the revision that peer negotiated". The routing
   tables are selected by READING THAT SAME CARRIER (the request context, via
   `requestRevision`) rather than by a second copy threaded beside it, so a record cannot
-  name a revision the dispatcher did not route by, or stay silent about one it did. The
-  refusal itself is recorded under the `UNSUPPORTED_PROTOCOL_VERSION` code.
+  name a revision the dispatcher did not route by, or stay silent about one it did. A refusal
+  because a revision could not be ESTABLISHED is recorded under
+  `UNSUPPORTED_PROTOCOL_VERSION`; one because an established PAIR cannot carry the message is
+  recorded under `UNTRANSLATABLE_ACROSS_REVISIONS` (below).
+- **A mismatched pair carries the stateless-safe subset and refuses the rest**
+  (ADR-0006). The refused set is not a list of methods that are hard to forward — every one of
+  them is trivially forwardable — but of methods whose MEANING depends on state one side
+  cannot hold: the `resources/subscribe` pair against an upstream whose revision replaced it,
+  a server-initiated request toward a host whose revision removed the mechanism, and any
+  result whose `resultType` is not `complete` crossing to a host with no `resultType` in its
+  vocabulary. That last one is the reason the boundary is a security control and not an
+  ergonomics feature: passing an `input_required` result to such a host is SILENT. It reads
+  the call as finished, drops the `inputRequests` the upstream is waiting on, and both sides
+  believe the exchange is complete — an enforcement-relevant desynchronization with no error
+  anywhere. An unrecognized variant is refused for the same reason, since a variant eunox
+  cannot model is one whose loss it cannot bound.
+
+  Three properties keep the translation itself from becoming a hole. The declaration is
+  REWRITTEN rather than passed through, so a forwarded body and the `MCP-Protocol-Version`
+  header eunox stamps always name one revision — otherwise the proxy manufactures the
+  mismatched pair it exists to mediate, and a first-wins and a last-wins upstream resolve one
+  request under different method sets. The `initialize` answered from a declaring leg's
+  discovery data has its capability object NARROWED to what the pair can carry, since
+  advertising methods eunox then denies fail-closed leaves a host planning around a surface it
+  cannot use, and an unrecognized capability is dropped rather than forwarded because this
+  build cannot know which methods it implies. And the refusal is classified a FAULT, not a
+  policy verdict, so an observing route (`--audit`) cannot downgrade it and forward what it
+  refuses — the downgrade that would do the most damage here, since it is the one that would
+  hand a peer the result variant it cannot read.
+
+  The refusal is recorded under a code of its own, `UNTRANSLATABLE_ACROSS_REVISIONS`, sharing
+  the spec's `-32022` integer with the establish-a-revision refusal but distinguished in
+  `error.data.code` and in `denial_code` — so "this deployment is mid-migration" is greppable
+  separately from "this peer's revision could not be established". A method the requesting
+  peer's OWN revision removed is not a boundary refusal and keeps `UNROUTABLE_METHOD`: routing
+  is a fact about one peer, the boundary a question about the pair, and reporting the first as
+  the second points an operator at their migration for a call a matched pair would refuse just
+  as flatly.
 - **The gate order is fixed and asserted.** Revision negotiation runs ahead of the
   revocation check on both transports, because a message whose revision is unresolved has
   no method table to be looked up in. The consequence is bounded and deliberate: a revoked

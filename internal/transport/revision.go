@@ -28,17 +28,12 @@ import (
 // body it describes.
 var errRevisionMismatch = errors.New("protocol revision disagrees with the context it arrived in")
 
-// errUnhonorableUpstreamRevision marks a message this proxy cannot forward at the revision it
-// resolved under.
-//
-// Params are forwarded VERBATIM into a conversation eunox itself opened with `initialize`, so
-// dispatching under one revision and addressing the upstream as another does not relay a
-// mismatched pair, it MANUFACTURES one — the same family of enforcement confusion
-// errRevisionMismatch refuses on the host leg. The handshake is the carrier both legs have; a
-// remote HTTP upstream reads a second one, the MCP-Protocol-Version header, which names the
-// same revision. Rewriting the request to match is translation, which the mismatched-pair
-// boundary governs and this build does not do.
-var errUnhonorableUpstreamRevision = errors.New("request revision cannot be honored by the upstream leg")
+// A message this proxy cannot forward at the revision it resolved under used to have a
+// sentinel of its own here, because dispatching under one revision while addressing the
+// upstream as another does not relay a mismatched pair, it MANUFACTURES one. That is still
+// true, and it is now errUntranslatableAcrossRevisions' to say: rewriting the request so the
+// two agree is TRANSLATION, and the boundary that decides which messages get it is the one
+// place the refusal belongs. See translate.go.
 
 // errUndeclaredOnDeclaringLeg marks a message that resolved to a declaring revision by
 // INHERITING its context rather than by stating a version, on a leg whose revision requires the
@@ -226,8 +221,8 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 	// a forward that never happens. Asked per FRAMING — a host RESPONSE has no method to look up
 	// and is relayed verbatim, so a method-keyed gate skipped exactly the class whose bytes reach
 	// the upstream unconditionally.
-	if paramsReachUpstream(msg) {
-		if err := checkUpstreamHonorable(resolved, legRev); err != nil {
+	if paramsReachUpstream(msg) && reachesUpstreamUnderRevision(resolved, msg) {
+		if err := checkUpstreamHonorable(resolved, legRev, msg); err != nil {
 			return "", err
 		}
 		// present || unreadable, not present: that check refuses a message for carrying NO
@@ -242,6 +237,30 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 		}
 	}
 	return resolved, nil
+}
+
+// reachesUpstreamUnderRevision narrows paramsReachUpstream by the peer's own routing tables:
+// a method resolved does not DISPATCH is refused by the fail-closed routing default and
+// forwards nothing, so neither upstream-facing check has anything to judge.
+//
+// paramsReachUpstream stays revision-INDEPENDENT — it answers a question about the method, and
+// deriving it from the tables would make a per-method fact depend on who is asking. What is
+// revision-dependent is whether THIS message gets that far, and that is this predicate.
+//
+// It exists because of gate ORDER. Negotiation runs before routing (a message whose revision is
+// unresolved has no table to be looked up in), so the upstream-facing checks see messages
+// routing is about to refuse. That was harmless while they only ever produced the same answer
+// routing would; it stopped being harmless when the translation boundary started producing a
+// DIFFERENT one, reporting a method the peer's own revision removed as two revisions that
+// cannot bridge it — a diagnosis pointing an operator at their migration for a call a matched
+// pair would refuse just as flatly.
+//
+// A message with no METHOD is exempt rather than refused. A host RESPONSE is dispatched by
+// neither table by construction, so asking this of one answers no for every response and would
+// hand the verbatim-relayed framing — the one whose bytes reach the upstream with no dispatch
+// decision at all — straight past both checks.
+func reachesUpstreamUnderRevision(resolved capability.Revision, msg mcp.RPCMsg) bool {
+	return msg.Method == "" || dispatchesMessage(resolved, msg)
 }
 
 // checkUndecodableForwarded refuses a message whose members this build alone refused and whose
@@ -275,11 +294,21 @@ func checkUndecodableForwarded(legRev capability.Revision, msg mcp.RPCMsg) error
 //
 // Not applied when the message declared its own revision, which is the matched-pair case and
 // the normal one: a conforming peer on a declaring revision states its version every time.
+//
+// Nor when the pair is MISMATCHED and the message translates. The gap this closes is a host on
+// the SAME declaring revision as the leg that inherited its declaration from the context
+// instead of restating it — eunox forwards those params verbatim, so nothing supplies the
+// member. On a mismatched pair translateRequest adds it, so refusing here would refuse a
+// message eunox is about to make conforming, and would do it under a code that tells the host
+// to add a member its own revision does not have.
 func checkDeclarationReachesUpstream(resolved, legRev capability.Revision, msg mcp.RPCMsg, declared bool) error {
 	if declared || legRev == "" || msg.Method == "" {
 		return nil
 	}
 	if !declaresPerRequestRevision(resolved) {
+		return nil
+	}
+	if resolved != upstreamAddressedRevision(legRev) && boundaryDisposition(msg).translates {
 		return nil
 	}
 	// The key is named from capability's own constant rather than spelled out: this text is
@@ -326,13 +355,24 @@ func upstreamAddressedRevision(legRev capability.Revision) capability.Revision {
 // would deny a message on the strength of a fact nobody has established. Every leg the proxy
 // opens now pins its revision at construction, so this covers the legs a test builds by
 // literal rather than a window a live one passes through.
-func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
+//
+// A MISMATCHED pair is no longer refused wholesale. Which messages such a pair may carry is
+// the translation boundary's question (translate.go), asked per message because the answer is
+// per method; what stays here is the refusal for the ones it will not carry, so a message that
+// cannot cross is stopped at negotiation rather than at the upstream call it would otherwise
+// reach. The call seam re-asks the same question, and deliberately: that is where the bytes
+// actually cross, and a gate that runs only at negotiation would be one refactor away from
+// being bypassed by a path that reaches the upstream another way.
+func checkUpstreamHonorable(resolved, legRev capability.Revision, msg mcp.RPCMsg) error {
 	if legRev == "" {
 		return nil
 	}
-	if addressed := upstreamAddressedRevision(legRev); resolved != addressed {
-		return fmt.Errorf("%w: this proxy addresses its upstream leg as %s, request resolves to %s",
-			errUnhonorableUpstreamRevision, addressed, resolved)
+	addressed := upstreamAddressedRevision(legRev)
+	if resolved == addressed {
+		return nil
+	}
+	if decl := boundaryDisposition(msg); !decl.translates {
+		return refuseAcrossRevisions(msg.Method, resolved, addressed, decl.why)
 	}
 	return nil
 }
@@ -348,11 +388,29 @@ func revisionRefusalReason(err error) string {
 	// proxy's own leg revisions). Anything else collapses to a fixed string rather than leaking
 	// an unreviewed message.
 	if errors.Is(err, errRevisionMismatch) || errors.Is(err, mcp.ErrUnknownRevision) ||
-		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUnhonorableUpstreamRevision) ||
+		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUntranslatableAcrossRevisions) ||
 		errors.Is(err, errUndecodableForwardedParams) || errors.Is(err, errUndeclaredOnDeclaringLeg) {
 		return err.Error()
 	}
 	return "protocol revision could not be established"
+}
+
+// revisionRefusalCode picks the symbolic code a revision refusal is recorded under.
+//
+// Two codes, because the tape has to separate two different operator problems that share one
+// wire integer: a revision that could not be ESTABLISHED for one peer, and a PAIR of
+// established revisions that cannot carry this message. The first is a misconfigured or
+// probing client; the second is a deployment mid-migration hitting the translation boundary,
+// and it is the one an operator greps for when deciding whether an upgrade is safe to finish.
+//
+// Keyed on the sentinel rather than on the text, so the two cannot drift as the messages are
+// reworded. Anything else keeps the establish-a-revision code, which is what every refusal
+// here meant before the boundary existed.
+func revisionRefusalCode(err error) string {
+	if errors.Is(err, errUntranslatableAcrossRevisions) {
+		return capability.ErrCodeUntranslatableAcrossRevisions
+	}
+	return capability.ErrCodeUnsupportedProtocolVersion
 }
 
 // refuseHostRevision records the refusal and builds the -32022 response for a request whose
@@ -383,12 +441,14 @@ func refuseHostRevision(ctx context.Context, rec auditRecorder, sessionID string
 	}
 	if rec != nil {
 		identifier, method := auditIdentity(msg)
-		rec.RecordDeny(ctx, sessionID, identifier, method, capability.ErrCodeUnsupportedProtocolVersion, "", nil, false)
+		rec.RecordDeny(ctx, sessionID, identifier, method, revisionRefusalCode(err), "", nil, false)
 	}
 	if !msg.IsRequest() {
 		return mcp.RPCMsg{}
 	}
-	return mcp.UnsupportedProtocolVersionResponse(msg.ID, reason)
+	// The same code the record carries: a host branching on `data.code` and a SIEM rule reading
+	// the tape must not be told two different things about one refusal.
+	return mcp.RevisionRefusalResponse(msg.ID, revisionRefusalCode(err), reason)
 }
 
 // The two reasons eunox answers a blocked upstream with when it refuses the host's reply to that

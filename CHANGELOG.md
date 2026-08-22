@@ -27,6 +27,28 @@ Section conventions:
 
 ### Added
 
+- **The mismatched-revision translation boundary (ADR-0006).** A host and an upstream on
+  different MCP revisions were refused wholesale; the stateless-safe subset now crosses.
+  `tools/call`, `resources/read`, `prompts/get`, the three `*/list` methods and the two
+  progress/cancellation notifications are carried, with the per-request revision declaration
+  added toward a declaring upstream and removed toward one that negotiates once, so a forwarded
+  body and the `MCP-Protocol-Version` header eunox stamps always name a single revision. A result
+  crossing to a declaring host gains the members that revision requires from the shape pass
+  below, which is the same pass a matched pair on that revision goes through — supplying them is
+  a property of the host's revision, not of the boundary. A host `initialize` reaching a leg
+  opened with `server/discover` is now answered
+  from that leg's discovery data rather than refused, with the capability object narrowed to what
+  the pair can actually carry (`resources.subscribe` dropped, unrecognized capabilities dropped).
+
+  Everything stateful-by-construction is refused, recorded, and never forwarded: the
+  `resources/subscribe` pair, `notifications/roots/list_changed`, a server-initiated request
+  toward a host whose revision removed the mechanism (the upstream is answered rather than left
+  blocked), a host response on such a pair, and any result whose `resultType` is not `complete`
+  heading to a host on the revision that has no such member — the refusal that matters most,
+  because passing an `input_required` result to a host with no `resultType` in its vocabulary is
+  silent: it reads the call as finished, drops the `inputRequests` the upstream is waiting on,
+  and both sides believe they are done.
+
 - **The 2026-07-28 result shape: supplied where eunox can, refused where it cannot.** A result
   eunox hands a peer on that revision now carries `resultType` — the upstream's own value where
   it sent one, `"complete"` where it did not — and a list result carries `cacheScope: "private"`
@@ -34,8 +56,11 @@ Section conventions:
   the two are split because they need different things (the clamp needs the one encoder every
   filter path reaches, the supply needs the revision the filter layer does not hold), and
   together they cover every list eunox emits to such a peer, whether the upstream over-shared,
-  under-shared, or said nothing. `ttlMs` is never invented — a freshness hint the upstream did
-  not offer is not one eunox can supply.
+  under-shared, or said nothing. The `--audit` wiretap is exempt from the cache member, matching
+  the clamp: that posture forwards the upstream's whole catalog, identical for every caller, so
+  there is no narrowed view for a shared cache to leak and `private` would be a claim about the
+  response that is not true. `ttlMs` is never invented — a freshness hint the upstream did not
+  offer is not one eunox can supply.
 
   The other half is a refusal. `resultType` is an OPEN union, so a value that is present and is
   neither `complete` nor a variant this build models is refused before it reaches the host,
@@ -52,6 +77,20 @@ Section conventions:
   refusal rather than as an allow followed by a contradiction. A 2025-11-25 peer's results are
   untouched, structurally: the first branch returns before reading anything, because these are
   members its revision does not define.
+
+### Changed
+
+- **New denial code `UNTRANSLATABLE_ACROSS_REVISIONS`** for boundary refusals. It shares the
+  spec-assigned `-32022` integer with `UNSUPPORTED_PROTOCOL_VERSION` but is distinguished in
+  `error.data.code` and in the audit record's `denial_code`, so a deployment mid-migration is
+  greppable separately from a peer whose revision could not be established. Classified a fault
+  rather than a policy verdict, so an observing (`--audit`) route cannot downgrade it. A method
+  the requesting peer's *own* revision removed keeps `UNROUTABLE_METHOD`: routing is a fact about
+  one peer and the boundary a question about the pair.
+- `mcp.UnsupportedProtocolVersionResponse` is replaced by `mcp.RevisionRefusalResponse(id, code,
+  message)`. Both refusals ride one wire integer, which is exactly the situation where a
+  convenience wrapper gets reached for by a site that meant the other one, so every caller now
+  names its code.
 
 - **`--protocol-version` on both demo mocks, and a stateless demo walkthrough.**
   `demo/mock-mcp-server` and `demo/mock-mcp-server-stdio` each take the revision they serve

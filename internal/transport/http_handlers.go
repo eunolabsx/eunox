@@ -145,6 +145,16 @@ func upstreamErrInfo(notices noticeWriter, err error, upstreamTimeMs int) (code,
 		// A host pipelined a request reusing an in-flight JSON-RPC id: a client fault, not an
 		// upstream failure — the record must not be mined as an upstream outage.
 		return codeInvalidRequest, "duplicate JSON-RPC request id already in flight", jsonRPCCodeInvalidRequest
+	case errors.Is(err, errUntranslatableAcrossRevisions):
+		// Produced AT the upstream call but not BY the upstream: the pair's revisions cannot
+		// carry this message, and the server never saw it. Recording it as an outage would
+		// report a healthy upstream as failing, which is the same reason errDuplicateID above
+		// is classified as a client fault rather than one.
+		//
+		// The reason is the error's own text, which revisionRefusalReason also echoes: every
+		// part of it comes from a closed set (two published revisions, a routed method, and a
+		// reason declared in this build), so none of it is peer-supplied.
+		return capability.ErrCodeUntranslatableAcrossRevisions, err.Error(), capability.JSONRPCCodeUnsupportedProtocolVersion
 	case errors.Is(err, errUnenforceableResultShape):
 		// Produced AT the upstream call but not BY a failing upstream: the server is reachable
 		// and answered, and what eunox cannot do is enforce what it answered. Recording it as an
@@ -222,7 +232,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			audit:            rt.audit,
 			sessionID:        sess.id,
 			upstreamTimeMs:   p.upstreamTimeMs,
-			callUpstream:     withResultShape(rt.audit, sess.callUpstream),
+			callUpstream:     withResultShape(rt.audit, withCrossRevisionTranslation(sess.upstreamRev, sess.callUpstream)),
 			strictAuditState: p.strictAudit(),
 			limits:           p.routeRefusalLimits(sess, rt),
 		},

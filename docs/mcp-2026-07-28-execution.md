@@ -57,7 +57,7 @@ criterion is the ADR reaching **Final** under the ADR lifecycle
 
 | Gate | Decision | Recorded in | Blocks |
 |---|---|---|---|
-| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (In Review) | W3, W4, W13's mismatch cells. **No longer blocks W1**, which landed its negotiation spine without activating any translation — see the note below the table. |
+| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (In Review) | W3, W4, W13's mismatch cells. **No longer blocks W1**, which landed its negotiation spine without activating any translation — see the note below the table. The boundary itself is now IMPLEMENTED and awaiting ratification rather than awaiting design — see the note after W1's. |
 | D2 | MRTR metering: the signed continuation — key sourcing, anchor binding, lifetime, replay bound, what re-evaluates per retry, and the commit-once quota rule. | [ADR-0007](adr/0007-mrtr-signed-continuation.md) (Draft) | W6 |
 | D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (updated: session-creation addendum) | W2, and through it W6/W7 |
 | D4 | Stream and deferred-effect enforcement: `subscriptions/listen` open/deny semantics, notification filtering, cancel rehoming; tasks anchor binding and the kill×tasks interaction. | [ADR-0008](adr/0008-stream-and-task-enforcement.md) (Draft) | W7, W8 |
@@ -71,6 +71,16 @@ under a Draft D1 is that each revision's table is deny-by-default over the same
 manifest, so selecting one can only REMOVE methods, never grant one policy did not
 permit — no translation is activated, and the mismatched-pair behavior D1 governs
 is untouched. D1 still gates W3, W4, and W13's mismatch cells.
+
+The **translation boundary itself** has since been implemented, and unlike the two
+cases below it does NOT claim to be admissible under a Draft/In Review D1: it is the
+behavior the plan says waits for `Final`, so it is offered for review and held there.
+The implementation follows ADR-0006's decision as written — the stateless-safe subset
+crosses, everything stateful-by-construction is refused under a code of its own, and a
+host `initialize` is answered from a declaring leg's discovery data with the capability
+object narrowed to what the pair can carry. What ratification decides is not whether the
+code is correct but whether the boundary is drawn in the right place; the code is what
+makes that reviewable against something other than prose.
 
 W11's **revision-selected upstream opener** landed under D1 In Review on the same
 kind of argument, and it is worth stating precisely because this one DOES change
@@ -623,9 +633,13 @@ blocked on another workstream rather than unstarted, and none of them is an exit
 - The **two new-host cells over HTTP**. A 2026-07-28 host has no `initialize`, and HTTP
   session creation is still anchored on that handshake, so those cells would assert the
   absence of W2 rather than the revision boundary. They land with W2.
-- **Mismatch cells asserting a TRANSLATED subset.** Nothing is translated today, so the
-  refusal is the whole boundary and that is what the cells assert. The translated half is
-  D1's to decide and lands with W3/W4.
+- ~~**Mismatch cells asserting a TRANSLATED subset.**~~ Landed with the boundary itself. The
+  cells now assert that the stateless-safe subset crosses — filtered, enforced, and with a
+  policy-denied call still denied by POLICY, since translation runs strictly below the
+  decision — and that a method the pair cannot carry is refused under the code naming the
+  PAIR rather than an unestablished revision. Only the old-host direction reaches that
+  refusal: every method the boundary refuses is one the newer revision removed, so a
+  2026-07-28 peer meets the fail-closed routing default first.
 
 Scope:
 

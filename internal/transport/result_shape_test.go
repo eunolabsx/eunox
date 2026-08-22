@@ -417,12 +417,29 @@ func TestWithResultShape(t *testing.T) {
 	})
 }
 
-// TestCallUpstream_AlwaysWrappedAtItsSeam is the source guard for the seam's whole argument.
+// callUpstreamWrappers is the chain every callUpstream construction site must be assigned,
+// outermost first.
 //
-// The shape rules are applied at CONSTRUCTION so no forward path has to remember them. That
-// holds only while every construction site wraps: a third one assigning a bare upstream call is
-// a result reaching a peer without the members its revision requires, failing at that peer with
-// an error that names eunox's own omission as the upstream's.
+// TWO wrappers sit on this seam and their ORDER is load-bearing, which is why one declaration
+// names both rather than each owning a guard of its own (they did, and the two then demanded to
+// be the outermost identifier apiece — a contradiction that only held while the second had not
+// landed). Translation runs INNERMOST, against the upstream's own revision; the shape pass runs
+// outside it, against the host's, so it sees a result already carried across the boundary and
+// supplies the members that host's revision requires. Inverted, the shape pass would stamp
+// members for the host onto bytes still addressed at the upstream, and the boundary would then
+// be handed a result eunox had already rewritten.
+var callUpstreamWrappers = []string{"withResultShape", "withCrossRevisionTranslation"}
+
+// TestCallUpstream_AlwaysWrappedAtItsSeam is the source guard for both wrappers' whole argument.
+//
+// Each is applied at CONSTRUCTION so no forward path has to remember it. That holds only while
+// every construction site wraps, in order: a site assigning a bare upstream call is a result
+// reaching a peer without the members its revision requires, or a message crossing a mismatched
+// pair untranslated — each failing at the far peer with an error that names eunox's own omission
+// as the upstream's.
+//
+// Walks the same parsed sources every other guard here does, so a file behind a build tag
+// cannot drop out of the enumeration silently.
 func TestCallUpstream_AlwaysWrappedAtItsSeam(t *testing.T) {
 	t.Parallel()
 	const field = "callUpstream"
@@ -438,13 +455,26 @@ func TestCallUpstream_AlwaysWrappedAtItsSeam(t *testing.T) {
 				return true
 			}
 			found++
-			call, ok := kv.Value.(*ast.CallExpr)
-			if !ok {
-				t.Errorf("%s: %s is assigned a bare upstream call; its results reach a peer unshaped", src.name, field)
-				return true
-			}
-			if fn, ok := call.Fun.(*ast.Ident); !ok || fn.Name != "withResultShape" {
-				t.Errorf("%s: %s is wrapped by something other than withResultShape", src.name, field)
+			expr := kv.Value
+			for _, want := range callUpstreamWrappers {
+				call, ok := expr.(*ast.CallExpr)
+				if !ok {
+					t.Errorf("%s: %s is not wrapped by %s; its results reach a peer unshaped or untranslated",
+						src.name, field, want)
+					return true
+				}
+				fn, ok := call.Fun.(*ast.Ident)
+				if !ok || fn.Name != want {
+					t.Errorf("%s: %s is wrapped by something other than %s at this position; the chain is %v, outermost first",
+						src.name, field, want, callUpstreamWrappers)
+					return true
+				}
+				// Both wrappers take (config, inner), so the next link is the last argument.
+				if len(call.Args) == 0 {
+					t.Errorf("%s: %s: %s is called with no inner upstream call", src.name, field, want)
+					return true
+				}
+				expr = call.Args[len(call.Args)-1]
 			}
 			return true
 		})

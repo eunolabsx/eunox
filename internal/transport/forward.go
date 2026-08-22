@@ -1488,6 +1488,28 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// a record written before any revision could be resolved, and this leg only runs on a
 	// session whose upstream handshake is complete.
 	ctx = capability.WithProtocolRevision(ctx, resolveRevision(fp.revision))
+	// The translation boundary, taken before the method split because it is about the LEG and
+	// not about what was asked for: a server-initiated request has no meaning for a host whose
+	// revision removed the whole mechanism, so every method on this leg is refused when the
+	// host is on such a revision, not just the ones policy would have weighed.
+	//
+	// Refused rather than bridged. Bridging would mean eunox answering on the host's behalf —
+	// inventing a sampling result, a roots list, an elicitation the user never saw — which is
+	// fabricating exactly the statefulness ADR-0006 refuses to fabricate, and doing it with
+	// content rather than bookkeeping.
+	//
+	// The initiator is ANSWERED rather than left hanging, per this leg's one rule: eunox may
+	// answer a blocked initiator wherever it can do so without acting on a second identity's
+	// behalf, and a refusal of its own says nothing about the host.
+	if refused := refuseServerRequestAcrossRevisions(msg.Method, resolveRevision(fp.revision)); refused != nil {
+		if fp.rec != nil {
+			fp.rec.RecordDeny(ctx, fp.sessionID, msg.Method, msg.Method,
+				capability.ErrCodeUntranslatableAcrossRevisions, "", nil, false)
+		}
+		fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID,
+			capability.JSONRPCCodeUnsupportedProtocolVersion, refused.Error()), answerUntranslatableLeg, msg.Method)
+		return
+	}
 	if msg.Method != samplingMethod {
 		if deny := fp.pdp.CheckKill(ctx, fp.sessionID); deny != nil {
 			denial := normalizeDenial(deny.Denial)

@@ -62,7 +62,7 @@ func TestDeclaredRevision_BoundsReflectedText(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unspeakable revision must be refused")
 	}
-	resp := UnsupportedProtocolVersionResponse(RawJSON(`1`), err.Error())
+	resp := RevisionRefusalResponse(RawJSON(`1`), capability.ErrCodeUnsupportedProtocolVersion, err.Error())
 	if len(resp.Error.Message) > 256 {
 		t.Errorf("refusal message is %d bytes; the caller's own string must be truncated, not reflected whole", len(resp.Error.Message))
 	}

@@ -119,7 +119,7 @@ func TestDeclaredRevision(t *testing.T) {
 // affordance: a peer refused for its version needs to be told what this build does speak.
 func TestUnsupportedProtocolVersionResponse(t *testing.T) {
 	t.Parallel()
-	resp := UnsupportedProtocolVersionResponse(RawJSON(`7`), "context negotiated 2025-11-25")
+	resp := RevisionRefusalResponse(RawJSON(`7`), capability.ErrCodeUnsupportedProtocolVersion, "context negotiated 2025-11-25")
 	if resp.Error == nil {
 		t.Fatal("refusal carries no error object")
 	}

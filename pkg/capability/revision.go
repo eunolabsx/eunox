@@ -125,23 +125,15 @@ const (
 // ResultKeyResultType is the result member a 2026-07-28 server states the variant of its reply
 // under, and ResultTypeComplete is the terminal variant — the exchange finished in this reply.
 //
-// The member is an OPEN union (`"complete" | "input_required" | string`), which is why only the
-// terminal value is named here rather than a closed set. Three readings follow from that, and
-// they are deliberately not the same:
+// The member is an OPEN union, which is why only the terminal value is named here. An ABSENT
+// member reads as complete (the spec's rule for a server on an earlier revision, and the shape
+// every 2025-11-25 upstream produces); a value this build does not recognize is an ambiguity
+// rather than a parse detail, and is refused wherever it would have to be acted on, because a
+// variant eunox cannot model is one whose loss it cannot bound.
 //
-//   - ABSENT means complete. That is the spec's own rule for a server on an earlier revision,
-//     and it is the shape every 2025-11-25 upstream produces, so any other reading would refuse
-//     ordinary traffic.
-//   - `complete` is the variant eunox can forward, because there is nothing left of the
-//     exchange to enforce.
-//   - Any OTHER present value is an ambiguity, not a parse detail. Reading it as complete would
-//     let an upstream carry a result variant past response-path enforcement, and eunox cannot
-//     enforce a result shape it does not model — so it is refused where it would have to be
-//     acted on.
-//
-// Here rather than in internal/mcp for ResultKeyCacheScope's reason: it is part of a revision's
-// result shape, and the layers that read or write it may not import the transport package that
-// owns the rest of the revision vocabulary.
+// Here for ResultKeyCacheScope's reason: it is part of a revision's result shape, and the
+// layers that read or write it may not import the transport package that owns the rest of the
+// revision vocabulary.
 const (
 	ResultKeyResultType = "resultType"
 	ResultTypeComplete  = "complete"

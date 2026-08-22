@@ -832,8 +832,9 @@ func TestStdioProxy_RevisionNegotiationEndToEnd(t *testing.T) {
 
 // TestStdioProxy_NewRevisionPeerLosesRemovedMethods: a peer that declares 2026-07-28 before
 // any handshake gets that revision's tables — so ping, a method the revision removed, is
-// denied by the same fail-closed default an unknown method hits, while tools/call (which
-// both revisions have) still serves.
+// denied by the same fail-closed default an unknown method hits, while tools/call (which both
+// revisions have, and which the translation boundary carries) still serves across the
+// mismatched pair this peer forms with the proxy's 2025-11-25 upstream leg.
 func TestStdioProxy_NewRevisionPeerLosesRemovedMethods(t *testing.T) {
 	if testing.Short() {
 		t.Skip("re-execs the test binary as an upstream subprocess; skipped in -short")
@@ -857,18 +858,36 @@ func TestStdioProxy_NewRevisionPeerLosesRemovedMethods(t *testing.T) {
 			ping.Error.Code, capability.JSONRPCCodeAuthorizationFailed)
 	}
 
-	// tools/call exists in both revisions, so the peer's own tables admit it — and it is
-	// refused anyway, one gate earlier: its params travel into a conversation eunox opened
-	// with `initialize` at 2025-11-25, and forwarding a body declaring 2026-07-28 into it
-	// would MANUFACTURE the mismatched pair the host leg refuses. This upstream is a
-	// subprocess, so there is no header here — the handshake is the carrier both legs have.
-	// The refusal names the leg rather than the method, which is the difference from ping's.
+	// tools/call exists in both revisions AND crosses the translation boundary, so this peer is
+	// served from a leg eunox opened at 2025-11-25. The body declaring 2026-07-28 does not
+	// MANUFACTURE a mismatched pair at the upstream, because translateRequest strips the
+	// declaration on the way out: eunox presents itself to that upstream as a client of its own
+	// revision, which is what a client of that revision would send.
+	//
+	// The result comes back carrying `resultType`, which the upstream did not send and this
+	// peer's revision requires — the other half of the same translation, and the reason this
+	// assertion checks the result shape rather than just the absence of an error.
 	call := h.roundTrip(t, mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: "tools/call",
 		Params: json.RawMessage(`{"name":"read_file","arguments":{"path":"/etc/hosts"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
 	})
-	if call.Error == nil || call.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
-		t.Fatalf("a forwarded call declaring a revision the upstream leg does not speak must be refused -32022, got %+v (result %s)", call.Error, call.Result)
+	if call.Error != nil {
+		t.Fatalf("a translatable call across a mismatched pair must be served, got %+v", call.Error)
+	}
+	if !strings.Contains(string(call.Result), `"resultType":"complete"`) {
+		t.Errorf("result = %s, want the resultType member this peer's revision requires and the older upstream cannot send", call.Result)
+	}
+
+	// The refused half of the same boundary, on the same pair: resources/subscribe is in this
+	// peer's own tables under NEITHER revision (2026-07-28 removed it), so it stops at routing
+	// rather than at the boundary — which is why the boundary's own refusal is asserted at the
+	// unit level, where a pair can be built that reaches it.
+	sub := h.roundTrip(t, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`3`), Method: "resources/subscribe",
+		Params: json.RawMessage(`{"uri":"file:///x","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
+	})
+	if sub.Error == nil || sub.Error.Code != capability.JSONRPCCodeAuthorizationFailed {
+		t.Errorf("resources/subscribe from a 2026-07-28 peer = %+v, want the unmapped-method refusal", sub.Error)
 	}
 
 	if err := h.shutdown(t); err != nil {
