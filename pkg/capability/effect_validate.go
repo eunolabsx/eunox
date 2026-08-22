@@ -174,7 +174,12 @@ func validateEffectByArgument(e *EffectContract) error {
 	for value := range t.Cases {
 		key := canonicalCaseFold(strings.TrimSpace(value))
 		if prev, dup := folded[key]; dup {
-			return fmt.Errorf("effect.byArgument declares cases %q and %q, which match the same argument value (matching is case-insensitive after trimming); a single value cannot resolve to two effects, so remove or reconcile one", prev, value)
+			// %+q, not %q: the pair this check exists to catch can differ by a single
+			// non-ASCII rune that renders indistinguishably from its ASCII fold ("ſelect"
+			// beside "select"), so an unescaped message names two keys the author reads
+			// as identical and cannot act on. Escaping to ASCII puts the offending rune
+			// in the error.
+			return fmt.Errorf("effect.byArgument declares cases %+q and %+q, which match the same argument value (keys are trimmed and compared under Unicode case folding, the same rule the matcher applies at runtime); a single value cannot resolve to two effects, so remove or reconcile one", prev, value)
 		}
 		folded[key] = value
 	}

@@ -1463,7 +1463,7 @@ Section conventions:
   the same shape is expressible in a reviewed contract-corpus entry an operator copies
   verbatim. The check now folds with the matcher's own relation, so the refusal the load-time
   check promises actually covers what the matcher matches. A manifest carrying such a pair is
-  now rejected at load rather than resolving nondeterministically.
+  now refused at load rather than loading and resolving to whichever row sorts first.
 
 - **The effect ceiling's `onExceed: deny` arm is as hard as its `escalate` arm.** The escalate
   arm is built non-downgradable so a route running `--audit` cannot turn "needs human approval"

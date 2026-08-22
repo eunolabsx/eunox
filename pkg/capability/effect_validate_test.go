@@ -91,7 +91,8 @@ func TestValidateEffectContract(t *testing.T) {
 		},
 		{
 			// The padded key is the point: matching trims and folds case, so " drop " and
-			// "DROP" select the same row and which one wins would be map-iteration order.
+			// "DROP" select the same row and which one wins falls to lookup's byte-order
+			// tiebreak rather than to the author.
 			// (gocritic's mapKey check reads padding as a typo; here it is the input under
 			// test.)
 			name: "byArgument case-variant keys",
@@ -267,6 +268,23 @@ func TestValidateEffectCeiling(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+// TestValidateEffectByArgument_CollisionErrorNamesTheOffendingRune pins the message half of
+// the refusal. The pair this check exists to catch differs by one non-ASCII rune that renders
+// indistinguishably from its ASCII fold, so a message quoting the two keys unescaped tells the
+// author their table declares "select" and "select" — a true statement they cannot act on.
+func TestValidateEffectByArgument_CollisionErrorNamesTheOffendingRune(t *testing.T) {
+	t.Parallel()
+	err := ValidateEffectContract(&EffectContract{ByArgument: &EffectByArgument{
+		Argument: "sql",
+		Cases: map[string]EffectCase{
+			"select":      {Class: EffectIrreversible},
+			"\u017felect": {Class: EffectReversible},
+		},
+	}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `\u017f`, "the colliding key's non-ASCII rune must be escaped into the message, or the two keys read as identical")
 }
 
 // TestValidateEffectByArgument_AcceptedTableResolvesEveryKeyToItsOwnRow asserts the
