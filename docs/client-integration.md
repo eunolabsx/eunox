@@ -134,6 +134,7 @@ upstreams:
     upstreamAuthHeader: "Authorization: Bearer ${STRIPE_KEY}"
     policy: ["./policies/stripe.yaml"]
     protocolVersion: auto             # auto (default) | "2025-11-25" | "2026-07-28"
+    forwardClientHeaders: ["X-Tenant-Id"]   # host headers relayed upstream; omitted = none
 ```
 
 ```bash
@@ -146,6 +147,18 @@ eunox proxy --config gateway.yaml
 > route to a reviewed version of a **single** manifest file; the gateway refuses
 > to start on a version mismatch — or if `expectVersion` is set on a route that
 > merges several policy files, since the pin would silently track only the first.
+
+> **Host headers do not cross unless you name them.** eunox forwards no header a
+> host sends to an upstream, and copies no upstream header into the response it
+> returns to a host. `forwardClientHeaders` opts named headers into the first
+> direction, per upstream; there is no wildcard, and no header eunox itself sets
+> on the upstream request may be listed (`Authorization`, `Mcp-Method`,
+> `Mcp-Name`, `Mcp-Protocol-Version`, `Mcp-Session-Id`, `Cookie`, `Host`, the
+> hop-by-hop set). Listing one fails startup with the reason, rather than
+> silently overriding a control the proxy is accountable for. The key is
+> HTTP-transport only — a stdio host sends no headers — and has no `defaults:`
+> inheritance: it grants a passthrough rather than tuning one, and a default
+> would make granting it everywhere the shorter thing to write.
 
 > **Protocol revision per upstream.** `protocolVersion` selects how eunox OPENS
 > that upstream's leg — `initialize` for `auto` and `2025-11-25`,

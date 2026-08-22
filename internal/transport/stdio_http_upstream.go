@@ -187,18 +187,17 @@ func (h *httpUpstream) writeSync(ctx context.Context, msg mcp.RPCMsg) error {
 // mid-session id never overwrites the established one. Goroutine-safe; a nil or
 // header without the session field is a no-op. Shared by writeSync and post.
 func (h *httpUpstream) captureUpstreamSessID(hdr http.Header) {
-	if hdr == nil {
-		return
-	}
-	sid := hdr.Get(SessionHeader)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Under the lock: the leg's revision is what decides whether there is a session to hold at
+	// all (UpstreamSessionID), and reading it outside would race setRevision.
+	sid := UpstreamSessionID(h.rev, hdr)
 	if sid == "" {
 		return
 	}
-	h.mu.Lock()
 	if h.sessID == "" {
 		h.sessID = sid
 	}
-	h.mu.Unlock()
 }
 
 // postWithCtx POSTs msg using a caller-supplied context so per-call timeouts

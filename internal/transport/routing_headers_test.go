@@ -294,11 +294,11 @@ func TestRoutingHeaders_CheckedInsideTheOneNegotiationAdapter(t *testing.T) {
 // capturingUpstream is an upstream that records the headers of the last POST it received and
 // answers a minimal result, so a test can read the pair eunox actually put on the wire rather
 // than the pair a helper claims it would.
-func capturingUpstream(t *testing.T) (*httptest.Server, func() http.Header) {
+func capturingUpstream(t *testing.T) (srv *httptest.Server, lastHeaders func() http.Header) {
 	t.Helper()
 	var mu sync.Mutex
 	var last http.Header
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		last = r.Header.Clone()
 		mu.Unlock()

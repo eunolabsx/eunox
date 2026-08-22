@@ -450,10 +450,32 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
+		p.refuseSessionlessPost(w, r, route, msg)
 		return
 	}
 	p.handleSessionPost(w, r, route, sessionID, msg)
+}
+
+// refuseSessionlessPost answers a host POST that carries no session and creates none.
+//
+// Negotiated FIRST, as every other arm on this transport is: this was the one host-leg refusal
+// taken ahead of the revision, so a peer whose declaration this build cannot honor got a bare
+// 400 and nothing on the tape, while the identical bytes on any other path were recorded as
+// UNSUPPORTED_PROTOCOL_VERSION. Nothing durable is pinned here — there is no session to pin on,
+// which is the whole subject of this refusal.
+//
+// That ordering is also what keeps the 400 from ever instructing a 2026-07-28 host to send
+// `Mcp-Session-Id`, a header its revision retired and which it cannot produce. Such a peer is
+// refused above: a sessionless POST has no context to have pinned a revision in, so it resolves
+// to the default and the declaration disagrees. Which is to say the reason a declaring host is
+// unservable over HTTP today is the context pin, not this header — and the remedy is session
+// creation on first request, which is ADR-0004's to decide. A revision-aware branch here would
+// be unreachable code standing in for that decision.
+func (p *HTTPProxy) refuseSessionlessPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) {
+	if _, ok := p.negotiateHostRevision(w, r, route, nil, msg); !ok {
+		return
+	}
+	http.Error(w, SessionHeader+" header required", http.StatusBadRequest)
 }
 
 // handleSessionPost handles a host POST carrying an existing Mcp-Session-Id: it validates

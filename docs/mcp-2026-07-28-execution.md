@@ -57,7 +57,7 @@ criterion is the ADR reaching **Final** under the ADR lifecycle
 
 | Gate | Decision | Recorded in | Blocks |
 |---|---|---|---|
-| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (**Final**, ratified 2026-08-22) | W3, W4, W13's mismatch cells — **unblocked**. The boundary is implemented and ratified; what remains under D1 is the discovery-filter parity property, the `x-mcp-header` allowlist and the `Mcp-Session-Id` retirement, each decided in the ADR and built in its own workstream. |
+| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (**Final**, ratified 2026-08-22) | W3, W4, W13's mismatch cells — **unblocked**. The boundary is implemented and ratified. The `x-mcp-header` allowlist and the `Mcp-Session-Id` retirement have since landed with W3; what remains under D1 is the discovery-filter parity property (W4) and the "never required" half of the session-header retirement, which turns out to be D3's rather than D1's — see W3. |
 | D2 | MRTR metering: the signed continuation — key sourcing, anchor binding, lifetime, replay bound, what re-evaluates per retry, and the commit-once quota rule. | [ADR-0007](adr/0007-mrtr-signed-continuation.md) (Draft) | W6 |
 | D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (Draft; the session-creation addendum is written and awaiting ratification) | W2's session-creation half, and through it W6/W7. **Does not block W2's revocation half**, which is D3-independent and has landed — see W2. |
 | D4 | Stream and deferred-effect enforcement: `subscriptions/listen` open/deny semantics, notification filtering, cancel rehoming; tasks anchor binding and the kill×tasks interaction. | [ADR-0008](adr/0008-stream-and-task-enforcement.md) (Draft) | W7, W8 |
@@ -71,7 +71,7 @@ W1 has since landed on that basis, negotiation included. What made it admissible
 under a Draft D1 is that each revision's table is deny-by-default over the same
 manifest, so selecting one can only REMOVE methods, never grant one policy did not
 permit — no translation is activated, and the mismatched-pair behavior D1 governs
-is untouched. D1 still gates W3, W4, and W13's mismatch cells.
+is untouched. D1 still gates W4 and W13's mismatch cells; W3 has since landed under it.
 
 The **translation boundary itself** has since been implemented, and — unlike the two
 cases below — it never claimed to be admissible under an unratified D1: it is the
@@ -305,7 +305,7 @@ Exit criteria:
 - [ ] A 2026-07-28 host's first HTTP request serves with no `initialize`, on both auth postures
       D3 admits. *(Not started: this is the D3-gated half.)*
 
-### W3 — Header verification and emission (plan §3) — M
+### W3 — Header verification and emission (plan §3) — M — **LANDED** (one criterion open, D3-gated)
 
 **Depends on:** W1, D1.
 
@@ -329,10 +329,50 @@ reach the upstream; header emission asserted in the remote-bridge tests.
 
 Exit criteria:
 
-- [ ] Mismatch matrix green; every cell audited with the new code value.
-- [ ] Smuggling test green; posture documented in the threat model.
-- [ ] Headers emitted on both upstream bridge paths (asserted).
-- [ ] No 2026-07-28 response carries or requires `Mcp-Session-Id` (test).
+- [x] Mismatch matrix green; every cell audited with the new code value.
+- [x] Smuggling test green; posture documented in the threat model (§3.17).
+- [x] Headers emitted on both upstream bridge paths (asserted).
+- [x] No 2026-07-28 response carries `Mcp-Session-Id` (test).
+- [ ] No 2026-07-28 request REQUIRES `Mcp-Session-Id`. *(D3-gated — see below.)*
+
+As landed, differing from the scope above in three places:
+
+- The **emitted pair is derived, not relayed**, and a target that cannot be expressed as
+  an HTTP header field value **fails the call**. The scope reads "emit both headers", which
+  leaves open the cheaper reading of copying the host's. That reading is wrong here: the
+  request eunox forwards is not always the one it received (a `*/list` may be filtered, a
+  stdio host's message never had headers, and the opener and drift probe are eunox's own),
+  so a relayed header would describe a different body. And trimming a target to fit a header
+  would MANUFACTURE the disagreement the inbound check refuses, with eunox's signature on it.
+  The emitted pair is driven back through the inbound verifier in a test, so the two halves
+  cannot drift.
+- The **`x-mcp-header` allowlist has no `defaults:` inheritance and no response-direction
+  key.** ADR-0006 says "stripped by default in both directions; an explicit per-upstream
+  allowlist config key forwards named headers only". The request direction gets the key
+  (`forwardClientHeaders`). The response direction gets none, deliberately: eunox builds its
+  host-facing response and copies no upstream header into it, which is a stronger posture
+  than an allowlist and raises no per-upstream question — an upstream header reaching the
+  host would be a second party setting cookies, cache directives and auth challenges on
+  eunox's own connection, and there is no legitimate named-header form of that.
+- **`Mcp-Session-Id` is retired from the upstream leg and from every response, but the
+  "never required" half is D3's.** The capture is scoped to old-revision upstreams, so eunox
+  never stamps the retired header on a stateless leg. No response to a declaring host carries
+  it — structurally, since answering `initialize` IS the negotiation and a 2026-07-28
+  declaration on it is refused. What this workstream found is that the reason a declaring host
+  is unservable over HTTP is **not** this header at all: a sessionless POST has no context to
+  have pinned a revision in, so it resolves to the default and any declaration disagrees —
+  refused at negotiation, above the session question entirely. Session creation on first
+  request is what changes that, and it is ADR-0004's decision (W2's unlanded half). A
+  revision-aware branch in the sessionless refusal was written and then removed as unreachable
+  code standing in for that decision; the residual is pinned by a test that changes the day
+  session creation lands.
+
+One thing outside the scope as written also landed, because this workstream is what exposed
+it: a **sessionless host POST is now negotiated before it is refused**. It was the one
+host-leg refusal taken ahead of the revision, so a peer whose declaration this build cannot
+honor got a bare 400 with nothing on the tape, while identical bytes on every other arm were
+recorded `UNSUPPORTED_PROTOCOL_VERSION`. That is the gate order `dispatch.go` states, in the
+one place no test looked.
 
 ### W4 — `server/discover` (plan §4) — M
 

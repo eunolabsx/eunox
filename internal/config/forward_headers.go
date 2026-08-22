@@ -122,7 +122,8 @@ func validHeaderFieldName(s string) bool {
 	if s == "" {
 		return false
 	}
-	const tokenSpecials = "!#$%&'*+-.^_`|~"
+	// The RFC 9110 tchar punctuation, spelled out because there is no stdlib predicate for it.
+	const tokenSpecials = "!#$%&'*+-.^_`|~" //nolint:gosec // G101: RFC 9110 tchar punctuation, not a credential
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
