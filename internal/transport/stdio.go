@@ -1221,7 +1221,13 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		}
 		msg = rewritten
 	}
-	_ = p.upWriter.Write(msg)
+	// The boundary applies to notifications too, and they do not reach it through the upstream
+	// call — this write IS the leg's outbound seam for them. See translateNotificationForLeg.
+	outbound, ok := translateNotificationForLeg(msg, resolveRevision(capability.ProtocolRevisionFromContext(ctx)), p.upstreamRev)
+	if !ok {
+		return false
+	}
+	_ = p.upWriter.Write(outbound)
 	return false
 }
 
@@ -1267,7 +1273,7 @@ func (p *StdioProxy) dispatchParams() dispatchParams {
 			audit:            p.audit,
 			sessionID:        p.sessionID,
 			upstreamTimeMs:   p.upstreamTimeMs,
-			callUpstream:     p.callUpstream,
+			callUpstream:     withCrossRevisionTranslation(p.upstreamRev, p.callUpstream),
 			strictAuditState: p.strictAudit(),
 			limits:           p.refusalLimits(),
 		},
@@ -1407,10 +1413,7 @@ func (p *StdioProxy) hostRevision() capability.Revision {
 // dispatchInitialize calls after the shared kill gate passes; the caller writes the
 // returned message to the host.
 func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
-	if refusal, refused := refuseInitializeAcrossRevisions(msg.ID, p.upstreamRev); refused {
-		return refusal
-	}
-	resp := buildInitializeResponse(msg.ID, p.upstreamCaps, p.upstreamInstructions)
+	resp := buildInitializeResponse(msg.ID, initializeCapabilitiesFor(p.upstreamCaps, p.upstreamRev), p.upstreamInstructions)
 	// The context pin is serveHost's, not this handler's — see StdioProxy.hostRev. Reaching
 	// this method at all means the request resolved to the revision that defines initialize.
 	// Bounded: a host may re-initialize as often as it likes and this answer is LOCAL — no session

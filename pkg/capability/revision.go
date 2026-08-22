@@ -122,6 +122,37 @@ const (
 	CacheScopePrivate   = "private"
 )
 
+// ResultKeyResultType is the result member a 2026-07-28 server states the variant of its reply
+// under, and ResultTypeComplete is the terminal variant — the exchange finished in this reply.
+//
+// The member is an OPEN union, which is why only the terminal value is named here. An ABSENT
+// member reads as complete (the spec's rule for a server on an earlier revision, and the shape
+// every 2025-11-25 upstream produces); a value this build does not recognize is an ambiguity
+// rather than a parse detail, and is refused wherever it would have to be acted on, because a
+// variant eunox cannot model is one whose loss it cannot bound.
+//
+// Here for ResultKeyCacheScope's reason: it is part of a revision's result shape, and the
+// layers that read or write it may not import the transport package that owns the rest of the
+// revision vocabulary.
+const (
+	ResultKeyResultType = "resultType"
+	ResultTypeComplete  = "complete"
+)
+
+// BoundResultType renders a peer-supplied `resultType` for an operator-facing message.
+//
+// The value reaches eunox from an upstream and can be any string the JSON permits, so it takes
+// the same treatment every other foreign value that becomes part of an error string takes: a
+// length bound and the control-and-line-terminator strip, so an upstream cannot forge log lines
+// or drive the operator's terminal through a member eunox quotes back.
+func BoundResultType(variant string) string {
+	return SanitizeControlRunes(TruncateUTF8(variant, maxReflectedResultTypeBytes))
+}
+
+// maxReflectedResultTypeBytes bounds a reflected `resultType`. Generous for any plausible
+// variant name and far below anything that would flood a console.
+const maxReflectedResultTypeBytes = 64
+
 // revisionCtxKey is the unexported context key the decided revision travels under, so no
 // package outside this one can plant a revision the transports did not resolve.
 type revisionCtxKey struct{}

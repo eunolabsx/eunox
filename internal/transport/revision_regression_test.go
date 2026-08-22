@@ -348,8 +348,14 @@ func TestDispatchesMessage_RejectsTheRequestFramedNotification(t *testing.T) {
 // sampling/createMessage before the context had pinned could declare the newer revision, have it
 // resolved and honored, pin nothing (a response is dispatched by neither table), and have the
 // declaration relayed into a leg eunox opened and addresses as the handshake revision — the
-// manufactured mismatched pair errUnhonorableUpstreamRevision exists to refuse, reached through
-// the framing whose bytes travel with no dispatch decision at all.
+// manufactured mismatched pair the translation boundary exists to refuse, reached through the
+// framing whose bytes travel with no dispatch decision at all.
+//
+// A response is refused on such a pair whatever else the boundary carries, and it is the one
+// refusal that holds for a reason other than the method's semantics: a response has no method,
+// and on a mismatched pair the only request it could be answering is a server-initiated one
+// this boundary already refused at the leg. So a reply of this shape answers nothing eunox
+// relayed.
 //
 // The FIRST case is the one that matters and the one a framing-aware gate over a request-shaped
 // READER still missed: a conforming response has no `params` at all — MCP puts a result's
@@ -395,8 +401,10 @@ func TestHonorabilityGate_CoversTheHostResponseFraming(t *testing.T) {
 			if rec == nil {
 				t.Fatal("the refused response left no record; a refusal the tape does not carry is the blind spot the framing guards exist to close")
 			}
-			if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUnsupportedProtocolVersion {
-				t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeUnsupportedProtocolVersion)
+			// The boundary code, not the establish-a-revision one: both revisions here are
+			// perfectly well established, and what fails is that the PAIR cannot carry this.
+			if code, _ := rec["denial_code"].(string); code != capability.ErrCodeUntranslatableAcrossRevisions {
+				t.Errorf("denial_code = %q, want %q", code, capability.ErrCodeUntranslatableAcrossRevisions)
 			}
 		})
 	}

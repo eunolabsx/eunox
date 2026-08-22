@@ -96,6 +96,24 @@ const (
 	// The WIRE code stays -32001, so what changes for a host is error.data.code (and the
 	// symbolic code a SIEM rule matches), not the JSON-RPC integer it branches on.
 	ErrCodeUnroutableMethod = "UNROUTABLE_METHOD"
+	// ErrCodeUntranslatableAcrossRevisions refuses a message that a mismatched host/upstream
+	// revision pair cannot carry: the method is routable for the requesting peer and the leg is
+	// live, but honoring it would require eunox to hold per-exchange state on behalf of a peer
+	// whose revision has none, or to hand a peer a result variant its revision cannot read.
+	//
+	// It is distinct from UNSUPPORTED_PROTOCOL_VERSION, which says a revision could not be
+	// ESTABLISHED, and from UNROUTABLE_METHOD, which says no table could route the method at
+	// all. This one says both of those succeeded and the PAIR is what cannot be served — the
+	// only refusal whose cause is a relationship between two peers rather than a fact about
+	// one. An operator reading a tape needs that separable: it is the code that says "this
+	// deployment is mid-migration", and the one a matched pair can never produce.
+	//
+	// The WIRE code is -32022, shared with UNSUPPORTED_PROTOCOL_VERSION, because the problem a
+	// host can act on is the same one — the revisions in play do not line up. ADR-0006 also
+	// names -32601 for a method with "no home for the pair"; that case never reaches here,
+	// having already been answered by the fail-closed routing default under
+	// UNROUTABLE_METHOD, which precedes this check.
+	ErrCodeUntranslatableAcrossRevisions = "UNTRANSLATABLE_ACROSS_REVISIONS"
 )
 
 // Fixed JSON-RPC integer error codes for denial responses.
@@ -143,6 +161,7 @@ var AllDenialCodes = []string{
 	ErrCodeEscalationRequired,
 	ErrCodeUnsupportedProtocolVersion,
 	ErrCodeUnroutableMethod,
+	ErrCodeUntranslatableAcrossRevisions,
 }
 
 // DenialWireCode maps a symbolic denial code (ErrCode*) to the JSON-RPC integer
@@ -190,7 +209,11 @@ func DenialWireCode(code string) (wire int, ok bool) {
 		return JSONRPCCodeEnforcementError, true
 	// The one spec-assigned code eunox emits: a peer whose protocol revision cannot be
 	// established gets -32022, not a policy code, because nothing about policy was reached.
-	case ErrCodeUnsupportedProtocolVersion:
+	// UNTRANSLATABLE_ACROSS_REVISIONS joins it on the spec-assigned integer: the two differ in
+	// WHY the revisions are a problem (one could not be established, the other could not be
+	// bridged), and error.data.code is what separates them, but a host branching on the
+	// integer wants the same answer from both — stop, the revisions do not line up.
+	case ErrCodeUnsupportedProtocolVersion, ErrCodeUntranslatableAcrossRevisions:
 		return JSONRPCCodeUnsupportedProtocolVersion, true
 	case ErrCodeCapabilityDenied:
 		return JSONRPCCodeCapabilityDenied, true
@@ -246,7 +269,12 @@ func ClassifyDenialCode(code string) DenialClass {
 	// be established, and the other's message no revision's routing tables could route. Both
 	// refusals precede every gate that could reach a verdict, so an observing route has none of
 	// its own to forward in their place.
-	case ErrCodeUnsupportedProtocolVersion, ErrCodeUnroutableMethod:
+	// UNTRANSLATABLE_ACROSS_REVISIONS joins them, and its downgrade is the one that would do
+	// real damage: an observing route forwarding a message this refuses would hand a peer a
+	// result variant its revision cannot read, or leave an upstream blocked on an exchange the
+	// host can never complete. There is no policy verdict to forward in its place either — the
+	// pair is refused before any match runs.
+	case ErrCodeUnsupportedProtocolVersion, ErrCodeUnroutableMethod, ErrCodeUntranslatableAcrossRevisions:
 		return DenialClassFault
 	default:
 		return DenialClassPolicy

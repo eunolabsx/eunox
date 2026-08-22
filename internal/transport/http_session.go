@@ -282,10 +282,7 @@ func (s *httpSession) touchRequest() {
 // buildInitResponse builds an initialize response for the host using the
 // upstream capabilities gathered during session startup.
 func (s *httpSession) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
-	if resp, refused := refuseInitializeAcrossRevisions(msg.ID, s.upstreamRev); refused {
-		return resp
-	}
-	return buildInitializeResponse(msg.ID, s.upstreamCaps, s.upstreamInstructions)
+	return buildInitializeResponse(msg.ID, initializeCapabilitiesFor(s.upstreamCaps, s.upstreamRev), s.upstreamInstructions)
 }
 
 // ownerMismatch reports whether cur (the current request's JWT identity) differs from the
@@ -1294,6 +1291,12 @@ func (s *httpSession) teardownDone() <-chan struct{} {
 // forwardNotification sends a notification to the upstream.
 // Remote mode: HTTP POST. Local mode: stdio write.
 func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
+	// This method is the leg's outbound seam for notifications, which never reach the upstream
+	// CALL the translation wrapper covers. See translateNotificationForLeg.
+	msg, ok := translateNotificationForLeg(msg, resolveRevision(capability.ProtocolRevisionFromContext(ctx)), s.upstreamRev)
+	if !ok {
+		return
+	}
 	if s.upHTTPClient != nil {
 		// Remote-HTTP upstream: host ids are forwarded unchanged, so a cancel already
 		// correlates -- do not rewrite it.
