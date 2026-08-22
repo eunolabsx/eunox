@@ -94,20 +94,20 @@ func DeclassifyLabelsOf(c *Constraint) []string {
 	if len(set) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(set))
-	for _, l := range flowLabelVocabulary {
-		if set[l] {
-			out = append(out, l)
-		}
+	keys := make([]string, 0, len(set))
+	for l := range set {
+		keys = append(keys, l)
 	}
-	// A label outside the closed vocabulary cannot appear here on a loaded manifest
-	// (validation rejects it) but can on a programmatically built constraint. Append it
-	// rather than dropping it: the engine's own check errors on an unknown label, and a
-	// silently dropped one would shrink what the caller asked to clear.
+	out := NormalizeFlowLabels(keys)
+	// A MALFORMED label (neither axis) cannot appear here on a loaded manifest (validation
+	// rejects it) but can on a programmatically built constraint, and NormalizeFlowLabels
+	// drops it. Append it rather than accepting the drop: the engine's own check errors on
+	// one, and silently dropping it would shrink what the caller asked to clear — the one
+	// direction on this path that under-blocks rather than over-blocks.
 	if len(out) != len(set) {
 		var extra []string
 		for l := range set {
-			if !flowLabelSet[l] {
+			if ValidateFlowLabel(l) != nil {
 				extra = append(extra, l)
 			}
 		}
@@ -217,10 +217,12 @@ func (a *DeclassifyApproval) Validate() error {
 	if len(a.Labels) == 0 {
 		return fmt.Errorf("declassify approval must name at least one label in 'labels'")
 	}
-	for _, l := range a.Labels {
-		if !IsFlowLabel(l) {
-			return fmt.Errorf("declassify approval 'labels' contains unknown flow label %q; valid native labels are %v", l, flowLabelVocabulary)
-		}
+	// Structural only, for ValidateFlowLabel's stated reason: an approval REMOVES an
+	// allowance, so a namespace this manifest never declared clears nothing. Count-bounded
+	// with the other claim-borne lists, so one boundary rule covers every externally-supplied
+	// label list rather than each surface deciding for itself.
+	if err := checkExternalFlowLabels(a.Labels, "declassify approval 'labels'"); err != nil {
+		return err
 	}
 	target := strings.TrimSpace(a.Target)
 	if target == "" {

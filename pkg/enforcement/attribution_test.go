@@ -6,6 +6,8 @@ package enforcement_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/callcounter"
@@ -148,6 +150,86 @@ func TestParseContextManifest(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+// TestParseContextManifest_LabelCountIsBounded pins the count bound the imported axis made
+// necessary. The closed native vocabulary used to cap a client's effective declared set at
+// five by construction; once a label may be an operator-open "namespace:value", an untrusted
+// peer can name unboundedly many well-formed ones in one `_meta` block. They reach the
+// decision path and a denial's details, where an oversized list pushes the marshaled map past
+// the audit total cap and gets the WHOLE map replaced by the truncation marker — the caller
+// erasing its own flow-denial evidence. See capability.MaxExternalFlowLabels.
+func TestParseContextManifest_LabelCountIsBounded(t *testing.T) {
+	block := func(n int) map[string]json.RawMessage {
+		labels := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			labels = append(labels, fmt.Sprintf("purview:c-%d", i))
+		}
+		body, err := json.Marshal(capability.ContextManifest{Labels: labels})
+		require.NoError(t, err)
+		return map[string]json.RawMessage{capability.MetaKeyContextManifest: body}
+	}
+
+	cm, err := capability.ParseContextManifest(block(capability.MaxExternalFlowLabels))
+	require.NoError(t, err, "a list exactly at the bound is admitted")
+	assert.Len(t, cm.Labels, capability.MaxExternalFlowLabels)
+
+	_, err = capability.ParseContextManifest(block(capability.MaxExternalFlowLabels + 1))
+	require.Error(t, err, "one over the bound is refused, not truncated")
+	assert.Contains(t, err.Error(), "more than the maximum")
+}
+
+// TestDeclaredLabels_BoundedCostAndIntactDenial covers the two halves of what the count
+// bound is and is not for.
+//
+// IS: the decision path normalizes (sorts), unions and walks a client's declared labels once
+// per enforced call, so an unbounded list is a CPU amplifier a peer drives from one `_meta`
+// block. At the bound the whole decision stays in the tens of microseconds.
+//
+// IS NOT: keeping the denial record legible. BoundDenialDetails already caps a deny's whole
+// details map at 8 KiB, so the `flow` discriminator and the record survive whatever the
+// caller sends — asserted here at the bound so a future change to either mechanism cannot
+// quietly make the other one load-bearing.
+func TestDeclaredLabels_BoundedCostAndIntactDenial(t *testing.T) {
+	labels := make([]string, 0, capability.MaxExternalFlowLabels)
+	for i := 0; i < capability.MaxExternalFlowLabels; i++ {
+		// Maximal-length labels, so this measures the worst case the grammar admits.
+		ns := fmt.Sprintf("ns-%d", i)
+		labels = append(labels,
+			ns+strings.Repeat("x", 32-len(ns))+":"+fmt.Sprintf("c-%d", i)+strings.Repeat("x", 96-len(fmt.Sprintf("c-%d", i))))
+	}
+	for _, l := range labels {
+		require.NoError(t, capability.ValidateFlowLabel(l))
+	}
+
+	eng := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+	)
+	resp := eng.ValidateAction(context.Background(), &capability.EnforceRequest{
+		SessionID:      "s",
+		TargetName:     "send_email",
+		Target:         &capability.EnforceRequestTarget{Type: "tool", Name: "send_email"},
+		DeclaredLabels: labels,
+	}, []capability.Constraint{{
+		Target:     "tool:send_email",
+		Actions:    []string{"call"},
+		Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{"public"}}},
+	}})
+
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, capability.ConditionTypeFlowLabel, resp.Denial.ConditionType)
+	assert.Equal(t, true, resp.Denial.Details[capability.FlowAuditDetailKey],
+		"the flow discriminator survives a maximal declaration")
+
+	// Bounded whole by BoundDenialDetails (8 KiB), far below the audit sink's own 1 MiB total
+	// cap — the cap that, if exceeded, would replace the map with a truncation marker. A long
+	// blocked-label array is ELIDED with a marker rather than dropping the map, which is that
+	// bound's designed behavior and not something the count bound is chasing.
+	marshaled, err := json.Marshal(resp.Denial.Details)
+	require.NoError(t, err)
+	assert.Less(t, len(marshaled), 1<<20)
 }
 
 // TestNormalizeDeclaredLabelsIsDeterministic pins that the effective set and the audit

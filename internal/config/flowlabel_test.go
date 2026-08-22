@@ -87,7 +87,7 @@ capabilities:
       - type: flowLabel
         allow: [public, sekret]
 `,
-			wantErr: "unknown label \"sekret\"",
+			wantErr: "unknown flow label \"sekret\"",
 		},
 		{
 			name: "unknown labelOutput label",
@@ -100,7 +100,7 @@ capabilities:
       - type: labelOutput
         labels: [toppublic]
 `,
-			wantErr: "unknown label \"toppublic\"",
+			wantErr: "unknown flow label \"toppublic\"",
 		},
 		{
 			name: "empty labelOutput labels",
@@ -233,5 +233,212 @@ capabilities:
 	_, err := LoadManifest(writeManifestFile(t, body))
 	if err == nil || !strings.Contains(err.Error(), "tool: or resource:") {
 		t.Fatalf("labelOutput on system: must be rejected, got %v", err)
+	}
+}
+
+// TestImportedSensitivity_NamespaceClosure drives the load-time closure the imported
+// sensitivity axis rests on. eunox cannot own the taxonomy's VALUES, so the namespace
+// declaration is the only closure left: it is what turns a misspelled taxonomy name into a
+// load error instead of a label that taints where nothing admits it and reads, much later,
+// as a mysterious denial.
+func TestImportedSensitivity_NamespaceClosure(t *testing.T) {
+	v2 := "schemaVersion: \"" + ManifestSchemaVersion02 + "\"\n"
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "declared namespace loads on both halves",
+			body: `name: p
+version: "0.1.0"
+flowLabelNamespaces: [purview, msip]
+capabilities:
+  - target: "tool:read_doc"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: [pii, "purview:highly-confidential"]
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allow: [public, "msip:general"]
+`,
+		},
+		{
+			name: "undeclared namespace in labelOutput",
+			body: `name: p
+version: "0.1.0"
+flowLabelNamespaces: [purview]
+capabilities:
+  - target: "tool:read_doc"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: ["msip:confidential"]
+`,
+			wantErr: "does not declare",
+		},
+		{
+			// The typo this closure exists for: without the declaration it would load
+			// clean and simply never match the sink that spells it correctly.
+			name: "misspelled namespace is a load error",
+			body: `name: p
+version: "0.1.0"
+flowLabelNamespaces: [purview]
+capabilities:
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allow: ["purvew:general"]
+`,
+			wantErr: "does not declare",
+		},
+		{
+			name: "no declaration admits no imported label",
+			body: `name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:read_doc"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: ["purview:confidential"]
+`,
+			wantErr: "does not declare",
+		},
+		{
+			name: "declassify is held to the same closure",
+			body: `name: p
+version: "0.1.0"
+capabilities:
+  - target: "tool:sanitize"
+    actions: [call]
+    directives:
+      - type: declassify
+        labels: ["purview:confidential"]
+`,
+			wantErr: "does not declare",
+		},
+		{
+			name: "malformed namespace declaration",
+			body: `name: p
+version: "0.1.0"
+flowLabelNamespaces: ["Purview"]
+capabilities: []
+`,
+			wantErr: "must start with a lowercase letter",
+		},
+		{
+			name: "duplicate namespace declaration",
+			body: `name: p
+version: "0.1.0"
+flowLabelNamespaces: [purview, purview]
+capabilities: []
+`,
+			wantErr: "declares \"purview\" twice",
+		},
+		{
+			name: "malformed imported label value",
+			body: `name: p
+version: "0.1.0"
+flowLabelNamespaces: [purview]
+capabilities:
+  - target: "tool:read_doc"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: ["purview:highly confidential"]
+`,
+			wantErr: "printable ASCII with no spaces",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadManifest(writeManifestFile(t, v2+tc.body))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("LoadManifest rejected a valid manifest: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("LoadManifest accepted %s, want rejection", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestFlowLabelNamespaces_RefusedUnder01 pins the grammar gate. flowLabelNamespaces has no
+// prototype-registry entry of its own (it is not a discriminator), so it is gated inside
+// checkTokenGrammarVersion beside effectCeiling — and that gate is what keeps a later
+// revision's surface from silently widening an earlier one.
+func TestFlowLabelNamespaces_RefusedUnder01(t *testing.T) {
+	body := "schemaVersion: \"" + ManifestSchemaVersion01 + `"
+name: p
+version: "0.1.0"
+flowLabelNamespaces: [purview]
+capabilities: []
+`
+	_, err := LoadManifest(writeManifestFile(t, body))
+	if err == nil || !strings.Contains(err.Error(), "flowLabelNamespaces was introduced in schemaVersion") {
+		t.Fatalf("flowLabelNamespaces must be refused under %q, got %v", ManifestSchemaVersion01, err)
+	}
+}
+
+// TestMergeManifests_UnionsFlowLabelNamespaces pins the union fold. Two files each
+// declaring the taxonomy their own capabilities use are COMPOSING, not disagreeing, so the
+// conflict check Audience and effectCeiling take would make the axis unusable across a
+// split policy. Nothing widens: a namespace only permits labels, and a label can only add
+// taint or narrow an allow-set.
+func TestMergeManifests_UnionsFlowLabelNamespaces(t *testing.T) {
+	load := func(body string) *LocalManifest {
+		t.Helper()
+		m, err := LoadManifest(writeManifestFile(t, "schemaVersion: \""+ManifestSchemaVersion02+"\"\n"+body))
+		if err != nil {
+			t.Fatalf("LoadManifest: %v", err)
+		}
+		return m
+	}
+	a := load(`name: a
+version: "0.1.0"
+flowLabelNamespaces: [purview]
+capabilities:
+  - target: "tool:read_doc"
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: ["purview:confidential"]
+`)
+	b := load(`name: b
+version: "0.1.0"
+flowLabelNamespaces: [msip, purview]
+capabilities:
+  - target: "tool:send_email"
+    actions: [call]
+    conditions:
+      - type: flowLabel
+        allow: ["msip:general"]
+`)
+	merged, err := MergeManifests([]*LocalManifest{a, b})
+	if err != nil {
+		t.Fatalf("MergeManifests rejected a composing pair: %v", err)
+	}
+	// First-seen order, deduplicated — and the merged whole re-validates, so each file's
+	// imported labels still resolve against the union.
+	want := []string{"purview", "msip"}
+	if len(merged.FlowLabelNamespaces) != len(want) {
+		t.Fatalf("merged namespaces = %v, want %v", merged.FlowLabelNamespaces, want)
+	}
+	for i, ns := range want {
+		if merged.FlowLabelNamespaces[i] != ns {
+			t.Errorf("merged namespaces = %v, want %v", merged.FlowLabelNamespaces, want)
+			break
+		}
 	}
 }

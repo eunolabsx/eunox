@@ -359,8 +359,12 @@ func (c *DelegationChain) ForcedLabels() []string {
 	return c.computeForcedLabels()
 }
 
-// UnknownForcedLabels returns the raw grant labels that are not native flow labels, in the
-// order the chain declares them.
+// UnknownForcedLabels returns the raw grant labels usable on NEITHER axis, in the order the
+// chain declares them.
+//
+// The predicate must mirror exactly what ForcedLabels' normalization keeps, which is both
+// axes: reporting an imported label here would hard-deny every delegated call carrying one,
+// turning a taxonomy this route does not police into an outage rather than extra denials.
 //
 // ForcedLabels normalizes against the vocabulary, which silently DROPS anything unrecognized.
 // That is right for a cooperating client's voluntary attribution (an unknown label there can
@@ -380,7 +384,7 @@ func (c *DelegationChain) UnknownForcedLabels() []string {
 	var unknown []string
 	for i := range c.Grants {
 		for _, l := range c.Grants[i].Labels {
-			if !IsFlowLabel(l) {
+			if ValidateFlowLabel(l) != nil {
 				unknown = append(unknown, l)
 			}
 		}
@@ -434,10 +438,11 @@ func (c *DelegationChain) EffectClassCap() (class, subject string, ok bool) {
 // claim parser trims to "ssn" and the other boundary leaves as " ssn" matches no key, so the
 // delegator's masking obligation evaporates instead of failing loudly.
 //
-// Labels/AllowLabels are deliberately left alone. They are matched against the closed flow-label
-// vocabulary, which Validate refuses anything outside — so a padded entry rejects the grant at
-// both boundaries alike rather than going silently inert, and trimming would ACCEPT a spelling
-// the claim path rejects.
+// Labels/AllowLabels are deliberately left alone. Validate refuses anything outside the two
+// flow-label axes, and padding puts an entry outside both (a leading space is in neither the
+// native vocabulary nor a well-formed namespace), so a padded entry rejects the grant at both
+// boundaries alike rather than going silently inert, and trimming would ACCEPT a spelling the
+// claim path rejects.
 func (g *DelegationGrant) normalize() {
 	g.Subject = strings.TrimSpace(g.Subject)
 	g.Targets = trimmedListPtr(g.Targets)
@@ -477,16 +482,22 @@ func (g *DelegationGrant) Validate() error {
 			}
 		}
 	}
-	for _, l := range g.Labels {
-		if !IsFlowLabel(l) {
-			return fmt.Errorf("delegation grant for %q: 'labels' contains unknown flow label %q; valid native labels are %v", g.Subject, l, FlowLabelVocabulary())
-		}
+	// Both label lists take structural validation only (see ValidateFlowLabel): a token is
+	// the IdP's artifact and this manifest's declared namespaces are the operator's, so
+	// requiring agreement would reject a correctly-issued narrowing token that names a
+	// taxonomy this route happens not to police. Neither list can widen — Labels FORCE
+	// taint onto the delegate's calls, AllowLabels only intersects the sink's allow-set —
+	// so an undeclared namespace over-blocks in both.
+	// Count-bounded per hop for MaxExternalFlowLabels' reason, and per hop rather than per
+	// chain because MaxDelegationDepth already bounds the hops: this chain is
+	// attacker-influenced input the decision path walks once per enforced call, which is the
+	// same argument that cap rests on.
+	if err := checkExternalFlowLabels(g.Labels, fmt.Sprintf("delegation grant for %q: 'labels'", g.Subject)); err != nil {
+		return err
 	}
 	if g.AllowLabels != nil {
-		for _, l := range *g.AllowLabels {
-			if !IsFlowLabel(l) {
-				return fmt.Errorf("delegation grant for %q: 'allowLabels' contains unknown flow label %q; valid native labels are %v", g.Subject, l, FlowLabelVocabulary())
-			}
+		if err := checkExternalFlowLabels(*g.AllowLabels, fmt.Sprintf("delegation grant for %q: 'allowLabels'", g.Subject)); err != nil {
+			return err
 		}
 	}
 	for _, f := range g.RedactFields {

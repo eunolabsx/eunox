@@ -168,8 +168,12 @@ func TestManifestSchema_ClosedVocabularies(t *testing.T) {
 	t.Parallel()
 	doc := loadManifestSchema(t)
 
-	if got, want := schemaEnum(t, schemaObjectAt(t, doc, "$defs", "flowLabel")), capability.FlowLabelVocabulary(); !sameStrings(got, want) {
-		t.Errorf("flowLabel enum = %v, want the native vocabulary %v", got, want)
+	// The NATIVE half only: the imported axis has no enum to pin, since its values are the
+	// incumbent taxonomy's and eunox never enumerates them. Pinned through the dedicated
+	// $def so widening #/$defs/flowLabel to the two-axis oneOf cannot quietly drop the one
+	// vocabulary the schema and the engine must still agree on.
+	if got, want := schemaEnum(t, schemaObjectAt(t, doc, "$defs", "nativeFlowLabel")), capability.NativeFlowLabelVocabulary(); !sameStrings(got, want) {
+		t.Errorf("nativeFlowLabel enum = %v, want the native vocabulary %v", got, want)
 	}
 	if got, want := schemaEnum(t, schemaObjectAt(t, doc, "$defs", "effectClass")), capability.EffectClassVocabulary(); !sameStrings(got, want) {
 		t.Errorf("effectClass enum = %v, want the closed reversibility set %v", got, want)

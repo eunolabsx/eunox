@@ -200,7 +200,7 @@ Two revisions are published, and a build parses both:
 | `schemaVersion` | What it adds |
 |---|---|
 | `"0.1"` | The base authorization vocabulary: targets, actions, `argumentSchema`, `principal`, the conditions in § 5, and the `redactFields` directive. |
-| `"0.2"` | Everything in `0.1`, plus the **flow + effect layer**: the [`flowLabel`](#flowlabel--the-information-flow-sink) condition, the [`labelOutput`](#labeloutput--the-information-flow-source) and [`declassify`](#declassify--clearing-a-label-under-human-approval) directives, the [`effectClass` / `blastRadius`](./effect-contracts.md) conditions, a constraint's [`effect`](./effect-contracts.md) contract, the top-level [`effectCeiling`](./effect-contracts.md), and the [`${task.*}`](#task-context-variables) variables. |
+| `"0.2"` | Everything in `0.1`, plus the **flow + effect layer**: the [`flowLabel`](#flowlabel--the-information-flow-sink) condition, the [`labelOutput`](#labeloutput--the-information-flow-source) and [`declassify`](#declassify--clearing-a-label-under-human-approval) directives, the [`effectClass` / `blastRadius`](./effect-contracts.md) conditions, a constraint's [`effect`](./effect-contracts.md) contract, the top-level [`effectCeiling`](./effect-contracts.md), the top-level [`flowLabelNamespaces`](#5b-information-flow--flowlabel-labeloutput-declassify), and the [`${task.*}`](#task-context-variables) variables. |
 
 The revisions are **closed against each other in one direction only**: a `0.2`
 manifest may use every `0.1` token, and a `0.1` manifest that uses a `0.2` token
@@ -2215,8 +2215,11 @@ Information-flow control is two halves plus an escape hatch:
 - **`declassify`** (directive, the **approved clear**): *"a human agreed this
   action removes these labels."*
 
-Labels are a **closed, flat** vocabulary of five native provenance/integrity
-classes — no lattice, no partial order:
+Labels span **two axes**. Both are **flat** — a label is a tag, and there is no
+lattice or partial order on either.
+
+**Axis 1 — native provenance/integrity.** A **closed** vocabulary of five source
+classes that eunox owns end to end:
 
 | Label | Meaning |
 |---|---|
@@ -2226,9 +2229,54 @@ classes — no lattice, no partial order:
 | `pii` | Carries personal information. |
 | `untrusted` | Attacker-influenceable input — the integrity class. An action whose control path carries it is blocked regardless of held permission. |
 
-A label is **asserted by policy, never inferred from content**. eunox reads no
-payload to decide one, so there is no classifier and no model anywhere on this
-path. A misspelled label is a load error.
+**Axis 2 — imported sensitivity.** A class some incumbent classifier
+(Purview/MSIP/BigID) already produced, written `namespace:value`:
+
+```yaml
+flowLabelNamespaces: [purview, msip]   # top-level: the taxonomies this policy speaks
+
+capabilities:
+  - target: tool:read_document
+    actions: [call]
+    directives:
+      - type: labelOutput
+        labels: ["purview:highly-confidential"]
+```
+
+eunox owns the **algebra** — the join, the subset check, the canonical order —
+and never the **taxonomy or the classifier**. It does not know what
+`purview:highly-confidential` means, cannot enumerate the values Purview defines,
+and never asks anything to classify a payload. To the enforcement path an
+imported label is an opaque set member, which is exactly what lets eunox enforce
+a taxonomy it does not own.
+
+Because the values are the incumbent's, the closure eunox can still own is the
+**namespace**: declare the taxonomies in the top-level `flowLabelNamespaces`, and
+an imported label naming an undeclared namespace is a **load error**. That is
+what keeps a misspelled taxonomy (`purvew:general`) from loading clean and
+matching nothing. The value half is checked only for shape — printable ASCII, no
+spaces (slugify the taxonomy's own spelling: `Highly Confidential` →
+`highly-confidential`), a namespace of lowercase letters, digits and hyphens.
+
+The two axes never interact: a sink admitting every native class still denies an
+imported taint, and a sink admitting only imported classes still denies a native
+one. Adding an imported label to a policy cannot widen a rule written for the
+native axis.
+
+> **The values are open, and that is safe here** because the sink rule is
+> *present and not allowed ⇒ deny*. A typo'd value taints where no sink admits it,
+> and in a sink's `allow` list admits nothing. Both directions over-block. An open
+> value space would **not** be safe in a rule that granted on a match.
+
+A label on either axis is **asserted by policy, never inferred from content**.
+eunox reads no payload to decide one, so there is no classifier and no model
+anywhere on this path. A label belonging to neither axis is a load error.
+
+> **A label is only as trustworthy as its source.** Today an imported label is
+> asserted by the policy author, the same way a native one is. Deriving it from a
+> field the *server* returned would make the flow control only as strong as that
+> server's trustworthiness — an agent-settable or downgradeable label defeats it —
+> so that ingestion path is deliberately not wired.
 
 ### `labelOutput` — the information-flow source
 

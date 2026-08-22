@@ -212,3 +212,79 @@ func TestFlowLabel_NonFlowConstraintCarriesNoLabels(t *testing.T) {
 	assert.Nil(t, resp.LabelsOut)
 	assert.Nil(t, resp.CarriedLabels)
 }
+
+// TestFlowLabel_ImportedSensitivityAxis drives an imported sensitivity label through the
+// whole source->sink invariant, and pins the property that makes an operator-owned value
+// space safe here: the algebra treats a label as an opaque set member, so eunox enforces a
+// taxonomy it cannot enumerate without ever interpreting one of its classes.
+func TestFlowLabel_ImportedSensitivityAxis(t *testing.T) {
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
+	ctx := context.Background()
+
+	src := eng.ValidateAction(ctx, req("s", "read_doc"), sourceCaps("read_doc", "purview:highly-confidential"))
+	require.Equal(t, capability.DecisionAllow, src.Decision)
+	assert.Equal(t, []string{"purview:highly-confidential"}, src.LabelsOut)
+
+	// A sink admitting a DIFFERENT class of the same taxonomy denies: the subset check is
+	// exact string membership, with no ordering between "general" and "highly-confidential"
+	// — the flat-tags stop-line holding on the imported axis as it does on the native one.
+	sink := eng.ValidateAction(ctx, req("s", "send_email"), sinkCaps("send_email", "purview:general"))
+	require.Equal(t, capability.DecisionDeny, sink.Decision)
+	require.NotNil(t, sink.Denial)
+	assert.Equal(t, capability.ConditionTypeFlowLabel, sink.Denial.ConditionType)
+	assert.Equal(t, []string{"purview:highly-confidential"}, sink.Denial.Details["blockedLabels"])
+
+	// The same sink admitting the class actually present allows.
+	ok := eng.ValidateAction(ctx, req("s", "archive"), sinkCaps("archive", "purview:highly-confidential"))
+	assert.Equal(t, capability.DecisionAllow, ok.Decision)
+}
+
+// TestFlowLabel_AxesAreIndependent pins that neither axis subsumes the other: a sink
+// admitting every native class still denies an imported taint, and vice versa. Without
+// this, adding the second axis could silently have widened a policy written for the first.
+func TestFlowLabel_AxesAreIndependent(t *testing.T) {
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
+	ctx := context.Background()
+
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("s", "read_doc"), sourceCaps("read_doc", "msip:confidential")).Decision)
+
+	// Every NATIVE class allowed, and the imported taint still blocks.
+	sink := eng.ValidateAction(ctx, req("s", "send_email"), sinkCaps("send_email", capability.NativeFlowLabelVocabulary()...))
+	require.Equal(t, capability.DecisionDeny, sink.Decision)
+	assert.Equal(t, []string{"msip:confidential"}, sink.Denial.Details["blockedLabels"])
+
+	// The mirror: a native taint against a sink that admits only imported classes.
+	require.Equal(t, capability.DecisionAllow,
+		eng.ValidateAction(ctx, req("t", "read_pii"), sourceCaps("read_pii", capability.FlowLabelPII)).Decision)
+	mirror := eng.ValidateAction(ctx, req("t", "send_email"), sinkCaps("send_email", "msip:confidential", "msip:general"))
+	require.Equal(t, capability.DecisionDeny, mirror.Decision)
+	assert.Equal(t, []string{capability.FlowLabelPII}, mirror.Denial.Details["blockedLabels"])
+}
+
+// TestFlowLabel_MixedAxisCarriedLabelsAreCanonical pins the canonical order on the audited
+// accumulated set once both axes are present: native-first in vocabulary order, then
+// imported sorted. A second renderer would not fail anything — it would just put a
+// differently-ordered set on the signed tape.
+func TestFlowLabel_MixedAxisCarriedLabelsAreCanonical(t *testing.T) {
+	eng := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
+	ctx := context.Background()
+
+	// Sources run in an order that does NOT match the canonical rendering.
+	for _, s := range [][]string{
+		{"purview:secret"},
+		{capability.FlowLabelUntrusted},
+		{"msip:general"},
+		{capability.FlowLabelPII},
+	} {
+		require.Equal(t, capability.DecisionAllow,
+			eng.ValidateAction(ctx, req("s", "src"), sourceCaps("src", s...)).Decision)
+	}
+
+	sink := eng.ValidateAction(ctx, req("s", "send_email"), sinkCaps("send_email"))
+	require.Equal(t, capability.DecisionDeny, sink.Decision)
+	assert.Equal(t, []string{
+		capability.FlowLabelPII, capability.FlowLabelUntrusted,
+		"msip:general", "purview:secret",
+	}, sink.CarriedLabels, "carried_labels renders native-first then imported, sorted")
+}

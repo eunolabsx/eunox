@@ -158,9 +158,9 @@ func (e *Engine) checkDeclassify(ctx context.Context, ec evalCtx, carriedLabels 
 	// Fail closed on an unknown label, matching recordLabels and handleFlowLabel: a loaded
 	// manifest cannot reach here with one, but a programmatically built constraint can.
 	for _, l := range want {
-		if !capability.IsFlowLabel(l) {
+		if err := capability.ValidateFlowLabel(l); err != nil {
 			return declassifyOutcome{}, e.declassifyRefusal(ec, carriedLabels, want, nil,
-				fmt.Sprintf("declassify names unknown flow label %q; valid native labels are %v", l, flowLabelVocab),
+				fmt.Sprintf("declassify names an unusable flow label: %v", err),
 				"unknown_label")
 		}
 	}

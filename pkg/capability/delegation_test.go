@@ -424,3 +424,66 @@ func TestDelegationChain_AllowLabelCapIntersectsAcrossHops(t *testing.T) {
 	require.True(t, capped)
 	assert.Equal(t, []string{capability.FlowLabelPublic}, allowed)
 }
+
+// TestDelegationGrant_LabelCountIsBounded pins the per-hop label bound. MaxDelegationDepth
+// bounds the hops on the argument that the chain is attacker-influenced input the decision
+// path walks once per enforced call; once a label may be an operator-open "namespace:value"
+// rather than one of five closed classes, each hop's own label lists need the same treatment
+// or the per-call work is unbounded again one level down. See MaxExternalFlowLabels.
+func TestDelegationGrant_LabelCountIsBounded(t *testing.T) {
+	labels := func(n int) []string {
+		out := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, fmt.Sprintf("purview:c-%d", i))
+		}
+		return out
+	}
+
+	atBound := capability.DelegationGrant{Subject: "agent", Labels: labels(capability.MaxExternalFlowLabels)}
+	assert.NoError(t, atBound.Validate(), "a hop exactly at the bound is admitted")
+
+	over := capability.DelegationGrant{Subject: "agent", Labels: labels(capability.MaxExternalFlowLabels + 1)}
+	err := over.Validate()
+	require.Error(t, err, "one over the bound is refused at the token boundary")
+	assert.Contains(t, err.Error(), "more than the maximum")
+
+	// The allow-cap takes the same bound: it is intersected per call the same way.
+	allowCap := labels(capability.MaxExternalFlowLabels + 1)
+	overCap := capability.DelegationGrant{Subject: "agent", AllowLabels: &allowCap}
+	err = overCap.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "allowLabels")
+
+	// Reachable through the exported chain boundary, not only through Validate: an embedder
+	// assembling a chain directly never goes through ParseDelegationGrants, and asserting the
+	// bound on the grant alone left that entry point admitting an unbounded list.
+	_, err = capability.ValidateDelegationChain(nil, []capability.DelegationGrant{over})
+	require.Error(t, err, "the count bound must hold at every boundary that accepts a chain")
+	assert.Contains(t, err.Error(), "more than the maximum")
+}
+
+// TestDelegationChain_ImportedForcedLabelsAreNotUnknown pins the two-axis half of the forced-label
+// path. UnknownForcedLabels must report exactly what ForcedLabels' normalization DROPS: a label
+// on either axis survives it, so reporting an imported one would hard-deny every delegated call
+// carrying it — turning a taxonomy this route does not police into an outage rather than the
+// extra denials the axis is designed to produce.
+func TestDelegationChain_ImportedForcedLabelsAreNotUnknown(t *testing.T) {
+	chain, err := capability.ValidateDelegationChain(nil, []capability.DelegationGrant{{
+		Subject: "agent-a",
+		Labels:  []string{"confidential", "purview:highly-confidential"},
+	}})
+	require.NoError(t, err, "a grant forcing an imported label is well-formed")
+	assert.Empty(t, chain.UnknownForcedLabels(), "a label on either axis is not unknown")
+	assert.Equal(t,
+		[]string{"confidential", "purview:highly-confidential"},
+		chain.ForcedLabels(),
+		"both axes survive normalization, native-first then imported sorted")
+
+	// The complement: a label on NEITHER axis is still surfaced, which is what stops a
+	// programmatically-built chain silently shedding taint its delegators imposed.
+	unchecked := &capability.DelegationChain{Grants: []capability.DelegationGrant{{
+		Subject: "agent-a",
+		Labels:  []string{"Purview:x", "quarantined"},
+	}}}
+	assert.Equal(t, []string{"Purview:x", "quarantined"}, unchecked.UnknownForcedLabels())
+}
