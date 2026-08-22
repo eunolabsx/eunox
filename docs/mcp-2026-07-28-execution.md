@@ -1,7 +1,7 @@
 # MCP 2026-07-28 execution plan
 
-**Status:** in progress — W1 has landed and W11 has landed its upstream-opener
-half; every other workstream is still planning.
+**Status:** in progress — W1 has landed; W13 has landed the e2e interop matrix and
+W11 its upstream-opener half; every other workstream is still planning.
 Companion to [mcp-2026-07-28-plan.md](mcp-2026-07-28-plan.md), which states what
 changes and why. This document states the work as workstreams — concrete
 deliverables, the tests each one owes, and the exit criteria that say when it is
@@ -11,8 +11,8 @@ done. Workstream sections are keyed to the plan's numbered items.
 A landed workstream says so in its heading; an unmarked heading is still planning.
 A workstream is **landed** only when every exit criterion below it is ticked or
 explicitly accounted for — W1 is landed with two criteria open, and says which.
-W11 is the one partial: its heading is unmarked because only the opener landed,
-and the section says what did not.
+W11 and W13 are the partials: each heading says so, and each section lists what
+did not land and why.
 
 References name a **file and a symbol, never a line number**.
 
@@ -148,12 +148,11 @@ Exit criteria:
       (`internal/transport/dispatch.go` `methodRegistry` + `buildRevisionDispatch`;
       `TestMethodRegistry_EveryMethodDeclaresRevisionMembership`,
       `TestRevisionDispatch_ExactSetPerRevision`.)
-- [ ] Old-revision wire behavior unchanged through the refactor (full suite + old×old
-      e2e cell green). **Half met, so unticked:** the full suite passes unmodified except
-      where a test called a signature this workstream widened, but the old×old cell this
-      criterion names as its arbiter is W13's Docker cell and does not exist. This doc's own
-      rule is that "mostly done" has no checkbox. Ticks when W13 stands that cell up.
-      **Narrowed twice since, and the gap is now the harness rather than the property:**
+- [x] Old-revision wire behavior unchanged through the refactor (full suite + old×old
+      e2e cell green). **Ticked: the cell exists.** W13 stood up the interop matrix in
+      `demo/e2e/run.sh`, whose old×old cell drives a 2025-11-25 host against a 2025-11-25
+      upstream through the real binary and asserts the enforced surface end to end. The
+      in-process pins below stay as the byte-level half of the same property:
       `internal/transport/revision_wire_test.go` pins the exact host-facing BYTES for every
       old-revision response the proxy generates itself (`initialize`, `ping`, a filtered
       `tools/list`, the fail-closed default, and the -32022 refusal), against a context that
@@ -163,8 +162,9 @@ Exit criteria:
       reaching one opener), with bytes asserted in both directions — the leg's opener, its
       `notifications/initialized` completion, the `MCP-Protocol-Version` header on every
       post-handshake request, a host's `tools/call` params crossing untouched, and the
-      host-facing filtered list and allowed-call results. What remains is W13's out-of-process
-      matrix over the demo mocks, not the property itself.
+      host-facing filtered list and allowed-call results. What remains is the DOCKER matrix over
+      `demo/mock-mcp-server*` — a second harness for a property the e2e matrix now asserts out
+      of process, not an open question about the property.
 - [x] -32022 on unsupported or missing protocol version, with audit record.
       (`mcp.UnsupportedProtocolVersionResponse`, `refuseHostRevision`;
       `TestRefuseHostRevision_EmitsSpecCodeAndRecords` plus the stdio e2e cell.)
@@ -533,7 +533,9 @@ in (`internal/transport/upstream_open.go`: `UpstreamOpenRevision`,
 revision the running proxy would not). What is NOT in is the FALLBACK: `auto`
 opens with `initialize` and does not probe `server/discover` first, because that
 changes what every existing 2025-11-25 upstream sees and its arbiter is W13's
-matrix. See the note under ADR-0006's upstream bullet.
+matrix. See the note under ADR-0006's upstream bullet. That matrix now exists
+(W13 below), so the fallback is unblocked on its arbiter and open only on the
+decision.
 
 Exit criteria:
 
@@ -541,10 +543,13 @@ Exit criteria:
       the fallback itself is deliberately unactivated; the pin-selected opener that
       replaces it for a configured upstream is covered by
       `internal/transport/upstream_open_test.go`.
-- [ ] `init`, `validate --live`, and the session-start drift check all work against a 2026-07-28-only upstream in e2e.
-      **In-process half met:** all three open the leg through the shared opener and carry the
-      per-request `_meta` declaration on a declaring leg
-      (`TestPinnedUpstreamLeg_ReachesTheWire`); the e2e cell is W13's.
+- [x] `init`, `validate --live`, and the session-start drift check all work against a 2026-07-28-only upstream in e2e.
+      In process: all three open the leg through the shared opener and carry the per-request
+      `_meta` declaration on a declaring leg (`TestPinnedUpstreamLeg_ReachesTheWire`). In e2e:
+      `demo/e2e/run.sh`'s CLI leg runs `init` and `validate --live` against a mock speaking ONLY
+      2026-07-28, and the matrix's matched new×new cell exercises the session-start drift check
+      against the same upstream — with the negative that gives them their meaning, an `auto`
+      (handshake) opener against that upstream, asserted to FAIL.
 - [ ] Fatal-or-skip behavior unchanged (test).
 
 ### W12 — Documentation and ADR housekeeping (plan §12) — M, continuous
@@ -562,9 +567,38 @@ Exit criteria:
 - [ ] No ADR this plan touches remains Draft — each is Final, or In Review awaiting consensus.
 - [ ] Threat model current; CHANGELOG complete for the release.
 
-### W13 — Test and demo infrastructure — L
+### W13 — Test and demo infrastructure — L — **PARTIALLY LANDED**
 
 **Depends on:** W1 (minimal). **Blocks:** most exit criteria above — build it early.
+
+**Landed: the e2e interop matrix and the new-revision e2e mocks.** `demo/e2e/mock-server`
+takes `--protocol-version` and `demo/e2e/mock-host` takes `--host-protocol-version`, so one
+binary pair drives all four cells of {host} × {upstream} over stdio in `demo/e2e/run.sh`,
+which already runs in CI. Two cells are matched pairs asserting the enforced surface; two are
+mismatched and assert the `-32022` refusal in both directions. A fifth leg runs the CLI
+probes against a 2026-07-28-only upstream. This ticked W1's old×old criterion and W11's
+e2e criterion.
+
+The declaring mock REFUSES an undeclared request rather than serving it, which is what makes
+the matched new-revision cell evidence that eunox declares the revision on every request it
+sends such a leg — a lenient mock would have passed either way.
+
+**Not landed**, and each for its own reason:
+
+- The **Docker mocks** (`demo/mock-mcp-server`, `demo/mock-mcp-server-stdio`,
+  `demo/e2e/mock-server`'s compose wiring) and the stateless `make -C demo …` targets. The
+  e2e harness needs no Docker and was the shorter path to the matrix; the demo walkthrough is
+  still 2025-11-25 only.
+- **MRTR, `subscriptions/listen`, and the tasks stub** in the mocks. eunox has no responder
+  for any of them (W6/W7/W8), so the only assertion available today is the fail-closed one —
+  which the matrix already makes from the host side, without needing the upstream to serve a
+  method the proxy will never forward. The mock half lands with each responder.
+- The **two new-host cells over HTTP**. A 2026-07-28 host has no `initialize`, and HTTP
+  session creation is still anchored on that handshake, so those cells would assert the
+  absence of W2 rather than the revision boundary. They land with W2.
+- **Mismatch cells asserting a TRANSLATED subset.** Nothing is translated today, so the
+  refusal is the whole boundary and that is what the cells assert. The translated half is
+  D1's to decide and lands with W3/W4.
 
 Scope:
 
@@ -581,9 +615,17 @@ Scope:
 
 Exit criteria:
 
-- [ ] Four-cell matrix runs in CI.
-- [ ] Mismatch cells assert the D1 boundary precisely (both directions).
-- [ ] Demo allow/deny/audit walkthrough works against the new-revision mock.
+- [x] Four-cell matrix runs in CI. (`demo/e2e/run.sh` leg 3, over stdio; it is part of
+      `make -C demo ci-test-e2e`, which CI already runs. The HTTP half of the matrix is
+      W2's — see above.)
+- [x] Mismatch cells assert the D1 boundary precisely (both directions). (Both cells assert
+      `-32022`, that the message names BOTH revisions, and that a policy-DENIED call is
+      refused on revision rather than on policy — i.e. the refusal precedes enforcement. The
+      handshake cell additionally asserts the message names translation as what serving it
+      would take. Precise for the boundary as it stands: refuse everything, translate
+      nothing.)
+- [ ] Demo allow/deny/audit walkthrough works against the new-revision mock. **Not started** —
+      the Docker mocks are unchanged; see the not-landed list above.
 
 ---
 

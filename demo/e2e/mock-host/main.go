@@ -217,6 +217,9 @@ type stdioConn struct {
 	writeMu sync.Mutex
 	resp    chan rpcMsg
 	nextID  int
+	// revision is the protocol revision this host speaks. On the declaring revision every
+	// request call() sends carries the `_meta` declaration; see revision.go.
+	revision string
 }
 
 func newStdioConn(proxyBin, config string) (*stdioConn, error) {
@@ -288,7 +291,7 @@ func (c *stdioConn) call(method string, params interface{}) (rpcMsg, error) {
 	c.nextID++
 	idNum := c.nextID
 	rawID := json.RawMessage(fmt.Sprintf("%d", idNum))
-	pb, _ := json.Marshal(params)
+	pb, _ := json.Marshal(declareRevision(params, c.revision))
 	c.writeRaw(rpcMsg{JSONRPC: "2.0", ID: &rawID, Method: method, Params: pb})
 
 	want := fmt.Sprintf("%d", idNum)
@@ -330,7 +333,13 @@ func (c *stdioConn) callRawID(rawID, method string, params interface{}) (rpcMsg,
 	}
 }
 
+// initialize opens a protocol-level session. The declaring revision removed the handshake, so
+// there is nothing to open there and this is a no-op rather than a refusal — a host that sent
+// `initialize` to a declaring leg would be testing a message no such host sends.
 func (c *stdioConn) initialize() error {
+	if c.revision == revisionDeclaring {
+		return nil
+	}
 	_, err := c.call("initialize", map[string]interface{}{
 		"protocolVersion": "2025-11-25",
 		"capabilities":    map[string]interface{}{"sampling": map[string]interface{}{}},
@@ -949,6 +958,9 @@ type auditRecord struct {
 	Target        string   `json:"target"`
 	Method        string   `json:"method"`
 	Obligations   []string `json:"obligations"`
+	// ProtocolRevision is the revision the request was decided under. Absent on a refusal
+	// recorded before negotiation ran, which is a fact the tape has to be able to state.
+	ProtocolRevision string `json:"protocol_revision"`
 }
 
 func runAuditCheck(path string, s *suite) {
@@ -980,8 +992,10 @@ func runAuditCheck(path string, s *suite) {
 	}
 	s.ok(fmt.Sprintf("audit log parsed (%d records)", len(recs)))
 
-	// Every record must carry an explicit allow/deny decision.
-	for i, r := range recs {
+	// Every record must carry an explicit allow/deny decision. Indexed rather than ranged by
+	// value throughout this function: auditRecord is past gocritic's rangeValCopy threshold.
+	for i := range recs {
+		r := &recs[i]
 		if r.Decision != "allow" && r.Decision != "deny" {
 			s.bad("audit decision field", fmt.Sprintf("record %d has decision=%q", i, r.Decision))
 			return
@@ -989,35 +1003,58 @@ func runAuditCheck(path string, s *suite) {
 	}
 	s.ok("audit: every record carries an explicit allow/deny decision")
 
+	// The interop matrix drove cells under both revisions, so the tape must show both — this
+	// is what makes a cell's claimed revision checkable against the record it produced rather
+	// than against its own log line. An unpublished value is a stamp nobody negotiated.
+	seenRevisions := map[string]bool{}
+	for i := range recs {
+		r := &recs[i]
+		if r.ProtocolRevision == "" {
+			continue
+		}
+		if r.ProtocolRevision != revisionHandshake && r.ProtocolRevision != revisionDeclaring {
+			s.bad("audit protocol_revision field",
+				fmt.Sprintf("record %d carries unpublished revision %q", i, r.ProtocolRevision))
+			return
+		}
+		seenRevisions[r.ProtocolRevision] = true
+	}
+	if seenRevisions[revisionHandshake] && seenRevisions[revisionDeclaring] {
+		s.ok("audit: decisions recorded under both protocol revisions")
+	} else {
+		s.bad("audit: decisions recorded under both protocol revisions",
+			fmt.Sprintf("saw %v", seenRevisions))
+	}
+
 	want := []struct {
 		desc string
-		pred func(auditRecord) bool
+		pred func(*auditRecord) bool
 	}{
-		{"audit: an allow recording the redacted paths (redactFields:ssn/nested.token/api_key) (get_secret_record)", func(r auditRecord) bool {
+		{"audit: an allow recording the redacted paths (redactFields:ssn/nested.token/api_key) (get_secret_record)", func(r *auditRecord) bool {
 			return r.Decision == "allow" && r.Target == "get_secret_record" &&
 				contains(r.Obligations, "redactFields:ssn") &&
 				contains(r.Obligations, "redactFields:nested.token") &&
 				contains(r.Obligations, "redactFields:api_key")
 		}},
-		{"audit: a deny with denial_code=AUTHORIZATION_FAILED (write_file)", func(r auditRecord) bool {
+		{"audit: a deny with denial_code=AUTHORIZATION_FAILED (write_file)", func(r *auditRecord) bool {
 			return r.Decision == "deny" && r.DenialCode == "AUTHORIZATION_FAILED" && r.Target == "write_file"
 		}},
-		{"audit: a deny with condition_type=allowedValues", func(r auditRecord) bool {
+		{"audit: a deny with condition_type=allowedValues", func(r *auditRecord) bool {
 			return r.Decision == "deny" && r.ConditionType == "allowedValues"
 		}},
-		{"audit: a deny with denial_code=RATE_LIMITED", func(r auditRecord) bool {
+		{"audit: a deny with denial_code=RATE_LIMITED", func(r *auditRecord) bool {
 			return r.Decision == "deny" && r.DenialCode == "RATE_LIMITED"
 		}},
-		{"audit: target_type=resource recorded", func(r auditRecord) bool { return r.TargetType == "resource" }},
-		{"audit: target_type=prompt recorded", func(r auditRecord) bool { return r.TargetType == "prompt" }},
-		{"audit: a sampling/createMessage decision recorded", func(r auditRecord) bool {
+		{"audit: target_type=resource recorded", func(r *auditRecord) bool { return r.TargetType == "resource" }},
+		{"audit: target_type=prompt recorded", func(r *auditRecord) bool { return r.TargetType == "prompt" }},
+		{"audit: a sampling/createMessage decision recorded", func(r *auditRecord) bool {
 			return r.Method == "sampling/createMessage"
 		}},
 	}
 	for _, w := range want {
 		found := false
-		for _, r := range recs {
-			if w.pred(r) {
+		for i := range recs {
+			if w.pred(&recs[i]) {
 				found = true
 				break
 			}
@@ -1036,7 +1073,12 @@ func runAuditCheck(path string, s *suite) {
 
 func main() {
 	mode := flag.String("mode", "stdio", "mode: stdio | http | audit")
-	suiteName := flag.String("suite", "full", "stdio suite: full | sampling-deny")
+	suiteName := flag.String("suite", "full",
+		"stdio suite: full | sampling-deny | interop-matched | interop-mismatch")
+	hostRevision := flag.String("host-protocol-version", revisionHandshake,
+		`MCP revision this host speaks: "2025-11-25" or "2026-07-28"`)
+	legRevision := flag.String("upstream-protocol-version", revisionHandshake,
+		"the revision the proxy addresses its upstream as (interop-mismatch asserts it is named in the refusal)")
 	proxyBin := flag.String("proxy-bin", "", "path to the eunox binary (stdio mode)")
 	config := flag.String("config", "", "path to the eunox stdio config (stdio mode)")
 	url := flag.String("url", "http://127.0.0.1:3100", "proxy base URL (http mode)")
@@ -1050,20 +1092,35 @@ func main() {
 
 	switch *mode {
 	case "stdio":
+		if *hostRevision != revisionHandshake && *hostRevision != revisionDeclaring {
+			fmt.Fprintf(os.Stderr, "unknown --host-protocol-version %q\n", *hostRevision)
+			os.Exit(2)
+		}
 		c, err := newStdioConn(*proxyBin, *config)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "spawn proxy: %v\n", err)
 			os.Exit(1)
 		}
+		c.revision = *hostRevision
 		if err := c.initialize(); err != nil {
 			fmt.Fprintf(os.Stderr, "initialize: %v\n", err)
 			c.close()
 			os.Exit(1)
 		}
-		if *suiteName == "sampling-deny" {
+		switch *suiteName {
+		case "sampling-deny":
 			header("e2e [stdio] sampling DENY")
 			runStdioSamplingDeny(c, s)
-		} else {
+		case "interop-matched":
+			header("e2e [interop] matched pair: host " + *hostRevision + " x upstream " + *legRevision)
+			runInteropMatched(c, s, *hostRevision)
+			if *hostRevision == revisionDeclaring {
+				runInteropDeclaringMethodSet(c, s)
+			}
+		case "interop-mismatch":
+			header("e2e [interop] mismatched pair: host " + *hostRevision + " x upstream " + *legRevision)
+			runInteropMismatch(c, s, *hostRevision, *legRevision)
+		default:
 			header("e2e [stdio] full enforcement matrix")
 			runStdioFull(c, s)
 		}
