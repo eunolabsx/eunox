@@ -121,7 +121,7 @@ func TestAuditChain_InteriorDeletionReportsBothBreakAndGap(t *testing.T) {
 	tampered := [][]byte{lines[0], lines[1], lines[4]}
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestAuditChain_PreSigningRecordsAreInvalid(t *testing.T) {
 
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(logLines(t, logPath), []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestAuditChain_MalformedLineInvalidUnderFilter(t *testing.T) {
 	// record is skipped AND the corrupted line is skipped by the filter before
 	// VerifyRecord runs, so invalid stays 0 and ok() falsely reports PASS.
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))),
-		verifierFor(t, keyPath), "no-such-request-id", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{RequestID: "no-such-request-id", Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestAuditChain_PerRecordHMACVerifiedUnderSinceFilter(t *testing.T) {
 	future := time.Now().Add(24 * time.Hour)
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))),
-		verifierFor(t, keyPath), "", future, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Since: future, Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestAuditChain_MalformedLineDoesNotPoisonChain(t *testing.T) {
 	tampered := [][]byte{lines[0], lines[1], []byte("GARBAGE-NOT-JSON")}
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestAuditChain_FilterDoesNotDisableChainCheck(t *testing.T) {
 	// A --request-id filter that matches nothing must still catch the deletion.
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
-		verifierFor(t, keyPath), "req-nomatch", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{RequestID: "req-nomatch", Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestAuditChain_FilterDoesNotDisableChainCheck(t *testing.T) {
 	// And a since filter that matches nothing must likewise still catch it.
 	sb.Reset()
 	res, err = VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Now().Add(24*time.Hour), &sb)
+		verifierFor(t, keyPath), VerifyOptions{Since: time.Now().Add(24 * time.Hour), Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -651,7 +651,7 @@ func TestWriteRecord_PartialWrite_TargetBelowZero_SetsTailOrphanPending(t *testi
 // caveat.
 func TestAuditChain_EmptyLog(t *testing.T) {
 	t.Parallel()
-	res, err := VerifyLog(bytes.NewReader(nil), &Sink{key: nonZeroTestKey()}, "", time.Time{}, &strings.Builder{})
+	res, err := VerifyLog(bytes.NewReader(nil), &Sink{key: nonZeroTestKey()}, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -899,7 +899,7 @@ func TestAuditDropMarker_RecordsDropAndChainStaysValid(t *testing.T) {
 	}
 
 	// The chain must still verify end to end.
-	res, err := VerifyLog(bytes.NewReader(data), sink, "", time.Time{}, io.Discard)
+	res, err := VerifyLog(bytes.NewReader(data), sink, VerifyOptions{Out: io.Discard})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -972,7 +972,7 @@ func TestAuditDropMarker_NamesAffectedMethodTarget(t *testing.T) {
 		t.Fatalf("no AUDIT_RECORDS_DROPPED marker found")
 	}
 
-	res, err := VerifyLog(bytes.NewReader(data), sink, "", time.Time{}, io.Discard)
+	res, err := VerifyLog(bytes.NewReader(data), sink, VerifyOptions{Out: io.Discard})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -1926,7 +1926,7 @@ func TestAuditKey_RotationVerifiesAcrossKeys(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 	var sb strings.Builder
-	res, err := VerifyLog(f, verifier, "", time.Time{}, &sb)
+	res, err := VerifyLog(f, verifier, VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -1993,7 +1993,7 @@ func TestAuditChain_UnknownKeyRecordIsNotAChainBreak(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 	var sb strings.Builder
-	res, err := VerifyLog(f, verifier, "", time.Time{}, &sb)
+	res, err := VerifyLog(f, verifier, VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -2305,7 +2305,7 @@ func TestAuditRecord_OversizedArgumentStaysVerifiable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	res, err := VerifyLog(bytes.NewReader(data), verifier, "", time.Time{}, io.Discard)
+	res, err := VerifyLog(bytes.NewReader(data), verifier, VerifyOptions{Out: io.Discard})
 	if err != nil {
 		t.Fatalf("verifyAuditLog returned error (regression: scanner token too long): %v", err)
 	}
@@ -2323,7 +2323,7 @@ func TestAuditRecord_OversizedArgumentStaysVerifiable(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatalf("Close (reopened): %v", err)
 	}
-	res, err = VerifyLog(bytes.NewReader(mustReadFile(t, logPath)), verifierFor(t, keyPath), "", time.Time{}, io.Discard)
+	res, err = VerifyLog(bytes.NewReader(mustReadFile(t, logPath)), verifierFor(t, keyPath), VerifyOptions{Out: io.Discard})
 	if err != nil {
 		t.Fatalf("verifyAuditLog after restart: %v", err)
 	}
@@ -2604,7 +2604,7 @@ func TestAuditChain_DetectsRewrittenGenesis(t *testing.T) {
 
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}

@@ -636,7 +636,7 @@ Flags:
 	force := fs.Bool("force", false, "Overwrite --output if it already exists (default: refuse to clobber). An\noverwrite also re-tightens the file mode to 0600.")
 	maxValues := fs.Int("max-values", suggestMaxValuesDefault, "Max distinct values an argument may have before allowedValues is downgraded to a review comment.\n0 or negative falls back to the default (20).")
 
-	logPath, code, done := parseAndResolveAuditLog("suggest", fs, args, configPath, auditLogPath, nil, suggestUsageExit)
+	logPath, code, done := parseAndResolveAuditLog("suggest", fs, args, configPath, auditLogPath, suggestUsageExit)
 	if done {
 		return code
 	}

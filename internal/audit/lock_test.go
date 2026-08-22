@@ -13,7 +13,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 )
 
 // TestAuditSink_SecondOpenSamePath_FailsClosed verifies that two Sinks cannot
@@ -56,7 +55,7 @@ func TestAuditSink_SecondOpenSamePath_FailsClosed(t *testing.T) {
 
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(logLines(t, logPath), []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}

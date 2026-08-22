@@ -56,7 +56,7 @@ Flags:
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 
-	logPath, code, done := parseAndResolveAuditLog("stats", fs, args, configPath, auditLogPath, nil, statsUsageExit)
+	logPath, code, done := parseAndResolveAuditLog("stats", fs, args, configPath, auditLogPath, statsUsageExit)
 	if done {
 		return code
 	}

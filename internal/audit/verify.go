@@ -215,6 +215,40 @@ func (s *Sink) keysToTry(keyID string) ([][]byte, error) {
 	return out, nil
 }
 
+// VerifyOptions carries everything a verify pass needs beyond the bytes and the
+// keyring: the report-window filters, where findings are written, and the optional
+// per-record collector the cross-tape join reads. One struct rather than a parameter
+// tail because the filters and the collector answer the same question — which records
+// this pass REPORTS on — and a positional tail is where a caller silently transposes
+// two of them.
+//
+// None of these narrows VERIFICATION: every record's HMAC and every chain link is
+// checked whatever is set here, so an investigator cannot be made to pass a filter that
+// hides tampering (see VerifyLog).
+type VerifyOptions struct {
+	// RequestID and TaskID narrow the report window to records carrying that
+	// request_id / task_id. They compose (both must match when both are set), so a
+	// cross-tape join can be narrowed to one call within one task.
+	RequestID string
+	TaskID    string
+	// Since is an inclusive lower bound on the record's signed `time`.
+	Since time.Time
+	// Out receives the per-record findings. nil means io.Discard, so a caller that
+	// only wants the tallies (or the collector) need not supply a sink.
+	Out io.Writer
+	// Collect, when non-nil, is called once for every DECODABLE record inside the
+	// report window, in file order, with that record's verification outcome. It is
+	// how the cross-tape join gets its records out of the pass that verified them,
+	// rather than re-reading the tape and answering "did this verify" a second time.
+	//
+	// It is called for records that FAILED verification too (the status says so): a
+	// joined sequence that silently dropped them would hide exactly the evidence the
+	// join is being read for. A line that does not decode at all reaches no collector
+	// — it carries no task_id to join on — and is counted Invalid, which fails the
+	// tape's own verdict.
+	Collect func(JoinedRecord)
+}
+
 // VerifyResult summarizes a single audit-verify pass. Its fields are exported so
 // the audit-verify subcommand in cmd/eunox can print the per-pass tallies.
 type VerifyResult struct {
@@ -289,8 +323,11 @@ func SanitizeAuditField(s string) string {
 // leading removal cannot be proven from the file alone — that needs an external
 // high-water mark. Interior deletion, reordering, insertion, and modification ARE
 // detected here.
-func VerifyLog(r io.Reader, verifier *Sink, requestID string, since time.Time, out io.Writer) (VerifyResult, error) {
-	v := &auditChainVerifier{verifier: verifier, requestID: requestID, since: since, out: out}
+func VerifyLog(r io.Reader, verifier *Sink, opts VerifyOptions) (VerifyResult, error) {
+	v := &auditChainVerifier{verifier: verifier, opts: opts}
+	if v.opts.Out == nil {
+		v.opts.Out = io.Discard
+	}
 	scanner := NewLineScanner(r)
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -331,7 +368,7 @@ func VerifyLog(r io.Reader, verifier *Sink, requestID string, since time.Time, o
 // discovery, so a rotation landing inside it re-points the base after the siblings are
 // already verified. Callers verifying a LIVE log bracket the pass with ChainSnapshot,
 // whose doc states both outcomes; this function reads the names it is given.
-func VerifyLogFiles(paths []string, verifier *Sink, requestID string, since time.Time, out io.Writer) (VerifyResult, error) {
+func VerifyLogFiles(paths []string, verifier *Sink, opts VerifyOptions) (VerifyResult, error) {
 	r, lazies := buildLazyChain(paths)
 	// Backstop: if VerifyLog returns before draining (e.g. a scanner error), close
 	// whatever file is still open. A clean pass already closes each at EOF.
@@ -340,7 +377,7 @@ func VerifyLogFiles(paths []string, verifier *Sink, requestID string, since time
 			lr.close()
 		}
 	}()
-	return VerifyLog(r, verifier, requestID, since, out)
+	return VerifyLog(r, verifier, opts)
 }
 
 // buildLazyChain joins paths (chain order, oldest first) into one io.Reader that
@@ -449,10 +486,8 @@ func (c *chainReader) Close() error {
 // tallies (res) and the chain anchor (hmac/seq of the last LEGITIMATE record).
 // processLine is called for each non-empty line, in order.
 type auditChainVerifier struct {
-	verifier  *Sink
-	requestID string
-	since     time.Time
-	out       io.Writer
+	verifier *Sink
+	opts     VerifyOptions
 
 	res      VerifyResult
 	havePrev bool
@@ -674,7 +709,62 @@ func (v *auditChainVerifier) processLine(line []byte) {
 	if dec.wellFormed && !forgedSeq0 && !unsigned {
 		v.updateChain(rec)
 	}
-	v.classify(line, rec, dec, forgedSeq0, unsigned)
+	v.collect(rec, dec, v.classify(line, rec, dec, forgedSeq0, unsigned))
+}
+
+// decodableVerdict is the verdict for a record classify rejected before reaching the
+// signature check (a forged seq-0 decoy, an unsigned record). Its `time` is parsed anyway
+// so a joined sequence can place it: the alternative is listing a record with a perfectly
+// good timestamp among the ones whose time does not parse, which misreports WHY it has no
+// position. That the timestamp is not covered by any signature this pass could check is
+// what the row's STATUS says — the whole sequence is a reconstruction, and no row in it is
+// trusted more than its status.
+func (v *auditChainVerifier) decodableVerdict(rec auditRecord, status RecordStatus) recordVerdict {
+	if v.opts.Collect == nil {
+		return recordVerdict{status: status}
+	}
+	t, ok := recordTime(rec)
+	return recordVerdict{status: status, at: t, timeOK: ok}
+}
+
+// collect hands one record to the join collector, if the pass has one and the record
+// is inside the report window. Driven by classify's verdict rather than re-deriving
+// it, so the sequence a join prints and the verdict the tape reports can never
+// disagree about the same record.
+func (v *auditChainVerifier) collect(rec auditRecord, dec recordDecode, verdict recordVerdict) {
+	// A line that did not decode carries no join key and no attribution: there is
+	// nothing to place in a sequence. It is already counted Invalid, so the tape's own
+	// verdict — not a silent omission here — is what tells the operator records were
+	// lost.
+	if v.opts.Collect == nil || !dec.wellFormed || !v.inJoinWindow(rec) {
+		return
+	}
+	v.opts.Collect(JoinedRecord{
+		PEP:        rec.PEP,
+		Seq:        rec.Seq,
+		Time:       rec.Time,
+		At:         verdict.at,
+		TimeOK:     verdict.timeOK,
+		TaskID:     rec.TaskID,
+		Method:     rec.Method,
+		TargetType: rec.TargetType,
+		Target:     rec.Target,
+		Decision:   rec.Decision,
+		DenialCode: rec.DenialCode,
+		Status:     verdict.status,
+	})
+}
+
+// inJoinWindow reports whether the record matches the collector's filters. Deliberately
+// NOT the --since window: a joined sequence is read to reconstruct one task end to end,
+// and dropping its head because the investigator asked for the last hour would present a
+// truncated sequence as a whole one. --since narrows the printed FINDINGS, which is a
+// different question.
+func (v *auditChainVerifier) inJoinWindow(rec auditRecord) bool {
+	if v.opts.TaskID != "" && rec.TaskID != v.opts.TaskID {
+		return false
+	}
+	return v.opts.RequestID == "" || rec.RequestID == v.opts.RequestID
 }
 
 // updateChain checks a legitimate record's prev_hmac linkage and seq contiguity
@@ -699,9 +789,9 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 		if rec.Seq == 1 && rec.PrevHMAC != auditGenesisPrev {
 			v.res.ChainBreaks++
 			if rec.PrevHMAC == "" {
-				_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq 1: prev_hmac is empty, expected genesis sentinel %q — the writer never emits an empty prev_hmac, so leading records were deleted and a replacement was forged\n", auditGenesisPrev)
+				_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq 1: prev_hmac is empty, expected genesis sentinel %q — the writer never emits an empty prev_hmac, so leading records were deleted and a replacement was forged\n", auditGenesisPrev)
 			} else {
-				_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq 1: prev_hmac is %q, expected genesis sentinel %q (a leading record was deleted or the origin was rewritten)\n", rec.PrevHMAC, auditGenesisPrev)
+				_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq 1: prev_hmac is %q, expected genesis sentinel %q (a leading record was deleted or the origin was rewritten)\n", rec.PrevHMAC, auditGenesisPrev)
 			}
 		}
 	} else {
@@ -714,12 +804,12 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 		// surface the untrustworthy anchor.
 		if v.prevRecordInvalid {
 			v.res.ChainBreaks++
-			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: the preceding record failed verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
+			_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq %d: the preceding record failed verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
 			v.prevRecordInvalid = false
 		}
 		if rec.PrevHMAC != v.prevHMAC {
 			v.res.ChainBreaks++
-			_, _ = fmt.Fprintf(v.out, "CHAIN BREAK at seq %d: prev_hmac does not match the preceding record (a record was deleted, reordered, or inserted)\n", rec.Seq)
+			_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq %d: prev_hmac does not match the preceding record (a record was deleted, reordered, or inserted)\n", rec.Seq)
 		}
 		// Every record reaching updateChain is signed and carries a seq > 0 (processLine
 		// keeps unsigned records and seq-0 decoys out of the chain state), so the gap
@@ -728,14 +818,14 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 		if rec.Seq != v.prevSeq+1 {
 			v.res.ChainBreaks++
 			if rec.Seq > v.prevSeq+1 {
-				_, _ = fmt.Fprintf(v.out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
+				_, _ = fmt.Fprintf(v.opts.Out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
 			} else {
 				// A seq that goes backward or repeats is not a missing record — this
 				// package's own documented tamper/restart signature (a duplicated,
 				// reordered, or reissued seq), the same shape a chain-resume already
 				// guards against elsewhere. Naming it distinctly keeps a reader from
 				// searching for a deleted line that was never there.
-				_, _ = fmt.Fprintf(v.out, "SEQ GAP: record seq %d does not follow %d (seq did not increase — a duplicate, reordered, or restarted chain, not a missing record)\n", rec.Seq, v.prevSeq)
+				_, _ = fmt.Fprintf(v.opts.Out, "SEQ GAP: record seq %d does not follow %d (seq did not increase — a duplicate, reordered, or restarted chain, not a missing record)\n", rec.Seq, v.prevSeq)
 			}
 		}
 	}
@@ -753,7 +843,7 @@ func (v *auditChainVerifier) reportSuppressedUnsigned() {
 	if v.unsignedSeen <= maxUnsignedDiagnostics {
 		return
 	}
-	_, _ = fmt.Fprintf(v.out,
+	_, _ = fmt.Fprintf(v.opts.Out,
 		"INVALID  %d unsigned record(s) in total (%d diagnostics elided): none carries an _hmac, so none can be verified. Pre-signing history must be moved aside before upgrading; otherwise reconcile against your external sink.\n",
 		v.unsignedSeen, v.unsignedSeen-maxUnsignedDiagnostics)
 }
@@ -771,21 +861,39 @@ func (v *auditChainVerifier) reportMalformedTime(rec auditRecord, malformed bool
 	if !malformed {
 		return
 	}
-	_, _ = fmt.Fprintf(v.out, "         also: seq=%d has an unparseable time field %q (already counted above)\n",
+	_, _ = fmt.Fprintf(v.opts.Out, "         also: seq=%d has an unparseable time field %q (already counted above)\n",
 		rec.Seq, SanitizeAuditField(rec.Time))
 }
 
 // classify counts and reports the record's verification outcome: malformed,
 // forged decoy, unsigned, or HMAC-verified (valid/invalid/skipped per the filter).
-func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDecode, forgedSeq0, unsigned bool) {
+// recordVerdict is what one classify call concluded about a record: the outcome the
+// tally it incremented reports, plus the parsed `time` that outcome already cost a
+// parse. Returned rather than recomputed by the collector, so the sequence a join
+// prints and the verdict the tape reports rest on one reading of each record.
+type recordVerdict struct {
+	status RecordStatus
+	at     time.Time
+	timeOK bool
+}
+
+// recordTime parses a record's signed `time` as RFC3339Nano. The ONE spelling of that
+// parse, so the verdict a malformed time earns and the position the join gives the record
+// cannot be decided from two different readings of the same field.
+func recordTime(rec auditRecord) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339Nano, rec.Time)
+	return t, err == nil
+}
+
+func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDecode, forgedSeq0, unsigned bool) recordVerdict {
 	// A line that failed to decode cannot be filtered or HMAC-verified, but is
 	// unambiguous corruption. Count it invalid before the filter so an active
 	// --request-id/--since cannot downgrade it to a silent skip and produce a false
 	// PASS over a corrupted log.
 	if !dec.wellFormed {
 		v.res.Invalid++
-		_, _ = fmt.Fprintf(v.out, "INVALID  malformed record %d: not valid JSON\n", v.res.Total)
-		return
+		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  malformed record %d: not valid JSON\n", v.res.Total)
+		return recordVerdict{status: StatusInvalid}
 	}
 
 	// A forged seq-0 decoy (Seq==0 + HMAC, anywhere in the stream) is rejected
@@ -793,8 +901,8 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	// against a signing-key holder.
 	if forgedSeq0 {
 		v.res.Invalid++
-		_, _ = fmt.Fprintf(v.out, "INVALID  record %d: seq 0 with a non-empty HMAC is not a valid record (forged seq-0 decoy)\n", v.res.Total)
-		return
+		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  record %d: seq 0 with a non-empty HMAC is not a valid record (forged seq-0 decoy)\n", v.res.Total)
+		return v.decodableVerdict(rec, StatusInvalid)
 	}
 
 	// An unsigned record carries nothing to verify. Treating one as merely skipped
@@ -816,11 +924,11 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		v.unsignedSeen++
 		switch {
 		case v.unsignedSeen <= maxUnsignedDiagnostics:
-			_, _ = fmt.Fprintf(v.out, "INVALID  record %d: unsigned record (seq=%d) carries no _hmac, so it cannot be verified (pre-signing history, or a stripped signature)\n", v.res.Total, rec.Seq)
+			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  record %d: unsigned record (seq=%d) carries no _hmac, so it cannot be verified (pre-signing history, or a stripped signature)\n", v.res.Total, rec.Seq)
 		case v.unsignedSeen == maxUnsignedDiagnostics+1:
-			_, _ = fmt.Fprintf(v.out, "INVALID  ... further unsigned records reported once at the end rather than one line each\n")
+			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  ... further unsigned records reported once at the end rather than one line each\n")
 		}
-		return
+		return v.decodableVerdict(rec, StatusUnsigned)
 	}
 
 	// Every record's HMAC is recomputed UNCONDITIONALLY, before the filter. Gating
@@ -829,7 +937,7 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	// only confirms rec.HMAC appears in the next record's prev_hmac, it does not
 	// recompute it from content. The filter controls only what is counted "valid" and
 	// printed, never whether a record is verified.
-	inReportWindow := v.requestID == "" || rec.RequestID == v.requestID
+	inReportWindow := v.inJoinWindow(rec)
 	// The signed `time` field is validated for EVERY signed record, independent of the
 	// --since/--request-id filter: an unparseable time on an HMAC-valid record is format
 	// drift or tampering and must fail the verdict identically whether or not a filter is
@@ -838,12 +946,12 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	// but FAIL under --since. The parse also feeds the --since lower-bound comparison.
 	// malformedTime distinguishes a bad-time record from one that is simply older than
 	// --since; both would otherwise fall to Skipped, understating Valid and hiding drift.
-	t, timeErr := time.Parse(time.RFC3339Nano, rec.Time)
-	malformedTime := timeErr != nil
+	t, timeOK := recordTime(rec)
+	malformedTime := !timeOK
 	switch {
 	case malformedTime:
 		inReportWindow = false
-	case !v.since.IsZero() && t.Before(v.since):
+	case !v.opts.Since.IsZero() && t.Before(v.opts.Since):
 		// --since is an inclusive lower bound: t.Before(since) is the exclusive skip
 		// region (t < since), so t == since is kept, matching log-tailing tools.
 		inReportWindow = false
@@ -876,15 +984,17 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	if err == nil && ok && (v.res.FirstVerifiedSeq == 0 || rec.Seq < v.res.FirstVerifiedSeq) {
 		v.res.FirstVerifiedSeq = rec.Seq
 	}
+	verdict := recordVerdict{at: t, timeOK: timeOK}
 	switch {
 	case errors.Is(err, errKeyIDNotInRing):
 		// Key absent from the ring (retired-key state, not tampering). Report and count
 		// it distinctly so the INVALID tally stays a true tamper count; the verdict
 		// still fails (OK() treats UnknownKey as unverified). key_id is sanitized in
 		// case a future writer admits control chars.
-		_, _ = fmt.Fprintf(v.out, "UNKNOWN_KEY_ID  seq=%d key_id=%s — signed with a key absent from the verification ring; add that key to verify it (expected after a key rotation that retired the signing key)\n",
+		_, _ = fmt.Fprintf(v.opts.Out, "UNKNOWN_KEY_ID  seq=%d key_id=%s — signed with a key absent from the verification ring; add that key to verify it (expected after a key rotation that retired the signing key)\n",
 			rec.Seq, SanitizeAuditField(rec.KeyID))
 		v.res.UnknownKey++
+		verdict.status = StatusUnknownKey
 		// Do NOT mark the chain anchor untrustworthy here: a named-but-absent key_id is
 		// the routine post-rotation state, and the record's _hmac is intact (it was
 		// computed by the legitimate signer with the now-retired key), so its successor's
@@ -898,9 +1008,10 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		// retired/absent key (as a named-but-missing key_id can). Report distinctly and
 		// count it in its own bucket so the INVALID tally stays a true tamper count; the
 		// verdict still fails (OK() treats Unverifiable as unverified).
-		_, _ = fmt.Fprintf(v.out, "UNVERIFIABLE  seq=%d — no key was available to check this record's HMAC (an empty verification ring, or a keyless verifier); cannot verify it (supply the signing key, or this may be tampering)\n",
+		_, _ = fmt.Fprintf(v.opts.Out, "UNVERIFIABLE  seq=%d — no key was available to check this record's HMAC (an empty verification ring, or a keyless verifier); cannot verify it (supply the signing key, or this may be tampering)\n",
 			rec.Seq)
 		v.res.Unverifiable++
+		verdict.status = StatusUnverifiable
 		// Not provably tampering (see the message): this is indistinguishable from a
 		// retired/absent key whose _hmac is intact and chains correctly, so do not
 		// fabricate a chain break on the successor. OK() already fails the verdict on any
@@ -910,27 +1021,33 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	case err != nil:
 		// A verification error or HMAC mismatch is tampering: count it regardless of
 		// the filter.
-		_, _ = fmt.Fprintf(v.out, "ERROR  seq %d: %v\n", rec.Seq, err)
+		_, _ = fmt.Fprintf(v.opts.Out, "ERROR  seq %d: %v\n", rec.Seq, err)
 		v.res.Invalid++
+		verdict.status = StatusInvalid
 		v.prevRecordInvalid = true
 	case !ok:
 		// Sanitize the interpolated fields (target and session_id are
 		// attacker-influenceable and not control-char-sanitized at storage, so a
 		// literal newline could inject a spurious finding line).
-		_, _ = fmt.Fprintf(v.out, "INVALID  seq=%d request_id=%s session_id=%s target=%s\n",
+		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  seq=%d request_id=%s session_id=%s target=%s\n",
 			rec.Seq, SanitizeAuditField(rec.RequestID), SanitizeAuditField(rec.SessionID), SanitizeAuditField(rec.Target))
 		v.res.Invalid++
+		verdict.status = StatusInvalid
 		v.prevRecordInvalid = true
 	case malformedTime:
 		// HMAC-valid but the required, signed `time` field does not parse as RFC3339
 		// Nano: count it Invalid (not Skipped) and surface a diagnostic so format drift
 		// or tampering is visible rather than buried in the Skipped tally.
-		_, _ = fmt.Fprintf(v.out, "INVALID  seq=%d: unparseable time field %q\n", rec.Seq, SanitizeAuditField(rec.Time))
+		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  seq=%d: unparseable time field %q\n", rec.Seq, SanitizeAuditField(rec.Time))
 		v.res.Invalid++
+		verdict.status = StatusInvalid
 	case inReportWindow:
 		v.res.Valid++
+		verdict.status = StatusVerified
 	default:
 		// Verified OK but outside the report window: counted skipped for display only.
 		v.res.Skipped++
+		verdict.status = StatusVerified
 	}
+	return verdict
 }

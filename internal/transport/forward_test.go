@@ -2247,7 +2247,7 @@ func TestVerifyAuditLog_SanitizesControlCharsInInvalidLine(t *testing.T) {
 		t.Fatalf("LoadOrCreateKeys: %v", err)
 	}
 	var out strings.Builder
-	if _, err := audit.VerifyLog(bytes.NewReader(data), audit.NewVerifier(keys), "", time.Time{}, &out); err != nil {
+	if _, err := audit.VerifyLog(bytes.NewReader(data), audit.NewVerifier(keys), audit.VerifyOptions{Out: &out}); err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
 	output := out.String()

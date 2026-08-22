@@ -19,7 +19,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/eunolabs/eunox/internal/config"
 )
@@ -62,7 +61,7 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 
 	// Empty ring: no candidate key, so UNVERIFIABLE (not INVALID); verdict still fails.
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, "", time.Time{}, &out)
+	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog (empty ring): %v", err)
 	}
@@ -80,7 +79,7 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 	// from tampering, so it stays INVALID — the defensible fail-closed default.
 	other := make([]byte, 32)
 	other[0] = 0xAB
-	res2, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{hmacKeyID(other): other}}, "", time.Time{}, &strings.Builder{})
+	res2, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{hmacKeyID(other): other}}, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLog (wrong key): %v", err)
 	}
@@ -89,7 +88,7 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 	}
 
 	// Ring holds the MATCHING key: verifies clean.
-	res3, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{hmacKeyID(key): key}}, "", time.Time{}, &strings.Builder{})
+	res3, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{hmacKeyID(key): key}}, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLog (matching key): %v", err)
 	}
@@ -114,7 +113,7 @@ func TestVerifyAuditLog_MalformedTimeReportedOnUnverifiableRecord(t *testing.T) 
 	})
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, "", time.Time{}, &out)
+	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -303,7 +302,7 @@ func TestOpenResumesPastTrailingPartialWrite(t *testing.T) {
 	// Verify the raw on-disk bytes (not re-joined lines): a leftover orphan would
 	// make the marker's line unparseable and surface here as a verify failure. Use
 	// the sink's loaded key directly (the key file is encoded, not raw HMAC bytes).
-	res, err := VerifyLog(bytes.NewReader(data), NewVerifier([][]byte{sink2.key}), "", time.Time{}, io.Discard)
+	res, err := VerifyLog(bytes.NewReader(data), NewVerifier([][]byte{sink2.key}), VerifyOptions{Out: io.Discard})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -787,7 +786,7 @@ func TestVerifyAuditLog_ForgedLegacySeq0DoesNotSuppressSeqGap(t *testing.T) {
 
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -865,7 +864,7 @@ func TestVerifyAuditLog_ForgedSeq0DoesNotSuppressSeqGap(t *testing.T) {
 
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -1217,7 +1216,7 @@ func TestVerifyAuditLog_Seq0WithHMACIsAlwaysForged(t *testing.T) {
 
 			var sb strings.Builder
 			res, err := VerifyLog(bytes.NewReader(bytes.Join(tc.build(t, key), []byte("\n"))),
-				verifierFor(t, keyPath), "", time.Time{}, &sb)
+				verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 			if err != nil {
 				t.Fatalf("VerifyLog: %v", err)
 			}
@@ -1278,7 +1277,7 @@ func TestVerifyAuditLog_MissingHMACSeqGt0_DoesNotPoisonChain(t *testing.T) {
 
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join([][]byte{line1, line2, line3}, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -1317,7 +1316,7 @@ func TestVerifyAuditLog_SeqBearingUnsignedRecords_AllInvalid(t *testing.T) {
 	data := strings.Join(lines, "\n") + "\n"
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader([]byte(data)), verifierFor(t, keyPath), "", time.Time{}, &sb)
+	res, err := VerifyLog(bytes.NewReader([]byte(data)), verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -1374,7 +1373,7 @@ func TestVerifyAuditLog_Seq0AfterNonWrap_StillForged(t *testing.T) {
 
 	var sb strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join([][]byte{line1, line2}, []byte("\n"))),
-		verifierFor(t, keyPath), "", time.Time{}, &sb)
+		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
 	}
@@ -1450,7 +1449,7 @@ func TestRotatedSiblingOrdering_SurvivesBackwardClockStep(t *testing.T) {
 	}
 	verifier := verifierFor(t, keyPath)
 	var out strings.Builder
-	res, err := VerifyLogFiles(files, verifier, "", time.Time{}, &out)
+	res, err := VerifyLogFiles(files, verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLogFiles: %v", err)
 	}
@@ -1510,7 +1509,7 @@ func TestVerifyLogFiles_DetectsInteriorWholeFileDeletion(t *testing.T) {
 	if len(files) != 3 {
 		t.Fatalf("expected 3 chain files (two siblings + base), got %v", files)
 	}
-	res, err := VerifyLogFiles(files, verifier, "", time.Time{}, io.Discard)
+	res, err := VerifyLogFiles(files, verifier, VerifyOptions{Out: io.Discard})
 	if err != nil {
 		t.Fatalf("VerifyLogFiles (intact): %v", err)
 	}
@@ -1530,7 +1529,7 @@ func TestVerifyLogFiles_DetectsInteriorWholeFileDeletion(t *testing.T) {
 		t.Fatalf("LogChainFiles (after delete): %v", err)
 	}
 	var out strings.Builder
-	res, err = VerifyLogFiles(files, verifier, "", time.Time{}, &out)
+	res, err = VerifyLogFiles(files, verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLogFiles (after delete): %v", err)
 	}
@@ -1554,7 +1553,7 @@ func TestVerifyLogFiles_MissingFileFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "audit.key")
 	missing := filepath.Join(dir, "audit.jsonl.20260601T000000.000000000Z")
-	if _, err := VerifyLogFiles([]string{missing}, verifierFor(t, keyPath), "", time.Time{}, io.Discard); err == nil {
+	if _, err := VerifyLogFiles([]string{missing}, verifierFor(t, keyPath), VerifyOptions{Out: io.Discard}); err == nil {
 		t.Fatal("VerifyLogFiles must fail closed when a listed chain file cannot be opened")
 	}
 }
@@ -1580,7 +1579,7 @@ func TestVerifyLogFiles_MidStreamOpenErrorFailsClosed(t *testing.T) {
 	}
 	missing := filepath.Join(dir, "audit.jsonl.20260601T000000.000000000Z")
 
-	if _, err := VerifyLogFiles([]string{logPath, missing}, verifierFor(t, keyPath), "", time.Time{}, io.Discard); err == nil {
+	if _, err := VerifyLogFiles([]string{logPath, missing}, verifierFor(t, keyPath), VerifyOptions{Out: io.Discard}); err == nil {
 		t.Fatal("VerifyLogFiles must fail closed when a non-first chain file cannot be opened")
 	}
 }
@@ -1612,7 +1611,7 @@ func TestVerifyLog_UnknownKeyIDNotTampering(t *testing.T) {
 	verifier := &Sink{verifyKeys: map[string][]byte{hmacKeyID(other): other}}
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(mustReadFile(t, logPath)), verifier, "", time.Time{}, &out)
+	res, err := VerifyLog(bytes.NewReader(mustReadFile(t, logPath)), verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -2113,7 +2112,7 @@ func TestVerifyRejectsNonCanonicalRecordBytes(t *testing.T) {
 			}
 
 			// And the whole-log verdict must fail, not pass.
-			res, _ := VerifyLog(bytes.NewReader(append(tampered, '\n')), verifier, "", time.Time{}, io.Discard)
+			res, _ := VerifyLog(bytes.NewReader(append(tampered, '\n')), verifier, VerifyOptions{Out: io.Discard})
 			if res.OK() {
 				t.Fatalf("VerifyLog must not pass a log holding a %s: %+v", tc.name, res)
 			}
@@ -2271,7 +2270,7 @@ func TestVerifyAuditLog_NonCanonicalRecordPoisonsChainAnchorForSuccessor(t *test
 
 	out := append(bytes.Join([][]byte{tampered, lines[1]}, []byte("\n")), '\n')
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(out), verifier, "", time.Time{}, &sb)
+	res, err := VerifyLog(bytes.NewReader(out), verifier, VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -2311,7 +2310,7 @@ func TestVerifyAuditLog_AllUnsignedLogFailsVerdict(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out strings.Builder
-			res, err := VerifyLog(bytes.NewReader(log), tc.verifier, "", time.Time{}, &out)
+			res, err := VerifyLog(bytes.NewReader(log), tc.verifier, VerifyOptions{Out: &out})
 			if err != nil {
 				t.Fatalf("VerifyLog: %v", err)
 			}
@@ -2506,7 +2505,7 @@ func TestVerifyLog_CapsUnsignedDiagnostics(t *testing.T) {
 	}
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, "", time.Time{}, &out)
+	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -2540,7 +2539,7 @@ func TestVerifyLog_UnsignedDiagnosticsUncappedBelowLimit(t *testing.T) {
 		[]byte(`{"time":"2026-06-15T10:00:01Z","request_id":"b","session_id":"s","target":"tool:exec","decision":"allow"}`),
 	}
 	var out strings.Builder
-	if _, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, "", time.Time{}, &out); err != nil {
+	if _, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, VerifyOptions{Out: &out}); err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
 	if got := strings.Count(out.String(), "carries no _hmac"); got != 2 {
@@ -2583,7 +2582,7 @@ func TestVerifyAuditLog_KeylessVerifierReportsUnverifiableNotTampered(t *testing
 	for name, verifier := range map[string]*Sink{"nil": nil, "zero": {}} {
 		t.Run(name, func(t *testing.T) {
 			var out strings.Builder
-			res, err := VerifyLog(bytes.NewReader(log.Bytes()), verifier, "", time.Time{}, &out)
+			res, err := VerifyLog(bytes.NewReader(log.Bytes()), verifier, VerifyOptions{Out: &out})
 			if err != nil {
 				t.Fatalf("VerifyLog: %v", err)
 			}
@@ -2608,7 +2607,7 @@ func TestVerifyAuditLog_KeylessVerifierReportsUnverifiableNotTampered(t *testing
 
 	// The control: with the real key in the ring, the same log verifies clean — so the
 	// assertions above are about the missing key, not about a malformed fixture.
-	res, err := VerifyLog(bytes.NewReader(log.Bytes()), &Sink{verifyKeys: map[string][]byte{keyID: key}}, "", time.Time{}, &strings.Builder{})
+	res, err := VerifyLog(bytes.NewReader(log.Bytes()), &Sink{verifyKeys: map[string][]byte{keyID: key}}, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLog (matching key): %v", err)
 	}
@@ -2636,7 +2635,7 @@ func TestVerifyLogFiles_RefusesSymlinkedChainFile(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if _, err := VerifyLogFiles([]string{link}, verifierFor(t, keyPath), "", time.Time{}, io.Discard); err == nil {
+	if _, err := VerifyLogFiles([]string{link}, verifierFor(t, keyPath), VerifyOptions{Out: io.Discard}); err == nil {
 		t.Fatal("VerifyLogFiles must refuse a symlinked chain file rather than follow it")
 	}
 }
@@ -2658,7 +2657,7 @@ func TestVerifyLog_SuppressedUnsignedSummarySurvivesScanAbort(t *testing.T) {
 	log.WriteString(strings.Repeat("x", auditScanBufferBytes+1) + "\n")
 
 	var out strings.Builder
-	_, err := VerifyLog(&log, verifierFor(t, keyPath), "", time.Time{}, &out)
+	_, err := VerifyLog(&log, verifierFor(t, keyPath), VerifyOptions{Out: &out})
 	if err == nil {
 		t.Fatal("an over-cap line must abort the scan with an error")
 	}
