@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
 
@@ -147,4 +149,53 @@ capabilities:
 			t.Errorf("error = %v, want it to name the declared version", err)
 		}
 	})
+}
+
+// TestForceSchemaVersionToString_LeavesASharedAnchorAlone pins the property that makes
+// resolving the alias safe: the retag replaces this KEY's slot, never the anchor it points at.
+//
+// An anchor is shared with every other reference to it, so retagging it reaches fields this
+// function has no business touching — `values: [&ver 0.2]` beside `schemaVersion: *ver`
+// decoded that condition's value as the string "0.2" rather than the number. No end-to-end
+// divergence was demonstrable (allowedValues render as strings either way, and a coerced shared
+// value is refused by the version gate first), which is exactly why the property is pinned
+// here, at the node level where it is visible, rather than through a load that hides it.
+func TestForceSchemaVersionToString_LeavesASharedAnchorAlone(t *testing.T) {
+	t.Parallel()
+
+	const src = `capabilities:
+  - values: [&ver 0.2]
+schemaVersion: *ver
+`
+	var node yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(src), &node))
+
+	forceSchemaVersionToString(&node)
+
+	var raw map[string]interface{}
+	require.NoError(t, node.Decode(&raw))
+
+	assert.Equal(t, "0.2", raw["schemaVersion"], "the aliased version must decode as a string so the loader's own gate can read it")
+
+	caps, ok := raw["capabilities"].([]interface{})
+	require.True(t, ok)
+	entry, ok := caps[0].(map[string]interface{})
+	require.True(t, ok)
+	values, ok := entry["values"].([]interface{})
+	require.True(t, ok)
+	assert.Equal(t, 0.2, values[0], "a sibling field aliasing the same anchor must keep its own type; retagging the anchor changed it to the string \"0.2\"")
+}
+
+// TestForceSchemaVersionToString_RetagsADirectScalarInPlace is the other arm: a value written
+// under the key itself is shared with nothing, so it is retagged where it sits.
+func TestForceSchemaVersionToString_RetagsADirectScalarInPlace(t *testing.T) {
+	t.Parallel()
+
+	var node yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte("schemaVersion: 0.1\n"), &node))
+	forceSchemaVersionToString(&node)
+
+	var raw map[string]interface{}
+	require.NoError(t, node.Decode(&raw))
+	assert.Equal(t, "0.1", raw["schemaVersion"])
 }

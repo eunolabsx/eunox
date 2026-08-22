@@ -195,23 +195,38 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 // misdiagnosis the gate's ordering exists to prevent, for a document that declares its
 // version perfectly well.
 func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
+	mapping, i := topLevelValueSlot(node, key)
+	if mapping == nil {
+		return nil
+	}
+	return resolveYAMLAlias(mapping.Content[i])
+}
+
+// topLevelValueSlot is topLevelValueNode's core, returning the mapping and the INDEX of key's
+// value rather than the value itself — the position, not the node.
+//
+// The distinction is load-bearing for forceSchemaVersionToString: an alias node's target is
+// SHARED with every other reference to that anchor, so a caller that means to change this one
+// key's value has to replace what sits in this slot rather than mutate what the slot points
+// at. A reader wants the resolved node and uses topLevelValueNode; a writer wants the slot.
+func topLevelValueSlot(node *yaml.Node, key string) (mapping *yaml.Node, valueIdx int) {
 	doc := resolveYAMLAlias(node)
 	if doc == nil {
-		return nil
+		return nil, -1
 	}
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
 		doc = resolveYAMLAlias(doc.Content[0])
 	}
 	if doc == nil || doc.Kind != yaml.MappingNode {
-		return nil
+		return nil, -1
 	}
 	for i := 0; i+1 < len(doc.Content); i += 2 {
-		k, v := resolveYAMLAlias(doc.Content[i]), doc.Content[i+1]
+		k := resolveYAMLAlias(doc.Content[i])
 		if k != nil && k.Kind == yaml.ScalarNode && k.Value == key {
-			return resolveYAMLAlias(v)
+			return doc, i + 1
 		}
 	}
-	return nil
+	return nil, -1
 }
 
 // schemaVersionFromNode reads the top-level schemaVersion scalar's SOURCE TEXT off the parsed
@@ -233,16 +248,41 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 // bare-number schemaVersion outright. Retagging keeps the verbatim text, so "0.10" stays
 // "0.10" rather than renormalizing to "0.1".
 //
-// topLevelValueNode resolves an alias, so an aliased `schemaVersion: *ver` retags the ANCHOR
-// itself. That is the node the value IS, and it is what lets an aliased version load at all
-// rather than dying on the opaque unmarshal error this function exists to prevent. Residual,
-// stated because the reach is not local: an anchor shared between schemaVersion and a
-// genuinely numeric field would retag that field too, which fails its decode loudly rather
-// than changing any policy.
+// An ALIASED `schemaVersion: *ver` is retagged by REPLACING this key's slot with a fresh string
+// scalar, never by retagging the anchor. An anchor is shared with every other reference to it,
+// so mutating it reaches fields this function has no business touching: with `values: [&ver
+// 0.2]` beside `schemaVersion: *ver`, retagging the anchor decoded that condition's value as
+// the string "0.2" instead of the number.
+//
+// No end-to-end divergence was demonstrable for it — the manifest layer renders allowedValues
+// entries as strings whichever way they are spelled, and a coerced value shared with
+// schemaVersion is refused by the version gate before the coercion guard is reached — so this
+// is a robustness fix rather than a live bug. It is worth making anyway: the alternative is a
+// function whose blast radius depends on which OTHER keys happen to alias the same anchor,
+// which is not a property this file can check or a reviewer can see locally.
 func forceSchemaVersionToString(node *yaml.Node) {
-	val := topLevelValueNode(node, "schemaVersion")
-	if val != nil && val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {
+	mapping, i := topLevelValueSlot(node, "schemaVersion")
+	if mapping == nil {
+		return
+	}
+	slot := mapping.Content[i]
+	val := resolveYAMLAlias(slot)
+	if val == nil || val.Kind != yaml.ScalarNode || (val.Tag != "!!int" && val.Tag != "!!float") {
+		return
+	}
+	if slot == val {
+		// Written directly under this key, so nothing else can be looking at it.
 		val.Tag = "!!str"
+		return
+	}
+	// Position from the ALIAS, so a later error about this value points at the reference the
+	// author wrote rather than at the anchor's definition somewhere else in the file.
+	mapping.Content[i] = &yaml.Node{
+		Kind:   yaml.ScalarNode,
+		Tag:    "!!str",
+		Value:  val.Value,
+		Line:   slot.Line,
+		Column: slot.Column,
 	}
 }
 

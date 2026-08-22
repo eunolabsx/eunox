@@ -46,16 +46,23 @@ func TestStdioForwardHostNotification_KillLandingDuringTheBarrierIsObserved(t *t
 	p.fwdHostWrites.Add(1)
 	p.fwdHostInFlight.Add(1)
 
-	var wg sync.WaitGroup
+	// The releasing goroutine makes NO assertions of its own. require's Goexit would skip the
+	// Done below, leaving the notification blocked in the barrier forever and turning a clean
+	// failure into a package-wide timeout — the one shape a helper goroutine must not have.
+	// The error is carried back and checked on the test goroutine instead.
+	var (
+		wg      sync.WaitGroup
+		killErr error
+	)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer p.fwdHostWrites.Done()
+		defer p.fwdHostInFlight.Add(-1)
 		// The kill lands strictly INSIDE the wait: the notification has already cleared the
 		// prologue's check by the time this runs.
 		time.Sleep(50 * time.Millisecond)
-		require.NoError(t, ks.KillSession(context.Background(), "barrier-sess"))
-		p.fwdHostInFlight.Add(-1)
-		p.fwdHostWrites.Done()
+		killErr = ks.KillSession(context.Background(), "barrier-sess")
 	}()
 
 	msg := mcp.RPCMsg{
@@ -67,6 +74,7 @@ func TestStdioForwardHostNotification_KillLandingDuringTheBarrierIsObserved(t *t
 
 	stop := p.forwardHostNotification(context.Background(), msg)
 	wg.Wait()
+	require.NoError(t, killErr)
 
 	assert.False(t, stop, "a kill is a refusal, not a shutdown signal")
 	assert.Empty(t, uw.messages, "host bytes must not reach a revoked session's upstream")
