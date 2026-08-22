@@ -570,7 +570,13 @@ func (e *Engine) policyUses(s capability.EngineSubsystem) bool {
 // reach: in audit (observe) mode a constraint with a failing condition returns a deny
 // without recording, yet the transport still forwards the request and the tool runs.
 func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceRequest) error {
-	if e.skipAntecedentRecording || e.counter == nil || req.SessionID == "" {
+	// The ANCHOR's id, not req.SessionID: under WithTaskAnchoredState the key this write lands
+	// on never reads SessionID at all, so gating on it skipped the marker for a task-anchored
+	// request that carries no session — leaving an allowed antecedent invisible to a later
+	// sequenceBlock Peek under the same task key, which is the fail-OPEN direction and the one
+	// this function's own contract calls out. Through resolveAnchor so the guard and the key
+	// cannot disagree about which subject the write belongs to.
+	if e.skipAntecedentRecording || e.counter == nil || e.resolveAnchor(req).ID == "" {
 		return nil
 	}
 	// Prefer the explicit target type set by every ManifestPDP entry point; the
@@ -697,6 +703,24 @@ func recordFailureDenial(requestID, now string, auditOnly bool, obligations []ca
 		ConditionType: capability.ConditionTypeSequenceBlock,
 		Message:       "session history recording failed; sequenceBlock state is unreliable",
 		Details:       map[string]interface{}{"phase": "record"},
+	})
+}
+
+// nilRequestDenial builds the structured refusal an exported verdict seam returns for a nil
+// argument it would otherwise dereference.
+//
+// A crash is the fail-OPEN reading of this package's own rule. "On any ambiguity, deny" is a
+// statement about the DECISION, and a decision point that panics produces no decision at all —
+// the process dies and whatever the operator's supervisor does next decides the traffic. Every
+// sibling seam already guards; these two were the exceptions.
+//
+// ErrCodeEnforcementError, so no posture forwards it: the caller's contract is broken, which is
+// not a policy verdict an observing route may downgrade. It builds no request id of its own —
+// there is no request to identify.
+func nilRequestDenial(seam string) capability.EnforceResponse {
+	return denyResponse("", "", false, nil, capability.DenialInfo{
+		Code:    capability.ErrCodeEnforcementError,
+		Message: seam + ": called with a nil request or constraint; refusing rather than evaluating an incomplete decision",
 	})
 }
 
@@ -1359,6 +1383,13 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 // itself — there is no separate error channel, so a deny is always a structured
 // EnforceResponse, never a Go error a caller must branch on.
 func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequest, capabilities []capability.Constraint) capability.EnforceResponse {
+	// A nil request denies rather than panicking, matching every sibling exported verdict seam:
+	// this package's fail-closed rule is that an ambiguity produces a structured deny, and a
+	// crash inside a decision point is the fail-OPEN reading of it — the proxy dies and the
+	// traffic it was policing goes wherever a restarted or unpoliced path takes it.
+	if req == nil {
+		return nilRequestDenial("ValidateAction")
+	}
 	requestID := NewRequestID()
 	now := e.clock.Now().UTC().Format(time.RFC3339Nano)
 
@@ -1574,6 +1605,15 @@ func StripEnginePrefix(s string) string {
 // (ValidateAction does both for you; this does neither). Obligations are collected
 // from the constraint's Directives after all conditions pass.
 func (e *Engine) EvaluateConditions(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) capability.EnforceResponse {
+	// Both are dereferenced unconditionally below. A nil MATCHED is the caller's own contract
+	// broken — this seam evaluates a constraint the caller already selected — so it denies with
+	// the same structured refusal rather than crashing; see nilRequestDenial.
+	if req == nil {
+		return nilRequestDenial("EvaluateConditions")
+	}
+	if matched == nil {
+		return nilRequestDenial("EvaluateConditions: no matched constraint")
+	}
 	requestID := NewRequestID()
 	now := e.clock.Now().UTC().Format(time.RFC3339Nano)
 	ctx = context.WithValue(ctx, ctxRequestIDKey{}, requestID)

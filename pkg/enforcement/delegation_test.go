@@ -214,3 +214,59 @@ func TestDelegation_NoChainChangesNothing(t *testing.T) {
 	require.Len(t, resp.Obligations, 1)
 	assert.Equal(t, []string{"email"}, resp.Obligations[0].Paths)
 }
+
+// TestDelegation_UnknownForcedLabelDeniesRatherThanNormalizingAway is the fail-open this
+// closes.
+//
+// A forced label is the delegators' DECISION about what this delegate is, not a cooperating
+// client's voluntary attribution — and the two were run through the same normalizer, which
+// drops anything outside the vocabulary. Dropping a voluntary declaration is safe (an unknown
+// label there could only ever have added denials). Dropping a FORCED one removes taint, so a
+// sink that should have refused the delegate's call allows it.
+//
+// ValidateDelegationChain refuses such a token at the boundary, so this fires only for an
+// embedder that built a chain without it — which is exactly the population a silent
+// normalization leaves unprotected, and the reason the sibling checks in this package surface
+// against the RAW authored values too.
+func TestDelegation_UnknownForcedLabelDeniesRatherThanNormalizingAway(t *testing.T) {
+	eng := declassifyEngine()
+	ctx := context.Background()
+	// A sink that permits only public-provenance flows. Nothing has tainted the session, so it
+	// is the forced label — and only the forced label — that decides.
+	caps := []capability.Constraint{{
+		Target:     "tool:*",
+		Actions:    []string{"call"},
+		Conditions: []capability.Condition{capability.FlowLabelCondition{Allow: []string{capability.FlowLabelPublic}}},
+	}}
+
+	t.Run("a known forced label still denies on its own merits", func(t *testing.T) {
+		resp := eng.ValidateAction(ctx, delegatedReq("s", "publish",
+			capability.DelegationGrant{Subject: "agent-a", Labels: []string{capability.FlowLabelUntrusted}}), caps)
+		require.Equal(t, capability.DecisionDeny, resp.Decision)
+		require.NotNil(t, resp.Denial)
+		assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	})
+
+	t.Run("an unknown forced label denies rather than being dropped", func(t *testing.T) {
+		resp := eng.ValidateAction(ctx, delegatedReq("s", "publish",
+			capability.DelegationGrant{Subject: "agent-a", Labels: []string{"quarantined"}}), caps)
+		require.Equal(t, capability.DecisionDeny, resp.Decision, "normalizing the label away lets the call through as untainted")
+		require.NotNil(t, resp.Denial)
+		// The FAULT code, not a policy verdict: the chain is malformed, so there is no verdict
+		// an observing route may downgrade into a forward.
+		assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
+		assert.False(t, resp.Denial.Downgradable())
+		assert.Contains(t, resp.Denial.Message, "quarantined", "the refusal must name the label it could not honor")
+	})
+
+	t.Run("the claim parser refuses the same grant outright", func(t *testing.T) {
+		// The shipped path, and where the boundary check actually lives: grant well-formedness
+		// is asserted by ParseDelegationGrants as it decodes the claim, NOT by
+		// ValidateDelegationChain, which only checks that the hops line up and narrow. That is
+		// what makes the decision-path check a backstop rather than a duplicate — a chain
+		// assembled any other way reaches the engine having passed no label check at all.
+		_, err := capability.ParseDelegationGrants([]byte(`[{"subject":"agent-a","labels":["quarantined"]}]`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "quarantined")
+	})
+}

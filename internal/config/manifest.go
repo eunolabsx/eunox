@@ -187,18 +187,28 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 
 // topLevelValueNode returns the value node of a top-level mapping key, unwrapping a
 // DocumentNode wrapper first. Shared by schemaVersionFromNode and forceSchemaVersionToString.
+//
+// The value is resolved through its ALIAS, for the same reason the coercion guard resolves
+// one: an `*ref` node carries no Value of its own, so both callers read it as absent. That
+// made an aliased schemaVersion falsely "required" in the gateway loader, and made the
+// manifest loader skip the pre-decode version gate entirely — producing exactly the coercion
+// misdiagnosis the gate's ordering exists to prevent, for a document that declares its
+// version perfectly well.
 func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
-	doc := node
-	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
-		doc = doc.Content[0]
+	doc := resolveYAMLAlias(node)
+	if doc == nil {
+		return nil
 	}
-	if doc.Kind != yaml.MappingNode {
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = resolveYAMLAlias(doc.Content[0])
+	}
+	if doc == nil || doc.Kind != yaml.MappingNode {
 		return nil
 	}
 	for i := 0; i+1 < len(doc.Content); i += 2 {
-		k, v := doc.Content[i], doc.Content[i+1]
-		if k.Kind == yaml.ScalarNode && k.Value == key {
-			return v
+		k, v := resolveYAMLAlias(doc.Content[i]), doc.Content[i+1]
+		if k != nil && k.Kind == yaml.ScalarNode && k.Value == key {
+			return resolveYAMLAlias(v)
 		}
 	}
 	return nil
@@ -222,6 +232,13 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 // cannot do this (it decodes strictly from raw bytes for KnownFields) and instead rejects a
 // bare-number schemaVersion outright. Retagging keeps the verbatim text, so "0.10" stays
 // "0.10" rather than renormalizing to "0.1".
+//
+// topLevelValueNode resolves an alias, so an aliased `schemaVersion: *ver` retags the ANCHOR
+// itself. That is the node the value IS, and it is what lets an aliased version load at all
+// rather than dying on the opaque unmarshal error this function exists to prevent. Residual,
+// stated because the reach is not local: an anchor shared between schemaVersion and a
+// genuinely numeric field would retag that field too, which fails its decode loudly rather
+// than changing any policy.
 func forceSchemaVersionToString(node *yaml.Node) {
 	val := topLevelValueNode(node, "schemaVersion")
 	if val != nil && val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {

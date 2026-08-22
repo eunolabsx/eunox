@@ -243,8 +243,18 @@ type HTTPProxy struct {
 	// authTimingKey is a per-process random HMAC key folding presented/expected tokens to a
 	// fixed-length MAC before the constant-time comparison. See constantTimeTokenEqual.
 	authTimingKey []byte
-	// preSessionDenies bounds the rate of transport-level refusal records — the only audit
-	// writes an unauthenticated caller can trigger, else a lever on --require-audit=strict.
+	// preSessionDenies is the PROXY-WIDE refusal-record table. The name is historical and now
+	// undersells it: it is charged by three different sources, not one.
+	//
+	//   - the pre-session refusals it was built for — the only audit writes an UNAUTHENTICATED
+	//     caller can trigger, and so a lever on --require-audit=strict;
+	//   - the -32022 revision refusal, which an ESTABLISHED session's traffic reaches;
+	//   - and every session's own upstream-driven table, for which this is the aggregate parent
+	//     holding the total at the pre-split ceiling (see newUpstreamRefusalLimiter).
+	//
+	// Left named for the first because the field is threaded through the leg wiring in a dozen
+	// places and a rename buys nothing the doc does not; what mattered was that the doc claimed
+	// a scope two of its three charge sources fall outside.
 	preSessionDenies *categoryRecordLimiter
 	// notices is the AGGREGATE stderr-diagnostic table: one bucket per notice CLASS, charged
 	// directly by every leg with no route in scope and as the parent of each route's own table.

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("[{\"ssn\":\"1\"},{\"ssn\":\x05\xff\xff\x05]")

@@ -187,7 +187,7 @@ func TestRefusalMetering_CallSitesAgreeWithTheDeclarations(t *testing.T) {
 // hand their own limiter to, and lives in neither transport's file.
 func TestRefusalMetering_StdioLimiterHasABucketPerDeclaredCategory(t *testing.T) {
 	t.Parallel()
-	lim := newRefusalRecordLimiterFor(stdioRefusalCategories...)
+	lim := newRefusalRecordLimiterFor(stdioRefusalCategories)
 	require.NotEmpty(t, stdioRefusalCategories)
 	for _, cat := range stdioRefusalCategories {
 		assert.Equal(t, meteringMetered, refusalDeclarations[cat].metering,
@@ -206,7 +206,7 @@ func TestRefusalMetering_StdioLimiterHasABucketPerDeclaredCategory(t *testing.T)
 // not of the categories one transport happens to charge.
 func TestRefusalMetering_SizedLimiterKeepsTheAggregateShare(t *testing.T) {
 	t.Parallel()
-	one := newRefusalRecordLimiterFor(catRevision)
+	one := newRefusalRecordLimiterFor([]refusalCategory{catRevision})
 	assert.Len(t, one.buckets, 1, "a transport charging one category must not retain buckets it can never spend")
 	assert.Equal(t, float64(perCategoryDenyRatePerSec), one.bucket(catRevision).ratePerSec,
 		"a subset limiter's bucket must hold the same share as the full table's, or a transport charging fewer categories would get a larger budget per category")

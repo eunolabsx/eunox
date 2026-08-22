@@ -16,9 +16,11 @@
 // taken FRESH after the decision turn — a kill landing during an unbounded wait has to be
 // recorded as KILL_SWITCH rather than as the method's own refusal, and a prologue-level answer
 // would be the stale one. So the request framing takes it inside dispatchRequest and
-// enforcedForwardCore, and the notification framing — which waits for nothing — takes it in
-// hostNotificationGate. See hostMessageGate's doc for what the two transports still hold of
-// their own, and why.
+// enforcedForwardCore, and the notification framing takes it in hostNotificationGate — where
+// the check is the WHOLE answer only for a leg that then forwards immediately. A transport
+// whose notification path waits after the gate owes the same fresh re-check the request framing
+// does: stdio's wire-ordering barrier is one (see forwardHostNotification), and it takes it.
+// See hostMessageGate's doc for what the two transports still hold of their own, and why.
 //
 //  1. REVISION negotiation (resolveHostRevision / refuseHostRevision). First, because every
 //     table below is revision-scoped: a message whose revision cannot be established has no

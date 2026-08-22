@@ -1,0 +1,2 @@
+go test fuzz v1
+string("[\"\\b00\\b0\\b\\b0\"]")

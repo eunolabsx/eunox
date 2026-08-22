@@ -23,6 +23,8 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/stretchr/testify/require"
+
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
@@ -1170,3 +1172,55 @@ type writeFailingKillSwitch struct {
 func (k writeFailingKillSwitch) ActivateGlobal(context.Context) error { return k.err }
 
 func (k writeFailingKillSwitch) KillSession(context.Context, string) error { return k.err }
+
+// TestHandleKill_OverLongSessionIDIsRefused bounds the one attacker-shaped value this endpoint
+// takes from a body rather than a header.
+//
+// The body is capped at maxRequestBodyBytes, so without a length check a ~4 MiB "session id"
+// flowed into the Redis kill key, into details.scope of the SIGNED RecordAllow, and back out in
+// the response echo — the rule maxClaimedSessionIDLen already states for the header form of
+// exactly this value. The caller holds the control token and is trusted to stop the proxy, not
+// to choose how many megabytes land on the tape; and an id this long names no session the proxy
+// ever minted, so refusing it forfeits no kill that could have worked.
+func TestHandleKill_OverLongSessionIDIsRefused(t *testing.T) {
+	t.Parallel()
+
+	newKillReq := func(body string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+		req.Header.Set("Content-Type", CTJSON)
+		req.Header.Set(ControlTokenHeader, testControlToken)
+		req.RemoteAddr = "127.0.0.1:9999"
+		req.Host = "127.0.0.1:9999"
+		return req
+	}
+
+	t.Run("over-length is a 400 and kills nothing", func(t *testing.T) {
+		t.Parallel()
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken, Stderr: io.Discard})
+		huge := strings.Repeat("a", maxClaimedSessionIDLen+1)
+		body, err := json.Marshal(map[string]string{"sessionId": huge})
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, newKillReq(string(body)))
+		require.Equal(t, http.StatusBadRequest, rr.Code)
+
+		status := killStatusForTest(t, proxy)
+		require.NotContains(t, status.KilledSessions, huge, "a refused kill must not have written a tombstone")
+	})
+
+	t.Run("an id at the bound still kills", func(t *testing.T) {
+		t.Parallel()
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken, Stderr: io.Discard})
+		atLimit := strings.Repeat("a", maxClaimedSessionIDLen)
+		body, err := json.Marshal(map[string]string{"sessionId": atLimit})
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, newKillReq(string(body)))
+		require.Equal(t, http.StatusOK, rr.Code, "the bound is a ceiling on absurdity, not a tightening of what a real id may be")
+
+		status := killStatusForTest(t, proxy)
+		require.Contains(t, status.KilledSessions, atLimit)
+	})
+}

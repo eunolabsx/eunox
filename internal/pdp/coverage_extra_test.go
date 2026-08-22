@@ -374,8 +374,9 @@ func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelInternal}}},
 	}
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, prior)
-	require.NoError(t, err)
+	_, cerr := engine.RecordSourceCall(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, prior,
+		enforcement.SourceCommitScope{Flow: true}, nil)
+	require.Nil(t, cerr)
 
 	// An audit-only source read that labels its output "confidential", hitting a
 	// downgradable deny with no labels stamped yet (the structural early-return shape).
@@ -414,8 +415,9 @@ func TestRecordAuditModeAntecedent_NonFlowConstraintNoLabels(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
 	}
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, src)
-	require.NoError(t, err)
+	_, cerr := engine.RecordSourceCall(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, src,
+		enforcement.SourceCommitScope{Flow: true}, nil)
+	require.Nil(t, cerr)
 
 	// A non-flow audit-only constraint hits a downgradable deny in the SAME tainted session.
 	nonFlow := &capability.Constraint{Target: "tool:ping", Actions: []string{"call"}, Enforcement: capability.EnforcementAudit}

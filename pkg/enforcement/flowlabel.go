@@ -134,6 +134,21 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	// provenance: this is what the delegators DECIDED this delegate is, on a verified token
 	// the delegate can't edit, vs. a cooperating agent describing its own inputs. Used for
 	// THIS check only, never persisted.
+	//
+	// An unrecognized forced label DENIES rather than being normalized away, which is what
+	// separates this set from the client attribution above. A voluntary declaration may be
+	// dropped safely — an unknown label there could only have added denials. A delegator's
+	// forced label is a decision, so dropping it REMOVES taint and lets a sink that should
+	// have denied allow. Surfaced against the RAW grants, mirroring the authored-'allow' check
+	// at the top of this function: ValidateDelegationChain already refuses such a token, so
+	// this fires only for an embedder that built a chain without it.
+	if unknown := req.Delegation.UnknownForcedLabels(); len(unknown) > 0 {
+		return &ConditionError{
+			Code:          capability.ErrCodeEnforcementError,
+			ConditionType: capability.ConditionTypeFlowLabel,
+			Message:       fmt.Sprintf("delegation chain forces unknown flow label(s) %v; valid native labels are %v — a forced label cannot be normalized away, since dropping it would remove taint the delegators imposed", unknown, flowLabelVocab),
+		}
+	}
 	forced := req.Delegation.ForcedLabels()
 	present = unionLabels(present, forced)
 
@@ -301,13 +316,6 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 		return nil, err
 	}
 	return out, nil
-}
-
-// RecordLabels is the exported form of recordLabels for the audit-mode antecedent path: when
-// a downgraded audit-mode source's read is forwarded, its labelOutput labels must still be
-// recorded (or a later ENFORCED sink Gets empty and fails open) and surfaced as labels_out.
-func (e *Engine) RecordLabels(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) ([]string, error) {
-	return e.recordLabels(ctx, req, matched)
 }
 
 // intersectLabels returns the members of want present in held, in want's order.

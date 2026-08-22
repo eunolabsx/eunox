@@ -359,6 +359,35 @@ func (c *DelegationChain) ForcedLabels() []string {
 	return c.computeForcedLabels()
 }
 
+// UnknownForcedLabels returns the raw grant labels that are not native flow labels, in the
+// order the chain declares them.
+//
+// ForcedLabels normalizes against the vocabulary, which silently DROPS anything unrecognized.
+// That is right for a cooperating client's voluntary attribution (an unknown label there can
+// only ever have added denials, so discarding it costs nothing), and wrong here: a delegator's
+// forced label is a DECISION about what this delegate is, and dropping it removes taint the
+// delegators imposed — a sink that should have denied allows. Validate refuses such a grant at
+// the token boundary, so on the shipped path this is always empty; it exists for an embedder
+// that builds a chain programmatically without going through ValidateDelegationChain, where a
+// silent drop is the fail-open direction.
+//
+// Computed from Grants rather than memoized: it is the exception path, and a memo field would
+// pay for it on every chain built.
+func (c *DelegationChain) UnknownForcedLabels() []string {
+	if c == nil {
+		return nil
+	}
+	var unknown []string
+	for i := range c.Grants {
+		for _, l := range c.Grants[i].Labels {
+			if !IsFlowLabel(l) {
+				unknown = append(unknown, l)
+			}
+		}
+	}
+	return unknown
+}
+
 // AllowedLabelCap returns the intersection of every hop's AllowLabels, and whether any hop
 // declared one. A nil-with-true result is the full quarantine (no labeled flow reaches any
 // sink); false means no hop capped the sink allow-set and the manifest's own Allow stands

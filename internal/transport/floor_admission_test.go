@@ -356,7 +356,7 @@ func TestReserveInterval_IsPerTableNotPerPackage(t *testing.T) {
 	// write is charged against the parent's budget, so it re-arms on the parent's argument. Pinned
 	// because both constants are a minute today, so the rule is otherwise invisible until the first
 	// time somebody moves one.
-	aggregate := newRefusalRecordLimiterFor(catDisplaced)
+	aggregate := newRefusalRecordLimiterFor([]refusalCategory{catDisplaced})
 	aggregate.reserveEvery = time.Hour
 	session := newUpstreamRefusalLimiter(aggregate, []refusalCategory{catServerRequestFailed})
 	require.NotContains(t, session.buckets, catDisplaced, "the category under test must be a delegated one")

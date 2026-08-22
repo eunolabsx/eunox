@@ -384,7 +384,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostToUp:              make(map[string]*json.RawMessage),
 		hostReader:            mcp.NewMsgReader(os.Stdin),
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
-		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories...),
+		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories),
 		notices:               newNoticeLimiter(1),
 		noticeFloor:           newNoticeReserve(nil),
 		noticeCollapse:        newNoticeCollapse(),
@@ -1195,6 +1195,19 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 	if !p.waitHostForwardOrShutdown(ctx) {
 		return true
 	}
+	// Revocation, AGAIN, after the barrier. The gate order's justification for letting the
+	// notification framing take its kill check in the prologue is that this framing "waits for
+	// nothing" — true on the gateway, false here: the wire-ordering barrier below parks this
+	// notification behind every request the host already sent, and that wait is unbounded under
+	// --upstream-timeout=0. A kill landing inside it was never re-observed, so host-controlled
+	// bytes reached a revoked session's upstream with no KILL_SWITCH record — a one-message
+	// window, and the same "take it FRESH past the wait" rule the REQUEST framing already
+	// follows for exactly this reason. Recorded through the gate's own producer so the two
+	// observations are one record shape.
+	if kill := gate.checkKill(); kill != nil {
+		recordKillDrop(ctx, gate.recorders.forCategory(catKill), kill, gate.subject, msg, gate.leg)
+		return false
+	}
 	// Translate a cancel's params.requestId from the host id to the nonce the upstream
 	// saw; drop it if the target request is no longer in flight. Others forward verbatim.
 	if msg.Method == methodNotificationsCancelled {
@@ -1493,13 +1506,19 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 // the flow set concurrently with a host source's write. A sampling request has no
 // proxy-receipt order, so it simply takes the next ticket: mutual exclusion, not ordering.
 //
-// The wait is BOUNDED (samplingTurnWait), for a hazard worse than the HTTP leg's: this runs
-// INLINE on the upstream reader goroutine, the only goroutine that delivers upstream responses
-// to waiting host handlers. A declassifying host call holds its turn across its whole upstream
-// round trip, so a sampling request arriving mid-clear waits for a turn whose holder is waiting
-// on a response only this blocked reader can deliver — a deadlock that unwinds only when
-// --upstream-timeout fires, never at 0. It applies even when sampling is denied, since the turn
-// is taken before DecideSampling runs.
+// The wait is BOUNDED (samplingTurnWait), and the reason is no longer the deadlock this comment
+// used to describe: that account — a turn taken INLINE on the upstream reader, the only
+// goroutine that delivers responses to waiting host handlers — was true before
+// serverRequestPool, which is exactly what that pool was introduced to remove. This leg now runs
+// on its own goroutine, so a parked turn stalls no other in-flight call.
+//
+// What the bound is for now is serverRequestPool's own admission: a parked waiter holds one of
+// maxConcurrentServerRequests slots, so an unbounded wait converts a slow turn into a saturated
+// pool that refuses every later server-initiated request. samplingTurnWait's PAIR is what makes
+// that affordable — perHolder refuses only a waiter whose turn-holder has not handed off for a
+// whole window, so a moving queue is not refused, and total keeps "the queue is moving" from
+// meaning forever. The bound applies even when sampling is denied, since the turn is taken
+// before DecideSampling runs.
 //
 // A plain FIFO made bounding this unsafe: an abandoned ticket stalled every later ticket behind
 // it. beginWithin abandons the ticket properly (the turn skips it), so a give-up costs only
