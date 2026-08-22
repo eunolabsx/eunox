@@ -212,7 +212,7 @@ which part). The full migration is planned in
 
 | Feature | 2026-07-28 method / field | eunox disposition | Notes |
 |---|---|---|---|
-| **List-result caching** (SEP-2549) | `cacheScope` (`public`/`private`) + `ttlMs` on `*/list`, `resources/read`, and the discovery result | **Open obligation.** eunox filters `*/list` per identity, so every list it emits is authorization-context-specific. `filterListResult` preserves sibling fields verbatim, so an upstream `cacheScope: public` would pass through unchanged on a personalized response. The fix is to **override `cacheScope` to `private`** on any response eunox has filtered (never preserve an upstream `public`); `ttlMs` may be preserved as a freshness hint. See threat model L-6. | A shared downstream cache honoring `public` on a filtered list could serve one identity's narrowed view to another — the spec's "caches MUST NOT be shared across authorization contexts" invariant |
+| **List-result caching** (SEP-2549) | `cacheScope` (`public`/`private`) + `ttlMs` on `*/list`, `resources/read`, and the discovery result | **`*/list` honored.** eunox filters `*/list` per identity, so every list it emits is authorization-context-specific; it therefore **clamps `cacheScope` to `private`** on every response it filtered, whatever the upstream said. Any value other than `private` is clamped, not just `public` — the field is an open union, so an unrecognized scope is an ambiguity and the narrow reading is the only one that cannot leak. `ttlMs` is preserved verbatim as a freshness hint. Two deliberate limits: the member is never ADDED where the upstream omitted it (2025-11-25 does not define it, and old-revision output stays byte-stable), and the `--audit` wiretap passthrough keeps the upstream's own scope, since it forwards a catalog identical for every caller. **`resources/read` is not covered:** eunox does not filter that reply per identity, but a delegation chain's `redactFields` masks fields in it, so the forwarded body can be caller-specific while its upstream `cacheScope` crosses verbatim. The discovery result is not personalized. See threat model L-6. | A shared downstream cache honoring `public` on a filtered list could serve one identity's narrowed view to another — the spec's "caches MUST NOT be shared across authorization contexts" invariant |
 | **MCP Apps** (SEP-1865) | `ui://` template resources; `ui/*` host↔iframe bridge | **Covered by existing mediation; documentation watch item.** App UI templates are fetched via `resources/read` / `resources/list` (already gated and filtered) and UI-initiated execution is an ordinary `tools/call` (already enforced and audited). The `ui/*` methods run on the host↔iframe postMessage bridge, which never traverses eunox. No new server-transport method exists today. | A *future* Apps revision adding a server-transport `app/*` method would hit the fail-closed unmapped-method path and need classification |
 
 Broader 2026-07-28 conformance splits into what
@@ -341,9 +341,26 @@ The pin **selects the opener**, and everything else about the leg follows from i
 sent, deliberately. ADR-0006 also describes a **probe** for `auto` — open with
 `server/discover`, fall back to `initialize` on method-not-found — and that half is
 not activated: it changes what every existing 2025-11-25 upstream sees before eunox
-knows anything about it, and the interop matrix that would arbitrate that change
-does not exist yet. Pinning needs neither, because an operator who writes the pin
-has stated the fact the probe would have gone looking for.
+knows anything about it, and an upstream that answers `server/discover` with anything
+other than a clean `-32601` would turn a working deployment into a failing one.
+Pinning needs no probe, because an operator who writes the pin has stated the fact
+the probe would have gone looking for.
+
+What the missing probe costs you is carried in the failure instead. If the opener for
+the revision a leg was opened at comes back `-32601`, eunox says so and names the
+remedy:
+
+```
+[eunox] Fatal: upstream open at 2025-11-25 (initialize): upstream initialize rejected:
+method not found: initialize (code -32601); this upstream does not implement the opener
+for 2025-11-25. If it speaks 2026-07-28, pin `protocolVersion: "2026-07-28"` on this
+upstream — eunox opens with the pinned revision's opener and does not probe for one
+(see docs/conformance.md).
+```
+
+Only `-32601` gets that line: it is the one answer that means the method is absent
+rather than failing. Any other rejection is not a revision mismatch, and suggesting a
+pin for it would send you the wrong way.
 
 Two consequences of the pin worth stating before you set it:
 

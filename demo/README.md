@@ -434,6 +434,76 @@ $ make -C demo ci-test-gateway
 
 ---
 
+## Step 5 — The same policy against a 2026-07-28 upstream
+
+Everything above speaks MCP **2025-11-25**: the host opens with `initialize`, the
+proxy opens the upstream leg the same way, and the protocol version is negotiated
+once. The **2026-07-28** revision removes both the handshake and the protocol
+session — `server/discover` opens the leg, and every request carries its own
+protocol version in `params._meta`.
+
+These targets run the same allow/deny walkthrough against a mock pinned to that
+revision, so you can see that the *policy* decisions are unchanged by the protocol
+change. No Docker; they run the proxy and the mock as local processes.
+
+```
+$ make -C demo stateless-allow       # read_file /reports/q3.pdf  → ALLOWED
+$ make -C demo stateless-deny        # write_file                 → DENIED (not in manifest)
+$ make -C demo stateless-deny-path   # read_file /etc/shadow      → DENIED (path not in /reports/*)
+$ make -C demo stateless-list        # tools/list                 → filtered, and cacheScope clamped
+```
+
+Two things to look at in `stateless-list`:
+
+```json
+{
+  "cacheScope": "private",
+  "resultType": "complete",
+  "tools": [ { "name": "read_file", ... }, { "name": "query_db", ... } ],
+  "ttlMs": 60000
+}
+```
+
+`write_file` is gone — the proxy filters the catalog to what the manifest permits,
+exactly as it does on the older revision. And `cacheScope` says `private` even
+though **the mock sent `public`**: eunox narrowed this list to what one caller may
+see, so telling a shared cache downstream that the response is reusable across
+identities would leak one caller's view to another. The mock volunteers the wrong
+answer on purpose, so reading `private` here is reading a working clamp rather than
+an upstream that never said anything.
+
+Run `make -C demo stateless-audit` in another terminal to watch the tape; each
+record carries `protocol_revision: "2026-07-28"`.
+
+### Why this is stdio-only
+
+An HTTP session is opened by `initialize`, which this revision does not have, so
+eunox refuses a `protocolVersion: "2026-07-28"` pin over the HTTP host transport
+rather than accepting a configuration in which every forwarded request would be
+refused as a mismatched pair. The Docker targets gain their stateless variant when
+session creation stops being anchored on the handshake.
+
+### If you point eunox at the wrong revision
+
+eunox does not probe an upstream for its revision — that would change what every
+existing upstream sees before eunox knows anything about it. It tells you instead.
+Drop the `protocolVersion` pin from an upstream config while pointing it at a
+2026-07-28-only server and the leg opens with `initialize`, the default; the
+startup failure names the remedy:
+
+```
+[eunox] Fatal: upstream open at 2025-11-25 (initialize): upstream initialize
+rejected: method not found: initialize (code -32601); this upstream does not
+implement the opener for 2025-11-25. If it speaks 2026-07-28, pin
+`protocolVersion: "2026-07-28"` on this upstream — eunox opens with the pinned
+revision's opener and does not probe for one (see docs/conformance.md).
+```
+
+Only `-32601` gets that line: it is the one answer that means the method is absent
+rather than failing. `make -C demo ci-test-stateless` asserts it.
+
+---
+
 ## Tear down
 
 ```
@@ -459,14 +529,25 @@ demo/
 ├── audit/                      audit log written here by eunox (bind-mounted into container)
 ├── mock-mcp-server/
 │   ├── main.go                 minimal MCP HTTP server (3 tools, fake responses)
+│   ├── revision.go             --protocol-version: which MCP revision it serves
 │   ├── main_test.go            unit tests
+│   ├── revision_test.go        per-revision opener/result-shape tests
 │   └── Dockerfile              multi-stage Go build (shares root go.mod)
+├── mock-mcp-server-stdio/
+│   ├── main.go                 the stdio twin of the above
+│   ├── revision.go             --protocol-version: which MCP revision it serves
+│   ├── main_test.go            unit tests
+│   └── revision_test.go        per-revision opener/result-shape tests
 ├── keycloak/
 │   └── realm-export.json       eunox-demo realm with demo-agent client and capability mappers
 └── scripts/
     ├── mcp-call.sh             initialize session + tool call (base/JWT)
     ├── mcp-call-gateway.sh     initialize session + tool call on a /mcp/<route>
+    ├── mcp-call-stdio.sh       initialize + tool call over stdio (no Docker)
+    ├── mcp-call-stateless.sh   one declaring 2026-07-28 request over stdio (no Docker)
     ├── ci-test-gateway.sh      gateway per-route integration test
+    ├── ci-test-stdio.sh        stdio policy-enforcement integration test
+    ├── ci-test-stateless.sh    the same, over a 2026-07-28 upstream
     └── get-jwt.sh              client-credentials token request to Keycloak
 ```
 

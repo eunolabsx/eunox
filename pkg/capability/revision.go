@@ -105,6 +105,23 @@ const MetaKeyProtocolVersion = "io.modelcontextprotocol/protocolVersion"
 // like the rest of `_meta`.
 const MetaKeyClientCapabilities = "io.modelcontextprotocol/clientCapabilities"
 
+// ResultKeyCacheScope is the `*/list` result member a 2026-07-28 server states the
+// cacheability of the response under, and CacheScopePublic/CacheScopePrivate are the two
+// values it takes.
+//
+// eunox only ever CLAMPS it. Every list it emits from an enforced route is
+// authorization-context-specific — the entries are the ones this caller may see — so a shared
+// cache downstream of the proxy that honored a `public` scope could serve one identity's
+// narrowed view to another. The clamp lives at the one encoder every filter path reaches
+// (internal/pdp), not here; what lives here is the spelling, because the member is part of a
+// revision's result shape and `internal/pdp` may not import the transport package that owns
+// the rest of the revision vocabulary.
+const (
+	ResultKeyCacheScope = "cacheScope"
+	CacheScopePublic    = "public"
+	CacheScopePrivate   = "private"
+)
+
 // revisionCtxKey is the unexported context key the decided revision travels under, so no
 // package outside this one can plant a revision the transports did not resolve.
 type revisionCtxKey struct{}

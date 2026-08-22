@@ -9,6 +9,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,10 +20,9 @@ import (
 )
 
 const (
-	sessionHeader      = "Mcp-Session-Id"
-	mcpProtocolVersion = "2025-11-25"
-	serverName         = "mock-mcp-server"
-	serverVersion      = "0.1.0"
+	sessionHeader = "Mcp-Session-Id"
+	serverName    = "mock-mcp-server"
+	serverVersion = "0.1.0"
 )
 
 // rpcMsg is a JSON-RPC 2.0 envelope.
@@ -147,22 +147,22 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Gate on isRequest(): an initialize *notification* (no id) must not allocate a
-	// session, or an invalid notification would leak one resident session each time.
-	if msg.Method == "initialize" && msg.isRequest() {
-		sid := newSessionID()
-		s.mu.Lock()
-		s.sessions[sid] = struct{}{}
-		s.mu.Unlock()
-		w.Header().Set(sessionHeader, sid)
-		writeResult(w, msg.ID, map[string]interface{}{
-			"protocolVersion": mcpProtocolVersion,
-			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
-			"serverInfo": map[string]interface{}{
-				"name":    serverName,
-				"version": serverVersion,
-			},
-		})
+	// Gate on isRequest(): an opener *notification* (no id) must not allocate a session,
+	// or an invalid notification would leak one resident session each time.
+	if msg.Method == openerMethod() && msg.isRequest() {
+		if !declarationOK(w, msg) {
+			return
+		}
+		// Only the handshake revision carries a protocol session; the declaring revision
+		// removed it, so serving that one allocates nothing and returns no header.
+		if sessionsRequired() {
+			sid := newSessionID()
+			s.mu.Lock()
+			s.sessions[sid] = struct{}{}
+			s.mu.Unlock()
+			w.Header().Set(sessionHeader, sid)
+		}
+		writeResult(w, msg.ID, openerResult())
 		return
 	}
 
@@ -177,23 +177,37 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sid := r.Header.Get(sessionHeader)
-	if sid == "" {
-		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
-		return
-	}
-	s.mu.RLock()
-	_, ok := s.sessions[sid]
-	s.mu.RUnlock()
-	if !ok {
-		http.Error(w, "session not found", http.StatusNotFound)
-		return
+	if sessionsRequired() {
+		sid := r.Header.Get(sessionHeader)
+		if sid == "" {
+			http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
+			return
+		}
+		s.mu.RLock()
+		_, ok := s.sessions[sid]
+		s.mu.RUnlock()
+		if !ok {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
 	}
 
+	// Per SERVED method, never before the switch. A method this revision does not have —
+	// the other revision's opener above all — must reach the -32601 default, which is the
+	// answer that says "absent" rather than "malformed". Checking first answered a bare
+	// `initialize` -32600, which is exactly what an unpinned eunox leg sends and exactly the
+	// negative its startup diagnostic keys on, so the boundary this mock exists to show was
+	// unobservable through it.
 	switch msg.Method {
 	case "tools/list":
+		if !declarationOK(w, msg) {
+			return
+		}
 		s.handleToolsList(w, msg)
 	case "tools/call":
+		if !declarationOK(w, msg) {
+			return
+		}
 		s.handleToolsCall(w, msg)
 	default:
 		writeRPCError(w, msg.ID, -32601, "method not found: "+msg.Method)
@@ -256,7 +270,7 @@ var toolList = []toolDef{
 }
 
 func (s *server) handleToolsList(w http.ResponseWriter, msg rpcMsg) { //nolint:gocritic // hugeParam: rpcMsg passed by value intentionally (mirrors cmd/eunox convention)
-	writeResult(w, msg.ID, map[string]interface{}{"tools": toolList})
+	writeResult(w, msg.ID, withListCaching(map[string]interface{}{"tools": toolList}))
 }
 
 // requiredStringArgs is checked because dispatchTool substitutes empty strings
@@ -309,12 +323,12 @@ func (s *server) handleToolsCall(w http.ResponseWriter, msg rpcMsg) { //nolint:g
 		return
 	}
 
-	writeResult(w, msg.ID, map[string]interface{}{
+	writeResult(w, msg.ID, withResultShape(map[string]interface{}{
 		"content": []map[string]interface{}{
 			{"type": "text", "text": text},
 		},
 		"isError": false,
-	})
+	}))
 }
 
 // dispatchTool returns the fake response text for the named tool, or "" if
@@ -361,6 +375,17 @@ func writeResult(w http.ResponseWriter, id *json.RawMessage, result interface{})
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// declarationOK writes the refusal and reports false when msg does not carry the
+// per-request protocol declaration the served revision requires. Only ever called for a
+// method this revision SERVES; see the switch in handlePost for why that ordering matters.
+func declarationOK(w http.ResponseWriter, msg rpcMsg) bool { //nolint:gocritic // hugeParam: rpcMsg passed by value intentionally (mirrors the rest of this file)
+	if errMsg := checkDeclaration(msg.Params); errMsg != "" {
+		writeRPCError(w, msg.ID, -32600, errMsg)
+		return false
+	}
+	return true
+}
+
 func writeRPCError(w http.ResponseWriter, id *json.RawMessage, code int, message string) {
 	resp := rpcMsg{
 		JSONRPC: "2.0",
@@ -372,12 +397,21 @@ func writeRPCError(w http.ResponseWriter, id *json.RawMessage, code int, message
 }
 
 func main() {
+	revision := flag.String("protocol-version", revisionHandshake,
+		"MCP protocol revision to serve ("+revisionHandshake+" or "+revisionDeclaring+")")
+	flag.Parse()
+	parsed, err := parseProtocolRevision(*revision)
+	if err != nil {
+		log.Fatalf("%s: %v", serverName, err)
+	}
+	protocolRevision = parsed
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("mock-mcp-server listening on :%s", port)               //nolint:gosec // G706: port is an env var used only for logging, not a command string
-	if err := http.ListenAndServe(":"+port, newServer()); err != nil { //nolint:gosec // G114: demo server; no timeout required
+	log.Printf("mock-mcp-server listening on :%s, serving MCP %s", port, protocolRevision) //nolint:gosec // G706: port is an env var used only for logging, not a command string
+	if err := http.ListenAndServe(":"+port, newServer()); err != nil {                     //nolint:gosec // G114: demo server; no timeout required
 		log.Fatalf("mock-mcp-server: %v", err)
 	}
 }

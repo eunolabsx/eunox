@@ -1019,7 +1019,7 @@ func TestOpenerResult_BoundsTheUpstreamsOwnRejection(t *testing.T) {
 	t.Parallel()
 
 	hostile := "\x1b[2Jrejected\n[eunox] ALL CLEAR\u2028forged" + strings.Repeat("B", 8<<10)
-	_, err := openerResult(mcp.MethodInitialize, mcp.RPCMsg{
+	_, err := openerResult(capability.Revision20251125, mcp.MethodInitialize, mcp.RPCMsg{
 		JSONRPC: "2.0",
 		ID:      mcp.RawJSON("1"),
 		Error:   &mcp.RPCError{Code: -32000, Message: hostile},

@@ -9,15 +9,15 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
 )
 
 const (
-	mcpProtocolVersion = "2025-11-25"
-	serverName         = "mock-mcp-server-stdio"
-	serverVersion      = "0.1.0"
+	serverName    = "mock-mcp-server-stdio"
+	serverVersion = "0.1.0"
 )
 
 type rpcMsg struct {
@@ -172,18 +172,26 @@ func handle(msg rpcMsg) { //nolint:gocritic // hugeParam: rpcMsg passed by value
 	case msg.isNotification():
 		// Must precede the method branches: an id-less "initialize" is a notification
 		// and gets no response (JSON-RPC servers must never reply to notifications).
-	case msg.Method == "initialize":
-		writeResult(msg.ID, map[string]interface{}{
-			"protocolVersion": mcpProtocolVersion,
-			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
-			"serverInfo": map[string]interface{}{
-				"name":    serverName,
-				"version": serverVersion,
-			},
-		})
+	case msg.Method == openerMethod():
+		// The opener is exempt from the declaration check on the handshake revision only,
+		// where it IS the negotiation. On the declaring revision it is an ordinary request
+		// and carries its declaration like any other, so the check runs below.
+		if errMsg := checkDeclaration(msg.Params); errMsg != "" {
+			writeError(msg.ID, -32600, errMsg)
+			return
+		}
+		writeResult(msg.ID, openerResult())
 	case msg.Method == "tools/list":
-		writeResult(msg.ID, map[string]interface{}{"tools": toolList})
+		if errMsg := checkDeclaration(msg.Params); errMsg != "" {
+			writeError(msg.ID, -32600, errMsg)
+			return
+		}
+		writeResult(msg.ID, withListCaching(map[string]interface{}{"tools": toolList}))
 	case msg.Method == "tools/call":
+		if errMsg := checkDeclaration(msg.Params); errMsg != "" {
+			writeError(msg.ID, -32600, errMsg)
+			return
+		}
 		var params struct {
 			Name      string                 `json:"name"`
 			Arguments map[string]interface{} `json:"arguments"`
@@ -204,12 +212,12 @@ func handle(msg rpcMsg) { //nolint:gocritic // hugeParam: rpcMsg passed by value
 			writeError(msg.ID, -32602, "unknown tool: "+params.Name)
 			return
 		}
-		writeResult(msg.ID, map[string]interface{}{
+		writeResult(msg.ID, withResultShape(map[string]interface{}{
 			"content": []map[string]interface{}{
 				{"type": "text", "text": text},
 			},
 			"isError": false,
-		})
+		}))
 	default:
 		if msg.isRequest() {
 			writeError(msg.ID, -32601, "method not found: "+msg.Method)
@@ -218,6 +226,16 @@ func handle(msg rpcMsg) { //nolint:gocritic // hugeParam: rpcMsg passed by value
 }
 
 func main() {
+	revision := flag.String("protocol-version", revisionHandshake,
+		"MCP protocol revision to serve ("+revisionHandshake+" or "+revisionDeclaring+")")
+	flag.Parse()
+	parsed, err := parseProtocolRevision(*revision)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", serverName, err)
+		os.Exit(2)
+	}
+	protocolRevision = parsed
+
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 4<<20), 4<<20)
 	for scanner.Scan() {

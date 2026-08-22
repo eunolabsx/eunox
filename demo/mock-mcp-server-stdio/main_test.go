@@ -191,8 +191,8 @@ func TestHandle_Initialize(t *testing.T) {
 	if err := json.Unmarshal(out.Result, &result); err != nil {
 		t.Fatalf("parsing initialize result: %v", err)
 	}
-	if result.ProtocolVersion != mcpProtocolVersion {
-		t.Errorf("protocolVersion: want %q, got %q", mcpProtocolVersion, result.ProtocolVersion)
+	if result.ProtocolVersion != revisionHandshake {
+		t.Errorf("protocolVersion: want %q, got %q", revisionHandshake, result.ProtocolVersion)
 	}
 	if result.ServerInfo.Name != serverName {
 		t.Errorf("serverInfo.name: want %q, got %q", serverName, result.ServerInfo.Name)

@@ -37,6 +37,13 @@ var ErrParse = errors.New("mcp: malformed JSON-RPC message")
 // consumer), and every caller outside it wants the fail-closed DecodeParams error unchanged.
 var errDuplicateObjectKey = errors.New("duplicate object key")
 
+// CodeMethodNotFound is the standard JSON-RPC 2.0 error code for a method the callee does
+// not implement. Unlike the JSONRPCCode* set in pkg/capability, which spells the codes eunox
+// PRODUCES from its own denial vocabulary, this is one eunox READS off a peer's answer — the
+// one negative that distinguishes "this upstream does not have that method" from every other
+// way an open can fail.
+const CodeMethodNotFound = -32601
+
 // RPCMsg is a JSON-RPC 2.0 message — a request, response, or notification depending on
 // which fields are populated.
 //

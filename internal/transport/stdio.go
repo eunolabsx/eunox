@@ -453,7 +453,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// without this watchdog Start hangs indefinitely until an operator signals it.
 	if err := p.runBoundedStartup(ctx, func() error {
 		if err := p.initUpstream(ctx); err != nil {
-			return fmt.Errorf("upstream initialize: %w", err)
+			return wrapUpstreamOpenFailure(p.upstreamRev, err)
 		}
 		if p.driftCheck != nil {
 			raw, probeErr := p.fetchUpstreamToolsRaw(ctx)

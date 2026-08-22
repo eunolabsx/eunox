@@ -115,6 +115,14 @@ jobs:
         # enforcement assertions and validates audit log HMAC signatures.
         # No Docker required.
 
+      - name: Run stateless (2026-07-28) integration tests
+        run: make -C demo ci-test-stateless
+        # The same walkthrough over a leg opened with server/discover: the same
+        # policy decisions, the filtered list's cacheScope clamp, the revision
+        # stamp on every record, and the startup diagnostic an unpinned leg gets
+        # against a single-revision upstream. Stdio only — an HTTP session is
+        # opened by initialize, which that revision does not have.
+
   # ── demo: flow + effect determinism gates ─────────────────────────────────
   # The two headline demos' acceptance bar: each runs its scenario 20 times and
   # requires a byte-identical normalized decision sequence and an HMAC-verified

@@ -11,6 +11,7 @@
 
 .PHONY: up up-jwt down allow deny deny-path deny-op audit jwt jwt-allow jwt-deny logs ci-test ci-test-jwt \
         stdio-allow stdio-deny stdio-deny-path stdio-deny-op ci-test-stdio flow-exfil ci-test-flow \
+        stateless-allow stateless-deny stateless-deny-path stateless-list stateless-audit ci-test-stateless \
         effect-escalate ci-test-effect \
         gateway-up gateway-down gw-files-allow gw-files-deny gw-db-allow gw-db-deny gw-cross-deny gw-404 \
         gateway-audit ci-test-gateway ci-test-e2e e2e trifecta trifecta-audit help
@@ -263,6 +264,58 @@ stdio-deny-op:
 ci-test-stdio:
 	@mkdir -p "$(DEMO_DIR)audit"
 	@bash "$(DEMO_DIR)scripts/ci-test-stdio.sh"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stateless demo — the same walkthrough against a 2026-07-28 upstream
+#
+# The 2026-07-28 revision removed the `initialize` handshake and the protocol
+# session: `server/discover` opens the leg and every request declares its own
+# protocol version in `params._meta`. These targets run the allow/deny walkthrough
+# against a mock pinned to that revision, so the policy decisions are demonstrably
+# the same ones across a revision change.
+#
+# Stdio only. An HTTP session is opened by `initialize`, which this revision does
+# not have, so eunox refuses a 2026-07-28 pin over the HTTP host transport. The
+# Docker targets gain their stateless variant when session creation stops being
+# anchored on the handshake.
+# ─────────────────────────────────────────────────────────────────────────────
+
+## stateless-allow: [2026-07-28] read_file /reports/q3.pdf → permitted by manifest.
+stateless-allow:
+	@mkdir -p "$(DEMO_DIR)audit"
+	@echo ">>> [2026-07-28] read_file /reports/q3.pdf  [expect: ALLOWED]"
+	@bash "$(DEMO_DIR)scripts/mcp-call-stateless.sh" \
+	  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"},"name":"read_file","arguments":{"path":"/reports/q3.pdf"}}}'
+
+## stateless-deny: [2026-07-28] write_file → absent from manifest, denied by default.
+stateless-deny:
+	@mkdir -p "$(DEMO_DIR)audit"
+	@echo ">>> [2026-07-28] write_file /etc/passwd  [expect: DENIED — not in manifest]"
+	@bash "$(DEMO_DIR)scripts/mcp-call-stateless.sh" \
+	  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"},"name":"write_file","arguments":{"path":"/etc/passwd","content":"hacked"}}}'
+
+## stateless-deny-path: [2026-07-28] read_file outside /reports/ → denied by allowedValues.
+stateless-deny-path:
+	@mkdir -p "$(DEMO_DIR)audit"
+	@echo ">>> [2026-07-28] read_file /etc/shadow  [expect: DENIED — path not in /reports/*]"
+	@bash "$(DEMO_DIR)scripts/mcp-call-stateless.sh" \
+	  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"},"name":"read_file","arguments":{"path":"/etc/shadow"}}}'
+
+## stateless-list: [2026-07-28] tools/list → filtered catalog, and cacheScope clamped to private.
+stateless-list:
+	@mkdir -p "$(DEMO_DIR)audit"
+	@echo ">>> [2026-07-28] tools/list  [expect: write_file filtered out; cacheScope clamped public -> private]"
+	@bash "$(DEMO_DIR)scripts/mcp-call-stateless.sh" \
+	  '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}'
+
+## stateless-audit: tail the audit tape, projecting the revision each decision was made under.
+stateless-audit:
+	@tail -f "$(DEMO_DIR)audit/audit.jsonl" | jq '{time, protocol_revision, method, target, decision, denial_code}'
+
+## ci-test-stateless: Run the stateless walkthrough as a test (no Docker; requires go + jq).
+ci-test-stateless:
+	@mkdir -p "$(DEMO_DIR)audit"
+	@bash "$(DEMO_DIR)scripts/ci-test-stateless.sh"
 
 ## flow-exfil: Demo (a) — within-scope exfil blocked by source->sink flow policy (no Docker; go + python3).
 flow-exfil:

@@ -261,7 +261,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		// A partial initialize may already have captured the upstream session ID, so
 		// close so the bounded DELETE terminates it instead of leaking it.
 		sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: the upstream session-termination DELETE intentionally uses a detached, bounded background context — close/reaper/signal/shutdown carry no request context.
-		return nil, fmt.Errorf("upstream initialize: %w", err)
+		return nil, wrapUpstreamOpenFailure(sess.upstreamRev, err)
 	}
 
 	// Register before starting any goroutine that might close the session: a fast close
