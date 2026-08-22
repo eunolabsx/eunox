@@ -78,15 +78,28 @@ both sides of the comparison are toolchain names.
 
 ## Register of non-called findings
 
-Every finding `govulncheck` reports that the gate does not fail on. A finding leaves this
-table only when it stops being reported.
+Every advisory the gate does not fail on, and what was decided about it. A line leaves
+this register only when the advisory no longer applies to the tree at all.
 
-### Open
+**Current state: the scan reports nothing.** As of the run that landed this file,
+`govulncheck ./...` against `go1.26.6` returns 0 in all three buckets — no called
+finding, no toolchain finding, nothing at `required` or `imported` level. The entries
+below are therefore a record of advisories that were *reachable in the module graph* and
+what was concluded about each, not a list of things the scan is currently printing.
 
-| Advisory | Module | Level | Disposition |
-| --- | --- | --- | --- |
-| [GO-2026-6179](https://pkg.go.dev/vuln/GO-2026-6179) | `golang.org/x/mod@v0.21.0` | required, not imported | **Not applicable — recorded.** See below. |
-| [GO-2026-6180](https://pkg.go.dev/vuln/GO-2026-6180) | `golang.org/x/mod@v0.21.0` | required, not imported | **Not applicable — recorded.** See below. |
+### Recorded — reachable in the module graph, not reported by the scan
+
+| Advisory | Module | Disposition |
+| --- | --- | --- |
+| [GO-2026-6179](https://pkg.go.dev/vuln/GO-2026-6179) | `golang.org/x/mod@v0.21.0` | **Not applicable — recorded.** See below. |
+| [GO-2026-6180](https://pkg.go.dev/vuln/GO-2026-6180) | `golang.org/x/mod@v0.21.0` | **Not applicable — recorded.** See below. |
+
+These two are visible when the full module graph is walked (`go list -m all` selects
+`x/mod v0.21.0`), which is how they were found. `govulncheck ./...` does **not** report
+them: the scan covers the modules providing packages it loads, and no package from
+`x/mod` is loaded, so they do not appear even at `required` level. They are recorded here
+anyway — a graph walk is a reasonable thing for someone to run, and finding two unexplained
+advisories with no written disposition is exactly the gap this register closes.
 
 **GO-2026-6179** (transparency-log tile verification bypass in `x/mod/sumdb/tlog`) and
 **GO-2026-6180** (unauthenticated hashes accepted by `x/mod/sumdb`'s `Client.Lookup`) are
@@ -116,8 +129,12 @@ scan re-reports them at the new level, and the resolution then is a real bump.
 | --- | --- | --- | --- |
 | [GO-2026-5942](https://pkg.go.dev/vuln/GO-2026-5942) | `stdlib@go1.26.5` (`net`) | imported, not called | Fixed in `go1.26.6`; closed by the toolchain pin bump. |
 
-This is the "1 vulnerability in an imported package" recorded alongside the five called
-stdlib advisories that made the scan red. The vulnerable symbols are
+This is the best identification of the "1 vulnerability in an imported package" recorded
+alongside the five called stdlib advisories that made the scan red. It is a
+reconstruction, not a transcript — the original scan output was not kept, and it is
+reached by elimination: of the stdlib advisories open against `go1.26.5`, it is the one
+whose package is in the import graph while its symbols are not called. Either way the
+disposition is the same, because the toolchain bump carries the fix. The vulnerable symbols are
 `net.LookupCNAME` / `Resolver.LookupCNAME`; `net` is in the import graph (transitively,
 via `net/http`) but nothing resolves a CNAME, so it never reached `called`. The Go pin
 moved to 1.26.6, which carries the fix, and it is no longer reported.
