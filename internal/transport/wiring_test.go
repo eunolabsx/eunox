@@ -10,7 +10,9 @@ package transport
 import (
 	"fmt"
 	"io"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -98,7 +100,7 @@ func TestWiring_GuardCoversEveryInterfaceOption(t *testing.T) {
 	t.Parallel()
 	for _, opts := range []any{HTTPGatewayOptions{}, StdioProxyOptions{}} {
 		ty := reflect.TypeOf(opts)
-		interfaces := interfaceOptionSetters(ty, ty.Name())
+		interfaces := interfaceOptionSetters(ty, ty.Name(), map[reflect.Type]bool{})
 		require.NotEmpty(t, interfaces, "%s declares no interface fields, so this guard would pass vacuously", ty.Name())
 		for path, fill := range interfaces {
 			stand, named := typedNilOptions[path]
@@ -125,8 +127,19 @@ type optionSetter func(dst reflect.Value, val reflect.Value)
 // purpose, so the test asks about exactly the set the guard covers: a container of interfaces added
 // to either options struct shows up here and demands a stand-in, which is the property a paths-only
 // walk over FIELDS did not have.
-func interfaceOptionSetters(ty reflect.Type, path string) map[string]optionSetter {
+//
+// The visited set is scoped to the current recursion, as pointerElementContainerPaths' is, and for
+// the reason cyclicOptions pins as legal: this walks the TYPE graph, which a container may close a
+// cycle in. The guard's own containerSeen is no help here — it bounds a VALUE walk — so without
+// this a self-referential container option would hang the completeness test rather than fail it.
+func interfaceOptionSetters(ty reflect.Type, path string, walking map[reflect.Type]bool) map[string]optionSetter {
 	out := map[string]optionSetter{}
+	if walking[ty] {
+		return out
+	}
+	walking[ty] = true
+	defer delete(walking, ty)
+
 	switch ty.Kind() {
 	case reflect.Interface:
 		out[path] = func(dst, val reflect.Value) { dst.Set(val) }
@@ -139,12 +152,12 @@ func interfaceOptionSetters(ty reflect.Type, path string) map[string]optionSette
 			if !field.IsExported() {
 				continue
 			}
-			for nested, inner := range interfaceOptionSetters(field.Type, path+"."+field.Name) {
+			for nested, inner := range interfaceOptionSetters(field.Type, path+"."+field.Name, walking) {
 				out[nested] = func(dst, val reflect.Value) { inner(dst.Field(i), val) }
 			}
 		}
 	case reflect.Slice:
-		for nested, inner := range interfaceOptionSetters(ty.Elem(), path+"[0]") {
+		for nested, inner := range interfaceOptionSetters(ty.Elem(), path+"[0]", walking) {
 			out[nested] = func(dst, val reflect.Value) {
 				dst.Set(reflect.MakeSlice(ty, 1, 1))
 				inner(dst.Index(0), val)
@@ -154,12 +167,12 @@ func interfaceOptionSetters(ty reflect.Type, path string) map[string]optionSette
 		if ty.Len() == 0 {
 			break
 		}
-		for nested, inner := range interfaceOptionSetters(ty.Elem(), path+"[0]") {
+		for nested, inner := range interfaceOptionSetters(ty.Elem(), path+"[0]", walking) {
 			out[nested] = func(dst, val reflect.Value) { inner(dst.Index(0), val) }
 		}
 	case reflect.Map:
 		key := reflect.New(ty.Key()).Elem()
-		for nested, inner := range interfaceOptionSetters(ty.Elem(), mapElemPath(path, key)) {
+		for nested, inner := range interfaceOptionSetters(ty.Elem(), mapElemPath(path, key), walking) {
 			out[nested] = func(dst, val reflect.Value) {
 				elem := reflect.New(ty.Elem()).Elem()
 				inner(elem, val)
@@ -232,6 +245,35 @@ func TestWiring_UnreadableFieldsAreNotTheGuardsSubject(t *testing.T) {
 	// where this package hands it over instead (requireUsable), the way a route's PDP is.
 	assert.Panics(t, func() { requireUsable("X.hidden", deadWriter) },
 		"the seam that hands an in-package subsystem over is what covers what the walk cannot read")
+}
+
+// aliasedContainerOptions is one container reached through two fields, only one of them exported —
+// an ordinary shape once a container option exists (an unexported index beside the map a caller
+// populates).
+type aliasedContainerOptions struct {
+	hidden map[string]io.Writer
+	Shown  map[string]io.Writer
+}
+
+// TestWiring_AnUnreadableAliasDoesNotConsumeItsContainer pins that the skip happens BEFORE the
+// container is recorded.
+//
+// Entering a container records it, and reflect's read-only flag propagates, so walking the
+// unreadable alias first consumed the key and turned the exported alias into a repeat visit — every
+// element skipped, nothing refused. Whether the caller's own wiring was checked at all then came
+// down to field declaration ORDER, which is not a rule anyone could follow.
+func TestWiring_AnUnreadableAliasDoesNotConsumeItsContainer(t *testing.T) {
+	t.Parallel()
+	var deadWriter *strings.Builder
+
+	shared := map[string]io.Writer{"a": deadWriter}
+	opts := aliasedContainerOptions{hidden: shared, Shown: shared}
+	require.False(t, reflect.ValueOf(opts).Field(0).CanInterface(),
+		"the premise: the unexported alias is read-only, and it is declared first")
+
+	assert.PanicsWithValue(t, wiringFault(`aliasedContainerOptions.Shown["a"]`, reflect.TypeOf(deadWriter)),
+		func() { requireUsableOptions(opts) },
+		"the exported alias is caller-supplied wiring whatever an unexported field beside it aliases")
 }
 
 // TestWiring_TheGuardStopsAtAPointer pins the OTHER side of the descent, which is a decision rather
@@ -348,6 +390,20 @@ func TestWiring_GuardTerminatesOnACyclicContainer(t *testing.T) {
 	assert.PanicsWithValue(t, wiringFault("cyclicOptions.Kids[0].Stderr", reflect.TypeOf(deadWriter)),
 		func() { requireUsableOptions(cyclicOptions{Kids: kids}) },
 		"and the wiring inside that cycle is still this guard's subject")
+}
+
+// TestWiring_TheCoverageMirrorTerminatesOnACyclicType pins the completeness test's own walk against
+// the shape cyclicOptions makes legal. It recurses the TYPE graph, which the guard's value-level
+// containerSeen does not bound, so a self-referential container option would hang this suite rather
+// than fail it — a test that never finishes reports nothing at all.
+func TestWiring_TheCoverageMirrorTerminatesOnACyclicType(t *testing.T) {
+	t.Parallel()
+	ty := reflect.TypeOf(cyclicOptions{})
+	setters := interfaceOptionSetters(ty, ty.Name(), map[reflect.Type]bool{})
+
+	assert.Equal(t, []string{"cyclicOptions.Stderr"}, slices.Sorted(maps.Keys(setters)),
+		"pruning a non-simple path loses no interface: every one reachable in the type graph is "+
+			"reachable without re-entering a cycle, and it is the PATH that carries the stand-in")
 }
 
 // containersClosedAtTheirSeam names every option field holding a container the walk deliberately

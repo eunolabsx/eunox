@@ -118,7 +118,26 @@ func requireUsableFields(path string, v reflect.Value, seen containerSeen) {
 
 // requireUsableValue is one node of that walk: it refuses a typed-nil interface and otherwise
 // descends, with a kind this guard does not look through falling through to a no-op.
+//
+// An UNREADABLE node stops the walk here rather than at the interface leaf under it, which is the
+// same verdict reached one step earlier and is load-bearing for the container case. reflect's
+// read-only flag PROPAGATES, so every leaf below an unexported name is skipped anyway and
+// descending could only ever refuse nothing — but entering a container RECORDS it in seen, and two
+// fields may alias one map or slice with only one of them exported. Walking the unreadable alias
+// first therefore consumed the key and made the exported one a repeat visit, so whether the
+// caller's wiring was checked at all came down to field declaration ORDER.
+//
+// It is a SKIP and not a refusal, which is the older half of the same rule: an exported interface
+// inside an unexported block is unreadable too, so refusing would fire on valid wiring while naming
+// a field that is already exported — and a shared nested options block is precisely the refactor
+// the descent exists to support. What this guard refuses is wiring a CALLER handed over, and a
+// field an outside caller cannot even SET is not that; this package's own is answered where it is
+// made instead, through requireUsable at the seam that hands the value over (a route's PDP is the
+// live example).
 func requireUsableValue(path string, v reflect.Value, seen containerSeen) {
+	if !v.CanInterface() {
+		return
+	}
 	switch v.Kind() {
 	case reflect.Struct:
 		requireUsableFields(path, v, seen)
@@ -143,20 +162,6 @@ func requireUsableValue(path string, v reflect.Value, seen containerSeen) {
 			// A nil interface is ABSENT, which is the caller's own business: every constructor
 			// here already decides what an omitted subsystem means (a deny-all PDP, an in-memory
 			// kill switch, os.Stderr), and those decisions are deliberate.
-			return
-		}
-		if !v.CanInterface() {
-			// Not caller-supplied wiring, which is this guard's whole subject. reflect's read-only
-			// flag marks exactly the values unreachable through exported names, and a field an
-			// outside caller cannot even SET is not one they can hand a typed nil to; this
-			// package's own wiring is answered where it is made instead, through requireUsable at
-			// the seam that hands the value over (a route's PDP is the live example).
-			//
-			// REFUSING here was the first shape and is wrong in the direction that matters: the
-			// read-only flag PROPAGATES, so an EXPORTED interface inside an unexported block is
-			// unreadable too — the refusal would fire on valid wiring while naming a field that is
-			// already exported, and the nested block is precisely the refactor the descent above
-			// exists to support.
 			return
 		}
 		if !capability.IsTypedNil(v.Interface()) {
@@ -190,9 +195,9 @@ func (s containerSeen) firstVisit(v reflect.Value) bool {
 }
 
 // mapElemPath names one map entry the way the hand-written seam checks already do
-// (`Routes["a"]`), so a path in a refusal reads the same wherever it was produced. The key is
-// formatted through reflect rather than Interface() because a map under an unexported name is
-// read-only, and a path that cannot be printed is the diagnosis-free panic this file replaces.
+// (`Routes["a"]`), so a path in a refusal reads the same wherever it was produced. A string key is
+// quoted for that reason; anything else is left to fmt, which renders the value a reflect.Value
+// holds rather than the reflect.Value itself.
 func mapElemPath(path string, key reflect.Value) string {
 	if key.Kind() == reflect.String {
 		return fmt.Sprintf("%s[%q]", path, key.String())
