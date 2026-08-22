@@ -119,11 +119,20 @@ func TestEffectGrammarRejections(t *testing.T) {
 			wantErr: "decides nothing",
 		},
 		{
-			// Matching is case-insensitive after trimming, so two keys that fold together
-			// would leave which row wins to map iteration order — a nondeterministic
-			// effect class, which is disqualifying for a determinism claim.
+			// Matching trims and folds case, so two keys that fold together would leave
+			// which row wins to the matcher's tiebreak — the smallest key by byte order,
+			// which can be the weaker row — rather than to the author.
 			name:    "a byArgument table whose cases collide under case folding",
 			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: q\n        cases:\n          DROP: {class: irreversible}\n          drop: {class: reversible}\n",
+			wantErr: "match the same argument value",
+		},
+		{
+			// U+017F LATIN SMALL LETTER LONG S is already lower case, so a ToLower-based
+			// dedup at load saw two distinct keys while the runtime matcher's EqualFold
+			// matches both against "SELECT" — the same manifest an operator can copy
+			// verbatim out of a reviewed contract corpus.
+			name:    "a byArgument table whose cases collide only under the matcher's fold",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: q\n        cases:\n          select: {class: irreversible}\n          \u017felect: {class: reversible}\n",
 			wantErr: "match the same argument value",
 		},
 		{
