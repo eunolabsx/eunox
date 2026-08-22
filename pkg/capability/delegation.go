@@ -728,9 +728,11 @@ func ValidateDelegationChain(actors []string, grants []DelegationGrant) (*Delega
 	// allowLabels entry, an invalid maxEffectClass) each grant nothing, so re-asserting is what
 	// makes them loud rather than merely inert.
 	//
-	// Written into a COPY: the caller keeps ownership of the slice it passed, and the chain the
-	// decision path shares read-only across every request on the token must not be reachable
-	// for mutation through it.
+	// Written into a COPY of the SLICE: the caller keeps ownership of the one it passed, so no
+	// grant can be appended to or replaced in the chain the decision path shares read-only
+	// across every request on the token. The copy is shallow — normalize rebuilds Targets and
+	// RedactFields, but Labels/AllowLabels stay aliased to the caller's backing arrays — so what
+	// it bounds is reachability through the SLICE, not every field of a grant in it.
 	grants = normalizedGrants(grants)
 	for i := range grants {
 		if err := grants[i].Validate(); err != nil {
