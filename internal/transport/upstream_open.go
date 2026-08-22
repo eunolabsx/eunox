@@ -19,10 +19,18 @@
 //
 // ADR-0006 also describes a PROBE for the `auto` case: open with `server/discover` and fall
 // back to `initialize` on method-not-found. That half is deliberately not activated here,
-// because it changes what every 2025-11-25 upstream sees before eunox knows anything about it,
-// and the interop matrix that would arbitrate the change does not exist. Selecting the opener
-// from the pin needs neither: an operator who writes `protocolVersion: "2026-07-28"` has stated
-// the fact the probe would have gone looking for.
+// because it changes what every 2025-11-25 upstream sees before eunox knows anything about it
+// — a `server/discover` some upstream answers with anything other than a clean -32601 (a hang,
+// a 500, a dropped connection) turns a working deployment into a failing one, and that is a
+// compatibility call ADR-0006 owns rather than this file. Selecting the opener from the pin
+// needs no probe: an operator who writes `protocolVersion: "2026-07-28"` has stated the fact
+// the probe would have gone looking for.
+//
+// What the deferral costs an operator IS carried, in the failure rather than on the wire:
+// openerMissingHint turns the -32601 the probe would have caught into the remedy that closes
+// it, so the one negative the probe exists to resolve names the pin instead of leaving the
+// operator to work it out. That is a diagnostic; it sends no byte an upstream did not already
+// receive, so it needs no ADR.
 
 package transport
 
@@ -30,6 +38,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -308,21 +317,78 @@ type UpstreamHandshake struct {
 
 // openerResult extracts the success result bytes from an opener reply, failing closed on any
 // non-success shape rather than handing the caller a session backed by an unconfirmed
-// upstream. method names the opener in the error, since the two are told apart by nothing else
-// on this path.
+// upstream. rev names the leg's revision, and its opener the method, since the two are told
+// apart by nothing else on this path.
 //
 // The exactly-one-of-result/error shape is isMalformedResponse's, not a fourth hand-written
 // spelling of it: this is the ONLY well-formedness gate the subprocess and local-HTTP openers
 // pass (they read through awaitStartupReply, which does not run correlateUpstreamReply), so a
 // reply carrying BOTH members must be refused here rather than silently read as a rejection.
-func openerResult(method string, resp mcp.RPCMsg) (json.RawMessage, error) {
+func openerResult(rev capability.Revision, method string, resp mcp.RPCMsg) (json.RawMessage, error) {
 	if isMalformedResponse(resp) {
 		return nil, fmt.Errorf("upstream %s response carried neither result nor error (or both)", method)
 	}
 	if resp.Error != nil {
-		return nil, fmt.Errorf("upstream %s rejected: %s (code %d)", method, BoundConsoleDetail(resp.Error.Message), resp.Error.Code)
+		return nil, fmt.Errorf("upstream %s rejected: %s (code %d)%s", method,
+			BoundConsoleDetail(resp.Error.Message), resp.Error.Code, openerMissingHint(rev, resp.Error.Code))
 	}
 	return resp.Result, nil
+}
+
+// openerMissingHint returns the remedy to append to an opener rejection that says the upstream
+// does not HAVE this revision's opener, or "" for every other failure.
+//
+// This is the operator-facing half of the `auto` probe ADR-0006 describes and this build does
+// not perform. eunox will not silently open with another revision's method — that changes what
+// every existing upstream sees at session start, which is the ADR's call, not this file's — but
+// the operator hitting the exact negative the probe exists to resolve should not have to work
+// out that a pin is what closes it. A -32601 on the opener is the one upstream answer that says
+// so unambiguously: the method is absent, not failing.
+//
+// Derived from openerRegistry rather than naming the other revision, for the reason the
+// registry exists: a third published revision must appear here without this function being
+// edited, and the candidates it names are exactly the revisions whose opener is a DIFFERENT
+// method — a revision sharing this one's opener is no remedy for the opener being absent.
+func openerMissingHint(rev capability.Revision, code int) string {
+	if code != mcp.CodeMethodNotFound {
+		return ""
+	}
+	opened := UpstreamOpenRevision(rev)
+	candidates := alternativeOpenerRevisions(opened)
+	if len(candidates) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; this upstream does not implement the opener for %s. If it speaks %s, pin `protocolVersion: %q` on this upstream — eunox opens with the pinned revision's opener and does not probe for one (see docs/conformance.md)",
+		opened, strings.Join(candidates, " or "), candidates[0])
+}
+
+// alternativeOpenerRevisions returns the published revisions whose opener is a different
+// method than opened's, sorted for a stable diagnostic.
+func alternativeOpenerRevisions(opened capability.Revision) []string {
+	openedMethod := openerRegistry[opened].method
+	var out []string
+	for _, rev := range capability.PublishedRevisions() {
+		if rev == opened {
+			continue
+		}
+		if spec, ok := openerRegistry[rev]; ok && spec.method != openedMethod {
+			out = append(out, rev.String())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// wrapUpstreamOpenFailure names the leg an open failed on by the revision it was opened at,
+// rather than by a hardcoded method name.
+//
+// The three transports each wrapped this as "upstream initialize: %w", which on a leg opened
+// with server/discover produced an error naming BOTH methods and contradicting itself
+// ("upstream initialize: upstream server/discover rejected ..."). The revision is what every
+// other fact about the leg is read off (see this file's package comment), so it is what the
+// failure names too.
+func wrapUpstreamOpenFailure(rev capability.Revision, err error) error {
+	return fmt.Errorf("upstream open at %s (%s): %w", UpstreamOpenRevision(rev), openerFor(rev).method, err)
 }
 
 // ApplyUpstreamOpenerResult validates the reply to a leg opened at rev and extracts the
@@ -337,7 +403,7 @@ func openerResult(method string, resp mcp.RPCMsg) (json.RawMessage, error) {
 func ApplyUpstreamOpenerResult(rev capability.Revision, resp mcp.RPCMsg) (UpstreamHandshake, error) {
 	spec := openerFor(rev)
 	method := spec.method
-	raw, err := openerResult(method, resp)
+	raw, err := openerResult(rev, method, resp)
 	if err != nil {
 		return UpstreamHandshake{}, err
 	}

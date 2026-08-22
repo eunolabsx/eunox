@@ -27,6 +27,26 @@ Section conventions:
 
 ### Added
 
+- **`--protocol-version` on both demo mocks, and a stateless demo walkthrough.**
+  `demo/mock-mcp-server` and `demo/mock-mcp-server-stdio` each take the revision they serve
+  (`2025-11-25` or `2026-07-28`) and answer the other revision's opener `-32601`, so the
+  boundary is observable rather than a server that quietly speaks both. Serving `2026-07-28`
+  means `server/discover` opens the leg, every request must carry its own
+  `io.modelcontextprotocol/protocolVersion` declaration in `params._meta` (which is what proves
+  eunox declares on the requests it originates and forwards a host's declaration untouched),
+  results carry `resultType`, list results carry `cacheScope` and `ttlMs`, and the HTTP mock
+  mints no `Mcp-Session-Id` — the revision removed the protocol session along with the
+  handshake. The list `cacheScope` is `public` deliberately: it is the wrong answer for a
+  response the proxy filters, so a demo reading `private` off the proxy's reply is reading a
+  working clamp rather than an upstream that never said anything.
+  `make -C demo stateless-allow|stateless-deny|stateless-deny-path|stateless-list|stateless-audit`
+  runs the existing allow/deny walkthrough against the newer revision, gated in CI by
+  `ci-test-stateless`. Stdio only: an HTTP session is opened by `initialize`, so eunox already
+  refuses a `2026-07-28` pin over the HTTP host transport, and the Docker targets gain their
+  stateless variant when session creation stops being anchored on the handshake. Old-revision
+  behavior is unchanged and asserted so — both mocks emit none of the newer revision's result
+  members when serving `2025-11-25`.
+
 - **`pep` on every audit record** (signed, `omitempty`): the policy-enforcement point that
   wrote it — the protocol binding it enforces at plus the operator's name for the instance,
   stamped as `"mcp:<name>"` — set with `--audit-pep` or the gateway config's `audit.pep`.
@@ -1453,6 +1473,23 @@ Section conventions:
 
 ### Fixed
 
+- **An upstream open that fails no longer names a method eunox did not send.** All three
+  transports wrapped an open failure as `upstream initialize: %w`, so a leg opened at
+  `2026-07-28` — whose opener is `server/discover` — produced a line naming both methods and
+  contradicting itself (`upstream initialize: upstream server/discover rejected: method not
+  found: server/discover`). The failure now names the revision the leg was opened at and that
+  revision's own opener, read off the same registry every other fact about the leg comes from.
+- **A `-32601` on the opener now names the remedy.** Pointing eunox at an upstream that speaks
+  only the other revision failed at startup with the bare method-not-found and left the operator
+  to work out that a `protocolVersion` pin is what closes it. That rejection now carries the pin
+  to set, derived from the opener registry so a third published revision reaches it without an
+  edit. Only `-32601` gets the line — it is the one answer that means the method is absent
+  rather than failing, and suggesting a pin for any other rejection would send an operator the
+  wrong way. eunox still does not PROBE an upstream for its revision: that changes what every
+  existing upstream sees before eunox knows anything about it, and the decision belongs to
+  ADR-0006. This is the diagnostic that stands in for it and sends no byte an upstream did not
+  already receive.
+
 - **An `effect.byArgument` table certified unambiguous at load can no longer collide at
   runtime.** The load-time ambiguity check deduplicated case keys with `strings.ToLower` while
   the runtime matcher resolves them with `strings.EqualFold` — two different relations. They
@@ -2671,6 +2708,25 @@ Section conventions:
   session establishment forever. All four now share one helper.
 
 ### Security
+
+- **A `*/list` response eunox filtered no longer tells a shared cache it may be reused across
+  identities.** The 2026-07-28 revision adds `cacheScope` (`public`/`private`) and `ttlMs` to
+  list results. eunox narrows every list an enforced route emits to what one caller may see,
+  and preserved the upstream's sibling fields verbatim — so a pinned 2026-07-28 upstream's
+  `cacheScope: public` reached the host on a response whose contents were
+  authorization-context-specific, and a shared cache downstream of the proxy honoring it could
+  serve one identity's narrowed view to another (threat model **L-6**, whose "not yet
+  applicable" caveat predated the `protocolVersion` pin and is now corrected). Every filtered
+  response is clamped to `private`, applied at the one encoder all three filter paths reach —
+  the manifest filters, the JWT claim filter, and the JWT intersection's splice — so the
+  property holds by construction rather than by three call sites remembering it. Anything
+  other than `private` is clamped rather than only `public`: `cacheScope` is an open union, so
+  an unrecognized or non-string value is an ambiguity and the narrow reading is the only one
+  that cannot leak. `ttlMs` is preserved verbatim as a freshness hint. Two deliberate limits,
+  both stated where they are taken: the clamp never ADDS the member (2025-11-25 does not define
+  it, and old-revision output stays byte-identical), and the `--audit` wiretap passthrough keeps
+  the upstream's own scope, since it forwards a catalog identical for every caller. No
+  2025-11-25 deployment is affected — that revision has no `cacheScope`.
 
 - **A request the engine cannot anchor writes no state, on every path — not only the ones
   that reach a decision.** Under `taskAnchoredState` an authenticated caller whose token

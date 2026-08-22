@@ -394,6 +394,12 @@ func countListEntries(result json.RawMessage, fieldName string) int {
 // pass-through is stated once: each call site is a pass-through by design, not a
 // copy-paste oversight, and a fourth list method added later inherits the intent
 // (and the count) from a single place.
+//
+// It forwards the upstream bytes UNTOUCHED, `cacheScope` included, and that is the
+// deliberate exemption from the clamp encodeOrderedObjectWithList applies: this response
+// is the upstream's whole catalog, identical for every caller, so an upstream `public` is
+// a true statement about it. The clamp exists for a response whose CONTENTS depended on
+// who asked, and nothing here depended on that.
 func passThroughList(result json.RawMessage, fieldName string) ListFilterResult {
 	keys, values, err := decodeOrderedObject(result)
 	if err != nil {
@@ -2692,8 +2698,9 @@ var emptyListEnvelope = func() map[string]json.RawMessage {
 // filterListResult filters the named array field in a JSON result envelope,
 // keeping only entries for which keep returns true. The full envelope, its
 // original top-level key ORDER, and each kept entry's JSON all survive — only the
-// list field's value changes. Fails closed to {"fieldName":[]} on any
-// parse/marshal error — never the original bytes.
+// list field's value and an upstream `cacheScope` change (see clampCacheScope).
+// Fails closed to {"fieldName":[]} on any parse/marshal error — never the original
+// bytes.
 //
 // It returns a ListFilterResult carrying the pruned envelope, the surviving
 // entries pre-parsed (Entries), and the pre-filter (Upstream) and post-filter
@@ -2838,11 +2845,61 @@ func isSafeJSONKey(s string) bool {
 	return true
 }
 
+// cacheScopeKeyFolded is capability.ResultKeyCacheScope under the same fold
+// decodeOrderedObject applies to every top-level key, so a case-variant spelling is
+// clamped in the same space it was admitted in. Derived rather than written out, for
+// jsonKeyNameFolded's reason: which representative a fold orbit collapses to belongs to
+// capability.FoldJSONKey, and a hand-written spelling that stopped matching would fail
+// silently — the clamp would simply stop applying.
+var cacheScopeKeyFolded = capability.FoldJSONKey(capability.ResultKeyCacheScope)
+
+// privateCacheScope is the clamped value, marshaled once.
+var privateCacheScope = json.RawMessage(`"` + capability.CacheScopePrivate + `"`)
+
+// clampCacheScope returns the bytes to emit for one sibling field of a list envelope
+// eunox re-emitted: the original bytes for every field but `cacheScope`, and `"private"`
+// for that one unless the upstream already said so.
+//
+// Every envelope reaching the encoder is a response this proxy decided the CONTENTS of —
+// the entries are the ones this caller may see — so its cacheability is a fact about one
+// authorization context and never about the upstream's catalog. An upstream `public`
+// preserved verbatim is threat-model finding L-6: a shared cache downstream of eunox
+// honoring it serves one identity's narrowed view to another.
+//
+// Anything OTHER than `private` is clamped, not just `public`. `cacheScope` is an open
+// union like `resultType`, so an unrecognized value is an ambiguity rather than a parse
+// detail, and the only reading of an ambiguous cacheability that cannot leak is the narrow
+// one. A non-string or `null` value takes the same branch for the same reason.
+//
+// It never ADDS the member to an envelope that lacks one. The encoder has no revision in
+// scope, and 2025-11-25 has no `cacheScope` at all, so an unconditional add would put a
+// member that revision does not define on every old-revision list response — the direction
+// this repo holds byte-stable. The residual is a DECLARING upstream that omits the member
+// the spec requires of it: eunox emits no scope there either, so a cache applying its own
+// default is unconstrained. Supplying one is the synthesis half of the same work, which
+// belongs where the revision is known.
+func clampCacheScope(key string, raw json.RawMessage) json.RawMessage {
+	if capability.FoldJSONKey(key) != cacheScopeKeyFolded {
+		return raw
+	}
+	if string(raw) == string(privateCacheScope) {
+		return raw
+	}
+	return privateCacheScope
+}
+
 // encodeOrderedObjectWithList re-emits a JSON object in keys order, substituting
 // the marshaled entries array for the value of fieldName while every other field
 // keeps its original bytes verbatim. For a conformant (unique-key) object the only
-// change versus the upstream is the pruned list — field order and SIBLING fields are
-// byte-faithful.
+// changes versus the upstream are the pruned list and the `cacheScope` clamp — field
+// order and every other SIBLING field are byte-faithful.
+//
+// It is the one encoder every filter path reaches (filterListResult and
+// replaceOrderedListField are its only producers, and between them cover the manifest
+// filters, the JWT claim filter, and the JWT intersection's splice), which is why the
+// clamp is applied here rather than at each of them: the invariant that a response eunox
+// filtered never carries `cacheScope: public` then holds by construction instead of by
+// three callers remembering.
 //
 // The entries themselves are not: they are re-marshaled with json.Marshal, which
 // HTML-escapes <, > and & inside the entry bytes. Semantically identical, and the list
@@ -2896,7 +2953,7 @@ func encodeOrderedObjectWithList(keys []string, values map[string]json.RawMessag
 			buf.Write(filtered)
 			wroteField = true
 		} else {
-			buf.Write(values[k])
+			buf.Write(clampCacheScope(k, values[k]))
 		}
 	}
 	// The list field was absent from keys (e.g. a passthrough envelope that omitted

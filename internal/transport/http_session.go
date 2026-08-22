@@ -501,7 +501,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 			waitBounded(sess.handshakeStopped, sess.shutdownBudget(), "upstream handshake reader", sess.errOut())
 			_ = cmd.Wait()
 		}()
-		return nil, fmt.Errorf("upstream initialize: %w", err)
+		return nil, wrapUpstreamOpenFailure(sess.upstreamRev, err)
 	}
 
 	// Register before starting readUpstream: readUpstream closes sess.done on exit and the

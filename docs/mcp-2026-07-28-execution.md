@@ -333,7 +333,11 @@ Scope:
 - Clamp `cacheScope` to `private` on any response eunox filtered — never preserve
   an upstream `public`; set it when a translated old-upstream response lacks it;
   preserve `ttlMs` as a freshness hint. Lands in `internal/pdp`'s
-  `filterListResult` path. Closes threat-model finding L-6.
+  `filterListResult` path. Closes threat-model finding L-6. *The clamp half has
+  landed, at `encodeOrderedObjectWithList` — the one encoder all three filter paths
+  reach, so the property is structural rather than per call site. The SET half has
+  not: the filter layer holds no revision, so supplying the member where a declaring
+  upstream omitted it belongs with the `resultType` synthesis above, which does.*
 - Assertion test that filtering preserves upstream list ordering (deterministic
   ordering is a spec SHOULD that eunox must not break).
 
@@ -341,9 +345,9 @@ Exit criteria:
 
 - [ ] Sweep test: no builder emits a 2026-07-28 result without `resultType`; old-revision output byte-stable.
 - [ ] Unknown-`resultType` result refused fail-closed and recorded; absent-means-complete asserted as a separate case.
-- [ ] Property test across all filter paths: a filtered response never carries `cacheScope: public`.
+- [x] Property test across all filter paths: a filtered response never carries `cacheScope: public`. *(`internal/pdp/cache_scope_test.go`, over the manifest, JWT-claim, JWT-intersection and deny-all filters x three list flavors x every upstream spelling of the member.)*
 - [ ] Ordering-preservation test green.
-- [ ] L-6 marked mitigated in `docs/threat-model-mcp.md`.
+- [x] L-6 marked mitigated in `docs/threat-model-mcp.md` (for `*/list`; the residual and the passthrough exemption are stated there).
 
 ### W6 — Multi round-trip requests (plan §6) — XL
 
@@ -532,8 +536,17 @@ in (`internal/transport/upstream_open.go`: `UpstreamOpenRevision`,
 `cmd/eunox/live_upstream.go` so a probe cannot open a configured upstream at a
 revision the running proxy would not). What is NOT in is the FALLBACK: `auto`
 opens with `initialize` and does not probe `server/discover` first, because that
-changes what every existing 2025-11-25 upstream sees and its arbiter is W13's
-matrix. See the note under ADR-0006's upstream bullet.
+changes what every existing 2025-11-25 upstream sees and the decision belongs to
+ADR-0006. See the note under ADR-0006's upstream bullet.
+
+The DIAGNOSTIC half has landed, which is what the deferral costs an operator:
+`openerMissingHint` turns the -32601 the probe would have caught into the remedy
+that closes it, and `wrapUpstreamOpenFailure` stopped naming `initialize` on a leg
+opened with `server/discover` — all three transports hardcoded that prefix, so the
+failure line contradicted itself. It sends no byte an upstream did not already
+receive, so it needs no ADR. Asserted in
+`internal/transport/upstream_open_diagnostic_test.go` and end to end by
+`demo/scripts/ci-test-stateless.sh`.
 
 Exit criteria:
 
@@ -571,7 +584,14 @@ Scope:
 - 2026-07-28 modes for `demo/mock-mcp-server`, `demo/mock-mcp-server-stdio`,
   `demo/e2e/mock-server`, and `demo/e2e/mock-host`: discover, per-request
   `_meta`, headers, an MRTR round, `subscriptions/listen`, a tasks stub, caching
-  fields.
+  fields. *The two DEMO mocks have theirs (`--protocol-version`, each mock's own
+  `revision.go`): the per-revision opener with -32601 on the other one, the
+  per-request `_meta` declaration enforced, `resultType`, and the list caching
+  fields — with `cacheScope: "public"` volunteered deliberately, so a demo reading
+  `private` off the proxy is reading a working clamp. MRTR, `subscriptions/listen`
+  and the tasks stub are NOT there: eunox has no responder for any of them (they
+  are absent from `methodRegistry` so they deny fail-closed), so a mock serving one
+  would add no assertion. Each mock half should land with its responder.*
 - An e2e **interop matrix**: {host 2025-11-25, 2026-07-28} × {upstream
   2025-11-25, 2026-07-28}. Matched cells assert full function; mismatched cells
   assert **exactly** the ADR-0006 boundary — the translated subset works, the
@@ -583,7 +603,17 @@ Exit criteria:
 
 - [ ] Four-cell matrix runs in CI.
 - [ ] Mismatch cells assert the D1 boundary precisely (both directions).
-- [ ] Demo allow/deny/audit walkthrough works against the new-revision mock.
+- [x] Demo allow/deny/audit walkthrough works against the new-revision mock —
+      **over stdio.** `make -C demo stateless-allow|stateless-deny|stateless-deny-path|stateless-list|stateless-audit`,
+      gated in CI by `ci-test-stateless`, which asserts the same allow/deny verdicts
+      the 2025-11-25 walkthrough makes, the filtered list's `cacheScope` clamp, the
+      revision stamp on every audit record, and the startup diagnostic an unpinned
+      leg gets against a single-revision upstream.
+      The DOCKER half is not stdio's to tick and is blocked on W2: an HTTP session is
+      opened by `initialize`, so `validateHandshakelessPins` refuses a 2026-07-28 pin
+      over the HTTP host transport rather than accept a config in which every
+      forwarded request would be refused. The HTTP mock has its `--protocol-version`
+      mode and its tests, so the fixture is ready for W2 rather than waiting on it.
 
 ---
 
