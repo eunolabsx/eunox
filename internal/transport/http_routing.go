@@ -180,6 +180,135 @@ func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.Response
 	}
 }
 
+// handleSessionCreatingInitialize answers the one `initialize` that runs OUTSIDE
+// dispatchRequest: the request with no session id, which creates the session the shared
+// dispatcher needs in order to run at all.
+//
+// It is a named function for the reason the existing-session path was split out — complexity
+// bounds — and for a second one this arm alone has: it carries EIGHT ordered gates that
+// gate_order_test.go asserts on, and an order asserted by a test three files away should be
+// stated once, here, beside the code that implements it:
+//
+//  1. revision negotiation, so every refusal below records under a resolved revision and a
+//     declaration this build cannot honor is refused before anything is spawned;
+//  2. the kill switch, before any privileged side effect;
+//  3. the per-route audience pin, so a token valid only for a SIBLING route's audience
+//     cannot spin up this route's upstream and read its serverInfo;
+//  4. --require-audit=strict, since creating a session is itself a privileged side effect;
+//  5. the session-slot RESERVATION, taken pre-spawn and held across establishment;
+//  6. establishment (subprocess or remote), under the session-start budget;
+//  7. the drift check, inside establishment, which tears the session back down on a refusal;
+//  8. the response, answered directly rather than through dispatchInitialize's kill gate.
+//
+// startGen is captured ahead of all of it — see the comment at its assignment.
+//
+// Returns nothing: every exit has already written its own response.
+func (p *HTTPProxy) handleSessionCreatingInitialize(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) {
+	// Captured BEFORE the kill gate below: that gate does a kill-store round-trip that
+	// may do I/O, and a kill activating/sweeping inside that window would otherwise
+	// yield a startGen equal to the post-sweep generation, letting registerSession admit
+	// a kill-denied session that then pins a subprocess/slot until process exit (with no
+	// idle reaper configured, that leak never self-heals).
+	startGen := p.currentReapGen()
+	// Negotiate FIRST, ahead of the kill gate — dispatch.go's canonical order, which
+	// stdio applies to these same bytes: a probe declaring an unhonorable revision must
+	// record the same code on both transports, kill active or not. Also before anything
+	// privileged: creating a session spawns or contacts an upstream, and a declaration
+	// this build cannot honor (or one naming a revision that has no `initialize` at all)
+	// must be refused without that side effect. Answering initialize is itself the
+	// negotiation, so the only admissible declaration here is the revision that defines
+	// the method.
+	rev, ok := p.negotiateHostRevision(w, r, route, nil, msg)
+	if !ok {
+		return
+	}
+	// The refusals below and the establishment itself all decide under the revision just
+	// resolved; stamping it is what puts protocol_revision on their records, the same
+	// "absent means pre-negotiation" convention every dispatched record follows.
+	ctx := capability.WithProtocolRevision(r.Context(), rev)
+	// Kill-switch check BEFORE spawning anything. This is the one initialize answered
+	// outside dispatchRequest (no session/dispatchParams yet), so it repeats the kill
+	// gate dispatchRequest applies to every other locally-answered method.
+	if deny := route.pdp.CheckKill(ctx, ""); deny != nil {
+		// No session exists yet, so claimedSession is the honest subject rather than fact.
+		// Rate-limited: an unauthenticated caller reaches this record, so an unbounded
+		// write here is an audit-queue flooding primitive; a suppressed record elides
+		// only the RECORD, the request is denied either way.
+		resp := recordKillDenial(ctx, p.preSessionKillRecorder(route), deny, msg, claimedSession(r))
+		writeJSONMsg(w, resp)
+		return
+	}
+	// Per-route audience pin BEFORE spawning: a token valid only for ANOTHER route's
+	// audience (accepted by the gateway's shared union validator) must not create a
+	// session on this route. Initialize doesn't flow through the Decide*/list/sampling
+	// paths that embed the same pin, so without this gate a cross-audience token could
+	// spin up this route's upstream and read its serverInfo.
+	if denied, blocked := p.initAudienceDenial(ctx, route, msg); blocked {
+		writeJSONMsg(w, denied)
+		return
+	}
+	// --require-audit=strict: creating a session spawns/contacts an upstream — a
+	// privileged side effect — so once the audit trail has degraded, refuse new sessions
+	// fail-closed rather than run traffic that can't be fully recorded.
+	if denied, blocked := p.initStrictAuditDenial(ctx, route, msg); blocked {
+		writeJSONMsg(w, denied)
+		return
+	}
+	// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held
+	// across establishment, so concurrent initializes can't all pass a registry-only
+	// check and each spawn an upstream before any registers. The defer below drops it.
+	if !p.tryReserveSessionSlot() {
+		// Recorded for the same reason as writeSessionCreateError's errSessionLimit leg:
+		// this is its cheap pre-spawn twin, and both go through the one route-stamped
+		// helper so the two ways to hit the same cap can't produce two record shapes.
+		p.recordSessionCapDeny(ctx, r, route)
+		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
+		return
+	}
+	// Released unconditionally — success included. One owner, one release: letting
+	// registerSession convert the reservation on success instead would double-free it on
+	// any failure AFTER registration (a drift refusal is one).
+	defer p.releaseSessionSlot()
+	// Establishment runs under sessionStartTimeout, independent of --upstream-timeout.
+	// Cover the larger of the two so the write deadline can't fire mid-handshake when
+	// --upstream-timeout is below sessionStartTimeout.
+	startBudget := sessionStartTimeout
+	if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > startBudget {
+		startBudget = b
+	}
+	rearmWriteDeadlineFor(w, startBudget)
+	initCtx, initCancel := context.WithTimeout(ctx, sessionStartTimeout)
+	defer initCancel()
+
+	var (
+		sess *httpSession
+		err  error
+	)
+	// Capture before session creation: upstream-initiated sampling carries no request
+	// of its own and is evaluated against this address. Setting it after creation would
+	// race the reader goroutine.
+	clientIP := p.sourceIP(r)
+	if route.transport == "http" {
+		sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen)
+	} else {
+		sess, err = p.newSession(initCtx, route, clientIP, startGen)
+	}
+	if err != nil {
+		p.writeSessionCreateError(ctx, w, r, route, err)
+		return
+	}
+	w.Header().Set(SessionHeader, sess.id)
+	// Re-arm before the success write too, so the entry arm's claim that the actual encode
+	// always arms a fresh window holds for this arm as well: establishment may have spent
+	// the whole start budget, leaving the window armed for it exhausted at encode time.
+	rearmWriteDeadlineFor(w, startBudget)
+	// Answered directly, not through dispatchInitialize's kill gate: the global-dimension
+	// CheckKill already ran above, and the session id minted here is brand new, so it
+	// can't yet be a per-session kill target.
+	resp := sess.buildInitResponse(msg)
+	writeJSONMsg(w, resp)
+}
+
 // handleMCPPost processes a JSON-RPC request from the MCP host for the given
 // upstream route.
 func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) {
@@ -208,109 +337,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// Require msg.IsRequest(): an initialize *notification* (no id) must never start an
 	// upstream or consume a session slot — handled as a stateless notification below.
 	if msg.Method == mcp.MethodInitialize && sessionID == "" && msg.IsRequest() {
-		// Captured BEFORE the kill gate below: that gate does a kill-store round-trip that
-		// may do I/O, and a kill activating/sweeping inside that window would otherwise
-		// yield a startGen equal to the post-sweep generation, letting registerSession admit
-		// a kill-denied session that then pins a subprocess/slot until process exit (with no
-		// idle reaper configured, that leak never self-heals).
-		startGen := p.currentReapGen()
-		// Negotiate FIRST, ahead of the kill gate — dispatch.go's canonical order, which
-		// stdio applies to these same bytes: a probe declaring an unhonorable revision must
-		// record the same code on both transports, kill active or not. Also before anything
-		// privileged: creating a session spawns or contacts an upstream, and a declaration
-		// this build cannot honor (or one naming a revision that has no `initialize` at all)
-		// must be refused without that side effect. Answering initialize is itself the
-		// negotiation, so the only admissible declaration here is the revision that defines
-		// the method.
-		rev, ok := p.negotiateHostRevision(w, r, route, nil, msg)
-		if !ok {
-			return
-		}
-		// The refusals below and the establishment itself all decide under the revision just
-		// resolved; stamping it is what puts protocol_revision on their records, the same
-		// "absent means pre-negotiation" convention every dispatched record follows.
-		ctx := capability.WithProtocolRevision(r.Context(), rev)
-		// Kill-switch check BEFORE spawning anything. This is the one initialize answered
-		// outside dispatchRequest (no session/dispatchParams yet), so it repeats the kill
-		// gate dispatchRequest applies to every other locally-answered method.
-		if deny := route.pdp.CheckKill(ctx, ""); deny != nil {
-			// No session exists yet, so claimedSession is the honest subject rather than fact.
-			// Rate-limited: an unauthenticated caller reaches this record, so an unbounded
-			// write here is an audit-queue flooding primitive; a suppressed record elides
-			// only the RECORD, the request is denied either way.
-			resp := recordKillDenial(ctx, p.preSessionKillRecorder(route), deny, msg, claimedSession(r))
-			writeJSONMsg(w, resp)
-			return
-		}
-		// Per-route audience pin BEFORE spawning: a token valid only for ANOTHER route's
-		// audience (accepted by the gateway's shared union validator) must not create a
-		// session on this route. Initialize doesn't flow through the Decide*/list/sampling
-		// paths that embed the same pin, so without this gate a cross-audience token could
-		// spin up this route's upstream and read its serverInfo.
-		if denied, blocked := p.initAudienceDenial(ctx, route, msg); blocked {
-			writeJSONMsg(w, denied)
-			return
-		}
-		// --require-audit=strict: creating a session spawns/contacts an upstream — a
-		// privileged side effect — so once the audit trail has degraded, refuse new sessions
-		// fail-closed rather than run traffic that can't be fully recorded.
-		if denied, blocked := p.initStrictAuditDenial(ctx, route, msg); blocked {
-			writeJSONMsg(w, denied)
-			return
-		}
-		// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held
-		// across establishment, so concurrent initializes can't all pass a registry-only
-		// check and each spawn an upstream before any registers. The defer below drops it.
-		if !p.tryReserveSessionSlot() {
-			// Recorded for the same reason as writeSessionCreateError's errSessionLimit leg:
-			// this is its cheap pre-spawn twin, and both go through the one route-stamped
-			// helper so the two ways to hit the same cap can't produce two record shapes.
-			p.recordSessionCapDeny(ctx, r, route)
-			http.Error(w, "session limit reached", http.StatusServiceUnavailable)
-			return
-		}
-		// Released unconditionally — success included. One owner, one release: letting
-		// registerSession convert the reservation on success instead would double-free it on
-		// any failure AFTER registration (a drift refusal is one).
-		defer p.releaseSessionSlot()
-		// Establishment runs under sessionStartTimeout, independent of --upstream-timeout.
-		// Cover the larger of the two so the write deadline can't fire mid-handshake when
-		// --upstream-timeout is below sessionStartTimeout.
-		startBudget := sessionStartTimeout
-		if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > startBudget {
-			startBudget = b
-		}
-		rearmWriteDeadlineFor(w, startBudget)
-		initCtx, initCancel := context.WithTimeout(ctx, sessionStartTimeout)
-		defer initCancel()
-
-		var (
-			sess *httpSession
-			err  error
-		)
-		// Capture before session creation: upstream-initiated sampling carries no request
-		// of its own and is evaluated against this address. Setting it after creation would
-		// race the reader goroutine.
-		clientIP := p.sourceIP(r)
-		if route.transport == "http" {
-			sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen)
-		} else {
-			sess, err = p.newSession(initCtx, route, clientIP, startGen)
-		}
-		if err != nil {
-			p.writeSessionCreateError(ctx, w, r, route, err)
-			return
-		}
-		w.Header().Set(SessionHeader, sess.id)
-		// Re-arm before the success write too, so the entry arm's claim that the actual encode
-		// always arms a fresh window holds for this arm as well: establishment may have spent
-		// the whole start budget, leaving the window armed for it exhausted at encode time.
-		rearmWriteDeadlineFor(w, startBudget)
-		// Answered directly, not through dispatchInitialize's kill gate: the global-dimension
-		// CheckKill already ran above, and the session id minted here is brand new, so it
-		// can't yet be a per-session kill target.
-		resp := sess.buildInitResponse(msg)
-		writeJSONMsg(w, resp)
+		p.handleSessionCreatingInitialize(w, r, route, msg)
 		return
 	}
 
@@ -1086,6 +1113,17 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.SessionID == "" {
 		http.Error(w, "sessionId or all required", http.StatusBadRequest)
+		return
+	}
+	// Refused rather than sanitized, and refused HERE rather than at each consumer. The body is
+	// capped at maxRequestBodyBytes, so without this an id of ~4 MiB flows into the Redis key,
+	// the signed RecordAllow's details.scope, and the response echo — the rule
+	// maxClaimedSessionIDLen states for the header form of exactly this value, which is
+	// attacker-influenceable there and merely absurd here. A control-token holder is trusted to
+	// stop the proxy, not to choose how many megabytes land on the tape; and an over-length id
+	// names no session this proxy ever minted, so refusing loses nothing a kill could have done.
+	if len(body.SessionID) > maxClaimedSessionIDLen {
+		http.Error(w, "sessionId is too long to name a session", http.StatusBadRequest)
 		return
 	}
 	if err := p.ks.KillSession(r.Context(), body.SessionID); !p.killWriteLanded("session kill", err) {

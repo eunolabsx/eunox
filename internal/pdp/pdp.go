@@ -1537,8 +1537,8 @@ func (p *ManifestPDP) recordUnmatchedForwardedState(ctx context.Context, req *ca
 // tool runs, so two guarantees would otherwise be broken: a later sequenceBlock naming
 // this target Peeks an empty history and fails OPEN (RecordSessionCall closes this), and
 // a later flowLabel sink Peeks the labelOutput labels this forwarded read actually
-// carried and fails OPEN (RecordLabels closes this — the data was produced, so it must
-// be labeled). The genuine-allow path already records both inside EvaluateConditions,
+// carried and fails OPEN (the flow half of RecordSourceCall closes this — the data was
+// produced, so it must be labeled). The genuine-allow path already records both inside EvaluateConditions,
 // and an enforced deny means the tool never ran, so neither needs this — and neither
 // does a NON-DOWNGRADABLE audit-mode deny: it is NOT forwarded, so recording would attribute
 // state to a call that never ran (the bug the Downgradable check below prevents).
@@ -1551,7 +1551,7 @@ func (p *ManifestPDP) recordUnmatchedForwardedState(ctx context.Context, req *ca
 // recordSourceCall) — so a fault in either leaves NEITHER committed.
 //
 // On the downgrade the labels this forwarded read carries in and asserts out are
-// stamped back onto resp (LabelsOut from RecordLabels, CarriedLabels from a pre-write
+// stamped back onto resp (LabelsOut from RecordSourceCall, CarriedLabels from a pre-write
 // Peek) so the audit record of the forwarded observe-allow reflects the same flow the
 // genuine-allow path records inside EvaluateConditions — otherwise an audit-mode source
 // read would log with empty labels though it produced labeled data. The structural

@@ -2008,7 +2008,3 @@ func openAuditChain(cmdName, logPath string) (reader io.Reader, closeAll func(),
 	rc := audit.OpenLogChain(files)
 	return rc, func() { _ = rc.Close() }, nil
 }
-
-// -----------------------------------------------------------------
-// suggest subcommand
-// -----------------------------------------------------------------

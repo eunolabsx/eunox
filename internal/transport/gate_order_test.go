@@ -567,9 +567,10 @@ var hostMessageDispositions = map[string]int{
 var dispositionPrologue = map[string]string{
 	// Negotiates for itself, ahead of every disposition it performs — checked, not asserted:
 	// these three are the entry points whose prologue the guard actually verifies.
-	"handleMCPPost":     "",
-	"handleSessionPost": "",
-	"serveHost":         "",
+	"handleMCPPost":                   "",
+	"handleSessionCreatingInitialize": "",
+	"handleSessionPost":               "",
+	"serveHost":                       "",
 	// Reached from a serveHost that has already negotiated and stamped the context. stdio
 	// negotiates in its READ loop, on the single goroutine that owns the pin, and the handlers
 	// below run on the context it returns.

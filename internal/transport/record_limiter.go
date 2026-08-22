@@ -218,7 +218,7 @@ const perBucketFloor = 1
 // share of the per-category rate/burst (see perCategoryDenyRatePerSec). The HTTP
 // proxy's, since that transport charges nearly all of them.
 func newRefusalRecordLimiter() *categoryRecordLimiter {
-	return newRefusalRecordLimiterFor(refusalCategories...)
+	return newRefusalRecordLimiterFor(refusalCategories)
 }
 
 // newRefusalRecordLimiterFor builds buckets for the categories ONE transport actually charges.
@@ -231,7 +231,12 @@ func newRefusalRecordLimiter() *categoryRecordLimiter {
 // A category outside cats falls to the shared `unknown` bucket, which is bounded rather than
 // unbounded — the safe direction — and each transport's charged set is held to what it declares,
 // so the fallback stays unreachable.
-func newRefusalRecordLimiterFor(cats ...refusalCategory) *categoryRecordLimiter {
+//
+// A SLICE, not a variadic tail, for the reason newUpstreamRefusalLimiter's doc gives: the
+// variadic shape lets a zero-category call compile into a bucket-less table where every category
+// falls to that shared 1/s `unknown` bucket — over-throttled and cross-category elision
+// restored, silently. Both callers already hold a declared set.
+func newRefusalRecordLimiterFor(cats []refusalCategory) *categoryRecordLimiter {
 	// floorOwnBucket, even though this table has no holder of its own: a per-session table
 	// DELEGATES a category it holds no bucket for wholly upward, floor included, and for such a
 	// category this tier is where that session contends with its peers.
@@ -733,6 +738,16 @@ func (t *tieredBuckets[K]) admitWithFloor(key K, floor *reserveSlot) bucketVerdi
 		// floored write buys is a property of the BUDGET it is charged against, and this write is
 		// charged against the parent's, so re-arming it on this tier's interval would size one
 		// table's bypass by another table's argument.
+		//
+		// PRECONDITION this arm rests on, named because nothing here enforces it: a key one
+		// holder DELEGATES must not be a key a sibling holder REGISTERS and charges. This arm
+		// harvests the parent's own tally, while a registering sibling pushes its tally back at
+		// its own tier on a parent refusal — so the same refused write would be reported once by
+		// each, at two different scopes, over-stating the flood in both. It holds today because
+		// the categories a remote-upstream session delegates are precisely the ones that session
+		// kind can never charge (see remoteUpstreamRefusalCategories), which is a fact about the
+		// call sites rather than about this table.
+		// TestRefusalCategories_NoKindDelegatesWhatASiblingCharges asserts it.
 		return t.parent.admitWithFloor(key, floor)
 	}
 	if !registered {

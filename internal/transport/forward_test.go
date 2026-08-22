@@ -867,10 +867,11 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 	engine := enforcement.New(enforcement.WithCallCounter(counter), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 
 	// Taint session "s" with a confidential source read.
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "read_secret"},
+	_, cerr := engine.RecordSourceCall(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "read_secret"},
 		&capability.Constraint{Target: "tool:read_secret", Actions: []string{"call"},
-			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}}})
-	require.NoError(t, err)
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}}},
+		enforcement.SourceCommitScope{Flow: true}, nil)
+	require.Nil(t, cerr)
 
 	// A sampling sink that admits only public-provenance flows: the confidential taint is
 	// blocked, an enforced deny (no --audit, non-audit constraint).

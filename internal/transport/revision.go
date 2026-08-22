@@ -109,8 +109,9 @@ type hostLeg struct {
 // For the REQUEST framing the kill check must be taken AFTER the decision turn, freshly, so a
 // kill landing during an unbounded wait is recorded as KILL_SWITCH rather than as the method's
 // own refusal; a prologue-level answer would be the stale one. That is why the request framing
-// takes it inside dispatchRequest and enforcedForwardCore, and why the notification framing —
-// which waits for nothing — can and does take it here-adjacent, in hostNotificationGate.
+// takes it inside dispatchRequest and enforcedForwardCore, and why the notification framing
+// takes it here-adjacent, in hostNotificationGate — which suffices only where nothing waits
+// after it. stdio's ordering barrier does, so that leg re-checks past it.
 type hostMessageGate struct {
 	// leg is the connection's own answer to what negotiation needs to know.
 	leg hostLeg
