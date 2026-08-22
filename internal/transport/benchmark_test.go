@@ -810,6 +810,16 @@ func benchStdioProxy(b *testing.B, dp pdp.PolicyDecisionPoint) *StdioProxy {
 // Architecture under test:
 //
 //	b.Loop ──► proxy.handleHostRequest ──► ManifestPDP.Decide ──► upstream goroutine (pipe)
+//	b.Loop ──► host pipe ──► proxy.serveHost ──► (as above) ──► host pipe   (ServeHost_Allow)
+//
+// The two entry points measure different things, and the second exists because the first cannot
+// see the serve loop's own per-message work: handleHostRequest is BELOW serveHost, which is the
+// only caller of negotiateHostRevision, so the shared revision prologue is never entered on the
+// direct path. Reporting the direct path's allocations as the transport's is what let a change to
+// that prologue land looking free on stdio while it was not measured at all. ServeHost_Allow pays
+// the framing and the handler goroutine on top, so it is the LOOP's number rather than the
+// dispatcher's — read it against Baseline_DirectPipe, which frames the same messages over the
+// same pipes with no proxy in between.
 //
 // Target: p99 < 2 ms overhead (stateless mode, pipe transport).
 func BenchmarkStdioProxy(b *testing.B) {
@@ -888,6 +898,50 @@ func BenchmarkStdioProxy(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			proxy.handleHostRequest(ctx, denyMsg)
+		}
+	})
+
+	// Through the serve loop, which is what the subtests above cannot reach: the revision
+	// prologue, the notification/request framing branch, the handler-pool acquire and the
+	// goroutine hand-off all live here. One request in flight at a time — the response is read
+	// before the next is written — so the loop measures per-message cost rather than how deeply
+	// this host pipelines.
+	b.Run("ServeHost_Allow", func(b *testing.B) {
+		dp := benchPDPOnly(b,
+			capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}},
+			capability.Constraint{Target: "tool:query_db", Actions: []string{"call"}},
+		)
+		proxy := benchStdioProxy(b, dp)
+		hostR, hostW := io.Pipe()
+		respR, respW := io.Pipe()
+		proxy.hostReader = mcp.NewMsgReader(hostR)
+		proxy.hostWriter = mcp.NewMsgWriter(respW)
+
+		serveCtx, stopServing := context.WithCancel(ctx)
+		served := make(chan struct{})
+		go func() {
+			defer close(served)
+			proxy.serveHost(serveCtx)
+		}()
+		b.Cleanup(func() {
+			stopServing()
+			// Closing the host read side is what reclaims serveHost's own reader goroutine: it is
+			// parked in a pipe read, which no context cancellation reaches.
+			_ = hostW.Close()
+			<-served
+		})
+
+		writer := mcp.NewMsgWriter(hostW)
+		reader := mcp.NewMsgReader(respR)
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if err := writer.Write(allowMsg); err != nil {
+				b.Fatalf("write to the serve loop: %v", err)
+			}
+			if _, err := reader.Read(); err != nil {
+				b.Fatalf("read the serve loop's answer: %v", err)
+			}
 		}
 	})
 }

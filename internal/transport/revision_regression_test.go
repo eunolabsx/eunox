@@ -651,6 +651,60 @@ func TestServerInitiatedLeg_NamesTheRevisionAnUnpinnedContextIsRoutedBy(t *testi
 	}
 }
 
+// TestHostMessageGate_AdmittedMessageCostsNothingBeyondTheResolve pins the shape of the shared
+// prologue's wiring as a measurement, because nothing about the shape itself fails a test.
+//
+// The gate reaches its peer only on the REFUSAL path, so filling it with closures compiled,
+// passed every behavioral test, and charged three heap allocations to every ADMITTED message —
+// negotiate calls a hook indirectly, so the compiler cannot keep the receiver local and each
+// closure spills whether or not it is ever called. Reverting to func fields costs nothing this
+// package would otherwise notice.
+//
+// RELATIVE, not an absolute allocation count: the baseline is the resolve the gate wraps, run on
+// the same message, so the assertion survives an unrelated allocation appearing inside
+// resolveHostRevision (mcp.DecodeParams allocates, and what it allocates is not this guard's
+// subject) and still fails the moment the WIRING allocates again. The gate is built inside the
+// measured function on purpose: that construction is where the closures were paid for.
+//
+// Both peers, because they satisfy the interface differently and only one of them is on the
+// stdio path the benchmarks reach. A per-request peer value (HTTP's sessionless arm) is expected
+// to allocate and is deliberately not measured here — see sessionlessGatePeer.
+//
+// Not parallel: AllocsPerRun panics inside one, and measures process-wide mallocs, so it must
+// not run beside another test's goroutines.
+func TestHostMessageGate_AdmittedMessageCostsNothingBeyondTheResolve(t *testing.T) {
+	stdio, _ := newStdioProxy(stdioServe{pdp: newTestManifestPDP()}, strings.NewReader(""))
+	sess := newTestSession(&httpSession{id: "sess-1", hostRev: handshakeRevision})
+	ctx := context.Background()
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: methodPing}
+
+	for _, tc := range []struct {
+		name string
+		peer hostGatePeer
+	}{
+		{"stdio", stdio},
+		{"httpSession", sess},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wired := testing.AllocsPerRun(200, func() {
+				gate := hostMessageGate{leg: hostLeg{contextRev: handshakeRevision}, peer: tc.peer}
+				if _, _, ok := gate.negotiate(ctx, msg); !ok {
+					t.Fatal("the admitted message was refused; this measures the admitted path")
+				}
+			})
+			bare := testing.AllocsPerRun(200, func() {
+				if _, err := resolveHostRevision(handshakeRevision, "", msg); err != nil {
+					t.Fatalf("resolving the same message directly failed: %v", err)
+				}
+			})
+			if wired > bare {
+				t.Errorf("negotiating an ADMITTED message through the gate allocates %v against %v for the resolve it wraps; the prologue's wiring is being built per message again (see hostGatePeer)",
+					wired, bare)
+			}
+		})
+	}
+}
+
 // TestStdioNegotiation_PinIsWrittenOnce pins the guard in front of the pin as a measurement
 // rather than as a comment. The pin cannot change once set — resolveHostRevision refuses a
 // disagreeing declaration one gate earlier and returns before this — so both the predicate and

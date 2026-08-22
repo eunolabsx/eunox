@@ -357,6 +357,15 @@ func (s *httpSession) unblocker() serverRequestUnblocker {
 	}
 }
 
+// revisionRefusalRecorder resolves the -32022 refusal's recorder for a message on this session:
+// the other half of the shared prologue's hostGatePeer, answered from state the session already
+// holds so an established request pays nothing for wiring only a refusal reads. Through the proxy
+// that created it and the route it is bound to — which handleSessionPost has already checked is
+// the route this request addressed.
+func (s *httpSession) revisionRefusalRecorder() auditRecorder {
+	return s.proxy.revisionRefusalRecorder(s, s.route)
+}
+
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would
 // have completed, so it does not stay blocked until this session's idle ceiling reclaims it.
 //

@@ -95,15 +95,15 @@ type hostLeg struct {
 // prologue below is what is common underneath both — negotiation, its refusal, and its debt to
 // a blocked initiator.
 //
-// It COSTS three heap allocations per host message, measured rather than assumed: `negotiate`
-// calls its three fields indirectly, so the receiver leaks (`-gcflags=-m`: "leaking param: g")
-// and every closure spills. BenchmarkHTTPProxy moves +3 allocs/op and ~+65 B/op on each proxied
-// subtest — around 1% of a request that already allocates ~330 times. Accepted rather than
-// optimized away, because the two shapes that would remove it both undo the point: hoisting the
-// resolve out of `negotiate` puts the sequence back at the call sites, and boxing the three
-// hooks into an interface only moves the allocation to the transport that cannot supply a
-// long-lived receiver. BenchmarkStdioProxy cannot see any of this — it drives handleHostRequest
-// directly, below serveHost, which is the only caller of stdio's negotiateHostRevision.
+// It costs an admitted host message NOTHING, which took two shapes to reach and is the reason
+// the wiring below looks as it does. As three injected closures it cost three heap allocations
+// per message: `negotiate` calls a func field indirectly, so the compiler cannot keep the
+// receiver local (`-gcflags=-m`: "leaking param: g") and every closure built to fill one spills
+// — paid on every message, including the admitted ones the resolve returns early for. The two
+// hooks whose receiver OUTLIVES the message are now an interface each transport satisfies from a
+// value it already holds (hostGatePeer), and the one that genuinely captured per-message state
+// (HTTP's ResponseWriter) is gone: the refusal is RETURNED for the caller to write. What did not
+// move is the sequence, which is what this type is for.
 //
 // Revocation is deliberately NOT part of this prologue, though the gate order places it next.
 // For the REQUEST framing the kill check must be taken AFTER the decision turn, freshly, so a
@@ -115,51 +115,71 @@ type hostLeg struct {
 type hostMessageGate struct {
 	// leg is the connection's own answer to what negotiation needs to know.
 	leg hostLeg
-	// recorder resolves the refusal's audit recorder, LAZILY: it is drawn from a rate-limit
-	// bucket, so resolving it for a message that is about to be admitted spends a token on
-	// nothing — and an unauthenticated peer can send those at will. Nil resolves to no
-	// recorder, which refuseHostRevision reads as "record nothing"; the wire refusal is
-	// unaffected either way.
-	recorder func() auditRecorder
-	// refuse writes the refusal to THIS peer. It is handed the response refuseHostRevision
-	// built, which is the zero message for any framing JSON-RPC forbids replying to — each
-	// transport decides what it sends instead (stdio nothing, HTTP a bodyless 202).
+	// peer is the connection itself, as the two hooks the refusal path needs from it.
 	//
 	// Never nil, like hostNotificationGate.checkKill: every gate has a peer to answer, and the
 	// refusal path is reachable by any peer sending a bad version, so there is nothing a
-	// fallback here could do that a caller with no writer has not already got wrong.
-	refuse func(mcp.RPCMsg)
-	// unblock answers the upstream request a refused host RESPONSE would have completed, so it
-	// does not hang until the connection ends. Nil on a leg that has no upstream to unblock —
-	// the pre-session arms, whose messages reach none. See server_request_unblock.go for the
-	// leg's one rule and its two exceptions.
-	unblock func(context.Context, mcp.RPCMsg)
+	// fallback here could do that a caller with no wiring has not already got wrong.
+	peer hostGatePeer
+}
+
+// hostGatePeer is the half of the prologue's wiring whose receiver OUTLIVES the message: where a
+// refusal's record goes, and how the upstream request a refused host RESPONSE would have
+// completed is answered.
+//
+// An INTERFACE rather than two closure fields, for a reason that is measured rather than
+// stylistic. negotiate calls a hook indirectly, so filling one with a closure allocates it on
+// every message — including the admitted ones, which is every message on a healthy connection.
+// Both transports answer both questions from a value they already hold for the length of the
+// connection (*StdioProxy, *httpSession), so boxing one costs nothing. The single caller with no
+// such value is HTTP's pre-session arm, which builds a sessionlessGatePeer per message: once per
+// session establishment rather than once per request.
+type hostGatePeer interface {
+	// revisionRefusalRecorder resolves the refusal's audit recorder, and is called only on the
+	// refusal path: the recorder is drawn from a rate-limit bucket, so resolving it for a message
+	// about to be admitted would spend a token on nothing — and an unauthenticated peer can send
+	// those at will. A nil recorder is what refuseHostRevision reads as "record nothing"; the
+	// wire refusal is unaffected either way.
+	revisionRefusalRecorder() auditRecorder
+	// unblockRefusedServerReply answers the upstream request a refused host RESPONSE would have
+	// completed, so it does not hang until the connection ends. A no-op on a leg with no upstream
+	// to unblock — the pre-session arms, whose messages reach none. See server_request_unblock.go
+	// for the leg's one rule and its two exceptions.
+	unblockRefusedServerReply(context.Context, mcp.RPCMsg)
 }
 
 // negotiate resolves the revision one host message is dispatched under, disposing of it
-// entirely when it cannot be established: ok=false means the record is written, this peer has
-// its refusal in whatever shape it takes, and any upstream request the message would have
-// answered has been unblocked.
+// entirely when it cannot be established: ok=false means the record is written, any upstream
+// request the message would have answered has been unblocked, and the returned message is the
+// refusal this peer is OWED — the zero message for any framing JSON-RPC forbids replying to, so
+// each transport writes what it is handed in the shape its peer takes (stdio nothing, HTTP a
+// bodyless 202).
+//
+// The refusal travels back rather than through an injected writer because that hook is the one
+// piece of this wiring that genuinely captures per-message state, so a closure for it is built
+// and spilled on every ADMITTED message to serve the refused ones. What stays inside is the part
+// the type exists for: the sequence — resolve, then record, then unblock — which no caller can
+// reorder or forget. Writing the refusal is not part of that sequence; each transport already
+// owns what its peer is sent when JSON-RPC forbids a reply.
+//
+// So the unblock now runs BEFORE the caller's write rather than after. Immaterial rather than
+// tolerated: it acts on the RESPONSE framing alone, and JSON-RPC forbids replying to a response,
+// so the message returned for that framing is the zero one — there is no content whose ordering
+// against the upstream's answer any peer could observe.
 //
 // The revision is returned rather than stamped onto a context here, because which context it is
 // stamped onto is exactly the part that differs between the transports — see the type's doc.
-func (g hostMessageGate) negotiate(ctx context.Context, msg mcp.RPCMsg) (capability.Revision, bool) {
+func (g hostMessageGate) negotiate(ctx context.Context, msg mcp.RPCMsg) (capability.Revision, mcp.RPCMsg, bool) {
 	rev, err := resolveHostRevision(g.leg.contextRev, g.leg.upstreamRev, msg)
 	if err == nil {
-		return rev, true
-	}
-	var rec auditRecorder
-	if g.recorder != nil {
-		rec = g.recorder()
+		return rev, mcp.RPCMsg{}, true
 	}
 	// Rate-limited like every other caller-driven refusal: a suppressed record still gets its
 	// refusal on the wire, so the peer is refused either way — what the bucket bounds is the
 	// tape write, which is the part a flood turns into an availability problem.
-	g.refuse(refuseHostRevision(ctx, rec, g.leg.sessionID, g.leg.contextRev, msg, err))
-	if g.unblock != nil {
-		g.unblock(ctx, msg)
-	}
-	return "", false
+	refusal := refuseHostRevision(ctx, g.peer.revisionRefusalRecorder(), g.leg.sessionID, g.leg.contextRev, msg, err)
+	g.peer.unblockRefusedServerReply(ctx, msg)
+	return "", refusal, false
 }
 
 // resolveHostRevision decides which revision one host message is dispatched under.
