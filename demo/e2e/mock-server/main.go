@@ -288,10 +288,31 @@ func initializeResult() map[string]interface{} {
 
 // dispatch returns (result, rpcError) for a request, exactly one non-nil;
 // never called for notifications.
+//
+// The two revision gates run BEFORE the method switch so no handler can serve a request the
+// running revision should have refused: a declaring leg needs the per-request declaration,
+// and each revision has its own method set (see revision.go).
 func dispatch(msg *rpcMsg, conn *stdioConn) (interface{}, *rpcError) {
+	if e := checkDeclaration(msg); e != nil {
+		return nil, e
+	}
+	if e := checkMethodExists(msg.Method); e != nil {
+		return nil, e
+	}
+	result, e := dispatchMethod(msg, conn)
+	if e != nil {
+		return nil, e
+	}
+	return stampResultShape(msg.Method, result), nil
+}
+
+func dispatchMethod(msg *rpcMsg, conn *stdioConn) (interface{}, *rpcError) {
 	switch msg.Method {
 	case "initialize":
 		return initializeResult(), nil
+
+	case "server/discover":
+		return discoverResult(), nil
 
 	case "tools/list":
 		return map[string]interface{}{"tools": toolList}, nil
@@ -548,7 +569,19 @@ func writeHTTPError(w http.ResponseWriter, id *json.RawMessage, code int, messag
 func main() {
 	transport := flag.String("transport", "stdio", `transport: "stdio" or "http"`)
 	port := flag.String("port", "8090", "listen port (http transport)")
+	revision := flag.String("protocol-version", revisionHandshake,
+		`MCP revision to speak: "2025-11-25" or "2026-07-28"`)
 	flag.Parse()
+
+	// Fail closed on an unknown revision rather than falling through to a default: a matrix
+	// cell that silently ran the wrong revision would report a pass for the pair it did not
+	// exercise, which is the one failure this harness cannot detect from its own output.
+	if *revision != revisionHandshake && *revision != revisionDeclaring {
+		fmt.Fprintf(os.Stderr, "unknown --protocol-version %q (want %s|%s)\n",
+			*revision, revisionHandshake, revisionDeclaring)
+		os.Exit(2)
+	}
+	serverRevision = *revision
 
 	switch *transport {
 	case "stdio":
