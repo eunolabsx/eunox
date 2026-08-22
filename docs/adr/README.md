@@ -75,3 +75,5 @@ silent edits.
 | [0006](./0006-dual-revision-translation-boundary.md) | Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest | In Review |
 | [0007](./0007-mrtr-signed-continuation.md) | Meter multi round-trip requests once per logical call, via a signed continuation | Draft |
 | [0008](./0008-stream-and-task-enforcement.md) | Enforce subscription streams and task methods at the opener's anchor | Draft |
+| [0009](./0009-crosswalk-label-ingestion.md) | Ingest an imported sensitivity label from a declared response field | Draft |
+| [0010](./0010-no-decision-path-classification.md) | Classification stays push-shaped; no classifier callout on the decision path | Draft |
