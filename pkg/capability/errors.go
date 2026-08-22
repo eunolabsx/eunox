@@ -114,6 +114,17 @@ const (
 	// having already been answered by the fail-closed routing default under
 	// UNROUTABLE_METHOD, which precedes this check.
 	ErrCodeUntranslatableAcrossRevisions = "UNTRANSLATABLE_ACROSS_REVISIONS"
+	// ErrCodeHeaderMismatch refuses a Streamable HTTP POST whose 2026-07-28 routing headers
+	// (`Mcp-Method`, `Mcp-Name`) disagree with the body they describe, or omit what that
+	// revision requires.
+	//
+	// Its own code rather than INVALID_PARAMS, because the two are read for different things:
+	// a malformed body is a client that got the shape wrong, while a header that names a
+	// different method or target than the body executes is an ENFORCEMENT-CONFUSION attempt —
+	// the headers exist so an intermediary can route, meter and log without parsing, and a
+	// disagreeing pair is metered as one call and executed as another. An operator grepping
+	// the tape for someone probing that boundary needs it under its own name.
+	ErrCodeHeaderMismatch = "HEADER_MISMATCH"
 )
 
 // Fixed JSON-RPC integer error codes for denial responses.
@@ -136,6 +147,10 @@ const (
 	// choose: -32022 is assigned by the MCP specification, which is also why it sits in the
 	// -32020..-32099 band eunox otherwise never mints into.
 	JSONRPCCodeUnsupportedProtocolVersion = -32022 // UNSUPPORTED_PROTOCOL_VERSION (spec-assigned)
+	// JSONRPCCodeHeaderMismatch is the wire code for ErrCodeHeaderMismatch. Like -32022 it is
+	// not eunox's to choose: 2026-07-28 assigns it, which is also why it sits in the
+	// -32020..-32099 band eunox otherwise never mints into. See SpecAssignedWireCodes.
+	JSONRPCCodeHeaderMismatch = -32020 // HEADER_MISMATCH (spec-assigned)
 )
 
 // AllDenialCodes lists every symbolic denial code (ErrCode*). It exists so
@@ -162,6 +177,7 @@ var AllDenialCodes = []string{
 	ErrCodeUnsupportedProtocolVersion,
 	ErrCodeUnroutableMethod,
 	ErrCodeUntranslatableAcrossRevisions,
+	ErrCodeHeaderMismatch,
 }
 
 // DenialWireCode maps a symbolic denial code (ErrCode*) to the JSON-RPC integer
@@ -215,6 +231,11 @@ func DenialWireCode(code string) (wire int, ok bool) {
 	// integer wants the same answer from both — stop, the revisions do not line up.
 	case ErrCodeUnsupportedProtocolVersion, ErrCodeUntranslatableAcrossRevisions:
 		return JSONRPCCodeUnsupportedProtocolVersion, true
+	// The second spec-assigned code eunox emits, and it does NOT join the -32022 pair above:
+	// those two both say "the revisions do not line up", where this says the pair of halves
+	// describing ONE request do not. A host branching on the integer wants different answers.
+	case ErrCodeHeaderMismatch:
+		return JSONRPCCodeHeaderMismatch, true
 	case ErrCodeCapabilityDenied:
 		return JSONRPCCodeCapabilityDenied, true
 	default:
@@ -275,6 +296,14 @@ func ClassifyDenialCode(code string) DenialClass {
 	// host can never complete. There is no policy verdict to forward in its place either — the
 	// pair is refused before any match runs.
 	case ErrCodeUnsupportedProtocolVersion, ErrCodeUnroutableMethod, ErrCodeUntranslatableAcrossRevisions:
+		return DenialClassFault
+	// HEADER_MISMATCH joins them, and for the same structural reason rather than by analogy: it
+	// is refused at the HTTP envelope, before any match runs, so there is no policy verdict to
+	// forward in its place. The downgrade would also be the worst of the three to permit — an
+	// observing route forwarding a request whose halves disagree hands the very confusion this
+	// refusal exists to catch to every downstream reader that trusts the header, which is the
+	// one posture where "forward and log" is not a safe approximation of enforcing.
+	case ErrCodeHeaderMismatch:
 		return DenialClassFault
 	default:
 		return DenialClassPolicy

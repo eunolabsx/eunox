@@ -386,6 +386,11 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 		// unlike the client.Do path below — which would otherwise leak to stderr/the doctor bundle.
 		return mcp.RPCMsg{}, nil, fmt.Errorf("building request: %w", scrubURLError(err))
 	}
+	// Granted host headers go on FIRST, so every header eunox is accountable for below
+	// overwrites a forwarded one by construction rather than by configuration (client_headers.go).
+	if err := applyForwardedHeaders(ctx, req); err != nil {
+		return mcp.RPCMsg{}, nil, err
+	}
 	req.Header.Set("Content-Type", CTJSON)
 	// The spec requires the client to advertise both JSON and SSE content types so the
 	// server may answer either way.
@@ -398,6 +403,11 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	// keep in step with the rest.
 	if !openerNegotiatesVersion(rev, msg.Method) {
 		setNegotiatedVersionHeader(req, rev)
+	}
+	// Before anything is sent: an unsendable routing header fails the CALL, so a request whose
+	// headers could not describe it honestly never reaches the upstream at all.
+	if err := setRoutingHeaders(req, rev, msg); err != nil {
+		return mcp.RPCMsg{}, nil, err
 	}
 	if sessID != "" {
 		req.Header.Set(SessionHeader, sessID)

@@ -412,6 +412,16 @@ type UpstreamConfig struct {
 	UpstreamAuthHeader    string `yaml:"upstreamAuthHeader"`
 	UpstreamTLSSkipVerify bool   `yaml:"upstreamTlsSkipVerify"`
 
+	// ForwardClientHeaders names the host request headers relayed to THIS upstream. Empty (and
+	// omitted) forwards none, which is the posture: a header a host can set is a channel past
+	// the boundary eunox exists to be. No wildcard, and no name eunox itself controls on the
+	// outbound request — see forward_headers.go for what that set is and why.
+	//
+	// Per-upstream with no `defaults:` inheritance, deliberately. Every other route override
+	// tunes a posture that already applies; this one GRANTS a passthrough, and a default would
+	// make granting it to every route the shorter thing to write.
+	ForwardClientHeaders []string `yaml:"forwardClientHeaders"`
+
 	// policy: one or more capability manifest files, merged in order. Omitting it is only
 	// valid when the effective enforcement is "audit": a policyless route with no audit
 	// posture fails closed at startup (SEC-05) rather than allowing every call unenforced.
@@ -1058,6 +1068,11 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 		if presentKey(i, "upstreamTlsSkipVerify") || u.UpstreamTLSSkipVerify {
 			return fmt.Errorf("upstream %q: 'upstreamTlsSkipVerify' is not allowed with stdio transport (HTTP-only)", u.Name)
 		}
+		// A stdio host speaks no HTTP, so there is no header to forward and an allowlist here
+		// would read as a granted passthrough that silently does nothing.
+		if presentKey(i, "forwardClientHeaders") || u.ForwardClientHeaders != nil {
+			return fmt.Errorf("upstream %q: 'forwardClientHeaders' is not allowed with stdio transport (HTTP-only)", u.Name)
+		}
 	case "http":
 		if err := validateHTTPUpstreamURL(u.Name, u.UpstreamURL); err != nil {
 			return err
@@ -1074,6 +1089,9 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 		}
 		if presentKey(i, "args") || u.Args != nil {
 			return fmt.Errorf("upstream %q: 'args' is not allowed with http transport (stdio-only)", u.Name)
+		}
+		if err := validateForwardClientHeaders(u.Name, u.ForwardClientHeaders, u.UpstreamAuthHeader); err != nil {
+			return err
 		}
 	case "":
 		return fmt.Errorf("upstream %q: 'transport' is required (\"stdio\" or \"http\")", u.Name)

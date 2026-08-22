@@ -246,6 +246,16 @@
           "description": "http transport only: skip TLS certificate verification for the upstream. For local/dev use only.",
           "default": false
         },
+        "forwardClientHeaders": {
+          "type": "array",
+          "description": "http transport only: host request headers relayed to this upstream. Omitted (the default) forwards none. No wildcard, and no header eunox itself sets on the upstream request (Authorization, Mcp-Method, Mcp-Name, Mcp-Protocol-Version, Mcp-Session-Id, Cookie, Host, the hop-by-hop set, ...) may be named; startup fails if one is.",
+          "items": {
+            "type": "string",
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          },
+          "uniqueItems": true,
+          "default": []
+        },
         "policy": {
           "type": "array",
           "description": "One or more capability manifest files, merged in order, governing this route. Omitting it is only valid when the effective enforcement is \"audit\" (observe-only): in gateway mode a route with no policy and no audit posture fails closed at startup (the gateway refuses to start). With \"audit\", the route forwards and logs every call without blocking.",
@@ -311,7 +321,8 @@
             "properties": {
               "upstreamUrl": false,
               "upstreamAuthHeader": false,
-              "upstreamTlsSkipVerify": false
+              "upstreamTlsSkipVerify": false,
+              "forwardClientHeaders": false
             }
           }
         },

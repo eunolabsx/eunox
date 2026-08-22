@@ -171,6 +171,11 @@ func TestClassifyDenialCode_CoversEveryCode(t *testing.T) {
 		// A pair that cannot carry a message is a fault, not a verdict: nothing was matched
 		// against policy, so an observing route has no decision of its own to forward instead.
 		capability.ErrCodeUntranslatableAcrossRevisions: capability.DenialClassFault,
+		// Refused at the HTTP envelope, before any match runs — so a fault for the same
+		// structural reason. And the downgrade would be the worst of these to permit: an
+		// observing route forwarding a request whose halves disagree hands the confusion this
+		// refusal exists to catch to every downstream reader that trusts the header.
+		capability.ErrCodeHeaderMismatch: capability.DenialClassFault,
 	}
 	for _, code := range capability.AllDenialCodes {
 		expected, listed := want[code]
