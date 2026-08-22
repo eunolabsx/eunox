@@ -2276,7 +2276,11 @@ anywhere on this path. A label belonging to neither axis is a load error.
 > asserted by the policy author, the same way a native one is. Deriving it from a
 > field the *server* returned would make the flow control only as strong as that
 > server's trustworthiness — an agent-settable or downgradeable label defeats it —
-> so that ingestion path is deliberately not wired.
+> so that ingestion path is deliberately not wired. The shape it takes when it is,
+> and the trust declaration it will require, are decided in
+> [ADR-0009](./adr/0009-crosswalk-label-ingestion.md); delegating the judgement to
+> an incumbent classifier over the network is decided against in
+> [ADR-0010](./adr/0010-no-decision-path-classification.md).
 
 ### `labelOutput` — the information-flow source
 
