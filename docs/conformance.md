@@ -214,6 +214,7 @@ which part). The full migration is planned in
 |---|---|---|---|
 | **List-result caching** (SEP-2549) | `cacheScope` (`public`/`private`) + `ttlMs` on `*/list`, `resources/read`, and the discovery result | **`*/list` honored.** eunox filters `*/list` per identity, so every list it emits is authorization-context-specific; it therefore **clamps `cacheScope` to `private`** on every response it filtered, whatever the upstream said. Any value other than `private` is clamped, not just `public` — the field is an open union, so an unrecognized scope is an ambiguity and the narrow reading is the only one that cannot leak. `ttlMs` is preserved verbatim as a freshness hint. The member IS added where a declaring upstream omitted the scope its own revision requires — supplied at the upstream call, where the revision is in scope, rather than at the filter encoder, which holds none. It is never added for a 2025-11-25 peer (that revision does not define it, and old-revision output stays byte-stable), and the `--audit` wiretap passthrough keeps the upstream's own scope, since it forwards a catalog identical for every caller. **`resources/read` is not covered:** eunox does not filter that reply per identity, but a delegation chain's `redactFields` masks fields in it, so the forwarded body can be caller-specific while its upstream `cacheScope` crosses verbatim. The discovery result is not personalized. See threat model L-6. | A shared downstream cache honoring `public` on a filtered list could serve one identity's narrowed view to another — the spec's "caches MUST NOT be shared across authorization contexts" invariant |
 | **Result shape** (SEP-2549) | `resultType` (`"complete" \| "input_required" \| string`) on every result | **Supplied and gated.** A result eunox hands a 2026-07-28 peer carries `resultType`: the upstream's own value where it sent one, `"complete"` where it did not. A result whose `resultType` is PRESENT and is neither `complete` nor a variant this build models is **refused** before it reaches the host, recorded `ENFORCEMENT_ERROR`, and answered `-32603` — the union is open, so an unrecognized value is an ambiguity, and eunox cannot enforce a result shape it does not model. Absence reads as complete (the spec's rule for servers predating the member, and the shape every 2025-11-25 upstream produces); an explicit JSON null reads as absent. Nothing is added for a 2025-11-25 peer. | Reading an unrecognized variant as complete would let an upstream carry a result past response-path enforcement. `input_required` in particular means the upstream is still WAITING, so forwarding it as finished desynchronizes the exchange silently. See threat model L-9 |
+| **JSON-RPC error-code partition** | -32000..-32019 implementation-defined, -32020..-32099 reserved for the specification; resource-not-found moves `-32002` → `-32602` | **Held, and held structurally.** Every code eunox mints sits in the implementation-defined band, is one of JSON-RPC's own pre-defined codes used for what it means, or is a reserved code the specification has already assigned and eunox is emitting that assigned meaning (today exactly one: `-32022`). A build-time guard walks every package in the module and fails on any integer constant — or bare error `Code` literal — that lands in a band eunox may not mint into, so a code added later cannot drift into reserved space. The moved resource-not-found is re-spelled across a mismatched pair in the one direction where the integer is unambiguous; see the translation-boundary section. | A reserved code shipped today is one the specification may assign a meaning to tomorrow, at which point every host that learns the new meaning reads an eunox denial as that protocol error — silently, with no version anywhere to notice. Under 2025-11-25 the collision was already live in the other direction: eunox's `-32001`/`-32002`/`-32003` met that revision's own HeaderMismatch, resource-not-found and MissingRequiredClientCapability |
 | **MCP Apps** (SEP-1865) | `ui://` template resources; `ui/*` host↔iframe bridge | **Covered by existing mediation; documentation watch item.** App UI templates are fetched via `resources/read` / `resources/list` (already gated and filtered) and UI-initiated execution is an ordinary `tools/call` (already enforced and audited). The `ui/*` methods run on the host↔iframe postMessage bridge, which never traverses eunox. No new server-transport method exists today. | A *future* Apps revision adding a server-transport `app/*` method would hit the fail-closed unmapped-method path and need classification |
 
 Broader 2026-07-28 conformance splits into what
@@ -253,9 +254,7 @@ over-cite:
   MRTR signed continuation and its commit-once metering in
   [ADR-0007](adr/0007-mrtr-signed-continuation.md); `subscriptions/listen` and
   the tasks extension in
-  [ADR-0008](adr/0008-stream-and-task-enforcement.md). The moved
-  missing-resource error code is mechanical and tracked in the
-  [execution plan](mcp-2026-07-28-execution.md) alone.
+  [ADR-0008](adr/0008-stream-and-task-enforcement.md).
 
 ### Per-revision method disposition
 
@@ -435,7 +434,7 @@ eunox decided under a third. Which direction it rewrites follows the receiving r
 | Direction | Request | Result |
 |---|---|---|
 | host `2025-11-25` → upstream `2026-07-28` | the per-request declaration is **added** (the upstream requires it; the host has no way to send it) | left alone, except that a variant the host cannot read is refused |
-| host `2026-07-28` → upstream `2025-11-25` | the declaration is **removed** (eunox presents itself as a client of the upstream's own revision) | `resultType: "complete"` is **added**, and `cacheScope: "private"` on the three `*/list` results |
+| host `2026-07-28` → upstream `2025-11-25` | the declaration is **removed** (eunox presents itself as a client of the upstream's own revision) | `resultType: "complete"` is **added**, and `cacheScope: "private"` on the three `*/list` results. An **error** carrying `-32002` from a resource-addressing method is re-spelled `-32602` |
 
 Supplying those members is **not** the boundary's doing, and the distinction matters to a reader
 of this table: they are added for every host on `2026-07-28`, including one on a *matched* pair,
@@ -443,6 +442,27 @@ by the result-shape pass described in the two rows above. What is a property of 
 that an older upstream never sends them, so on this direction the pass always has work to do.
 `ttlMs` is deliberately never added: it is a freshness hint the older upstream did not offer,
 and inventing a lifetime for someone else's data is a fabrication eunox stops short of.
+
+An upstream **error** crosses the boundary too, and one integer in it means different things to
+the two peers. 2025-11-25 assigns `-32002` to resource-not-found; 2026-07-28 moves that meaning
+to `-32602` and frees `-32002` into the implementation-defined band. Forwarded verbatim, a
+2026-07-28 host reads `-32002` as some implementation's private code and loses the one fact the
+upstream was reporting, so eunox re-spells it.
+
+Only in that direction, and only for a method that addresses a resource:
+
+| | Translated? |
+|---|---|
+| `-32002` from `resources/read` → a `2026-07-28` host | **yes** — under 2025-11-25 the spec gives `-32002` exactly one meaning, so re-spelling it says the same thing |
+| `-32602` from a `2026-07-28` upstream → a `2025-11-25` host | **no** — under that revision `-32602` carries resource-not-found *and* JSON-RPC's own invalid-params, so narrowing it to `-32002` would assert the first about what may have been the second |
+| `-32002` from `tools/call` | **no** — 2025-11-25 permits an upstream its own implementation-defined codes, and a method naming no resource is not reporting a missing one |
+| any other code, or a matched pair | **no** — only the code whose meaning MOVED is eunox's to restate |
+
+The scope is derived from the same method-to-target-type mapping the audit layer stamps
+`target_type` from, so a resource-addressing method added later is covered without this being
+remembered. eunox's own denials never reach it: the rewrite sits at the upstream call, so every
+code it sees came from the upstream — which is what makes reading `-32002` as the spec's meaning
+safe despite eunox spelling `CAPABILITY_DENIED` with the same integer under that revision.
 
 What a mismatched pair refuses, with `UNTRANSLATABLE_ACROSS_REVISIONS` (`-32022`), recorded,
 and the upstream never contacted:

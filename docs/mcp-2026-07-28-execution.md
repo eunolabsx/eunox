@@ -519,9 +519,10 @@ Exit criteria:
 - [ ] Kill×tasks semantics decided, implemented, e2e-tested.
 - [ ] Manifest-vocabulary conventions satisfied if vocabulary was added.
 
-### W9 — Error-code alignment (plan §9) — S
+### W9 — Error-code alignment (plan §9) — S — **LANDED**
 
-**Depends on:** W1.
+**Depends on:** W1. The resource-not-found half also needed D1, which had not landed
+when this was scoped — see below.
 
 Scope: resource-not-found mapping to -32602 for new-revision peers
 (`denialToJSONRPCCode`, `internal/transport/jsonrpc.go`); `IsInfraDenialCode`
@@ -529,10 +530,54 @@ revision-aware; a **range-pin test** asserting every eunox-minted code sits in
 -32000..-32019 and never in the reserved -32020..-32099 (except the spec-defined
 -32020/-32022 emissions, which are asserted individually).
 
+As landed, differing from that scope in three places, each because the scope named a
+site that turned out not to be where the question lives:
+
+- **The resource-not-found remap is at the translation BOUNDARY, not in
+  `denialToJSONRPCCode`.** That function maps eunox's own symbolic codes, and eunox
+  mints no resource-not-found — the upstream does. The real gap was that an upstream
+  ERROR crossed a mismatched pair with its integer untouched: every gate in
+  `translateResult` tests `resp.Result`, which an error response does not carry, so it
+  matched the "nothing to do" branch. `translateReply` now routes a reply by shape and
+  `translateErrorCode` re-spells the one code whose meaning moved. This is why the
+  workstream needed D1: before the boundary existed there was no mismatched pair to
+  translate for.
+
+- **Only one direction is translated, and the asymmetry is the finding.** Old to new is
+  a widening (2025-11-25 gives `-32002` exactly one meaning). New to old is a narrowing
+  and is refused: 2026-07-28 puts resource-not-found on `-32602`, which is also
+  JSON-RPC's own invalid-params, so remapping would assert a missing resource about what
+  may have been a malformed request. Never fabricate on a peer's behalf, applied to an
+  integer.
+
+- **`IsInfraDenialCode` is deliberately NOT revision-aware.** The hazard behind that
+  scope item is real, but it lives in the wire INTEGER: `-32002` is both eunox's
+  `CAPABILITY_DENIED` and 2025-11-25's resource-not-found. This function reads the
+  SYMBOLIC code off the audit tape, which names one thing under both revisions, and its
+  one caller (`eunox suggest`) holds no revision to pass. Adding an unread parameter
+  would imply a distinction that does not exist. The decision is pinned by a signature
+  guard rather than a comment, so threading one through later fails with the reasoning
+  attached.
+
 Exit criteria:
 
-- [ ] Range-pin test green and in CI (a future code addition cannot drift into reserved space).
-- [ ] Mapping tests updated for both revisions.
+- [x] Range-pin test green and in CI (a future code addition cannot drift into reserved space).
+      (`pkg/capability/wirecode.go` holds the partition as vocabulary — `ClassifyWireCode`,
+      `MintableWireCode`, `SpecAssignedWireCodes` — and
+      `internal/transport/wire_code_range_test.go` pins it three ways: every symbolic code
+      mints into a permitted band; every integer CONSTANT in every package of the module is
+      mintable; no bare error-`Code` literal is unmintable. The walk is module-wide rather than
+      over the two packages that declare codes today, since a third package minting its own is
+      exactly the addition that would not think to update a list. Mutation-checked five ways —
+      a denial code moved into reserved space, a transport constant moved there, an unrelated
+      constant given a reserved value, a bare unmintable literal, and a second unreviewed
+      `SpecAssignedWireCodes` entry — each caught.)
+- [x] Mapping tests updated for both revisions. (`ResourceNotFoundWireCode` per revision plus
+      both spellings' mintability in `pkg/capability/wirecode_test.go`;
+      `internal/transport/translate_error_test.go` drives the composed upstream-call seam for
+      the translated direction, the un-narrowed direction, and four negatives. Verified against
+      the real binary: a `-32002` from a 2025-11-25 upstream reaches a 2026-07-28 host as
+      `-32602`, the same code from `tools/call` does not, and a matched pair is unchanged.)
 
 ### W10 — Tier-2 pinning under JSON Schema 2020-12 (plan §10) — M design, S code
 

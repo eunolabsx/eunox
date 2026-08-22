@@ -141,15 +141,18 @@ func TestHealthSeam_UnfilledReporterNeverReportsGreen(t *testing.T) {
 	}
 }
 
-// healthSeamGuardedDirs is every package directory in this module — the whole module rather than
-// the three packages that answer the seam today, which is the list that would have gone stale
-// first.
+// moduleGoPackageDirs is every package directory in this module — the whole module rather than the
+// packages a given guard expects to matter, which is the list that would have gone stale first.
 //
-// A package the walk never reaches contributes no implementations, so an UNDECLARED one there goes
-// unchecked; that is the guard's one open edge, and it is why the walk is not narrowed. Its own
-// gaps are loud rather than open: a parse error is fatal in packageSourcesIn, and a package holding
-// a DECLARED implementation that went unparsed fails the table's equality.
-func healthSeamGuardedDirs(t *testing.T) []string {
+// A package the walk never reaches contributes nothing, so an UNDECLARED violation there goes
+// unchecked; that is the open edge every guard built on this shares, and it is why the walk is not
+// narrowed. Its own gaps are loud rather than open: a parse error is fatal in packageSourcesIn, and
+// a package holding a DECLARED implementation that went unparsed fails its guard's own equality.
+//
+// Shared by the health-seam conformance table and the wire-code range pin. Extracted rather than
+// copied for packageSourcesIn's stated reason one level up: a second hand-rolled walk is how one of
+// them comes to skip a directory quietly, and a guard that silently skips is worse than no guard.
+func moduleGoPackageDirs(t *testing.T) []string {
 	t.Helper()
 	const moduleRoot = "../.."
 	seen := map[string]bool{}
@@ -159,8 +162,8 @@ func healthSeamGuardedDirs(t *testing.T) []string {
 			return err
 		}
 		if d.IsDir() {
-			// Hidden trees, vendored code and testdata hold no implementation this seam folds,
-			// and testdata in particular holds deliberately malformed sources.
+			// Hidden trees, vendored code and testdata are not this module's own sources, and
+			// testdata in particular holds deliberately malformed ones.
 			if name := d.Name(); path != moduleRoot && (strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata") {
 				return fs.SkipDir
 			}
@@ -175,8 +178,8 @@ func healthSeamGuardedDirs(t *testing.T) []string {
 		}
 		return nil
 	})
-	require.NoError(t, err, "walking the module for health-seam implementations")
-	require.NotEmpty(t, dirs, "the walk found no packages at all; the guard is asserting nothing")
+	require.NoError(t, err, "walking the module for Go package directories")
+	require.NotEmpty(t, dirs, "the walk found no packages at all; every guard built on it is asserting nothing")
 	sort.Strings(dirs)
 	return dirs
 }
@@ -192,7 +195,7 @@ func healthSeamGuardedDirs(t *testing.T) []string {
 func TestHealthSeam_EveryImplementationIsInTheTable(t *testing.T) {
 	t.Parallel()
 	found := map[string]seamKind{}
-	for _, dir := range healthSeamGuardedDirs(t) {
+	for _, dir := range moduleGoPackageDirs(t) {
 		for _, src := range packageSourcesIn(t, dir) {
 			for _, decl := range src.file.Decls {
 				fn, ok := decl.(*ast.FuncDecl)

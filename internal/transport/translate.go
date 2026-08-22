@@ -258,6 +258,81 @@ func translateResult(method string, resp mcp.RPCMsg, hostRev, legRev capability.
 	return resp, resultCrossesToHost(method, resp, hostRev, legRev)
 }
 
+// translateReply is the boundary's one entry point for whatever the upstream answered, routing a
+// result to translateResult and an ERROR to translateErrorCode.
+//
+// It exists because a reply is one of two shapes and only one of them was being looked at: every
+// gate in translateResult tests `resp.Result`, so an error response — which carries none —
+// matched the "nothing to do" branch and crossed with its code untouched. An error is not the
+// quiet case here; it is the one carrying an integer whose MEANING the two revisions disagree
+// about.
+//
+// Routing on `resp.Error != nil` is exact because a reply carrying BOTH is refused before it
+// gets here — awaitNonced on the subprocess path and correlateUpstreamReply on the HTTP bridges
+// both reject one violating JSON-RPC's exactly-one-of invariant. That is a dependency rather
+// than an observation: a fourth upstream path skipping those guards would take the error branch
+// and with it skip the result-side REFUSAL, which is the fail-open direction.
+func translateReply(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
+	if resp.Error != nil {
+		return translateErrorCode(method, resp, hostRev, legRev), nil
+	}
+	return translateResult(method, resp, hostRev, legRev)
+}
+
+// translateErrorCode rewrites an upstream error's integer into the receiving host's spelling,
+// for the one code whose meaning moved between the revisions.
+//
+// # What moved
+//
+// 2025-11-25 assigns -32002 to resource-not-found. 2026-07-28 moves that meaning to -32602 and
+// frees -32002 into the implementation-defined band. So the same integer means different things
+// to the two peers, and a proxy that forwards it verbatim hands one peer a code from the other's
+// dictionary — a 2026-07-28 host reads -32002 as some implementation's private code and loses
+// the one fact the upstream was reporting.
+//
+// # Why only one direction
+//
+// Old to new is a WIDENING and safe: under 2025-11-25 the spec assigns -32002 exactly one
+// meaning, so reading it as resource-not-found is the conforming reading and the new spelling
+// says the same thing.
+//
+// New to old is a NARROWING and is deliberately NOT performed. Under 2026-07-28 the same -32602
+// carries both resource-not-found and JSON-RPC's own invalid-params, so the integer no longer
+// distinguishes them; remapping it to -32002 would assert "the resource does not exist" about
+// what may well have been a malformed request. Left alone, -32602 is still a code the old host
+// understands (invalid params) — less precise than the truth, but never a claim eunox invented.
+// Never fabricate on a peer's behalf is the boundary's rule, and this is the same rule applied to
+// an integer.
+//
+// # Why it is scoped to the methods that address a resource
+//
+// A -32002 arriving from `tools/call` is an upstream using the implementation-defined band as
+// 2025-11-25 permitted, not a missing resource, and rewriting it would be eunox inventing a
+// meaning. The scope is DERIVED from capability.MethodTargetType — the same mapping the audit
+// layer stamps `target_type` from — so a resource-addressing method added later is covered
+// without this being remembered.
+//
+// eunox's OWN denials never reach here: this wrapper sits at the upstream call, so every code it
+// sees came from the upstream. That is what makes reading -32002 as the spec's meaning safe
+// despite eunox spelling CAPABILITY_DENIED with the same integer.
+func translateErrorCode(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) mcp.RPCMsg {
+	if hostRev == upstreamAddressedRevision(legRev) || !declaresPerRequestRevision(hostRev) {
+		return resp
+	}
+	if target, ok := capability.MethodTargetType(method); !ok || target != capability.TargetTypeResource {
+		return resp
+	}
+	if resp.Error.Code != capability.ResourceNotFoundWireCode(upstreamAddressedRevision(legRev)) {
+		return resp
+	}
+	// Copied rather than mutated in place: resp.Error is a pointer into the decoded upstream
+	// message, and the caller's copy of that message is the one the reader may still hold.
+	rewritten := *resp.Error
+	rewritten.Code = capability.ResourceNotFoundWireCode(hostRev)
+	resp.Error = &rewritten
+	return resp
+}
+
 // resultCrossesToHost refuses an upstream result whose variant a non-declaring host cannot
 // read.
 //
@@ -339,7 +414,7 @@ func withCrossRevisionTranslation(legRev capability.Revision, inner func(context
 		if err != nil {
 			return resp, err
 		}
-		return translateResult(msg.Method, resp, hostRev, legRev)
+		return translateReply(msg.Method, resp, hostRev, legRev)
 	}
 }
 
