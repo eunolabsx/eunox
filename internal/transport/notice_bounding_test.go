@@ -264,6 +264,88 @@ func TestNoticeBounding_EveryOneShotSiteUsesTheLatch(t *testing.T) {
 	}
 }
 
+// reserveClaimEntryPoint is the reserve primitive itself: reserveSlot.claim, the one call that
+// spends a slot. Matched by name, which is what an AST walk can see without type information — and
+// the name is distinctive enough in this package that a collision fails this guard loudly rather
+// than passing it silently.
+const reserveClaimEntryPoint = "claim"
+
+// reserveClaimants is the CLOSED set of functions that may claim a reserveSlot, each stating the
+// direction it uses the primitive in. Three, and they are three different questions asked of one
+// re-arming slot: never re-arm at all (a latch), fold every occurrence inside the window (a
+// source-side collapse), deliver one line when the tier that would have carried it has nothing left
+// (a floor).
+//
+// It lives here rather than beside the primitive because it is a statement about SOURCE SHAPE —
+// which functions IMPLEMENT the mechanism — the same kind of statement noticeMechanism and
+// noticeEntryPoints make, and not the kind unmeteredNotices makes about production lines.
+//
+// Deliberately not narrowed to the diagnostic half, though the drift it is here to catch is a
+// diagnostic one: the refusal RECORDS' floor is the same primitive, and a fourth hand-rolled claim
+// there is the same three-latches state one axis over. Closing the primitive outright costs nothing
+// extra and needs no per-site judgment about whether a given claim is "beside a diagnostic", which
+// is a question this walk could not answer from the callee anyway.
+var reserveClaimants = map[noticeFunc]string{
+	"*noticeLatch.admitOnce":           "the one-shot direction: an interval that never elapses, so every occurrence after the first measures a zero elapsed time and is refused on one atomic load",
+	"noticeWriter.admitNotice":         "the collapse window, claimed ABOVE the class bucket so an occurrence it folds spends no token",
+	"*tieredBuckets[K].admitWithFloor": "the floor, in the opposite direction from the other two: the guaranteed arrival when the tier that would have carried the write has nothing left",
+}
+
+// TestNoticeBounding_EveryReserveClaimIsDeclared closes the reserve primitive to its declared
+// claimants, in both directions.
+//
+// This is the completeness gate the WINDOW half has instead of a vocabulary. A window is
+// metered-only: admitNotice reads the collapse disposition and an unmetered site never reaches
+// admitNotice, so a site wanting "one line per interval, and no class bucket" has no declaration to
+// write — and the shape it reaches for instead is a reserveSlot of its own beside its Fprintf.
+// That is exactly the state noticeLatch removed one axis over, where three sites each implemented
+// one idea: nothing recorded that the line was windowed, nothing stated the reason on either side,
+// and nothing failed when the next site forgot.
+//
+// Giving noticeDeclaration a collapse field and an interval with zero entries using it was the
+// alternative, and it is rejected for the reason a staging grammar string is: a vocabulary whose
+// only reader is a test is a mechanism nothing keeps honest, and what it compiles to is the
+// reserveSlot field it was meant to replace. So the gate goes on the PRIMITIVE rather than on a
+// declaration nobody writes. The first site that wants an unmetered window fails here, and the
+// failure names the remedy — extend the declaration, do not claim a fourth slot — which is what
+// makes the deferral a routed decision rather than an omission that expires quietly.
+//
+// Two-way for the reason the latch guard is: "claims without being declared" is the drift starting,
+// and "declared but claims nothing" is this table quietly ceasing to describe the mechanism.
+func TestNoticeBounding_EveryReserveClaimIsDeclared(t *testing.T) {
+	t.Parallel()
+	claiming, claims := map[noticeFunc]bool{}, 0
+	for _, src := range packageSources(t) {
+		for _, decl := range src.file.Decls {
+			fnDecl, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fnDecl.Body == nil {
+				continue
+			}
+			qualified := qualifiedFuncName(fnDecl)
+			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
+				call, isCall := n.(*ast.CallExpr)
+				if !isCall || callName(call) != reserveClaimEntryPoint {
+					return true
+				}
+				claims++
+				claiming[qualified] = true
+				if _, isDeclared := reserveClaimants[qualified]; !isDeclared {
+					t.Errorf("%s:%d: %s claims a reserve slot but is not one of its declared claimants; a diagnostic that wants a window takes it through its own declaration — extend noticeDeclaration (the unmeteredNotices value) with a collapse disposition and its interval, and lift the window above admitNotice's metering branch — rather than holding a slot of its own where nothing records that the line is windowed, nothing states the reason, and nothing fails when the next site forgets. Metering it instead is NOT the remedy: a class bucket is a peer-driven budget, and charging one for a line no peer drives takes tokens from the lines the class split exists to keep legible",
+						src.name, src.fset.Position(call.Pos()).Line, qualified)
+				}
+				return true
+			})
+		}
+	}
+	require.Positive(t, claims, "no %s call was found in any non-test file; this guard would pass vacuously", reserveClaimEntryPoint)
+	for fn, why := range reserveClaimants {
+		assert.True(t, claiming[fn],
+			"%s is declared a reserve claimant but claims nothing; a declaration nothing reaches stops describing the mechanism it was written about", fn)
+		assert.NotEmpty(t, why,
+			"%s claims the reserve primitive with no stated direction; the three claimants ask three different questions of one slot, and which one this is cannot be read off the call", fn)
+	}
+}
+
 // noticeEntryPointCall reports whether n is a call to one of the mechanism's site-taking entry
 // points, and its arguments. Both spellings are matched — the package function and the method — so
 // adding an entry point is a table edit rather than a second walk.

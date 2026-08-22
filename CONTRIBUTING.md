@@ -301,7 +301,12 @@ rules:
   `gopkg.in/yaml.v3`'s upstream is archived; it is retained because it is
   stable and has no open advisory, but track a maintained replacement and plan a
   migration before any future advisory forces one. Run a vulnerability scan
-  (`govulncheck ./...`) as part of release prep.
+  (`make vulncheck`) as part of release prep — it fails on a called advisory in a
+  module we depend on, and reports stdlib/toolchain advisories without failing,
+  because those are fixed by moving the Go pin rather than by a branch. Anything it
+  reports but does not gate on belongs in
+  [`docs/dependency-advisories.md`](./docs/dependency-advisories.md), either resolved
+  by a bump or recorded with the reason it does not apply.
 
 ---
 

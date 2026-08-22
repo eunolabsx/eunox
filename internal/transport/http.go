@@ -243,8 +243,18 @@ type HTTPProxy struct {
 	// authTimingKey is a per-process random HMAC key folding presented/expected tokens to a
 	// fixed-length MAC before the constant-time comparison. See constantTimeTokenEqual.
 	authTimingKey []byte
-	// preSessionDenies bounds the rate of transport-level refusal records — the only audit
-	// writes an unauthenticated caller can trigger, else a lever on --require-audit=strict.
+	// preSessionDenies is the PROXY-WIDE refusal-record table. The name is historical and now
+	// undersells it: it is charged by three different sources, not one.
+	//
+	//   - the pre-session refusals it was built for — the only audit writes an UNAUTHENTICATED
+	//     caller can trigger, and so a lever on --require-audit=strict;
+	//   - the -32022 revision refusal, which an ESTABLISHED session's traffic reaches;
+	//   - and every session's own upstream-driven table, for which this is the aggregate parent
+	//     holding the total at the pre-split ceiling (see newUpstreamRefusalLimiter).
+	//
+	// Left named for the first because the field is threaded through the leg wiring in a dozen
+	// places and a rename buys nothing the doc does not; what mattered was that the doc claimed
+	// a scope two of its three charge sources fall outside.
 	preSessionDenies *categoryRecordLimiter
 	// notices is the AGGREGATE stderr-diagnostic table: one bucket per notice CLASS, charged
 	// directly by every leg with no route in scope and as the parent of each route's own table.
@@ -459,6 +469,10 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	// aggregate: a route arriving through the exported Routes seam from somewhere other than
 	// BuildRoutes would otherwise get a repaired bucket table beside nil collapse windows, which
 	// reads as correctly wired and silently restores the per-frame flood.
+	// Validated over the WHOLE map before anything is mutated. The loop below writes in place
+	// on values the caller still holds, so validating and mutating in one pass left the routes
+	// ahead of a rejected one already bound and re-pointed — a panic the caller cannot act on
+	// without knowing which half of its map this constructor got through.
 	for name, route := range p.routes {
 		// Routes is a caller-populated map, which requireUsableOptions cannot reach into (it walks
 		// interface FIELDS), so the nil value it may hold is refused here rather than dereferenced
@@ -473,7 +487,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		// look through a pointer: what a caller-built subsystem holds inside itself is its own
 		// package's business, and a route is this package's.
 		requireUsable(fmt.Sprintf("HTTPGatewayOptions.Routes[%q].pdp", name), route.pdp)
-		// And a route already claimed by another proxy is refused rather than taken over: the two
+		// And a route already claimed by another proxy is refused rather than taken over: the
 		// assignments below are IN PLACE on a value the caller still holds, so a second proxy over
 		// the same map silently repoints the first's diagnostics and re-arms its collapse windows.
 		// See UpstreamRoute.boundProxy. Build a fresh set (BuildRoutes) per proxy.
@@ -483,6 +497,8 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 					"per-upstream diagnostic state that a second proxy would take over, silencing the first's "+
 					"lines and re-arming its collapse windows. Build routes per proxy.", name))
 		}
+	}
+	for _, route := range p.routes {
 		route.boundProxy = true
 		route.notices = newRouteNoticeLimiter(p.notices)
 		route.noticeCollapse = newNoticeCollapse()

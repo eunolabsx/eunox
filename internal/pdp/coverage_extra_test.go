@@ -318,23 +318,23 @@ func TestRecordAuditModeAntecedent_RecordsOnlyOnAuditDeny(t *testing.T) {
 	enforced := &capability.Constraint{Target: "tool:t", Actions: []string{"call"}}
 
 	// No-op: an enforced (not audit-only) deny — the tool never ran.
-	recordAuditModeAntecedent(context.Background(), engine, nil, req, enforced,
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, enforced, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny})
 	// No-op: audit-only but an allow — already recorded inside the engine.
-	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly, true,
 		&capability.EnforceResponse{Decision: capability.DecisionAllow})
 	require.Equal(t, 0, counter.writes, "no antecedent must be recorded on the no-op paths")
 
 	// Recording path: an audit-mode deny still forwards and runs the tool, so the
 	// antecedent must be recorded for a later sequenceBlock Peek.
-	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny})
 	require.Equal(t, 1, counter.writes, "an audit-mode deny must record exactly one antecedent")
 
 	// No-op: an audit-mode deny carrying the producer's override is NOT downgraded — the tool
 	// never runs — so recording it would poison history with a phantom antecedent a
 	// later sequenceBlock reads as "ran", spuriously blocking a downstream call.
-	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{BlockOverride: true}})
 	require.Equal(t, 1, counter.writes, "an overridden audit-mode deny must NOT record an antecedent (the tool never ran)")
 
@@ -344,13 +344,13 @@ func TestRecordAuditModeAntecedent_RecordsOnlyOnAuditDeny(t *testing.T) {
 	// "forwarded" and commit an antecedent for a call that never ran. Reachable from any
 	// denial constructor that does not stamp the bool — a transport-layer literal, an
 	// out-of-tree PDP.
-	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny,
 			Denial: &capability.DenialInfo{Code: capability.ErrCodeEnforcementError}})
 	require.Equal(t, 1, counter.writes, "a fault-class deny is blocked by its CODE, so it must not record an antecedent either")
 
 	// And a revocation, the third shape: an emergency stop never forwards.
-	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly,
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, auditOnly, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny,
 			Denial: &capability.DenialInfo{Code: capability.ErrCodeKillSwitch}})
 	require.Equal(t, 1, counter.writes, "a revoked call never runs, so it leaves no antecedent")
@@ -374,8 +374,9 @@ func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelInternal}}},
 	}
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, prior)
-	require.NoError(t, err)
+	_, cerr := engine.RecordSourceCall(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, prior,
+		enforcement.SourceCommitScope{Flow: true}, nil)
+	require.Nil(t, cerr)
 
 	// An audit-only source read that labels its output "confidential", hitting a
 	// downgradable deny with no labels stamped yet (the structural early-return shape).
@@ -387,7 +388,7 @@ func TestRecordAuditModeAntecedent_BackfillsFlowLabels(t *testing.T) {
 	}
 	req := &capability.EnforceRequest{SessionID: "s", TargetName: "t"}
 	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}
-	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, src, resp)
+	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, src, true, resp)
 
 	require.Nil(t, override, "a clean record must not override the downgrade")
 	assert.Equal(t, []string{capability.FlowLabelConfidential}, resp.LabelsOut,
@@ -414,14 +415,15 @@ func TestRecordAuditModeAntecedent_NonFlowConstraintNoLabels(t *testing.T) {
 		Actions:    []string{"call"},
 		Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}},
 	}
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, src)
-	require.NoError(t, err)
+	_, cerr := engine.RecordSourceCall(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "a"}, src,
+		enforcement.SourceCommitScope{Flow: true}, nil)
+	require.Nil(t, cerr)
 
 	// A non-flow audit-only constraint hits a downgradable deny in the SAME tainted session.
 	nonFlow := &capability.Constraint{Target: "tool:ping", Actions: []string{"call"}, Enforcement: capability.EnforcementAudit}
 	req := &capability.EnforceRequest{SessionID: "s", TargetName: "ping"}
 	resp := &capability.EnforceResponse{Decision: capability.DecisionDeny}
-	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, nonFlow, resp)
+	override := recordAuditModeAntecedent(ctx, engine, engine.Clock(), req, nonFlow, true, resp)
 
 	require.Nil(t, override, "a clean record must not override the downgrade")
 	assert.Nil(t, resp.CarriedLabels, "a non-flow constraint must not stamp carried_labels, matching its genuine-allow record")
@@ -597,25 +599,25 @@ func TestDecodeJWTClaimsPreservingNumbers_Malformed(t *testing.T) {
 	t.Parallel()
 
 	// Not 3 segments.
-	_, err := decodeJWTClaimsPreservingNumbers("only.two")
+	_, err := decodeJWTClaimsFromToken("only.two")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expected 3 segments")
 
 	// 3 segments but the payload is not valid base64url.
-	_, err = decodeJWTClaimsPreservingNumbers("aaa.!!!notbase64!!!.ccc")
+	_, err = decodeJWTClaimsFromToken("aaa.!!!notbase64!!!.ccc")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decoding JWT payload segment")
 
 	// 3 segments, valid base64url, but the payload is not a JSON object.
 	// base64url("not json") with no padding.
 	badPayload := "header." + b64url("not json") + ".sig"
-	_, err = decodeJWTClaimsPreservingNumbers(badPayload)
+	_, err = decodeJWTClaimsFromToken(badPayload)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decoding claims")
 
 	// Happy path: a JSON object decodes, preserving a large integer as json.Number.
 	okPayload := "header." + b64url(`{"big":9007199254740993}`) + ".sig"
-	claims, err := decodeJWTClaimsPreservingNumbers(okPayload)
+	claims, err := decodeJWTClaimsFromToken(okPayload)
 	require.NoError(t, err)
 	n, ok := claims["big"].(json.Number)
 	require.True(t, ok, "large integer must decode as json.Number, got %T", claims["big"])

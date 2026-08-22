@@ -96,6 +96,13 @@ The GitHub Actions workflow (`.github/workflows/go-ci.yml`) runs:
 - Tests with race detector and 80% coverage threshold for `pkg/`
 - Apache-2.0 license header check
 - Cross-compilation (linux/amd64, linux/arm64, darwin/arm64, windows/amd64, windows/arm64)
+- `govulncheck`, gating only on a called advisory in a module we depend on
+
+A second workflow (`.github/workflows/vuln-scheduled.yml`) re-runs the vulnerability
+scan daily against `main` and opens a tracking issue for what the PR gate deliberately
+does not block on — stdlib and toolchain advisories, which are fixed by moving the Go
+pin, and findings the code does not call. The split and the standing record of those
+findings are in [dependency-advisories.md](./dependency-advisories.md).
 
 ## Local Development Stack
 

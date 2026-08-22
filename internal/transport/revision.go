@@ -50,6 +50,21 @@ var errUnhonorableUpstreamRevision = errors.New("request revision cannot be hono
 // peer inherited a revision whose own rule is that inheritance is not enough.
 var errUndeclaredOnDeclaringLeg = errors.New("request inherited a revision that requires a per-request declaration, and carries none")
 
+// errUndecodableForwardedParams marks a message this build refused whole — a duplicate object
+// key, the one rejection a conforming peer does not share — whose bytes nevertheless travel to
+// the upstream with nothing re-reading them.
+//
+// mcp.DeclaredRevision cannot say what such a body declares, and "eunox could not read it" is
+// not "it declares nothing": a peer adds a throwaway duplicate key to make this proxy's decoder
+// bail while leaving a clean io.modelcontextprotocol/protocolVersion in `_meta` for the
+// upstream's last-wins parser to read. Every gate downstream then compares an INHERITED revision the forwarded bytes
+// contradict — errRevisionMismatch and checkUpstreamHonorable both pass, and on a remote leg
+// eunox stamps an MCP-Protocol-Version header naming a revision other than the one the body it
+// is carrying declares. That is the enforcement-versus-upstream parser differential
+// mcp.DecodeParams exists to close, so the framing-blind fallback must not reopen it for the
+// framings DecodeParams never gets a second look at.
+var errUndecodableForwardedParams = errors.New("params this proxy forwards verbatim could not be decoded, so the protocol revision they declare to the upstream cannot be established")
+
 // hostLeg is what revision negotiation needs to know about the connection a message arrived on.
 //
 // A struct rather than three parameters because the SESSIONLESS arms supply mostly zero values,
@@ -94,8 +109,9 @@ type hostLeg struct {
 // For the REQUEST framing the kill check must be taken AFTER the decision turn, freshly, so a
 // kill landing during an unbounded wait is recorded as KILL_SWITCH rather than as the method's
 // own refusal; a prologue-level answer would be the stale one. That is why the request framing
-// takes it inside dispatchRequest and enforcedForwardCore, and why the notification framing —
-// which waits for nothing — can and does take it here-adjacent, in hostNotificationGate.
+// takes it inside dispatchRequest and enforcedForwardCore, and why the notification framing
+// takes it here-adjacent, in hostNotificationGate — which suffices only where nothing waits
+// after it. stdio's ordering barrier does, so that leg re-checks past it.
 type hostMessageGate struct {
 	// leg is the connection's own answer to what negotiation needs to know.
 	leg hostLeg
@@ -160,6 +176,19 @@ func (g hostMessageGate) negotiate(ctx context.Context, msg mcp.RPCMsg) (capabil
 // checkUpstreamHonorable for what it gates.
 func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg) (capability.Revision, error) {
 	declared, present, err := mcp.DeclaredRevisionOf(msg)
+	// UNREADABLE is a third answer, not an absence: this build refused a body a conforming peer
+	// reads fine, so what it declares is unknown. Refused outright where those bytes travel
+	// unread (checkUndecodableForwarded); otherwise the message is on its way to a handler that
+	// re-decodes and denies it, so it resolves as an undeclared one does — the malformed body
+	// chooses no table, and the target-bearing INVALID_REQUEST its handler writes is not
+	// replaced by a version failure.
+	unreadable := errors.Is(err, mcp.ErrUndecodableDeclaration)
+	if unreadable {
+		if fwdErr := checkUndecodableForwarded(legRev, msg); fwdErr != nil {
+			return "", fwdErr
+		}
+		declared, present, err = "", false, nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -181,11 +210,33 @@ func resolveHostRevision(contextRev, legRev capability.Revision, msg mcp.RPCMsg)
 		if err := checkUpstreamHonorable(resolved, legRev); err != nil {
 			return "", err
 		}
-		if err := checkDeclarationReachesUpstream(resolved, legRev, msg, present); err != nil {
+		// present || unreadable, not present: that check refuses a message for carrying NO
+		// declaration, and an unreadable body has not been established to carry none — the
+		// absence above is this decoder's, not the peer's. Passing the manufactured one made a
+		// malformed tools/call on a declaring leg refuse -32022 as errUndeclaredOnDeclaringLeg,
+		// which is the exact relabelling the unreadable arm exists to avoid, on the one leg
+		// revision the tests for it did not cover. Nothing is lost by skipping: the handler
+		// denies these bytes before they reach the upstream that would have wanted the member.
+		if err := checkDeclarationReachesUpstream(resolved, legRev, msg, present || unreadable); err != nil {
 			return "", err
 		}
 	}
 	return resolved, nil
+}
+
+// checkUndecodableForwarded refuses a message whose members this build alone refused and whose
+// bytes reach the upstream unread. See errUndecodableForwardedParams for what such a
+// message can otherwise smuggle past enforcement, and unreadParamsReachUpstream for why the
+// question is asked of three framings rather than of every message whose params travel.
+//
+// A leg with no revision ("") has no upstream for the bytes to reach — the sessionless arms —
+// which is the same window checkUpstreamHonorable declines to judge, and for the same reason:
+// refusing there would deny a message on the strength of a forward that never happens.
+func checkUndecodableForwarded(legRev capability.Revision, msg mcp.RPCMsg) error {
+	if legRev == "" || !unreadParamsReachUpstream(msg) {
+		return nil
+	}
+	return errUndecodableForwardedParams
 }
 
 // checkDeclarationReachesUpstream refuses a message that would arrive at a declaring upstream
@@ -211,8 +262,11 @@ func checkDeclarationReachesUpstream(resolved, legRev capability.Revision, msg m
 	if !declaresPerRequestRevision(resolved) {
 		return nil
 	}
-	return fmt.Errorf("%w: %s requires io.modelcontextprotocol/protocolVersion in every request's _meta, and eunox forwards params verbatim rather than adding one",
-		errUndeclaredOnDeclaringLeg, resolved)
+	// The key is named from capability's own constant rather than spelled out: this text is
+	// echoed to the peer verbatim (revisionRefusalReason allowlists it), and a message telling a
+	// host which member to add is worthless if the spelling drifts from the one the decoder reads.
+	return fmt.Errorf("%w: %s requires %s in every request's _meta, and eunox forwards params verbatim rather than adding one",
+		errUndeclaredOnDeclaringLeg, resolved, capability.MetaKeyProtocolVersion)
 }
 
 // upstreamAddressedRevision is the revision this proxy PRESENTS to an upstream leg: the one
@@ -269,12 +323,13 @@ func checkUpstreamHonorable(resolved, legRev capability.Revision) error {
 // other caller-supplied value.
 func revisionRefusalReason(err error) string {
 	// One condition, not an arm per sentinel: what this function protects is the ALLOWLIST of
-	// errors whose text is safe to echo, and all of these are (each names only the failure
-	// class and version strings — the peer's own, already matched against a closed set, and
-	// this proxy's own leg revisions). Anything else collapses to a fixed string rather than
-	// leaking an unreviewed message.
+	// errors whose text is safe to echo, and all of these are (each names the failure class and
+	// at most version strings — the peer's own, already matched against a closed set, and this
+	// proxy's own leg revisions). Anything else collapses to a fixed string rather than leaking
+	// an unreviewed message.
 	if errors.Is(err, errRevisionMismatch) || errors.Is(err, mcp.ErrUnknownRevision) ||
-		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUnhonorableUpstreamRevision) {
+		errors.Is(err, mcp.ErrConflictingRevision) || errors.Is(err, errUnhonorableUpstreamRevision) ||
+		errors.Is(err, errUndecodableForwardedParams) || errors.Is(err, errUndeclaredOnDeclaringLeg) {
 		return err.Error()
 	}
 	return "protocol revision could not be established"

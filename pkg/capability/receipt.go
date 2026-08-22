@@ -215,6 +215,13 @@ const (
 // also have signed with it, so a receipt "verified" against one proves nothing about which
 // party produced it — the same reason every other JWS in this package is asymmetric-only.
 func NewEffectReceiptVerifier(jwksJSON []byte, maxAge, leeway time.Duration) (*EffectReceiptVerifier, error) {
+	// The operator configured this key set for one upstream and read it before doing so;
+	// a second, case-variant spelling of "keys" (or of a key's own "x"/"kty") would hand
+	// the unmarshal below a different key domain than the one they reviewed, with nothing
+	// in the file's appearance to show it. Same refusal the registry's trust store takes.
+	if err := RefuseAmbiguousJSONKeys(jwksJSON); err != nil {
+		return nil, fmt.Errorf("parsing effect-receipt JWKS: %w", err)
+	}
 	var ks jose.JSONWebKeySet
 	if err := json.Unmarshal(jwksJSON, &ks); err != nil {
 		return nil, fmt.Errorf("parsing effect-receipt JWKS: %w", err)

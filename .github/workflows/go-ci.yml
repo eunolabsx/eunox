@@ -302,6 +302,19 @@ jobs:
           path: bench-ci.txt
           retention-days: 30
 
+  # Gates on what a branch can fix, and only that. govulncheck queries a LIVE
+  # database, so a pinned toolchain goes red on the calendar rather than on a commit:
+  # the next stdlib advisory turns every open PR red simultaneously, none of them at
+  # fault and none able to fix it, because the fix is a toolchain bump that no
+  # contributor's branch should be carrying. A red check nobody's diff caused becomes
+  # the normal state and stops being read, which costs the findings that ARE a branch's
+  # fault the attention they need.
+  #
+  # So this job gates on a called advisory in a module we depend on -- the finding the
+  # scan exists for -- and reports stdlib/toolchain advisories without failing. The
+  # scheduled counterpart (.github/workflows/vuln-scheduled.yml) is what carries those
+  # to an issue, so the toolchain bump is tracked as work rather than as tree-wide red.
+  # Non-called findings are reported at both and tracked in docs/dependency-advisories.md.
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
@@ -313,10 +326,32 @@ jobs:
           go-version: "1.26.6"
           cache-dependency-path: go.sum
 
+      # Runs first and needs no network: it proves the classifier still gates on the
+      # right bucket. If the split itself is broken, a green scan below means nothing.
+      - name: Check the govulncheck classifier against captured streams
+        run: make check-vulncheck-classifier
+
+      # The scanner version is pinned in the Makefile (GOVULNCHECK_VERSION), which the
+      # script reads -- one source, same rule as golangci-lint -- so a tool regression
+      # cannot silently change results between runs.
+      #
+      # The step publishes the summary and THEN re-raises the gate's exit code, which the
+      # obvious one-liner gets wrong twice: --summary-out truncates its target, so
+      # appending is what keeps an earlier step's summary; and the run block is `bash -e`,
+      # so a plain `script && cat` would skip the summary on exactly the failing run whose
+      # findings a reader needs.
       - name: Run govulncheck
-        # Pinned (not @latest) so the scanner version is reproducible: a tool
-        # regression cannot silently change results between runs.
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.4.0 ./...
+        run: |
+          set +e
+          ./scripts/govulncheck.sh --mode gate --summary-out summary.md
+          rc=$?
+          set -e
+          # An `if` rather than `[ -f ] && cat`: a failing test in an AND list makes the
+          # list nonzero, and there is no summary to publish when the scan itself died.
+          if [ -f summary.md ]; then
+            cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
 
   vulnerability-scan:
     name: Trivy Vulnerability Scan

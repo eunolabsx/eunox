@@ -2955,8 +2955,8 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 	badOutput := filepath.Join(blocker, "manifest.yaml")
 
 	code := cmdSuggest([]string{"--audit-log", logPath, "--output", badOutput})
-	if code != 1 {
-		t.Errorf("expected exit code 1 (WriteFile failed), got %d", code)
+	if code != suggestUsageExit {
+		t.Errorf("expected exit code %d (a refused --output is a file error, not a finding about the tape — init exits the same way for the identical failure), got %d", suggestUsageExit, code)
 	}
 }
 
@@ -3238,5 +3238,29 @@ upstreams:
 	writeDoctorManifests(&buf, cfg, nil)
 	if !strings.Contains(buf.String(), "WOULD FAIL CLOSED") || !strings.Contains(buf.String(), "audience pin") {
 		t.Errorf("expected a WOULD FAIL CLOSED line naming the audience pin:\n%s", buf.String())
+	}
+}
+
+// TestCmdValidate_ProtocolVersionRequiresLive is the silently-inert-flag regression.
+// --upstream-protocol-version selects how to reach a LIVE upstream, so it belongs to the set
+// the binary rejects rather than silently drops — it was the one exception, which meant a
+// typo'd revision validated clean under both `--config` and a bare `validate` while selecting
+// nothing at all.
+func TestCmdValidate_ProtocolVersionRequiresLive(t *testing.T) {
+	dir := t.TempDir()
+	mfPath := filepath.Join(dir, "m.yaml")
+	if err := os.WriteFile(mfPath, []byte("schemaVersion: \"0.1\"\ncapabilities: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdValidate([]string{"--upstream-protocol-version", "2026-07-28", mfPath}); code != 2 {
+		t.Errorf("without --live: exit %d, want 2 (an unpaired upstream flag is rejected, not inert)", code)
+	}
+
+	cfgPath := filepath.Join(dir, "eunox.yaml")
+	if err := os.WriteFile(cfgPath, []byte("transport: stdio\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdValidate([]string{"--config", cfgPath, "--upstream-protocol-version", "2026-07-28"}); code != 2 {
+		t.Errorf("under --config: exit %d, want 2 (each route's own protocolVersion is used, so the flag must be refused)", code)
 	}
 }

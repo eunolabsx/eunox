@@ -2434,14 +2434,15 @@ func (s *Sink) setRetentionStalled(reason string) {
 // this is NOT an audit-integrity loss and deliberately does not feed the
 // --require-audit=strict gate (see AuditDegraded). It means the configured
 // rotateSizeBytes/retainRotated disk bound is currently not being enforced, so the log
-// will grow without limit until the underlying fault is fixed. Surfaced by /healthz,
-// /metrics, and doctor so an operator sees it before the filesystem fills.
+// will grow without limit until the underlying fault is fixed. Reported to an operator
+// through Health(), which is the sink's ONE reading — /healthz, /metrics and doctor render
+// that sample rather than asking here.
 //
 // Rotation and retention stall independently, so both can be reported at once: the
 // reason names each stalled subsystem, in a fixed rotation-then-retention order (never
 // "whichever failed most recently") so the reported text depends only on what is
 // currently wrong, not on the order the faults appeared in.
-func (s *Sink) MaintenanceStalled() (stalled bool, reason string) {
+func (s *Sink) maintenanceStalled() (stalled bool, reason string) {
 	if s == nil {
 		return false, ""
 	}

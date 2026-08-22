@@ -296,7 +296,7 @@ func TestRecordAuditModeAntecedent_RouteAuditRecordsEnforcedConstraint(t *testin
 	enforced := &capability.Constraint{Target: "tool:t", Actions: []string{"call"}}
 
 	// Enforce route (no skipQuota): an enforced-constraint deny records nothing.
-	recordAuditModeAntecedent(context.Background(), engine, nil, req, enforced,
+	recordAuditModeAntecedent(context.Background(), engine, nil, req, enforced, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny})
 	if counter.writes != 0 {
 		t.Fatalf("writes = %d, want 0 on an enforce route", counter.writes)
@@ -304,7 +304,7 @@ func TestRecordAuditModeAntecedent_RouteAuditRecordsEnforcedConstraint(t *testin
 
 	// Whole-route --audit (skipQuota): the same deny is forwarded, so record its antecedent.
 	ctxAudit := enforcement.WithSkipQuota(context.Background())
-	recordAuditModeAntecedent(ctxAudit, engine, nil, req, enforced,
+	recordAuditModeAntecedent(ctxAudit, engine, nil, req, enforced, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny})
 	if counter.writes != 1 {
 		t.Fatalf("writes = %d, want 1 (route --audit must record the antecedent)", counter.writes)
@@ -312,7 +312,7 @@ func TestRecordAuditModeAntecedent_RouteAuditRecordsEnforcedConstraint(t *testin
 
 	// A BlockOverride is never downgraded — the tool never ran — so it records nothing even
 	// under route audit.
-	recordAuditModeAntecedent(ctxAudit, engine, nil, req, enforced,
+	recordAuditModeAntecedent(ctxAudit, engine, nil, req, enforced, true,
 		&capability.EnforceResponse{Decision: capability.DecisionDeny, Denial: &capability.DenialInfo{BlockOverride: true}})
 	if counter.writes != 1 {
 		t.Fatalf("writes = %d, want 1 (a BlockOverride must not record even under route audit)", counter.writes)

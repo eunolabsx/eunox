@@ -16,9 +16,11 @@
 // taken FRESH after the decision turn — a kill landing during an unbounded wait has to be
 // recorded as KILL_SWITCH rather than as the method's own refusal, and a prologue-level answer
 // would be the stale one. So the request framing takes it inside dispatchRequest and
-// enforcedForwardCore, and the notification framing — which waits for nothing — takes it in
-// hostNotificationGate. See hostMessageGate's doc for what the two transports still hold of
-// their own, and why.
+// enforcedForwardCore, and the notification framing takes it in hostNotificationGate — where
+// the check is the WHOLE answer only for a leg that then forwards immediately. A transport
+// whose notification path waits after the gate owes the same fresh re-check the request framing
+// does: stdio's wire-ordering barrier is one (see forwardHostNotification), and it takes it.
+// See hostMessageGate's doc for what the two transports still hold of their own, and why.
 //
 //  1. REVISION negotiation (resolveHostRevision / refuseHostRevision). First, because every
 //     table below is revision-scoped: a message whose revision cannot be established has no
@@ -117,7 +119,7 @@ func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
 // method's own refusal.
 func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if deny := d.pdp.CheckKill(ctx, d.sessionID); deny != nil {
-		return recordKillDenial(ctx, d.rec, deny, msg.ID, verifiedSession(d.sessionID), msg.Method), true
+		return recordKillDenial(ctx, d.rec, deny, msg, verifiedSession(d.sessionID)), true
 	}
 	return mcp.RPCMsg{}, false
 }
@@ -203,6 +205,38 @@ func paramsReachUpstream(msg mcp.RPCMsg) bool {
 		return true
 	}
 	return forwardsHostParams(msg.Method)
+}
+
+// unreadParamsReachUpstream narrows paramsReachUpstream to the messages whose bytes travel on
+// with NOTHING in this proxy re-decoding them first — the exact class for which
+// mcp.DeclaredRevision's "the method handler denies these bytes moments later" argument does
+// not hold, and therefore the class an unreadable body may not be read as an undeclared one.
+//
+// A request routed to a Decide handler is the one message that argument covers: the handler
+// runs mcp.DecodeParams over the same bytes and answers a target-bearing malformedDeny. Three
+// shapes it does not, and the registry cannot merge them because two are not per-method facts
+// at all: a host RESPONSE (relayed verbatim, never dispatched), a notifyForward NOTIFICATION,
+// and a LocalForwards REQUEST — the */list methods, whose handler hands msg to the upstream
+// untouched and filters only the reply.
+//
+// DERIVED from paramsReachUpstream so it can never claim a message that gate does not, then
+// narrowed by FRAMING within it. The narrowing is load-bearing rather than tidiness: that gate
+// asks its per-method half as one OR over the three handler fields, so it reports true for a
+// Decide method in notification framing and for a notifyForward method in request framing —
+// two pairings this proxy REFUSES rather than forwards, whose bytes therefore reach nobody to
+// disagree with.
+func unreadParamsReachUpstream(msg mcp.RPCMsg) bool {
+	if !paramsReachUpstream(msg) {
+		return false
+	}
+	if msg.IsResponse() {
+		return true
+	}
+	spec := methodRegistry[msg.Method]
+	if msg.IsRequest() {
+		return spec.Decide == nil && spec.LocalForwards
+	}
+	return spec.Notification == notifyForward
 }
 
 // forwardsHostParams reports whether method's own params reach the upstream, in either
@@ -545,6 +579,23 @@ func resolveRevision(rev capability.Revision) capability.Revision {
 	return capability.DefaultRevision
 }
 
+// ensureProtocolRevision stamps rev onto ctx unless the carrier already holds one, so a leg that
+// stamps defensively for a direct caller costs the production path nothing and cannot overwrite
+// the revision the request was actually decided under with a session-level pin.
+//
+// An EMPTY rev stamps nothing, deliberately: it is not resolveRevision's empty-carrier rule
+// spelled a second time. That rule answers "which method table routes this message", where the
+// surface eunox already shipped is the only safe default; this one answers "what did the record
+// say was negotiated", where an absent revision MEANS "written before one could be resolved" —
+// so defaulting here would put a revision on the tape for a connection that never negotiated
+// one, which is exactly the false claim the stamp was added to remove.
+func ensureProtocolRevision(ctx context.Context, rev capability.Revision) context.Context {
+	if rev == "" || capability.ProtocolRevisionFromContext(ctx) != "" {
+		return ctx
+	}
+	return capability.WithProtocolRevision(ctx, rev)
+}
+
 // tablesFromContext returns the routing tables for the revision the request was negotiated
 // under. Re-derived from the single carrier at each lookup rather than resolved once and
 // passed alongside it: a carried copy is exactly the second carrier this seam exists to
@@ -658,7 +709,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 		return notificationSwallowed
 	}
 	if kill := g.checkKill(); kill != nil {
-		recordKillDrop(ctx, g.recorders.forCategory(catKill), kill, g.subject, msg.Method, msg.Method, g.leg)
+		recordKillDrop(ctx, g.recorders.forCategory(catKill), kill, g.subject, msg, g.leg)
 		return notificationRefused
 	}
 	if swallowed {
@@ -789,8 +840,11 @@ func dispatchPing(msg mcp.RPCMsg) mcp.RPCMsg {
 // malformedDeny records a fail-closed audit deny for an enforced request rejected BEFORE the
 // PDP (unparseable params, empty target), so a probe with malformed input isn't invisible to
 // an auditor. Uses codeInvalidRequest, not capability.ErrCodeInvalidParams — the real target
-// never parsed, so IsInfraDenialCode lets suggest skip it rather than fabricate a phantom
-// target like "tool:tools/call".
+// never parsed, so IsInfraDenialCode lets suggest skip it.
+//
+// The identifier comes from auditIdentity for the same reason: every method reaching here
+// RESOLVES a target type (they are the enforced ones), so passing the method through made the
+// sink synthesize the phantom `tool:tools/call` this comment used to claim it avoided.
 func (d dispatchParams) malformedDeny(ctx context.Context, msg mcp.RPCMsg, reason string) mcp.RPCMsg {
 	// Kill gate FIRST: the malformed path is a Decide* method (skips the boundary gate) that's
 	// rejected before the PDP (never reaches enforcedForwardCore's own check), so without this
@@ -800,7 +854,8 @@ func (d dispatchParams) malformedDeny(ctx context.Context, msg mcp.RPCMsg, reaso
 		return resp
 	}
 	if d.rec != nil {
-		d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, codeInvalidRequest, "", nil, false)
+		identifier, method := auditIdentity(msg)
+		d.rec.RecordDeny(ctx, d.sessionID, identifier, method, codeInvalidRequest, "", nil, false)
 	}
 	return mcp.ErrorResponse(msg.ID, jsonRPCCodeInvalidParams, reason)
 }

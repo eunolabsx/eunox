@@ -136,6 +136,21 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	// provenance: this is what the delegators DECIDED this delegate is, on a verified token
 	// the delegate can't edit, vs. a cooperating agent describing its own inputs. Used for
 	// THIS check only, never persisted.
+	//
+	// An unrecognized forced label DENIES rather than being normalized away, which is what
+	// separates this set from the client attribution above. A voluntary declaration may be
+	// dropped safely — an unknown label there could only have added denials. A delegator's
+	// forced label is a decision, so dropping it REMOVES taint and lets a sink that should
+	// have denied allow. Surfaced against the RAW grants, mirroring the authored-'allow' check
+	// at the top of this function: ValidateDelegationChain already refuses such a token, so
+	// this fires only for an embedder that built a chain without it.
+	if unknown := req.Delegation.UnknownForcedLabels(); len(unknown) > 0 {
+		return &ConditionError{
+			Code:          capability.ErrCodeEnforcementError,
+			ConditionType: capability.ConditionTypeFlowLabel,
+			Message:       fmt.Sprintf("delegation chain forces unknown flow label(s) %v; valid native labels are %v — a forced label cannot be normalized away, since dropping it would remove taint the delegators imposed", unknown, flowLabelVocab),
+		}
+	}
 	forced := req.Delegation.ForcedLabels()
 	present = unionLabels(present, forced)
 
@@ -306,13 +321,6 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 	return out, nil
 }
 
-// RecordLabels is the exported form of recordLabels for the audit-mode antecedent path: when
-// a downgraded audit-mode source's read is forwarded, its labelOutput labels must still be
-// recorded (or a later ENFORCED sink Gets empty and fails open) and surfaced as labels_out.
-func (e *Engine) RecordLabels(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint) ([]string, error) {
-	return e.recordLabels(ctx, req, matched)
-}
-
 // intersectLabels returns the members of want present in held, in want's order.
 //
 // Bounds an approved declassification's clear to the taint the decision actually OBSERVED —
@@ -377,16 +385,16 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // Every write fails closed on its own fault, mapped to a SourceCommitError. recordLabels and
 // RecordSessionCall each self-guard when the policy doesn't need them, so a flow-only or
 // seq-only policy does exactly one write and needs no rollback.
-func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string, decl declassifyOutcome) (labelsOut []string, cerr *SourceCommitError) {
+func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, scope SourceCommitScope, carriedLabels []string, decl declassifyOutcome) (labelsOut []string, cerr *SourceCommitError) {
 	if e.anchorUnresolved(req) {
 		// evaluateMatched already refuses this well before the allow tail; this is a
 		// backstop, and also the entry point the PDP's audit-mode antecedent path uses for
 		// a deny that never ran the decision at all. Falling back to session keying here
 		// would silently write the split anchorUnresolved exists to refuse.
-		return nil, &SourceCommitError{Err: errUnanchorableStateWrite, Flow: flowRelevant}
+		return nil, &SourceCommitError{Err: errUnanchorableStateWrite, Flow: scope.Flow}
 	}
 	var added []string
-	if flowRelevant {
+	if scope.Flow {
 		var err error
 		labelsOut, err = e.recordLabels(ctx, req, matched)
 		if err != nil {
@@ -402,7 +410,7 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 			return nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
 		}
 	}
-	if err := e.RecordSessionCall(ctx, req); err != nil {
+	if err := e.recordAntecedentIn(ctx, scope, req); err != nil {
 		// Take the label add back out so the hard-denied call leaves no taint. Best-effort —
 		// a rollback fault leaves a stranded label, the accepted fail-closed residual
 		// (over-blocks, never leaks). Runs before the branch below since both arms need it.
@@ -424,16 +432,42 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 // un-anchored write would happen.
 var errUnanchorableStateWrite = errors.New("this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing to record this call against a second, session-keyed bucket (fail closed)")
 
+// SourceCommitScope names which of recordSourceCall's two namespaces this commit writes.
+//
+// Both halves are the CALLER's question, and they are asked separately because the two
+// namespaces are bounded by different things. Flow is per-constraint (does this entry declare
+// a labelOutput). The antecedent is bounded policy-wide inside RecordSessionCall, but a caller
+// may hold a NARROWER bound the engine cannot see: the PDP's forwarded no-match deny knows
+// which target names some sequenceBlock actually queries, and recording an unqueryable name
+// mints a counter key per made-up target. A single flag for both would force that caller to
+// choose between committing the taint of a forwarded read and minting those keys.
+//
+// A struct rather than two adjacent bools: the two are independent and a transposition would
+// silently swap which namespace a commit writes.
+type SourceCommitScope struct {
+	Flow       bool
+	Antecedent bool
+}
+
+// recordAntecedentIn is RecordSessionCall under the caller's scope, so the skip is a
+// documented no-write rather than a nil error from a write that was never attempted.
+func (e *Engine) recordAntecedentIn(ctx context.Context, scope SourceCommitScope, req *capability.EnforceRequest) error {
+	if !scope.Antecedent {
+		return nil
+	}
+	return e.RecordSessionCall(ctx, req)
+}
+
 // RecordSourceCall is the exported form of recordSourceCall for the audit-mode antecedent
 // path: when a downgraded audit-mode source's deny is forwarded, its flow labels and
 // sequenceBlock antecedent must still be recorded atomically and surfaced on the forwarded
-// record.
+// record. scope names which of the two this caller wants (see SourceCommitScope).
 //
 // Commits NO declassification: that path forwards a call whose verdict was a DENY, and the
 // approval check that authorizes a clear runs only on the allow tail — a downgraded observe
 // deny must never untaint a session.
-func (e *Engine) RecordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, flowRelevant bool, carriedLabels []string) ([]string, *SourceCommitError) {
-	return e.recordSourceCall(ctx, req, matched, flowRelevant, carriedLabels, declassifyOutcome{})
+func (e *Engine) RecordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, scope SourceCommitScope, carriedLabels []string) ([]string, *SourceCommitError) {
+	return e.recordSourceCall(ctx, req, matched, scope, carriedLabels, declassifyOutcome{})
 }
 
 // labelsAdded returns the labels in out not already in the pre-call carried set — the ones

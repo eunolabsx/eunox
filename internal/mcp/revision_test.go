@@ -66,11 +66,29 @@ func TestDeclaredRevision(t *testing.T) {
 			params: `{"_meta":{"io.modelcontextprotocol/protocolVersion":null}}`,
 		},
 		{
-			// Duplicate keys are rejected by DecodeParams, and a rejected probe reads as
-			// "nothing declared" so the method handler's own decode writes the denial.
-			name:   "duplicate version key reads as absent",
-			params: `{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/protocolVersion":"2025-11-25"}}`,
+			// Duplicate keys are rejected by DecodeParams, which leaves this build with no
+			// answer at all rather than with "nothing declared" — the two readings a caller
+			// must keep apart, since the peer reading the same forwarded bytes has an answer.
+			name:    "duplicate version key is undecodable, not absent",
+			params:  `{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/protocolVersion":"2025-11-25"}}`,
+			wantErr: ErrUndecodableDeclaration,
 		},
+		{
+			// The smuggling shape: the duplicate is a THROWAWAY key that has nothing to do with
+			// the version, so nothing about the declaration itself looks malformed — a last-wins
+			// upstream reads 2026-07-28 out of bytes this decoder refuses whole.
+			name:    "a throwaway duplicate key elsewhere in params is undecodable",
+			params:  `{"progressToken":1,"x":1,"x":1,"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`,
+			wantErr: ErrUndecodableDeclaration,
+		},
+		// The decode failures that are NOT the differential, and so stay plain absences: a
+		// shape with no `_meta` object for anyone to read a declaration out of, and a body no
+		// conforming decoder accepts either. Reporting these as unreadable would have the
+		// forwarding gate refuse messages carrying nothing to smuggle.
+		{name: "params that are not an object read as absent", params: `[1,2,3]`},
+		{name: "a non-object _meta reads as absent", params: `{"_meta":5}`},
+		{name: "an array _meta reads as absent", params: `{"_meta":[]}`},
+		{name: "invalid JSON reads as absent", params: `{"_meta":{"io.modelcontextprotocol/protocolVersion":`},
 		{
 			name:   "the key appearing as a string VALUE is not a declaration",
 			params: `{"note":"io.modelcontextprotocol/protocolVersion"}`,

@@ -547,8 +547,8 @@ var negotiationPrimitives = map[string]string{
 var hostMessageDispositions = map[string]int{
 	"dispatchRequest":       3,
 	"admit":                 2,
-	"recordKillDenial":      6,
-	"recordKillDrop":        7,
+	"recordKillDenial":      5,
+	"recordKillDrop":        6,
 	"recordSessionGateDeny": 5,
 }
 
@@ -567,9 +567,10 @@ var hostMessageDispositions = map[string]int{
 var dispositionPrologue = map[string]string{
 	// Negotiates for itself, ahead of every disposition it performs — checked, not asserted:
 	// these three are the entry points whose prologue the guard actually verifies.
-	"handleMCPPost":     "",
-	"handleSessionPost": "",
-	"serveHost":         "",
+	"handleMCPPost":                   "",
+	"handleSessionCreatingInitialize": "",
+	"handleSessionPost":               "",
+	"serveHost":                       "",
 	// Reached from a serveHost that has already negotiated and stamped the context. stdio
 	// negotiates in its READ loop, on the single goroutine that owns the pin, and the handlers
 	// below run on the context it returns.

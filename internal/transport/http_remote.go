@@ -95,7 +95,44 @@ const (
 	// MaxUpstreamErrBodyBytes bounds how much of a non-2xx upstream body is read for
 	// the operator-facing error/log. A diagnostic snippet, not the payload, so small.
 	MaxUpstreamErrBodyBytes = 64 << 10
+	// maxConsoleDetailBytes bounds how much of a string eunox did not author is actually
+	// EMBEDDED in a message a human reads. Much smaller than what a non-2xx body is READ at,
+	// because the two answer different questions: the read bound stops an unbounded upstream
+	// body from being pulled into memory, while this one decides how many bytes of a hostile
+	// peer's choosing land on an operator's console per failed call. 64 KiB per failure, at
+	// the classFailure notice rate, is a log-flooding primitive; no genuine diagnostic needs
+	// more than the first couple of KiB.
+	maxConsoleDetailBytes = 2 << 10
 )
+
+// BoundConsoleDetail makes a string eunox did not author safe to put in front of an operator:
+// cut to maxConsoleDetailBytes with a visible truncation marker, and every control and
+// line-terminating rune neutralized.
+//
+// The sanitization is the point, and it is this package's standard everywhere else — a
+// reflected protocol version goes through mcp.BoundReflectedRevision ("an unbounded one would
+// put an upstream in control of the console"), a refused Origin through boundedRefusalDetail,
+// an audit envelope field through audit.BoundEnvelopeField. Every string this wraps had the
+// bound and not the strip, or neither, on inputs authored by the threat model's central
+// adversary: a compromised remote upstream answers any enforced call with a body and a
+// JSON-RPC error message of its choosing, and both reach stderr through %v. ANSI/C0 sequences
+// in them drive the terminal, and a bare newline forges what looks like a second eunox log
+// line.
+//
+// Applied at the point a foreign value becomes part of an error STRING rather than at each
+// printer: one of these errors travels to a session-create stderr line, another to the
+// upstream-error notice, another out of the drift probe into a WARN line two packages away,
+// and a sanitizer placed on one printer is one the next consumer does not inherit.
+//
+// Not stripped down to printable ASCII the way a reflected revision is: a revision name comes
+// from a closed set, while an upstream's error message legitimately carries non-English text
+// that a reader needs.
+//
+// Exported for the CLI's live-upstream probe, which prints the same upstream's rejections from
+// its own package — see MaxUpstreamErrBodyBytes, exported beside it for the same probe.
+func BoundConsoleDetail(s string) string {
+	return capability.SanitizeControlRunes(capability.BoundString(strings.TrimSpace(s), maxConsoleDetailBytes))
+}
 
 // buildUpstreamTransport builds the *http.Transport for a remote upstream. When
 // tlsSkipVerify is true it accepts any TLS certificate (development only; callers warn).
@@ -386,7 +423,7 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxUpstreamErrBodyBytes))
-		return mcp.RPCMsg{}, resp.Header, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return mcp.RPCMsg{}, resp.Header, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, BoundConsoleDetail(string(body)))
 	}
 	// A 200 OK may carry a JSON or SSE body; for SSE, extract the matching JSON-RPC payload.
 	// A lenient upstream may answer a notification with an empty body/no matching event
@@ -501,7 +538,11 @@ func sseResponseForID(r io.Reader, wantID *json.RawMessage) (mcp.RPCMsg, error) 
 	if out, matched := decodeEvent(); matched {
 		return out, nil
 	}
-	return mcp.RPCMsg{}, fmt.Errorf("no SSE event matched request id %s", want)
+	// The id is the HOST's, forwarded verbatim on a remote route and bounded only by the 4 MiB
+	// body cap, and this error is printed to stderr like any other upstream failure — so it is
+	// the same console exposure a hostile upstream's own strings are, reached from the other
+	// side of the proxy.
+	return mcp.RPCMsg{}, fmt.Errorf("no SSE event matched request id %s", BoundConsoleDetail(want))
 }
 
 // scanSSELines is a bufio.SplitFunc that splits an SSE byte stream on CR, LF, or

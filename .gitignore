@@ -25,6 +25,11 @@ go.work.sum
 /mock-host
 /mock-server
 
+# Vulnerability scan output (scripts/govulncheck.sh --json-out/--summary-out; the
+# workflows write these at the repo root)
+/govulncheck.json
+/summary.md
+
 # Environment variables
 .env
 .env.local

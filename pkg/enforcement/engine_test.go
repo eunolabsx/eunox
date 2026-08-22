@@ -4368,7 +4368,7 @@ func TestAllowedTables_ColumnsAndShapes(t *testing.T) {
 		resp := runCondition(t, enforcement.New(), cond, args, "")
 		assert.Equal(t, capability.DecisionDeny, resp.Decision)
 		assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
-		assert.Contains(t, resp.Denial.Message, "non-string item")
+		assert.Contains(t, resp.Denial.Message, "neither a table name nor a table object")
 	})
 
 	t.Run("non-string column fails closed", func(t *testing.T) {

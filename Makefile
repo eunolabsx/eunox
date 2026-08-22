@@ -5,6 +5,7 @@ VERSION ?= 0.1.0
 GO ?= go
 GOFLAGS ?= -race
 GOLANGCI_LINT_VERSION ?= v2.12.2
+GOVULNCHECK_VERSION ?= v1.4.0
 
 # Version stamped into `make build` binaries. Prefer git's tag/commit so a local
 # build reports a real version instead of the "dev" default; fall back to
@@ -19,6 +20,7 @@ DOCKERFILE_MCP_WIN := deploy/docker/Dockerfile.mcp.windows
 
 .PHONY: all build test lint print-lint-version clean coverage check-license check-notice check-fmt fmt vet \
         check-go-version check-cross-compile mcpb \
+        vulncheck print-vulncheck-version check-vulncheck-classifier \
         docker-build-mcp docker-build-mcp-multi docker-push-mcp
 
 all: lint test build
@@ -66,6 +68,28 @@ print-lint-version:
 ## Run go vet
 vet:
 	$(GO) vet ./...
+
+## Scan for known vulnerabilities, gating only on what a branch can actually fix.
+##
+## Delegates to scripts/govulncheck.sh, which splits findings by the module the
+## vulnerable symbol lives in: a called advisory in a module we depend on fails
+## (bump the dependency), while a stdlib/toolchain advisory is reported and does not
+## -- it is fixed by moving the Go pin, which is its own change and not something a
+## contributor's branch should carry. See the script header and
+## docs/dependency-advisories.md.
+vulncheck:
+	@./scripts/govulncheck.sh --mode gate
+
+## Print the pinned govulncheck version. Single source of the pin, same rule as
+## print-lint-version: the workflows read it from here rather than restating it.
+print-vulncheck-version:
+	@echo $(GOVULNCHECK_VERSION)
+
+## Verify the govulncheck classifier gates on the right bucket, using captured
+## streams in scripts/testdata/ (no network). CI-enforced: the case that matters --
+## a tree-wide stdlib advisory -- cannot be reproduced on demand, so it is a fixture.
+check-vulncheck-classifier:
+	@./scripts/check-vulncheck-classifier.sh
 
 ## Format all Go files in place with gofmt.
 fmt:

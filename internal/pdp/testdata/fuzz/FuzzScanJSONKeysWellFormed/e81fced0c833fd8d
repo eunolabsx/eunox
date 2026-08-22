@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"caf\\u00e9\":\"\\ud8}d\\ude00\"}")

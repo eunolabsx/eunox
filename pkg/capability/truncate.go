@@ -6,6 +6,7 @@ package capability
 import (
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -70,4 +71,33 @@ func BoundString(s string, limit int) string {
 		return shortMarker
 	}
 	return s[:runeBoundaryCut(s, keep)] + marker
+}
+
+// SanitizeControlRunes replaces every control and line-terminating rune in s with a space,
+// leaving the rest of the text (including non-ASCII) intact. Invalid UTF-8 is normalized to
+// U+FFFD first, so the walk sees runes rather than raw bytes.
+//
+// It exists because a string that reaches a terminal or a line-oriented reader is not made safe
+// by being length-bounded alone: an ESC-bearing value drives the operator's console (cursor
+// moves, colour, title rewrites, and on some emulators worse), and a value carrying a newline
+// injects a whole spurious line into a diagnostic a SIEM parses one line at a time. Both are
+// reachable from strings eunox does not author — a remote upstream's error body, a header, a
+// tool name.
+//
+// unicode.IsControl covers only category Cc (the C0 and C1 controls), so it misses U+2028 (LINE
+// SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) — line terminators plenty of parsers, terminals
+// and log splitters honour. Those are mapped too, or a raw U+2028 injects the very line this
+// exists to prevent.
+//
+// Mapped to a space rather than dropped: removing the rune silently joins the tokens either
+// side of it, which changes what a reader sees the value SAY, where a space preserves the
+// break. Bounding is a separate question — compose with TruncateUTF8 or BoundString.
+func SanitizeControlRunes(s string) string {
+	s = strings.ToValidUTF8(s, "\ufffd")
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return ' '
+		}
+		return r
+	}, s)
 }

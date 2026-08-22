@@ -139,14 +139,8 @@ type httpSession struct {
 	notifMu   sync.Mutex
 	notifSubs []chan mcp.RPCMsg
 
-	// droppedNotifs counts notifications dropped by a full subscriber SSE channel, so a lost
-	// tools/list_changed etc. is observable rather than silent. Atomic: no extra locking under
-	// broadcast's notifMu.
-	droppedNotifs atomic.Uint64
-	// notifDropWarned is the noticeOnce bound on the line beside that counter, through the
-	// package's one latch primitive. A separate field rather than `droppedNotifs.Add(1) == 1`,
-	// because a tally and a latch answer different questions and folding them made the diagnostic's
-	// bound a property of a counter that exists for an operator to read.
+	// notifDropWarned bounds the line reporting a notification dropped to a slow SSE
+	// subscriber, through the package's one latch primitive.
 	notifDropWarned noticeLatch
 
 	closeOnce sync.Once
@@ -1156,12 +1150,9 @@ func (s *httpSession) readUpstream(ctx context.Context) {
 			// rely solely on the local /control/kill path's SSE eviction. s.route is
 			// dereferenced unconditionally: production never builds a route-less session, and
 			// a guard here would mean silently failing open instead.
-			killCtx := ctx
-			if s.claims != nil {
-				killCtx = pdp.WithJWTClaims(killCtx, s.claims)
-			}
+			killCtx := s.withSessionRecordContext(ctx)
 			if deny := s.route.pdp.CheckKill(killCtx, s.id); deny != nil {
-				recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg.Method, msg.Method, legHTTPUpstreamNotification)
+				recordKillDrop(killCtx, asRecorder(s.route.sink), deny, verifiedSession(s.id), msg, legHTTPUpstreamNotification)
 				continue
 			}
 			s.broadcast(msg)
@@ -1456,12 +1447,12 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 		select {
 		case ch <- msg:
 		default:
-			// Slow subscriber: channel full, notification dropped. Track and warn on the
-			// first drop so a lost tools/list_changed is observable, not silent.
-			s.droppedNotifs.Add(1)
+			// Slow subscriber: channel full, notification dropped. Warned once so a lost
+			// tools/list_changed is observable rather than silent, and a subscriber that
+			// stays behind cannot turn every dropped frame into a write syscall.
 			if s.notifDropWarned.admitOnce() {
 				_, _ = fmt.Fprintf(s.errOut(),
-					"[eunox] WARNING: HTTP session %s dropped a notification (method=%q) to a slow SSE subscriber; further drops counted but not individually logged.\n",
+					"[eunox] WARNING: HTTP session %s dropped a notification (method=%q) to a slow SSE subscriber; further drops on this session are not reported individually.\n",
 					s.id, msg.Method)
 			}
 		}
@@ -1572,7 +1563,7 @@ func (s *httpSession) removeSubAndDrain(ctx context.Context, ch chan mcp.RPCMsg)
 // on the unblock having actually CONSUMED the request. That is what makes it exactly-once: both
 // callers (the SSE write loop and the drain) can see the same message, and only one take succeeds.
 func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPCMsg, reason string) {
-	ctx = s.withSessionClaims(ctx)
+	ctx = s.withSessionRecordContext(ctx)
 	if !s.unblocker().unblock(ctx, msg.ID, reason) {
 		return
 	}
@@ -1609,4 +1600,14 @@ func (s *httpSession) withSessionClaims(ctx context.Context) context.Context {
 		return ctx
 	}
 	return pdp.WithJWTClaims(ctx, s.claims)
+}
+
+// withSessionRecordContext is withSessionClaims plus this session's negotiated revision, for the
+// upstream-driven legs that write a record from a context no host request ever passed through.
+// The sink OMITS protocol_revision when the context carries none, which on this tape means
+// "written before a revision could be resolved" — false for any established session, which pinned
+// hostRev at creation. Same rule, and same fix, as dispatchServerRequest's stamp on the sibling
+// server-request arm.
+func (s *httpSession) withSessionRecordContext(ctx context.Context) context.Context {
+	return ensureProtocolRevision(s.withSessionClaims(ctx), s.hostRev)
 }

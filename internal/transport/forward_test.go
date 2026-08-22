@@ -867,10 +867,11 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 	engine := enforcement.New(enforcement.WithCallCounter(counter), enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()))
 
 	// Taint session "s" with a confidential source read.
-	_, err := engine.RecordLabels(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "read_secret"},
+	_, cerr := engine.RecordSourceCall(ctx, &capability.EnforceRequest{SessionID: "s", TargetName: "read_secret"},
 		&capability.Constraint{Target: "tool:read_secret", Actions: []string{"call"},
-			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}}})
-	require.NoError(t, err)
+			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}}}},
+		enforcement.SourceCommitScope{Flow: true}, nil)
+	require.Nil(t, cerr)
 
 	// A sampling sink that admits only public-provenance flows: the confidential taint is
 	// blocked, an enforced deny (no --audit, non-audit constraint).
@@ -2585,14 +2586,14 @@ func TestRecordKillDenial_SubjectRoutesTheSessionID(t *testing.T) {
 	req := newTestRequestWithSession("victim-real-session-id")
 
 	verifiedRec := &fwdRecorder{}
-	resp := recordKillDenial(context.Background(), verifiedRec, killDeny(), mcp.RawJSON(`1`), verifiedSession("sess-1"), "tools/call")
+	resp := recordKillDenial(context.Background(), verifiedRec, killDeny(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}, verifiedSession("sess-1"))
 	require.NotNil(t, resp.Error, "the host still gets a structured denial either way")
 	require.Len(t, verifiedRec.records, 1)
 	assert.Equal(t, "sess-1", verifiedRec.records[0].sessionID)
 	assert.Nil(t, verifiedRec.records[0].details)
 
 	claimedRec := &fwdRecorder{}
-	resp = recordKillDenial(context.Background(), claimedRec, killDeny(), mcp.RawJSON(`1`), claimedSession(req), "tools/call")
+	resp = recordKillDenial(context.Background(), claimedRec, killDeny(), mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}, claimedSession(req))
 	require.NotNil(t, resp.Error)
 	require.Len(t, claimedRec.records, 1)
 	assert.Empty(t, claimedRec.records[0].sessionID,
@@ -2609,8 +2610,9 @@ func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
 	req := newTestRequestWithSession("victim-real-session-id")
 
 	verifiedRec := &fwdRecorder{}
+	cancelled := mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/cancelled"}
 	recordKillDrop(context.Background(), verifiedRec, killDeny(), verifiedSession("sess-1"),
-		"notifications/cancelled", "notifications/cancelled", legHTTPNotification)
+		cancelled, legHTTPNotification)
 	require.Len(t, verifiedRec.records, 1)
 	assert.Equal(t, "sess-1", verifiedRec.records[0].sessionID)
 	assert.Equal(t, string(legHTTPNotification), verifiedRec.records[0].details["transport"])
@@ -2618,7 +2620,7 @@ func TestRecordKillDrop_SubjectRoutesTheSessionID(t *testing.T) {
 
 	claimedRec := &fwdRecorder{}
 	recordKillDrop(context.Background(), claimedRec, killDeny(), claimedSession(req),
-		"notifications/cancelled", "notifications/cancelled", legHTTPNotification)
+		cancelled, legHTTPNotification)
 	require.Len(t, claimedRec.records, 1)
 	assert.Empty(t, claimedRec.records[0].sessionID,
 		"a claimed id must not be forgeable into the signed session_id field")

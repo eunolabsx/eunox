@@ -121,6 +121,14 @@ excluded (a contract cannot contain its own digest). Two entries whose contracts
 `id`; integrity lives in `digest`. `read_file` and `brave_web_search` both being
 "reversible, idempotent" is the same *contract* attached to two different tools.
 
+The digest is over the block's **numbers as spelled**, and the manifest loader renormalizes
+a number as it reads it (`1.0` becomes `1`, `1e3` becomes `1000`). A blast radius written in
+a spelling that does not survive that would digest to one value here and another in the
+manifest that copied the block verbatim, so the entry would be publishable and impossible to
+pin — reported at manifest load as "the block was edited after it was pinned", for a block
+the author never touched. Such a spelling is therefore **refused when the entry loads**, with
+the canonical one named; write `1`, not `1.0`.
+
 ## Contributing an entry
 
 - One file per contract, named after its id with `/` replaced by `_`.
@@ -146,7 +154,15 @@ excluded (a contract cannot contain its own digest). Two entries whose contracts
   - declares a `byArgument` table with no `argument`, with neither `cases` nor `default`,
     or with two case keys that match the same argument value (matching is case-insensitive
     after trimming, so `DROP` and `drop` are one key);
-  - carries its own `effect.ref` — a corpus entry *is* the thing a ref points at.
+  - carries its own `effect.ref` — a corpus entry *is* the thing a ref points at;
+  - spells a `blastRadius` `value` in a form a manifest would renormalize (see "Digest
+    semantics");
+  - carries two JSON members that are the same name to a decoder (`"effect"` and
+    `"Effect"`, or a repeated `"digest"`). `encoding/json` matches member names
+    case-insensitively and keeps the **last** one, so such an entry shows one contract to
+    the reviewer and loads another — and, because the digest is computed over what was
+    decoded, it self-validates while doing it. Refused rather than resolved, at every depth
+    of the file and in the trust store too.
 
   Previously only the digest was checked, so a mistake in an entry survived review and
   surfaced later as a confusing manifest-load error about a block the author had copied
@@ -208,6 +224,12 @@ well-known URL:
   ]
 }
 ```
+
+A `keyId` is matched **verbatim** against a signature's, in both directions, so one carrying
+surrounding whitespace (` stripe-2026`, the shape a copy-paste produces) could never match
+anything: every signature it was configured to verify would report as `unverified(n)`, which
+reads as "signed by strangers" rather than as the configuration mistake it is. Both the store
+and a signature refuse an untrimmed `keyId` outright.
 
 `roles` exists because trusting a key is not one decision. You may well trust a security
 researcher's key as a **reviewer** while not accepting it as the vendor of anything, and

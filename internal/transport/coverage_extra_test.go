@@ -961,6 +961,112 @@ func TestDoMCPHTTP_NonOKReturnsError(t *testing.T) {
 	}
 }
 
+// TestDoMCPHTTP_NonOKBodyIsBoundedAndControlStripped is the regression for an operator's
+// console being driven by the threat model's central adversary.
+//
+// A compromised remote upstream answers any enforced call with a non-2xx body of its choosing,
+// and that body reaches stderr through %v — the session-create failure line, the upstream-error
+// notice, the CLI probe. It was length-bounded (64 KiB) and nothing else: ANSI/C0 sequences in
+// it drove the terminal, a bare newline forged what reads as a second eunox log line, and 64 KiB
+// per failed call at the classFailure notice rate is a log-flooding primitive. Sanitized at the
+// one place the bytes become a string, so every consumer inherits it.
+func TestDoMCPHTTP_NonOKBodyIsBoundedAndControlStripped(t *testing.T) {
+	t.Parallel()
+
+	// An escape sequence that repaints the terminal, a forged log line, and a Unicode line
+	// separator plenty of log splitters honour — then far more bytes than any diagnostic needs.
+	hostile := "\x1b[2J\x1b]0;pwned\x07real detail\n[eunox] ALL CLEAR\u2028also forged" + strings.Repeat("A", 8<<10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(hostile))
+	}))
+	t.Cleanup(srv.Close)
+
+	req := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON("1"), Method: "tools/list"}
+	_, _, err := DoMCPHTTP(context.Background(), srv.Client(), srv.URL, req, "", "", capability.Revision20251125)
+	if err == nil {
+		t.Fatal("a non-2xx upstream response must return an error")
+	}
+	got := err.Error()
+
+	for _, bad := range []string{"\x1b", "\x07", "\n", "\r", "\u2028", "\u2029"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("error carries %q: an upstream must not reach the console with control or line-terminating runes", bad)
+		}
+	}
+	if len(got) > maxConsoleDetailBytes+256 {
+		t.Errorf("error is %d bytes, want the snippet bounded near %d", len(got), maxConsoleDetailBytes)
+	}
+	// Neutralized, not discarded: the operator still needs to read what the upstream said, and
+	// the truncation is visible rather than silent.
+	if !strings.Contains(got, "real detail") {
+		t.Errorf("error = %q, want the upstream's actual message preserved", got)
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("error = %q, want a visible truncation marker rather than a silent cut", got)
+	}
+	if !strings.Contains(got, "502") {
+		t.Errorf("error = %q, want it to still report the status", got)
+	}
+}
+
+// TestOpenerResult_BoundsTheUpstreamsOwnRejection covers the second console input a hostile
+// upstream authors: its JSON-RPC error MESSAGE, which is unbounded by the protocol and produced
+// on any call it decides to reject. This one reaches stderr through the session-create failure
+// line, and — via the drift probe's identically-shaped sites — through a WARN line in a
+// different package on every glob-only session start.
+func TestOpenerResult_BoundsTheUpstreamsOwnRejection(t *testing.T) {
+	t.Parallel()
+
+	hostile := "\x1b[2Jrejected\n[eunox] ALL CLEAR\u2028forged" + strings.Repeat("B", 8<<10)
+	_, err := openerResult(mcp.MethodInitialize, mcp.RPCMsg{
+		JSONRPC: "2.0",
+		ID:      mcp.RawJSON("1"),
+		Error:   &mcp.RPCError{Code: -32000, Message: hostile},
+	})
+	if err == nil {
+		t.Fatal("an upstream rejection must return an error")
+	}
+	got := err.Error()
+	for _, bad := range []string{"\x1b", "\n", "\r", "\u2028", "\u2029"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("error carries %q: an upstream's rejection must not reach the console with control or line-terminating runes", bad)
+		}
+	}
+	if len(got) > maxConsoleDetailBytes+256 {
+		t.Errorf("error is %d bytes, want the message bounded near %d", len(got), maxConsoleDetailBytes)
+	}
+	if !strings.Contains(got, "rejected") {
+		t.Errorf("error = %q, want the upstream's actual message preserved", got)
+	}
+}
+
+// TestSSEResponseForID_BoundsTheForeignRequestID is the same exposure reached from the other
+// side of the proxy. The id is the HOST's, forwarded verbatim on a remote route and bounded
+// only by the 4 MiB body cap, and this failure is printed like any other upstream error — so a
+// host can drive the operator's console through an upstream that simply answers nothing
+// matching.
+func TestSSEResponseForID_BoundsTheForeignRequestID(t *testing.T) {
+	t.Parallel()
+
+	hostile := mcp.RawJSON(`"` + "\u001b[2Jid\u2028forged" + strings.Repeat("C", 8<<10) + `"`)
+	// A well-formed SSE stream carrying an event for a DIFFERENT id, so the no-match arm runs.
+	body := strings.NewReader("data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n")
+	_, err := sseResponseForID(body, hostile)
+	if err == nil {
+		t.Fatal("a stream with no matching event must return an error")
+	}
+	got := err.Error()
+	for _, bad := range []string{"\x1b", "\n", "\r", "\u2028", "\u2029"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("error carries %q: a forwarded request id must not reach the console with control or line-terminating runes", bad)
+		}
+	}
+	if len(got) > maxConsoleDetailBytes+256 {
+		t.Errorf("error is %d bytes, want the id bounded near %d", len(got), maxConsoleDetailBytes)
+	}
+}
+
 func TestDoMCPHTTP_AcceptedReturnsEmpty(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

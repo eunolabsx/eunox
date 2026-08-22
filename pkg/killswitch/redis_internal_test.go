@@ -1601,8 +1601,11 @@ func (f *publishFailFake) Publish(_ context.Context, _ string, _ interface{}) *r
 
 // TestRedis_KillSession_PublishErrorPropagates verifies that when the durable
 // Redis SET succeeds but PUBLISH fails, KillSession surfaces the propagation
-// error so the caller can report partial propagation and retry, while the local
+// error so the caller can report partial propagation, while the local
 // cache still reflects the kill (fail-closed on the issuing instance).
+//
+// Surfacing it is only half of what a caller needs — TestRedis_PublishFailure_IsDistinguishable
+// covers the other half, that the error says WHICH of the two writes failed.
 func TestRedis_KillSession_PublishErrorPropagates(t *testing.T) {
 	t.Parallel()
 	r := newDoubleRedis(&publishFailFake{pubErr: errBoom})
@@ -2558,4 +2561,87 @@ func TestRedis_WithSessionKillTTL(t *testing.T) {
 		"a positive value is taken verbatim")
 	assert.Equal(t, time.Duration(0), NewRedis(nil, WithSessionKillTTL(-1)).sessionKillTTL,
 		"a negative value opts out of expiry entirely (0 = no TTL stamped)")
+}
+
+// TestRedis_PublishFailure_IsDistinguishable pins what a durable-write-succeeded,
+// notification-failed error must be distinguishable AS.
+//
+// Every writer here ends with publish, so before ErrPublishFailed a caller received one
+// undifferentiated error for two outcomes that are opposites on the emergency-stop path: the
+// revocation is not in Redis, or it is in Redis and only real-time propagation was lost. The
+// CLI's exit contract answers exactly that question, so it could not be honored — on a Redis
+// ACL granting SET/DEL/SCAN but not PUBLISH, every kill reported failure while in fact landing.
+//
+// The cause must stay reachable underneath: an operator diagnosing the ACL needs the Redis
+// error itself, which is why this is a wrap and not a replacement.
+func TestRedis_PublishFailure_IsDistinguishable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		write func(*Redis) error
+	}{
+		{name: "ActivateGlobal", write: func(r *Redis) error { return r.ActivateGlobal(context.Background()) }},
+		{name: "DeactivateGlobal", write: func(r *Redis) error { return r.DeactivateGlobal(context.Background()) }},
+		{name: "KillSession", write: func(r *Redis) error { return r.KillSession(context.Background(), "sess-1") }},
+		{name: "ReviveSession", write: func(r *Redis) error { return r.ReviveSession(context.Background(), "sess-1") }},
+		{name: "KillAgent", write: func(r *Redis) error { return r.KillAgent(context.Background(), "agent-1") }},
+		{name: "ReviveAgent", write: func(r *Redis) error { return r.ReviveAgent(context.Background(), "agent-1") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := newDoubleRedis(&publishFailFake{pubErr: errBoom})
+			err := tc.write(r)
+			if !errors.Is(err, ErrPublishFailed) {
+				t.Errorf("err = %v, want it to wrap ErrPublishFailed so a caller can tell a lost notification from a lost write", err)
+			}
+			if !errors.Is(err, errBoom) {
+				t.Errorf("err = %v, want the underlying Redis cause to stay reachable", err)
+			}
+		})
+	}
+}
+
+// TestRedis_DurableWriteFailure_IsNotAPublishFailure is the other half: the sentinel must NOT
+// appear when the durable write itself failed, or a caller acting on it would report a
+// revocation that is nowhere as landed — the fail-open this distinction exists to prevent.
+func TestRedis_DurableWriteFailure_IsNotAPublishFailure(t *testing.T) {
+	t.Parallel()
+
+	r := newDoubleRedis(&writeFailFake{setErr: errBoom, delErr: errBoom})
+	for _, tc := range []struct {
+		name  string
+		write func() error
+	}{
+		{name: "ActivateGlobal", write: func() error { return r.ActivateGlobal(context.Background()) }},
+		{name: "DeactivateGlobal", write: func() error { return r.DeactivateGlobal(context.Background()) }},
+		{name: "KillSession", write: func() error { return r.KillSession(context.Background(), "sess-1") }},
+		{name: "ReviveSession", write: func() error { return r.ReviveSession(context.Background(), "sess-1") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.write()
+			if !errors.Is(err, errBoom) {
+				t.Fatalf("err = %v, want the durable write's own failure", err)
+			}
+			if errors.Is(err, ErrPublishFailed) {
+				t.Errorf("err = %v must not claim the state was written durably: it was not", err)
+			}
+		})
+	}
+}
+
+// writeFailFake fails the durable write itself (SET and DEL), the opposite of publishFailFake.
+type writeFailFake struct {
+	redis.Cmdable
+	setErr error
+	delErr error
+}
+
+func (f *writeFailFake) Set(_ context.Context, _ string, _ interface{}, _ time.Duration) *redis.StatusCmd {
+	return redis.NewStatusResult("", f.setErr)
+}
+
+func (f *writeFailFake) Del(_ context.Context, _ ...string) *redis.IntCmd {
+	return redis.NewIntResult(0, f.delErr)
 }

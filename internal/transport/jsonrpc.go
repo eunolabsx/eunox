@@ -185,9 +185,12 @@ func (t *serverReqTracker) take(key string) (trackedServerRequest, bool) {
 }
 
 // tracked reports whether key is an outstanding server-initiated request WITHOUT consuming it.
-// The peek exists for the one disposition that must not consume: a site with no upstream writer
-// to answer through, which reports the abandoned request rather than dropping it silently but
-// must leave the id routable by whatever path still can. See serverRequestUnblocker.unblock.
+//
+// TEST-ONLY. The peek-without-consume disposition it was written for is gone: unblock now
+// takes the entry unconditionally, because a destroyed answer must be reported from the entry
+// that made it unroutable. Production has no caller; what remains is the tests' way to assert
+// which ids a refusal left routable, which is exactly the property the take-then-report order
+// exists to preserve.
 func (t *serverReqTracker) tracked(key string) bool {
 	t.mu.Lock()
 	_, ok := t.ids[key]

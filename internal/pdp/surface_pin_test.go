@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -734,5 +735,39 @@ func TestTier2_RemovalIsReportedOncePerDisappearance(t *testing.T) {
 	got = b.Observe("s", onlyB, true)
 	if len(got) != 1 || got[0].Kind != SurfaceRemoved {
 		t.Fatalf("a second disappearance must report again, got %+v", got)
+	}
+}
+
+// TestTier2_BrokenSetIsBounded is the A6 regression: the broken set is fed with tools/list
+// entry NAMES, which an adversarial upstream chooses — an untrustworthy-by-construction
+// listing breaks every name it could be presenting, so fresh names on every response grew
+// the map for the life of the session (the process, on stdio) while the hashes map beside it
+// was capped for exactly this threat.
+//
+// At the cap the session widens to allBroken rather than storing more, which is strictly
+// stronger: nothing it declines to record becomes callable.
+func TestTier2_BrokenSetIsBounded(t *testing.T) {
+	b := NewSurfaceBaseline()
+
+	names := make([]string, 0, maxSessionSurfaceEntries+16)
+	for i := range maxSessionSurfaceEntries + 16 {
+		names = append(names, "tool-"+strconv.Itoa(i))
+	}
+	b.MarkBroken("sess-1", names...)
+
+	b.mu.RLock()
+	s := b.sessions["sess-1"]
+	stored, all := len(s.broken), s.allBroken
+	b.mu.RUnlock()
+
+	if stored > maxSessionSurfaceEntries {
+		t.Errorf("broken set holds %d entries, want at most %d — an upstream-driven map must be bounded", stored, maxSessionSurfaceEntries)
+	}
+	if !all {
+		t.Error("reaching the cap must widen the session to allBroken; otherwise the entries it declined to store are silently unpinned")
+	}
+	// The widening is what makes the bound safe: a name never stored still denies.
+	if !b.Broken("sess-1", names[len(names)-1]) {
+		t.Error("a name dropped at the cap must still be broken through the whole-session flag")
 	}
 }

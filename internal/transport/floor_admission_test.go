@@ -271,7 +271,7 @@ func TestFlooredWrite_TwoTierChainIsUnchanged(t *testing.T) {
 	// tokens and the parent is the tier that refuses.
 	sibling := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
 	sibling.setNow(func() time.Time { return at })
-	for range int(perCategoryDenyBurst) + 1 {
+	for range perCategoryDenyBurstSize + 1 {
 		sibling.admitRefusal(catDisplaced)
 	}
 	require.Less(t, aggregate.bucket(catDisplaced).tokens, float64(1))
@@ -307,12 +307,12 @@ func TestRefusalRecord_EveryWriteTakesTheAdmissionThatResolvesTheFloor(t *testin
 	req := httptest.NewRequest("POST", "/mcp", strings.NewReader("{}"))
 
 	admitted := 0
-	for range int(perCategoryDenyBurst) + 1 {
+	for range perCategoryDenyBurstSize + 1 {
 		if p.recordRefusal(context.Background(), req, nil, codeAuthFailed, catAuth, nil) {
 			admitted++
 		}
 	}
-	assert.Equal(t, int(perCategoryDenyBurst)+1, admitted,
+	assert.Equal(t, perCategoryDenyBurstSize+1, admitted,
 		"the write past the drained bucket is the holder's guaranteed arrival; reaching the buckets directly skipped the floor the table holds")
 
 	// The floor is one write per interval, not a second budget.
@@ -356,7 +356,7 @@ func TestReserveInterval_IsPerTableNotPerPackage(t *testing.T) {
 	// write is charged against the parent's budget, so it re-arms on the parent's argument. Pinned
 	// because both constants are a minute today, so the rule is otherwise invisible until the first
 	// time somebody moves one.
-	aggregate := newRefusalRecordLimiterFor(catDisplaced)
+	aggregate := newRefusalRecordLimiterFor([]refusalCategory{catDisplaced})
 	aggregate.reserveEvery = time.Hour
 	session := newUpstreamRefusalLimiter(aggregate, []refusalCategory{catServerRequestFailed})
 	require.NotContains(t, session.buckets, catDisplaced, "the category under test must be a delegated one")
@@ -364,7 +364,7 @@ func TestReserveInterval_IsPerTableNotPerPackage(t *testing.T) {
 	now := at
 	aggregate.setNow(func() time.Time { return now })
 	session.setNow(func() time.Time { return now })
-	for range int(perCategoryDenyBurst) {
+	for range perCategoryDenyBurstSize {
 		require.True(t, session.admitRefusal(catDisplaced).ok)
 	}
 	require.True(t, session.admitRefusal(catDisplaced).reserved, "the drained aggregate is floored through")
@@ -372,7 +372,7 @@ func TestReserveInterval_IsPerTableNotPerPackage(t *testing.T) {
 	// Two minutes on, the parent's bucket has refilled, so drain it again to put the floor back in
 	// play: what is under test is whether the SLOT re-armed, not whether a token is available.
 	now = at.Add(2 * time.Minute)
-	for range int(perCategoryDenyBurst) {
+	for range perCategoryDenyBurstSize {
 		require.True(t, session.admitRefusal(catDisplaced).ok)
 	}
 	assert.False(t, session.admitRefusal(catDisplaced).ok,

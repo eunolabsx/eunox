@@ -197,21 +197,46 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 
 // topLevelValueNode returns the value node of a top-level mapping key, unwrapping a
 // DocumentNode wrapper first. Shared by schemaVersionFromNode and forceSchemaVersionToString.
+//
+// The value is resolved through its ALIAS, for the same reason the coercion guard resolves
+// one: an `*ref` node carries no Value of its own, so both callers read it as absent. That
+// made an aliased schemaVersion falsely "required" in the gateway loader, and made the
+// manifest loader skip the pre-decode version gate entirely — producing exactly the coercion
+// misdiagnosis the gate's ordering exists to prevent, for a document that declares its
+// version perfectly well.
 func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
-	doc := node
-	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
-		doc = doc.Content[0]
-	}
-	if doc.Kind != yaml.MappingNode {
+	mapping, i := topLevelValueSlot(node, key)
+	if mapping == nil {
 		return nil
 	}
+	return resolveYAMLAlias(mapping.Content[i])
+}
+
+// topLevelValueSlot is topLevelValueNode's core, returning the mapping and the INDEX of key's
+// value rather than the value itself — the position, not the node.
+//
+// The distinction is load-bearing for forceSchemaVersionToString: an alias node's target is
+// SHARED with every other reference to that anchor, so a caller that means to change this one
+// key's value has to replace what sits in this slot rather than mutate what the slot points
+// at. A reader wants the resolved node and uses topLevelValueNode; a writer wants the slot.
+func topLevelValueSlot(node *yaml.Node, key string) (mapping *yaml.Node, valueIdx int) {
+	doc := resolveYAMLAlias(node)
+	if doc == nil {
+		return nil, -1
+	}
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = resolveYAMLAlias(doc.Content[0])
+	}
+	if doc == nil || doc.Kind != yaml.MappingNode {
+		return nil, -1
+	}
 	for i := 0; i+1 < len(doc.Content); i += 2 {
-		k, v := doc.Content[i], doc.Content[i+1]
-		if k.Kind == yaml.ScalarNode && k.Value == key {
-			return v
+		k := resolveYAMLAlias(doc.Content[i])
+		if k != nil && k.Kind == yaml.ScalarNode && k.Value == key {
+			return doc, i + 1
 		}
 	}
-	return nil
+	return nil, -1
 }
 
 // schemaVersionFromNode reads the top-level schemaVersion scalar's SOURCE TEXT off the parsed
@@ -232,10 +257,44 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 // cannot do this (it decodes strictly from raw bytes for KnownFields) and instead rejects a
 // bare-number schemaVersion outright. Retagging keeps the verbatim text, so "0.10" stays
 // "0.10" rather than renormalizing to "0.1".
+//
+// An ALIASED `schemaVersion: *ver` is retagged by REPLACING this key's slot with a fresh string
+// scalar, never by retagging the anchor. An anchor is shared with every other reference to it,
+// so mutating it silently rewrites fields this function has no business touching — and one of
+// them changes POLICY, not just type.
+//
+// With `values: [&ver 0.2]` beside `schemaVersion: *ver`, retagging the anchor decoded that
+// condition's value as a Go string rather than the json.Number every other numeric spelling
+// yields. MatchAllowedValue matches a string entry ONLY as a glob and only against a string
+// argument, so the entry stopped matching the numeric argument it was written for: the
+// capability silently denied every call it was meant to allow, with no load-time signal.
+// Deny-side, but a policy change from a retag that had no business leaving this key.
+//
+// Copying also leaves the anchor's own tag intact for rejectCoercedScalarsForFormat, which runs
+// after this and would otherwise skip a node this function had already rewritten.
 func forceSchemaVersionToString(node *yaml.Node) {
-	val := topLevelValueNode(node, "schemaVersion")
-	if val != nil && val.Kind == yaml.ScalarNode && (val.Tag == "!!int" || val.Tag == "!!float") {
+	mapping, i := topLevelValueSlot(node, "schemaVersion")
+	if mapping == nil {
+		return
+	}
+	slot := mapping.Content[i]
+	val := resolveYAMLAlias(slot)
+	if val == nil || val.Kind != yaml.ScalarNode || (val.Tag != "!!int" && val.Tag != "!!float") {
+		return
+	}
+	if slot == val {
+		// Written directly under this key, so nothing else can be looking at it.
 		val.Tag = "!!str"
+		return
+	}
+	// Position from the ALIAS, so a later error about this value points at the reference the
+	// author wrote rather than at the anchor's definition somewhere else in the file.
+	mapping.Content[i] = &yaml.Node{
+		Kind:   yaml.ScalarNode,
+		Tag:    "!!str",
+		Value:  val.Value,
+		Line:   slot.Line,
+		Column: slot.Column,
 	}
 }
 
@@ -294,14 +353,36 @@ func numericPolicyScalarKeyApplies(enclosingKey, key string) bool {
 }
 
 func rejectCoercedValueScalars(n *yaml.Node, isJSON bool) error {
-	return rejectCoercedScalarsUnder(n, isJSON, "")
+	return rejectCoercedScalarsUnder(n, isJSON, "", make(map[coercionVisit]bool))
+}
+
+// coercionVisit keys the walk's visited set. The KEY is part of it, not just the node: an
+// anchored mapping is checked once per enclosing key it is referenced under, because the
+// enclosing key is what decides whether a numeric field applies there. Keying on the node
+// alone would check `&a {value: 010}` at whichever reference the walk reached first and skip
+// it under `effect: {blastRadius: *a}`; keying on nothing (visit-and-forget) makes a
+// billion-laughs alias graph expand exponentially. Node x key is bounded by the document.
+type coercionVisit struct {
+	node *yaml.Node
+	key  string
 }
 
 // rejectCoercedScalarsUnder is rejectCoercedValueScalars' walk, carrying the mapping key the
 // current node hangs off so a scoped numeric key is recognized only inside its own block.
-func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) error {
+//
+// An ALIAS is resolved here, not only at the pairwise checks below: an aliased MAPPING was
+// otherwise descended into as an AliasNode, whose Content is empty, so its fields were
+// checked only at the anchor's definition site — under whatever key sat there, which is not
+// the key that decides whether they are numeric policy fields.
+func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string, visited map[coercionVisit]bool) error {
+	n = resolveYAMLAlias(n)
 	if n == nil {
 		return nil
+	}
+	if v := (coercionVisit{node: n, key: enclosingKey}); visited[v] {
+		return nil
+	} else {
+		visited[v] = true
 	}
 	if n.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(n.Content); i += 2 {
@@ -329,21 +410,21 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string) e
 		// Recurse pairwise so each value carries the key it hangs off; a key node is walked
 		// too, with no enclosing key.
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			if err := rejectCoercedScalarsUnder(n.Content[i], isJSON, ""); err != nil {
+			if err := rejectCoercedScalarsUnder(n.Content[i], isJSON, "", visited); err != nil {
 				return err
 			}
 			childKey := ""
 			if k := resolveYAMLAlias(n.Content[i]); k.Kind == yaml.ScalarNode {
 				childKey = k.Value
 			}
-			if err := rejectCoercedScalarsUnder(n.Content[i+1], isJSON, childKey); err != nil {
+			if err := rejectCoercedScalarsUnder(n.Content[i+1], isJSON, childKey, visited); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, child := range n.Content {
-		if err := rejectCoercedScalarsUnder(child, isJSON, enclosingKey); err != nil {
+		if err := rejectCoercedScalarsUnder(child, isJSON, enclosingKey, visited); err != nil {
 			return err
 		}
 	}
@@ -424,6 +505,54 @@ func scalarCoercion(item *yaml.Node) (src, canonical string, coerced, ok bool) {
 	src = strings.TrimSpace(item.Value)
 	canonical = string(c)
 	return src, canonical, src != canonical, true
+}
+
+// CanonicalNumberLiteral returns the spelling a numeric literal ends up with after the
+// manifest loader's YAML-node -> interface{} -> JSON renormalization above, whether that
+// spelling denotes the SAME number, and whether lit is a number that pipeline reads as one
+// at all.
+//
+// Exported because a REGISTRY corpus entry is copied into a manifest verbatim and pinned by
+// the digest of its own bytes: the corpus loader decodes with UseNumber and keeps the
+// literal, this loader re-marshals it, so a literal whose spelling does not survive the
+// round trip (1.0 -> 1, 1e3 -> 1000) digests to two different values and the copy can never
+// match its pin. The renormalization is this file's, so the answer about what survives it
+// has to be this file's too — a second implementation elsewhere would be a place for the
+// two to disagree about exactly the literals that matter.
+//
+// exact is reported separately because a renormalization that ROUNDS (an integer past
+// float64's exact range) has no faithful spelling at all: naming its canonical form as the
+// correction to write would hand the author a different magnitude than the one they
+// declared, which for a blast radius is the input to the ceiling and the cumulative bound.
+func CanonicalNumberLiteral(lit string) (canonical string, exact, ok bool) {
+	var v interface{}
+	if err := yaml.Unmarshal([]byte(lit), &v); err != nil {
+		return "", false, false
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", false, false
+	}
+	// The LAST step of the pipeline decides, not the yaml kind: the field is a json.Number,
+	// and encoding/json accepts a quoted literal into one. So a scalar yaml.v3 declined to
+	// resolve as a number (an exponent past float64's range, which its ParseFloat reports
+	// out of range and it leaves a plain string) is re-marshaled quoted and reaches the
+	// policy VERBATIM — pinnable, where reading the yaml kind alone called it unusable.
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return "", false, false
+	}
+	if n.String() == "" {
+		// A JSON null unmarshals into a string kind by leaving it untouched rather than
+		// failing, so an empty or null scalar arrives here looking like a canonical form.
+		return "", false, false
+	}
+	if n.String() == lit {
+		// Identical spelling needs no arbitrary-precision comparison, which is the only
+		// expensive step here and is what a large literal would pay it on.
+		return lit, true, true
+	}
+	return n.String(), numericallyEqual(lit, n.String()), true
 }
 
 // numericallyEqual reports whether src and canonical denote the same number, compared exactly

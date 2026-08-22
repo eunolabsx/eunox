@@ -44,6 +44,15 @@ type Checker interface {
 // A backend whose state lives in-process is always confirmable and simply never reports a
 // cause; the rule binds the ones that mirror remote state.
 //
+// PARTIAL PROPAGATION is the writers' shared rule, for the same reason. A backend that mirrors
+// its state to other instances does two things per write — a durable one and a notification —
+// and only the first decides whether the revocation landed. An error from ActivateGlobal /
+// KillAgent / KillSession (or their undo) therefore does NOT by itself mean the write failed:
+// one wrapping ErrPublishFailed says the state IS durable and only real-time propagation was
+// lost, with convergence bounded by the backend's reconcile cadence. A caller whose question is
+// "did the revocation land" must check for it before reporting failure — reporting a landed
+// emergency stop as failed invites a re-run, or worse, a conclusion that the system is unstopped.
+//
 // The ONE exception is an explicit operator choice to prefer availability: the Redis backend's
 // WithFailOpen (--killswitch-fail-open, ADR-0003) serves the last-known cache from ShouldBlock
 // and Status during an outage rather than denying, and HealthStatus alone reports the cause.

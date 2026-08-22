@@ -1157,7 +1157,7 @@ func TestRotateReopenFallbackRespectsSizeBound(t *testing.T) {
 	}
 	// A failed reopen leaves rotation deferred until the next retry recovers, exactly
 	// like the ordinal-seed and rename failures — it must be reported the same way.
-	if stalled, reason := s.MaintenanceStalled(); !stalled {
+	if stalled, reason := s.maintenanceStalled(); !stalled {
 		t.Error("a failed reopen must report a rotation stall: the size bound is going unenforced")
 	} else if !strings.Contains(reason, "rotation deferred") {
 		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
@@ -1233,7 +1233,7 @@ func TestRetryRotateReopenRecovers(t *testing.T) {
 	}
 	// The deferred rotation completed, so rotation is no longer stalled — a reopen that
 	// recovers via retryRotateReopen must clear the stall exactly like a clean rotation.
-	if stalled, reason := s.MaintenanceStalled(); stalled {
+	if stalled, reason := s.maintenanceStalled(); stalled {
 		t.Errorf("a recovered reopen must clear rotation's stall: stalled=%v reason=%q", stalled, reason)
 	}
 }
@@ -1300,7 +1300,7 @@ func TestRetryRotateReopenStillFailing(t *testing.T) {
 	}
 	// The fallback persists, so the size bound is still going unenforced — this must stay
 	// reported on every retry, not just the first one that entered fallback.
-	if stalled, reason := s.MaintenanceStalled(); !stalled {
+	if stalled, reason := s.maintenanceStalled(); !stalled {
 		t.Error("a still-failing reopen retry must keep reporting a rotation stall")
 	} else if !strings.Contains(reason, "rotation deferred") {
 		t.Errorf("reason = %q, want it to name the rotation subsystem", reason)
@@ -1324,13 +1324,13 @@ func TestPruneRotated_ClearsResolvedStallWithoutADelete(t *testing.T) {
 		t.Fatalf("write sibling: %v", err)
 	}
 	s.setRetentionStalled("an older sibling could not be deleted")
-	if stalled, _ := s.MaintenanceStalled(); !stalled {
+	if stalled, _ := s.maintenanceStalled(); !stalled {
 		t.Fatal("setRetentionStalled did not take effect")
 	}
 
 	s.pruneRotated()
 
-	if stalled, reason := s.MaintenanceStalled(); stalled {
+	if stalled, reason := s.maintenanceStalled(); stalled {
 		t.Fatalf("stall still reported after retention became satisfied: %q", reason)
 	}
 }
@@ -1347,7 +1347,7 @@ func TestPruneRotated_RetentionDisabledLeavesRotationStalled(t *testing.T) {
 
 	s.pruneRotated()
 
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("retention pruning must not clear a stall belonging to rotation")
 	}
@@ -1373,7 +1373,7 @@ func TestPruneRotated_HealthyPassLeavesRotationStalled(t *testing.T) {
 
 	s.pruneRotated()
 
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("a healthy retention pass must not clear a stall belonging to rotation")
 	}
@@ -1399,7 +1399,7 @@ func TestPruneRotated_ListFailureMarksRetentionStall(t *testing.T) {
 
 	s.pruneRotated()
 
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("a listing failure must be reported: retention cannot run, so its bound is going unenforced")
 	}
@@ -1423,7 +1423,7 @@ func TestPruneRotated_ListFailureLeavesRotationStalled(t *testing.T) {
 
 	s.pruneRotated()
 
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("both subsystems are stalled, so the status must report stalled")
 	}
@@ -1442,7 +1442,7 @@ func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
 	t.Parallel()
 	s := &Sink{}
 
-	if stalled, reason := s.MaintenanceStalled(); stalled || reason != "" {
+	if stalled, reason := s.maintenanceStalled(); stalled || reason != "" {
 		t.Fatalf("a fresh sink must be healthy: stalled=%v reason=%q", stalled, reason)
 	}
 
@@ -1450,7 +1450,7 @@ func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
 	// rotation-then-retention.
 	s.setRetentionStalled("a sibling cannot be deleted")
 	s.setRotationStalled("the ordinal cannot be seeded")
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("two stalled subsystems must report stalled")
 	}
@@ -1465,7 +1465,7 @@ func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
 
 	// Clearing one leaves the other exactly as it was.
 	s.setRotationStalled("")
-	stalled, reason = s.MaintenanceStalled()
+	stalled, reason = s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("clearing rotation must not clear retention")
 	}
@@ -1478,7 +1478,7 @@ func TestMaintenanceStatus_KeyedPerSubsystem(t *testing.T) {
 
 	// Clearing the last one returns the sink to healthy.
 	s.setRetentionStalled("")
-	if stalled, reason := s.MaintenanceStalled(); stalled || reason != "" {
+	if stalled, reason := s.maintenanceStalled(); stalled || reason != "" {
 		t.Fatalf("clearing every subsystem must report healthy: stalled=%v reason=%q", stalled, reason)
 	}
 	if s.rotationStallReason != "" || s.retentionStallReason != "" {
@@ -1522,7 +1522,7 @@ func TestRotate_CleanSuccessClearsRotationStall(t *testing.T) {
 	if s.f == f {
 		t.Fatal("test precondition: rotate() must have swapped to a fresh base fd")
 	}
-	if stalled, reason := s.MaintenanceStalled(); stalled {
+	if stalled, reason := s.maintenanceStalled(); stalled {
 		t.Fatalf("a successful rotation must clear its own stall: stalled=%v reason=%q", stalled, reason)
 	}
 }
@@ -1568,7 +1568,7 @@ func TestRotate_UnnameableTargetMarksRotationStall(t *testing.T) {
 
 	s.rotate()
 
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("a rotation that cannot name a target must be reported: the size bound is going unenforced")
 	}
@@ -1612,7 +1612,7 @@ func TestRotate_RenameFailureMarksRotationStall(t *testing.T) {
 	if s.inFallback {
 		t.Fatal("a rename failure must not enter the reopen-fallback state (nothing was renamed)")
 	}
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("a rotation that cannot rename the active log must be reported: the size bound is going unenforced")
 	}
@@ -1668,7 +1668,7 @@ func TestRotate_SyncFailureMarksRotationStall(t *testing.T) {
 	if got := s.writeFailures.Load(); got != before+1 {
 		t.Errorf("writeFailures = %d, want %d (the pre-existing durability signal)", got, before+1)
 	}
-	stalled, reason := s.MaintenanceStalled()
+	stalled, reason := s.maintenanceStalled()
 	if !stalled {
 		t.Fatal("a rotation deferred on a sync failure must be reported: the size bound is going unenforced")
 	}

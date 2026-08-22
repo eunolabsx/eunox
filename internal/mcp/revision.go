@@ -28,6 +28,25 @@ var ErrUnknownRevision = errors.New("mcp: unsupported protocol revision")
 // state its revision.
 var ErrConflictingRevision = errors.New("mcp: protocol revision declared in more than one member")
 
+// ErrUndecodableDeclaration marks a member this build refused whole while a conforming peer
+// reads it fine, so whether it declares a revision — and which — is UNKNOWN rather than
+// answered.
+//
+// Scoped to the duplicate-key rejection, which is the whole differential: it is eunox's own
+// strictness, so those bytes carry an answer for the peer they are forwarded to and none for
+// the proxy forwarding them. The other decode failures are NOT this — invalid JSON is rejected
+// by every decoder alike, and a shape mismatch means there was no `_meta` object for anyone to
+// read a declaration out of — so they stay the plain "nothing declared" they were.
+//
+// Reported rather than folded into declared=false because only the caller knows which of the
+// two readings its message admits. For one a method handler re-decodes and denies moments
+// later, "unknown" is safely read as "nothing declared". For one whose bytes travel to a peer
+// unread, it is not.
+//
+// Deliberately not wrapping the decode error: that error names the caller's own key spellings,
+// and this one's text is echoed to the peer it refuses.
+var ErrUndecodableDeclaration = errors.New("mcp: protocol revision declaration could not be decoded")
+
 // maxReflectedRevisionLen bounds how much of a rejected version string is echoed back to the
 // peer. The value reaches the error precisely BECAUSE it failed the closed-set match, so it
 // is arbitrary caller text up to the transport's whole frame — reflecting it unbounded would
@@ -37,9 +56,10 @@ const maxReflectedRevisionLen = 32
 // DeclaredRevision reads the protocol revision a request declares in its `_meta`
 // (capability.MetaKeyProtocolVersion), as 2026-07-28 requires on every request.
 //
-// Three outcomes, and the caller must keep them apart: a revision this build speaks; nothing
-// declared (declared=false, err=nil); or a declaration this build cannot honor
-// (ErrUnknownRevision).
+// Four outcomes, and the caller must keep them apart: a revision this build speaks; nothing
+// declared (declared=false, err=nil); a declaration this build cannot honor
+// (ErrUnknownRevision); or a body this build alone refuses, so there is no answer either way
+// (ErrUndecodableDeclaration).
 //
 // The params are DECODED rather than scanned for the key as raw bytes. A byte-substring probe
 // was the obvious fast path and was wrong: JSON permits escaping any character of an object
@@ -49,12 +69,13 @@ const maxReflectedRevisionLen = 32
 // versus upstream parser differential the DecodeParams choice below exists to close, so the
 // probe cannot be the thing that reintroduces it. Cost: one JSON walk per host message.
 //
-// A params body that does not decode reports nothing declared rather than an error. It is a
-// malformed REQUEST, and relabelling every one of those as a version failure would replace
-// the target-bearing INVALID_REQUEST record the enforced-method handlers write. What keeps
-// that safe is where a caller-chosen table can come from at all: this reports "nothing
-// declared", so the caller resolves the context's pinned revision — or, on a context with no
-// pin yet, capability.DefaultRevision. Neither is a table the malformed body chose.
+// A params body that does not decode reports nothing declared rather than an error, EXCEPT for
+// the duplicate-key rejection (ErrUndecodableDeclaration, whose doc has the distinction).
+// Reading a malformed body as undeclared is what keeps a version failure from replacing the
+// target-bearing INVALID_REQUEST record the enforced-method handlers write, and what makes it
+// safe is where a caller-chosen table can come from at all: "nothing declared" resolves the
+// context's pinned revision — or, on a context with no pin yet, capability.DefaultRevision.
+// Neither is a table the malformed body chose.
 func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared bool, err error) {
 	if len(params) == 0 {
 		return "", false, nil
@@ -70,6 +91,9 @@ func DeclaredRevision(params json.RawMessage) (rev capability.Revision, declared
 	// params body carrying the version key twice cannot resolve to one revision here and a
 	// different one in whatever the upstream reads from the same forwarded bytes.
 	if decErr := DecodeParams(params, &probe); decErr != nil {
+		if errors.Is(decErr, errDuplicateObjectKey) {
+			return "", false, ErrUndecodableDeclaration
+		}
 		return "", false, nil
 	}
 	raw := bytes.TrimSpace(probe.Meta.Version)

@@ -99,7 +99,7 @@ func TestRemoteSession_RefusalTableHoldsOnlyWhatItCanReach(t *testing.T) {
 	// A category it does NOT hold is delegated WHOLLY to the aggregate, which is the proxy-wide
 	// bound those records had before the per-session split existed — never the floor-rate `unknown`
 	// bucket, which would silently make an unlisted category the most suppressed one on the proxy.
-	for range int(perCategoryDenyBurst) {
+	for range perCategoryDenyBurstSize {
 		ok := remote.admitWithFloor(catDisplaced, nil).ok
 		require.True(t, ok)
 	}

@@ -144,6 +144,21 @@ var ErrIncompleteEnumeration = redisutil.ErrIncompleteFanOut
 // siblings: a declaration that contradicts the client is a wiring bug, and it never heals.
 var ErrTopologyContradicted = errors.New("killswitch: the declared keyspace topology contradicts the Redis client's own type; failing closed (drop the declaration, or pass the client the declaration describes)")
 
+// ErrPublishFailed marks a failure that happened AFTER the durable write already landed: the
+// revocation (or its undo) is in Redis and every replica converges on its next reconcile tick,
+// but the real-time pub/sub notification did not go out.
+//
+// Distinguishable rather than returned bare, because a caller whose whole question is "did the
+// revocation land" — `eunox kill`'s exit contract, /control/kill's status — cannot tell a lost
+// notification from a lost kill through an undifferentiated error, and answering "it failed"
+// for a kill that is durably written is the wrong direction on the emergency-stop path. On a
+// minimally-privileged Redis ACL granting SET/DEL/SCAN but not PUBLISH, every kill reports
+// failure forever while in fact landing.
+//
+// Wrapped around the cause, so a caller that wants the underlying Redis error still reaches it
+// with errors.Is/As.
+var ErrPublishFailed = errors.New("killswitch: kill-switch state was written durably, but the pub/sub notification failed")
+
 // Redis is a Redis-backed kill-switch manager with pub/sub propagation and local cache.
 type Redis struct {
 	client redis.Cmdable
@@ -465,15 +480,29 @@ func (r *Redis) resolveTopology(nilClient bool) error {
 // It is idempotent: repeated calls launch the listener and reconcile loop only once (a
 // second call would otherwise overwrite r.cancel and run duplicate loops).
 func (r *Redis) Start(ctx context.Context) {
-	// Hold lifeMu across the whole Start body so a concurrent Stop blocks until cancel is
-	// published and both goroutines are registered, ordering every wg.Add before Stop's
-	// wg.Wait.
+	gained := r.startUnderLifeMu(ctx)
+	// The initial snapshot's revocations are delivered with lifeMu RELEASED, for the reason
+	// refreshState releases refreshMu first: a callback may call back into the Manager, and
+	// Stop takes lifeMu — an observer reacting to a startup-time kill by stopping the switch
+	// would otherwise deadlock against the Start that is notifying it. Delivering after the
+	// whole body also means such a callback sees a started switch rather than the
+	// fail-closed unstarted answer.
+	r.notifyRevocations(gained)
+}
+
+// startUnderLifeMu is Start's body, run under lifeMu, returning the initial snapshot's
+// revocations for Start to deliver once the lock is released.
+//
+// lifeMu is held across the WHOLE body so a concurrent Stop blocks until cancel is
+// published and both goroutines are registered, ordering every wg.Add before Stop's
+// wg.Wait.
+func (r *Redis) startUnderLifeMu(ctx context.Context) []Revocation {
 	r.lifeMu.Lock()
 	defer r.lifeMu.Unlock()
 	// Start at most once. If Stop already ran, do not start either: launching
 	// goroutines now would orphan them beyond Stop's reach.
 	if r.startedOnce || r.stopped {
-		return
+		return nil
 	}
 	// A latched wiring fault means this backend can never confirm its kill set — the client
 	// would panic on every command, or the servers holding the keyspace cannot be enumerated —
@@ -486,7 +515,7 @@ func (r *Redis) Start(ctx context.Context) {
 			r.logger.Error("kill switch: wiring fault; the switch is permanently degraded and every check fails closed",
 				slog.String("error", r.wiringErr.Error()))
 		}
-		return
+		return nil
 	}
 	r.startedOnce = true
 
@@ -537,7 +566,10 @@ func (r *Redis) Start(ctx context.Context) {
 
 	// Load initial state. On failure the switch starts degraded (blocking in
 	// fail-closed, allowing the empty cache in fail-open) and self-corrects later.
-	if err := r.refreshState(subCtx); err != nil {
+	// serializedRefresh, not refreshState: the revocations it finds are returned to Start
+	// and delivered outside lifeMu (see there).
+	gained, err := r.serializedRefresh(subCtx)
+	if err != nil {
 		if r.logger != nil {
 			mode := "blocking all traffic until Redis is reachable (fail-closed)"
 			if r.failOpen {
@@ -573,6 +605,8 @@ func (r *Redis) Start(ctx context.Context) {
 		defer r.wg.Done()
 		r.drainRefreshTrigger(subCtx)
 	}()
+
+	return gained
 }
 
 // reconcileLoop periodically refreshes the local cache from Redis so kill events lost by
@@ -1066,16 +1100,24 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 // publish broadcasts msg on the kill-switch channel. The durable write and cache update
 // already happened, so a publish failure does NOT undo the kill — it only delays remote
 // convergence to the next reconcile. Publish is part of redis.Cmdable, so no assertion needed.
+//
+// No wiringErr check of its own: every caller returns on it before reaching a durable write,
+// so one here could only ever be dead code that reads as a live guard.
+//
+// That same "the durable write already happened" precondition is what makes this the one place
+// ErrPublishFailed is stamped: wrapping at each caller would be four copies of a judgment this
+// function's own contract already states, and the next writer added would inherit the bare error.
 func (r *Redis) publish(ctx context.Context, msg string) error {
-	if r.wiringErr != nil {
-		return r.wiringErr
+	if err := r.client.Publish(ctx, redisPubSubChan, msg).Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrPublishFailed, err)
 	}
-	return r.client.Publish(ctx, redisPubSubChan, msg).Err()
+	return nil
 }
 
-// recordRefreshErr stores err as the last refresh error and returns it, so refreshState's
-// three failure paths share one stamp-and-return. Only ever called within refreshState,
-// which holds refreshMu for its whole body, so lastRefreshErr has a single serialized writer.
+// recordRefreshErr stores err as the last refresh error and returns it, so the refresh's
+// failure paths share one stamp-and-return. Every scan-time caller is inside
+// serializedRefresh, which holds refreshMu for its whole body, so lastRefreshErr has a
+// single serialized writer.
 func (r *Redis) recordRefreshErr(err error) error {
 	r.mu.Lock()
 	r.lastRefreshErr = err
@@ -1087,6 +1129,20 @@ func (r *Redis) refreshState(ctx context.Context) error {
 	if r.wiringErr != nil {
 		return r.recordRefreshErr(r.wiringErr)
 	}
+	gained, err := r.serializedRefresh(ctx)
+	// Observers run with refreshMu RELEASED, matching the pub/sub delivery path: the
+	// contract says a callback may call back in, and refreshMu is neither reentrant nor
+	// ctx-aware, so a callback reaching any refresh-taking method (Reset re-seeds through
+	// refreshState) would self-deadlock — wedging the reconcile goroutine for the
+	// process's life, on the emergency-stop path, and hanging a later Stop on wg.Wait.
+	r.notifyRevocations(gained)
+	return err
+}
+
+// serializedRefresh is refreshState's scan-and-commit half, run under refreshMu. It
+// RETURNS the revocations its commit added rather than delivering them, so the lock is
+// released before any observer runs.
+func (r *Redis) serializedRefresh(ctx context.Context) ([]Revocation, error) {
 	// Serialize refreshes so two scans cannot interleave and commit out of order: a
 	// cacheGen match only guards against a racing cache MUTATION, not against a
 	// second refresh that captured the same generation, so without this an older
@@ -1111,18 +1167,18 @@ func (r *Redis) refreshState(ctx context.Context) error {
 
 		val, err := r.client.Get(ctx, redisGlobalKey).Result()
 		if err != nil && !errors.Is(err, redis.Nil) {
-			return r.recordRefreshErr(err)
+			return nil, r.recordRefreshErr(err)
 		}
 		newGlobal := err == nil && val == "1"
 
 		newAgents := make(map[string]bool)
 		if err := r.scanPrefix(ctx, redisAgentPrefix, newAgents); err != nil {
-			return r.recordRefreshErr(err)
+			return nil, r.recordRefreshErr(err)
 		}
 
 		newSessions := make(map[string]bool)
 		if err := r.scanPrefix(ctx, redisSessionPfx, newSessions); err != nil {
-			return r.recordRefreshErr(err)
+			return nil, r.recordRefreshErr(err)
 		}
 
 		r.mu.Lock()
@@ -1130,8 +1186,7 @@ func (r *Redis) refreshState(ctx context.Context) error {
 			// No cache mutation raced the scan: the snapshot is consistent.
 			gained := r.commitRefreshLocked(newGlobal, newAgents, newSessions)
 			r.mu.Unlock()
-			r.notifyRevocations(gained)
-			return nil
+			return gained, nil
 		}
 		if attempt+1 < maxRefreshAttempts {
 			// A kill/revive/global toggle landed during the scan; the snapshot may
@@ -1151,13 +1206,13 @@ func (r *Redis) refreshState(ctx context.Context) error {
 		}
 		gained := r.commitRefreshLocked(newGlobal || r.globalActive, newAgents, newSessions)
 		r.mu.Unlock()
-		r.notifyRevocations(gained)
-		return nil
+		return gained, nil
 	}
 }
 
 // notifyRevocations calls the observers for every revocation a refresh added. Always
-// OUTSIDE r.mu, since an observer's documented response is to re-ask ShouldBlock.
+// OUTSIDE both r.mu and refreshMu, since an observer's documented response is to call back
+// into the Manager.
 func (r *Redis) notifyRevocations(gained []Revocation) {
 	for _, ev := range gained {
 		r.observers.notify(ev)
@@ -1170,9 +1225,9 @@ func (r *Redis) notifyRevocations(gained []Revocation) {
 // staleness gate denies ALL traffic in fail-closed mode when it is not maintained.
 //
 // It returns the revocations the snapshot ADDS, for the caller to notify after releasing
-// r.mu. The reconcile loop fires observers too, not just pub/sub, because a publish that
-// never arrives would otherwise leave a consumer with nothing to reclaim on (and the
-// sessionIdleTimeoutMs: 0 case has no sweep at all).
+// r.mu AND refreshMu. The reconcile loop fires observers too, not just pub/sub, because a
+// publish that never arrives would otherwise leave a consumer with nothing to reclaim on
+// (and the sessionIdleTimeoutMs: 0 case has no sweep at all).
 func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) []Revocation {
 	var gained []Revocation
 	if global && !r.globalActive {

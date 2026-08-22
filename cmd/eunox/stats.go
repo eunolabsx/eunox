@@ -198,6 +198,30 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 	return out, nil
 }
 
+// decodeDetails returns a record's `details` map when the raw line contains probe, and nil
+// otherwise — the probe-then-decode step all three detail tallies share.
+//
+// The probe is what keeps this cheap: `details` is the caller's whole argument map, so decoding
+// it on every record to answer a rare question is the cost each of these tallies exists to
+// avoid. Each probe is derived from its producer's own key, so a rename there is a compile error
+// rather than a filter that silently matches nothing.
+//
+// A decode failure reads as "no details", the direction that under-reports rather than
+// inventing a count. Shared so a record hitting two probes decodes once per probe rather than
+// once per tally with three copies of the same eight lines to keep in agreement.
+func decodeDetails(line, probe []byte) map[string]json.RawMessage {
+	if !bytes.Contains(line, probe) {
+		return nil
+	}
+	var rec struct {
+		Details map[string]json.RawMessage `json:"details"`
+	}
+	if err := json.Unmarshal(line, &rec); err != nil {
+		return nil
+	}
+	return rec.Details
+}
+
 // declassifyProbe is the byte pattern addDeclassifyDetails scans a raw record for before
 // paying for a second decode, derived from the producer's own key prefix so the two can't drift.
 var declassifyProbe = []byte(audit.DeclassifyDetailPrefix)
@@ -207,16 +231,10 @@ var declassifyProbe = []byte(audit.DeclassifyDetailPrefix)
 // RawMessage would copy the caller's entire argument map on most records — and decodes only
 // on a hit. A miss reads as "no declassification facts", the safe direction.
 func (s *auditStatsSummary) addDeclassifyDetails(line []byte) {
-	if !bytes.Contains(line, declassifyProbe) {
+	details := decodeDetails(line, declassifyProbe)
+	if details == nil {
 		return
 	}
-	var rec struct {
-		Details map[string]json.RawMessage `json:"details"`
-	}
-	if err := json.Unmarshal(line, &rec); err != nil {
-		return
-	}
-	details := rec.Details
 	if _, ok := details[audit.DeclassifySpentApprovalKey]; ok {
 		s.spentApprovals++
 	}
@@ -239,16 +257,7 @@ var handlerFaultProbe = []byte(audit.HandlerFaultKey)
 // addHandlerFaultDetails tallies records reporting a repaired condition-handler fault. A miss
 // reads as "no fault", the direction that under-reports rather than inventing an alert.
 func (s *auditStatsSummary) addHandlerFaultDetails(line []byte) {
-	if !bytes.Contains(line, handlerFaultProbe) {
-		return
-	}
-	var rec struct {
-		Details map[string]json.RawMessage `json:"details"`
-	}
-	if err := json.Unmarshal(line, &rec); err != nil {
-		return
-	}
-	if _, ok := rec.Details[audit.HandlerFaultKey]; ok {
+	if _, ok := decodeDetails(line, handlerFaultProbe)[audit.HandlerFaultKey]; ok {
 		s.handlerFaults++
 	}
 }
@@ -264,18 +273,9 @@ var unroutableProbe = []byte(audit.UnroutableKey)
 // run met a method the peer's revision removed or one nobody has heard of. Without it, the tool
 // the --audit banner points an operator at reports them as an undifferentiated block count.
 func (s *auditStatsSummary) addUnroutableDetails(line []byte) {
-	if !bytes.Contains(line, unroutableProbe) {
-		return
-	}
-	// Decoded through the producer's KEY, not a struct tag naming it: a rename there is a
-	// compile error at the probe above and would otherwise leave this silently matching nothing.
-	var rec struct {
-		Details map[string]json.RawMessage `json:"details"`
-	}
-	if err := json.Unmarshal(line, &rec); err != nil {
-		return
-	}
-	raw, present := rec.Details[audit.UnroutableKey]
+	// Read through the producer's KEY, not a struct tag naming it: a rename there is a compile
+	// error at the probe and would otherwise leave this silently matching nothing.
+	raw, present := decodeDetails(line, unroutableProbe)[audit.UnroutableKey]
 	if !present {
 		return
 	}

@@ -187,6 +187,11 @@ func (c *Contract) Validate() error {
 	if err := capability.ValidateEffectContract(c.Effect); err != nil {
 		return fmt.Errorf("contract %q: %w", c.ID, err)
 	}
+	// A digest is only worth publishing if the copy a manifest makes of this block digests
+	// to the same value; see checkPinnableNumbers.
+	if err := checkPinnableNumbers(c.Effect); err != nil {
+		return fmt.Errorf("contract %q: %w", c.ID, err)
+	}
 	actual, err := capability.EffectContractDigest(c.Effect)
 	if err != nil {
 		return fmt.Errorf("contract %q: %w", c.ID, err)
@@ -213,13 +218,22 @@ func (c *Contract) Validate() error {
 	return nil
 }
 
-// strictDecodeJSON is the one JSON reader for a document on disk: unknown fields
-// refused, and trailing content after the first value refused (catches two concatenated
-// objects, where Decode would otherwise silently read only the first).
+// strictDecodeJSON is the one JSON reader for a document on disk: ambiguous member names
+// refused, unknown fields refused, and trailing content after the first value refused
+// (catches two concatenated objects, where Decode would otherwise silently read only the
+// first).
 //
 // useNumber preserves integer literals beyond float64's exact range — matters for a
 // contract's blast radius, not for a key file.
 func strictDecodeJSON(data []byte, target any, what string, useNumber bool) error {
+	// BEFORE the decode, because the decode is what resolves the ambiguity: encoding/json
+	// binds member names case-insensitively and keeps the last duplicate, so
+	// DisallowUnknownFields does not see a second spelling of a known field at all. Both
+	// documents this reads — a corpus entry and the attestation trust store — are read by a
+	// human first, and last-wins is precisely the substitution that reading cannot detect.
+	if err := capability.RefuseAmbiguousJSONKeys(data); err != nil {
+		return fmt.Errorf("parsing %s: %w", what, err)
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if useNumber {
@@ -274,8 +288,12 @@ func LoadCorpus(dir string) ([]Contract, error) {
 			// file's content into the corpus, or reintroduce the FIFO hang the check
 			// above exists to close. O_NOFOLLOW closes it the same way readTrustStoreFile
 			// does for the trust store.
-			Flags:     config.OpenNoFollow,
-			OverLimit: "refusing to buffer it rather than decoding a corpus entry that cannot be one",
+			Flags: config.OpenNoFollow,
+			// The directory listing above chose this path, not the operator: whoever can
+			// write the corpus directory chooses what the scan finds, which is what the
+			// FIFO guard is for. See BoundedRead.Discovered.
+			Discovered: true,
+			OverLimit:  "refusing to buffer it rather than decoding a corpus entry that cannot be one",
 		})
 		if err != nil {
 			return nil, err
@@ -297,6 +315,69 @@ func LoadCorpus(dir string) ([]Contract, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+// checkPinnableNumbers refuses a blast-radius literal whose spelling does not survive the
+// manifest loader's own number renormalization.
+//
+// This loader decodes with UseNumber, so "value": 1.0 digests over the literal "1.0". The
+// manifest loader renormalizes it to 1 before decoding, so the block a manifest COPIES
+// VERBATIM out of this entry digests to a different value and its `effect.ref` pin can
+// never match — with a failure that blames the author ("the block was edited after it was
+// pinned") for a block they did not touch. The entry is publishable and unpinnable, which
+// is the one thing a corpus entry exists to be.
+//
+// Refused here, at publish time, rather than canonicalized inside EffectContractDigest:
+// changing the digest function re-digests every entry already published against it, where
+// this only refuses a spelling nothing has published yet.
+func checkPinnableNumbers(e *capability.EffectContract) error {
+	if e == nil {
+		return nil
+	}
+	if err := checkPinnableBlastRadius("effect.blastRadius", e.BlastRadius); err != nil {
+		return err
+	}
+	if e.ByArgument == nil {
+		return nil
+	}
+	// Sorted so an entry with two offending rows reports the same one every time.
+	cases := make([]string, 0, len(e.ByArgument.Cases))
+	for value := range e.ByArgument.Cases {
+		cases = append(cases, value)
+	}
+	sort.Strings(cases)
+	for _, value := range cases {
+		where := fmt.Sprintf("effect.byArgument.cases[%q].blastRadius", value)
+		if err := checkPinnableBlastRadius(where, e.ByArgument.Cases[value].BlastRadius); err != nil {
+			return err
+		}
+	}
+	if e.ByArgument.Default != nil {
+		return checkPinnableBlastRadius("effect.byArgument.default.blastRadius", e.ByArgument.Default.BlastRadius)
+	}
+	return nil
+}
+
+// checkPinnableBlastRadius applies checkPinnableNumbers' rule to one magnitude. The two
+// refusals are worded differently because only one of them has a spelling to recommend: a
+// literal the loader merely RE-SPELLS has a canonical form to write, while one it ROUNDS has
+// none at all — and offering the rounded form as the fix would tell the author to declare a
+// magnitude they did not write, which is the ceiling's and the cumulative bound's own input.
+func checkPinnableBlastRadius(where string, s *capability.BlastRadiusSpec) error {
+	if s == nil || s.Value == nil {
+		return nil
+	}
+	lit := s.Value.String()
+	canonical, exact, ok := config.CanonicalNumberLiteral(lit)
+	switch {
+	case !ok || canonical == lit:
+		// Not a number at all is ValidateEffectContract's report to make, not this one's.
+		return nil
+	case !exact:
+		return fmt.Errorf("%s 'value' %s is past the precision the manifest loader keeps: it renormalizes to %s, a DIFFERENT magnitude, so no spelling of this number can be copied into a manifest and pinned — declare a magnitude the loader carries exactly", where, lit, canonical)
+	default:
+		return fmt.Errorf("%s 'value' is written %s, which a manifest copying this block renormalizes to %s; the copy would digest differently and its 'effect.ref' pin could never match this entry, so write %s here", where, lit, canonical, canonical)
+	}
 }
 
 // maxContractFileBytes bounds one corpus entry's read against a MISDIRECTED --dir path

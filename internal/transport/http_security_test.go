@@ -10,6 +10,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,7 +23,10 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/stretchr/testify/require"
+
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
 // ---------------------------------------------------------------------------
@@ -1064,5 +1068,159 @@ func TestRequireJSONContentType_Kill(t *testing.T) {
 		if !status.GlobalActive {
 			t.Error("an accepted /control/kill {\"all\":true} must activate the global kill switch")
 		}
+	})
+}
+
+// TestHandleKill_PublishOnlyFailureIsStillAKill covers /control/kill's half of the split the
+// CLI's exit contract turns on: the kill-store write LANDED and only the real-time
+// notification to other instances failed.
+//
+// The handler treated any error from the store as a failed emergency stop and answered 500,
+// which is correct for a write that did not land and exactly wrong for one that did — the
+// operator running `eunox kill` against an HTTP proxy is told their stop failed when it is in
+// force here and converging everywhere else. The teardown is the local half of the kill and
+// still runs; a genuine write failure keeps its 500.
+func TestHandleKill_PublishOnlyFailureIsStillAKill(t *testing.T) {
+	t.Parallel()
+
+	newKillReq := func(body string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+		req.Header.Set("Content-Type", CTJSON)
+		req.Header.Set(ControlTokenHeader, testControlToken)
+		req.RemoteAddr = "127.0.0.1:9999"
+		req.Host = "127.0.0.1:9999"
+		return req
+	}
+
+	cases := []struct {
+		name     string
+		body     string
+		writeErr error
+		wantCode int
+		wantNote string
+	}{
+		{
+			name:     "global kill whose notification was lost",
+			body:     `{"all":true}`,
+			writeErr: fmt.Errorf("%w: connection reset", killswitch.ErrPublishFailed),
+			wantCode: http.StatusOK,
+			wantNote: "written durably",
+		},
+		{
+			name:     "session kill whose notification was lost",
+			body:     `{"sessionId":"sess-1"}`,
+			writeErr: fmt.Errorf("%w: connection reset", killswitch.ErrPublishFailed),
+			wantCode: http.StatusOK,
+			wantNote: "written durably",
+		},
+		{
+			name:     "a durable write that genuinely failed keeps its 500",
+			body:     `{"all":true}`,
+			writeErr: errors.New("redis: connection refused"),
+			wantCode: http.StatusInternalServerError,
+			wantNote: "failed",
+		},
+		{
+			name:     "session kill that genuinely failed keeps its 500",
+			body:     `{"sessionId":"sess-1"}`,
+			writeErr: errors.New("redis: connection refused"),
+			wantCode: http.StatusInternalServerError,
+			wantNote: "failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var stderr bytes.Buffer
+			proxy := newHTTPProxy(httpProxyOptions{
+				Port:         3000,
+				ControlToken: testControlToken,
+				KS:           writeFailingKillSwitch{Manager: killswitch.NewInMemory(), err: tc.writeErr},
+				Stderr:       &stderr,
+			})
+			rr := httptest.NewRecorder()
+			proxy.handleKill(rr, newKillReq(tc.body))
+			if rr.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (body=%q)", rr.Code, tc.wantCode, rr.Body.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantNote) {
+				t.Errorf("stderr = %q, want it to carry %q", stderr.String(), tc.wantNote)
+			}
+			if tc.wantCode == http.StatusOK {
+				// Named by its FLAG, never by a duration: each OTHER instance converges on its
+				// own --killswitch-reconcile-interval, which this process does not know and
+				// which is not its own default merely because that is what it could print.
+				if !strings.Contains(stderr.String(), "--killswitch-reconcile-interval") {
+					t.Errorf("stderr = %q, want the convergence bound named by its flag", stderr.String())
+				}
+				if strings.Contains(stderr.String(), killswitch.DefaultReconcileInterval.String()) {
+					t.Errorf("stderr = %q must not state this process's default as another instance's interval", stderr.String())
+				}
+			}
+		})
+	}
+}
+
+// writeFailingKillSwitch answers every kill WRITE with one canned error while behaving like a
+// real manager for everything else — the proxy subscribes to revocations at construction, so a
+// bare stub would not do.
+type writeFailingKillSwitch struct {
+	killswitch.Manager
+	err error
+}
+
+func (k writeFailingKillSwitch) ActivateGlobal(context.Context) error { return k.err }
+
+func (k writeFailingKillSwitch) KillSession(context.Context, string) error { return k.err }
+
+// TestHandleKill_OverLongSessionIDIsRefused bounds the one attacker-shaped value this endpoint
+// takes from a body rather than a header.
+//
+// The body is capped at maxRequestBodyBytes, so without a length check a ~4 MiB "session id"
+// flowed into the Redis kill key, into details.scope of the SIGNED RecordAllow, and back out in
+// the response echo — the rule maxClaimedSessionIDLen already states for the header form of
+// exactly this value. The caller holds the control token and is trusted to stop the proxy, not
+// to choose how many megabytes land on the tape; and an id this long names no session the proxy
+// ever minted, so refusing it forfeits no kill that could have worked.
+func TestHandleKill_OverLongSessionIDIsRefused(t *testing.T) {
+	t.Parallel()
+
+	newKillReq := func(body string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/control/kill", strings.NewReader(body))
+		req.Header.Set("Content-Type", CTJSON)
+		req.Header.Set(ControlTokenHeader, testControlToken)
+		req.RemoteAddr = "127.0.0.1:9999"
+		req.Host = "127.0.0.1:9999"
+		return req
+	}
+
+	t.Run("over-length is a 400 and kills nothing", func(t *testing.T) {
+		t.Parallel()
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken, Stderr: io.Discard})
+		huge := strings.Repeat("a", maxClaimedSessionIDLen+1)
+		body, err := json.Marshal(map[string]string{"sessionId": huge})
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, newKillReq(string(body)))
+		require.Equal(t, http.StatusBadRequest, rr.Code)
+
+		status := killStatusForTest(t, proxy)
+		require.NotContains(t, status.KilledSessions, huge, "a refused kill must not have written a tombstone")
+	})
+
+	t.Run("an id at the bound still kills", func(t *testing.T) {
+		t.Parallel()
+		proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken, Stderr: io.Discard})
+		atLimit := strings.Repeat("a", maxClaimedSessionIDLen)
+		body, err := json.Marshal(map[string]string{"sessionId": atLimit})
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		proxy.handleKill(rr, newKillReq(string(body)))
+		require.Equal(t, http.StatusOK, rr.Code, "the bound is a ceiling on absurdity, not a tightening of what a real id may be")
+
+		status := killStatusForTest(t, proxy)
+		require.Contains(t, status.KilledSessions, atLimit)
 	})
 }
