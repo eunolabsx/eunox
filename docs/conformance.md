@@ -437,10 +437,12 @@ eunox decided under a third. Which direction it rewrites follows the receiving r
 | host `2025-11-25` → upstream `2026-07-28` | the per-request declaration is **added** (the upstream requires it; the host has no way to send it) | left alone, except that a variant the host cannot read is refused |
 | host `2026-07-28` → upstream `2025-11-25` | the declaration is **removed** (eunox presents itself as a client of the upstream's own revision) | `resultType: "complete"` is **added**, and `cacheScope: "private"` on the three `*/list` results |
 
+Supplying those members is **not** the boundary's doing, and the distinction matters to a reader
+of this table: they are added for every host on `2026-07-28`, including one on a *matched* pair,
+by the result-shape pass described in the two rows above. What is a property of the boundary is
+that an older upstream never sends them, so on this direction the pass always has work to do.
 `ttlMs` is deliberately never added: it is a freshness hint the older upstream did not offer,
-and inventing a lifetime for someone else's data is the fabrication this boundary exists to
-avoid. `cacheScope` is set to `private` rather than copied, because every list eunox emits is
-filtered per caller identity.
+and inventing a lifetime for someone else's data is a fabrication eunox stops short of.
 
 What a mismatched pair refuses, with `UNTRANSLATABLE_ACROSS_REVISIONS` (`-32022`), recorded,
 and the upstream never contacted:
@@ -449,7 +451,7 @@ and the upstream never contacted:
 |---|---|
 | `resources/subscribe` / `resources/unsubscribe` | the newer revision replaced the pair with `subscriptions/listen`; bridging would make eunox hold the subscription correspondence for the connection's life |
 | `notifications/roots/list_changed` | announces a capability the newer revision deprecates, so it names a surface the upstream cannot read |
-| a result whose `resultType` is not `complete` | a host with no `resultType` in its vocabulary reads it as a finished call, drops the `inputRequests` the upstream is waiting on, and the exchange desynchronizes **silently** — an unrecognized variant is refused for the same reason |
+| a result whose `resultType` is not `complete`, toward a `2025-11-25` host | that host has no `resultType` in its vocabulary, so it reads the result as a finished call, drops the `inputRequests` the upstream is waiting on, and the exchange desynchronizes **silently**. An unrecognized variant is refused for the same reason. Toward a *declaring* host the same result is refused too, but by the result-shape pass and for its own reason (`ENFORCEMENT_ERROR`): that host can read the member, and eunox still cannot enforce a variant it does not model |
 | a server-initiated request toward a `2026-07-28` host | that revision removed the mechanism; there is no way to ask the host and no honest answer eunox could give on its behalf. The upstream is answered rather than left blocked |
 | a host *response* | on a mismatched pair the only request it could answer is a server-initiated one already refused at the leg |
 

@@ -352,6 +352,13 @@ Scope:
 - Assertion test that filtering preserves upstream list ordering (deterministic
   ordering is a spec SHOULD that eunox must not break).
 
+*Reconciled with D1 on landing.* The boundary shipped a copy of the supply half while this was
+in review, and the two were collapsed onto one implementation: supplying the members is a
+property of the **host's** revision (a matched 2026-07-28 pair needs them too), so it lives here
+and the boundary keeps only the refusal it alone can make — a variant a `2025-11-25` host would
+misread. The two wrappers on `callUpstream` compose, translation innermost, held to that order
+by one source guard declaring the chain.
+
 Exit criteria:
 
 - [x] Sweep test: no builder emits a 2026-07-28 result without `resultType`; old-revision output byte-stable.
