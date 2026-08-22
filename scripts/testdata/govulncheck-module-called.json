@@ -1,0 +1,10 @@
+{"config":{"protocol_version":"v1.0.0","scanner_name":"govulncheck","scanner_version":"v1.4.0","db":"https://vuln.go.dev","go_version":"go1.26.6","scan_level":"symbol","scan_mode":"source"}}
+{"progress":{"message":"Scanning your code and its dependencies..."}}
+{"osv":{"id":"GO-2026-9001","summary":"Authentication bypass in github.com/example/dep"}}
+{"finding":{"osv":"GO-2026-9001","fixed_version":"v1.2.1","trace":[{"module":"github.com/example/dep","version":"v1.2.0"}]}}
+{"finding":{"osv":"GO-2026-9001","fixed_version":"v1.2.1","trace":[{"module":"github.com/example/dep","version":"v1.2.0","package":"github.com/example/dep/auth"}]}}
+{"finding":{"osv":"GO-2026-9001","fixed_version":"v1.2.1","trace":[{"module":"github.com/example/dep","version":"v1.2.0","package":"github.com/example/dep/auth","function":"Verify"},{"module":"github.com/eunolabs/eunox","package":"github.com/eunolabs/eunox/internal/pdp","function":"JWTPDP.Decide"}]}}
+{"osv":{"id":"GO-2026-5026","summary":"Invoking failure to reject ASCII-only Punycode-encoded labels"}}
+{"finding":{"osv":"GO-2026-5026","fixed_version":"go1.26.7","trace":[{"module":"stdlib","version":"go1.26.6"}]}}
+{"finding":{"osv":"GO-2026-5026","fixed_version":"go1.26.7","trace":[{"module":"stdlib","version":"go1.26.6","package":"net/http"}]}}
+{"finding":{"osv":"GO-2026-5026","fixed_version":"go1.26.7","trace":[{"module":"stdlib","version":"go1.26.6","package":"net/http","function":"Client.Do"},{"module":"github.com/eunolabs/eunox","package":"github.com/eunolabs/eunox/internal/transport","function":"DoMCPHTTP"}]}}

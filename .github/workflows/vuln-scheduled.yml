@@ -1,0 +1,152 @@
+# Copyright 2026 Eunolabs, LLC
+# SPDX-License-Identifier: Apache-2.0
+
+# The calendar half of the vulnerability scan.
+#
+# The PR gate (.github/workflows/go-ci.yml) fails only on a called advisory in a module
+# this code depends on -- the finding a branch can actually fix. Advisories against the
+# pinned Go toolchain are reported there and do not block, because they arrive on the
+# calendar rather than on a commit: the next stdlib advisory would otherwise turn every
+# open PR red at once, none of them at fault, and the fix (moving the Go pin) is a change
+# no contributor's branch should carry.
+#
+# Something still has to notice them, which is this job. It re-runs the same scan daily
+# against main and opens -- or updates -- a single tracking issue when anything is found.
+# An issue is work with an owner; tree-wide red is not.
+name: Scheduled vulnerability scan
+
+on:
+  schedule:
+    # Daily. The database is live, so the useful cadence is the database's, not the
+    # repo's -- a quiet week still needs checking. Offset off the hour so this does not
+    # queue behind everything else scheduled at :00.
+    - cron: "17 6 * * *"
+  workflow_dispatch: {}
+  # Re-run when the scan's own inputs change, so a Go pin bump or a dependency change
+  # closes the tracking issue on the commit that fixed it rather than up to a day later.
+  push:
+    branches: [main]
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - "scripts/govulncheck.sh"
+      - ".github/workflows/vuln-scheduled.yml"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Scan and report
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Needed to open and update the tracking issue. This is the only workflow in the
+      # repo with issue write access; it writes exactly one issue, found by label.
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.6"
+          cache-dependency-path: go.sum
+
+      - name: Check the govulncheck classifier against captured streams
+        run: make check-vulncheck-classifier
+
+      # --mode report never exits nonzero for FINDINGS, so a red run here means the scan
+      # itself failed (a database it could not reach, packages it could not load) -- which
+      # is worth a red X, because a scan that did not happen is not a pass.
+      - name: Run govulncheck (report)
+        id: scan
+        run: |
+          ./scripts/govulncheck.sh --mode report \
+            --json-out govulncheck.json \
+            --summary-out summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          # Anything outside the "0 / 0 / 0" all-clear is worth an issue: a called
+          # toolchain advisory needs a pin bump, and a non-called one needs a line in
+          # docs/dependency-advisories.md saying which it is.
+          if grep -qE '^\| .* \| [1-9][0-9]* \|' summary.md; then
+            echo "findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "findings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload the raw scan
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: govulncheck-json
+          path: govulncheck.json
+          retention-days: 30
+
+      # One tracking issue, found by label, updated in place. Opening a fresh issue per
+      # run would reproduce on the issue tracker exactly the noise this split took off
+      # the PR checks.
+      - name: Open or update the tracking issue
+        if: steps.scan.outputs.findings == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label="vulnerability-scan"
+          # Create the label if it is not there yet; `|| true` because a concurrent run
+          # (or a prior one) may have created it already, and that is not a failure.
+          gh label create "$label" --repo "$REPO" \
+            --color B60205 --description "Open govulncheck findings tracked by the scheduled scan" || true
+
+          {
+            echo "The scheduled vulnerability scan found open advisories against \`main\`."
+            echo
+            echo "This issue is opened and updated by \`.github/workflows/vuln-scheduled.yml\`."
+            echo "It exists because these findings do **not** gate pull requests: a stdlib or"
+            echo "toolchain advisory is fixed by moving the Go pin, and a non-called finding is"
+            echo "not something a branch introduced. See \`docs/dependency-advisories.md\` for how"
+            echo "each is meant to be resolved or recorded."
+            echo
+            cat summary.md
+            echo
+            echo "---"
+            echo "Scan: $RUN_URL (commit \`${GITHUB_SHA:0:12}\`)"
+          } > body.md
+
+          existing=$(gh issue list --repo "$REPO" --state open --label "$label" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$REPO" --body-file body.md
+            gh issue comment "$existing" --repo "$REPO" \
+              --body "Re-scanned at $RUN_URL — findings above refreshed."
+            echo "updated issue #$existing"
+          else
+            gh issue create --repo "$REPO" --label "$label" \
+              --title "govulncheck: open advisories against main" --body-file body.md
+          fi
+
+      # A scan that comes back clean closes the tracker, so the issue's existence is
+      # itself the signal rather than something a human has to reconcile by hand.
+      - name: Close the tracking issue when the scan is clean
+        if: steps.scan.outputs.findings == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --repo "$REPO" --state open --label "vulnerability-scan" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "Scan is clean as of $RUN_URL — no open advisories against \`main\`."
+            echo "closed issue #$existing"
+          else
+            echo "no open tracking issue and nothing found; nothing to do."
+          fi
