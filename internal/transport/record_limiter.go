@@ -104,13 +104,26 @@ const (
 	catUnroutable refusalCategory = "unroutable"
 	catSmuggled   refusalCategory = "smuggled_notification"
 	// catServerRequestFailed bounds the records for a server-initiated request this proxy had
-	// already TRACKED and then failed: a forward no client accepted (both the outcome the leg
-	// records synchronously and the correction a later SSE failure appends), and a host reply
-	// destroyed because there was no upstream sink to relay it through. Driven by the upstream like
-	// catDisplaced, and metered for the same reason — nothing caps how many such requests an
-	// upstream issues over a session's life. No numeral: the writers are what they are, and a count
-	// here is a thing to keep in agreement with them.
+	// already TRACKED and then delivered, and then failed: the correction appended when a buffered
+	// request never reached the host, and a host reply destroyed because there was no upstream sink
+	// to relay it through. Driven by the upstream like catDisplaced, and metered for the same reason
+	// — nothing caps how many such requests an upstream issues over a session's life.
+	//
+	// Both writers are gated on CONSUMING a tracker entry, which is what separates them from
+	// catUndeliveredForward below and is why that one does not share this bucket.
 	catServerRequestFailed refusalCategory = "failed_server_request"
+	// catUndeliveredForward bounds the deny for a server-initiated request no client accepted at
+	// all — the outcome the forward leg records synchronously when a session has no subscriber able
+	// to receive it.
+	//
+	// Its own bucket, not catServerRequestFailed's, for the reason catUnroutableID has one: the two
+	// are not equally cheap to reach. This needs no host at any point (hold no GET stream open, or
+	// simply outrun the subscriber buffer) and an upstream drives one per request, while
+	// catServerRequestFailed's writers each need a request that was TRACKED and taken. Sharing one
+	// bucket let the cheaper flood suppress the correction that repairs a standing ALLOW — the
+	// record the tamper-evident tape most needs, since without it that allow stands as claiming a
+	// delivery that never happened.
+	catUndeliveredForward refusalCategory = "undelivered_server_request"
 	// catUnroutableID bounds the record for a server-initiated request eunox refuses because its
 	// own JSON-RPC id is larger than the in-flight tracker retains. Its own bucket, not
 	// catDisplaced's: the two refusals are answered identically but are not equally cheap to
@@ -189,6 +202,7 @@ var refusalDeclarations = map[refusalCategory]refusalDeclaration{
 	catDisplaced:            {metering: meteringMetered},
 	catUnroutableID:         {metering: meteringMetered},
 	catServerRequestFailed:  {metering: meteringMetered},
+	catUndeliveredForward:   {metering: meteringMetered},
 	catRefusalUndeliverable: {metering: meteringMetered},
 	// The fail-closed ROUTING refusal, on either transport and in either framing.
 	catUnroutable: {metering: meteringExempt, why: exemptBecausePolicyDenyCostsTheSame},
@@ -259,22 +273,23 @@ var stdioRefusalCategories = []refusalCategory{
 // Declared here beside the transports' own sets so "which refusals does a session's own upstream
 // drive" is one statement rather than a property re-derived from four category docs.
 var upstreamRefusalCategories = []refusalCategory{
-	catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
+	catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable, catUndeliveredForward,
 }
 
 // remoteUpstreamRefusalCategories is the subset a REMOTE-upstream session holds buckets for.
 //
-// Three of the four are driven by a server-initiated request the proxy TRACKED, and this mode
-// tracks none: there is no upstream reader to receive one, so nothing ever enters the in-flight
-// tracker and no displacement, over-cap id, or undeliverable refusal can arise. Their buckets
-// would bound nothing.
+// All but one of the upstream-driven set are driven by a server-initiated request the proxy
+// TRACKED or FORWARDED, and this mode does neither: there is no upstream reader to receive one, so
+// nothing ever enters the in-flight tracker and no displacement, over-cap id, undeliverable refusal
+// or undelivered forward can arise. Their buckets would bound nothing.
 //
 // catServerRequestFailed is kept as the one whose writers are gated on a tracker entry this mode
 // merely cannot produce TODAY, rather than on machinery it does not have: a remote leg that ever
-// gains an inbound channel reaches it first. Keeping one bucket that a live mode may need beats
-// re-deriving this list from a comment when it does — and the cost of being wrong in this
-// direction is one idle rate limiter, against a category delegated to the shared aggregate in the
-// other.
+// gains an inbound channel reaches it first. catUndeliveredForward is NOT kept, because its writer
+// is gated on that missing machinery — the forward leg runs only on the upstream reader this mode
+// never starts. Keeping one bucket that a live mode may need beats re-deriving this list from a
+// comment when it does — and the cost of being wrong in this direction is one idle rate limiter,
+// against a category delegated to the shared aggregate in the other.
 //
 // Narrowing is safe rather than merely cheap because a category this table has no bucket for is
 // delegated WHOLLY to the aggregate parent (see tieredBuckets.admitWithFloor) — the proxy-wide bound those
@@ -285,22 +300,22 @@ var remoteUpstreamRefusalCategories = []refusalCategory{catServerRequestFailed}
 // newUpstreamRefusalLimiter builds ONE HTTP session's buckets for the upstream-driven categories.
 //
 // Per session, not proxy-wide, for the reason saturationGate states for its own records: one
-// session's flood must not elide another's. These four are driven by a session's OWN upstream, so a
+// session's flood must not elide another's. These are driven by a session's OWN upstream, so a
 // dead subprocess on session A used to drain the shared bucket at its ~2/s share and suppress
 // session B's record that a LIVE in-flight request was lost — folded instead into a
 // suppressed_refusal_count on a record stamped with A's route. Each category's own bucket exists to
 // stop exactly that between categories; the session is the same argument one dimension out.
 //
 // The split alone would trade the elision bug for an availability one: at the default
-// maxSessions (512) four categories at a per-session share is 4096 records/s sustained and 10240
-// burst, against an audit queue of 4096 — and --require-audit defaults to STRICT, so overflowing
-// it latches AuditDegraded and denies every route. So the per-session table charges the proxy's
+// maxSessions (512) the upstream-driven set at a per-session share is thousands of records/s
+// sustained and a burst several times an audit queue 4096 deep — and --require-audit defaults to
+// STRICT, so overflowing it latches AuditDegraded and denies every route. So the per-session table charges the proxy's
 // own table as its AGGREGATE parent: this session's buckets decide fairness, the parent keeps the
 // total at the pre-split ceiling. aggregate may be nil (a bare-struct-literal proxy in a test),
 // which bounds the session alone. See docs/threat-model-mcp.md §3.7.
 //
 // cats is the session's own reachable set rather than a constant, since a remote-upstream session
-// reaches at most one of the four — see remoteUpstreamRefusalCategories. A SLICE rather than a
+// reaches at most one of them — see remoteUpstreamRefusalCategories. A SLICE rather than a
 // variadic tail: the variadic form let `newUpstreamRefusalLimiter(aggregate)` compile into a table
 // with no buckets at all, which delegates every upstream-driven category to the parent and silently
 // undoes the per-session split this constructor exists for.
@@ -582,7 +597,7 @@ type bucketVerdict struct {
 // at once delivers `holders x keys` writes in ONE burst, and the steady state after that is
 // `holders x keys` per interval for as long as the incident lasts. Here the keys are the
 // upstream-driven categories a session holds a slot for, so at the CLI's default maxSessions of
-// 512 that is 512x4 = 2048 refusal records in a burst against a queue 4096 deep, then ~34/s
+// 512 that is 512x5 = 2560 refusal records in a burst against a queue 4096 deep, then ~42/s
 // sustained — what a fleet-wide upstream failure looks like, which is the incident the arrival
 // exists for. The arithmetic is DERIVED from the live sets by a test rather than trusted here (see
 // TestReserveCeiling_IsDerivedFromTheLiveSets), because it is written in terms of three sets that

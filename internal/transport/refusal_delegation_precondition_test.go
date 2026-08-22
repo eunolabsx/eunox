@@ -42,14 +42,15 @@ var sessionKindCharges = map[string]struct {
 }{
 	"subprocess upstream": {
 		registers: upstreamRefusalCategories,
-		charges:   []refusalCategory{catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable},
+		charges:   []refusalCategory{catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable, catUndeliveredForward},
 		why:       "it owns an upstream reader, so every server-initiated refusal is reachable",
 	},
 	"remote HTTP upstream": {
 		registers: remoteUpstreamRefusalCategories,
-		// The three it does not register are each gated on a serverReqTracker entry, and this
-		// kind never creates one — see TestSessionKinds_OnlyTheSubprocessKindReadsItsUpstream
-		// for the structural fact that makes that true rather than merely claimed.
+		// The ones it does not register are gated on a serverReqTracker entry (which this kind
+		// never creates) or on the forward leg the upstream reader drives (which it never starts)
+		// — see TestSessionKinds_OnlyTheSubprocessKindReadsItsUpstream for the structural fact
+		// that makes that true rather than merely claimed.
 		charges: []refusalCategory{catServerRequestFailed},
 		why:     "it runs no upstream reader, so nothing ever enters the in-flight tracker",
 	},
