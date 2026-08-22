@@ -1453,6 +1453,18 @@ Section conventions:
 
 ### Fixed
 
+- **An `effect.byArgument` table certified unambiguous at load can no longer collide at
+  runtime.** The load-time ambiguity check deduplicated case keys with `strings.ToLower` while
+  the runtime matcher resolves them with `strings.EqualFold` — two different relations. They
+  disagree on exactly the runes this codebase folds carefully everywhere else: U+017F (LATIN
+  SMALL LETTER LONG S) is already lower case, so `{"ſelect": ..., "select": ...}` passed
+  validation as two distinct rows and then had the argument `SELECT` match BOTH, with the
+  winner decided by byte order — which can be the weaker row of an effect-class table, and
+  the same shape is expressible in a reviewed contract-corpus entry an operator copies
+  verbatim. The check now folds with the matcher's own relation, so the refusal the load-time
+  check promises actually covers what the matcher matches. A manifest carrying such a pair is
+  now refused at load rather than loading and resolving to whichever row sorts first.
+
 - **Three invocations the stated contract calls incoherent are refused rather than resolved
   silently.** `/control/kill` got its trailing-token refusal precisely so the kill EXECUTED
   cannot differ from the one a reviewer of the body reads, but that guard sees only a

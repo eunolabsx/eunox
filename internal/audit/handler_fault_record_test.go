@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -55,7 +54,7 @@ func TestHandlerFaultRecordSignAndVerifyRoundTrip(t *testing.T) {
 		t.Fatalf("want 2 records, got %d", len(lines))
 	}
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifierFor(t, keyPath), "", time.Time{}, &sb)
+	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}

@@ -660,13 +660,36 @@ session shapes MCP servers actually expose.
 | `eunox kill [--revive] [--redis-addr <addr>] --session <session-id>` | Target a session id verbatim. Same as the positional, except that the positional `all` means the whole deployment — so `--session all` is the only way to address a session whose id is literally `all`. Exactly one target may be given: a positional, `--session`, or `--agent`. |
 | `eunox stats`                                                       | Print a denial histogram from the audit log                  |
 | `eunox contracts` | Verify a local effect-contract corpus (every declared digest recomputed from its own content) and print the `effect.ref` pin an author copies into a manifest. With `--trust-keys`, also verify each entry's signed vendor/reviewer attestations against a local trust store and report who attests to it and who disputes it. Offline — neither the registry nor any key is ever fetched. |
-| `eunox audit-verify`                                              | Verify HMAC-SHA256 signatures in the audit log               |
+| `eunox audit-verify [--audit-log <tape>]... [--task-id <id>]`      | Verify HMAC-SHA256 signatures in the audit log. `--audit-log` is repeatable — one per enforcement point's tape, each verified as its own chain with its own verdict — and `--task-id` prints the sequence they share for one task, attributed by `pep`. |
 | `eunox doctor [--config <eunox.yaml>] [--live]`                    | Print a redacted support bundle (binary identity, config, manifests, audit tail) for bug reports. Nothing is uploaded. |
 | `eunox version`                                                     | Print the binary version and build metadata. |
 
 `eunox audit-verify` accepts `--request-id <id>` and `--since <RFC3339>` to
 scope which records it reports. The full HMAC chain is always verified regardless —
 these filters only narrow which records are counted and printed, not what is checked.
+
+**Across enforcement points.** Each enforcement point signs its own chain over its own
+tape, so two of them are two chains, not one. Pass `--audit-log` once per tape and
+`--task-id` for the task that crossed them:
+
+```bash
+eunox audit-verify \
+  --audit-log edge.jsonl --audit-key-path edge.key \
+  --audit-log core.jsonl --audit-key-path core.key \
+  --task-id task-7f3a
+```
+
+Each tape is verified independently and reports its own verdict (an exit code cannot say
+*which* tape broke), then the records they share for that task print as one sequence,
+each row attributed by the `pep` its writer stamped. Pass one `--audit-key-path` instead
+when the enforcement points share a signing key; the rings are never merged, so a record
+signed by one enforcement point never verifies on another's tape.
+
+That sequence is a reconstruction, not a verdict. Within a tape the order is proven and is
+what it follows (`seq` is signed and its contiguity checked); across tapes it rests on each
+writer's own clock, and eunox neither requires nor checks clock sync between enforcement
+points. A call missing from an enforcement point that never handled it is expected rather
+than evidence of loss. Only the per-tape verdicts gate the exit code.
 
 ---
 

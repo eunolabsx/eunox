@@ -152,9 +152,9 @@ const (
 )
 
 // methodSpec is ONE method's whole declaration: the revisions it exists in, how its request
-// framing is dispatched, and what happens to its notification framing. The four routing
-// tables are DERIVED from these (buildRevisionDispatch), so a method's revision membership
-// is stated once rather than mirrored into four maps that can silently disagree — the
+// framing is dispatched, and what happens to its notification framing. The per-revision
+// routing tables are DERIVED from these (buildRevisionDispatch), so a method's revision
+// membership is stated once rather than mirrored into maps that can silently disagree — the
 // pattern pkg/capability's tokenSpec already uses for grammar revisions.
 //
 // Removal across revisions is expressed by ABSENCE from In: a method outside the requesting
@@ -419,7 +419,7 @@ func (t revisionTables) notification(method string) (notificationDisposition, bo
 // revisionDispatch holds the per-revision tables derived from methodRegistry at init.
 var revisionDispatch = buildRevisionDispatch(methodRegistry)
 
-// buildRevisionDispatch derives each published revision's four routing tables from the
+// buildRevisionDispatch derives each published revision's routing tables from the
 // declarations. An entry that declares no revision, or names one this build does not speak,
 // contributes to no table at all — it is dispatched nowhere and falls to the fail-closed
 // default, the same outcome as never having been declared. That silence is intentional

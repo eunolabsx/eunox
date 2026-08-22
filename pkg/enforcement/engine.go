@@ -1745,10 +1745,14 @@ const resourceSpecificityLiteralWeight = 10
 // more-specific one.
 const maxWildcardTiebreak = resourceSpecificityLiteralWeight - 1
 
-// exactMatchSpecificity is the score for an exact match, dominating every glob's uncapped
-// formula score. 1<<27 is far above any realistic glob score yet small enough that
-// exactMatchSpecificity * resourceScoreWeight stays within a 32-bit int (GOARCH=386, arm,
-// mips), matching the 32-bit safety pkg/callcounter already engineers for.
+// exactMatchSpecificity is the score for an exact match, above any glob score a realistic
+// pattern reaches — by margin, not by construction: the formula below is uncapped, so a
+// pattern of ~13.4M literal runes outscores it and one of ~21.5M overflows the derived
+// score's 32-bit int, both expressible under the 32 MiB manifest cap. Operator-authored
+// input only, deciding order among the operator's own constraints, so neither is reachable
+// by a caller. 1<<27 is small enough that exactMatchSpecificity * resourceScoreWeight stays
+// within a 32-bit int (GOARCH=386, arm, mips), matching the 32-bit safety pkg/callcounter
+// already engineers for.
 const exactMatchSpecificity = 1 << 27
 
 // ResourceSpecificity scores how specifically a capability's resource pattern matches

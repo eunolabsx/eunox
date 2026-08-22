@@ -251,7 +251,7 @@ func TestVerifyLog_GoodAndTampered(t *testing.T) {
 	lines[1] = tampered
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifier, "", time.Time{}, &out)
+	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestVerifyLog_ScannerError(t *testing.T) {
 	r := &errReader{data: []byte(`{"seq":1}`), err: sentinel}
 
 	verifier := &Sink{key: nonZeroTestKey()}
-	_, err := VerifyLog(r, verifier, "", time.Time{}, &strings.Builder{})
+	_, err := VerifyLog(r, verifier, VerifyOptions{Out: &strings.Builder{}})
 	if err == nil {
 		t.Fatal("VerifyLog must return the scanner error")
 	}
@@ -319,7 +319,7 @@ func TestVerifyLog_WithSinceFilterSkips(t *testing.T) {
 	cutoff := base.Add(30 * time.Minute)
 	var out strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join(logLines(t, logPath), []byte("\n"))),
-		verifier, "", cutoff, &out)
+		verifier, VerifyOptions{Since: cutoff, Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}

@@ -14,7 +14,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/config"
@@ -693,7 +692,7 @@ func TestDeclassifyDetailKeys_SignAndVerifyRoundTrip(t *testing.T) {
 	keys, err := audit.LoadOrCreateKeys(dir + "/audit.key")
 	require.NoError(t, err)
 	var out strings.Builder
-	res, err := audit.VerifyLog(bytes.NewReader(data), audit.NewVerifier(keys), "", time.Time{}, &out)
+	res, err := audit.VerifyLog(bytes.NewReader(data), audit.NewVerifier(keys), audit.VerifyOptions{Out: &out})
 	require.NoError(t, err)
 	assert.True(t, res.OK(), "the declassification detail keys must verify under the record HMAC:\n%s", out.String())
 	assert.Equal(t, 3, res.Valid)

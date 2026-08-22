@@ -61,7 +61,7 @@ func TestVerifyLogFiles_RefusesFIFOChainFile(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := VerifyLogFiles([]string{fifo}, verifier, "", time.Time{}, io.Discard)
+		_, err := VerifyLogFiles([]string{fifo}, verifier, VerifyOptions{Out: io.Discard})
 		done <- err
 	}()
 

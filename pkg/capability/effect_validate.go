@@ -159,15 +159,27 @@ func validateEffectByArgument(e *EffectContract) error {
 	}
 	// Two keys that match the SAME argument value are an ambiguous table. Matching is
 	// case-insensitive after trimming (an operator writes "DROP" or "drop"), so
-	// {"DROP": irreversible, "drop": reversible} would leave which row wins to map
-	// iteration order — a nondeterministic effect class, which is disqualifying for a
-	// layer whose whole claim is determinism. Reject it here, the way every other
-	// case-variant ambiguity in this codebase is rejected rather than resolved.
+	// {"DROP": irreversible, "drop": reversible} would leave which row wins to lookup's
+	// collision tiebreak — the smallest key by byte order, which can be the WEAKER row —
+	// rather than to the author. Reject it here, the way every other case-variant
+	// ambiguity in this codebase is rejected rather than resolved.
+	//
+	// The fold has to be the one the MATCHER applies or the certificate this check issues
+	// is worthless. lookup matches with strings.EqualFold; strings.ToLower under-folds
+	// exactly where EqualFold does not (U+017F LATIN SMALL LETTER LONG S is already lower
+	// case, so ToLower leaves "ſelect" distinct from "select" while EqualFold matches both
+	// against "SELECT"), so that pair certified clean here and then collided at runtime —
+	// exactly the tiebreak a load-time refusal is supposed to make unreachable.
 	folded := make(map[string]string, len(t.Cases))
 	for value := range t.Cases {
-		key := strings.ToLower(strings.TrimSpace(value))
+		key := canonicalCaseFold(strings.TrimSpace(value))
 		if prev, dup := folded[key]; dup {
-			return fmt.Errorf("effect.byArgument declares cases %q and %q, which match the same argument value (matching is case-insensitive after trimming); a single value cannot resolve to two effects, so remove or reconcile one", prev, value)
+			// %+q, not %q: the pair this check exists to catch can differ by a single
+			// non-ASCII rune that renders indistinguishably from its ASCII fold ("ſelect"
+			// beside "select"), so an unescaped message names two keys the author reads
+			// as identical and cannot act on. Escaping to ASCII puts the offending rune
+			// in the error.
+			return fmt.Errorf("effect.byArgument declares cases %+q and %+q, which match the same argument value (keys are trimmed and compared under Unicode case folding, the same rule the matcher applies at runtime); a single value cannot resolve to two effects, so remove or reconcile one", prev, value)
 		}
 		folded[key] = value
 	}
