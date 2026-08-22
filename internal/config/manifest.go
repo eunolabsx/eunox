@@ -250,16 +250,18 @@ func schemaVersionFromNode(node *yaml.Node) (string, bool) {
 //
 // An ALIASED `schemaVersion: *ver` is retagged by REPLACING this key's slot with a fresh string
 // scalar, never by retagging the anchor. An anchor is shared with every other reference to it,
-// so mutating it reaches fields this function has no business touching: with `values: [&ver
-// 0.2]` beside `schemaVersion: *ver`, retagging the anchor decoded that condition's value as
-// the string "0.2" instead of the number.
+// so mutating it silently rewrites fields this function has no business touching — and one of
+// them changes POLICY, not just type.
 //
-// No end-to-end divergence was demonstrable for it — the manifest layer renders allowedValues
-// entries as strings whichever way they are spelled, and a coerced value shared with
-// schemaVersion is refused by the version gate before the coercion guard is reached — so this
-// is a robustness fix rather than a live bug. It is worth making anyway: the alternative is a
-// function whose blast radius depends on which OTHER keys happen to alias the same anchor,
-// which is not a property this file can check or a reviewer can see locally.
+// With `values: [&ver 0.2]` beside `schemaVersion: *ver`, retagging the anchor decoded that
+// condition's value as a Go string rather than the json.Number every other numeric spelling
+// yields. MatchAllowedValue matches a string entry ONLY as a glob and only against a string
+// argument, so the entry stopped matching the numeric argument it was written for: the
+// capability silently denied every call it was meant to allow, with no load-time signal.
+// Deny-side, but a policy change from a retag that had no business leaving this key.
+//
+// Copying also leaves the anchor's own tag intact for rejectCoercedScalarsForFormat, which runs
+// after this and would otherwise skip a node this function had already rewritten.
 func forceSchemaVersionToString(node *yaml.Node) {
 	mapping, i := topLevelValueSlot(node, "schemaVersion")
 	if mapping == nil {

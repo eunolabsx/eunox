@@ -12,6 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
 // TestSchemaVersionFromNode_ResolvesAnAlias covers the blind spot topLevelValueNode had: an
@@ -154,12 +157,10 @@ capabilities:
 // TestForceSchemaVersionToString_LeavesASharedAnchorAlone pins the property that makes
 // resolving the alias safe: the retag replaces this KEY's slot, never the anchor it points at.
 //
-// An anchor is shared with every other reference to it, so retagging it reaches fields this
-// function has no business touching — `values: [&ver 0.2]` beside `schemaVersion: *ver`
-// decoded that condition's value as the string "0.2" rather than the number. No end-to-end
-// divergence was demonstrable (allowedValues render as strings either way, and a coerced shared
-// value is refused by the version gate first), which is exactly why the property is pinned
-// here, at the node level where it is visible, rather than through a load that hides it.
+// An anchor is shared with every reference to it, so retagging it rewrote fields this function
+// has no business touching. See TestLoadManifest_SharedAnchorDoesNotRestrictAPolicy for what
+// that cost — the type change here is the mechanism, and a silently non-matching capability is
+// the effect.
 func TestForceSchemaVersionToString_LeavesASharedAnchorAlone(t *testing.T) {
 	t.Parallel()
 
@@ -198,4 +199,65 @@ func TestForceSchemaVersionToString_RetagsADirectScalarInPlace(t *testing.T) {
 	var raw map[string]interface{}
 	require.NoError(t, node.Decode(&raw))
 	assert.Equal(t, "0.1", raw["schemaVersion"])
+}
+
+// TestLoadManifest_SharedAnchorDoesNotRestrictAPolicy is the end-to-end half, and the one that
+// says why the node-level property above matters.
+//
+// Retagging the shared anchor decoded the condition's value as a Go string instead of the
+// json.Number every other numeric spelling produces. MatchAllowedValue matches a string entry
+// ONLY as a glob, and only against a string argument — so the entry stopped matching the
+// numeric argument it was written for, and the capability silently denied every call it was
+// meant to allow. Deny-side, and invisible at load time.
+//
+// Asserted against the PLAIN spelling rather than against a hardcoded type, so the rule under
+// test is the one that matters: however the author spells the value, the same argument decides.
+func TestLoadManifest_SharedAnchorDoesNotRestrictAPolicy(t *testing.T) {
+	t.Parallel()
+
+	write := func(t *testing.T, content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "manifest.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	values := func(t *testing.T, path string) []interface{} {
+		t.Helper()
+		m, err := LoadManifest(path)
+		require.NoError(t, err)
+		av, ok := m.Capabilities[0].Conditions[0].(*capability.AllowedValuesCondition)
+		require.True(t, ok)
+		return av.Values
+	}
+
+	plain := values(t, write(t, `schemaVersion: "0.1"
+name: plain
+version: "0.1.0"
+capabilities:
+  - target: tool:t
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: n
+        values: [0.2]
+`))
+	shared := values(t, write(t, `name: shared
+version: "0.1.0"
+capabilities:
+  - target: tool:t
+    actions: [call]
+    conditions:
+      - type: allowedValues
+        argument: n
+        values: [&ver 0.2]
+schemaVersion: *ver
+`))
+
+	// A caller's JSON number arrives as a float64.
+	const arg = 0.2
+	require.True(t, enforcement.MatchAllowedValue(arg, plain, nil),
+		"a numeric allowedValues entry must match the numeric argument it names")
+	assert.True(t, enforcement.MatchAllowedValue(arg, shared, nil),
+		"aliasing the value must not turn the entry into a glob that never matches a numeric argument")
+	assert.IsType(t, plain[0], shared[0], "the two spellings must decode to the same type")
 }
