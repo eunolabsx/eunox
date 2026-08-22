@@ -182,7 +182,13 @@ func runInteropMatched(c *stdioConn, s *suite, revision string) {
 // becoming "routed to something" — the registry comment says they deny; this proves it over a
 // real transport.
 func runInteropDeclaringMethodSet(c *stdioConn, s *suite) {
-	removed := []string{"ping", "resources/subscribe", "resources/unsubscribe", "completion/complete"}
+	// Every entry here must be one 2026-07-28 actually REMOVED and 2025-11-25 has — i.e. one
+	// declared `In: {2025-11-25}` in the proxy's methodRegistry. completion/complete was in this
+	// list and did not belong: it has no registry entry under EITHER revision, so it answers
+	// UNROUTABLE_METHOD identically for both peers and the cell would not change outcome under
+	// any regression of the removal it claimed to cover. runStdioFull already asserts it under
+	// 2025-11-25, where it is an ordinary unmapped method.
+	removed := []string{"ping", "resources/subscribe", "resources/unsubscribe"}
 	for _, method := range removed {
 		m, err := c.call(method, map[string]interface{}{})
 		s.expectErrorCode(method+" (removed in 2026-07-28) is unroutable", codeUnroutableMethod, m, err)

@@ -207,13 +207,29 @@ cli_probe_ok "eunox validate --live walks a 2026-07-28-only route" \
 # The negative that gives the two above their meaning: the same upstream, probed with the
 # handshake opener, must FAIL. Without it a probe that silently fell back to `initialize`
 # would pass every assertion here.
+#
+# The OUTPUT is asserted, not just the exit status. `eunox init` exits non-zero for a renamed
+# flag, a spawn failure, or any usage error, so an exit-code-only check would print PASS while
+# the property it exists to establish — that `auto` selects the `initialize` opener rather than
+# probing `server/discover` — went untested. Naming the rejected opener is what pins that, and
+# it survives the mock reordering its own gates: whether it refuses `initialize` for the missing
+# declaration or for not existing, the message names `initialize` either way.
+desc="the handshake opener is refused by a 2026-07-28-only upstream"
 if out="$("$PROXY_BIN" init --transport stdio --upstream-protocol-version auto \
        -- "$SERVER_BIN" --transport stdio --protocol-version 2026-07-28 2>&1)"; then
-  echo "FAIL  the handshake opener is refused by a 2026-07-28-only upstream"
+  echo "FAIL  $desc (it succeeded)"
+  printf '%s\n' "$out" | tail -5
+  overall=1
+elif ! printf '%s' "$out" | grep -q 'initialize'; then
+  echo "FAIL  $desc — it failed, but not by having its opener rejected"
+  printf '%s\n' "$out" | tail -5
+  overall=1
+elif printf '%s' "$out" | grep -q 'server/discover'; then
+  echo "FAIL  $desc — the probe reached server/discover, so \`auto\` did not select the handshake opener"
   printf '%s\n' "$out" | tail -5
   overall=1
 else
-  echo "PASS  the handshake opener is refused by a 2026-07-28-only upstream"
+  echo "PASS  $desc"
 fi
 
 # ── 5: http leg (start upstreams + gateway, drive, tear down) ────────────────

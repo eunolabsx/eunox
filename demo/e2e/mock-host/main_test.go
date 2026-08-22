@@ -1240,13 +1240,19 @@ func TestRunHTTPSuite_FakeGateway(t *testing.T) {
 
 // TestRunAuditCheck_InProcess covers the happy path of runAuditCheck with a
 // crafted JSONL file that satisfies all assertion predicates.
-func TestRunAuditCheck_InProcess(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "audit.jsonl")
-
-	// The revisions mirror the real tape the suite produces: the interop matrix drives cells
-	// under both, and a pre-negotiation refusal legitimately carries none.
-	recs := []auditRecord{
+// conformingAuditFixture is a tape runAuditCheck accepts with ZERO failures: it satisfies every
+// assertion that function makes.
+//
+// Shared with the negative tests, and that sharing is the point. A negative built from a
+// partial fixture fails whether or not the property under test is checked at all — the seven
+// content assertions fail on it regardless — so the test passes with the check deleted. Mutating
+// a fixture that otherwise passes cleanly is what makes the failure count attributable to the
+// mutation.
+//
+// The revisions mirror the real tape the suite produces: the interop matrix drives cells under
+// both, and a pre-negotiation refusal legitimately carries none.
+func conformingAuditFixture() []auditRecord {
+	return []auditRecord{
 		{
 			Decision: "allow", Target: "get_secret_record", Method: "tools/call",
 			TargetType:       "tool",
@@ -1260,6 +1266,13 @@ func TestRunAuditCheck_InProcess(t *testing.T) {
 		{Decision: "allow", Target: "code_review", Method: "prompts/get", TargetType: "prompt", ProtocolRevision: revisionHandshake},
 		{Decision: "allow", Method: "sampling/createMessage", TargetType: "sampling"},
 	}
+}
+
+func TestRunAuditCheck_InProcess(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	recs := conformingAuditFixture()
 
 	var buf bytes.Buffer
 	for _, r := range recs {
@@ -1301,33 +1314,48 @@ func writeAuditFixture(t *testing.T, recs []auditRecord) string {
 // The protocol-revision assertion has to FAIL on the two shapes it exists to catch, or it is
 // decoration: a tape covering only one revision (a matrix cell that silently did not run) and
 // a record stamped with a revision nobody published.
+//
+// Each case MUTATES a fixture runAuditCheck otherwise accepts with zero failures, and asserts
+// the failure count moves from 0 to exactly 1. Asserting only "something failed" against a
+// hand-built partial tape is what this test did first, and it passed with the whole
+// seenRevisions block deleted: the partial fixtures failed seven unrelated content assertions,
+// so the count was non-zero either way and the property under test was never exercised.
 func TestRunAuditCheck_ProtocolRevisionNegatives(t *testing.T) {
 	cases := []struct {
-		name string
-		recs []auditRecord
+		name   string
+		mutate func([]auditRecord) []auditRecord
 	}{
 		{
 			name: "only one revision on the tape",
-			recs: []auditRecord{
-				{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionHandshake},
-				{Decision: "deny", Method: "tools/call", ProtocolRevision: revisionHandshake},
+			mutate: func(recs []auditRecord) []auditRecord {
+				for i := range recs {
+					if recs[i].ProtocolRevision == revisionDeclaring {
+						recs[i].ProtocolRevision = revisionHandshake
+					}
+				}
+				return recs
 			},
 		},
 		{
 			name: "a revision nobody published",
-			recs: []auditRecord{
-				{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionHandshake},
-				{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionDeclaring},
-				{Decision: "allow", Method: "tools/call", ProtocolRevision: "2099-01-01"},
+			mutate: func(recs []auditRecord) []auditRecord {
+				recs[0].ProtocolRevision = "2099-01-01"
+				return recs
 			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &suite{}
-			runAuditCheck(writeAuditFixture(t, tc.recs), s)
-			if s.fail == 0 {
-				t.Fatalf("runAuditCheck accepted %s (pass=%d)", tc.name, s.pass)
+			base := &suite{}
+			runAuditCheck(writeAuditFixture(t, conformingAuditFixture()), base)
+			if base.fail != 0 {
+				t.Fatalf("the shared fixture is not clean: %d failures — the differential below would be meaningless", base.fail)
+			}
+
+			got := &suite{}
+			runAuditCheck(writeAuditFixture(t, tc.mutate(conformingAuditFixture())), got)
+			if got.fail != 1 {
+				t.Fatalf("runAuditCheck reported %d failures for %s, want exactly 1 — the only difference from the clean fixture is the revision", got.fail, tc.name)
 			}
 		})
 	}
