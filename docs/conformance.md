@@ -460,7 +460,14 @@ Only in that direction, and only for a method that addresses a resource:
 
 The scope is derived from the same method-to-target-type mapping the audit layer stamps
 `target_type` from, so a resource-addressing method added later is covered without this being
-remembered. eunox's own denials never reach it: the rewrite sits at the upstream call, so every
+remembered.
+
+**The audit record names the upstream's own code, not the one forwarded.**
+`_eunox_upstream_error_code` carries what the upstream sent (`-32002` in the case above) even
+when the host was handed `-32602`, because the field names the upstream and a signed record must
+not say otherwise — and after the rewrite the two are indistinguishable, so nothing downstream
+could recover it. Only the original is recorded: the forward direction is determined by the
+method, the two revisions and that code, all of which the record already carries. eunox's own denials never reach it: the rewrite sits at the upstream call, so every
 code it sees came from the upstream — which is what makes reading `-32002` as the spec's meaning
 safe despite eunox spelling `CAPABILITY_DENIED` with the same integer under that revision.
 

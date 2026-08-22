@@ -59,6 +59,11 @@ Section conventions:
   codes, and a `-32002` from `tools/call` is not reporting a missing resource. `ttlMs`'s rule, one
   layer down — never fabricate on a peer's behalf.
 
+  The audit record names the **upstream's** code, not the forwarded one: `_eunox_upstream_error_code`
+  reads `-32002` even where the host was handed `-32602`. The field names the upstream, a signed
+  record must not say otherwise, and the two are indistinguishable after the rewrite — while the
+  forwarded value stays derivable from the method, the revisions and that code.
+
 - **The mismatched-revision translation boundary (ADR-0006, ratified 2026-08-22 — the first
   `Final` ADR under the current lifecycle).** A host and an upstream on
   different MCP revisions were refused wholesale; the stateless-safe subset now crosses.
