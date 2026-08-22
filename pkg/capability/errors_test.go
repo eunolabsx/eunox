@@ -168,6 +168,9 @@ func TestClassifyDenialCode_CoversEveryCode(t *testing.T) {
 		capability.ErrCodeEscalationRequired:         capability.DenialClassPolicy,
 		capability.ErrCodeUnsupportedProtocolVersion: capability.DenialClassFault,
 		capability.ErrCodeUnroutableMethod:           capability.DenialClassFault,
+		// A pair that cannot carry a message is a fault, not a verdict: nothing was matched
+		// against policy, so an observing route has no decision of its own to forward instead.
+		capability.ErrCodeUntranslatableAcrossRevisions: capability.DenialClassFault,
 	}
 	for _, code := range capability.AllDenialCodes {
 		expected, listed := want[code]

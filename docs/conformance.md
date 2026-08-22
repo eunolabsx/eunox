@@ -237,10 +237,15 @@ over-cite:
   `protocolVersion` config pin — which now selects how the upstream leg is
   OPENED, including the `server/discover` opener and the per-request `_meta`
   declaration on eunox's own requests — and the `protocol_revision` audit field.
-  See the per-revision method table below.
-- **Designed in Draft ADRs, not yet implemented:** the mismatched-pair
-  translation boundary, the `server/discover` RESPONDER and its list-filter
-  parity (the *client* side of discover ships as the pinned leg's opener), the
+  The **mismatched-pair translation boundary** has since landed on top of it:
+  the stateless-safe subset crosses, everything stateful-by-construction is
+  refused `UNTRANSLATABLE_ACROSS_REVISIONS`, and a host `initialize` is answered
+  from a declaring leg's discovery data with the capability object narrowed to
+  what the pair can carry. See the per-revision method table and the
+  translation-boundary section below.
+- **Designed in Draft ADRs, not yet implemented:** the `server/discover`
+  RESPONDER and its list-filter parity (the *client* side of discover ships as
+  the pinned leg's opener, and a host `initialize` is answered from its data), the
   discover-first probe for an `auto` upstream, the `Mcp-Method`/`Mcp-Name`
   headers, and the rest of the CLI probe/drift dual-revision handling in
   [ADR-0006](adr/0006-dual-revision-translation-boundary.md); the
@@ -364,22 +369,24 @@ pin for it would send you the wrong way.
 
 Two consequences of the pin worth stating before you set it:
 
-- **A pinned leg is a matched pair only for a host on the same revision.** A
-  2025-11-25 host in front of an upstream pinned to `2026-07-28` has every
-  forwarding method refused `UNSUPPORTED_PROTOCOL_VERSION` (`-32022`), because
-  translating that pair is what the mismatched-pair boundary governs and this
-  release does not implement it. Pin the upstream when the host declares the same
-  revision, not before.
-- **eunox declares only on the requests it originates** — the opener and the
-  session-start `tools/list` drift probe. A host's own params are still forwarded
+- **A mismatched pair carries the stateless-safe subset and refuses the rest.**
+  A 2025-11-25 host in front of an upstream pinned to `2026-07-28` (or the
+  reverse) is served for `tools/call`, `resources/read`, `prompts/get` and the
+  three `*/list` methods, plus `notifications/cancelled` and
+  `notifications/progress`. Anything whose meaning depends on state one side
+  cannot hold is refused `UNTRANSLATABLE_ACROSS_REVISIONS` (`-32022`) and
+  recorded — see the translation-boundary table below.
+- **eunox declares on the requests it originates, and on a mismatched pair only,
+  on the ones it forwards.** On a MATCHED pair a host's params are forwarded
   verbatim, `_meta` included, so a host on a declaring leg must carry its own
-  per-request declaration on every request. A message that reached a declaring
+  per-request declaration on every request; a message that reached a declaring
   revision by *inheriting* its context rather than stating a version is refused
-  `UNSUPPORTED_PROTOCOL_VERSION` before it is forwarded: host-side omission
-  inherits, upstream-side eunox adds nothing, and together they would deliver a
-  request missing the member that revision requires. Refusing names the cause
-  where the upstream's own rejection would not. (A host *response* owes no
-  declaration — it answers something the upstream declared for itself.)
+  `UNSUPPORTED_PROTOCOL_VERSION` before it is forwarded, because host-side
+  omission inherits, upstream-side eunox adds nothing, and together they would
+  deliver a request missing the member that revision requires. On a MISMATCHED
+  pair that is exactly what translation supplies, so the refusal does not apply.
+  (A host *response* owes no declaration — it answers something the upstream
+  declared for itself.)
 
 The handshake's own answer is now **checked** rather than allowed to set the leg's
 revision, and the two ways it can disagree get different answers:
@@ -404,20 +411,53 @@ everything:
   is always `2025-11-25` and the pair could never match. Use `transport: stdio` for
   such an upstream, where a peer opens its context by declaring a revision.
 - **A host `initialize` reaching a leg that speaks a handshake-less revision is
-  refused** `UNSUPPORTED_PROTOCOL_VERSION`, rather than answered from that leg's
-  `server/discover` data. Synthesizing one revision's handshake from the other's
-  capability object is translation, and it would hand the host a capability set
-  describing methods this build then denies fail-closed.
+  answered from that leg's `server/discover` data, with the capability object
+  NARROWED** to what the pair can carry. Handing it over verbatim would advertise
+  methods eunox then denies fail-closed, which is worse for the host than a
+  refusal — it would plan around a surface it cannot use. `tools`, `resources`
+  and `prompts` survive; `resources.subscribe` is dropped, because the subscribe
+  pair is refused; and a capability this build knows no methods for is dropped
+  rather than forwarded, since it cannot be known to translate.
 
-A host request's own `_meta` declaration is forwarded **verbatim** — nothing strips or
-rewrites `_meta`. Rewriting it to match the leg is translation, which the mismatched-pair
-boundary governs and this release does not implement, so eunox instead **refuses** a
-declaration it cannot forward honestly: a request whose declared revision differs from the
-one the upstream leg speaks (or from the revision that leg is addressed as) is refused
-`UNSUPPORTED_PROTOCOL_VERSION` (`-32022`) and recorded, before the upstream is contacted.
-Otherwise the proxy would not be relaying a mismatched pair but manufacturing one — a body
-declaring one revision beside a header naming another, which a first-wins and a last-wins
-upstream resolve differently while eunox decided under a third.
+### The translation boundary
+
+On a **matched** pair a host request's own `_meta` declaration is forwarded **verbatim** —
+nothing strips or rewrites it, and the byte stream is what every release before the boundary
+produced.
+
+On a **mismatched** pair eunox rewrites the declaration so the body and the
+`MCP-Protocol-Version` header always name one revision. Otherwise the proxy would not be
+relaying a mismatched pair but manufacturing one — a body declaring one revision beside a
+header naming another, which a first-wins and a last-wins upstream resolve differently while
+eunox decided under a third. Which direction it rewrites follows the receiving revision:
+
+| Direction | Request | Result |
+|---|---|---|
+| host `2025-11-25` → upstream `2026-07-28` | the per-request declaration is **added** (the upstream requires it; the host has no way to send it) | left alone, except that a variant the host cannot read is refused |
+| host `2026-07-28` → upstream `2025-11-25` | the declaration is **removed** (eunox presents itself as a client of the upstream's own revision) | `resultType: "complete"` is **added**, and `cacheScope: "private"` on the three `*/list` results |
+
+`ttlMs` is deliberately never added: it is a freshness hint the older upstream did not offer,
+and inventing a lifetime for someone else's data is the fabrication this boundary exists to
+avoid. `cacheScope` is set to `private` rather than copied, because every list eunox emits is
+filtered per caller identity.
+
+What a mismatched pair refuses, with `UNTRANSLATABLE_ACROSS_REVISIONS` (`-32022`), recorded,
+and the upstream never contacted:
+
+| Refused | Why |
+|---|---|
+| `resources/subscribe` / `resources/unsubscribe` | the newer revision replaced the pair with `subscriptions/listen`; bridging would make eunox hold the subscription correspondence for the connection's life |
+| `notifications/roots/list_changed` | announces a capability the newer revision deprecates, so it names a surface the upstream cannot read |
+| a result whose `resultType` is not `complete` | a host with no `resultType` in its vocabulary reads it as a finished call, drops the `inputRequests` the upstream is waiting on, and the exchange desynchronizes **silently** — an unrecognized variant is refused for the same reason |
+| a server-initiated request toward a `2026-07-28` host | that revision removed the mechanism; there is no way to ask the host and no honest answer eunox could give on its behalf. The upstream is answered rather than left blocked |
+| a host *response* | on a mismatched pair the only request it could answer is a server-initiated one already refused at the leg |
+
+A method the requesting peer's **own** revision removed is not a boundary refusal: it is
+answered by the ordinary fail-closed routing default (`UNROUTABLE_METHOD`, `-32001`), because
+routing is a fact about one peer and the boundary is a question about the pair. The two codes
+share the `-32022` integer with `UNSUPPORTED_PROTOCOL_VERSION` but differ in `error.data.code`
+and on the audit tape, so "this deployment is mid-migration" is greppable separately from "this
+peer's revision could not be established".
 
 Two consequences worth stating plainly:
 

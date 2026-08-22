@@ -51,7 +51,17 @@ func TestResolveHostRevision(t *testing.T) {
 		// proxy ADDRESSES its upstream as, which is the revision the leg was OPENED at — the
 		// operator's pin, or the handshake revision under `auto`.
 		{name: "resolving to the addressed revision", contextRev: capability.Revision20251125, legRev: capability.Revision20251125, declared: "2025-11-25", want: capability.Revision20251125},
-		{name: "resolving past the addressed revision", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", wantErr: errUnhonorableUpstreamRevision},
+		// A mismatched pair on a TRANSLATABLE method resolves rather than refusing: the boundary
+		// carries tools/call across, rewriting the declaration so the body and the header eunox
+		// stamps still name one revision (see translate.go, and the property test below).
+		{name: "resolving past the addressed revision", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", want: capability.Revision20260728},
+		// ROUTING PRECEDES THE PAIR. resources/subscribe is not in 2026-07-28's table at all, so
+		// this peer's own revision has already removed it — and the boundary must stay silent so
+		// the ordinary unmapped default answers, naming the method rather than telling an
+		// operator their two revisions cannot bridge something a matched pair would refuse too.
+		// Negotiation runs before routing, so without an explicit check this resolved as a pair
+		// problem.
+		{name: "a method the peer's own revision removed is left to routing", method: capability.MethodResourcesSubscribe, contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", want: capability.Revision20260728},
 		// A MATCHED pair on a pinned leg: the host declares what the leg speaks, so the body
 		// and the header eunox stamps name one revision and the request is forwardable. This is
 		// what the pin bought — before the opener was revision-selected, every leg was addressed
@@ -63,12 +73,21 @@ func TestResolveHostRevision(t *testing.T) {
 		// refused HERE rather than one layer away by the upstream.
 		{name: "inherited on a declaring leg", contextRev: capability.Revision20260728, legRev: capability.Revision20260728, wantErr: errUndeclaredOnDeclaringLeg},
 		// And the mismatched pair in the other direction: an old host in front of a pinned new
-		// upstream is refused rather than served into a conversation held at another revision.
-		{name: "old host against a pinned new leg", contextRev: capability.Revision20251125, legRev: capability.Revision20260728, declared: "2025-11-25", wantErr: errUnhonorableUpstreamRevision},
+		// upstream. This is the primary migration deployment ADR-0006 exists to serve, so the
+		// translatable methods cross — translateRequest adds the declaration the newer upstream
+		// requires and the older host has no way to send.
+		{name: "old host against a pinned new leg", contextRev: capability.Revision20251125, legRev: capability.Revision20260728, declared: "2025-11-25", want: capability.Revision20251125},
+		// The direction in which the boundary refusal is actually reachable: subscribe IS in the
+		// old host's table, so routing admits it and the PAIR is what cannot carry it — the new
+		// upstream replaced the pair with subscriptions/listen. Every method the boundary
+		// refuses is one the newer revision removed, so this is the only direction that reaches
+		// it; the other is answered by routing, above.
+		{name: "old host, refused method, pinned new leg", method: capability.MethodResourcesSubscribe, contextRev: capability.Revision20251125, legRev: capability.Revision20260728, declared: "2025-11-25", wantErr: errUntranslatableAcrossRevisions},
 		// INHERITED, not declared: a peer pins the newer revision by declaring once on a method
 		// that forwards nothing, then omits the declaration forever after. Checking the
 		// declaration alone let exactly that request through.
-		{name: "inheriting a revision the leg is not addressed as", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, wantErr: errUnhonorableUpstreamRevision},
+		{name: "inheriting a revision the leg is not addressed as", contextRev: capability.Revision20260728, legRev: capability.Revision20251125, want: capability.Revision20260728},
+		{name: "inheriting one, on a method that peer's revision removed", method: capability.MethodResourcesSubscribe, contextRev: capability.Revision20260728, legRev: capability.Revision20251125, want: capability.Revision20260728},
 		// A method answered without contacting the upstream carries its revision nowhere, so
 		// the leg has nothing to be contradicted by and the message resolves normally.
 		{name: "declared on a locally answered method", method: methodPing, contextRev: capability.Revision20260728, legRev: capability.Revision20251125, declared: "2026-07-28", want: capability.Revision20260728},
@@ -454,15 +473,23 @@ func TestCheckNegotiatedRevision_BoundsTheReflectedVersion(t *testing.T) {
 // upstream-leg check exists for, asserted against the header PRODUCER rather than against a
 // second copy of what it emits.
 //
-// Params are forwarded verbatim, so a host's `_meta` declaration reaches the upstream beside
-// eunox's own MCP-Protocol-Version. Every combination of declared revision and leg revision
-// this build can produce is driven through the gate, and any pair it ADMITS must be one whose
-// body and header name the same revision — otherwise the proxy is manufacturing exactly the
-// mismatch its host leg refuses, and a first-wins and a last-wins upstream resolve the same
-// request under different method sets.
+// A host's `_meta` declaration reaches the upstream beside eunox's own MCP-Protocol-Version.
+// Every combination of declared revision and leg revision this build can produce is driven
+// through the gate, and any pair it ADMITS must be one whose body and header name the same
+// revision — otherwise the proxy is manufacturing exactly the mismatch its host leg refuses,
+// and a first-wins and a last-wins upstream resolve the same request under different method
+// sets.
+//
+// Read off the message as it ACTUALLY reaches the upstream, which since the translation
+// boundary means after translateRequest. A mismatched pair is now admitted rather than refused,
+// and translation is what keeps the property true there: toward a declaring leg the declaration
+// is rewritten to the leg's own revision, and toward a non-declaring one it is removed, so
+// neither can contradict the header. Asserting against the pre-translation bytes would have
+// reported those admissions as violations while the wire was correct — and, worse, would keep
+// passing if translation later stopped rewriting them.
 func TestUpstreamDeclaration_NeverContradictsTheHeaderEunoxStamps(t *testing.T) {
 	t.Parallel()
-	admitted := 0
+	admitted, translated := 0, 0
 	for _, declared := range capability.PublishedRevisions() {
 		for _, legRev := range capability.PublishedRevisions() {
 			t.Run(fmt.Sprintf("declared=%s/leg=%s", declared, legRev), func(t *testing.T) {
@@ -471,20 +498,40 @@ func TestUpstreamDeclaration_NeverContradictsTheHeaderEunoxStamps(t *testing.T) 
 					Params: json.RawMessage(fmt.Sprintf(
 						`{"name":"read_file","_meta":{"io.modelcontextprotocol/protocolVersion":%q}}`, declared)),
 				}
-				if _, err := resolveHostRevision(declared, legRev, msg); err != nil {
+				resolved, err := resolveHostRevision(declared, legRev, msg)
+				if err != nil {
 					return // refused: nothing is forwarded, so no pair is manufactured
 				}
 				admitted++
-				// Admitted, so these bytes reach the upstream. Read the header off the real
-				// producer: a hand-written expectation here would keep passing the day
-				// setNegotiatedVersionHeader changes what it stamps.
+				forwarded, err := translateRequest(msg, resolved, legRev)
+				if err != nil {
+					t.Fatalf("the gate admitted a message translation then refused: %v", err)
+				}
+				if declared != upstreamAddressedRevision(legRev) {
+					translated++
+				}
+				// Read the header off the real producer: a hand-written expectation here would
+				// keep passing the day setNegotiatedVersionHeader changes what it stamps.
 				req := httptest.NewRequest(http.MethodPost, "http://upstream.invalid/mcp", http.NoBody)
 				setNegotiatedVersionHeader(req, legRev)
-				if got := req.Header.Get("MCP-Protocol-Version"); got != declared.String() {
-					t.Errorf("a forwarded body declaring %s would carry MCP-Protocol-Version: %s — the gate admitted a pair that names two revisions", declared, got)
+				header := req.Header.Get("MCP-Protocol-Version")
+
+				body, present, err := mcp.DeclaredRevisionOf(forwarded)
+				if err != nil {
+					t.Fatalf("the translated body's declaration is unreadable: %v", err)
+				}
+				// An absent declaration contradicts nothing: the upstream reads its revision off
+				// the header alone, which is what a client of its revision would send.
+				if present && body.String() != header {
+					t.Errorf("a forwarded body declaring %s would carry MCP-Protocol-Version: %s — the pair names two revisions", body, header)
 				}
 			})
 		}
+	}
+	// The translated admissions are the ones this property newly covers; without them the loop
+	// would be asserting only the matched pairs it always did.
+	if translated == 0 {
+		t.Error("no mismatched pair was admitted; the property held only over matched pairs")
 	}
 	// Not vacuous: a gate that refused every declaration would satisfy the loop above while
 	// making the whole declaration surface unusable.
@@ -572,12 +619,16 @@ func TestRevisionRefusalReason_EveryAllowlistedSentinelReachesThePeer(t *testing
 			names:    "1999-01-01",
 		},
 		{
-			name:       "a revision the upstream leg is not addressed as",
-			contextRev: capability.Revision20260728,
-			legRev:     capability.Revision20251125,
-			msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: metaParams(t, "2026-07-28", map[string]any{"name": "read_file"})},
-			sentinel:   errUnhonorableUpstreamRevision,
-			names:      "2026-07-28",
+			// A method the boundary will not carry. tools/call would be TRANSLATED across this
+			// pair, so the case has to name one of the refused methods for the sentinel to be
+			// reachable at all — which is itself the shape of the change: what used to refuse
+			// every message on a mismatched pair now refuses only the ones that cannot cross.
+			name:       "a method the revision pair cannot carry",
+			contextRev: capability.Revision20251125,
+			legRev:     capability.Revision20260728,
+			msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodResourcesSubscribe, Params: metaParams(t, "2025-11-25", map[string]any{"uri": "file:///x"})},
+			sentinel:   errUntranslatableAcrossRevisions,
+			names:      capability.MethodResourcesSubscribe,
 		},
 		{
 			name:       "params this build alone refused, reaching the upstream unread",

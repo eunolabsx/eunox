@@ -296,27 +296,100 @@ func correlateUpstreamReply(req, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 	return resp, nil
 }
 
-// refuseInitializeAcrossRevisions refuses a host `initialize` when the upstream leg speaks a
-// revision that has no handshake, and reports whether it did.
+// initializeCapabilitiesFor returns the capability object a host `initialize` is answered with
+// on a leg speaking upstreamRev — the upstream's own on a matched pair, and a NARROWED copy on
+// a declaring leg, where the object came from `server/discover`.
 //
-// The handshake answer eunox synthesizes carries the UPSTREAM's advertised capability object
-// while stamping the handshake revision over it. On a declaring leg that object came from
-// `server/discover` and is in the newer revision's shape, so answering would hand a
-// 2025-11-25 host a capability set describing methods this build then denies fail-closed —
-// a cross-revision capability translation, which is what the mismatched-pair boundary governs
-// and this build does not perform.
+// Answering at all is ADR-0006's discovery translation, and narrowing is what makes it honest.
+// The discover object describes the newer revision's surface; handing it to a 2025-11-25 host
+// verbatim would advertise methods this build then denies fail-closed, which is worse for the
+// host than refusing outright — it would plan around a surface it cannot use. So the answer
+// advertises exactly what the pair can actually carry (crossRevisionRegistry), and nothing
+// else.
 //
-// Refused at the HANDSHAKE rather than at each later call, because that is the first message
-// of the pair and the only one whose refusal an operator can act on: the alternative is a
-// session that establishes clean and then denies every request for its life.
-func refuseInitializeAcrossRevisions(id *json.RawMessage, upstreamRev capability.Revision) (mcp.RPCMsg, bool) {
+// This runs at the HANDSHAKE, which is the first message of the pair and the only one whose
+// answer an operator can act on. A wrong answer here is a session that establishes clean and
+// then denies for its life — the failure the previous refusal existed to prevent, and the one
+// narrowing removes the reason for.
+func initializeCapabilitiesFor(caps map[string]interface{}, upstreamRev capability.Revision) map[string]interface{} {
 	if !declaresPerRequestRevision(upstreamRev) {
-		return mcp.RPCMsg{}, false
+		return caps
 	}
-	return mcp.UnsupportedProtocolVersionResponse(id, fmt.Sprintf(
-		"this proxy speaks %s to its upstream, which has no %s handshake; a host on %s cannot be served from that leg without translating a mismatched pair, which this build does not do",
-		upstreamRev, mcp.MethodInitialize, handshakeRevision)), true
+	return narrowCapabilitiesToTranslatable(caps)
 }
+
+// narrowCapabilitiesToTranslatable copies caps keeping only the server capabilities whose
+// methods cross the translation boundary.
+//
+// Keyed off crossRevisionRegistry rather than a second list of capability names, so a method
+// whose disposition changes cannot leave this advertising a surface the boundary stopped
+// carrying. A capability eunox does not recognize is DROPPED rather than kept: this build
+// cannot know which methods it implies, so it cannot know whether they translate, and
+// advertising an unknown surface is the fail-open direction.
+//
+// `resources.subscribe` is dropped even when `resources` itself is kept, because the subscribe
+// pair is the one refusal inside an otherwise-translatable capability — the sub-flag is how the
+// old revision advertises it, so dropping the flag is how the answer stops promising it.
+func narrowCapabilitiesToTranslatable(caps map[string]interface{}) map[string]interface{} {
+	narrowed := map[string]interface{}{}
+	for name, methods := range capabilityMethods {
+		advertised, ok := caps[name]
+		if !ok || !allTranslateAcrossRevisions(methods) {
+			continue
+		}
+		narrowed[name] = advertised
+		if name == capabilityNameResources {
+			narrowed[name] = withoutSubscribeFlag(advertised)
+		}
+	}
+	return narrowed
+}
+
+// allTranslateAcrossRevisions reports whether every method a capability implies crosses the
+// boundary.
+func allTranslateAcrossRevisions(methods []string) bool {
+	for _, method := range methods {
+		if !crossRevisionRegistry[method].translates {
+			return false
+		}
+	}
+	return true
+}
+
+// withoutSubscribeFlag returns the resources capability without its `subscribe` flag, or the
+// value unchanged when it is not the object shape the flag lives in.
+func withoutSubscribeFlag(advertised interface{}) interface{} {
+	flags, ok := advertised.(map[string]interface{})
+	if !ok {
+		return advertised
+	}
+	stripped := make(map[string]interface{}, len(flags))
+	for key, value := range flags {
+		if key == capabilitySubscribeFlag {
+			continue
+		}
+		stripped[key] = value
+	}
+	return stripped
+}
+
+// capabilityMethods maps each server capability eunox understands to the methods it implies.
+// A capability absent from this map is one this build cannot reason about, and
+// narrowCapabilitiesToTranslatable drops it rather than guessing.
+var capabilityMethods = map[string][]string{
+	capabilityNameTools:     {capability.MethodToolsList, capability.MethodToolsCall},
+	capabilityNameResources: {capability.MethodResourcesList, capability.MethodResourcesRead},
+	capabilityNamePrompts:   {capability.MethodPromptsList, capability.MethodPromptsGet},
+}
+
+const (
+	capabilityNameTools     = "tools"
+	capabilityNameResources = "resources"
+	capabilityNamePrompts   = "prompts"
+	// capabilitySubscribeFlag is how the handshake revision advertises the resources/subscribe
+	// pair, which the translation boundary refuses.
+	capabilitySubscribeFlag = "subscribe"
+)
 
 // buildInitializeResponse constructs the host-facing `initialize` response from the
 // upstream capabilities/instructions gathered at session startup. A nil caps map defaults

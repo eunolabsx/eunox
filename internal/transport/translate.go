@@ -1,0 +1,453 @@
+// Copyright 2026 Eunolabs, LLC
+// SPDX-License-Identifier: Apache-2.0
+
+// The cross-revision translation boundary: what a MISMATCHED host/upstream revision pair may
+// carry, and what it may not.
+//
+// A matched pair does not reach this file at all. Everything here is scoped to the case where
+// the host resolved one revision and the upstream leg is addressed as another, which before
+// this file was refused wholesale by checkUpstreamHonorable.
+//
+// # The rule
+//
+// ADR-0006: translate only what is stateless and lossless in both directions; never fabricate
+// statefulness on a peer's behalf. Two consequences worth stating because they are what the
+// declaration table encodes:
+//
+//   - A method that carries no per-exchange state translates. `tools/call`, `resources/read`,
+//     `prompts/get` and the three `*/list` methods are request-response with the whole exchange
+//     in one round trip, so bridging them costs eunox no memory of anything.
+//   - A method whose meaning DEPENDS on state one side cannot hold is refused, even though
+//     nothing about the individual message is hard to forward. The subscribe pair is the clear
+//     case: forwarding `resources/subscribe` to an upstream whose revision replaced it with
+//     `subscriptions/listen` would open a stream one side believes exists and the other has
+//     never heard of, and eunox would have to hold the correspondence for the connection's life.
+//
+// # Why the disposition is DECLARED rather than derived
+//
+// It cannot be derived from the method's revision membership: every method here is in BOTH
+// revisions' tables (a method outside the peer's table never gets this far — it hits
+// dispatchUnmapped first), so membership says nothing about whether the PAIR can carry it.
+// It is a fact about the semantics, so it is written down per method, and a method whose params
+// reach an upstream with no declaration fails the build rather than inheriting either answer.
+//
+// # Direction matters, and the two directions do different work
+//
+// Host to upstream, the translation is a DECLARATION: a 2026-07-28 upstream requires
+// `io.modelcontextprotocol/protocolVersion` on every request, and an old host sends none.
+// Upstream to host, it is a RESULT SHAPE: a 2026-07-28 host requires `resultType` on every
+// result, and an old upstream sends none.
+//
+// The refusals are not symmetric either, and the asymmetry is the point: what cannot cross
+// toward a stateless host (`input_required`) is different from what cannot cross toward one
+// that has no per-request declaration.
+
+package transport
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/eunolabs/eunox/internal/mcp"
+	"github.com/eunolabs/eunox/pkg/capability"
+)
+
+// errUntranslatableAcrossRevisions marks a message a mismatched pair cannot carry. It reaches
+// the tape and the wire through upstreamErrInfo, which maps it to
+// capability.ErrCodeUntranslatableAcrossRevisions and the spec's -32022 — the same path the
+// duplicate-id fault takes, and for the same reason: it is a refusal produced AT the upstream
+// call that is not an upstream failure, and recording it as one would report an outage against
+// a healthy server.
+var errUntranslatableAcrossRevisions = errors.New("message cannot be translated across the host/upstream revision boundary")
+
+// crossRevisionDeclaration is one method's disposition on a mismatched pair, with the reason
+// it holds. Both answers carry a `why`: a refusal an operator hits mid-migration needs to say
+// what it protects, and a translation needs to say what makes it lossless.
+type crossRevisionDeclaration struct {
+	// translates is true when the message may cross a mismatched pair, with whatever
+	// per-direction adjustment translateRequest/translateResult applies.
+	translates bool
+	why        string
+}
+
+// crossRevisionRegistry declares every method whose params reach an upstream. Keyed the way
+// methodRegistry is, and held to the same completeness rule by
+// TestCrossRevisionRegistry_CoversEveryForwardingMethod: a method that forwards host params
+// with no entry here fails the build rather than defaulting to either answer.
+//
+// A host RESPONSE has no method and is handled separately (see boundaryDisposition), because
+// the only reason a response exists on a mismatched pair is a server-initiated request that
+// this boundary already refused on the way out.
+var crossRevisionRegistry = map[string]crossRevisionDeclaration{
+	capability.MethodToolsCall: {
+		translates: true,
+		why:        "request-response in one round trip; the whole exchange crosses at once, so bridging it holds no state",
+	},
+	capability.MethodResourcesRead: {
+		translates: true,
+		why:        "request-response in one round trip; a read carries no subscription and no continuation",
+	},
+	capability.MethodPromptsGet: {
+		translates: true,
+		why:        "request-response in one round trip",
+	},
+	capability.MethodToolsList: {
+		translates: true,
+		why:        "enumeration is stateless; the reply is filtered per identity either way, and the result-shape members the newer revision requires are addable without inventing anything",
+	},
+	capability.MethodResourcesList: {
+		translates: true,
+		why:        "enumeration is stateless, as for tools/list",
+	},
+	capability.MethodPromptsList: {
+		translates: true,
+		why:        "enumeration is stateless, as for tools/list",
+	},
+	capability.MethodResourcesSubscribe: {
+		why: "opening a stream against an upstream whose revision replaced this pair with subscriptions/listen would require eunox to hold the subscription correspondence for the connection's life — the statefulness ADR-0006 refuses to fabricate",
+	},
+	capability.MethodResourcesUnsubscribe: {
+		why: "the close half of a pair whose open is refused; translating it alone would acknowledge tearing down a stream that was never opened",
+	},
+	methodNotificationsCancelled: {
+		translates: true,
+		why:        "pairs with a request that crossed; refusing it would leave a translated request the host cannot cancel, which is worse than forwarding a notification that names an id the upstream already knows",
+	},
+	methodNotificationsProgress: {
+		translates: true,
+		why:        "carries a progress token for an exchange already in flight and commits nothing",
+	},
+	methodNotificationsRootsListChanged: {
+		why: "announces a capability the newer revision deprecates, so it can only travel old-host-to-new-upstream, where it names a surface the upstream has no way to read",
+	},
+}
+
+// boundaryDisposition answers whether msg may cross a mismatched pair.
+//
+// A message with no method — a host RESPONSE — is refused. On a mismatched pair the only
+// request it could be answering is a server-initiated one, which this boundary refuses at the
+// upstream leg before it ever reaches the host, so a response arriving here means either a
+// reply to a request eunox never relayed or a peer probing the seam. Neither is forwardable.
+func boundaryDisposition(msg mcp.RPCMsg) crossRevisionDeclaration {
+	if msg.Method == "" {
+		return crossRevisionDeclaration{
+			why: "a host response on a mismatched pair answers a server-initiated request this boundary refuses at the leg, so no reply of this shape was ever asked for",
+		}
+	}
+	// The zero value refuses, which is what makes an unlisted method fail closed at runtime
+	// even though the registry test is what should have caught it at build time.
+	return crossRevisionRegistry[msg.Method]
+}
+
+// refuseAcrossRevisions builds the boundary error for a message that may not cross, naming
+// both revisions and the method.
+//
+// Every part of the message is from a closed set — two published revisions and a method this
+// build routes — so it is safe to surface to the host verbatim, which revisionRefusalReason
+// relies on for the sibling revision errors.
+func refuseAcrossRevisions(method string, hostRev, legRev capability.Revision, why string) error {
+	subject := method
+	if subject == "" {
+		subject = "a response"
+	}
+	return fmt.Errorf("%w: %s cannot cross a host %s / upstream %s pair (%s)",
+		errUntranslatableAcrossRevisions, subject, hostRev, legRev, why)
+}
+
+// translateRequest adapts a host message for an upstream leg addressed at a different
+// revision, or returns it unchanged when the pair is matched.
+//
+// The two adjustments are mirror images, and each is the thing the RECEIVING revision requires
+// of a client that speaks it:
+//
+//   - Toward a DECLARING upstream, the per-request revision declaration is ADDED. This is the
+//     one place a host's own `_meta` is written to, and it is exactly the translation the
+//     matched-pair rule forbids (see DeclareUpstreamRevision, which does the merge and is
+//     otherwise reserved for requests eunox originates). Without it the upstream refuses every
+//     forwarded request for a member the host had no way to know it needed.
+//   - Toward a NON-declaring upstream, a declaration the host sent is REMOVED. eunox is
+//     presenting itself to that upstream as a client of ITS revision, and such a client sends
+//     no such member; leaving it there would hand an upstream a version claim about a leg it is
+//     not on. Lossless in the sense that matters: the member describes the host-to-eunox leg,
+//     which the upstream has no stake in.
+//
+// Notifications take the same treatment as requests. A declaring upstream requires the member
+// on every message a client sends it, and a notification is not exempt.
+func translateRequest(msg mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
+	addressed := upstreamAddressedRevision(legRev)
+	if hostRev == addressed {
+		return msg, nil
+	}
+	if declaresPerRequestRevision(legRev) {
+		return DeclareUpstreamRevision(msg, legRev)
+	}
+	return stripRevisionDeclaration(msg)
+}
+
+// stripRevisionDeclaration removes the per-request revision members from msg's params, and
+// removes an emptied `_meta` with them so the upstream sees the shape a client of its own
+// revision would send rather than a vestigial empty object.
+//
+// Fails closed on every malformed shape, for DeclareUpstreamRevision's reasons: params that
+// decode to JSON `null` (which nils the map with no error) and params carrying a duplicate key
+// (which mcp.DecodeParams refuses where a plain Unmarshal would silently resolve one).
+func stripRevisionDeclaration(msg mcp.RPCMsg) (mcp.RPCMsg, error) {
+	if len(msg.Params) == 0 {
+		return msg, nil
+	}
+	fail := func(err error) (mcp.RPCMsg, error) {
+		return mcp.RPCMsg{}, fmt.Errorf("stripping the revision declaration from %s: %w", msg.Method, err)
+	}
+	fields := map[string]json.RawMessage{}
+	if err := mcp.DecodeParams(msg.Params, &fields); err != nil {
+		return fail(fmt.Errorf("params are not a JSON object: %w", err))
+	}
+	raw, ok := fields[metaMember]
+	if !ok || len(raw) == 0 {
+		return msg, nil
+	}
+	meta := map[string]json.RawMessage{}
+	if err := mcp.DecodeParams(raw, &meta); err != nil {
+		return fail(fmt.Errorf("existing %s is not a JSON object: %w", metaMember, err))
+	}
+	before := len(meta)
+	delete(meta, capability.MetaKeyProtocolVersion)
+	delete(meta, capability.MetaKeyClientCapabilities)
+	if len(meta) == before {
+		return msg, nil
+	}
+	if len(meta) == 0 {
+		delete(fields, metaMember)
+	} else {
+		encoded, err := json.Marshal(meta)
+		if err != nil {
+			return fail(err)
+		}
+		fields[metaMember] = encoded
+	}
+	params, err := json.Marshal(fields)
+	if err != nil {
+		return fail(err)
+	}
+	msg.Params = params
+	return msg, nil
+}
+
+// translateResult adapts an upstream reply for a host on a different revision, or returns it
+// unchanged when the pair is matched or the reply carries no result to adapt.
+//
+// Only ONE direction rewrites bytes. Toward a declaring host, the result-shape members that
+// revision requires are added, because an old upstream cannot know to send them. Toward a
+// non-declaring host nothing is stripped: the extra members a newer upstream sends are inert
+// for a host that does not read them, and rewriting a result to remove members nobody looks at
+// would put eunox's hands on payload bytes for no gain. The one thing that direction DOES is
+// refuse (see resultCrossesToHost).
+func translateResult(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
+	addressed := upstreamAddressedRevision(legRev)
+	if hostRev == addressed || len(resp.Result) == 0 {
+		return resp, nil
+	}
+	if !declaresPerRequestRevision(hostRev) {
+		return resp, resultCrossesToHost(method, resp, hostRev, legRev)
+	}
+	return addResultShape(method, resp)
+}
+
+// resultCrossesToHost refuses an upstream result whose variant a non-declaring host cannot
+// read.
+//
+// `input_required` is the whole of it, and it is refused rather than passed through because
+// passing it through is SILENT: an old host has no `resultType` in its vocabulary, so it reads
+// the result as a completed call, drops the `inputRequests` the upstream is waiting on, and the
+// exchange desynchronizes with both sides believing they are done. A refusal costs the caller
+// one failed call; the pass-through costs them a wrong answer they cannot detect.
+//
+// Any other unrecognized variant is refused for the same reason, which is also why the check is
+// "not complete" rather than "is input_required": a variant this build has never heard of is
+// exactly the case where eunox cannot know what a host would lose by reading it as complete.
+// An ABSENT resultType is complete by the spec's rule for earlier-revision servers, and is the
+// shape every 2025-11-25 upstream produces, so it crosses.
+func resultCrossesToHost(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) error {
+	variant, present, err := resultTypeOf(resp.Result)
+	if err != nil {
+		return refuseAcrossRevisions(method, hostRev, legRev,
+			"the upstream result could not be read well enough to establish whether its variant is one this host's revision understands")
+	}
+	if !present || variant == capability.ResultTypeComplete {
+		return nil
+	}
+	return refuseAcrossRevisions(method, hostRev, legRev, fmt.Sprintf(
+		"the upstream answered resultType %q, which a host on %s has no way to read; forwarding it would be read as a completed call and the exchange would desynchronize silently",
+		capability.BoundResultType(variant), hostRev))
+}
+
+// addResultShape adds the result members 2026-07-28 requires to a result an older upstream
+// produced.
+//
+// `resultType: "complete"` is the honest value and the only one available: an upstream that
+// does not have the member cannot be mid-exchange, because the variant that means "mid
+// exchange" is one its revision has no way to express.
+//
+// `cacheScope: "private"` on the list-shaped results, never `public`. eunox filters every list
+// it emits per caller identity, so a list crossing this boundary is authorization-specific by
+// construction — the same reason the filter path clamps an upstream's own `public`. It is SET
+// here rather than left to that clamp because an old upstream sends no `cacheScope` at all, and
+// a member that is absent is not one the clamp can narrow.
+//
+// `ttlMs` is deliberately NOT added. It is a freshness hint, the old upstream offered none, and
+// inventing a lifetime for someone else's data is the kind of fabrication this boundary exists
+// to avoid.
+func addResultShape(method string, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
+	fields := map[string]json.RawMessage{}
+	if err := mcp.DecodeParams(resp.Result, &fields); err != nil {
+		// Not every result is a JSON object the spec models — but every result eunox is asked to
+		// add members to must be, so a result that is not one cannot be translated.
+		return mcp.RPCMsg{}, fmt.Errorf("%w: the upstream result for %s is not a JSON object, so the members %s requires cannot be added: %w",
+			errUntranslatableAcrossRevisions, method, capability.Revision20260728, err)
+	}
+	// A JSON `null` result decodes into a NIL map with no error, so it reaches here looking
+	// like an empty object. Refused rather than replaced with one: the host requires the
+	// member, but manufacturing an object around a value the upstream sent as null invents a
+	// result shape nobody produced, and this boundary's whole rule is that it adds what a
+	// revision requires and never fabricates content.
+	if fields == nil {
+		return mcp.RPCMsg{}, fmt.Errorf("%w: the upstream result for %s is JSON null, which has no place to carry the members %s requires",
+			errUntranslatableAcrossRevisions, method, capability.Revision20260728)
+	}
+	if _, ok := fields[capability.ResultKeyResultType]; !ok {
+		fields[capability.ResultKeyResultType] = json.RawMessage(`"` + capability.ResultTypeComplete + `"`)
+	}
+	if listShapedResult(method) {
+		if _, ok := fields[capability.ResultKeyCacheScope]; !ok {
+			fields[capability.ResultKeyCacheScope] = json.RawMessage(`"` + capability.CacheScopePrivate + `"`)
+		}
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return mcp.RPCMsg{}, fmt.Errorf("%w: re-encoding the translated result for %s: %w", errUntranslatableAcrossRevisions, method, err)
+	}
+	resp.Result = encoded
+	return resp, nil
+}
+
+// listShapedResult reports whether method's result carries the cache members 2026-07-28 defines
+// for list-shaped results. Derived from the registry's own LocalForwards flag rather than a
+// second list of the three `*/list` methods, so a fourth enumerating method cannot be added
+// with this half forgotten.
+func listShapedResult(method string) bool {
+	return methodRegistry[method].LocalForwards
+}
+
+// resultTypeOf reads a result's `resultType` member. present is false for a result that omits
+// it — the shape every 2025-11-25 upstream produces — which the spec reads as complete.
+//
+// The DUPLICATE-KEY refusal mcp.DecodeParams applies matters here for the reason it matters on
+// the request side: a result carrying two spellings of the member would be read one way by this
+// check and the other way by the host's own parser, which is the enforcement-versus-peer
+// differential the decoder exists to close.
+func resultTypeOf(result json.RawMessage) (variant string, present bool, err error) {
+	fields := map[string]json.RawMessage{}
+	if err := mcp.DecodeParams(result, &fields); err != nil {
+		return "", false, err
+	}
+	raw, ok := fields[capability.ResultKeyResultType]
+	if !ok || len(raw) == 0 {
+		return "", false, nil
+	}
+	if err := json.Unmarshal(raw, &variant); err != nil {
+		return "", false, err
+	}
+	return variant, true, nil
+}
+
+// withCrossRevisionTranslation wraps a leg's upstream call so every enforced forward crosses
+// the boundary through one seam.
+//
+// Wrapped at CONSTRUCTION rather than applied per call site, because the alternative is asking
+// each of the forward core, the `*/list` dispatcher, and whatever calls the upstream next to
+// remember — and the one that forgets is a message crossing a mismatched pair untranslated,
+// which fails at the far peer with an error naming eunox's own bug as the upstream's.
+//
+// The host revision comes from the CONTEXT, not from a field, because it is decided per request
+// (capability.WithProtocolRevision, stamped by each transport's negotiation) while the leg
+// revision is fixed for the leg's life. resolveRevision handles the empty carrier the same way
+// every other reader of it does.
+//
+// A matched pair returns inner untouched at the first branch of each translate step, so nothing
+// about the byte stream a matched pair produces changes — the release's own regression
+// invariant, held structurally rather than by test.
+func withCrossRevisionTranslation(legRev capability.Revision, inner func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error)) func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
+	if inner == nil {
+		// nil is a MODE the forward core and dispatchList both read (a leg with no upstream), so
+		// it must survive wrapping rather than becoming a non-nil func that fails on use.
+		return nil
+	}
+	return func(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
+		hostRev := resolveRevision(capability.ProtocolRevisionFromContext(ctx))
+		if hostRev == upstreamAddressedRevision(legRev) {
+			return inner(ctx, msg)
+		}
+		// The disposition is re-asked here rather than trusted from the honorability gate:
+		// that gate runs at negotiation, and this is the seam the bytes actually cross.
+		if decl := boundaryDisposition(msg); !decl.translates {
+			return mcp.RPCMsg{}, refuseAcrossRevisions(msg.Method, hostRev, legRev, decl.why)
+		}
+		outbound, err := translateRequest(msg, hostRev, legRev)
+		if err != nil {
+			return mcp.RPCMsg{}, fmt.Errorf("%w: %w", errUntranslatableAcrossRevisions, err)
+		}
+		resp, err := inner(ctx, outbound)
+		if err != nil {
+			return resp, err
+		}
+		return translateResult(msg.Method, resp, hostRev, legRev)
+	}
+}
+
+// refuseServerRequestAcrossRevisions refuses an upstream's server-initiated request when the
+// host it would be relayed to is on a revision that has no server-initiated requests, or nil
+// when the leg may proceed.
+//
+// This is the one boundary check with no host message in scope — the request originates at the
+// upstream — so it reads the session's pinned revision as a fact rather than resolving one, the
+// same way every other decision on this leg does.
+//
+// Keyed on the HOST's revision alone. The upstream's is implied: a leg addressed at a revision
+// with no server-initiated mechanism cannot produce one of these in the first place, so a pair
+// that reaches here with a declaring host is a mismatched pair by construction, and asking
+// about the upstream again would be asking a question the message itself already answered.
+func refuseServerRequestAcrossRevisions(method string, hostRev capability.Revision) error {
+	if !declaresPerRequestRevision(hostRev) {
+		return nil
+	}
+	return refuseAcrossRevisions(method, hostRev, handshakeRevision,
+		"the host's revision replaced server-initiated requests with a client-driven exchange, so there is no way to ask it and no honest answer eunox could give on its behalf")
+}
+
+// translateNotificationForLeg adapts a host notification for an upstream leg addressed at a
+// different revision, reporting false when it must be dropped instead.
+//
+// Notifications need this for the same reason requests do — a declaring upstream requires the
+// per-request declaration on every message a client sends it, not only on the ones carrying an
+// id — but they cannot get it from withCrossRevisionTranslation, because a forwarded
+// notification never goes through the upstream CALL: there is no reply to correlate, so each
+// transport writes it straight out (stdio to its subprocess writer, HTTP through
+// forwardNotification). Wrapping the call seam therefore covered every enforced request and
+// none of these.
+//
+// A drop rather than a refusal, because JSON-RPC forbids answering a notification and the
+// boundary already ADMITTED this one at negotiation: reaching a translation failure here means
+// the params are malformed in a way the gate could not see, which is the same disposition every
+// other unforwardable notification takes.
+func translateNotificationForLeg(msg mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, bool) {
+	if hostRev == upstreamAddressedRevision(legRev) {
+		return msg, true
+	}
+	translated, err := translateRequest(msg, hostRev, legRev)
+	if err != nil {
+		return mcp.RPCMsg{}, false
+	}
+	return translated, true
+}

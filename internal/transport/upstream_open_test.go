@@ -380,37 +380,61 @@ func TestUpstreamOpenRevision_UnsupportedPinFailsClosed(t *testing.T) {
 	}
 }
 
-// TestInitializeAcrossRevisions_IsRefusedNotTranslated: a host handshake reaching a leg that
-// speaks a handshake-less revision must be refused, not answered from that leg's discovery
-// data. Answering would stamp the handshake revision over a capability object in the newer
-// revision's shape — a cross-revision translation this build does not perform — and the host
-// would then feature-detect off methods eunox denies fail-closed.
-func TestInitializeAcrossRevisions_IsRefusedNotTranslated(t *testing.T) {
+// TestInitializeAcrossRevisions_IsTranslatedNarrowly: a host handshake reaching a leg that
+// speaks a handshake-less revision is ANSWERED from that leg's discovery data — ADR-0006's
+// discovery translation — but only after the capability object is narrowed to what the pair can
+// actually carry.
+//
+// The narrowing is the whole of what makes answering safe, and it is what this test guards.
+// Handing over the discover object verbatim would stamp the handshake revision on a capability
+// set in the newer revision's shape, and the host would feature-detect off methods eunox then
+// denies fail-closed — which is worse for it than a refusal, because it plans around a surface
+// it cannot use. This was refused outright before the boundary existed, for exactly that
+// reason; what changed is that the answer can now be made honest rather than withheld.
+func TestInitializeAcrossRevisions_IsTranslatedNarrowly(t *testing.T) {
 	t.Parallel()
 	sess := newTestSession(&httpSession{
-		upstreamRev:  capability.Revision20260728,
-		upstreamCaps: map[string]interface{}{"subscriptions": map[string]interface{}{}},
-		done:         make(chan struct{}),
+		upstreamRev: capability.Revision20260728,
+		upstreamCaps: map[string]interface{}{
+			// Advertised by the declaring upstream and NOT carryable: this build knows no
+			// methods for it, so it cannot know whether they translate.
+			"subscriptions": map[string]interface{}{},
+			"tools":         map[string]interface{}{"listChanged": true},
+			"prompts":       map[string]interface{}{},
+			// Carryable, EXCEPT for the sub-flag naming the one refused pair inside it.
+			"resources": map[string]interface{}{"subscribe": true, "listChanged": true},
+		},
+		done: make(chan struct{}),
 	})
 	resp := sess.buildInitResponse(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize})
-	if resp.Error == nil {
-		t.Fatalf("the handshake was answered from a declaring leg: %s", resp.Result)
-	}
-	if resp.Error.Code != capability.JSONRPCCodeUnsupportedProtocolVersion {
-		t.Errorf("code = %d, want the -32022 revision refusal", resp.Error.Code)
+	if resp.Error != nil {
+		t.Fatalf("the handshake was refused rather than translated: %+v", resp.Error)
 	}
 	if strings.Contains(string(resp.Result), "subscriptions") {
-		t.Error("the declaring leg's capability object reached the host")
+		t.Error("a capability this build cannot reason about reached the host; an unknown surface must be dropped, not forwarded")
+	}
+	if strings.Contains(string(resp.Result), "subscribe") {
+		t.Error("resources.subscribe reached the host, promising a pair the boundary refuses")
+	}
+	for _, kept := range []string{"tools", "prompts", "resources", "listChanged"} {
+		if !strings.Contains(string(resp.Result), kept) {
+			t.Errorf("%q was dropped; narrowing must keep what the pair can carry, or the answer is useless", kept)
+		}
 	}
 
-	// The matched case is unaffected: a handshake leg still answers its own handshake.
+	// The matched case is untouched — including the subscribe flag, which is only refused
+	// because the PAIR cannot carry it, never because the method is unsupported.
 	ok := newTestSession(&httpSession{
 		upstreamRev:  handshakeRevision,
-		upstreamCaps: map[string]interface{}{"tools": map[string]interface{}{}},
+		upstreamCaps: map[string]interface{}{"tools": map[string]interface{}{}, "resources": map[string]interface{}{"subscribe": true}},
 		done:         make(chan struct{}),
 	})
-	if resp := ok.buildInitResponse(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize}); resp.Error != nil {
-		t.Errorf("a matched handshake was refused: %+v", resp.Error)
+	matched := ok.buildInitResponse(mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize})
+	if matched.Error != nil {
+		t.Fatalf("a matched handshake was refused: %+v", matched.Error)
+	}
+	if !strings.Contains(string(matched.Result), "subscribe") {
+		t.Error("a matched pair lost resources.subscribe; narrowing must not reach the matched path")
 	}
 }
 

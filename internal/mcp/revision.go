@@ -168,32 +168,59 @@ func BoundReflectedRevision(version string) string {
 	return string(out)
 }
 
-// unsupportedRevisionData is the constant `data` payload every -32022 refusal carries: the
-// symbolic code plus every revision this build speaks, so a refused peer can retry against
-// one rather than guess. Built once — none of it depends on the request, and the refusal path
-// is reachable pre-authentication.
-var unsupportedRevisionData = buildUnsupportedRevisionData()
+// revisionRefusalData caches the `data` payload for each symbolic code that rides the -32022
+// wire integer: the code plus every revision this build speaks, so a refused peer can retry
+// against one rather than guess.
+//
+// Built once per code — none of it depends on the request, and the refusal path is reachable
+// pre-authentication. Keyed by code rather than a single value because two DIFFERENT refusals
+// share the integer: one says a revision could not be established, the other that an
+// established PAIR cannot carry the message. `data.code` is the only thing that separates them
+// for a host or a SIEM rule, so a single cached payload would have made the distinction the
+// audit tape draws invisible on the wire.
+var revisionRefusalData = map[string]json.RawMessage{
+	capability.ErrCodeUnsupportedProtocolVersion:    buildRevisionRefusalData(capability.ErrCodeUnsupportedProtocolVersion),
+	capability.ErrCodeUntranslatableAcrossRevisions: buildRevisionRefusalData(capability.ErrCodeUntranslatableAcrossRevisions),
+}
 
-func buildUnsupportedRevisionData() json.RawMessage {
+func buildRevisionRefusalData(code string) json.RawMessage {
 	versions := capability.PublishedRevisionNames()
 	data, _ := json.Marshal(struct {
 		Code      string   `json:"code"`
 		Supported []string `json:"supported"`
-	}{Code: capability.ErrCodeUnsupportedProtocolVersion, Supported: versions})
+	}{Code: code, Supported: versions})
 	return data
 }
 
-// UnsupportedProtocolVersionResponse builds the spec's UNSUPPORTED_PROTOCOL_VERSION
-// (-32022) refusal. message names what was wrong with the request's own declaration; any
-// caller-supplied text it embeds has already been bounded and stripped by BoundReflectedRevision.
-func UnsupportedProtocolVersionResponse(id *json.RawMessage, message string) RPCMsg {
+// RevisionRefusalResponse builds the spec's -32022 refusal under a named symbolic code.
+// message names what was wrong; any caller-supplied text it embeds has already been bounded
+// and stripped by BoundReflectedRevision.
+//
+// The integer is the spec's and is SHARED; the CODE is what tells a host which of the two
+// revision problems it hit — one peer's revision could not be established, or two established
+// revisions cannot carry this message between them. It is stamped into both the message prefix
+// and `data.code`, so the greppable text and the structured field cannot disagree.
+//
+// Every caller names its code rather than one of them being the default behind a shorter
+// spelling: the two refusals share a wire integer, which is exactly the situation in which a
+// convenience wrapper gets reached for by a site that meant the other one.
+//
+// An unrecognized code falls back to the establish-a-revision payload rather than emitting a
+// `data` block naming a code with no cached payload: this is the pre-authentication refusal
+// path, and minting JSON per request there is what the cache exists to avoid.
+func RevisionRefusalResponse(id *json.RawMessage, code, message string) RPCMsg {
+	data, ok := revisionRefusalData[code]
+	if !ok {
+		code = capability.ErrCodeUnsupportedProtocolVersion
+		data = revisionRefusalData[code]
+	}
 	return RPCMsg{
 		JSONRPC: "2.0",
 		ID:      id,
 		Error: &RPCError{
 			Code:    capability.JSONRPCCodeUnsupportedProtocolVersion,
-			Message: capability.ErrCodeUnsupportedProtocolVersion + ": " + message,
-			Data:    unsupportedRevisionData,
+			Message: code + ": " + message,
+			Data:    data,
 		},
 	}
 }

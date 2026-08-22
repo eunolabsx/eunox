@@ -327,6 +327,7 @@ const (
 	answerStrictAuditRefusal   = "refusing a server-initiated request: the audit trail has degraded under --require-audit=strict"
 	answerPolicyRefusal        = "denying a server-initiated request the policy refused"
 	answerPoolSaturated        = "refusing a server-initiated request: the in-flight pool is saturated"
+	answerUntranslatableLeg    = "refusing a server-initiated request an upstream aimed at a host whose revision has no such thing"
 )
 
 // The server-request drop legs: WHY a server-initiated request this proxy had already accepted was
