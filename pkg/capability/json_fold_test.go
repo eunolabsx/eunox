@@ -4,6 +4,7 @@
 package capability
 
 import (
+	"strings"
 	"testing"
 	"unicode"
 	"unicode/utf8"
@@ -105,5 +106,52 @@ func TestFoldJSONKey_InvalidUTF8NormalizesToReplacement(t *testing.T) {
 	}
 	if !utf8.ValidString(a) {
 		t.Errorf("FoldJSONKey(%q) = %q, want valid UTF-8", "na\xffme", a)
+	}
+}
+
+// TestCanonicalCaseFold_IsEqualFoldsCanonicalForm pins the property every caller of the
+// fold relies on and that no caller can check for itself: two strings fold to the same
+// value EXACTLY when strings.EqualFold reports them equal. A load-time dedup keyed on the
+// fold is only a certificate about an EqualFold matcher's behavior while that holds — the
+// effect.byArgument table certified unambiguous at load and then colliding at runtime is
+// what a ToLower-based dedup produced.
+func TestCanonicalCaseFold_IsEqualFoldsCanonicalForm(t *testing.T) {
+	t.Parallel()
+	corpus := []string{
+		"", "s", "S", "ſ", "select", "SELECT", "ſelect", "ſELECT",
+		"k", "K", "K", "key", "KEY", "Key",
+		"drop", "DROP", "DrOp", "delete", "ı", "I", "i",
+		"straße", "STRASSE", "ß", "ss", "SS",
+		"na\xffme", "na\xfeme", "na�me", "name",
+		"İ", "ΐ", "ΐ", "σ", "ς", "Σ",
+	}
+	for _, a := range corpus {
+		for _, b := range corpus {
+			want := strings.EqualFold(a, b)
+			if got := canonicalCaseFold(a) == canonicalCaseFold(b); got != want {
+				t.Errorf("canonicalCaseFold(%q)==canonicalCaseFold(%q) is %v, but strings.EqualFold reports %v; the fold must be EqualFold's canonical form", a, b, got, want)
+			}
+		}
+	}
+}
+
+// TestCanonicalCaseFold_IsEqualFoldsCanonicalFormOverBMPPairs sweeps the same property over
+// every simple-fold orbit in the BMP rather than a hand-picked corpus, so a future change to
+// the representative rule cannot preserve the table above by accident.
+func TestCanonicalCaseFold_IsEqualFoldsCanonicalFormOverBMPPairs(t *testing.T) {
+	t.Parallel()
+	for r := rune(0); r <= 0xFFFF; r++ {
+		if !utf8.ValidRune(r) {
+			continue
+		}
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			a, b := "x"+string(r)+"y", "x"+string(f)+"y"
+			if !strings.EqualFold(a, b) {
+				t.Fatalf("strings.EqualFold(%q, %q) is false for two members of one orbit; the premise of this test is wrong", a, b)
+			}
+			if canonicalCaseFold(a) != canonicalCaseFold(b) {
+				t.Fatalf("canonicalCaseFold(%q) != canonicalCaseFold(%q), but strings.EqualFold matches them", a, b)
+			}
+		}
 	}
 }

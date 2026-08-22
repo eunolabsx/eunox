@@ -127,6 +127,15 @@ func TestEffectGrammarRejections(t *testing.T) {
 			wantErr: "match the same argument value",
 		},
 		{
+			// U+017F LATIN SMALL LETTER LONG S is already lower case, so a ToLower-based
+			// dedup at load saw two distinct keys while the runtime matcher's EqualFold
+			// matches both against "SELECT" — the same manifest an operator can copy
+			// verbatim out of a reviewed contract corpus.
+			name:    "a byArgument table whose cases collide only under the matcher's fold",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: q\n        cases:\n          select: {class: irreversible}\n          \u017felect: {class: reversible}\n",
+			wantErr: "match the same argument value",
+		},
+		{
 			name:    "a byArgument table whose cases collide on surrounding whitespace",
 			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: q\n        cases:\n          DROP: {class: irreversible}\n          \"DROP \": {class: reversible}\n",
 			wantErr: "match the same argument value",

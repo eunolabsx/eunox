@@ -86,10 +86,12 @@ type AllowedOperationsCondition struct {
 	// compiled holds Operations with each entry pre-trimmed by Compile at load time,
 	// so the hot path compares ready strings instead of re-trimming the whole
 	// allowlist on every enforced call. It stays a SLICE compared with EqualFold
-	// rather than a lookup set: a map would have to key on some fixed case mapping,
-	// and no such mapping reproduces EqualFold's Unicode case folding exactly (the
-	// Kelvin sign folds to "K" but does not upper- or lower-case to it), so the
-	// switch would silently narrow which manifests match. Unexported, so it never
+	// rather than a lookup set: keying a map on a case MAPPING does not reproduce
+	// EqualFold's Unicode case folding (the Kelvin sign folds to "K" but does not
+	// upper- or lower-case to it), so that switch would silently narrow which
+	// manifests match, and the fold that does reproduce it — canonicalCaseFold —
+	// would have to run over the request's operation to probe the map, per enforced
+	// call, in place of the scan it replaces. Unexported, so it never
 	// serializes; nil on an uncompiled condition (e.g. one built directly in a test),
 	// where AllowsOperation trims as it scans instead.
 	compiled []string
