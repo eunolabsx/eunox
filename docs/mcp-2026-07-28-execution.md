@@ -1,15 +1,18 @@
 # MCP 2026-07-28 execution plan
 
-**Status:** in progress — W1 has landed; every other workstream is still planning.
+**Status:** in progress — W1 has landed and W11 has landed its upstream-opener
+half; every other workstream is still planning.
 Companion to [mcp-2026-07-28-plan.md](mcp-2026-07-28-plan.md), which states what
 changes and why. This document states the work as workstreams — concrete
 deliverables, the tests each one owes, and the exit criteria that say when it is
 done. Workstream sections are keyed to the plan's numbered items.
-**Verified against:** eunox @ `d5d9a85`.
+**Verified against:** eunox @ `bd3797a`.
 
 A landed workstream says so in its heading; an unmarked heading is still planning.
 A workstream is **landed** only when every exit criterion below it is ticked or
 explicitly accounted for — W1 is landed with two criteria open, and says which.
+W11 is the one partial: its heading is unmarked because only the opener landed,
+and the section says what did not.
 
 References name a **file and a symbol, never a line number**.
 
