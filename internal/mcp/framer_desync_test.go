@@ -269,3 +269,29 @@ func TestMsgWriter_SetPoisonHookOnAlreadyPoisonedWriterDoesNotFire(t *testing.T)
 		t.Errorf("onPoison fired %d times for a transition that predates it, want 0", got)
 	}
 }
+
+// TestMsgWriter_SetPoisonHookConcurrentWithPoisoningWrite pins that the hook field is read UNDER
+// the writer's mutex. Firing it off-lock is deliberate (re-entrancy), but the field is written by
+// SetPoisonHook under that same mutex, and both methods document themselves as safe against a
+// writer already serving — so reading it below the Unlock was a data race under the contract they
+// state, latent only because the in-tree caller installs before serving.
+//
+// Under -race a single unsynchronized pair is enough to fail; the iterations are for the scheduler,
+// and each writer is fresh because the poison latches on the first frame.
+func TestMsgWriter_SetPoisonHookConcurrentWithPoisoningWrite(t *testing.T) {
+	t.Parallel()
+	for range 200 {
+		mw := NewMsgWriter(&shortWriter{accept: 4, err: syscall.EPIPE})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			mw.SetPoisonHook(func() {})
+		}()
+		go func() {
+			defer wg.Done()
+			_ = mw.Write(RPCMsg{JSONRPC: "2.0", Method: "tools/call"})
+		}()
+		wg.Wait()
+	}
+}

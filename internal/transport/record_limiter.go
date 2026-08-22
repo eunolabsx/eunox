@@ -103,11 +103,13 @@ const (
 	// refusalDeclarations for the reason, which is the same for both.
 	catUnroutable refusalCategory = "unroutable"
 	catSmuggled   refusalCategory = "smuggled_notification"
-	// catServerRequestFailed bounds the two records for a server-initiated request this proxy had
-	// already TRACKED and then failed: a delivery that never reached the host, and a host reply
+	// catServerRequestFailed bounds the records for a server-initiated request this proxy had
+	// already TRACKED and then failed: a forward no client accepted (both the outcome the leg
+	// records synchronously and the correction a later SSE failure appends), and a host reply
 	// destroyed because there was no upstream sink to relay it through. Driven by the upstream like
 	// catDisplaced, and metered for the same reason — nothing caps how many such requests an
-	// upstream issues over a session's life.
+	// upstream issues over a session's life. No numeral: the writers are what they are, and a count
+	// here is a thing to keep in agreement with them.
 	catServerRequestFailed refusalCategory = "failed_server_request"
 	// catUnroutableID bounds the record for a server-initiated request eunox refuses because its
 	// own JSON-RPC id is larger than the in-flight tracker retains. Its own bucket, not

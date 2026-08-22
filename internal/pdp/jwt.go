@@ -357,13 +357,29 @@ func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 		acceptedAudiences:        sanitizeAudiences(opts.AcceptedAudiences),
 		routeAudience:            opts.RouteAudience,
 		allowAnyIssuer:           opts.AllowAnyIssuer,
-		inner:                    opts.Inner,
+		inner:                    normalizedInner(opts.Inner),
 		ks:                       opts.KillSwitch,
 		clock:                    opts.Clock,
 		leeway:                   capability.EffectiveLeeway(opts.Leeway),
 		experimentalCapabilities: opts.ExperimentalCapabilities,
 	}
 	return p
+}
+
+// normalizedInner collapses a typed-nil Inner — the classic `(*ManifestPDP)(nil)` in a non-nil
+// interface — to a plain nil, so the whole package's `p.inner != nil` guards and innerEnforces'
+// `case nil` answer the fail-closed way for it. Untreated, such a value is a real policy backstop
+// to every one of them, and the first identity-only token dereferences the nil receiver: a panicked
+// request goroutine (on stdio, the process) in place of the deny this wrapper owes.
+//
+// At CONSTRUCTION rather than at each guard, since both constructors route through newJWTPDP and
+// the field is never reassigned — the same discipline CommitDeclassified's receiver guard and the
+// transport's requireUsableOptions apply, with this the one leg of it left open.
+func normalizedInner(inner PolicyDecisionPoint) PolicyDecisionPoint {
+	if capability.IsNilValue(inner) {
+		return nil
+	}
+	return inner
 }
 
 // NewJWTPDPWithCache builds a per-route JWTPDP sharing an already-constructed JWKS
@@ -403,6 +419,10 @@ func (p *JWTPDP) KeyFetchHealth() (capability.KeyFetchHealth, bool) {
 // innerEnforces reports whether p.inner is a real policy backstop for an
 // identity-only (no mcp.capabilities) request. Neither nil nor AlwaysAllowPDP
 // qualify — in JWT mode the wrapper must fail closed, not inherit allow-everything.
+//
+// `case nil` matches an untyped nil interface alone, which is enough only because
+// normalizedInner has already collapsed a typed nil to one at construction; a wrapped nil reaching
+// here would fall to default and be treated as a backstop.
 func (p *JWTPDP) innerEnforces() bool {
 	switch p.inner.(type) {
 	case nil:

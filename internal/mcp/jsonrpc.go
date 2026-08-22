@@ -560,11 +560,19 @@ func (mw *MsgWriter) Write(msg RPCMsg) error {
 		mw.poisonErr = err
 		justPoisoned = true
 	}
+	// Read the hook UNDER the lock, call it off-lock: SetPoisonHook writes the field under this
+	// same mutex on an already-serving writer, so reading it below the Unlock is a data race under
+	// the concurrency contract both methods document. Only on the poisoning frame, so the ordinary
+	// write path is unchanged.
+	var hook func()
+	if justPoisoned {
+		hook = mw.onPoison
+	}
 	mw.mu.Unlock()
 	// Fire the hook off-lock so it can never re-enter Write (which would self-deadlock
 	// on mw.mu), regardless of which write path first wedged.
-	if justPoisoned && mw.onPoison != nil {
-		mw.onPoison()
+	if justPoisoned && hook != nil {
+		hook()
 	}
 	return err
 }
