@@ -5,11 +5,13 @@ package transport
 
 import (
 	"context"
+	"go/ast"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -124,10 +126,83 @@ func TestTranslateErrorCode_DoesNotMutateTheUpstreamsOwnMessage(t *testing.T) {
 	original := &mcp.RPCError{Code: capability.JSONRPCCodeResourceNotFound20251125, Message: "gone"}
 	upstream := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Error: original}
 
-	got := translateErrorCode(capability.MethodResourcesRead, upstream,
+	got := translateErrorCode(context.Background(), capability.MethodResourcesRead, upstream,
 		capability.Revision20260728, capability.Revision20251125)
 
 	assert.Equal(t, capability.JSONRPCCodeInvalidParams, got.Error.Code, "the host's copy is translated")
 	assert.Equal(t, capability.JSONRPCCodeResourceNotFound20251125, original.Code,
 		"the upstream's own decoded error must be untouched; the reader may still hold it")
+}
+
+// The audit tape must name what the UPSTREAM sent, not what the host was handed.
+//
+// The rewrite happens below the record, on the same response object, so the tape recorded the
+// translated integer under a field whose name promises the upstream's own — and a translated
+// -32602 is indistinguishable from an upstream that genuinely sent -32602, so nothing on the
+// record could recover it. This asserts the two halves separately: the host is translated, the
+// tape is not.
+func TestUpstreamErrorDetail_RecordsWhatTheUpstreamSent(t *testing.T) {
+	t.Parallel()
+	upstream := mcp.RPCMsg{
+		JSONRPC: "2.0",
+		ID:      mcp.RawJSON(`1`),
+		Error:   &mcp.RPCError{Code: capability.JSONRPCCodeResourceNotFound20251125, Message: "no such resource"},
+	}
+	call := withResultShape(false, withCrossRevisionTranslation(capability.Revision20251125,
+		func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) { return upstream, nil }))
+
+	// The slot dispatchRequest installs. Its absence is what the guard below is about.
+	ctx := withUpstreamCodeRewrite(capability.WithProtocolRevision(context.Background(), capability.Revision20260728))
+	got, err := call(ctx, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodResourcesRead})
+	require.NoError(t, err)
+
+	assert.Equal(t, capability.JSONRPCCodeInvalidParams, got.Error.Code, "the host receives its own revision's spelling")
+	assert.Equal(t, map[string]interface{}{
+		audit.UpstreamErrorCodeKey: capability.JSONRPCCodeResourceNotFound20251125,
+	}, upstreamErrorDetail(ctx, got), "the tape must name the code the upstream actually sent")
+}
+
+// An untranslated reply records its own code, so the slot cannot leak a stale value onto a
+// record it has nothing to do with.
+func TestUpstreamErrorDetail_UntranslatedRepliesAreUnaffected(t *testing.T) {
+	t.Parallel()
+	ctx := withUpstreamCodeRewrite(context.Background())
+	resp := mcp.RPCMsg{Error: &mcp.RPCError{Code: capability.JSONRPCCodeEnforcementError}}
+	assert.Equal(t, map[string]interface{}{
+		audit.UpstreamErrorCodeKey: capability.JSONRPCCodeEnforcementError,
+	}, upstreamErrorDetail(ctx, resp))
+
+	// And with no slot installed at all: today's behavior, not a panic.
+	assert.Equal(t, map[string]interface{}{
+		audit.UpstreamErrorCodeKey: capability.JSONRPCCodeEnforcementError,
+	}, upstreamErrorDetail(context.Background(), resp))
+}
+
+// dispatchRequest is where the slot is installed, and the install is what makes the record
+// truthful on every audited path. A source guard rather than a behavioral test because the
+// failure mode is silent: without it the detail falls back to the forwarded code, which is
+// exactly the wrong value and looks like an ordinary record.
+func TestDispatchRequest_InstallsTheUpstreamCodeRewriteSlot(t *testing.T) {
+	t.Parallel()
+	src := dispatchSource(t)
+	var found bool
+	ast.Inspect(src.file, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "dispatchRequest" {
+			return true
+		}
+		ast.Inspect(fn, func(inner ast.Node) bool {
+			call, ok := inner.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "withUpstreamCodeRewrite" {
+				found = true
+			}
+			return true
+		})
+		return false
+	})
+	assert.True(t, found,
+		"dispatchRequest no longer installs the rewrite slot; every audited path would record the code the HOST was handed under a field naming the upstream")
 }

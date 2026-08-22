@@ -2307,7 +2307,7 @@ func TestEnforcedForwardCore_StrictGateBeforeAuditOnlyRecord(t *testing.T) {
 	}
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}
 	resp := enforcedForwardCore(context.Background(), fp, nil, msg, dec, "tools/call", "secret_tool", "secret_tool", "tool", true,
-		func(mcp.RPCMsg) map[string]interface{} { return nil })
+		func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 
 	if rec.forward {
 		t.Error("the upstream must NOT be called when the strict-audit gate blocks the forward")
@@ -2349,7 +2349,7 @@ func TestStrictAuditDenial_StructuredDetailIsDiscrete(t *testing.T) {
 	dec := capability.EnforceResponse{Decision: capability.DecisionAllow}
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}
 	resp := enforcedForwardCore(context.Background(), fp, nil, msg, dec, "tools/call", "tool_x", "tool_x", "tool", true,
-		func(mcp.RPCMsg) map[string]interface{} { return nil })
+		func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 
 	if resp.Error == nil || resp.Error.Code != denialToJSONRPCCode(capability.ErrCodeAuditUnavailable) {
 		t.Fatalf("response = %+v, want an AUDIT_UNAVAILABLE error", resp.Error)

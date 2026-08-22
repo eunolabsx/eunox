@@ -106,9 +106,9 @@ func allowDecision() capability.EnforceResponse {
 }
 
 func TestUpstreamErrorDetail(t *testing.T) {
-	assert.Nil(t, upstreamErrorDetail(mcp.RPCMsg{Result: json.RawMessage(`{}`)}),
+	assert.Nil(t, upstreamErrorDetail(context.Background(), mcp.RPCMsg{Result: json.RawMessage(`{}`)}),
 		"a clean success must add no detail")
-	got := upstreamErrorDetail(mcp.RPCMsg{Error: &mcp.RPCError{Code: -32000, Message: "boom: secret leaked"}})
+	got := upstreamErrorDetail(context.Background(), mcp.RPCMsg{Error: &mcp.RPCError{Code: -32000, Message: "boom: secret leaked"}})
 	require.NotNil(t, got)
 	assert.Equal(t, -32000, got[audit.UpstreamErrorCodeKey])
 	// The upstream message can carry sensitive content; only the code is recorded.

@@ -258,6 +258,70 @@ func translateResult(method string, resp mcp.RPCMsg, hostRev, legRev capability.
 	return resp, resultCrossesToHost(method, resp, hostRev, legRev)
 }
 
+// upstreamCodeRewrite carries, for one request, the error code the UPSTREAM actually sent when
+// the boundary re-spelled it for the host.
+//
+// # Why the audit tape needs this at all
+//
+// The rewrite happens at the upstream call, which is BELOW the audit record — the same response
+// object the host receives is the one upstreamErrorDetail reads. So the tape recorded the
+// translated integer under `_eunox_upstream_error_code`, a field whose name promises what the
+// upstream sent. On a signed, tamper-evident log that is a false statement, and it is not
+// recoverable after the fact: a translated -32602 and an upstream that genuinely sent -32602 are
+// the same bytes.
+//
+// # Why only the ORIGINAL is recorded
+//
+// The forward direction is deterministic — method, the two revisions and the upstream's code
+// decide the host's code — and the record already carries the revision. So the original is
+// strictly more informative than the translated value, and recording it costs no second detail
+// key, no new reserved name, and no threat-model addition.
+//
+// # Why a context holder
+//
+// The translation cannot move above the audit: it must stay at the upstream call, because that
+// is what guarantees every code it sees came from the upstream. Applied any later it would also
+// rewrite eunox's OWN denials — CAPABILITY_DENIED is -32002 under the same revision — and turn a
+// policy refusal into invalid-params. So the fact has to travel UP from the seam, and the context
+// is the only channel the wrapper has: it is built at construction and sees nothing but ctx and
+// the message.
+//
+// Installed once, by dispatchRequest, which is the single entry both audit-writing paths (the
+// enforced forward core, and the `*/list` dispatcher) are reached through. A path that somehow
+// missed the install degrades to recording the forwarded code — today's behavior rather than a
+// new failure — and a source guard pins the install.
+type upstreamCodeRewrite struct {
+	original  int
+	rewritten bool
+}
+
+type upstreamCodeRewriteKey struct{}
+
+// withUpstreamCodeRewrite installs the per-request slot the boundary reports a rewrite into.
+func withUpstreamCodeRewrite(ctx context.Context) context.Context {
+	return context.WithValue(ctx, upstreamCodeRewriteKey{}, &upstreamCodeRewrite{})
+}
+
+// noteUpstreamCodeRewrite records the code the upstream sent, before the boundary re-spelled it.
+// A no-op when no slot was installed.
+func noteUpstreamCodeRewrite(ctx context.Context, original int) {
+	if slot, ok := ctx.Value(upstreamCodeRewriteKey{}).(*upstreamCodeRewrite); ok {
+		slot.original, slot.rewritten = original, true
+	}
+}
+
+// upstreamCodeBeforeRewrite returns the upstream's own error code when the boundary rewrote it.
+//
+// Written by the wrapper's goroutine and read by the same one after it returns — the slot is per
+// request, and a request is handled start to finish on one goroutine.
+func upstreamCodeBeforeRewrite(ctx context.Context) (int, bool) {
+	slot, ok := ctx.Value(upstreamCodeRewriteKey{}).(*upstreamCodeRewrite)
+	if !ok || !slot.rewritten {
+		return 0, false
+	}
+	return slot.original, true
+}
+
 // translateReply is the boundary's one entry point for whatever the upstream answered, routing a
 // result to translateResult and an ERROR to translateErrorCode.
 //
@@ -272,9 +336,9 @@ func translateResult(method string, resp mcp.RPCMsg, hostRev, legRev capability.
 // both reject one violating JSON-RPC's exactly-one-of invariant. That is a dependency rather
 // than an observation: a fourth upstream path skipping those guards would take the error branch
 // and with it skip the result-side REFUSAL, which is the fail-open direction.
-func translateReply(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
+func translateReply(ctx context.Context, method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
 	if resp.Error != nil {
-		return translateErrorCode(method, resp, hostRev, legRev), nil
+		return translateErrorCode(ctx, method, resp, hostRev, legRev), nil
 	}
 	return translateResult(method, resp, hostRev, legRev)
 }
@@ -315,7 +379,7 @@ func translateReply(method string, resp mcp.RPCMsg, hostRev, legRev capability.R
 // eunox's OWN denials never reach here: this wrapper sits at the upstream call, so every code it
 // sees came from the upstream. That is what makes reading -32002 as the spec's meaning safe
 // despite eunox spelling CAPABILITY_DENIED with the same integer.
-func translateErrorCode(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) mcp.RPCMsg {
+func translateErrorCode(ctx context.Context, method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) mcp.RPCMsg {
 	if hostRev == upstreamAddressedRevision(legRev) || !declaresPerRequestRevision(hostRev) {
 		return resp
 	}
@@ -327,6 +391,10 @@ func translateErrorCode(method string, resp mcp.RPCMsg, hostRev, legRev capabili
 	}
 	// Copied rather than mutated in place: resp.Error is a pointer into the decoded upstream
 	// message, and the caller's copy of that message is the one the reader may still hold.
+	// Reported UP before the code is replaced: the audit record must name what the upstream
+	// sent, and after this assignment nothing can recover it (a translated -32602 and a genuine
+	// one are the same bytes).
+	noteUpstreamCodeRewrite(ctx, resp.Error.Code)
 	rewritten := *resp.Error
 	rewritten.Code = capability.ResourceNotFoundWireCode(hostRev)
 	resp.Error = &rewritten
@@ -414,7 +482,7 @@ func withCrossRevisionTranslation(legRev capability.Revision, inner func(context
 		if err != nil {
 			return resp, err
 		}
-		return translateReply(msg.Method, resp, hostRev, legRev)
+		return translateReply(ctx, msg.Method, resp, hostRev, legRev)
 	}
 }
 

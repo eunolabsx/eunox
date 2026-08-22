@@ -146,7 +146,7 @@ func TestEnforcedForwardCore_DeclassifyDoesNotMutateCallerDetails(t *testing.T) 
 	live := map[string]interface{}{"path": "/tmp/x"}
 	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false,
-		func(mcp.RPCMsg) map[string]interface{} { return live })
+		func(context.Context, mcp.RPCMsg) map[string]interface{} { return live })
 
 	assert.Equal(t, map[string]interface{}{"path": "/tmp/x"}, live,
 		"the caller's argument map must be untouched")

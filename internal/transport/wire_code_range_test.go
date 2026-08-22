@@ -6,7 +6,9 @@ package transport
 import (
 	"go/ast"
 	"go/token"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -29,9 +31,10 @@ import (
 //
 //   - Every symbolic denial code maps through DenialWireCode to a mintable integer. That covers
 //     the vocabulary a denial is built from.
-//   - Every integer CONSTANT anywhere in the module whose value falls in JSON-RPC's reserved
-//     -32768..-32000 is mintable. That covers the codes the transports mint directly, which the
-//     denial vocabulary never sees.
+//   - Every integer LITERAL anywhere in the module whose value falls in JSON-RPC's reserved
+//     -32768..-32000 is mintable — a named constant, a positional call argument, a struct field,
+//     anywhere. That covers the codes the transports mint directly, which the denial vocabulary
+//     never sees.
 
 // TestWireCodes_EveryDenialCodeMintsIntoAPermittedBand pins the symbolic vocabulary.
 //
@@ -78,16 +81,7 @@ func TestWireCodes_ReservedBandIsOnlyReachedByASpecAssignedCode(t *testing.T) {
 	}
 }
 
-// wireCodeConstant is one integer constant this module declares inside JSON-RPC's reserved range,
-// with where it was found — the position being the whole value of the failure message, since the
-// point is to send a contributor to the line they just wrote.
-type wireCodeConstant struct {
-	name  string
-	value int
-	where string
-}
-
-// TestWireCodes_NoModuleConstantDriftsIntoReservedSpace is the guard the plan's exit criterion
+// TestWireCodes_NoModuleLiteralDriftsIntoReservedSpace is the guard the plan's exit criterion
 // names: a future code addition cannot drift into reserved space.
 //
 // It walks EVERY package in the module rather than the two that declare wire codes today. The
@@ -95,91 +89,97 @@ type wireCodeConstant struct {
 // the addition that would not think to update a list, and the whole point is that it does not
 // have to.
 //
-// Only CONSTANTS are examined. A bare literal in a struct field would slip past — that gap is
-// closed by the sibling guard below rather than by widening this one, because the two want
-// different things from the AST and one walk doing both reports neither clearly.
-func TestWireCodes_NoModuleConstantDriftsIntoReservedSpace(t *testing.T) {
+// It examines every reserved-range integer LITERAL, wherever it appears — not just the value of a
+// named constant, and not just a `Code:` struct field. Both narrower shapes were tried and both
+// had the same hole: `mcp.ErrorResponse(id, -32025, "…")` is the module's most common way to mint
+// an error, and it is a positional call argument, so it declares no constant and fills no keyed
+// field. A guard that misses the commonest construction site while claiming to close the hazard
+// is worse than none.
+//
+// Keyed on the VALUE rather than on a name, deliberately: a constant called `retryBudget` set to
+// -32021 is on the wire the moment something assigns it to an error code, and a name-shaped
+// filter (`*Code*`) would miss it while looking like it covered the question. The value is what a
+// peer sees.
+//
+// What it CANNOT see is a code computed rather than written — `base - offset`. Resolving that
+// means evaluating arbitrary Go, and the alternative to under-reporting there is a guard nobody
+// can reason about. Every wire code in this module is a literal, which is the convention this
+// leans on.
+func TestWireCodes_NoModuleLiteralDriftsIntoReservedSpace(t *testing.T) {
 	t.Parallel()
-	found, sawPartitionFile := collectReservedRangeConstants(t)
+	found, sawPartitionFile := collectReservedRangeLiterals(t)
 	require.NotEmpty(t, found,
-		"no wire-code constant was found anywhere in the module; the guard passed by walking nothing")
+		"no wire-code literal was found anywhere in the module; the guard passed by walking nothing")
 	require.True(t, sawPartitionFile,
 		"the exempted partition file was not among the walked sources; a rename would otherwise disable the exemption AND leave the guard reporting green")
 
 	for _, c := range found {
 		ok, why := capability.MintableWireCode(c.value)
-		assert.Truef(t, ok, "%s: %s = %d is in the %s band and eunox may not mint it: %s",
-			c.where, c.name, c.value, capability.ClassifyWireCode(c.value), why)
+		assert.Truef(t, ok, "%s: %d is in the %s band and eunox may not mint it: %s",
+			c.where, c.value, capability.ClassifyWireCode(c.value), why)
 	}
 }
 
-// wireCodePartitionFile is the one file exempt from the constant pin: it DEFINES the partition,
-// so its band boundaries (-32768, -32099, -32020) are the rule rather than codes measured against
-// it. Holding the definition to itself is circular, and the circularity is not harmless — every
+// wireCodeLiteral is one reserved-range integer literal this module writes, with where it was
+// found — the position being the whole value of the failure message, since the point is to send a
+// contributor to the line they just wrote.
+type wireCodeLiteral struct {
+	value int
+	where string
+}
+
+// wireCodePartitionFile is the one file exempt from the pin: it DEFINES the partition, so its
+// band boundaries (-32768, -32099, -32020) are the rule rather than codes measured against it.
+// Holding the definition to itself is circular, and the circularity is not harmless — every
 // boundary constant reports as a violation, which is a permanently red guard nobody can read.
 //
-// A whole-file exemption rather than a per-name one because a boundary is the only kind of
-// constant that file holds, and its existence is ASSERTED (sawPartitionFile) so a rename cannot
-// quietly turn the exemption into a hole.
-const wireCodePartitionFile = "wirecode.go"
-
-// collectReservedRangeConstants finds every integer constant in the module whose value lands in
-// JSON-RPC's reserved -32768..-32000, and reports whether the exempted partition file was seen.
+// Matched on the PATH, not the basename. A basename match would silently exempt any future
+// `wirecode.go` in any package — and `sawPartitionFile` would still pass, because the real file
+// was also walked, so the hole would be invisible from here.
 //
-// Keyed on the VALUE rather than on the name, deliberately: a constant called `retryBudget` set
-// to -32021 is on the wire the moment something assigns it to an error code, and a name-shaped
-// filter (`*Code*`) would miss it while looking like it covered the question. The value is what
-// a peer sees.
-func collectReservedRangeConstants(t *testing.T) (found []wireCodeConstant, sawPartitionFile bool) {
+// A whole-file exemption rather than a per-name one because a boundary is the only kind of code
+// that file holds, and its existence is ASSERTED so a rename cannot quietly turn it into a hole.
+const wireCodePartitionFile = "pkg/capability/wirecode.go"
+
+// collectReservedRangeLiterals finds every integer literal in the module whose value lands in
+// JSON-RPC's reserved -32768..-32000, and reports whether the exempted partition file was seen.
+func collectReservedRangeLiterals(t *testing.T) (found []wireCodeLiteral, sawPartitionFile bool) {
 	t.Helper()
 	for _, dir := range moduleGoPackageDirs(t) {
 		for _, src := range packageSourcesIn(t, dir) {
-			if src.name == wireCodePartitionFile {
+			if isWireCodePartitionFile(src.path) {
 				sawPartitionFile = true
 				continue
 			}
-			for _, decl := range src.file.Decls {
-				gen, ok := decl.(*ast.GenDecl)
-				if !ok || gen.Tok != token.CONST {
-					continue
+			ast.Inspect(src.file, func(n ast.Node) bool {
+				value, ok := reservedRangeIntLiteral(n)
+				if !ok {
+					return true
 				}
-				for _, spec := range gen.Specs {
-					value, ok := spec.(*ast.ValueSpec)
-					if !ok {
-						continue
-					}
-					for i, name := range value.Names {
-						if i >= len(value.Values) {
-							// An iota run or a repeated-expression const: no literal of its own to
-							// read, and no way for one to carry a wire code.
-							continue
-						}
-						n, ok := reservedRangeIntLiteral(value.Values[i])
-						if !ok {
-							continue
-						}
-						found = append(found, wireCodeConstant{
-							name:  name.Name,
-							value: n,
-							where: src.fset.Position(name.Pos()).String(),
-						})
-					}
-				}
-			}
+				found = append(found, wireCodeLiteral{
+					value: value,
+					where: src.fset.Position(n.Pos()).String(),
+				})
+				return true
+			})
 		}
 	}
 	return found, sawPartitionFile
 }
 
+// isWireCodePartitionFile matches the partition file by its path within the module, normalized so
+// the walk's leading "../.." and the platform separator do not decide the answer.
+func isWireCodePartitionFile(path string) bool {
+	return strings.HasSuffix(filepath.ToSlash(filepath.Clean(path)), wireCodePartitionFile)
+}
+
 // reservedRangeIntLiteral reads a negated integer literal (`-32002`, which parses as a unary
 // expression rather than a literal) and reports whether it falls in JSON-RPC's reserved range.
 //
-// Only the literal form is read. A constant computed from an expression is not resolved: doing
-// that means evaluating arbitrary Go, and the alternative to under-reporting there is a guard
-// nobody can reason about. Every wire code in this module is written as a literal, which is the
-// convention this leans on — and the sibling literal guard fails a computed one at the use site.
-func reservedRangeIntLiteral(expr ast.Expr) (int, bool) {
-	unary, ok := expr.(*ast.UnaryExpr)
+// Only the NEGATED form is read, which is every wire code: JSON-RPC's error space is entirely
+// negative, so a bare positive literal cannot be one.
+func reservedRangeIntLiteral(n ast.Node) (int, bool) {
+	unary, ok := n.(*ast.UnaryExpr)
 	if !ok || unary.Op != token.SUB {
 		return 0, false
 	}
@@ -191,51 +191,9 @@ func reservedRangeIntLiteral(expr ast.Expr) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	n := -magnitude
-	if n < -32768 || n > -32000 {
+	value := -magnitude
+	if value < -32768 || value > -32000 {
 		return 0, false
 	}
-	return n, true
-}
-
-// TestWireCodes_NoBareLiteralMintsAnUnmintableCode closes the gap the constant guard leaves: a
-// code written straight into an error rather than declared first.
-//
-// It is the shape that would defeat the other guard entirely — `&mcp.RPCError{Code: -32025}`
-// declares no constant to walk.
-//
-// It forbids an UNMINTABLE value, not every literal. Requiring a constant for its own sake would
-// be style enforcement, and it would fail the demo mocks for writing JSON-RPC's own -32600 inline
-// — which is a conforming server saying `invalid request` in the language JSON-RPC assigned it,
-// exactly what a mock upstream is for. What is not anyone's to write inline, or at all, is an
-// integer the specification has reserved.
-func TestWireCodes_NoBareLiteralMintsAnUnmintableCode(t *testing.T) {
-	t.Parallel()
-	walked := 0
-	for _, dir := range moduleGoPackageDirs(t) {
-		for _, src := range packageSourcesIn(t, dir) {
-			walked++
-			ast.Inspect(src.file, func(n ast.Node) bool {
-				kv, ok := n.(*ast.KeyValueExpr)
-				if !ok {
-					return true
-				}
-				key, ok := kv.Key.(*ast.Ident)
-				if !ok || key.Name != "Code" {
-					return true
-				}
-				value, ok := reservedRangeIntLiteral(kv.Value)
-				if !ok {
-					return true
-				}
-				if mintable, _ := capability.MintableWireCode(value); mintable {
-					return true
-				}
-				t.Errorf("%s: an error Code is the bare literal %d, which is in the %s band and may not go on the wire",
-					src.fset.Position(kv.Pos()), value, capability.ClassifyWireCode(value))
-				return true
-			})
-		}
-	}
-	require.NotZero(t, walked, "no sources were walked; the guard is asserting nothing")
+	return value, true
 }

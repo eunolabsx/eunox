@@ -330,7 +330,7 @@ func TestEnforcedForwardCore_AllowDetailsAreNotTheCallersMap(t *testing.T) {
 
 	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
 		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false,
-		func(mcp.RPCMsg) map[string]interface{} { return live })
+		func(context.Context, mcp.RPCMsg) map[string]interface{} { return live })
 
 	assert.Equal(t, map[string]interface{}{"path": "/tmp/x"}, live,
 		"the commit-failed annotation must not be written into the caller's argument map")

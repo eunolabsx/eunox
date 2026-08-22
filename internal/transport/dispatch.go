@@ -768,6 +768,10 @@ func dispatchRequest(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) (rep
 			reply = mcp.RPCMsg{}
 		}
 	}()
+	// The slot the translation boundary reports an error-code rewrite into. Installed HERE
+	// because this is the single entry both audit-writing paths are reached through (the enforced
+	// forward core, and the `*/list` dispatcher below), and the rewrite happens below both.
+	ctx = withUpstreamCodeRewrite(ctx)
 	handler, enforced := tablesFromContext(ctx).request(msg.Method)
 	if enforced {
 		return handler(ctx, d, msg)
@@ -900,12 +904,12 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 		toolDetails = quarantineReservedArgs(params.Arguments)
 	}
 	out := enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
-		func(upResp mcp.RPCMsg) map[string]interface{} {
+		func(ctx context.Context, upResp mcp.RPCMsg) map[string]interface{} {
 			// Record the upstream's forwarded error code so a rejected call isn't identical to
 			// a clean success on the tape. Merges into a COPY of toolDetails — never mutates
 			// the caller's live params.Arguments map. quarantineReservedArgs has already moved
 			// every reserved name out, so nothing here can shadow a real argument.
-			extra := upstreamErrorDetail(upResp)
+			extra := upstreamErrorDetail(ctx, upResp)
 			// The signed effect receipt, verified here so its verdict rides the SAME allow record
 			// rather than a second one — a separate record double-counted allows in `eunox stats`
 			// and let `eunox suggest` mine it as a fake argument map. nil costs nothing.
@@ -1153,7 +1157,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// upstream apart.
 	warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
 		if d.rec != nil {
-			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
+			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(ctx, upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
 		}
 	})
 
@@ -1165,7 +1169,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 // plus, when present, the forwarded upstream JSON-RPC error code. observeMode marks the
 // audit/observe posture so a reader can distinguish a policy-filtered 0 from an all-permitting
 // manifest.
-func listAllowDetails(upResp mcp.RPCMsg, upstreamCount, filteredCount int, observeMode bool) map[string]interface{} {
+func listAllowDetails(ctx context.Context, upResp mcp.RPCMsg, upstreamCount, filteredCount int, observeMode bool) map[string]interface{} {
 	details := map[string]interface{}{
 		"upstream_count":   upstreamCount,
 		"filtered_count":   filteredCount,
@@ -1177,9 +1181,9 @@ func listAllowDetails(upResp mcp.RPCMsg, upstreamCount, filteredCount int, obser
 		details["observe_mode"] = true
 	}
 	// A forwarded upstream error is noted by code (never message), mirroring
-	// upstreamErrorDetail.
+	// upstreamErrorDetail — including its rule that the code recorded is the UPSTREAM's own.
 	if upResp.Error != nil {
-		details[audit.UpstreamErrorCodeKey] = upResp.Error.Code
+		details[audit.UpstreamErrorCodeKey] = auditedUpstreamErrorCode(ctx, upResp)
 	}
 	return details
 }
