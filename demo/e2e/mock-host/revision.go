@@ -200,39 +200,110 @@ func runInteropDeclaringMethodSet(c *stdioConn, s *suite) {
 	}
 }
 
-// runInteropMismatch drives a mismatched pair and asserts the ADR-0006 refusal in both
-// directions. hostRev is what this host declares; legRev is what the proxy addresses its
-// upstream as.
+// runInteropMismatch drives a mismatched pair and asserts the ADR-0006 boundary as it now
+// stands: the stateless-safe subset CROSSES, and what depends on state one side cannot hold is
+// refused. hostRev is what this host declares; legRev is what the proxy addresses its upstream
+// as.
+//
+// These cells asserted a blanket -32022 until the translation boundary landed, which was the
+// whole boundary while nothing crossed. What they assert now is the diff that landing made —
+// which is exactly what they were stood up early to make visible.
 func runInteropMismatch(c *stdioConn, s *suite, hostRev, legRev string) {
 	desc := fmt.Sprintf("host %s x upstream %s", hostRev, legRev)
 
-	// A handshake-revision host opens with `initialize`, and against a declaring leg that is
-	// the most explicit statement of the boundary eunox puts on the wire: it names both
-	// revisions AND says translation is what it would take. Asserted separately from the
-	// enforced methods below because it is the only message that says so.
+	// A handshake-revision host opens with `initialize`. Against a declaring leg that is now
+	// ANSWERED from the leg's own discovery data rather than refused — with the capability
+	// object narrowed to what the pair can carry, which is what makes answering honest rather
+	// than advertising methods the proxy then denies.
 	if hostRev == revisionHandshake {
 		m, err := c.call("initialize", map[string]interface{}{
 			"protocolVersion": hostRev,
 			"capabilities":    map[string]interface{}{},
 			"clientInfo":      map[string]interface{}{"name": "e2e-mock-host", "version": "1.0"},
 		})
-		s.expectRevisionRefusal(desc+": initialize refused -32022", hostRev, legRev, m, err)
-		if m.Error != nil && !strings.Contains(m.Error.Message, "translating a mismatched pair") {
-			s.bad(desc+": the initialize refusal names translation as what it would take",
-				"message did not say so: "+m.Error.Message)
-		} else if m.Error != nil {
-			s.ok(desc + ": the initialize refusal names translation as what it would take")
+		s.expectAllow(desc+": initialize is answered from the declaring leg's discovery data", m, err)
+		if caps := subObject(resultObject(m), "capabilities"); has(caps, "tools") {
+			s.ok(desc + ": the answered handshake advertises what the pair can carry")
+		} else {
+			s.bad(desc+": the answered handshake advertises what the pair can carry",
+				fmt.Sprintf("capabilities = %v", caps))
+		}
+		// resources.subscribe names the one pair inside `resources` the boundary refuses, so a
+		// narrowed answer must not promise it.
+		if res := subObject(subObject(resultObject(m), "capabilities"), "resources"); has(res, "subscribe") {
+			s.bad(desc+": the answered handshake drops the capability naming a refused pair",
+				"resources.subscribe survived narrowing")
+		} else {
+			s.ok(desc + ": the answered handshake drops the capability naming a refused pair")
 		}
 	}
 
+	// The translated subset: request-response in one round trip, so bridging it holds no state.
 	m, err := c.call("tools/list", nil)
-	s.expectRevisionRefusal(desc+": tools/list refused -32022", hostRev, legRev, m, err)
+	s.expectAllow(desc+": tools/list crosses the boundary", m, err)
+	names := listNames(m, "tools", "name")
+	if contains(names, "read_file") && !contains(names, "write_file") {
+		s.ok(desc + ": a translated list is still policy-filtered")
+	} else {
+		s.bad(desc+": a translated list is still policy-filtered", fmt.Sprintf("got %v", names))
+	}
 
 	m, err = c.call(toolCall("read_file", map[string]interface{}{"path": "/reports/q3.pdf"}))
-	s.expectRevisionRefusal(desc+": an allowed tools/call is still refused", hostRev, legRev, m, err)
+	s.expectAllow(desc+": an allowed tools/call crosses the boundary", m, err)
 
-	// The refusal must precede enforcement, not follow it: a call the policy would DENY has to
-	// come back as the revision refusal too, or the proxy decided a request it cannot honor.
+	// Translation runs strictly BELOW the decision, so a call the policy refuses comes back as
+	// a policy denial rather than crossing. The pair being mismatched changes how a message
+	// travels, never what it is permitted to do.
 	m, err = c.call(toolCall("write_file", map[string]interface{}{"path": "/etc/x", "content": "y"}))
-	s.expectRevisionRefusal(desc+": a denied tools/call is refused on revision, not policy", hostRev, legRev, m, err)
+	s.expectDeny(desc+": a denied tools/call is still denied by policy", "AUTHORIZATION_FAILED", "", m, err)
+
+	runInteropRefusedAcrossBoundary(c, s, desc, hostRev, legRev)
+}
+
+// runInteropRefusedAcrossBoundary asserts what a mismatched pair will NOT carry.
+//
+// Only one direction can reach it. Every method the boundary refuses is one the newer revision
+// REMOVED, so a 2026-07-28 host never has it in its own table and the fail-closed routing
+// default answers first — routing is a fact about one peer, the boundary a question about the
+// pair. Asserting the refusal from the new-host side would be asserting routing while claiming
+// to assert the boundary.
+func runInteropRefusedAcrossBoundary(c *stdioConn, s *suite, desc, hostRev, legRev string) {
+	m, err := c.call("resources/subscribe", map[string]interface{}{"uri": "file:///data/reports/q3.pdf"})
+	if hostRev != revisionHandshake {
+		// The new host's own revision removed it, so this is the ordinary unmapped default.
+		s.expectErrorCode(desc+": a method this peer's own revision removed is unroutable",
+			codeUnroutableMethod, m, err)
+		return
+	}
+	s.expectRevisionRefusal(desc+": a method the pair cannot carry is refused -32022", hostRev, legRev, m, err)
+	if m.Error == nil {
+		return
+	}
+	// The code, not just the integer: -32022 is shared with the refusal that says a revision
+	// could not be ESTABLISHED, and what separates them on the wire is error.data.code. This
+	// one has to say the PAIR is the problem, or an operator cannot tell a mid-migration
+	// deployment from a misconfigured client.
+	if code := denialCodeOf(m); code != "UNTRANSLATABLE_ACROSS_REVISIONS" {
+		s.bad(desc+": the boundary refusal names the pair, not an unestablished revision",
+			fmt.Sprintf("error.data.code = %q", code))
+	} else {
+		s.ok(desc + ": the boundary refusal names the pair, not an unestablished revision")
+	}
+}
+
+// resultObject decodes a reply's result into a map, or an empty map when there is none.
+func resultObject(m rpcMsg) map[string]interface{} { //nolint:gocritic // hugeParam: rpcMsg by value mirrors the proxy convention.
+	out := map[string]interface{}{}
+	_ = json.Unmarshal(m.Result, &out)
+	return out
+}
+
+// denialCodeOf reads the symbolic code from a denial's structured error data.
+func denialCodeOf(m rpcMsg) string { //nolint:gocritic // hugeParam.
+	if m.Error == nil {
+		return ""
+	}
+	var d denialData
+	_ = json.Unmarshal(m.Error.Data, &d)
+	return d.Code
 }

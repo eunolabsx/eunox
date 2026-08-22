@@ -623,9 +623,13 @@ blocked on another workstream rather than unstarted, and none of them is an exit
 - The **two new-host cells over HTTP**. A 2026-07-28 host has no `initialize`, and HTTP
   session creation is still anchored on that handshake, so those cells would assert the
   absence of W2 rather than the revision boundary. They land with W2.
-- **Mismatch cells asserting a TRANSLATED subset.** Nothing is translated today, so the
-  refusal is the whole boundary and that is what the cells assert. The translated half is
-  D1's to decide and lands with W3/W4.
+- ~~**Mismatch cells asserting a TRANSLATED subset.**~~ Landed with the boundary itself. The
+  cells now assert that the stateless-safe subset crosses — filtered, enforced, and with a
+  policy-denied call still denied by POLICY, since translation runs strictly below the
+  decision — and that a method the pair cannot carry is refused under the code naming the
+  PAIR rather than an unestablished revision. Only the old-host direction reaches that
+  refusal: every method the boundary refuses is one the newer revision removed, so a
+  2026-07-28 peer meets the fail-closed routing default first.
 
 Scope:
 
