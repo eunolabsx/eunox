@@ -58,10 +58,13 @@ edited as the discussion moves it; once `Final`, it is not rewritten — a new A
 supersedes it instead. Amendments to a `Final` ADR are additive and dated, never
 silent edits.
 
-> **Process introduced 2026-06-28.** All ADRs below predate this lifecycle and
-> none have been ratified under it, so every one is reset to **Draft**. Treat them
-> as strong guidance until maintainer consensus graduates each to `Final`. Records
-> previously marked `Accepted` note that reset in their `Status` line.
+> **Process introduced 2026-06-28.** All ADRs below predate this lifecycle, so
+> every one was reset to **Draft** at that point. Treat a `Draft` record as strong
+> guidance until maintainer consensus graduates it to `Final`. Records previously
+> marked `Accepted` note that reset in their `Status` line.
+>
+> **ADR-0006 was ratified 2026-08-22** — the first `Final` under this lifecycle,
+> and therefore the first record that is binding and append-only.
 
 ## Index
 
@@ -72,7 +75,7 @@ silent edits.
 | [0003](./0003-redis-killswitch-fail-open.md) | Redis kill switch fails closed by default on a Redis outage (opt-in fail-open) | Draft |
 | [0004](./0004-bearer-identity-session-anchor.md) | Anchor client correlation and revocation on bearer identity, not the protocol session | Draft |
 | [0005](./0005-upstream-credential-delegation.md) | Resolve upstream credentials per request via a provider seam, prefer delegation over a shared static token | Draft |
-| [0006](./0006-dual-revision-translation-boundary.md) | Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest | In Review |
+| [0006](./0006-dual-revision-translation-boundary.md) | Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest | Final |
 | [0007](./0007-mrtr-signed-continuation.md) | Meter multi round-trip requests once per logical call, via a signed continuation | Draft |
 | [0008](./0008-stream-and-task-enforcement.md) | Enforce subscription streams and task methods at the opener's anchor | Draft |
 | [0009](./0009-crosswalk-label-ingestion.md) | Ingest an imported sensitivity label from a declared response field | Draft |

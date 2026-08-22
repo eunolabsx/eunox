@@ -27,7 +27,8 @@ Section conventions:
 
 ### Added
 
-- **The mismatched-revision translation boundary (ADR-0006).** A host and an upstream on
+- **The mismatched-revision translation boundary (ADR-0006, ratified 2026-08-22 — the first
+  `Final` ADR under the current lifecycle).** A host and an upstream on
   different MCP revisions were refused wholesale; the stateless-safe subset now crosses.
   `tools/call`, `resources/read`, `prompts/get`, the three `*/list` methods and the two
   progress/cancellation notifications are carried, with the per-request revision declaration

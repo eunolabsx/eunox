@@ -1,7 +1,8 @@
 # ADR-0006: Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest
 
-- **Status:** In Review
+- **Status:** Final
 - **Date:** 2026-08-07
+- **Ratified:** 2026-08-22
 - **Deciders:** eunox maintainers
 
 ## Context
@@ -101,9 +102,19 @@ and refuse the rest fail-closed.** Concretely:
   - *Translated:* `tools/call`, `resources/read`, `prompts/get`, the three
     `*/list` methods; discovery in both directions (`server/discover` answered
     from an old upstream's synthesized handshake data, `initialize` answered
-    from a new upstream's discover data); and required-field addition on
-    results crossing old→new (`resultType`, `cacheScope`/`ttlMs` — with the
-    filtered-response `private` clamp).
+    from a new upstream's discover data); and the required result members on
+    results crossing old→new.
+
+    *As landed, the member supply is not this boundary's.* Adding `resultType`
+    and `cacheScope` is a property of the HOST's revision — a matched
+    2026-07-28 pair needs exactly the same members — so it lives in the
+    result-shape pass every declaring host's results cross, and the boundary
+    keeps only the refusal below. What the boundary contributes is that an
+    older upstream never sends them, so on this direction the pass always has
+    work to do. `ttlMs` is **never** added: it is a freshness hint the older
+    upstream did not offer, and inventing a lifetime for someone else's data is
+    a fabrication this record's own rule forbids. Preserved verbatim where the
+    upstream sent one.
   - *Refused, fail closed, audited:* everything stateful-by-construction. An
     `input_required` result crossing to a 2025-11-25 host is converted to a
     structured denial (an old host would read it as complete — silent
@@ -117,7 +128,17 @@ and refuse the rest fail-closed.** Concretely:
     behalf.**
 - Refusals at this boundary carry one new structured audit code value
   (threat-model note required) and map to -32022 where the problem is the
-  version, -32601 where the method has no home for the pair.
+  version.
+
+  *As landed, a method with no home for the pair is not a boundary refusal at
+  all,* so the -32601 this record originally paired with it does not arise.
+  Every method the boundary would refuse on those grounds is one the newer
+  revision REMOVED, so a 2026-07-28 peer does not have it in its own table and
+  the ordinary fail-closed routing default answers first: `UNROUTABLE_METHOD`,
+  wire code -32001. Routing is a fact about one peer; the boundary is a
+  question about the pair, and letting the pair answer a question one peer had
+  already settled would report a mid-migration deployment where there was only
+  an unknown method.
 - **`server/discover` output flows through the same `ListFilterer` facets the
   `*/list` methods use** — discovery can never reveal an entry list filtering
   hides, held by a parity property test.
@@ -164,3 +185,11 @@ and refuse the rest fail-closed.** Concretely:
   required CI fixture.
 - Per-request `_meta` inspection joins the hot path for new-revision traffic;
   the parse must stay allocation-lean.
+- **Ratification is of the decision, not of a finished implementation.** The
+  negotiation spine, the revision-scoped routing tables, the translated and
+  refused sets, and the audit stamp have landed; the discovery-filter parity
+  property, the `x-mcp-header` allowlist and the `Mcp-Session-Id` retirement are
+  decided here and built elsewhere. Which is which is tracked in
+  [the execution plan](../mcp-2026-07-28-execution.md), not restated here — a
+  record that doubles as a status board is one that goes stale while reading as
+  binding.
