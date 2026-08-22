@@ -58,7 +58,7 @@ taint, never remove it:
   trusted upstream labels its own responses in a declared field.
 - **The attribution interface** — a cooperating client declares labels per call
   in `_meta` under `io.eunolabs.context-manifest`
-  (`pkg/capability/attribution.go:25`).
+  (`pkg/capability/attribution.go:24`).
 - **A delegation hop's forced labels** — the taint a delegator imposes on a
   delegate's calls, carried on a verified token the delegate cannot edit.
 

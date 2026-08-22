@@ -21,9 +21,9 @@ through, eunox can read a **declared field structurally** — the way
 taxonomy's own spelling onto the namespaced axis.
 
 This is not a new argument on an existing directive. `labelOutput`
-(`pkg/capability/flowlabel.go:142`) is a **decision-time state write on allow**:
+(`pkg/capability/flowlabel.go:367`) is a **decision-time state write on allow**:
 that is exactly why it carries no response obligation
-(`pkg/capability/flowlabel.go:152`) and is valid on any source target, `tool:`
+(`pkg/capability/flowlabel.go:377`) and is valid on any source target, `tool:`
 or `resource:`. Deriving a label from `$.metadata.msip_label` makes it
 **response-reading for the first time**, which changes when the taint is known,
 what happens when it cannot be committed, and what an audit record can say about
@@ -44,10 +44,12 @@ append-only** ([CONTRIBUTING.md](../../CONTRIBUTING.md)), conditions match a
 for question 2 — both label axes are **flat**, with no lattice and no partial
 order, including between two values of one taxonomy.
 
-This decision depends on the imported-sensitivity axis itself, which is authored
-but **not yet merged** at the time of writing: there is no `namespace:value`
-label in `main` for a crosswalk to map onto. Nothing here is buildable until
-that lands.
+The imported-sensitivity axis this builds on is in place: a label may name a
+class from an external taxonomy as `namespace:value`, and the top-level
+`flowLabelNamespaces` declares the taxonomies a policy speaks, merged as a union
+across files (`internal/config/manifest.go:1843`). The guide records the
+crosswalk itself as deliberately not wired, for the trust reason question 4
+states (`docs/capability-manifest-guide.md` §5b).
 
 ## Decision
 
@@ -105,9 +107,9 @@ second grammar for the same job is the drift this repo removes elsewhere.
 
 **The response-reading form is valid on `tool:` targets only.** It needs a
 response the proxy inspects, and that is `tools/call` today — the reasoning
-`requireResponseDirectiveTarget` (`internal/config/manifest.go:1729`) already
+`requireResponseDirectiveTarget` (`internal/config/manifest.go:1769`) already
 applies to `redactFields`. Native `labelOutput` keeps its any-source-target
-validity (`internal/config/manifest.go:1740`), because a decision-time assertion
+validity (`internal/config/manifest.go:1780`), because a decision-time assertion
 needs no response.
 
 **`labels` and `from`+`map` compose on one directive, and the ingested set is
@@ -206,4 +208,5 @@ the upstream-asserted-label trust boundary, and the spec repo
 (`eunolabs/agent-capability-manifest`), which `CONTRIBUTING.md` requires for any
 manifest grammar change.
 
-Nothing here is buildable until the imported-sensitivity axis merges.
+The axis this rests on has landed, so nothing external gates the build; what
+gates it is this decision, which is `Draft` until maintainer consensus moves it.
