@@ -58,6 +58,8 @@ response-reading form of `labelOutput` that can only ever ADD taint, gated on
 the operator declaring the upstream a trusted label source.**
 
 ```yaml
+flowLabelNamespaces: [msip, sensitivity]   # every label the table can mint
+
 - target: tool:fetch_document
   actions: [call]
   directives:
@@ -68,11 +70,25 @@ the operator declaring the upstream a trusted label source.**
 
 crosswalks:                             # their taxonomy -> our namespace
   purview-crosswalk:
-    "Confidential\\PII":   ["msip:confidential", "sensitivity:gdpr-pii"]
-    "Highly Confidential": ["msip:highly-confidential"]
-    "General":             []
-    unmapped:              ["msip:unclassified"]
+    map:
+      "Confidential\\PII":   ["msip:confidential", "sensitivity:gdpr-pii"]
+      "Highly Confidential": ["msip:highly-confidential"]
+      "General":             []
+    unmapped:                ["msip:unclassified"]
 ```
+
+The fallback sits **beside** the value table rather than inside it. The
+incumbent's value space is deliberately not enumerable, so a reserved key within
+it would be a key eunox claims and a taxonomy could legitimately use; `map` and
+`unmapped` as siblings leave the value key space wholly the incumbent's.
+
+**Every label the table can mint goes through the same namespace closure the
+authored ones do** — `validateFlowLabelSet` against the declared
+`flowLabelNamespaces` (`internal/config/manifest.go:1796`), which today covers
+`flowLabel`'s `allow`, `labelOutput`'s `labels`, and `declassify`'s `labels`. A
+crosswalk's right-hand sides are a fourth site producing labels, and they must
+take that check at load or the grammar loses its one real invariant: that a
+label legal in a `labelOutput` is legal in the `flowLabel` that reads it back.
 
 **The crosswalk lives in the manifest**, as a top-level `crosswalks` key
 published under `schemaVersion "0.2"` — the open pre-1.0 grammar head that also
@@ -116,40 +132,83 @@ needs no response.
 UNIONED into the authored one.** `from` and `map` must appear together, and a
 directive carrying neither shape is a load error, so "response-reading with
 nothing to read" is unrepresentable. Encoding the union structurally — rather
-than as a rule stated across two directives — is what makes "the crosswalk can
-only add" a property of the shape instead of a property someone has to remember:
-a downgrade attempt by the upstream can at worst fail to add.
+than as a rule stated across two directives — is what makes the authored
+`labels` an actual floor rather than a default someone has to remember.
+
+**The floor is the whole of what the trust gate does not have to carry, and the
+residual above it is stated rather than glossed.** A crosswalk cannot take the
+session below the authored `labels`, whatever the upstream returns. It can,
+however, land a *weaker set than a correct mapping would have* whenever the
+upstream drives the value to the `unmapped` arm — by omitting the field,
+returning `null`, returning a non-string, or spelling the value differently (a
+body the walker refuses denies outright, and so is not one of these) — and an
+authored `unmapped` is by construction a set the
+policy is willing to accept. So a table that declares `unmapped` hands the
+upstream a channel around its own mapping, bounded below by `labels` and by
+nothing else. Two things follow: the authored `labels` floor is the load-bearing
+control and an `unmapped` entry is the convenience, not the reverse; and the
+comparison is **exact bytes**, with no case folding, trimming, or Unicode
+normalization, so a spelling variant lands on `unmapped` (visible, and floored)
+rather than silently matching a neighbouring entry.
 
 **The mode is refused unless the operator declares the upstream a trusted label
-source**, per route in deployment config. The field is upstream-controlled, so
-an untrusted server asserting `"General"` would be asserting *less* sensitivity
-than the data carries. Trust in a particular deployment's upstream is deployment
-wiring; the crosswalk table is policy vocabulary — which is why they live in
-different files, and why a manifest carrying the response-reading form is
-refused at route build when its route makes no such declaration.
+source**, on the upstream in deployment config. The field is upstream-controlled,
+so an untrusted server asserting `"General"` would be asserting *less*
+sensitivity than the data carries. Trust in a particular deployment's upstream is
+deployment wiring; the crosswalk table is policy vocabulary — which is why they
+live in different files.
 
-**The taint commits before any response byte reaches the host, and the decision
-turn is not extended across the forward.** Data can only flow into a later call
-after the host has the response, so a sink issued *concurrently* with the source
-call was issued before the data existed and cannot carry it. The accepted cost is
-stated rather than hidden: for that concurrent window the crosswalk form is
-**less conservative** than the decision-time native form, which over-blocks it.
-That is a property of this form only and must not be generalized to the rest of
-the flow layer.
+The refusal belongs on `LoadUpstreamPDP` (`internal/transport/route.go`), **not**
+on `BuildRoutes`. `BuildRoutes` is the gateway's path only; the stdio transport
+reaches its policy through `LoadUpstreamPDP` directly (`cmd/eunox/main.go:1753`),
+so a gate placed at route build would ship the fail-open ungated on stdio — the
+exact hazard `LoadUpstreamPDP`'s own `requireUsable` calls already exist to close
+at that seam, and for the reason its comment gives.
+
+**The taint commits before any response byte reaches the host, and the call
+HOLDS the decision turn until it has.** A sink issued concurrently with the
+source call cannot carry the data — it was issued before the data existed — so
+ordering against *sinks* would not by itself require the turn. Ordering against a
+concurrent **declassify** does. `finishDecision` (`internal/transport/dispatch.go:104`)
+already keeps the turn past the forward for exactly one case, and gives the
+reason: a declassifying call splits its flow-state write across the decision
+(resolving what to clear) and the post-forward commit (removing it), so releasing
+early lets a concurrent source land between the two and have a fresh taint
+wrongly cleared. A crosswalk commit **is** such a source, and lands in precisely
+that window. Extending the same exception to a constraint carrying the
+response-reading form is therefore not new machinery, and not a conservatism
+preference — it is the existing exception applied to the second member of the
+class it was written for.
+
+The cost is the one `finishDecision` already documents: head-of-line blocking on
+the anchor for the duration of one ingesting call, bounded by
+`--upstream-timeout`, paid only by calls that actually ingest.
 
 **A commit that fails withholds the response.** A flow-store fault turns an
 allowed call into an `ENFORCEMENT_ERROR` and the result is not relayed. Handing
 the host tainted data with the taint unrecorded is the fail-open the whole layer
 exists to prevent.
 
-**The ingestion writes its own audit record.** The allow record was already
-written when the response arrived, and records are append-only, so the ingested
-labels cannot be folded into it. The new record reports the ingested set
-separately from policy-asserted `labels_out` — an auditor has to be able to tell
-what the policy said from what the upstream said, the same separation
-`declared_labels` and `delegated_labels` already carry — together with the
-source value, bounded and control-sanitized (`capability.BoundString` +
+**The ingested labels land on the call's own allow record, as a new top-level
+field beside `labels_out`.** The allow record is written *after* the forward, the
+redaction and the declassify commit (`internal/transport/forward.go`), so the
+response-derived set is in hand before there is a record to write — nothing has
+to be appended to a record already on the tape, and the append-only invariant is
+untouched. `labels_cleared` is the precedent and the proof: it is likewise
+derived post-forward and is carried as a signed top-level field on the same allow
+record, through `RecordDeclassifiedAllow`.
+
+It is a **separate field** rather than more entries in `labels_out`, because an
+auditor has to be able to tell what the policy asserted from what the upstream
+said — the separation `declared_labels` and `delegated_labels` draw, though those
+are keys in a denial's `Details` map rather than top-level fields, so they are
+the precedent for the *distinction*, not for the shape. The source value rides
+along, bounded and control-sanitized (`capability.BoundString` +
 `capability.SanitizeControlRunes`), since it is a string eunox did not author.
+
+A new top-level field means **the threat model must be updated in the same
+change** — `CONTRIBUTING.md` requires it, and the delegation work set the
+precedent of recording explicitly that it added none.
 
 ## Alternatives considered
 
@@ -165,9 +224,15 @@ source value, bounded and control-sanitized (`capability.BoundString` +
 - **A separate discriminator for the response-reading form** — rejected: it
   would split the union of authored and ingested labels across two directives
   and lose the structural guarantee that ingestion can only add.
-- **Extending the decision turn across the forward** — rejected: it serializes
-  an in-flight upstream call per anchor to close a window that provably cannot
-  carry the data.
+- **Releasing the decision turn at the decision, as a non-declassifying call
+  does** — rejected, and it was this record's own first answer. The argument for
+  it (a concurrent sink cannot carry data it was issued before) is sound but
+  answers only half the question: it says nothing about a concurrent
+  *declassify*, whose held window a post-forward taint commit lands inside.
+- **A second audit record for the ingestion** — rejected: also this record's own
+  first answer, on the mistaken premise that the allow record was already
+  written. It is not; it is written after the forward, which is why
+  `labels_cleared` can already carry post-forward state on it.
 - **Inferring sensitivity from response content** — rejected permanently, not
   for this iteration. eunox reads a declared field structurally and runs no
   classifier; see [ADR-0010](./0010-no-decision-path-classification.md).
@@ -187,24 +252,40 @@ The costs are real:
 - **A new denial shape reaches the host: a deny after an allow.** A call the
   policy permitted can still end in `ENFORCEMENT_ERROR` with the response
   withheld. Clients and the integration guide need to expect it.
-- **A second audit record per ingesting call**, which the record-rate
-  admission control has to budget for.
-- **The concurrent-sink window is weaker than the native form's**, and the
-  reason it is safe is an argument rather than a mechanism — it needs to be
-  restated wherever someone is tempted to reuse it.
+- **A wider allow record**, not a second one. The earlier draft of this decision
+  assumed the allow record was already written by then and budgeted a second
+  record against the record-rate limiter; both halves were wrong — that limiter
+  meters refusal categories, not allows, and the ordering makes the second record
+  unnecessary. What the extra field does cost is audit queue depth under
+  `--require-audit=strict`, which is where a real bound would have to be argued.
+- **Head-of-line blocking on the anchor for the length of an ingesting call**,
+  since it holds the decision turn past the forward. This is the second member
+  of the class `finishDecision` already pays that cost for, so the cost is
+  precedented — but it now applies to a directive an author may reach for far
+  more often than `declassify`.
+- **An upstream can route around its own mapping** wherever the table declares
+  `unmapped`, bounded below by the authored `labels` floor and by nothing else.
+  The floor is the control; `unmapped` is a convenience that widens what the
+  upstream can choose.
 - **A wrong trust declaration is a fail-open**, which is why it is a hard
-  route-build refusal and not a `validate` warning.
+  refusal at `LoadUpstreamPDP` — the seam BOTH transports reach — and not a
+  `validate` warning.
 
 Tests this commits us to: table-driven crosswalk resolution (mapped, unmapped,
-absent, `null`, non-string, malformed envelope); the load-time collision rule and
-the multi-file union; the `0.1` refusal for the new token; the trust-gate
-refusal at route build; the commit-failure-withholds-response path; and a
-sign-and-verify round trip for the new record's fields.
+absent, `null`, non-string, malformed envelope, and a spelling variant landing on
+`unmapped` rather than a neighbour); the load-time collision rule and the
+multi-file union; every right-hand label taking the `flowLabelNamespaces`
+closure, so an undeclared namespace in a crosswalk is refused exactly as one in a
+`labelOutput` is; the `0.1` refusal for the new token; the trust-gate refusal
+reached on BOTH transports, not only the gateway; the turn being held past the
+forward for an ingesting constraint; the commit-failure-withholds-response path;
+and a sign-and-verify round trip for the new field.
 
 Docs this commits us to keeping in sync: `docs/capability-manifest-guide.md`
 §5b, the `$defs` branch plus the top-level `crosswalks` key in
 `schemas/eunox-capability-manifest.schema.json`, `docs/threat-model-mcp.md` for
-the upstream-asserted-label trust boundary, and the spec repo
+both the upstream-asserted-label trust boundary and the new top-level audit
+field, and the spec repo
 (`eunolabs/agent-capability-manifest`), which `CONTRIBUTING.md` requires for any
 manifest grammar change.
 

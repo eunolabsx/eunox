@@ -90,11 +90,20 @@ compromise between them:
   surface.
 
 An **embedder** who accepts these trade-offs for their own deployment can
-already do this today without eunox shipping it: `enforcement.WithPolicyEvaluator`
-(`pkg/enforcement/engine.go:381`) is the sanctioned external-PDP seam, and a
-resolver written behind it puts the network dependency in the consumer's code,
-where its availability is their own operational concern rather than a property
-of the proxy.
+already do this today without eunox shipping it, and the seam depends on what
+they want the resolver to produce. To make a resolver's answer *decide* a call,
+`enforcement.WithPolicyEvaluator` (`pkg/enforcement/engine.go:381`) is the
+sanctioned external-PDP seam. To make it produce *taint* — the thing this axis is
+about — that seam is the wrong one: `PolicyEvaluator.Evaluate` returns a
+`*ConditionError` and writes no state, so it can deny a call but cannot label
+one. Labelling means `WithCommittingConditionHandler`
+(`pkg/enforcement/engine.go:805`), or supplying the `FlowLabelStore` itself
+(`pkg/enforcement/engine.go:309`) and populating it out of band — which is the
+push shape again, arrived at from the embedder's side.
+
+Either way the network dependency sits in the consumer's code, where its
+availability is their own operational concern rather than a property of the
+proxy.
 
 **What this costs, stated plainly:** an upstream that does not label its own
 data, reached by a client that does not attribute, cannot get per-resource
