@@ -1715,7 +1715,9 @@ func mergeFlowLabelNamespaces(merged, next []string) []string {
 	if len(next) == 0 {
 		return merged
 	}
-	seen := make(map[string]bool, len(merged)+len(next))
+	// Capacity from the pre-populated side alone, not the two summed (CodeQL flags a
+	// summed length as a potential allocation overflow); the map grows for the rest.
+	seen := make(map[string]bool, len(merged))
 	for _, ns := range merged {
 		seen[ns] = true
 	}
