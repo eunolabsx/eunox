@@ -632,6 +632,14 @@ type reserveSlot struct {
 // exactly one write: the loser reloads the instant the winner just stored and finds it unelapsed.
 // The stamp is allocated only past the early return, so a spent slot — the flood path's answer —
 // costs one atomic load and a comparison.
+//
+// The CLAIMANTS are a closed set, enforced by a source guard rather than by this comment
+// (reserveClaimants, in notice_bounding_test.go). Three functions ask three different questions of
+// one slot — a latch that never re-arms, a source-side collapse window, and this budget's floor —
+// and a fourth hand-rolled claim beside a diagnostic is how the three-implementations-of-one-idea
+// state that noticeLatch removed comes back one axis over. That closure is also what lets the
+// unmetered half's collapse field stay unwritten honestly: a site wanting a window fails the guard
+// and is routed to the declaration (see noticeDeclaration) instead of to a slot of its own.
 func (s *reserveSlot) claim(at time.Time, every time.Duration) bool {
 	if s == nil {
 		return false

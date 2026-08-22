@@ -443,14 +443,24 @@ const (
 // exemption and must be empty otherwise, mirroring refusalDeclaration: the reason IS the exemption.
 // It carries no class, since a line that charges no bucket names none.
 //
-// It carries no COLLAPSE either, and that is a decision rather than an omission. A collapse
-// disposition is applied by admitNotice, which an unmetered site never reaches — so a field here
-// would be a declaration with no reader, which is precisely what noticeOnce was before noticeLatch.
-// What an unmetered site that wants a window does instead is hold a reserveSlot of its own and
-// claim it with the interval it wants: that is the same primitive under both the collapse window
-// and the diagnostic floor, and noticeLatch is its degenerate case. Metering is NOT the answer for
-// such a site — a class bucket is a peer-driven budget, and charging one for a line no peer drives
-// takes tokens from the lines the class split exists to keep legible.
+// It carries no COLLAPSE either, and that is a decision rather than an omission — but a ROUTED one
+// now, which is the part that changed. A collapse disposition is applied by admitNotice, which an
+// unmetered site never reaches, so a field here with no entry using it would be a declaration whose
+// only reader is a test: precisely what noticeOnce was before noticeLatch, and what it would
+// compile to is the reserveSlot field it was meant to replace.
+//
+// So the answer for a site that wants "one line per interval, and no class bucket" is to come HERE
+// and give this declaration a collapse disposition with its interval, lifting the window above
+// admitNotice's metering branch so one vocabulary serves both halves — NOT to hold a reserveSlot of
+// its own beside its Fprintf. That shape is unavailable rather than merely discouraged: the
+// primitive's claimants are a closed set (see reserveSlot.claim), so a hand-rolled window fails the
+// source guard, and the failure names this field. Which is the whole reason the field can be
+// deferred honestly — the first site that wants it arrives here rather than becoming a fourth
+// implementation of one idea, which is the state noticeLatch removed one axis over.
+//
+// Metering is NOT the answer for such a site either — a class bucket is a peer-driven budget, and
+// charging one for a line no peer drives takes tokens from the lines the class split exists to keep
+// legible.
 type noticeDeclaration struct {
 	bound noticeBound
 	why   string
