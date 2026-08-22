@@ -330,7 +330,7 @@ func TestNoticeBounding_EveryReserveClaimIsDeclared(t *testing.T) {
 				claims++
 				claiming[qualified] = true
 				if _, isDeclared := reserveClaimants[qualified]; !isDeclared {
-					t.Errorf("%s:%d: %s claims a reserve slot but is not one of its declared claimants; a diagnostic that wants a window takes it through its declaration in meteredNotices — extend noticeDeclaration with a collapse disposition and its interval, and lift the window above admitNotice's metering branch, rather than holding a slot of its own where nothing records that the line is windowed, nothing states the reason, and nothing fails when the next site forgets",
+					t.Errorf("%s:%d: %s claims a reserve slot but is not one of its declared claimants; a diagnostic that wants a window takes it through its own declaration — extend noticeDeclaration (the unmeteredNotices value) with a collapse disposition and its interval, and lift the window above admitNotice's metering branch — rather than holding a slot of its own where nothing records that the line is windowed, nothing states the reason, and nothing fails when the next site forgets. Metering it instead is NOT the remedy: a class bucket is a peer-driven budget, and charging one for a line no peer drives takes tokens from the lines the class split exists to keep legible",
 						src.name, src.fset.Position(call.Pos()).Line, qualified)
 				}
 				return true
