@@ -155,6 +155,23 @@ func upstreamErrInfo(notices noticeWriter, err error, upstreamTimeMs int) (code,
 		// part of it comes from a closed set (two published revisions, a routed method, and a
 		// reason declared in this build), so none of it is peer-supplied.
 		return capability.ErrCodeUntranslatableAcrossRevisions, err.Error(), capability.JSONRPCCodeUnsupportedProtocolVersion
+	case errors.Is(err, errUnenforceableResultShape):
+		// Produced AT the upstream call but not BY a failing upstream: the server is reachable
+		// and answered, and what eunox cannot do is enforce what it answered. Recording it as an
+		// outage would report a healthy upstream as down, which is why errDuplicateID above is
+		// likewise classified as something other than one.
+		//
+		// ENFORCEMENT_ERROR is the class the malformed-`*/list`-response refusal already uses,
+		// and this is the same shape: a reply eunox will not forward because it cannot reach a
+		// verdict about it.
+		//
+		// The error's own text is safe to reflect, and that is a property of how it is BUILT
+		// rather than an assumption about it: every message errUnenforceableResultShape wraps is
+		// composed from this build's own vocabulary plus, at most, a `resultType` bounded and
+		// control-stripped by capability.BoundResultType. Nothing quotes an upstream's member
+		// NAME — an earlier version reached the strict decoder, whose error quotes the offending
+		// key verbatim, and a 4 KiB key produced a 4 KiB host-facing reason.
+		return capability.ErrCodeEnforcementError, err.Error(), capability.JSONRPCCodeEnforcementError
 	case errors.Is(err, mcp.ErrFrameDesync):
 		// A partial frame from a NON-deadline cause (EPIPE, ENOSPC, an interrupted write). Not a
 		// timeout: reporting it as one would fabricate a "did not respond within N ms" for an
@@ -215,7 +232,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			audit:            rt.audit,
 			sessionID:        sess.id,
 			upstreamTimeMs:   p.upstreamTimeMs,
-			callUpstream:     withCrossRevisionTranslation(sess.upstreamRev, sess.callUpstream),
+			callUpstream:     withResultShape(rt.audit, withCrossRevisionTranslation(sess.upstreamRev, sess.callUpstream)),
 			strictAuditState: p.strictAudit(),
 			limits:           p.routeRefusalLimits(sess, rt),
 		},

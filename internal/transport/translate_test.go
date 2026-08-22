@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/ast"
 	"strings"
 	"testing"
 
@@ -185,12 +184,20 @@ func TestTranslateRequest_FailsClosedOnMalformedParams(t *testing.T) {
 	}
 }
 
-func TestTranslateResult_AddsTheShapeADeclaringHostRequires(t *testing.T) {
+// What a declaring host actually RECEIVES from an older upstream, asserted through the composed
+// seam rather than through translateResult alone.
+//
+// Supplying the members that revision requires is not the boundary's job — a matched 2026-07-28
+// pair needs exactly the same thing — so it lives in the shape pass wrapped around this one, and
+// asserting it against translateResult would be asserting the wrong half. Driving the pair of
+// wrappers is also the only way this test can catch the two being composed in the wrong order.
+func TestCrossRevisionForward_DeclaringHostGetsTheShapeItsRevisionRequires(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name       string
 		method     string
 		result     string
+		wantErr    bool
 		wantSubstr []string
 		wantAbsent []string
 	}{
@@ -212,19 +219,41 @@ func TestTranslateResult_AddsTheShapeADeclaringHostRequires(t *testing.T) {
 			wantAbsent: []string{"ttlMs"},
 		},
 		{
-			name:       "an upstream's own members are never overwritten",
-			method:     capability.MethodToolsList,
-			result:     `{"tools":[],"resultType":"something-else","cacheScope":"public"}`,
-			wantSubstr: []string{`"something-else"`, `"public"`},
+			name:   "an upstream's own members are never overwritten",
+			method: capability.MethodToolsList,
+			result: `{"tools":[],"resultType":"complete","cacheScope":"public"}`,
+			// `public` stands HERE: narrowing a scope the upstream stated is the filter path's
+			// clamp, and this pass only supplies what was absent. The two halves together are
+			// what covers every list — see supplyCacheScope.
+			wantSubstr: []string{`"complete"`, `"public"`},
+		},
+		{
+			name:   "a variant this build cannot model is refused rather than carried",
+			method: capability.MethodToolsCall,
+			result: `{"content":[],"resultType":"something-else"}`,
+			// Refused toward a DECLARING host too, and for its own reason: eunox has no
+			// response-path enforcement for a variant it does not model, so forwarding it
+			// carries a result past enforcement. The boundary's refusal is the other direction
+			// (see resultCrossesToHost), where the host cannot READ the member at all.
+			wantErr: true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Result: json.RawMessage(tc.result)}
-			got, err := translateResult(tc.method, resp, capability.Revision20260728, capability.Revision20251125)
+			call := withResultShape(false, withCrossRevisionTranslation(capability.Revision20251125,
+				func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) { return resp, nil }))
+			ctx := capability.WithProtocolRevision(context.Background(), capability.Revision20260728)
+			got, err := call(ctx, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: tc.method})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("result = %s, want a refusal", got.Result)
+				}
+				return
+			}
 			if err != nil {
-				t.Fatalf("translateResult: %v", err)
+				t.Fatalf("forward: %v", err)
 			}
 			for _, want := range tc.wantSubstr {
 				if !strings.Contains(string(got.Result), want) {
@@ -495,48 +524,6 @@ func TestNarrowCapabilitiesToTranslatable(t *testing.T) {
 	}
 	if _, ok := resources["listChanged"]; !ok {
 		t.Error("resources.listChanged was dropped; narrowing must remove only what the boundary refuses")
-	}
-}
-
-// TestCallUpstream_AlwaysWrappedAtItsSeam is the source guard for the wrapper's whole argument.
-//
-// Translation is applied at CONSTRUCTION so no forward path has to remember it. That only holds
-// while every construction site actually wraps: a third one assigning a bare upstream call is a
-// message crossing a mismatched pair untranslated, failing at the far peer with an error that
-// names eunox's own bug as the upstream's.
-//
-// Walks the same parsed sources every other guard here does, so a file behind a build tag
-// cannot drop out of the enumeration silently.
-func TestCallUpstream_AlwaysWrappedAtItsSeam(t *testing.T) {
-	t.Parallel()
-	const field = "callUpstream"
-	found := 0
-	for _, src := range packageSources(t) {
-		ast.Inspect(src.file, func(n ast.Node) bool {
-			kv, ok := n.(*ast.KeyValueExpr)
-			if !ok {
-				return true
-			}
-			key, ok := kv.Key.(*ast.Ident)
-			if !ok || key.Name != field {
-				return true
-			}
-			found++
-			call, ok := kv.Value.(*ast.CallExpr)
-			if !ok {
-				t.Errorf("%s: %s is assigned something other than a call to withCrossRevisionTranslation; a bare upstream call forwards untranslated across a mismatched pair",
-					src.name, field)
-				return true
-			}
-			fn, ok := call.Fun.(*ast.Ident)
-			if !ok || fn.Name != "withCrossRevisionTranslation" {
-				t.Errorf("%s: %s is wrapped by something other than withCrossRevisionTranslation", src.name, field)
-			}
-			return true
-		})
-	}
-	if found == 0 {
-		t.Fatal("no callUpstream assignment was found; the guard passed by walking nothing")
 	}
 }
 

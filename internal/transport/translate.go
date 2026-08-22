@@ -238,21 +238,24 @@ func stripRevisionDeclaration(msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 // translateResult adapts an upstream reply for a host on a different revision, or returns it
 // unchanged when the pair is matched or the reply carries no result to adapt.
 //
-// Only ONE direction rewrites bytes. Toward a declaring host, the result-shape members that
-// revision requires are added, because an old upstream cannot know to send them. Toward a
-// non-declaring host nothing is stripped: the extra members a newer upstream sends are inert
-// for a host that does not read them, and rewriting a result to remove members nobody looks at
-// would put eunox's hands on payload bytes for no gain. The one thing that direction DOES is
-// refuse (see resultCrossesToHost).
+// This step never rewrites bytes, in EITHER direction. Toward a declaring host the members that
+// revision requires do have to be added — but a matched 2026-07-28 pair needs exactly the same
+// thing, so supplying them is not a property of the boundary and does not belong here: it is
+// applied once for every declaring host by the shape pass this wrapper sits inside
+// (result_shape.go), which is also the pass that refuses a variant eunox cannot enforce. Toward
+// a non-declaring host nothing is stripped either: the extra members a newer upstream sends are
+// inert for a host that does not read them, and rewriting a result to remove members nobody
+// looks at would put eunox's hands on payload bytes for no gain.
+//
+// What is left is the one thing only the boundary can say: a variant an old host would MISREAD
+// (see resultCrossesToHost). The shape pass cannot make that call, because it is a fact about
+// the peer's revision rather than about the result.
 func translateResult(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
 	addressed := upstreamAddressedRevision(legRev)
-	if hostRev == addressed || len(resp.Result) == 0 {
+	if hostRev == addressed || len(resp.Result) == 0 || declaresPerRequestRevision(hostRev) {
 		return resp, nil
 	}
-	if !declaresPerRequestRevision(hostRev) {
-		return resp, resultCrossesToHost(method, resp, hostRev, legRev)
-	}
-	return addResultShape(method, resp)
+	return resp, resultCrossesToHost(method, resp, hostRev, legRev)
 }
 
 // resultCrossesToHost refuses an upstream result whose variant a non-declaring host cannot
@@ -269,97 +272,31 @@ func translateResult(method string, resp mcp.RPCMsg, hostRev, legRev capability.
 // exactly the case where eunox cannot know what a host would lose by reading it as complete.
 // An ABSENT resultType is complete by the spec's rule for earlier-revision servers, and is the
 // shape every 2025-11-25 upstream produces, so it crosses.
+//
+// The member is read through the shape pass's SHALLOW top-level scan rather than a strict
+// decode of the whole body. A deep decode refuses fold-equal duplicate keys at every nesting
+// depth, which is right for host params bound into an upstream's struct and wrong for a result:
+// an upstream answering `{"structuredContent":{"id":1,"ID":2}}` is carrying two legal sibling
+// fields of its OWN payload, and hard-refusing that after the tool has already run makes a
+// mismatched pair a compatibility hazard rather than a translation. The differential that
+// matters is at the top level, in the member both sides read, and that is where the scan checks.
 func resultCrossesToHost(method string, resp mcp.RPCMsg, hostRev, legRev capability.Revision) error {
-	variant, present, err := resultTypeOf(resp.Result)
+	members, err := scanResultMembers(resp.Result)
 	if err != nil {
 		return refuseAcrossRevisions(method, hostRev, legRev,
 			"the upstream result could not be read well enough to establish whether its variant is one this host's revision understands")
 	}
-	if !present || variant == capability.ResultTypeComplete {
+	variant, present, err := members.resultType()
+	if err != nil {
+		return refuseAcrossRevisions(method, hostRev, legRev,
+			"the upstream result states a variant that is not a JSON string, so whether this host's revision understands it cannot be established")
+	}
+	if capability.ResultTypeForwardable(variant, present) {
 		return nil
 	}
 	return refuseAcrossRevisions(method, hostRev, legRev, fmt.Sprintf(
 		"the upstream answered resultType %q, which a host on %s has no way to read; forwarding it would be read as a completed call and the exchange would desynchronize silently",
 		capability.BoundResultType(variant), hostRev))
-}
-
-// addResultShape adds the result members 2026-07-28 requires to a result an older upstream
-// produced.
-//
-// `resultType: "complete"` is the honest value and the only one available: an upstream that
-// does not have the member cannot be mid-exchange, because the variant that means "mid
-// exchange" is one its revision has no way to express.
-//
-// `cacheScope: "private"` on the list-shaped results, never `public`. eunox filters every list
-// it emits per caller identity, so a list crossing this boundary is authorization-specific by
-// construction — the same reason the filter path clamps an upstream's own `public`. It is SET
-// here rather than left to that clamp because an old upstream sends no `cacheScope` at all, and
-// a member that is absent is not one the clamp can narrow.
-//
-// `ttlMs` is deliberately NOT added. It is a freshness hint, the old upstream offered none, and
-// inventing a lifetime for someone else's data is the kind of fabrication this boundary exists
-// to avoid.
-func addResultShape(method string, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
-	fields := map[string]json.RawMessage{}
-	if err := mcp.DecodeParams(resp.Result, &fields); err != nil {
-		// Not every result is a JSON object the spec models — but every result eunox is asked to
-		// add members to must be, so a result that is not one cannot be translated.
-		return mcp.RPCMsg{}, fmt.Errorf("%w: the upstream result for %s is not a JSON object, so the members %s requires cannot be added: %w",
-			errUntranslatableAcrossRevisions, method, capability.Revision20260728, err)
-	}
-	// A JSON `null` result decodes into a NIL map with no error, so it reaches here looking
-	// like an empty object. Refused rather than replaced with one: the host requires the
-	// member, but manufacturing an object around a value the upstream sent as null invents a
-	// result shape nobody produced, and this boundary's whole rule is that it adds what a
-	// revision requires and never fabricates content.
-	if fields == nil {
-		return mcp.RPCMsg{}, fmt.Errorf("%w: the upstream result for %s is JSON null, which has no place to carry the members %s requires",
-			errUntranslatableAcrossRevisions, method, capability.Revision20260728)
-	}
-	if _, ok := fields[capability.ResultKeyResultType]; !ok {
-		fields[capability.ResultKeyResultType] = json.RawMessage(`"` + capability.ResultTypeComplete + `"`)
-	}
-	if listShapedResult(method) {
-		if _, ok := fields[capability.ResultKeyCacheScope]; !ok {
-			fields[capability.ResultKeyCacheScope] = json.RawMessage(`"` + capability.CacheScopePrivate + `"`)
-		}
-	}
-	encoded, err := json.Marshal(fields)
-	if err != nil {
-		return mcp.RPCMsg{}, fmt.Errorf("%w: re-encoding the translated result for %s: %w", errUntranslatableAcrossRevisions, method, err)
-	}
-	resp.Result = encoded
-	return resp, nil
-}
-
-// listShapedResult reports whether method's result carries the cache members 2026-07-28 defines
-// for list-shaped results. Derived from the registry's own LocalForwards flag rather than a
-// second list of the three `*/list` methods, so a fourth enumerating method cannot be added
-// with this half forgotten.
-func listShapedResult(method string) bool {
-	return methodRegistry[method].LocalForwards
-}
-
-// resultTypeOf reads a result's `resultType` member. present is false for a result that omits
-// it — the shape every 2025-11-25 upstream produces — which the spec reads as complete.
-//
-// The DUPLICATE-KEY refusal mcp.DecodeParams applies matters here for the reason it matters on
-// the request side: a result carrying two spellings of the member would be read one way by this
-// check and the other way by the host's own parser, which is the enforcement-versus-peer
-// differential the decoder exists to close.
-func resultTypeOf(result json.RawMessage) (variant string, present bool, err error) {
-	fields := map[string]json.RawMessage{}
-	if err := mcp.DecodeParams(result, &fields); err != nil {
-		return "", false, err
-	}
-	raw, ok := fields[capability.ResultKeyResultType]
-	if !ok || len(raw) == 0 {
-		return "", false, nil
-	}
-	if err := json.Unmarshal(raw, &variant); err != nil {
-		return "", false, err
-	}
-	return variant, true, nil
 }
 
 // withCrossRevisionTranslation wraps a leg's upstream call so every enforced forward crosses

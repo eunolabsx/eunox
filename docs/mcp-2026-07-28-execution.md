@@ -57,7 +57,7 @@ criterion is the ADR reaching **Final** under the ADR lifecycle
 
 | Gate | Decision | Recorded in | Blocks |
 |---|---|---|---|
-| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (In Review) | W3, W4, W13's mismatch cells. **No longer blocks W1**, which landed its negotiation spine without activating any translation — see the note below the table. The boundary itself is now IMPLEMENTED and awaiting ratification rather than awaiting design — see the note after W1's. |
+| D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (**Final**, ratified 2026-08-22) | W3, W4, W13's mismatch cells — **unblocked**. The boundary is implemented and ratified; what remains under D1 is the discovery-filter parity property, the `x-mcp-header` allowlist and the `Mcp-Session-Id` retirement, each decided in the ADR and built in its own workstream. |
 | D2 | MRTR metering: the signed continuation — key sourcing, anchor binding, lifetime, replay bound, what re-evaluates per retry, and the commit-once quota rule. | [ADR-0007](adr/0007-mrtr-signed-continuation.md) (Draft) | W6 |
 | D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (updated: session-creation addendum) | W2, and through it W6/W7 |
 | D4 | Stream and deferred-effect enforcement: `subscriptions/listen` open/deny semantics, notification filtering, cancel rehoming; tasks anchor binding and the kill×tasks interaction. | [ADR-0008](adr/0008-stream-and-task-enforcement.md) (Draft) | W7, W8 |
@@ -72,18 +72,21 @@ manifest, so selecting one can only REMOVE methods, never grant one policy did n
 permit — no translation is activated, and the mismatched-pair behavior D1 governs
 is untouched. D1 still gates W3, W4, and W13's mismatch cells.
 
-The **translation boundary itself** has since been implemented, and unlike the two
-cases below it does NOT claim to be admissible under a Draft/In Review D1: it is the
-behavior the plan says waits for `Final`, so it is offered for review and held there.
-The implementation follows ADR-0006's decision as written — the stateless-safe subset
-crosses, everything stateful-by-construction is refused under a code of its own, and a
-host `initialize` is answered from a declaring leg's discovery data with the capability
-object narrowed to what the pair can carry. What ratification decides is not whether the
-code is correct but whether the boundary is drawn in the right place; the code is what
-makes that reviewable against something other than prose.
+The **translation boundary itself** has since been implemented, and — unlike the two
+cases below — it never claimed to be admissible under an unratified D1: it is the
+behavior the plan says waits for `Final`. It merged ahead of that and **ADR-0006 was
+ratified 2026-08-22**, which closes the gap rather than excusing it; the order was
+wrong even though the outcome is the one the plan asks for. The implementation follows
+ADR-0006's decision as written — the stateless-safe subset crosses, everything
+stateful-by-construction is refused under a code of its own, and a host `initialize`
+is answered from a declaring leg's discovery data with the capability object narrowed
+to what the pair can carry — with two places the ADR's text was corrected to match at
+ratification: `ttlMs` is never fabricated and the member supply is the host revision's
+rather than the boundary's, and a method with no home for the pair is answered by
+routing (`UNROUTABLE_METHOD`, -32001) rather than the -32601 the record first named.
 
-W11's **revision-selected upstream opener** landed under D1 In Review on the same
-kind of argument, and it is worth stating precisely because this one DOES change
+W11's **revision-selected upstream opener** landed while D1 was still In Review, on the
+same kind of argument (recorded as history — D1 is Final as of 2026-08-22), and it is worth stating precisely because this one DOES change
 wire behavior. The change is reachable only through a configuration that did not
 previously exist as a control: with no `protocolVersion` pin the leg is opened,
 headed and completed byte for byte as before, so no existing deployment's upstream
@@ -186,10 +189,11 @@ Exit criteria:
 - [x] Revision field on audit records with threat-model update and sign/verify roundtrip.
       (`protocol_revision`; threat model §3.16 + §6.1;
       `TestRecord_ProtocolRevisionSignAndVerify`, including the tamper leg.)
-- [ ] ADR-0006 Final before any translation behavior activates. **Now In Review, so still
-      unticked** — `Final` is ratification by maintainer consensus, never a lone merge (see
-      [adr/README.md](adr/README.md)), so it is not a criterion an implementing PR can close.
-      What blocked readiness is closed: the one place the ADR's text and the shipped code
+- [x] ADR-0006 Final before any translation behavior activates. **Ratified 2026-08-22** by
+      maintainer decision (`Final` is never a lone merge — see [adr/README.md](adr/README.md)),
+      which is why this was not a criterion the implementing PR could close for itself. Ordering
+      note: the boundary merged before the ratification rather than after it.
+      What blocked readiness was closed first: the one place the ADR's text and the shipped code
       disagreed — a request "carrying neither" a context nor a declaration — now reads as the
       code behaves, with the reason it belongs to ADR-0004's session-creation half rather than
       to this boundary. Nothing landed here activates translation either: each revision's table
@@ -212,7 +216,7 @@ As landed, differing from the scope above in three places:
   land on the surface eunox already shipped: omission can never reach a newer method set,
   and the newer table is only ever reached by an explicit declaration. **No longer a
   divergence:** ADR-0006 now states this resolution and why it belongs to ADR-0004's half,
-  so the ADR and the code agree ahead of ratification.
+  so the ADR and the code agree, and that agreement is what was ratified.
 - The **2026-07-28 methods this revision ADDS** (`server/discover`,
   `subscriptions/listen`, `tasks/*`) are deliberately absent from the registry, so they
   deny fail-closed rather than routing to a handler that does not exist. W4/W7/W8 add
@@ -325,7 +329,7 @@ Exit criteria:
 - [ ] Kill-gate test green.
 - [ ] Old-upstream synthesis cell green in the e2e matrix (new host × old upstream).
 
-### W5 — Result shape and caching invariants (plan §5) — M
+### W5 — Result shape and caching invariants (plan §5) — M — **LANDED**
 
 **Depends on:** W1.
 
@@ -347,17 +351,34 @@ Scope:
   `filterListResult` path. Closes threat-model finding L-6. *The clamp half has
   landed, at `encodeOrderedObjectWithList` — the one encoder all three filter paths
   reach, so the property is structural rather than per call site. The SET half has
-  not: the filter layer holds no revision, so supplying the member where a declaring
-  upstream omitted it belongs with the `resultType` synthesis above, which does.*
+  landed too, at `applyResultShape`: the filter layer holds no revision, so supplying the member
+  where a declaring upstream omitted it went with the `resultType` synthesis above, which does.*
 - Assertion test that filtering preserves upstream list ordering (deterministic
   ordering is a spec SHOULD that eunox must not break).
 
+*Reconciled with D1 on landing.* The boundary shipped a copy of the supply half while this was
+in review, and the two were collapsed onto one implementation: supplying the members is a
+property of the **host's** revision (a matched 2026-07-28 pair needs them too), so it lives here
+and the boundary keeps only the refusal it alone can make — a variant a `2025-11-25` host would
+misread. The two wrappers on `callUpstream` compose, translation innermost, held to that order
+by one source guard declaring the chain.
+
 Exit criteria:
 
-- [ ] Sweep test: no builder emits a 2026-07-28 result without `resultType`; old-revision output byte-stable.
-- [ ] Unknown-`resultType` result refused fail-closed and recorded; absent-means-complete asserted as a separate case.
+- [x] Sweep test: no builder emits a 2026-07-28 result without `resultType`; old-revision output byte-stable.
+      (`internal/transport/result_shape_test.go` `TestResultShape_SweepEveryResultBearingMethod`, whose
+      method set is DERIVED from `methodRegistry` so a method added for a revision is covered the day it
+      is added; both directions asserted, including that a conforming result is not re-encoded at all.)
+- [x] Unknown-`resultType` result refused fail-closed and recorded; absent-means-complete asserted as a separate case.
+      (`applyResultShape`; recorded `ENFORCEMENT_ERROR` via `upstreamErrInfo`, answered `-32603`.
+      `TestResultShape_ResultTypeOpenUnion` covers absent, `complete`, `input_required`, a
+      post-dating variant, a non-string, an explicit null, a duplicate member and a null result.
+      Threat model L-9.)
 - [x] Property test across all filter paths: a filtered response never carries `cacheScope: public`. *(`internal/pdp/cache_scope_test.go`, over the manifest, JWT-claim, JWT-intersection and deny-all filters x three list flavors x every upstream spelling of the member.)*
-- [ ] Ordering-preservation test green.
+- [x] Ordering-preservation test green. (`internal/pdp/list_ordering_test.go`, over the same
+      manifest/JWT/deny-all x three-list-flavor table the cache-scope property uses, plus the JWT
+      intersection splice — whose catalog is deliberately not in claim order, so a filter emitting
+      in claim order fails it. Mutation-checked by reversing the kept entries.)
 - [x] L-6 marked mitigated in `docs/threat-model-mcp.md` (for `*/list`; the residual and the passthrough exemption are stated there).
 
 ### W6 — Multi round-trip requests (plan §6) — XL
@@ -586,7 +607,7 @@ workstreams land; `CHANGELOG.md` entries accrue per workstream.
 Exit criteria:
 
 - [ ] conformance.md states both targeted revisions with a complete per-method, per-revision matrix.
-- [ ] No ADR this plan touches remains Draft — each is Final, or In Review awaiting consensus.
+- [ ] No ADR this plan touches remains Draft — each is Final, or In Review awaiting consensus. *(ADR-0006 Final 2026-08-22; the rest still Draft.)*
 - [ ] Threat model current; CHANGELOG complete for the release.
 
 ### W13 — Test and demo infrastructure — L — **LANDED** (scope deferred, criteria met)

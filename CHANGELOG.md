@@ -27,25 +27,57 @@ Section conventions:
 
 ### Added
 
-- **The mismatched-revision translation boundary (ADR-0006).** A host and an upstream on
+- **The mismatched-revision translation boundary (ADR-0006, ratified 2026-08-22 — the first
+  `Final` ADR under the current lifecycle).** A host and an upstream on
   different MCP revisions were refused wholesale; the stateless-safe subset now crosses.
   `tools/call`, `resources/read`, `prompts/get`, the three `*/list` methods and the two
   progress/cancellation notifications are carried, with the per-request revision declaration
   added toward a declaring upstream and removed toward one that negotiates once, so a forwarded
-  body and the `MCP-Protocol-Version` header eunox stamps always name a single revision. Results
-  crossing to a declaring host gain the members that revision requires — `resultType: "complete"`,
-  and `cacheScope: "private"` on the list-shaped results. `ttlMs` is deliberately never
-  fabricated. A host `initialize` reaching a leg opened with `server/discover` is now answered
+  body and the `MCP-Protocol-Version` header eunox stamps always name a single revision. A result
+  crossing to a declaring host gains the members that revision requires from the shape pass
+  below, which is the same pass a matched pair on that revision goes through — supplying them is
+  a property of the host's revision, not of the boundary. A host `initialize` reaching a leg
+  opened with `server/discover` is now answered
   from that leg's discovery data rather than refused, with the capability object narrowed to what
   the pair can actually carry (`resources.subscribe` dropped, unrecognized capabilities dropped).
 
   Everything stateful-by-construction is refused, recorded, and never forwarded: the
   `resources/subscribe` pair, `notifications/roots/list_changed`, a server-initiated request
   toward a host whose revision removed the mechanism (the upstream is answered rather than left
-  blocked), a host response on such a pair, and any result whose `resultType` is not `complete` —
-  which is the refusal that matters most, because passing an `input_required` result to a host
-  with no `resultType` in its vocabulary is silent: it reads the call as finished, drops the
-  `inputRequests` the upstream is waiting on, and both sides believe they are done.
+  blocked), a host response on such a pair, and any result whose `resultType` is not `complete`
+  heading to a host on the revision that has no such member — the refusal that matters most,
+  because passing an `input_required` result to a host with no `resultType` in its vocabulary is
+  silent: it reads the call as finished, drops the `inputRequests` the upstream is waiting on,
+  and both sides believe they are done.
+
+- **The 2026-07-28 result shape: supplied where eunox can, refused where it cannot.** A result
+  eunox hands a peer on that revision now carries `resultType` — the upstream's own value where
+  it sent one, `"complete"` where it did not — and a list result carries `cacheScope: "private"`
+  where the upstream omitted it. That last is the SET half of the clamp that shipped earlier;
+  the two are split because they need different things (the clamp needs the one encoder every
+  filter path reaches, the supply needs the revision the filter layer does not hold), and
+  together they cover every list eunox emits to such a peer, whether the upstream over-shared,
+  under-shared, or said nothing. The `--audit` wiretap is exempt from the cache member, matching
+  the clamp: that posture forwards the upstream's whole catalog, identical for every caller, so
+  there is no narrowed view for a shared cache to leak and `private` would be a claim about the
+  response that is not true. `ttlMs` is never invented — a freshness hint the upstream did not
+  offer is not one eunox can supply.
+
+  The other half is a refusal. `resultType` is an OPEN union, so a value that is present and is
+  neither `complete` nor a variant this build models is refused before it reaches the host,
+  recorded `ENFORCEMENT_ERROR` and answered `-32603`. `input_required` is the variant that shows
+  why: it means the upstream is still WAITING, with `inputRequests` the caller must answer, so
+  forwarding it as though the call had finished desynchronizes the exchange with no error at
+  either end — and eunox cannot enforce a result shape it does not model. Absence reads as
+  complete (the spec's rule for servers predating the member, and the shape every 2025-11-25
+  upstream produces), and an explicit JSON null reads as absent, matching every other decoder in
+  this build. Threat model L-9.
+
+  Applied at the upstream call — the one seam both the enforced forward core and the `*/list`
+  dispatcher cross — so no forward path has to remember it, and so a refusal is recorded as a
+  refusal rather than as an allow followed by a contradiction. A 2025-11-25 peer's results are
+  untouched, structurally: the first branch returns before reading anything, because these are
+  members its revision does not define.
 
 ### Changed
 

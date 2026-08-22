@@ -139,6 +139,20 @@ const (
 	ResultTypeComplete  = "complete"
 )
 
+// ResultTypeForwardable reports whether a result carrying this `resultType` is one eunox can
+// hand to a peer without modelling what it means.
+//
+// present is a SEPARATE parameter rather than being inferred from an empty variant, because the
+// two are different facts and conflating them is a fail-open: an upstream sending
+// `"resultType": ""` states a variant that names nothing, and reading that as absence would
+// forward it under the permissive rule meant for servers that predate the member entirely.
+//
+// A predicate rather than a set membership test, so the "absent means complete" rule has one
+// home instead of being restated by each caller that has to distinguish absent from present.
+func ResultTypeForwardable(variant string, present bool) bool {
+	return !present || variant == ResultTypeComplete
+}
+
 // BoundResultType renders a peer-supplied `resultType` for an operator-facing message.
 //
 // The value reaches eunox from an upstream and can be any string the JSON permits, so it takes
