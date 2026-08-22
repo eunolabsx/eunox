@@ -27,6 +27,38 @@ Section conventions:
 
 ### Added
 
+- **Per-token revocation: `eunox kill --jti <token-id>`.** The kill switch gains its finest
+  dimension — one issued bearer token, rather than an identity or a connection. It is the one to
+  reach for when a credential LEAKS: killing the agent stops everything that identity holds and
+  killing a session stops one connection, but neither is the token that got out, and both cost
+  availability the incident does not require. Available on `eunox kill` (Redis transport, with
+  `--revive --jti` to lift it) and as a `jti` field on `POST /control/kill`.
+
+  Token revocations do **not** expire, unlike session tombstones: a credential revoked for cause
+  must not be re-admitted by a clock. They stop being consulted when the token's own `exp`
+  passes, which is the holder's clock, not the operator's.
+
+  The id comes from the `jti` of the token whose signature the request was already admitted on —
+  never a header or a caller-supplied field — so a presenter cannot choose which credential the
+  revocation set is consulted about. Reading it is also what moved `jti` onto the watched-claims
+  list: while nothing decoded it, two spellings were none of eunox's business, but
+  `{"jti":"revoked","JTI":"clean"}` would now bind last-wins to a value the holder controls and a
+  revoked credential would keep serving. An ambiguous `jti` is a rejected token.
+
+  Revoking a token **reclaims** the sessions holding it, not just their next request: the
+  on-delivery reclaim re-asks the kill switch about each held session, which matters most under
+  `sessionIdleTimeoutMs: 0` where no reaper would find them later. It follows a client that
+  **rotated** its bearer mid-session too — a session's claims are captured once at `initialize`
+  and the owner binding compares `sub`, so matching on those alone would deny the rotated
+  credential's traffic while reclaiming nothing.
+
+- **New signed audit field `token_id`.** The JWT `jti`, stamped from a validated token. It
+  answers a different question from `agent_id`/`user_id` beside it: which CREDENTIAL authorized
+  the call, not which identity it speaks for. After a revocation it is the only field separating
+  the leaked token's calls from the same agent's calls on a token that was never compromised.
+  Omitted when the token carries no `jti` and for every request with no token, so an existing
+  deployment's records are byte-identical until its IdP issues one.
+
 - **The 2026-07-28 JSON-RPC error-code partition, held structurally.** That revision splits what
   was one free range: -32000..-32019 stays implementation-defined, and -32020..-32099 becomes the
   specification's to assign as the protocol grows. Every code eunox mints now sits in the
@@ -117,6 +149,20 @@ Section conventions:
   members its revision does not define.
 
 ### Changed
+
+- **`killswitch.Checker.ShouldBlock` takes a `killswitch.Subject`** — `{AgentID, SessionID,
+  JTI}` — instead of positional identity strings. Passed by value and allocation-free
+  (benchmarked), since the kill check runs ahead of every policy evaluation. Adding the token
+  dimension required no signature change anywhere, which was the point: each dimension used to
+  be a positional string, so a new one meant editing every implementation, caller and test in
+  lockstep, and a transposition of two same-typed arguments still compiled.
+
+  The Redis backend's dimensions are likewise **declared once** (`pkg/killswitch/dimension.go`)
+  and its writer, pub/sub handler, reconcile scan, `Reset` and `Status` all iterate that
+  declaration. They previously hand-mirrored the (agent, session) pair across six sites; a
+  seventh dimension added by that method is six edits that must agree, and the one somebody
+  forgets does not fail — a `jti:kill:` event the handler does not know falls back to a full
+  SCAN, and a prefix `Reset` does not sweep is re-loaded by the next reconcile.
 
 - **New denial code `UNTRANSLATABLE_ACROSS_REVISIONS`** for boundary refusals. It shares the
   spec-assigned `-32022` integer with `UNSUPPORTED_PROTOCOL_VERSION` but is distinguished in

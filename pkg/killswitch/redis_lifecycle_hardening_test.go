@@ -102,7 +102,7 @@ func TestRedis_ShouldBlock_StoppedReportsErrStopped_NotUnreachable(t *testing.T)
 
 	r.Stop() // cancels runCtx → the switch is now frozen, not merely partitioned
 
-	_, err := r.ShouldBlock(context.Background(), "some-agent", "some-session")
+	_, err := r.ShouldBlock(context.Background(), Subject{AgentID: "some-agent", SessionID: "some-session"})
 	require.ErrorIs(t, err, ErrStopped,
 		"a stopped+degraded switch must report ErrStopped (frozen), not ErrBackendUnreachable (transient)")
 	require.NotErrorIs(t, err, ErrBackendUnreachable)
@@ -121,7 +121,7 @@ func TestRedis_HealthStatus_UnstartedAgreesWithShouldBlock(t *testing.T) {
 	t.Parallel()
 	r, _ := newTestRedis(t) // reachable backend: only the missing Start is at fault
 
-	_, blockErr := r.ShouldBlock(context.Background(), "some-agent", "some-session")
+	_, blockErr := r.ShouldBlock(context.Background(), Subject{AgentID: "some-agent", SessionID: "some-session"})
 	require.ErrorIs(t, blockErr, ErrNotStarted,
 		"precondition: an unstarted switch denies with ErrNotStarted")
 	require.ErrorIs(t, r.HealthStatus(), ErrNotStarted,

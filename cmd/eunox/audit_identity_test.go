@@ -46,6 +46,28 @@ func TestAuditIdentity_FromClaims(t *testing.T) {
 	assert.Equal(t, 2, id.DelegationDepth)
 }
 
+// The token id answers a DIFFERENT question from the identity fields beside it: which
+// credential authorized the call, not which identity it speaks for. An incident needs both —
+// after a token is revoked, this is the only field that separates the calls it made from the
+// same agent's calls on a token that was never compromised.
+func TestAuditIdentity_CarriesTheTokenID(t *testing.T) {
+	t.Parallel()
+	ctx := pdp.WithJWTClaims(context.Background(), &pdp.JWTClaims{
+		AgentID: "agent-1",
+		Subject: "user@example.com",
+		TokenID: "jti-abc",
+	})
+	id := auditIdentity(ctx)
+	assert.Equal(t, "jti-abc", id.TokenID)
+	assert.Equal(t, "agent-1", id.AgentID, "the credential id must not displace the identity fields")
+	assert.Equal(t, "user@example.com", id.UserID)
+
+	// A token that carries no jti leaves the field empty rather than borrowing another
+	// axis: an existing deployment's records stay byte-identical until its IdP issues one.
+	none := auditIdentity(pdp.WithJWTClaims(context.Background(), &pdp.JWTClaims{AgentID: "agent-1"}))
+	assert.Empty(t, none.TokenID)
+}
+
 // TestAuditIdentity_PopulatesEveryField is the guard that pays for keeping this adapter in the
 // binary rather than in the package that owns the claims (see audit_identity.go).
 //
@@ -65,6 +87,7 @@ func TestAuditIdentity_PopulatesEveryField(t *testing.T) {
 		AgentID: "agent-1",
 		TaskID:  "task-9",
 		Subject: "user-7",
+		TokenID: "jti-3",
 		Delegation: &capability.DelegationChain{
 			Actors: []string{"agent-a", "agent-b"},
 		},

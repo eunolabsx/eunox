@@ -258,7 +258,7 @@ func TestRedis_DeactivateGlobal(t *testing.T) {
 	assert.False(t, r.globalActive)
 	r.mu.RUnlock()
 
-	blocked, err := r.ShouldBlock(ctx, "", "")
+	blocked, err := r.ShouldBlock(ctx, Subject{})
 	require.NoError(t, err)
 	assert.False(t, blocked)
 }
@@ -279,7 +279,7 @@ func TestRedis_ReviveSession(t *testing.T) {
 	assert.False(t, r.killedSessions["sess-abc"])
 	r.mu.RUnlock()
 
-	blocked, err := r.ShouldBlock(ctx, "", "sess-abc")
+	blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess-abc"})
 	require.NoError(t, err)
 	assert.False(t, blocked)
 }
@@ -298,19 +298,19 @@ func TestRedis_KillUpdatesLocalCacheBeforePublish(t *testing.T) {
 
 	// KillAgent: cache must reflect the kill the moment the call returns.
 	require.NoError(t, r.KillAgent(ctx, "agent-x"))
-	blocked, err := r.ShouldBlock(ctx, "agent-x", "")
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent-x"})
 	require.NoError(t, err)
 	assert.True(t, blocked, "KillAgent must update the local cache before returning")
 
 	// KillSession.
 	require.NoError(t, r.KillSession(ctx, "sess-x"))
-	blocked, err = r.ShouldBlock(ctx, "", "sess-x")
+	blocked, err = r.ShouldBlock(ctx, Subject{SessionID: "sess-x"})
 	require.NoError(t, err)
 	assert.True(t, blocked, "KillSession must update the local cache before returning")
 
 	// ActivateGlobal.
 	require.NoError(t, r.ActivateGlobal(ctx))
-	blocked, err = r.ShouldBlock(ctx, "other", "")
+	blocked, err = r.ShouldBlock(ctx, Subject{AgentID: "other"})
 	require.NoError(t, err)
 	assert.True(t, blocked, "ActivateGlobal must update the local cache before returning")
 
@@ -323,13 +323,13 @@ func TestRedis_KillUpdatesLocalCacheBeforePublish(t *testing.T) {
 
 	// ReviveAgent.
 	require.NoError(t, r.ReviveAgent(ctx, "agent-x"))
-	blocked, err = r.ShouldBlock(ctx, "agent-x", "")
+	blocked, err = r.ShouldBlock(ctx, Subject{AgentID: "agent-x"})
 	require.NoError(t, err)
 	assert.False(t, blocked, "ReviveAgent must update the local cache before returning")
 
 	// ReviveSession.
 	require.NoError(t, r.ReviveSession(ctx, "sess-x"))
-	blocked, err = r.ShouldBlock(ctx, "", "sess-x")
+	blocked, err = r.ShouldBlock(ctx, Subject{SessionID: "sess-x"})
 	require.NoError(t, err)
 	assert.False(t, blocked, "ReviveSession must update the local cache before returning")
 }
@@ -380,7 +380,7 @@ func TestRedis_Status_MirrorsShouldBlocksGateChain(t *testing.T) {
 		status, err := r.Status(ctx)
 		require.ErrorIs(t, err, ErrBackendUnreachable)
 		require.Nil(t, status)
-		_, blockErr := r.ShouldBlock(ctx, "agent-x", "sess-x")
+		_, blockErr := r.ShouldBlock(ctx, Subject{AgentID: "agent-x", SessionID: "sess-x"})
 		require.ErrorIs(t, blockErr, ErrBackendUnreachable, "report and data plane must agree")
 	})
 
@@ -625,7 +625,7 @@ func TestIncompleteEnumeration_IsReportedRatherThanCommittedAsTheWholeKillSet(t 
 
 	require.ErrorIs(t, r.HealthStatus(), ErrIncompleteEnumeration,
 		"a scan that reached one shard of two must report the cause; reporting ready is the fail-open a partial kill set is served through")
-	blocked, err := r.ShouldBlock(ctx, "", "sess-b")
+	blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess-b"})
 	assert.False(t, blocked)
 	assert.ErrorIs(t, err, ErrBackendUnreachable,
 		"fail-closed must deny on an unconfirmable kill set rather than answer not-killed for a session whose kill lived on the shard the scan skipped")
@@ -688,7 +688,7 @@ func TestIncompleteEnumeration_HonoursFailOpen(t *testing.T) {
 	r.Start(ctx)
 	defer r.Stop()
 
-	blocked, err := r.ShouldBlock(ctx, "", "sess-b")
+	blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess-b"})
 	assert.False(t, blocked)
 	assert.NoError(t, err, "fail-open trades revocation for availability during a transient outage, and a shard that is down is one")
 	assert.ErrorIs(t, r.HealthStatus(), ErrIncompleteEnumeration,
@@ -721,7 +721,7 @@ func TestNilClient_EveryEntryPointFailsClosedRatherThanPanicking(t *testing.T) {
 			r.Start(ctx)
 			defer r.Stop()
 
-			blocked, err := r.ShouldBlock(ctx, "agent", "sess")
+			blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent", SessionID: "sess"})
 			assert.False(t, blocked)
 			assert.ErrorIs(t, err, ErrNilClient,
 				"fail-OPEN must not turn a permanent wiring fault into a silent all-clear; it trades revocation for availability during a TRANSIENT outage, and this one never heals")
@@ -763,7 +763,7 @@ func TestUnknownTopology_FailsClosedRatherThanServingAPartialKillSet(t *testing.
 	r.Start(ctx)
 	defer r.Stop()
 
-	blocked, err := r.ShouldBlock(ctx, "agent", "sess-1")
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent", SessionID: "sess-1"})
 	assert.False(t, blocked)
 	assert.ErrorIs(t, err, ErrUnknownTopology,
 		"a backend that cannot establish which servers hold its keyspace must report that from every reader rather than answering not-killed")
@@ -792,7 +792,7 @@ func TestDeclaredTopology_IsTheEscapeHatchTheRefusalNeeds(t *testing.T) {
 		defer r.Stop()
 		require.NoError(t, r.HealthStatus(), "a declared topology must leave the backend usable")
 
-		blocked, err := r.ShouldBlock(ctx, "", "sess-1")
+		blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess-1"})
 		require.NoError(t, err)
 		assert.True(t, blocked, "the declared single-node SCAN must load the kill set")
 	})
@@ -815,7 +815,7 @@ func TestDeclaredTopology_IsTheEscapeHatchTheRefusalNeeds(t *testing.T) {
 		r.Start(ctx)
 		defer r.Stop()
 
-		blocked, err := r.ShouldBlock(ctx, "", "sess-b")
+		blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess-b"})
 		require.NoError(t, err)
 		assert.True(t, blocked, "the declared fan-out must visit every shard, not whichever one a keyless SCAN reached")
 	})
@@ -940,7 +940,7 @@ func TestRedis_KillAndReviveAgent(t *testing.T) {
 	assert.True(t, r.killedAgents["agent-xyz"])
 	r.mu.RUnlock()
 
-	blocked, err := r.ShouldBlock(ctx, "agent-xyz", "")
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent-xyz"})
 	require.NoError(t, err)
 	assert.True(t, blocked)
 
@@ -949,7 +949,7 @@ func TestRedis_KillAndReviveAgent(t *testing.T) {
 	// membership test degraded to "is anything killed?" blocks the whole fleet on one
 	// `eunox kill --agent`, and every other Redis case still passes (each either starts from an
 	// empty kill set or queries the agent it just killed).
-	blocked, err = r.ShouldBlock(ctx, "agent-other", "")
+	blocked, err = r.ShouldBlock(ctx, Subject{AgentID: "agent-other"})
 	require.NoError(t, err)
 	assert.False(t, blocked, "killing one agent must not block an unrelated one")
 
@@ -964,7 +964,7 @@ func TestRedis_KillAndReviveAgent(t *testing.T) {
 	assert.False(t, r.killedAgents["agent-xyz"])
 	r.mu.RUnlock()
 
-	blocked, err = r.ShouldBlock(ctx, "agent-xyz", "")
+	blocked, err = r.ShouldBlock(ctx, Subject{AgentID: "agent-xyz"})
 	require.NoError(t, err)
 	assert.False(t, blocked)
 }
@@ -1092,7 +1092,7 @@ func TestRedis_KillSession_ShouldBlock(t *testing.T) {
 	defer r.Stop()
 
 	require.NoError(t, r.KillSession(ctx, "sess-block"))
-	blocked, err := r.ShouldBlock(ctx, "", "sess-block")
+	blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess-block"})
 	require.NoError(t, err)
 	assert.True(t, blocked)
 }
@@ -1105,7 +1105,7 @@ func TestRedis_ActivateGlobal_ShouldBlock(t *testing.T) {
 	defer r.Stop()
 
 	require.NoError(t, r.ActivateGlobal(ctx))
-	blocked, err := r.ShouldBlock(ctx, "any-agent", "any-sess")
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "any-agent", SessionID: "any-sess"})
 	require.NoError(t, err)
 	assert.True(t, blocked)
 }
@@ -1124,14 +1124,14 @@ func TestRedis_ShouldBlock_BeforeStartFailsClosed(t *testing.T) {
 	// the durable key exists but the cache was never seeded, so fail closed.
 	require.NoError(t, r.ActivateGlobal(ctx))
 
-	blocked, err := r.ShouldBlock(ctx, "agent-x", "sess-x")
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent-x", SessionID: "sess-x"})
 	require.ErrorIs(t, err, ErrNotStarted, "an unstarted switch must fail closed, not report an all-clear")
 	assert.False(t, blocked, "ShouldBlock returns (false, err); the caller denies on the error, not the bool")
 
 	// After Start the switch seeds its cache and behaves normally again.
 	r.Start(ctx)
 	defer r.Stop()
-	blocked, err = r.ShouldBlock(ctx, "agent-x", "sess-x")
+	blocked, err = r.ShouldBlock(ctx, Subject{AgentID: "agent-x", SessionID: "sess-x"})
 	require.NoError(t, err)
 	assert.True(t, blocked, "after Start the previously-set global kill is enforced")
 }
@@ -1145,7 +1145,7 @@ func TestRedis_HealthStatus(t *testing.T) {
 	// ErrNotStarted, so reporting nil here would publish "ok" through a total
 	// data-plane outage. HealthStatus must mirror ShouldBlock's gate order.
 	assert.ErrorIs(t, r.HealthStatus(), ErrNotStarted)
-	blocked, err := r.ShouldBlock(ctx, "agent-x", "sess-x")
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent-x", SessionID: "sess-x"})
 	assert.False(t, blocked)
 	assert.ErrorIs(t, err, ErrNotStarted, "health probe and data plane must agree")
 
@@ -1271,7 +1271,7 @@ func TestRedis_PubSubPropagation(t *testing.T) {
 	// observed by listenPubSub -> handlePubSubMessage. Poll briefly since the
 	// delivery is asynchronous.
 	require.Eventually(t, func() bool {
-		blocked, _ := r.ShouldBlock(ctx, "propagated-agent", "")
+		blocked, _ := r.ShouldBlock(ctx, Subject{AgentID: "propagated-agent"})
 		return blocked
 	}, 2*time.Second, 10*time.Millisecond)
 }
@@ -1385,7 +1385,7 @@ func TestRedis_RefreshState_DoesNotBlockShouldBlock(t *testing.T) {
 	results := make(chan bool, workers)
 	for i := 0; i < workers; i++ {
 		go func() {
-			blocked, err := r.ShouldBlock(ctx, "", "")
+			blocked, err := r.ShouldBlock(ctx, Subject{})
 			if err == nil {
 				results <- blocked
 			} else {
@@ -1819,7 +1819,7 @@ func TestRedis_MultiInstance_KillPropagatesAcrossInstances(t *testing.T) {
 
 	// Instance B must observe the kill issued by A, propagated over Redis pub/sub.
 	require.Eventually(t, func() bool {
-		blocked, _ := instanceB.ShouldBlock(ctx, "agent-x", "")
+		blocked, _ := instanceB.ShouldBlock(ctx, Subject{AgentID: "agent-x"})
 		return blocked
 	}, 2*time.Second, 10*time.Millisecond,
 		"a kill on instance A must propagate to instance B via pub/sub")
@@ -1827,7 +1827,7 @@ func TestRedis_MultiInstance_KillPropagatesAcrossInstances(t *testing.T) {
 	// A revive on A must likewise clear the block on B.
 	require.NoError(t, instanceA.ReviveAgent(ctx, "agent-x"))
 	require.Eventually(t, func() bool {
-		blocked, _ := instanceB.ShouldBlock(ctx, "agent-x", "")
+		blocked, _ := instanceB.ShouldBlock(ctx, Subject{AgentID: "agent-x"})
 		return !blocked
 	}, 2*time.Second, 10*time.Millisecond,
 		"a revive on instance A must propagate to instance B via pub/sub")
@@ -1857,7 +1857,7 @@ func TestRedis_ShouldBlock_ServesCachedStateWhenRedisDown(t *testing.T) {
 
 	// Kill an agent while Redis is healthy: populates both Redis and local cache.
 	require.NoError(t, r.KillAgent(ctx, "agent-cached"))
-	blocked, err := r.ShouldBlock(ctx, "agent-cached", "")
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent-cached"})
 	require.NoError(t, err)
 	require.True(t, blocked)
 
@@ -1866,7 +1866,7 @@ func TestRedis_ShouldBlock_ServesCachedStateWhenRedisDown(t *testing.T) {
 
 	// ShouldBlock serves the local cache: the cached kill is still enforced and
 	// no error is returned despite Redis being down.
-	blocked, err = r.ShouldBlock(ctx, "agent-cached", "")
+	blocked, err = r.ShouldBlock(ctx, Subject{AgentID: "agent-cached"})
 	require.NoError(t, err, "ShouldBlock must not error when Redis is down — it reads local cache")
 	assert.True(t, blocked, "a kill cached before the outage must remain enforced during the outage")
 }
@@ -1895,7 +1895,7 @@ func TestRedis_Reconcile_RecoversLostPubSubEvent(t *testing.T) {
 	require.NoError(t, client.Set(ctx, redisSessionPfx+"sess-lost", "1", 0).Err())
 
 	require.Eventually(t, func() bool {
-		blocked, _ := r.ShouldBlock(ctx, "", "sess-lost")
+		blocked, _ := r.ShouldBlock(ctx, Subject{SessionID: "sess-lost"})
 		return blocked
 	}, 2*time.Second, 10*time.Millisecond,
 		"a kill whose pub/sub event was lost must be recovered by periodic reconciliation")
@@ -1949,7 +1949,7 @@ func TestRedis_Reset_ReseedsRacedKill(t *testing.T) {
 		t.Fatalf("Reset returned error: %v", err)
 	}
 
-	blocked, err := r.ShouldBlock(context.Background(), "victim", "")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "victim"})
 	if err != nil {
 		t.Fatalf("ShouldBlock error: %v", err)
 	}
@@ -2025,7 +2025,7 @@ func TestRedis_Reset_TrailingReseedIgnoresCanceledCallerContext(t *testing.T) {
 
 	// A healthy, non-killed subject must not be denied by a spurious fail-closed
 	// window opened by the misattributed cancellation.
-	blocked, err := r.ShouldBlock(context.Background(), "some-agent", "")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "some-agent"})
 	if err != nil {
 		t.Errorf("ShouldBlock must not fail closed after a clean Reset, got: %v", err)
 	}
@@ -2075,13 +2075,13 @@ func TestRedis_HandlePubSubMessage_Reset_RefreshesFromRedis(t *testing.T) {
 
 	// The cache clear is synchronous (under the lock), so the stale kill is gone
 	// immediately.
-	if blocked, _ := r.ShouldBlock(context.Background(), "stale", ""); blocked {
+	if blocked, _ := r.ShouldBlock(context.Background(), Subject{AgentID: "stale"}); blocked {
 		t.Error("reset event must clear stale local kill state")
 	}
 	// The trailing refresh is now asynchronous: the drainRefreshTrigger goroutine
 	// re-reads Redis and re-seeds the durable "victim" kill. Poll until it converges.
 	require.Eventually(t, func() bool {
-		blocked, _ := r.ShouldBlock(context.Background(), "victim", "")
+		blocked, _ := r.ShouldBlock(context.Background(), Subject{AgentID: "victim"})
 		return blocked
 	}, 2*time.Second, 5*time.Millisecond,
 		"a kill durably present in Redis must survive a reset event via the async trailing refresh")
@@ -2108,7 +2108,7 @@ func TestRedis_ShouldBlock_FailClosedByDefault_WhenDegraded(t *testing.T) {
 	t.Parallel()
 	r := newDegradedRedis(t, false)
 
-	blocked, err := r.ShouldBlock(context.Background(), "agent-1", "sess-1")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "agent-1", SessionID: "sess-1"})
 	require.Error(t, err, "default fail-closed: a degraded backend must surface an error so the caller denies")
 	require.ErrorIs(t, err, ErrBackendUnreachable)
 	assert.False(t, blocked)
@@ -2118,7 +2118,7 @@ func TestRedis_ShouldBlock_FailClosed_DoesNotLeakBackendError(t *testing.T) {
 	t.Parallel()
 	r := newDegradedRedis(t, false)
 
-	_, err := r.ShouldBlock(context.Background(), "", "sess-1")
+	_, err := r.ShouldBlock(context.Background(), Subject{SessionID: "sess-1"})
 	require.Error(t, err)
 	// The underlying redis dial error (host:port, etc.) must NOT be wrapped into
 	// the client-facing error -- only the static sentinel -- so backend connection
@@ -2131,7 +2131,7 @@ func TestRedis_ShouldBlock_FailOpen_OptIn_WhenDegraded(t *testing.T) {
 	t.Parallel()
 	r := newDegradedRedis(t, true)
 
-	blocked, err := r.ShouldBlock(context.Background(), "agent-1", "sess-1")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "agent-1", SessionID: "sess-1"})
 	require.NoError(t, err, "fail-open opt-in must not error on a degraded backend")
 	assert.False(t, blocked, "no kill in local cache -> not blocked under fail-open")
 }
@@ -2141,7 +2141,7 @@ func TestRedis_ShouldBlock_FailOpen_StillHonoursCachedKill_WhenDegraded(t *testi
 	r := newDegradedRedis(t, true)
 	r.killedSessions["sess-1"] = true
 
-	blocked, err := r.ShouldBlock(context.Background(), "", "sess-1")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{SessionID: "sess-1"})
 	require.NoError(t, err)
 	assert.True(t, blocked, "a kill already in the local cache still blocks under fail-open")
 }
@@ -2154,7 +2154,7 @@ func TestRedis_ShouldBlock_FailClosed_CachedKillIsKnownState_NoError(t *testing.
 	r := newDegradedRedis(t, false)
 	r.globalActive = true
 
-	blocked, err := r.ShouldBlock(context.Background(), "", "")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{})
 	require.NoError(t, err, "a cached global kill is confirmed state, not an unconfirmed request")
 	assert.True(t, blocked)
 }
@@ -2168,11 +2168,11 @@ func TestRedis_ShouldBlock_Healthy_Unaffected(t *testing.T) {
 		killedSessions: map[string]bool{"sess-1": true},
 	}
 	markStarted(t, r) // a started, healthy switch
-	blocked, err := r.ShouldBlock(context.Background(), "", "sess-1")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{SessionID: "sess-1"})
 	require.NoError(t, err)
 	assert.True(t, blocked)
 
-	blocked, err = r.ShouldBlock(context.Background(), "", "sess-2")
+	blocked, err = r.ShouldBlock(context.Background(), Subject{SessionID: "sess-2"})
 	require.NoError(t, err)
 	assert.False(t, blocked)
 }
@@ -2201,7 +2201,7 @@ func TestRedis_ShouldBlock_FailClosed_AfterRealRefreshFailure(t *testing.T) {
 	markStarted(t, r) // a started switch whose refresh then fails
 	require.Error(t, r.refreshState(context.Background()), "refresh against a closed backend must fail")
 
-	_, err := r.ShouldBlock(context.Background(), "", "sess-1")
+	_, err := r.ShouldBlock(context.Background(), Subject{SessionID: "sess-1"})
 	require.ErrorIs(t, err, ErrBackendUnreachable, "default fail-closed: degraded backend must block")
 }
 
@@ -2258,7 +2258,7 @@ func TestRedis_RefreshState_DoesNotEraseConcurrentKill(t *testing.T) {
 	require.NoError(t, r.refreshState(context.Background()))
 	require.True(t, hc.hook == nil, "scan hook must have fired during the refresh")
 
-	blocked, err := r.ShouldBlock(context.Background(), "victim", "")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "victim"})
 	require.NoError(t, err)
 	assert.True(t, blocked, "kill applied during the refresh scan window must not be erased")
 }
@@ -2481,7 +2481,7 @@ func TestRedis_Start_KillDuringSnapshotWindowIsObserved(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		blocked, _ := ks.ShouldBlock(context.Background(), "alice", "")
+		blocked, _ := ks.ShouldBlock(context.Background(), Subject{AgentID: "alice"})
 		if blocked {
 			return // observed the kill from the snapshot window
 		}
@@ -2511,7 +2511,7 @@ func TestRedis_RefreshState_ClearsErrorWhenNoFresherFailure(t *testing.T) {
 	require.NoError(t, r.HealthStatus(),
 		"a successful refresh with no fresher failure must clear the health stamp")
 
-	blocked, err := r.ShouldBlock(context.Background(), "uncached-agent", "")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "uncached-agent"})
 	assert.False(t, blocked)
 	require.NoError(t, err, "recovered switch must stop failing closed")
 }
@@ -2532,14 +2532,14 @@ func TestRedis_ShouldBlock_FailsClosedAfterContextCanceled(t *testing.T) {
 	t.Cleanup(r.Stop)
 
 	// While the context is live, a non-match is a normal all-clear under fail-open.
-	blocked, err := r.ShouldBlock(context.Background(), "uncached-agent", "")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "uncached-agent"})
 	require.NoError(t, err)
 	assert.False(t, blocked)
 
 	// Cancel the Start context: the loops exit and the switch freezes.
 	cancel()
 	require.Eventually(t, func() bool {
-		_, err := r.ShouldBlock(context.Background(), "uncached-agent", "")
+		_, err := r.ShouldBlock(context.Background(), Subject{AgentID: "uncached-agent"})
 		return errors.Is(err, ErrStopped)
 	}, 2*time.Second, 5*time.Millisecond,
 		"after its Start context is canceled, ShouldBlock must fail closed with ErrStopped on a non-match")

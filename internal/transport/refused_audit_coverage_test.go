@@ -357,7 +357,7 @@ func TestHandleKill_NoRecordWhenActivationFails(t *testing.T) {
 // the handler short-circuits first.
 type failingKillSwitch struct{}
 
-func (failingKillSwitch) ShouldBlock(context.Context, string, string) (bool, error) {
+func (failingKillSwitch) ShouldBlock(context.Context, killswitch.Subject) (bool, error) {
 	return false, nil
 }
 func (failingKillSwitch) ActivateGlobal(context.Context) error   { return errors.New("backend down") }
@@ -369,6 +369,9 @@ func (failingKillSwitch) ReviveAgent(context.Context, string) error {
 	return errors.New("backend down")
 }
 func (failingKillSwitch) KillSession(context.Context, string) error {
+	return errors.New("backend down")
+}
+func (failingKillSwitch) RevokeJTI(context.Context, string) error {
 	return errors.New("backend down")
 }
 func (failingKillSwitch) ReviveSession(context.Context, string) error {

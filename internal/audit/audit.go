@@ -48,6 +48,16 @@ type auditRecord struct {
 	AgentID     string `json:"agent_id,omitempty"`   // JWT mcp.agent_id, stamped when a validated token is present (§ 2.1)
 	TaskID      string `json:"task_id,omitempty"`    // JWT mcp.task_id, stamped when a validated token is present (§ 2.1)
 	UserID      string `json:"user_id,omitempty"`    // JWT subject (sub): the human/principal identity, stamped when a validated token is present (§ 2.1)
+	// TokenID is the JWT `jti`: which CREDENTIAL authorized this call, where AgentID/UserID
+	// say which identity it speaks for. The two answer different questions and an incident
+	// needs both — "revoke the token that leaked" is answerable only from this field, and
+	// after a revocation it is what distinguishes the calls that credential made from the
+	// same agent's calls on a token that was never compromised.
+	//
+	// IdP-supplied and bounded exactly like AgentID/TaskID/UserID. Omitted for a token that
+	// carries no jti and for every request with no token, so an existing deployment's records
+	// are byte-identical until it starts issuing them.
+	TokenID string `json:"token_id,omitempty"`
 	// Delegate and DelegationDepth attribute a DELEGATED call to the sub-agent that actually
 	// made it. UserID names the human the token is for; on a chain user -> agent-a -> agent-b
 	// that human made none of these calls directly, and without these two the record is
@@ -506,6 +516,10 @@ type Identity struct {
 	// UserID is the token SUBJECT (sub): the human or principal the agent acts for. On a
 	// delegated call it is still the human — which is precisely why Delegate exists.
 	UserID string
+	// TokenID is the validated token's RFC 7519 `jti`: WHICH credential authorized the call,
+	// as opposed to which identity it speaks for. Empty for a token that omits it and for
+	// every request with no token at all.
+	TokenID string
 	// Delegate is the identity currently HOLDING the token: the outermost RFC 8693 `act`
 	// actor. Empty for a token carrying no actor chain, which is nearly all of them.
 	Delegate string
@@ -1585,6 +1599,7 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		id.AgentID = boundFieldTo(id.AgentID, auditEnvelopeFieldCap)
 		id.TaskID = boundFieldTo(id.TaskID, auditEnvelopeFieldCap)
 		id.UserID = boundFieldTo(id.UserID, auditEnvelopeFieldCap)
+		id.TokenID = boundFieldTo(id.TokenID, auditEnvelopeFieldCap)
 		// Bounded with the other three: act.sub is IdP-supplied and structure-validated but
 		// not length-bounded at the source, so it is the same exposure they are. The depth is
 		// an int the chain validator already caps at MaxDelegationDepth.
@@ -1601,6 +1616,7 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		AgentID:     id.AgentID,
 		TaskID:      id.TaskID,
 		UserID:      id.UserID,
+		TokenID:     id.TokenID,
 		// The acting delegate, for a call a sub-agent made on the human's behalf. Both are
 		// zero for every non-delegated request and omitempty keeps them off those records.
 		Delegate:        id.Delegate,
@@ -1907,7 +1923,7 @@ func (rec *auditRecord) queueSize() int64 {
 	for _, o := range rec.Obligations {
 		n += int64(len(o))
 	}
-	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.Delegate))
+	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.TokenID) + len(rec.Delegate))
 	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
 	n += int64(len(rec.PEP) + len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
 	n += int64(len(rec.DenialCode) + len(rec.ConditionType) + len(rec.ProtocolRevision))

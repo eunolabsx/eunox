@@ -23,6 +23,7 @@ const (
 	redisGlobalKey   = "killswitch:global"
 	redisAgentPrefix = "killswitch:agent:"
 	redisSessionPfx  = "killswitch:session:"
+	redisJTIPrefix   = "killswitch:jti:"
 	redisPubSubChan  = "killswitch:events"
 
 	// defaultReconcileInterval is how often the local cache is fully refreshed from Redis,
@@ -204,6 +205,7 @@ type Redis struct {
 	globalActive   bool
 	killedAgents   map[string]bool
 	killedSessions map[string]bool
+	revokedJTIs    map[string]bool
 	lastRefreshErr error // last refresh error; nil means healthy
 	// lastRefreshOK is when a refresh last CONFIRMED state against Redis. lastRefreshErr
 	// is edge-triggered (set only once a refresh has run AND failed), so a partition
@@ -433,6 +435,7 @@ func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 		client:            client,
 		killedAgents:      make(map[string]bool),
 		killedSessions:    make(map[string]bool),
+		revokedJTIs:       make(map[string]bool),
 		reconcileInterval: defaultReconcileInterval,
 		sessionKillTTL:    defaultSessionKillTTL,
 	}
@@ -750,7 +753,7 @@ func (r *Redis) HealthStatus() error {
 // ShouldBlock checks if any kill switch is active, using the local cache first. A kill
 // present blocks unconditionally even while Redis is degraded; only when nothing matches
 // does degraded mode matter (fail-closed denies, fail-open serves the cache). See ADR-0003.
-func (r *Redis) ShouldBlock(_ context.Context, agentID, sessionID string) (bool, error) {
+func (r *Redis) ShouldBlock(_ context.Context, subj Subject) (bool, error) {
 	// Fail closed until Start has seeded the cache: an unstarted switch has an empty
 	// cache and nil lastRefreshErr, indistinguishable from an all-clear, so a NewRedis
 	// wired in but never Started would otherwise ignore every kill in Redis silently.
@@ -768,11 +771,13 @@ func (r *Redis) ShouldBlock(_ context.Context, agentID, sessionID string) (bool,
 	if r.globalActive {
 		return true, nil
 	}
-	if agentID != "" && r.killedAgents[agentID] {
-		return true, nil
-	}
-	if sessionID != "" && r.killedSessions[sessionID] {
-		return true, nil
+	// Walked in declaration order, which is the same order InMemory walks, so the two
+	// backends attribute a request that matches several dimensions to the same one.
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		if id := dim.subject(subj); id != "" && dim.cache(r)[id] {
+			return true, nil
+		}
 	}
 	// Nothing matches, so the cache's confidence decides. livenessLocked defines that
 	// chain once (shared with HealthStatus); this maps it to the client-facing sentinels.
@@ -922,13 +927,13 @@ func (r *Redis) DeactivateGlobal(ctx context.Context) error {
 	return r.publish(ctx, "global:deactivate")
 }
 
-// setBlock is the shared body of KillAgent/ReviveAgent/KillSession/ReviveSession. The two
-// booleans (kill, session) are the only real axes; the key prefix, publish verb, cache map,
-// and error-message names are all DERIVED from them, so a caller cannot mismatch (e.g.
-// write the agent key while publishing on the session channel). An empty id is rejected
-// rather than writing the bare prefix key and triggering a spurious full refresh on every
-// replica.
-func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) error {
+// setBlock is the shared body of every per-id kill and revive. The two axes are the VERB
+// (kill or revive) and the DIMENSION; the key prefix, publish channel, cache map, TTL policy,
+// observer event and error-message names are all read off the dimension's declaration, so a
+// caller cannot mismatch them — write the agent key while publishing on the session channel,
+// or add a dimension whose revocation nothing ever notifies. An empty id is rejected rather
+// than writing the bare prefix key and triggering a spurious full refresh on every replica.
+func (r *Redis) setBlock(ctx context.Context, kill bool, dim *killDimension, id string) error {
 	if r.wiringErr != nil {
 		return r.wiringErr
 	}
@@ -936,35 +941,22 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	if !kill {
 		verb = "Revive"
 	}
-	entity, idField, keyPrefix := "Agent", "agentID", redisAgentPrefix
-	if session {
-		entity, idField, keyPrefix = "Session", "sessionID", redisSessionPfx
-	}
 	if id == "" {
-		return fmt.Errorf("killswitch: %s%s: %s must not be empty", verb, entity, idField)
+		return fmt.Errorf("killswitch: %s%s: %s must not be empty", verb, dim.entity, dim.idField)
 	}
-	key := keyPrefix + id
+	key := dim.keyPrefix + id
 	var err error
 	if kill {
-		// Only SESSION tombstones expire; an agent kill is durable revocation of a
-		// long-lived identity. See defaultSessionKillTTL.
-		ttl := time.Duration(0)
-		if session {
-			ttl = r.sessionKillTTL
-		}
-		err = r.client.Set(ctx, key, "1", ttl).Err()
+		err = r.client.Set(ctx, key, "1", dim.ttl(r.sessionKillTTL)).Err()
 	} else {
 		err = r.client.Del(ctx, key).Err()
 	}
 	if err != nil {
 		return err
 	}
-	// The map field is selected under the lock so a concurrent Reset swap is not raced.
+	// The map is selected under the lock so a concurrent Reset swap is not raced.
 	r.mu.Lock()
-	cache := r.killedAgents
-	if session {
-		cache = r.killedSessions
-	}
+	cache := dim.cache(r)
 	gained := kill && !cache[id]
 	if kill {
 		cache[id] = true
@@ -977,38 +969,58 @@ func (r *Redis) setBlock(ctx context.Context, kill, session bool, id string) err
 	// changed local state: this instance's own pub/sub echo dedups identically against
 	// the now-updated cache, so this is the only delivery a local kill ever gets.
 	if gained {
-		ev := Revocation{AgentID: id}
-		if session {
-			ev = Revocation{SessionID: id}
-		}
-		r.observers.notify(ev)
+		r.observers.notify(dim.event(id))
 	}
-	// Channel name mirrors the durable-key dimension: "<entity>:<action>:<id>".
+	// Channel name mirrors the durable-key dimension: "<dimension>:<action>:<id>".
 	action := "kill"
 	if !kill {
 		action = "revive"
 	}
-	return r.publish(ctx, strings.ToLower(entity)+":"+action+":"+id)
+	return r.publish(ctx, dim.name+":"+action+":"+id)
+}
+
+// mustDimension returns the declared dimension by name for this package's own call sites,
+// which pass a literal that killDimensions is required to contain.
+//
+// A panic rather than an error return: a missing entry is a build-time authoring mistake in
+// this file, not a runtime condition a caller could handle, and the table test asserts every
+// name these methods pass is declared — so this is unreachable in a build that tests.
+func mustDimension(name string) *killDimension {
+	dim, ok := dimensionByName(name)
+	if !ok {
+		panic("killswitch: undeclared kill dimension " + name)
+	}
+	return dim
 }
 
 // KillAgent blocks the specified agent.
 func (r *Redis) KillAgent(ctx context.Context, agentID string) error {
-	return r.setBlock(ctx, true, false, agentID)
+	return r.setBlock(ctx, true, mustDimension("agent"), agentID)
 }
 
 // ReviveAgent removes the kill on the specified agent.
 func (r *Redis) ReviveAgent(ctx context.Context, agentID string) error {
-	return r.setBlock(ctx, false, false, agentID)
+	return r.setBlock(ctx, false, mustDimension("agent"), agentID)
 }
 
 // KillSession blocks the specified session.
 func (r *Redis) KillSession(ctx context.Context, sessionID string) error {
-	return r.setBlock(ctx, true, true, sessionID)
+	return r.setBlock(ctx, true, mustDimension("session"), sessionID)
 }
 
 // ReviveSession removes the kill on the specified session.
 func (r *Redis) ReviveSession(ctx context.Context, sessionID string) error {
-	return r.setBlock(ctx, false, true, sessionID)
+	return r.setBlock(ctx, false, mustDimension("session"), sessionID)
+}
+
+// RevokeJTI blocks every request presenting the bearer token with this id.
+func (r *Redis) RevokeJTI(ctx context.Context, jti string) error {
+	return r.setBlock(ctx, true, mustDimension("jti"), jti)
+}
+
+// ReviveJTI removes the revocation on the specified token id.
+func (r *Redis) ReviveJTI(ctx context.Context, jti string) error {
+	return r.setBlock(ctx, false, mustDimension("jti"), jti)
 }
 
 // Reset clears all kill-switch state.
@@ -1022,13 +1034,14 @@ func (r *Redis) Reset(ctx context.Context) error {
 		return fmt.Errorf("kill switch reset: delete global key: %w", err)
 	}
 
-	// Delete agent/session keys, propagating errors. In-memory state is cleared only
-	// after all Redis deletions succeed, keeping it consistent with Redis.
-	if err := r.deleteByPrefix(ctx, redisAgentPrefix); err != nil {
-		return err
-	}
-	if err := r.deleteByPrefix(ctx, redisSessionPfx); err != nil {
-		return err
+	// Delete every dimension's keys, propagating errors. In-memory state is cleared only
+	// after all Redis deletions succeed, keeping it consistent with Redis. Over the
+	// declaration, so a dimension added later is swept rather than left behind in Redis to
+	// be re-loaded by the next reconcile — a Reset that does not reset.
+	for i := range killDimensions {
+		if err := r.deleteByPrefix(ctx, killDimensions[i].keyPrefix); err != nil {
+			return err
+		}
 	}
 
 	// Capture the publish error but finish the local clear + reseed first: the durable
@@ -1038,8 +1051,9 @@ func (r *Redis) Reset(ctx context.Context) error {
 
 	r.mu.Lock()
 	r.globalActive = false
-	r.killedAgents = make(map[string]bool)
-	r.killedSessions = make(map[string]bool)
+	for _, dim := range killDimensions {
+		dim.replace(r, make(map[string]bool))
+	}
 	r.cacheGen++
 	r.mu.Unlock()
 
@@ -1094,7 +1108,7 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 		}
 	case killLive:
 	}
-	return buildStatus(r.globalActive, r.killedAgents, r.killedSessions), nil
+	return buildStatusOf(r.globalActive, func(d *killDimension) map[string]bool { return d.cache(r) }), nil
 }
 
 // publish broadcasts msg on the kill-switch channel. The durable write and cache update
@@ -1171,20 +1185,20 @@ func (r *Redis) serializedRefresh(ctx context.Context) ([]Revocation, error) {
 		}
 		newGlobal := err == nil && val == "1"
 
-		newAgents := make(map[string]bool)
-		if err := r.scanPrefix(ctx, redisAgentPrefix, newAgents); err != nil {
-			return nil, r.recordRefreshErr(err)
-		}
-
-		newSessions := make(map[string]bool)
-		if err := r.scanPrefix(ctx, redisSessionPfx, newSessions); err != nil {
-			return nil, r.recordRefreshErr(err)
+		scanned := make(map[string]map[string]bool, len(killDimensions))
+		for i := range killDimensions {
+			dim := &killDimensions[i]
+			found := make(map[string]bool)
+			if err := r.scanPrefix(ctx, dim.keyPrefix, found); err != nil {
+				return nil, r.recordRefreshErr(err)
+			}
+			scanned[dim.name] = found
 		}
 
 		r.mu.Lock()
 		if r.cacheGen == startGen {
 			// No cache mutation raced the scan: the snapshot is consistent.
-			gained := r.commitRefreshLocked(newGlobal, newAgents, newSessions)
+			gained := r.commitRefreshLocked(newGlobal, scanned)
 			r.mu.Unlock()
 			return gained, nil
 		}
@@ -1198,13 +1212,13 @@ func (r *Redis) serializedRefresh(ctx context.Context) ([]Revocation, error) {
 		// UNION in the kills the cache gained concurrently so none is erased. This
 		// biases fail-closed (a revoked entry is retained, not dropped); the next
 		// reconcile reconciles any raced deletion.
-		for a := range r.killedAgents {
-			newAgents[a] = true
+		for i := range killDimensions {
+			dim := &killDimensions[i]
+			for id := range dim.cache(r) {
+				scanned[dim.name][id] = true
+			}
 		}
-		for s := range r.killedSessions {
-			newSessions[s] = true
-		}
-		gained := r.commitRefreshLocked(newGlobal || r.globalActive, newAgents, newSessions)
+		gained := r.commitRefreshLocked(newGlobal || r.globalActive, scanned)
 		r.mu.Unlock()
 		return gained, nil
 	}
@@ -1228,24 +1242,35 @@ func (r *Redis) notifyRevocations(gained []Revocation) {
 // r.mu AND refreshMu. The reconcile loop fires observers too, not just pub/sub, because a
 // publish that never arrives would otherwise leave a consumer with nothing to reclaim on
 // (and the sessionIdleTimeoutMs: 0 case has no sweep at all).
-func (r *Redis) commitRefreshLocked(global bool, agents, sessions map[string]bool) []Revocation {
+func (r *Redis) commitRefreshLocked(global bool, scanned map[string]map[string]bool) []Revocation {
 	var gained []Revocation
 	if global && !r.globalActive {
 		gained = append(gained, Revocation{Global: true})
 	}
-	for id := range agents {
-		if !r.killedAgents[id] {
-			gained = append(gained, Revocation{AgentID: id})
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		held := dim.cache(r)
+		for id := range scanned[dim.name] {
+			if !held[id] {
+				gained = append(gained, dim.event(id))
+			}
 		}
 	}
-	for id := range sessions {
-		if !r.killedSessions[id] {
-			gained = append(gained, Revocation{SessionID: id})
-		}
-	}
+
 	r.globalActive = global
-	r.killedAgents = agents
-	r.killedSessions = sessions
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		// A dimension the scan did not populate keeps its existing cache rather than being
+		// replaced with a nil map. Both callers fill every key today, so this cannot fire —
+		// but the two failure modes if one ever stops are a PANIC on the next kill (writing
+		// to a nil map, inside the emergency stop) and a silently emptied kill set. Keeping
+		// what is held is fail-closed and costs one lookup per reconcile.
+		found, ok := scanned[dim.name]
+		if !ok {
+			continue
+		}
+		dim.replace(r, found)
+	}
 	r.lastRefreshErr = nil
 	r.lastRefreshOK = r.clock()
 	return gained
@@ -1456,8 +1481,9 @@ func (r *Redis) listenPubSub(ctx context.Context, pubsub *redis.PubSub) {
 }
 
 // handlePubSubMessage processes a kill-switch event and updates local cache immediately.
-// Message format: "global:activate", "global:deactivate", "agent:kill:<id>",
-// "agent:revive:<id>", "session:kill:<id>", "session:revive:<id>", "reset".
+// Message format: "global:activate", "global:deactivate", "reset", and
+// "<dimension>:kill:<id>" / "<dimension>:revive:<id>" for every entry in killDimensions —
+// the same names setBlock publishes under, read off the same declaration.
 func (r *Redis) handlePubSubMessage(payload string) {
 	r.mu.Lock()
 	shouldRefresh := false
@@ -1476,29 +1502,40 @@ func (r *Redis) handlePubSubMessage(payload string) {
 		r.globalActive = false
 	case "reset":
 		r.globalActive = false
-		r.killedAgents = make(map[string]bool)
-		r.killedSessions = make(map[string]bool)
+		for i := range killDimensions {
+			killDimensions[i].replace(r, make(map[string]bool))
+		}
 		// Re-read Redis after the clear (as Reset() does): a kill that raced the
 		// publisher's delete sweep could otherwise stay hidden on this replica.
 		shouldRefresh = true
 	default:
 		// Prefixed events carry a non-empty id; cutKillID returns "" for a non-match
 		// or a bare prefix, so an unrecognized message falls through to a full refresh.
-		if id := cutKillID(payload, "agent:kill:"); id != "" {
-			if !r.killedAgents[id] {
-				gained = append(gained, Revocation{AgentID: id})
+		//
+		// Walked over the declaration rather than spelled out per dimension. A dimension
+		// missing from a hand-written chain does not fail loudly — it falls to the refresh
+		// arm below, so the revocation still converges on the next reconcile tick while
+		// real-time propagation is silently lost for that axis alone. That is the shape of
+		// bug nobody finds until an operator revokes a credential mid-incident.
+		handled := false
+		for i := range killDimensions {
+			dim := &killDimensions[i]
+			if id := cutKillID(payload, dim.name+":kill:"); id != "" {
+				cache := dim.cache(r)
+				if !cache[id] {
+					gained = append(gained, dim.event(id))
+				}
+				cache[id] = true
+				handled = true
+				break
 			}
-			r.killedAgents[id] = true
-		} else if id := cutKillID(payload, "agent:revive:"); id != "" {
-			delete(r.killedAgents, id)
-		} else if id := cutKillID(payload, "session:kill:"); id != "" {
-			if !r.killedSessions[id] {
-				gained = append(gained, Revocation{SessionID: id})
+			if id := cutKillID(payload, dim.name+":revive:"); id != "" {
+				delete(dim.cache(r), id)
+				handled = true
+				break
 			}
-			r.killedSessions[id] = true
-		} else if id := cutKillID(payload, "session:revive:"); id != "" {
-			delete(r.killedSessions, id)
-		} else {
+		}
+		if !handled {
 			// Unknown message — trigger a full refresh from Redis.
 			shouldRefresh = true
 		}

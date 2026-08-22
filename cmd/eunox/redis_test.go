@@ -164,7 +164,7 @@ func TestRedisKillSwitch_Integration(t *testing.T) {
 	})
 
 	// Initially: not blocked.
-	blocked, err := ks.ShouldBlock(ctx, "agent-1", "session-abc")
+	blocked, err := ks.ShouldBlock(ctx, killswitch.Subject{AgentID: "agent-1", SessionID: "session-abc"})
 	if err != nil {
 		t.Fatalf("ShouldBlock: %v", err)
 	}
@@ -180,12 +180,12 @@ func TestRedisKillSwitch_Integration(t *testing.T) {
 	// Wait for the kill to propagate (pub/sub, or the reconcile fallback) instead
 	// of racing a fixed sleep, which can flake on a loaded runner.
 	require.Eventually(t, func() bool {
-		b, e := ks.ShouldBlock(ctx, "agent-1", "session-abc")
+		b, e := ks.ShouldBlock(ctx, killswitch.Subject{AgentID: "agent-1", SessionID: "session-abc"})
 		return e == nil && b
 	}, 2*time.Second, 10*time.Millisecond, "session must be blocked after KillSession")
 
 	// A different session is unaffected.
-	blocked, err = ks.ShouldBlock(ctx, "agent-1", "session-xyz")
+	blocked, err = ks.ShouldBlock(ctx, killswitch.Subject{AgentID: "agent-1", SessionID: "session-xyz"})
 	if err != nil {
 		t.Fatalf("ShouldBlock other session: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestRedisKillSwitch_GlobalActivate(t *testing.T) {
 	}
 
 	require.Eventually(t, func() bool {
-		blocked, err := ks.ShouldBlock(ctx, "any-agent", "any-session")
+		blocked, err := ks.ShouldBlock(ctx, killswitch.Subject{AgentID: "any-agent", SessionID: "any-session"})
 		return err == nil && blocked
 	}, 2*time.Second, 10*time.Millisecond, "all sessions must be blocked under the global kill switch")
 }

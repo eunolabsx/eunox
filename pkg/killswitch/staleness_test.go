@@ -33,19 +33,19 @@ func TestShouldBlock_StaleCacheFailsClosed(t *testing.T) {
 	r.lastRefreshOK = base // a refresh just succeeded
 
 	// Fresh cache: a non-match is a confident all-clear.
-	if blocked, err := r.ShouldBlock(context.Background(), "a", "s"); blocked || err != nil {
+	if blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "a", SessionID: "s"}); blocked || err != nil {
 		t.Fatalf("a freshly-confirmed cache must serve a non-match cleanly; blocked=%v err=%v", blocked, err)
 	}
 
 	// One missed reconcile tick is ordinary jitter and must not deny.
 	now = base.Add(45 * time.Second)
-	if blocked, err := r.ShouldBlock(context.Background(), "a", "s"); blocked || err != nil {
+	if blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "a", SessionID: "s"}); blocked || err != nil {
 		t.Fatalf("one missed tick is jitter, not an outage; blocked=%v err=%v", blocked, err)
 	}
 
 	// Two intervals with no confirmed refresh means the loop is not converging.
 	now = base.Add(61 * time.Second)
-	blocked, err := r.ShouldBlock(context.Background(), "a", "s")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "a", SessionID: "s"})
 	if blocked {
 		t.Error("a staleness denial reports an error rather than a synthetic match")
 	}
@@ -62,7 +62,7 @@ func TestShouldBlock_StaleCacheFailsClosed(t *testing.T) {
 
 	// A confirmed refresh clears it.
 	r.lastRefreshOK = now
-	if blocked, err := r.ShouldBlock(context.Background(), "a", "s"); blocked || err != nil {
+	if blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "a", SessionID: "s"}); blocked || err != nil {
 		t.Fatalf("a fresh refresh must clear the staleness denial; blocked=%v err=%v", blocked, err)
 	}
 	if r.HealthStatus() != nil {
@@ -88,7 +88,7 @@ func TestShouldBlock_StaleCacheServedUnderFailOpen(t *testing.T) {
 	r.lastRefreshOK = base
 
 	now = base.Add(10 * time.Minute)
-	if blocked, err := r.ShouldBlock(context.Background(), "a", "s"); blocked || err != nil {
+	if blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "a", SessionID: "s"}); blocked || err != nil {
 		t.Fatalf("fail-open must keep serving a stale cache; blocked=%v err=%v", blocked, err)
 	}
 	// The operator signal still fires even though the data plane is permissive.
@@ -113,7 +113,7 @@ func TestShouldBlock_CachedKillBlocksEvenWhenStale(t *testing.T) {
 	r.lastRefreshOK = base
 	now = base.Add(time.Hour)
 
-	blocked, err := r.ShouldBlock(context.Background(), "rogue", "")
+	blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "rogue"})
 	if !blocked || err != nil {
 		t.Fatalf("a cached kill must block unconditionally, even on a stale cache; blocked=%v err=%v", blocked, err)
 	}
@@ -180,13 +180,13 @@ func TestStaleness_LowIntervalDoesNotDenyAHealthyBackend(t *testing.T) {
 
 	// A slow-but-successful refresh cycle: well past 2 intervals, well inside the floor.
 	now = base.Add(10 * time.Second)
-	if blocked, err := r.ShouldBlock(context.Background(), "a", "s"); blocked || err != nil {
+	if blocked, err := r.ShouldBlock(context.Background(), Subject{AgentID: "a", SessionID: "s"}); blocked || err != nil {
 		t.Fatalf("a healthy backend must not be denied on a lowered reconcile interval; blocked=%v err=%v", blocked, err)
 	}
 
 	// Past the floor, the gate still fires: this bounds the window, it does not remove it.
 	now = base.Add(time.Second + maxRefreshCycleBudget + time.Second)
-	if _, err := r.ShouldBlock(context.Background(), "a", "s"); !errors.Is(err, ErrBackendUnreachable) {
+	if _, err := r.ShouldBlock(context.Background(), Subject{AgentID: "a", SessionID: "s"}); !errors.Is(err, ErrBackendUnreachable) {
 		t.Fatalf("past the floored budget the cache must still fail closed, got %v", err)
 	}
 }

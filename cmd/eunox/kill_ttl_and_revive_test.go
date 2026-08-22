@@ -410,7 +410,7 @@ func TestCmdKill_ReviveConvergesOnARunningProxy(t *testing.T) {
 		})
 	})
 	require.Eventually(t, func() bool {
-		blocked, err := proxyKS.ShouldBlock(ctx, "", "sess-live")
+		blocked, err := proxyKS.ShouldBlock(ctx, killswitch.Subject{SessionID: "sess-live"})
 		return err == nil && blocked
 	}, 2*time.Second, 10*time.Millisecond, "the proxy must observe the kill")
 
@@ -418,7 +418,7 @@ func TestCmdKill_ReviveConvergesOnARunningProxy(t *testing.T) {
 		require.Zero(t, cmdKill([]string{"--redis-addr", mr.Addr(), "--revive", "sess-live"}))
 	})
 	require.Eventually(t, func() bool {
-		blocked, err := proxyKS.ShouldBlock(ctx, "", "sess-live")
+		blocked, err := proxyKS.ShouldBlock(ctx, killswitch.Subject{SessionID: "sess-live"})
 		return err == nil && !blocked
 	}, 2*time.Second, 10*time.Millisecond, "the proxy must observe the revive")
 }
@@ -785,4 +785,49 @@ upstreams:
 		_, statErr := os.Stat(p)
 		require.True(t, os.IsNotExist(statErr), "%s must not exist: the flag error is decidable before any audit state is minted", p)
 	}
+}
+
+// TestCmdKill_JTIRejectsSessionTTLFlag: a token revocation never expires, so a tombstone
+// lifetime is exactly as meaningless there as it is with --agent — and accepting it silently
+// would suggest the revocation carries an expiry, which is the one property an operator
+// revoking a leaked credential most needs to be wrong about in the safe direction.
+func TestCmdKill_JTIRejectsSessionTTLFlag(t *testing.T) {
+	mr := miniredis.RunT(t)
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdKill([]string{"--redis-addr", mr.Addr(), "--killswitch-session-ttl", "1h", "--jti", "tok-1"})
+	})
+	require.Equal(t, 1, code)
+	require.Contains(t, stderr, "--killswitch-session-ttl has no effect with --jti")
+}
+
+// Every non-expiring target rejects the lifetime flag, enumerated so a dimension added later
+// with no tombstone is a failing test rather than a flag that silently does nothing.
+func TestCmdKill_EveryNonExpiringTargetRejectsSessionTTLFlag(t *testing.T) {
+	mr := miniredis.RunT(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"global", []string{"all"}},
+		{"agent", []string{"--agent", "agent-1"}},
+		{"jti", []string{"--jti", "tok-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var code int
+			stderr := captureStderr(t, func() {
+				code = cmdKill(append([]string{"--redis-addr", mr.Addr(), "--killswitch-session-ttl", "1h"}, tc.args...))
+			})
+			require.Equal(t, 1, code)
+			require.Contains(t, stderr, "--killswitch-session-ttl has no effect")
+		})
+	}
+
+	// The control: the one dimension that DOES write an expiring tombstone accepts it, so the
+	// rows above are about non-expiry rather than about the flag being rejected everywhere.
+	var code int
+	captureStderr(t, func() {
+		code = cmdKill([]string{"--redis-addr", mr.Addr(), "--killswitch-session-ttl", "1h", "sess-1"})
+	})
+	require.Equal(t, 0, code, "a session kill writes a tombstone, so the lifetime flag applies")
 }

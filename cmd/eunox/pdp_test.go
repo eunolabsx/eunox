@@ -565,7 +565,7 @@ func TestManifestPDP_ShouldBlockError_ResourceRead_FailClosed(t *testing.T) {
 // errKillSwitch is a test double that always returns an error from ShouldBlock.
 type errKillSwitch struct{}
 
-func (e *errKillSwitch) ShouldBlock(_ context.Context, _, _ string) (bool, error) {
+func (e *errKillSwitch) ShouldBlock(_ context.Context, _ killswitch.Subject) (bool, error) {
 	return false, errKillSwitchFailed
 }
 
@@ -585,6 +585,8 @@ func (e *errKillSwitch) KillAgent(_ context.Context, _ string) error     { retur
 func (e *errKillSwitch) ReviveAgent(_ context.Context, _ string) error   { return nil }
 func (e *errKillSwitch) KillSession(_ context.Context, _ string) error   { return nil }
 func (e *errKillSwitch) ReviveSession(_ context.Context, _ string) error { return nil }
+func (e *errKillSwitch) RevokeJTI(_ context.Context, _ string) error     { return nil }
+func (e *errKillSwitch) ReviveJTI(_ context.Context, _ string) error     { return nil }
 func (e *errKillSwitch) Reset(_ context.Context) error                   { return nil }
 func (e *errKillSwitch) Status(_ context.Context) (*killswitch.Status, error) {
 	return &killswitch.Status{}, nil

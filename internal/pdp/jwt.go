@@ -62,7 +62,16 @@ type JWTClaims struct {
 	TaskID          string
 	AgentID         string
 	Subject         string
-	Issuer          string
+	// TokenID is the verified RFC 7519 `jti`: the identifier of THIS credential, which the
+	// kill switch's finest revocation dimension is keyed on. Empty when the token omits it,
+	// which leaves that dimension unevaluated rather than matching anything.
+	//
+	// A revocation key only, never a scope key. A manifest's `principal:` scoping reads
+	// `sub`, and keying accumulated policy state on a per-token value would split an agent's
+	// budgets across every token it was ever issued — a caller could reset a spent `maxCalls`
+	// by asking its IdP for a fresh token. See ADR-0004.
+	TokenID string
+	Issuer  string
 	// Audiences is the verified `aud` claim (always a list). Lets a per-route
 	// wrapper pin its own audience after the shared validator accepts the token
 	// for the union of all routes — see routeAudience / WrapRoutesWithJWT.
@@ -603,8 +612,11 @@ func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, e
 // missed in the other. Membership is "does this build read it", not "is it a
 // registered claim" (ClaimMembers' own criterion):
 //
-//   - `jti` is deliberately ABSENT — nothing here decodes it, so watching it would
-//     reject tokens over a spelling collision in a claim eunox never reads.
+//   - `jti` is PRESENT, and it changed sides the moment revocation started reading it. While
+//     nothing decoded it, watching it would have rejected tokens over a collision in a claim
+//     eunox never looked at. Now it is the kill switch's finest dimension, so an ambiguous
+//     `{"jti":"revoked","JTI":"clean"}` resolves last-wins to a value the holder chose — and
+//     a revoked credential keeps serving. Watching it is what makes the revocation binding.
 //   - `cnf` is deliberately PRESENT despite not being a go-jose std claim: it is read
 //     from the raw map (last-member-wins), and an ambiguous `cnf` fails OPEN —
 //     `{"cnf":{"jkt":…},"cnf":null}` resolves to null, which CnfIsSenderConstrained
@@ -615,8 +627,9 @@ func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, e
 var watchedTopLevelClaims = []string{
 	// The proxy's own claim blocks.
 	"mcp", "act",
-	// Identity and audience: `sub` is what a manifest's principal: scoping reads.
-	"sub", "iss", "aud",
+	// Identity and audience: `sub` is what a manifest's principal: scoping reads, and
+	// `jti` is what per-token revocation is keyed on.
+	"sub", "iss", "aud", "jti",
 	// Temporal bounds: whether the token is live at all.
 	"exp", "nbf", "iat",
 	// Proof-of-possession: read from the raw claim map, and the one that fails open.
@@ -666,6 +679,7 @@ func newValidatedClaims(capsList []string, capsPresent bool, declassify []capabi
 		TaskID:          payload.MCP.TaskID,
 		AgentID:         payload.MCP.AgentID,
 		Subject:         std.Subject,
+		TokenID:         std.ID,
 		Issuer:          std.Issuer,
 		Audiences:       []string(std.Audience),
 		Extra:           rawClaims,

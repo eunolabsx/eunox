@@ -31,7 +31,7 @@ import (
 // every Decide*/CheckKill path that embeds it.
 type errKS struct{ killswitch.Checker }
 
-func (errKS) ShouldBlock(_ context.Context, _, _ string) (bool, error) {
+func (errKS) ShouldBlock(_ context.Context, _ killswitch.Subject) (bool, error) {
 	return false, errKSUnavailable
 }
 

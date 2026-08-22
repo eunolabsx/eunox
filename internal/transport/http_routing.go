@@ -1133,6 +1133,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var body struct {
 		SessionID string `json:"sessionId"`
+		JTI       string `json:"jti"`
 		All       bool   `json:"all"`
 	}
 	// closedSchema, because this body's members select WHICH kill runs: it rejects a trailing
@@ -1149,8 +1150,18 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// deployment-wide stop, and the record then names a scope the body only half-describes.
 	// Fail-safe in effect, but the endpoint's contract is that the kill executed is the one
 	// the body names, so an incoherent body is refused rather than resolved by field order.
-	if body.All && body.SessionID != "" {
-		http.Error(w, "sessionId and all are mutually exclusive; pass exactly one", http.StatusBadRequest)
+	//
+	// Counted rather than compared pairwise: with three targets the pairwise form is three
+	// conditions that must agree, and the one somebody forgets is a body naming two
+	// dimensions that silently runs whichever arm sorts first.
+	named := 0
+	for _, present := range []bool{body.All, body.SessionID != "", body.JTI != ""} {
+		if present {
+			named++
+		}
+	}
+	if named > 1 {
+		http.Error(w, "sessionId, jti and all are mutually exclusive; pass exactly one", http.StatusBadRequest)
 		return
 	}
 	if body.All {
@@ -1182,8 +1193,30 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		p.writeKillResponse(w, killScopeAll, killDimensionGlobal)
 		return
 	}
+	if body.JTI != "" {
+		// Bounded for maxClaimedSessionIDLen's reason one field over: an uncapped id flows
+		// into the Redis key, the signed record's scope, and the response echo.
+		if len(body.JTI) > maxClaimedSessionIDLen {
+			http.Error(w, "jti is too long to name a token", http.StatusBadRequest)
+			return
+		}
+		if err := p.ks.RevokeJTI(r.Context(), body.JTI); !p.killWriteLanded("token revocation", err) {
+			http.Error(w, "kill switch token revocation failed", http.StatusInternalServerError)
+			return
+		}
+		p.recordKillActivated(r, body.JTI, killDimensionJTI)
+		// No local teardown to do, and that is the dimension's nature rather than an
+		// omission: a token id names a CREDENTIAL, not a connection, so which of this
+		// proxy's sessions presented it is not a question the endpoint can answer without
+		// re-deciding every one. The kill switch's own revocation delivery does it instead
+		// — reclaimOnRevocation re-asks ShouldBlock about each held session, which is
+		// exactly the "revocation is a trigger, not a work list" contract, and it covers
+		// sessions on sibling instances that this handler could never reach.
+		p.writeKillResponse(w, body.JTI, killDimensionJTI)
+		return
+	}
 	if body.SessionID == "" {
-		http.Error(w, "sessionId or all required", http.StatusBadRequest)
+		http.Error(w, "sessionId, jti or all required", http.StatusBadRequest)
 		return
 	}
 	// Refused rather than sanitized, and refused HERE rather than at each consumer. The body is
@@ -1272,7 +1305,7 @@ func (p *HTTPProxy) recordKillActivated(r *http.Request, scope, dimension string
 }
 
 // writeKillResponse writes the kill endpoint's
-// {"ok":true,"killed":<target>,"dimension":<global|session>} success body. Every route
+// {"ok":true,"killed":<target>,"dimension":<global|session|jti>} success body. Every route
 // honors the kill switch, so the response carries no partial-coverage caveat.
 //
 // dimension is reported for the same reason the audit record carries it: a session whose
@@ -1291,6 +1324,10 @@ func (p *HTTPProxy) writeKillResponse(w http.ResponseWriter, killed, dimension s
 const (
 	killDimensionGlobal  = "global"
 	killDimensionSession = "session"
+	// killDimensionJTI is the per-credential dimension. Unlike a session tombstone it does
+	// not expire, so it is the one dimension this endpoint writes that an operator must
+	// explicitly lift (`eunox kill --revive --jti`, Redis only).
+	killDimensionJTI = "jti"
 )
 
 // sessionlessLeg is the leg every pre-session arm negotiates against: `initialize` exists only
