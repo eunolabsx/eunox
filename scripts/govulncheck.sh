@@ -43,6 +43,18 @@
 
 set -euo pipefail
 
+# Every path the caller named is resolved against the directory they ran this FROM,
+# because the cd below moves to the repository root: without this a relative
+# --json-out/--summary-out silently lands in the repo instead of the caller's cwd,
+# which both contradicts "run it from anywhere" and can overwrite a tracked file.
+INVOCATION_DIR="$PWD"
+abspath() {
+	case "$1" in
+	/*) printf '%s\n' "$1" ;;
+	*) printf '%s/%s\n' "$INVOCATION_DIR" "$1" ;;
+	esac
+}
+
 cd "$(dirname "$0")/.."
 
 MODE="gate"
@@ -50,26 +62,42 @@ JSON_OUT=""
 SUMMARY_OUT=""
 JSON_IN=""
 
+# A missing operand must not fall through to `shift 2`, which fails under `set -e` and
+# exits 1 with no diagnostic -- colliding with the gate's own "vulnerability found"
+# status. Every bad input here exits 2, the same as an unknown argument.
+need_value() { # need_value <count> <flag>
+	if [ "$1" -lt 2 ]; then
+		echo "govulncheck.sh: $2 requires a value" >&2
+		exit 2
+	fi
+}
+
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--mode)
-		MODE="${2:-}"
+		need_value $# "$1"
+		MODE="$2"
 		shift 2
 		;;
 	--json-out)
-		JSON_OUT="${2:-}"
+		need_value $# "$1"
+		JSON_OUT=$(abspath "$2")
 		shift 2
 		;;
 	--summary-out)
-		SUMMARY_OUT="${2:-}"
+		need_value $# "$1"
+		SUMMARY_OUT=$(abspath "$2")
 		shift 2
 		;;
 	--json-in)
-		JSON_IN="${2:-}"
+		need_value $# "$1"
+		JSON_IN=$(abspath "$2")
 		shift 2
 		;;
 	-h | --help)
-		sed -n '5,42p' "$0"
+		# Print the header block by shape rather than by line number, so editing the
+		# comment above cannot silently truncate --help.
+		awk 'NR > 4 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 		exit 0
 		;;
 	*)
@@ -95,31 +123,63 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 stream="$work/govulncheck.json"
-PINNED_GO=""
+PINNED_TOOLCHAIN=""
+
+# Keep the raw stream wherever the caller asked for it. Called at every exit that has
+# one, INCLUDING a failed scan: the artifact upload in vuln-scheduled.yml runs
+# `if: always()` precisely so a failed run leaves something to read, and copying only
+# on success left it with nothing on exactly those runs.
+save_stream() {
+	if [ -n "$JSON_OUT" ] && [ -s "$stream" ]; then
+		cp "$stream" "$JSON_OUT"
+	fi
+}
 
 if [ -n "$JSON_IN" ]; then
+	if [ ! -r "$JSON_IN" ]; then
+		echo "govulncheck.sh: --json-in file not readable: $JSON_IN" >&2
+		exit 2
+	fi
 	cp "$JSON_IN" "$stream"
 else
-	VERSION=$(make -s --no-print-directory print-vulncheck-version)
+	# `set +e` around each probe for the reason need_value exists: a failing command
+	# substitution under `set -e` exits 1 with no diagnostic, which is the gate's own
+	# "vulnerability found" status. Let the emptiness check below produce the message.
+	set +e
+	VERSION=$(make -s --no-print-directory print-vulncheck-version 2>/dev/null)
+	set -e
 	if [ -z "$VERSION" ]; then
 		echo "govulncheck.sh: could not read GOVULNCHECK_VERSION from the Makefile" >&2
 		exit 2
 	fi
 
-	# Analyze with the toolchain the release actually ships, not whatever GOTOOLCHAIN
-	# resolves to. `go run pkg@version` honors the TOOL's own go directive, so an
-	# x/vuln release requiring a newer Go than our pin would switch the whole
-	# invocation -- and govulncheck reports stdlib advisories against the toolchain it
-	# loaded packages with, so the scan would be describing a Go that does not ship.
-	# Build the tool under GOTOOLCHAIN=auto (it must be allowed its own requirement),
-	# then run the SCAN pinned. The go_version assertion below proves it held.
-	PINNED_GO=$(awk '/^go /{print $2; exit}' go.mod)
-	if [ -z "$PINNED_GO" ]; then
-		echo "govulncheck.sh: could not read the 'go' directive from go.mod" >&2
+	# Analyze with the toolchain that actually builds this module, not whatever
+	# GOTOOLCHAIN resolves to for the TOOL. `go install pkg@version` honors x/vuln's own
+	# go directive, so a release of it requiring a newer Go than we build with would
+	# switch the whole invocation -- and govulncheck reports stdlib advisories against
+	# the toolchain it loaded packages with, so the scan would describe a Go that does
+	# not ship. Build the tool under GOTOOLCHAIN=auto (it must be allowed its own
+	# requirement), then run the SCAN pinned.
+	#
+	# Ask the go command which toolchain that is rather than parsing go.mod. The `go`
+	# directive is a LANGUAGE version, not a toolchain name: `go 1.27` is a legal
+	# two-component value that names no toolchain (pinning GOTOOLCHAIN=go1.27 fails, and
+	# the assertion below would then fail every PR), and a `toolchain` directive
+	# overrides it outright -- so a repo that added one would have this scan silently
+	# describing the wrong Go, the exact failure the assertion exists to catch. `go
+	# version` performs the same resolution the build does, honoring both directives.
+	set +e
+	PINNED_TOOLCHAIN=$(GOTOOLCHAIN=auto go version 2>/dev/null | awk '{print $3}')
+	set -e
+	case "$PINNED_TOOLCHAIN" in
+	go[0-9]*) ;;
+	*)
+		echo "govulncheck.sh: could not resolve the module's toolchain (got '$PINNED_TOOLCHAIN')" >&2
 		exit 2
-	fi
+		;;
+	esac
 
-	echo "govulncheck $VERSION, analyzing against go$PINNED_GO (go.mod pin)" >&2
+	echo "govulncheck $VERSION, analyzing against $PINNED_TOOLCHAIN" >&2
 	GOBIN="$work/bin" GOTOOLCHAIN=auto \
 		go install "golang.org/x/vuln/cmd/govulncheck@$VERSION"
 
@@ -128,19 +188,18 @@ else
 	# reach, a package it could not load) and must not read as "no findings" -- the
 	# whole point of this script is that a scan which did not happen is not a pass.
 	set +e
-	GOTOOLCHAIN="go$PINNED_GO" "$work/bin/govulncheck" -format json ./... >"$stream" 2>"$work/err"
+	GOTOOLCHAIN="$PINNED_TOOLCHAIN" "$work/bin/govulncheck" -format json ./... >"$stream" 2>"$work/err"
 	rc=$?
 	set -e
 	if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+		save_stream
 		echo "govulncheck.sh: govulncheck failed (exit $rc); the scan did not complete." >&2
 		cat "$work/err" >&2
 		exit 2
 	fi
 fi
 
-if [ -n "$JSON_OUT" ]; then
-	cp "$stream" "$JSON_OUT"
-fi
+save_stream
 
 # A stream with no config message is one that never started -- an empty file reads as
 # "clean" to every query below, so refuse it rather than reporting a vacuous pass.
@@ -150,8 +209,11 @@ if ! jq -e -s 'any(.[]; has("config"))' "$stream" >/dev/null 2>&1; then
 fi
 
 scanned_go=$(jq -r -s 'map(select(has("config")) | .config.go_version) | first // ""' "$stream")
-if [ -n "$PINNED_GO" ] && [ -n "$scanned_go" ] && [ "$scanned_go" != "go$PINNED_GO" ]; then
-	echo "govulncheck.sh: scan analyzed $scanned_go but go.mod pins go$PINNED_GO;" >&2
+# Both sides are toolchain names now (config.go_version reports one, and
+# PINNED_TOOLCHAIN came from `go version`), so this compares like with like. Skipped
+# under --json-in, where no scan ran and the stream's toolchain is the fixture's.
+if [ -n "$PINNED_TOOLCHAIN" ] && [ -n "$scanned_go" ] && [ "$scanned_go" != "$PINNED_TOOLCHAIN" ]; then
+	echo "govulncheck.sh: scan analyzed $scanned_go but this module builds with $PINNED_TOOLCHAIN;" >&2
 	echo "  stdlib findings would describe a toolchain that does not ship." >&2
 	exit 2
 fi

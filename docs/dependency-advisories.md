@@ -54,13 +54,27 @@ does not apply.
 
 ### Which toolchain the scan describes
 
-`scripts/govulncheck.sh` pins `GOTOOLCHAIN` to `go.mod`'s `go` directive for the scan and
-then asserts the stream's `config.go_version` came back as that version. `govulncheck`
-reports stdlib advisories against the toolchain it loaded packages with, and
-`go install pkg@version` honors the *tool's* own `go` directive — so a future `x/vuln`
-requiring a newer Go than the pin would otherwise switch the whole invocation and the scan
-would be describing a Go that does not ship. The assertion turns that from an assumption
-into a check.
+`scripts/govulncheck.sh` pins `GOTOOLCHAIN` to the toolchain that actually builds this
+module for the duration of the scan, then asserts the stream's `config.go_version` came
+back as that toolchain. `govulncheck` reports stdlib advisories against the toolchain it
+loaded packages with, and `go install pkg@version` honors the *tool's* own `go` directive
+— so a future `x/vuln` requiring a newer Go than we build with would otherwise switch the
+whole invocation and leave the scan describing a Go that does not ship. The assertion
+turns that from an assumption into a check.
+
+Which toolchain that is comes from `go version` rather than from parsing `go.mod`. The
+`go` directive is a **language** version, not a toolchain name, and the two differ in
+ways that matter here:
+
+- `go 1.27` is a legal two-component value naming no toolchain (releases are `go1.27.0`),
+  so using it as a `GOTOOLCHAIN` name fails outright — and comparing it against
+  `config.go_version` would fail the assertion on every pull request.
+- A `toolchain` directive overrides the `go` directive entirely, so a repo that added one
+  would have the scan silently pinned to the wrong Go — precisely the failure the
+  assertion exists to catch.
+
+`go version` performs the same resolution the build does, honoring both directives, so
+both sides of the comparison are toolchain names.
 
 ## Register of non-called findings
 

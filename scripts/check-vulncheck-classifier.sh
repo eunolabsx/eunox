@@ -90,6 +90,54 @@ else
 	fail=1
 fi
 
+# Bad input must exit 2, never 1. Exit 1 is the gate's "a called advisory in a module we
+# depend on" status, so a usage error that borrows it reads as a vulnerability finding --
+# and a missing operand falling through to `shift 2` under `set -e` did exactly that,
+# silently. Each of these is a distinct way to get there.
+check_usage_error() { # check_usage_error <label> <args...>
+	local label="$1"
+	shift
+	local out rc
+	set +e
+	out=$("$CLASSIFIER" "$@" 2>&1)
+	rc=$?
+	set -e
+	if [ "$rc" -eq 2 ]; then
+		echo "ok   usage/$label (exit 2)"
+	else
+		echo "FAIL usage/$label: exit $rc, want 2 (a usage error must not borrow the gate's exit 1)" >&2
+		echo "$out" >&2
+		fail=1
+	fi
+}
+
+check_usage_error missing-mode-value --mode
+check_usage_error missing-json-in-value --json-in
+check_usage_error missing-json-out-value --json-out
+check_usage_error missing-summary-out-value --summary-out
+check_usage_error bad-mode --mode nonsense
+check_usage_error unreadable-json-in --json-in "$DATA/does-not-exist.json"
+check_usage_error unknown-flag --frobnicate
+
+# Relative output paths belong to the CALLER's directory, not the repository root the
+# script cd's to -- otherwise a local run writes into the tree, and can overwrite a
+# tracked file that happens to share the name.
+repo_root=$PWD
+outdir=$(mktemp -d)
+(
+	cd "$outdir"
+	"$repo_root/scripts/govulncheck.sh" --mode report \
+		--json-in "$repo_root/scripts/testdata/govulncheck-clean.json" \
+		--json-out relative-out.json --summary-out relative-summary.md >/dev/null
+)
+if [ -f "$outdir/relative-out.json" ] && [ -f "$outdir/relative-summary.md" ]; then
+	echo "ok   relative-output-paths (resolved against the caller's cwd)"
+else
+	echo "FAIL relative-output-paths: outputs did not land in the caller's cwd ($outdir)" >&2
+	fail=1
+fi
+rm -rf "$outdir"
+
 if [ "$fail" -ne 0 ]; then
 	echo "govulncheck classifier: FAILED" >&2
 	exit 1
