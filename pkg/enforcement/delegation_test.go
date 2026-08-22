@@ -224,8 +224,9 @@ func TestDelegation_NoChainChangesNothing(t *testing.T) {
 // label there could only ever have added denials). Dropping a FORCED one removes taint, so a
 // sink that should have refused the delegate's call allows it.
 //
-// ValidateDelegationChain refuses such a token at the boundary, so this fires only for an
-// embedder that built a chain without it — which is exactly the population a silent
+// Both token-boundary entry points refuse such a grant — ParseDelegationGrants as it decodes
+// the claim, ValidateDelegationChain as it assembles the chain — so this fires only for an
+// embedder that reached the engine through neither, which is exactly the population a silent
 // normalization leaves unprotected, and the reason the sibling checks in this package surface
 // against the RAW authored values too.
 func TestDelegation_UnknownForcedLabelDeniesRatherThanNormalizingAway(t *testing.T) {
@@ -259,13 +260,18 @@ func TestDelegation_UnknownForcedLabelDeniesRatherThanNormalizingAway(t *testing
 		assert.Contains(t, resp.Denial.Message, "quarantined", "the refusal must name the label it could not honor")
 	})
 
-	t.Run("the claim parser refuses the same grant outright", func(t *testing.T) {
-		// The shipped path, and where the boundary check actually lives: grant well-formedness
-		// is asserted by ParseDelegationGrants as it decodes the claim, NOT by
-		// ValidateDelegationChain, which only checks that the hops line up and narrow. That is
-		// what makes the decision-path check a backstop rather than a duplicate — a chain
-		// assembled any other way reaches the engine having passed no label check at all.
+	t.Run("the token boundary refuses the same grant outright", func(t *testing.T) {
+		// Both halves of the boundary, because a caller may reach either: ParseDelegationGrants
+		// asserts the grant as it decodes the claim, and ValidateDelegationChain re-asserts it
+		// for a chain assembled any other way. That is what makes the decision-path check above
+		// a backstop rather than the only check — it fires for an embedder that skips both.
 		_, err := capability.ParseDelegationGrants([]byte(`[{"subject":"agent-a","labels":["quarantined"]}]`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "quarantined")
+
+		_, err = capability.ValidateDelegationChain(nil, []capability.DelegationGrant{
+			{Subject: "agent-a", Labels: []string{"quarantined"}},
+		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "quarantined")
 	})
