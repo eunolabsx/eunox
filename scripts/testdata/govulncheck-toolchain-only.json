@@ -1,0 +1,29 @@
+{"config":{"protocol_version":"v1.0.0","scanner_name":"govulncheck","scanner_version":"v1.4.0","db":"https://vuln.go.dev","go_version":"go1.26.5","scan_level":"symbol","scan_mode":"source"}}
+{"progress":{"message":"Scanning your code and its dependencies..."}}
+{"osv":{"id":"GO-2026-5026","summary":"Invoking failure to reject ASCII-only Punycode-encoded labels in golang.org/x/net/idna"}}
+{"finding":{"osv":"GO-2026-5026","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5"}]}}
+{"finding":{"osv":"GO-2026-5026","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"net/http"}]}}
+{"finding":{"osv":"GO-2026-5026","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"net/http","function":"Client.Do"},{"module":"github.com/eunolabs/eunox","package":"github.com/eunolabs/eunox/internal/transport","function":"DoMCPHTTP"}]}}
+{"osv":{"id":"GO-2026-5972","summary":"Enforce maximum recursion depth in encoding/asn1"}}
+{"finding":{"osv":"GO-2026-5972","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5"}]}}
+{"finding":{"osv":"GO-2026-5972","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"encoding/asn1"}]}}
+{"finding":{"osv":"GO-2026-5972","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"encoding/asn1","function":"Unmarshal"},{"module":"github.com/eunolabs/eunox","package":"github.com/eunolabs/eunox/internal/audit","function":"Sink.Close"}]}}
+{"osv":{"id":"GO-2026-6089","summary":"Denial of service in net/http"}}
+{"finding":{"osv":"GO-2026-6089","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5"}]}}
+{"finding":{"osv":"GO-2026-6089","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"net/http"}]}}
+{"finding":{"osv":"GO-2026-6089","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"net/http","function":"Server.Serve"},{"module":"github.com/eunolabs/eunox","package":"github.com/eunolabs/eunox/internal/transport","function":"HTTPProxy.Serve"}]}}
+{"osv":{"id":"GO-2026-6090","summary":"Panic on malformed handshake in crypto/tls"}}
+{"finding":{"osv":"GO-2026-6090","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5"}]}}
+{"finding":{"osv":"GO-2026-6090","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"crypto/tls"}]}}
+{"finding":{"osv":"GO-2026-6090","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"crypto/tls","function":"Conn.Handshake"},{"module":"github.com/eunolabs/eunox","package":"github.com/eunolabs/eunox/internal/transport","function":"DoMCPHTTP"}]}}
+{"osv":{"id":"GO-2026-6218","summary":"Incorrect path resolution in net/url"}}
+{"finding":{"osv":"GO-2026-6218","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5"}]}}
+{"finding":{"osv":"GO-2026-6218","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"net/url"}]}}
+{"finding":{"osv":"GO-2026-6218","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"net/url","function":"URL.Parse"},{"module":"github.com/eunolabs/eunox","package":"github.com/eunolabs/eunox/internal/config","function":"LoadGatewayConfig"}]}}
+{"osv":{"id":"GO-2026-5942","summary":"Misleading results from cgo resolver in net"}}
+{"finding":{"osv":"GO-2026-5942","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5"}]}}
+{"finding":{"osv":"GO-2026-5942","fixed_version":"go1.26.6","trace":[{"module":"stdlib","version":"go1.26.5","package":"net"}]}}
+{"osv":{"id":"GO-2026-6179","summary":"Fix transparency log tile verification bypass in golang.org/x/mod/sumdb/tlog"}}
+{"finding":{"osv":"GO-2026-6179","fixed_version":"v0.40.0","trace":[{"module":"golang.org/x/mod","version":"v0.21.0"}]}}
+{"osv":{"id":"GO-2026-6180","summary":"Ignore unrelated, unauthenticated hashes in Lookup in golang.org/x/mod/sumdb"}}
+{"finding":{"osv":"GO-2026-6180","fixed_version":"v0.40.0","trace":[{"module":"golang.org/x/mod","version":"v0.21.0"}]}}

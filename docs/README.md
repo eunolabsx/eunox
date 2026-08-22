@@ -25,6 +25,7 @@ Design and operational documentation for `eunox`.
 | [interface-pinning-tier2.md](./interface-pinning-tier2.md) | Tier-2 interface pinning: auto-baselining every advertised tool surface per session and denying mid-session drift, plus the honest limit on what metadata comparison cannot catch. |
 | [../registry/README.md](../registry/README.md) | The effect-contract registry: corpus format, trust model (package signing, not behavioral verification), and how a manifest pins an entry. |
 | [threat-model-mcp.md](./threat-model-mcp.md) | Security threat model for the `eunox` proxy. |
+| [dependency-advisories.md](./dependency-advisories.md) | How the vulnerability scan is split — which advisories gate a pull request, which go to the scheduled run's tracking issue — plus the standing record for every finding the gate does not fail on. |
 | [deployment-hardening.md](./deployment-hardening.md) | Making eunox a mandatory enforcement chokepoint: credential, network, and endpoint controls that prevent direct-to-upstream bypass. |
 | [whitepaper/deploymentwhitepaper.pdf](./whitepaper/deploymentwhitepaper.pdf) | Deployment whitepaper (PDF) — the printable companion to `deployment-hardening.md`. |
 | [Capability Manifest Specification](https://github.com/eunolabs/agent-capability-manifest) | The normative spec — published as a standalone vendor-neutral repo (Apache-2.0). |
