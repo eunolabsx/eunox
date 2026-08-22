@@ -144,6 +144,21 @@ var ErrIncompleteEnumeration = redisutil.ErrIncompleteFanOut
 // siblings: a declaration that contradicts the client is a wiring bug, and it never heals.
 var ErrTopologyContradicted = errors.New("killswitch: the declared keyspace topology contradicts the Redis client's own type; failing closed (drop the declaration, or pass the client the declaration describes)")
 
+// ErrPublishFailed marks a failure that happened AFTER the durable write already landed: the
+// revocation (or its undo) is in Redis and every replica converges on its next reconcile tick,
+// but the real-time pub/sub notification did not go out.
+//
+// Distinguishable rather than returned bare, because a caller whose whole question is "did the
+// revocation land" — `eunox kill`'s exit contract, /control/kill's status — cannot tell a lost
+// notification from a lost kill through an undifferentiated error, and answering "it failed"
+// for a kill that is durably written is the wrong direction on the emergency-stop path. On a
+// minimally-privileged Redis ACL granting SET/DEL/SCAN but not PUBLISH, every kill reports
+// failure forever while in fact landing.
+//
+// Wrapped around the cause, so a caller that wants the underlying Redis error still reaches it
+// with errors.Is/As.
+var ErrPublishFailed = errors.New("killswitch: kill-switch state was written durably, but the pub/sub notification failed")
+
 // Redis is a Redis-backed kill-switch manager with pub/sub propagation and local cache.
 type Redis struct {
 	client redis.Cmdable
@@ -1088,8 +1103,15 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 //
 // No wiringErr check of its own: every caller returns on it before reaching a durable write,
 // so one here could only ever be dead code that reads as a live guard.
+//
+// That same "the durable write already happened" precondition is what makes this the one place
+// ErrPublishFailed is stamped: wrapping at each caller would be four copies of a judgment this
+// function's own contract already states, and the next writer added would inherit the bare error.
 func (r *Redis) publish(ctx context.Context, msg string) error {
-	return r.client.Publish(ctx, redisPubSubChan, msg).Err()
+	if err := r.client.Publish(ctx, redisPubSubChan, msg).Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrPublishFailed, err)
+	}
+	return nil
 }
 
 // recordRefreshErr stores err as the last refresh error and returns it, so the refresh's

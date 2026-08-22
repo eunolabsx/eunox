@@ -19,6 +19,7 @@ import (
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
 // writeJSONMsg sets the JSON content type and encodes v as the response body. Status-less:
@@ -156,6 +157,15 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 // the one leaving no trace. The other two legs are benign lifecycle races, not attack
 // signal, so they stay status-only.
 func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
+	// Re-arm before ANY of the writes below. The initialize arm armed one window covering
+	// establishment, but a failure path spends time that window does not budget for: a drift
+	// refusal runs sess.close synchronously, whose worst case is two sequential shutdown
+	// budgets, and the ctx-expiry arm adds another bounded wait on top. At a large
+	// --shutdown-timeout against a SIGTERM-ignoring subprocess the deadline is already past by
+	// the time the 500 carrying the drift refusal is written, so the one outcome the startup
+	// drift check exists to deliver reaches the host as a connection error instead. This is the
+	// teardown-shaped write the teardown re-arm (built for DELETE and /control/kill) missed.
+	rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	switch {
 	case errors.Is(err, errSessionLimit):
 		p.recordSessionCapDeny(ctx, r, route)
@@ -292,6 +302,10 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			return
 		}
 		w.Header().Set(SessionHeader, sess.id)
+		// Re-arm before the success write too, so the entry arm's claim that the actual encode
+		// always arms a fresh window holds for this arm as well: establishment may have spent
+		// the whole start budget, leaving the window armed for it exhausted at encode time.
+		rearmWriteDeadlineFor(w, startBudget)
 		// Answered directly, not through dispatchInitialize's kill gate: the global-dimension
 		// CheckKill already ran above, and the session id minted here is brand new, so it
 		// can't yet be a per-session kill target.
@@ -1043,9 +1057,10 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.All {
 		// Propagate a kill-store write failure (fail closed): returning {"ok":true} on a
-		// failed emergency stop would leave the operator believing the system is safe.
-		if err := p.ks.ActivateGlobal(r.Context()); err != nil {
-			_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch activation failed: %v\n", err)
+		// failed emergency stop would leave the operator believing the system is safe. Which
+		// errors are that failure, and which mean the stop landed and only its notification
+		// did not, is killWriteLanded's question.
+		if err := p.ks.ActivateGlobal(r.Context()); !p.killWriteLanded("activation", err) {
 			http.Error(w, "kill switch activation failed", http.StatusInternalServerError)
 			return
 		}
@@ -1073,8 +1088,7 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sessionId or all required", http.StatusBadRequest)
 		return
 	}
-	if err := p.ks.KillSession(r.Context(), body.SessionID); err != nil {
-		_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch session kill failed: %v\n", err)
+	if err := p.ks.KillSession(r.Context(), body.SessionID); !p.killWriteLanded("session kill", err) {
 		http.Error(w, "kill switch session kill failed", http.StatusInternalServerError)
 		return
 	}
@@ -1086,6 +1100,35 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	// which does not run when sessionIdleTimeoutMs is 0 — see teardownSessionByID.
 	p.teardownSessionByID(body.SessionID) //nolint:contextcheck // teardown path: close()'s upstream session-termination DELETE intentionally uses a detached, bounded background context. Same rationale as the handleMCPDelete close() site.
 	p.writeKillResponse(w, body.SessionID, killDimensionSession)
+}
+
+// killWriteLanded reports whether a kill-store write took effect, and writes the operator
+// line for the two ways it may not have fully done so.
+//
+// killswitch.ErrPublishFailed is the reason this is not a plain err != nil: the durable write
+// LANDED and only the real-time notification to other instances was lost, so the stop is in
+// force on this proxy and every replica converges on its next reconcile tick. Answering 500
+// there would tell the operator their emergency stop failed when it did not — the same
+// mis-report `eunox kill --redis-addr` made, reached through the other transport, and the
+// direction that invites concluding the system is unstopped. The teardown below still runs,
+// which is the local half of the kill and the half this response is really about.
+//
+// The line stays unmetered for the reason its declaration states: /control/kill requires the
+// control token, so no peer can drive it.
+func (p *HTTPProxy) killWriteLanded(what string, err error) bool {
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, killswitch.ErrPublishFailed):
+		// The tick is named by its FLAG, not by a duration: convergence happens on each OTHER
+		// instance's own --killswitch-reconcile-interval, which this process does not know and
+		// which is not this process's default merely because the default is what it would print.
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch %s is written durably, but real-time propagation to other instances failed: %v. Each converges on its next reconcile tick (--killswitch-reconcile-interval).\n", what, err)
+		return true
+	default:
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] kill switch %s failed: %v\n", what, err)
+		return false
+	}
 }
 
 // killScopeAll is the scope recorded (and returned) for a whole-proxy emergency stop,

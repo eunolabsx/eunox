@@ -534,31 +534,138 @@ func (f publishFailCmdable) Publish(_ context.Context, _ string, _ interface{}) 
 	return goredis.NewIntResult(0, f.pubErr)
 }
 
-// TestReviveViaRedis_PublishOnlyFailureIsReportedAsError pins the CURRENT behavior
-// when the durable write already landed but the follow-up PUBLISH fails: reviveViaRedis
-// still returns a hard error, even though killswitch.Redis has already applied the
-// revive/deactivation and every live proxy will observe it (immediately via a healthy
-// subscriber, or at the latest on the next reconcile tick). This split has no dedicated
-// coverage at the CLI layer — TestReviveViaRedis_BackendErrorsAreReported only exercises
-// a connection failure, where the write itself also fails. Pinning it here means a
-// future change to how reviveViaRedis reports this split (e.g. distinguishing it from a
-// genuine failed write) is a deliberate test update, not a silent behavior change.
-func TestReviveViaRedis_PublishOnlyFailureIsReportedAsError(t *testing.T) {
+// TestReviveViaRedis_PublishOnlyFailureIsSuccessWithAWarning pins the split this command's
+// exit contract turns on: the durable write LANDED and only the follow-up PUBLISH failed.
+//
+// This used to be reported as a hard error, which contradicted the documented contract ("0 =
+// the revocation was written to Redis") for a write that is in fact in Redis and converges on
+// every live proxy's next reconcile tick. On a Redis ACL granting SET/DEL/SCAN but not
+// PUBLISH, that made every kill and every revive report failure forever while taking effect —
+// the worst direction to be wrong in on the emergency-stop path, since the operator's next
+// conclusion is that nothing was revoked. The degradation is not swallowed: it is announced on
+// stderr, leaving stdout the machine-readable result line.
+func TestReviveViaRedis_PublishOnlyFailureIsSuccessWithAWarning(t *testing.T) {
 	errPublishOnly := errors.New("publish-only failure")
 	// WithSingleNodeKeyspace because a fake Cmdable is a concrete type killswitch cannot
 	// classify, and an unclassifiable client is refused outright (ErrUnknownTopology) rather
 	// than assumed single-node. This double stands in for one server, so it says so.
 	ks := killswitch.NewRedis(publishFailCmdable{pubErr: errPublishOnly}, killswitch.WithSingleNodeKeyspace())
 
-	err := reviveViaRedis(context.Background(), ks, killTarget{kind: killTargetSession, id: "sess-1"})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "revive session")
-	require.ErrorIs(t, err, errPublishOnly)
+	for _, tc := range []struct {
+		name   string
+		target killTarget
+		verb   string
+	}{
+		{name: "session", target: killTarget{kind: killTargetSession, id: "sess-1"}, verb: "revive session"},
+		{name: "global", target: killTarget{kind: killTargetGlobal}, verb: "deactivate global kill switch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			stdout := captureStdout(t, func() {
+				stderr := captureStderr(t, func() {
+					err = reviveViaRedis(context.Background(), ks, tc.target)
+				})
+				require.Contains(t, stderr, tc.verb, "the warning must name the operation it is about")
+				require.Contains(t, stderr, "IS written", "the warning's whole job is to say the revocation landed")
+				require.Contains(t, stderr, errPublishOnly.Error(), "the cause stays reachable for an operator diagnosing the ACL")
+				// The FLAG, never a duration: convergence happens on each running proxy's own
+				// --killswitch-reconcile-interval, and this command holds no proxy's config,
+				// so printing its own default would state a number that is wrong for exactly
+				// the deployment that tuned it.
+				require.Contains(t, stderr, "--killswitch-reconcile-interval")
+				require.NotContains(t, stderr, killswitch.DefaultReconcileInterval.String())
+			})
+			require.NoError(t, err, "a lost pub/sub notification is not a failed revocation")
+			require.Contains(t, stdout, `"ok":true`, "stdout stays the machine-readable result line")
+		})
+	}
+}
 
-	err = reviveViaRedis(context.Background(), ks, killTarget{kind: killTargetGlobal})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "deactivate global kill switch")
-	require.ErrorIs(t, err, errPublishOnly)
+// TestKillWriteOutcome_SeparatesALostNotificationFromALostKill covers the KILL direction of
+// the same split, at the one seam runRedisKill's arms all pass through — runRedisKill itself
+// dials from an address and admits no double.
+//
+// The three arms are the whole contract: a clean write is silent success, a write that landed
+// but did not propagate is success plus a stderr warning, and anything else stays the hard
+// failure the exit contract's 1 is for.
+func TestKillWriteOutcome_SeparatesALostNotificationFromALostKill(t *testing.T) {
+	errPublishOnly := errors.New("publish-only failure")
+	ks := killswitch.NewRedis(publishSetFailCmdable{pubErr: errPublishOnly}, killswitch.WithSingleNodeKeyspace())
+
+	t.Run("a clean write says nothing", func(t *testing.T) {
+		var err error
+		stderr := captureStderr(t, func() { err = killWriteOutcome("kill session \"s\"", nil) })
+		require.NoError(t, err)
+		require.Empty(t, stderr)
+	})
+
+	t.Run("a failure that is not a lost notification stays hard", func(t *testing.T) {
+		boom := errors.New("connection refused")
+		err := killWriteOutcome("kill session \"s\"", boom)
+		require.Error(t, err)
+		require.ErrorIs(t, err, boom)
+		require.Contains(t, err.Error(), `kill session "s"`)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		verb   string
+		write  func() error
+		target killTarget
+	}{
+		{
+			name:   "session",
+			verb:   `kill session "sess-1"`,
+			write:  func() error { return ks.KillSession(context.Background(), "sess-1") },
+			target: killTarget{kind: killTargetSession, id: "sess-1"},
+		},
+		{
+			name:   "agent",
+			verb:   `kill agent "agent-1"`,
+			write:  func() error { return ks.KillAgent(context.Background(), "agent-1") },
+			target: killTarget{kind: killTargetAgent, id: "agent-1"},
+		},
+		{
+			name:   "global",
+			verb:   "activate global kill switch",
+			write:  func() error { return ks.ActivateGlobal(context.Background()) },
+			target: killTarget{kind: killTargetGlobal},
+		},
+	} {
+		t.Run(tc.name+" landed but did not propagate", func(t *testing.T) {
+			var err error
+			stdout := captureStdout(t, func() {
+				stderr := captureStderr(t, func() {
+					if err = killWriteOutcome(tc.verb, tc.write()); err == nil {
+						printRedisResult("killed", tc.target)
+					}
+				})
+				require.Contains(t, stderr, tc.verb)
+				require.Contains(t, stderr, "IS written")
+				require.Contains(t, stderr, errPublishOnly.Error())
+				require.Contains(t, stderr, "--killswitch-reconcile-interval")
+				require.NotContains(t, stderr, killswitch.DefaultReconcileInterval.String())
+			})
+			require.NoError(t, err, "a lost pub/sub notification is not a failed kill")
+			require.Contains(t, stdout, `"ok":true`)
+		})
+	}
+}
+
+// publishSetFailCmdable is publishFailCmdable for the KILL direction, which writes with Set
+// rather than Del. Kept separate rather than widened: a double that answers both is one a
+// revive test could pass against while never touching the command it claims to model.
+type publishSetFailCmdable struct {
+	goredis.Cmdable
+	pubErr error
+}
+
+func (f publishSetFailCmdable) Set(_ context.Context, _ string, _ interface{}, _ time.Duration) *goredis.StatusCmd {
+	return goredis.NewStatusResult("OK", nil)
+}
+
+func (f publishSetFailCmdable) Publish(_ context.Context, _ string, _ interface{}) *goredis.IntCmd {
+	return goredis.NewIntResult(0, f.pubErr)
 }
 
 // mustGet reads a key that the test requires to exist.

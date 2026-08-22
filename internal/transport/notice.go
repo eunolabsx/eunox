@@ -547,7 +547,7 @@ var unmeteredNotices = map[noticeFunc]noticeDeclaration{
 	"NewHTTPProxyGateway":                {bound: noticeExempt, why: exemptNotPeerDriven},
 	"BuildRoutes":                        {bound: noticeExempt, why: exemptNotPeerDriven},
 	"DeleteMCPHTTPSession":               {bound: noticeExempt, why: exemptNotPeerDriven},
-	"*HTTPProxy.handleKill":              {bound: noticeExempt, why: exemptNotPeerDriven},
+	"*HTTPProxy.killWriteLanded":         {bound: noticeExempt, why: exemptNotPeerDriven},
 	"printRemoteUpstreamNotice":          {bound: noticeExempt, why: exemptNotPeerDriven},
 	"PrintRoutePolicyNotices":            {bound: noticeExempt, why: exemptNotPeerDriven},
 	"*StdioProxy.signalUpstream":         {bound: noticeExempt, why: exemptNotPeerDriven},

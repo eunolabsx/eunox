@@ -76,6 +76,10 @@ revocation channel: it is a single process, so stop that process to halt it.
 
 Exit codes:
   0  The revocation (or --revive) was accepted by the proxy or written to Redis.
+     This includes the case where the write landed but the real-time
+     notification to other instances did not: the state is durable and every
+     running proxy converges on its next reconcile tick, so the kill takes
+     effect and the degradation is reported on stderr rather than as a failure.
   1  Anything else. Unlike the binary's other subcommands, kill does NOT split
      usage errors out as 2: the only question its caller has under pressure is
      whether the kill landed, and a second failure code would invite a script
@@ -371,20 +375,20 @@ func runRedisKill(req redisKillRequest) error {
 	}
 	switch req.target.kind {
 	case killTargetGlobal:
-		if err := ks.ActivateGlobal(ctx); err != nil {
-			return fmt.Errorf("activate global kill switch: %w", err)
+		if err := killWriteOutcome("activate global kill switch", ks.ActivateGlobal(ctx)); err != nil {
+			return err
 		}
 		printRedisResult("killed", req.target)
 	case killTargetSession:
-		if err := ks.KillSession(ctx, req.target.id); err != nil {
-			return fmt.Errorf("kill session %q: %w", req.target.id, err)
+		if err := killWriteOutcome(fmt.Sprintf("kill session %q", req.target.id), ks.KillSession(ctx, req.target.id)); err != nil {
+			return err
 		}
 		printRedisResult("killed", req.target)
 	case killTargetAgent:
 		// Agent kills never expire — an identity revoked for cause should not be
 		// re-admitted by a clock.
-		if err := ks.KillAgent(ctx, req.target.id); err != nil {
-			return fmt.Errorf("kill agent %q: %w", req.target.id, err)
+		if err := killWriteOutcome(fmt.Sprintf("kill agent %q", req.target.id), ks.KillAgent(ctx, req.target.id)); err != nil {
+			return err
 		}
 		printRedisResult("killed", req.target)
 		// The kill is only CONSULTED where the proxy validates JWTs (--jwks-uri, HTTP);
@@ -412,22 +416,22 @@ const sessionKillTTLLookupTimeout = 3 * time.Second
 func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget) error {
 	switch target.kind {
 	case killTargetGlobal:
-		if err := ks.DeactivateGlobal(ctx); err != nil {
-			return fmt.Errorf("deactivate global kill switch: %w", err)
+		if err := killWriteOutcome("deactivate global kill switch", ks.DeactivateGlobal(ctx)); err != nil {
+			return err
 		}
 		printRedisResultWithNote("revived", target,
 			"per-session and per-agent kills are unaffected; revive those by id")
 	case killTargetAgent:
 		// The undo for a kill that never expires otherwise.
-		if err := ks.ReviveAgent(ctx, target.id); err != nil {
-			return fmt.Errorf("revive agent %q: %w", target.id, err)
+		if err := killWriteOutcome(fmt.Sprintf("revive agent %q", target.id), ks.ReviveAgent(ctx, target.id)); err != nil {
+			return err
 		}
 		printRedisResult("revived", target)
 	case killTargetSession:
 		// Idempotent: an id never killed (or already expired) deletes nothing and still
 		// succeeds, so the command is safe to re-run.
-		if err := ks.ReviveSession(ctx, target.id); err != nil {
-			return fmt.Errorf("revive session %q: %w", target.id, err)
+		if err := killWriteOutcome(fmt.Sprintf("revive session %q", target.id), ks.ReviveSession(ctx, target.id)); err != nil {
+			return err
 		}
 		printRedisResult("revived", target)
 	default:
@@ -435,6 +439,37 @@ func reviveViaRedis(ctx context.Context, ks *killswitch.Redis, target killTarget
 		return fmt.Errorf("internal: unhandled kill target kind %d (%s); refusing to guess which kill dimension was meant", target.kind, target.dimension())
 	}
 	return nil
+}
+
+// killWriteOutcome folds one kill/revive write into the only question this command's exit
+// contract answers: did the revocation land in the shared state. what names the operation for
+// the failure message ("kill session \"x\"").
+//
+// killswitch.ErrPublishFailed means it DID land — the durable write succeeded and only the
+// real-time pub/sub notification was lost, so every live proxy picks the kill up on its next
+// reconcile tick. Returning that as a failure contradicted the documented exit contract ("0 =
+// the revocation was written to Redis") and, on a Redis ACL granting SET/DEL/SCAN but not
+// PUBLISH, made every kill report failure forever while in fact taking effect — the worst
+// direction to be wrong in on an emergency stop, since the operator's next move is to assume
+// nothing was revoked.
+//
+// The degradation is announced on stderr; stdout keeps the machine-readable result line, the
+// same split resolveSessionKillTTL's fallbacks use.
+func killWriteOutcome(what string, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, killswitch.ErrPublishFailed):
+		// The tick is named by its FLAG rather than by a duration. Convergence happens on each
+		// running PROXY's own --killswitch-reconcile-interval, and this command has no proxy's
+		// configuration in hand — printing its own default would state a number that is wrong
+		// for exactly the deployment that tuned it, in the message an operator acts on.
+		fmt.Fprintf(os.Stderr, "eunox kill: %s: the revocation IS written to the shared Redis state, but the real-time notification to running proxies failed (%v). Each running proxy converges on its next reconcile tick (--killswitch-reconcile-interval), so the kill still takes effect and this does not need re-running.\n",
+			what, err)
+		return nil
+	default:
+		return fmt.Errorf("%s: %w", what, err)
+	}
 }
 
 // printRedisResult writes the {"ok":true,"<verb>":<id>,"dimension":...,"via":"redis"} line,

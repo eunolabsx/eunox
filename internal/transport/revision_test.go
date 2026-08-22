@@ -530,3 +530,94 @@ func TestCheckDeclarationReachesUpstream(t *testing.T) {
 		})
 	}
 }
+
+// TestRevisionRefusalReason_EveryAllowlistedSentinelReachesThePeer pins the allowlist against
+// the one way it silently fails: a refusal whose text was written to name a cause, collapsed to
+// the opaque fallback because its sentinel was never added.
+//
+// That is what happened to errUndeclaredOnDeclaringLeg. Its own doc says "Refusing here names
+// the cause", its text satisfies the allowlist's stated criterion (fixed prose plus revision
+// names from a closed set), and a host pinned to a declaring revision that omitted the
+// per-request declaration nonetheless got "protocol revision could not be established" —
+// telling a peer with a mechanically fixable request nothing about what to fix.
+//
+// Each case is produced by resolveHostRevision rather than constructed here, so an error the
+// allowlist matches but the resolver no longer returns fails as a dead entry.
+func TestRevisionRefusalReason_EveryAllowlistedSentinelReachesThePeer(t *testing.T) {
+	t.Parallel()
+
+	smuggled := `{"name":"read_file","_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`
+
+	cases := []struct {
+		name       string
+		contextRev capability.Revision
+		legRev     capability.Revision
+		msg        mcp.RPCMsg
+		sentinel   error
+		// names is a fragment the echoed reason must carry: the thing a peer needs in order to
+		// act on the refusal, which the fallback string cannot carry for any of them.
+		names string
+	}{
+		{
+			name:       "declaration disagreeing with the context",
+			contextRev: capability.Revision20251125,
+			msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: metaParams(t, "2026-07-28", map[string]any{"name": "read_file"})},
+			sentinel:   errRevisionMismatch,
+			names:      "2026-07-28",
+		},
+		{
+			name:     "a revision this build does not speak",
+			msg:      mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: metaParams(t, "1999-01-01", map[string]any{"name": "read_file"})},
+			sentinel: mcp.ErrUnknownRevision,
+			names:    "1999-01-01",
+		},
+		{
+			name:       "a revision the upstream leg is not addressed as",
+			contextRev: capability.Revision20260728,
+			legRev:     capability.Revision20251125,
+			msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: metaParams(t, "2026-07-28", map[string]any{"name": "read_file"})},
+			sentinel:   errUnhonorableUpstreamRevision,
+			names:      "2026-07-28",
+		},
+		{
+			name:       "params this build alone refused, reaching the upstream unread",
+			contextRev: capability.Revision20251125,
+			legRev:     capability.Revision20251125,
+			msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsList, Params: json.RawMessage(smuggled)},
+			sentinel:   errUndecodableForwardedParams,
+			names:      "could not be decoded",
+		},
+		{
+			// The entry that was missing. What a peer needs is the member's exact spelling, so
+			// that is what the reason has to reach it carrying.
+			name:       "inherited on a leg whose revision requires a declaration",
+			contextRev: capability.Revision20260728,
+			legRev:     capability.Revision20260728,
+			msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall, Params: metaParams(t, nil, map[string]any{"name": "read_file"})},
+			sentinel:   errUndeclaredOnDeclaringLeg,
+			names:      capability.MetaKeyProtocolVersion,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := resolveHostRevision(tc.contextRev, tc.legRev, tc.msg)
+			if !errors.Is(err, tc.sentinel) {
+				t.Fatalf("err = %v, want %v", err, tc.sentinel)
+			}
+			reason := revisionRefusalReason(err)
+			if reason != err.Error() {
+				t.Fatalf("reason = %q, want the sentinel's own text %q — an allowlist miss reads exactly like this", reason, err.Error())
+			}
+			if !strings.Contains(reason, tc.names) {
+				t.Errorf("reason = %q, want it to name %q", reason, tc.names)
+			}
+		})
+	}
+
+	// The other half of the allowlist: anything NOT on it collapses, so an error carrying an
+	// unreviewed (possibly caller-supplied) string cannot be echoed by being added later.
+	if got := revisionRefusalReason(errors.New("some upstream said: " + strings.Repeat("x", 40))); got != "protocol revision could not be established" {
+		t.Errorf("unlisted error echoed %q, want the fixed fallback", got)
+	}
+}
