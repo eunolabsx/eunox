@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // audit-verify: re-verify the local audit log's per-record HMAC signatures and its
-// tamper-evident chain, across the base log and every rotated sibling.
+// tamper-evident chain, across the base log and every rotated sibling — and, with
+// --audit-log passed once per enforcement point, across several tapes as several
+// INDEPENDENT chains (see audit_verify_join.go).
 
 package main
 
@@ -40,10 +42,12 @@ func loadConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *strin
 	return cfg, nil
 }
 
-// applyConfigAuditDefaults is loadConfigAuditDefaults for readers that abort on an
-// unloadable config (audit-verify, stats, suggest); doctor deliberately does not use this.
-func applyConfigAuditDefaults(cmdName, configPath string, logPath, keyPath *string) error {
-	_, err := loadConfigAuditDefaults(cmdName, configPath, logPath, keyPath)
+// applyConfigAuditDefaults is loadConfigAuditDefaults for the readers that abort on an
+// unloadable config and take no key of their own (stats, suggest); doctor deliberately does
+// not use this, and audit-verify takes applyConfigAuditDefaultsList instead — its
+// --audit-log/--audit-key-path are repeatable, so the default fills a LIST.
+func applyConfigAuditDefaults(cmdName, configPath string, logPath *string) error {
+	_, err := loadConfigAuditDefaults(cmdName, configPath, logPath, nil)
 	return err
 }
 
@@ -66,14 +70,14 @@ func parseReaderArgs(name string, fs *flag.FlagSet, args []string) (code int, do
 	return 0, false
 }
 
-// parseAuditReaderFlags runs parseReaderArgs, then lets --config fill any audit path the
-// operator left empty. configPath is a pointer (not a value) because it is read only after
-// fs.Parse runs here; a by-value copy would capture the pre-parse empty string.
-func parseAuditReaderFlags(name string, fs *flag.FlagSet, args []string, configPath, logPath, keyPath *string) (code int, done bool) {
+// parseAuditReaderFlags runs parseReaderArgs, then lets --config fill the audit log path if
+// the operator left it empty. configPath is a pointer (not a value) because it is read only
+// after fs.Parse runs here; a by-value copy would capture the pre-parse empty string.
+func parseAuditReaderFlags(name string, fs *flag.FlagSet, args []string, configPath, logPath *string) (code int, done bool) {
 	if code, done := parseReaderArgs(name, fs, args); done {
 		return code, done
 	}
-	if err := applyConfigAuditDefaults(name, *configPath, logPath, keyPath); err != nil {
+	if err := applyConfigAuditDefaults(name, *configPath, logPath); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1, true
 	}
@@ -92,16 +96,19 @@ func resolveAuditReaderLogPath(name, configured string) (string, bool) {
 	return logPath, true
 }
 
-// parseAndResolveAuditLog runs the preamble every audit-tape reader shares before it can even
-// locate its log — parseAuditReaderFlags, then resolveAuditReaderLogPath — and translates
-// parseAuditReaderFlags' generic 1 to the caller's own usageExit (audit-verify/suggest/stats
+// parseAndResolveAuditLog runs the preamble the single-tape audit readers share before they
+// can even locate their log — parseAuditReaderFlags, then resolveAuditReaderLogPath — and
+// translates parseAuditReaderFlags' generic 1 to the caller's own usageExit (suggest/stats
 // each reserve their non-2 codes for a command-specific outcome; see each one's own
 // <name>UsageExit doc). done reports the caller must return exitCode immediately; logPath is
 // valid only when done is false. Stops at path resolution rather than also opening the log,
-// because audit-verify's continuation (key loading, then per-file chain discovery) diverges
-// from suggest/stats' single openAuditChain call immediately after this point.
-func parseAndResolveAuditLog(name string, fs *flag.FlagSet, args []string, configPath, auditLogPath, keyPath *string, usageExit int) (logPath string, exitCode int, done bool) {
-	if code, doneParse := parseAuditReaderFlags(name, fs, args, configPath, auditLogPath, keyPath); doneParse {
+// so a caller keeps its own stance on an unopenable one.
+//
+// audit-verify does not use it: its --audit-log is repeatable (one per enforcement point's
+// tape), so it resolves a LIST through resolveAuditTapes, which also has the key pairing to
+// decide.
+func parseAndResolveAuditLog(name string, fs *flag.FlagSet, args []string, configPath, auditLogPath *string, usageExit int) (logPath string, exitCode int, done bool) {
+	if code, doneParse := parseAuditReaderFlags(name, fs, args, configPath, auditLogPath); doneParse {
 		if code != 0 {
 			return "", usageExit, true
 		}
@@ -117,7 +124,7 @@ func parseAndResolveAuditLog(name string, fs *flag.FlagSet, args []string, confi
 // openAuditChainOrExit runs openAuditChain and folds its error into the caller's own usageExit,
 // printing the (already fully-formatted) error verbatim. Shared by suggest and stats, the two
 // readers that both continue straight into a merged rotated-chain io.Reader; audit-verify does
-// not use this — it needs the discovered chain FILES themselves (audit.LogChainFiles), not a
+// not use this — it needs the discovered chain FILES themselves (audit.SnapshotLogChain), not a
 // merged reader, to verify per-file rather than stream one concatenated pass.
 func openAuditChainOrExit(name, logPath string, usageExit int) (r io.Reader, closeChain func(), exitCode int, done bool) {
 	r, closeChain, err := openAuditChain(name, logPath)
@@ -132,12 +139,41 @@ func openAuditChainOrExit(name, logPath string, usageExit int) (r io.Reader, clo
 // log-read failure, and for a pass a rotation raced (no verdict was reached). Exit 1 is
 // reserved for a log that fails verification (like validate reserves it for findings), so
 // a cron/CI job can tell tampering from a misconfigured flag or an inconclusive run.
-// parseAuditReaderFlags reports usage errors as 1, so this command translates at the call site.
+// parseReaderArgs reports usage errors as 1, so this command translates at the call site.
 const auditVerifyUsageExit = 2
 
 // auditVerifySummaryFormat is hoisted to a constant so the site-drift test can assert the
 // landing-page demo still quotes tallies this command actually emits.
 const auditVerifySummaryFormat = "Checked %d record(s): %d valid, %d invalid, %d skipped, %d unknown-key, %d unverifiable; %d chain break(s).\n"
+
+// auditVerifyUsage is the command's help text. Hoisted to a constant because the
+// cross-tape half of it is the only statement anywhere of what a joined sequence does and
+// does not establish, and an operator reads it before they have a report to read.
+const auditVerifyUsage = `Usage: eunox audit-verify [flags]
+
+Verify HMAC-SHA256 signatures in the local audit log.
+
+Cross-enforcement-point mode: pass --audit-log once per enforcement point's tape.
+Each is verified as its OWN chain, with its own key and its own verdict — records
+from different enforcement points do not form one chain, since seq and prev_hmac
+are per writer. With --task-id, the records those tapes share for one task are
+then printed as one sequence, each attributed by the ` + "`pep`" + ` it was written with.
+That sequence is a reconstruction, not a verdict: within a tape it follows the
+order the tape proves, across tapes it rests on each writer's own clock (eunox
+neither requires nor checks clock sync), and a call missing from an enforcement
+point that never handled it is expected rather than evidence of loss. Only the
+per-tape verdicts gate the exit code.
+
+Exit codes:
+  0  Every record verified and the tamper-evident chain is intact, on every tape.
+  1  A tape failed verification (an invalid record, a chain break, an
+     unverifiable or unknown-key record). Reserved for findings, so a cron or
+     CI job can gate on it; never used for usage errors.
+  2  Usage error, a config, key-resolution, or log-read failure, or a pass that
+     a rotation raced (inconclusive — re-run).
+
+Flags:
+`
 
 // cmdAuditVerify runs the `audit-verify` subcommand, returning the exit code (rather than
 // calling os.Exit) so tests can drive every branch.
@@ -145,100 +181,170 @@ func cmdAuditVerify(args []string) int {
 	fs := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
 	fs.Usage = func() {
 		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, `Usage: eunox audit-verify [flags]
-
-Verify HMAC-SHA256 signatures in the local audit log.
-
-Exit codes:
-  0  Every record verified and the tamper-evident chain is intact.
-  1  The log failed verification (an invalid record, a chain break, an
-     unverifiable or unknown-key record). Reserved for findings, so a cron or
-     CI job can gate on it; never used for usage errors.
-  2  Usage error, a config, key-resolution, or log-read failure, or a pass that
-     a rotation raced (inconclusive — re-run).
-
-Flags:
-`)
+		_, _ = fmt.Fprint(w, auditVerifyUsage)
 		fs.SetOutput(w)
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log and\naudit.keyPath are used as defaults for --audit-log and --audit-key-path.")
-	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
-	auditKeyPath := fs.String("audit-key-path", "", "Path to the HMAC signing key for the audit log (default: ~/.eunox/audit.key).\nOverrides EUNOX_AUDIT_KEY_PATH environment variable.")
+	var logs, keys repeatedPath
+	fs.Var(&logs, "audit-log", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl). Repeatable:\neach occurrence names one enforcement point's tape, verified as its own\nchain with its own verdict.")
+	fs.Var(&keys, "audit-key-path", "Path to the HMAC signing key for the audit log (default: ~/.eunox/audit.key).\nOverrides EUNOX_AUDIT_KEY_PATH environment variable. Repeatable: pass one\n(every tape shares a key) or exactly one per --audit-log, in the same order.")
 	requestID := fs.String("request-id", "", "Report (count and print) only the record with this request ID. Every record\nis still HMAC-verified and the tamper-evident chain is always checked; this\nfilter narrows the report, not the verification.")
+	taskID := fs.String("task-id", "", "Print the sequence of records carrying this task ID, joined across every\n--audit-log and attributed by the pep field each record was written with.\nLike --request-id, it also narrows which records are counted and printed\n(others fall to the skipped tally); every record is still HMAC-verified and\nthe tamper-evident chain is always checked. The join is a reconstruction,\nnot a verdict: see the notes it prints.")
 	since := fs.String("since", "", "Report (count and print) only records after this RFC3339 timestamp. Every\nrecord is still HMAC-verified and the tamper-evident chain is always checked;\nthis filter narrows the report, not the verification.")
 
-	logPath, code, done := parseAndResolveAuditLog("audit-verify", fs, args, configPath, auditLogPath, auditKeyPath, auditVerifyUsageExit)
-	if done {
+	if code, done := parseReaderArgs("audit-verify", fs, args); done {
+		if code != 0 {
+			return auditVerifyUsageExit
+		}
 		return code
 	}
-
-	// Key path resolves: flag (already merged with config) > env var > default.
-	expandedKeyPath, err := audit.ResolveKeyPath(*auditKeyPath)
+	if err := applyConfigAuditDefaultsList("audit-verify", *configPath, &logs, &keys); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return auditVerifyUsageExit
+	}
+	tapes, err := resolveAuditTapes(logs, keys)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: %v\n", err)
+		fmt.Fprintln(os.Stderr, err)
 		return auditVerifyUsageExit
 	}
-	// Load-only: minting a key here on a missing/mistyped path would make every record
-	// report UNKNOWN_KEY and misdiagnose an operator error as a key rotation.
-	keys, err := audit.LoadKeys(expandedKeyPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: loading audit key: %v\n", err)
-		return auditVerifyUsageExit
-	}
-
-	// Keyed by key id, so records straddling a rotation each verify against the key that
-	// signed them; records with no key_id (pre-rotation format) are tried against every key.
-	verifier := audit.NewVerifier(keys)
-
-	// Verify the whole rotated set as one chain, not just the base file — deletion of an
-	// entire interior rotated file would otherwise go undetected. Snapshot rather than a
-	// bare LogChainFiles: this runs against a live proxy under traffic (audit-verify takes
-	// no lock by design), so the pass has to be bracketed against a rotation moving the
-	// files under it.
-	snap, err := audit.SnapshotLogChain(logPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: discovering rotated audit logs: %v\n", err)
-		return auditVerifyUsageExit
-	}
-	chainFiles := snap.Files
-	if len(chainFiles) == 0 {
-		fmt.Fprint(os.Stderr, auditLogMissingHint("audit-verify", logPath))
-		return auditVerifyUsageExit
-	}
-
-	var sinceTime time.Time
+	opts := audit.VerifyOptions{RequestID: *requestID, TaskID: *taskID}
 	if *since != "" {
-		sinceTime, err = time.Parse(time.RFC3339, *since)
+		opts.Since, err = time.Parse(time.RFC3339, *since)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "eunox audit-verify: invalid --since value %q: %v\n", *since, err)
 			return auditVerifyUsageExit
 		}
 	}
+	return runAuditVerify(tapes, opts)
+}
 
-	if len(chainFiles) > 1 {
-		fmt.Printf("Verifying %d audit log files as one chain (oldest rotated to current base).\n", len(chainFiles))
+// applyConfigAuditDefaultsList fills an EMPTY --audit-log/--audit-key-path list from the
+// config's audit block. A list the operator populated is left alone: the config supplies
+// a default, never an extra member — silently appending the configured tape to the ones
+// named on the command line would verify a file that was not asked about and merge its
+// records into the join.
+func applyConfigAuditDefaultsList(cmdName, configPath string, logs, keys *repeatedPath) error {
+	var logDefault, keyDefault string
+	if _, err := loadConfigAuditDefaults(cmdName, configPath, &logDefault, &keyDefault); err != nil {
+		return err
 	}
+	if len(*logs) == 0 && logDefault != "" {
+		*logs = append(*logs, logDefault)
+	}
+	if len(*keys) == 0 && keyDefault != "" {
+		*keys = append(*keys, keyDefault)
+	}
+	return nil
+}
+
+// runAuditVerify verifies every tape as its own chain, then prints the task-joined
+// sequence if one was asked for. The exit code covers the per-tape VERDICTS only: the
+// join establishes nothing (absence of a task's calls from an enforcement point that
+// never handled them is expected, unlike a gap inside one chain), so it can never fail a
+// run on its own.
+//
+// A tape that cannot be read, or whose pass a rotation raced, stops the run at exit 2
+// rather than being skipped: continuing would print a sequence missing that tape's
+// records with nothing in the output saying so, which is the one way this report can
+// mislead about the thing it exists to show.
+func runAuditVerify(tapes []auditTape, opts audit.VerifyOptions) int {
+	if len(tapes) > 1 {
+		fmt.Printf("Verifying %d audit tapes as %d INDEPENDENT chains: each enforcement point signs its own\n"+
+			"tape with its own key, so there is one verdict per tape and no chain across them.\n", len(tapes), len(tapes))
+	}
+	rings := verifiedRings{}
+	var joined []audit.JoinedRecord
+	failed := false
+	for _, t := range tapes {
+		if len(tapes) > 1 {
+			fmt.Printf("\nTape %d: %s\n", t.num, t.logPath)
+		}
+		res, recs, code := verifyOneTape(t, opts, rings)
+		if code != 0 {
+			return code
+		}
+		joined = append(joined, recs...)
+		if len(tapes) > 1 {
+			printTapeVerdict(t, res)
+		}
+		if !res.OK() {
+			failed = true
+		}
+	}
+	if opts.TaskID != "" {
+		printJoinedSequence(opts.TaskID, tapes, joined)
+	} else if len(tapes) > 1 {
+		fmt.Println("\nPass --task-id to print the sequence these tapes share for one task, attributed by `pep`.")
+	}
+	if failed {
+		return 1
+	}
+	return 0
+}
+
+// verifyOneTape runs the single-tape pass — key ring, rotated-sibling discovery, the
+// bracketed verification, the tallies — and collects the task's records out of that same
+// pass. code is non-zero when the caller must stop (a read, key, or inconclusive
+// failure); res and recs are meaningful only when it is 0.
+func verifyOneTape(t auditTape, opts audit.VerifyOptions, rings verifiedRings) (audit.VerifyResult, []audit.JoinedRecord, int) {
+	verifier, err := rings.verifierFor(t.keyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return audit.VerifyResult{}, nil, auditVerifyUsageExit
+	}
+	// Verify the whole rotated set as one chain, not just the base file — deletion of an
+	// entire interior rotated file would otherwise go undetected. Snapshot rather than a
+	// bare LogChainFiles: this runs against a live proxy under traffic (audit-verify takes
+	// no lock by design), so the pass has to be bracketed against a rotation moving the
+	// files under it.
+	snap, err := audit.SnapshotLogChain(t.logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: discovering rotated audit logs for %s: %v\n", t.logPath, err)
+		return audit.VerifyResult{}, nil, auditVerifyUsageExit
+	}
+	if len(snap.Files) == 0 {
+		fmt.Fprint(os.Stderr, auditLogMissingHint("audit-verify", t.logPath))
+		return audit.VerifyResult{}, nil, auditVerifyUsageExit
+	}
+	if len(snap.Files) > 1 {
+		fmt.Printf("Verifying %d audit log files as one chain (oldest rotated to current base).\n", len(snap.Files))
+	}
+
 	// Findings are HELD rather than streamed: a rotation racing the pass fabricates a
 	// CHAIN BREAK at the seam, and printing it before the bracket has run puts a tamper
 	// alarm on the operator's terminal that the next line then retracts.
 	held := &heldFindings{out: os.Stdout}
-	res, verifyErr := audit.VerifyLogFiles(chainFiles, verifier, *requestID, sinceTime, held)
+	pass := opts
+	pass.Out = held
+	// Collected only when a join was asked for: without a task id there is no join key,
+	// and buffering every record of every tape to print nothing is a memory cost with no
+	// reader.
+	var recs []audit.JoinedRecord
+	if opts.TaskID != "" {
+		pass.Collect = func(r audit.JoinedRecord) {
+			r.Tape = t.num
+			recs = append(recs, r)
+		}
+	}
+	res, verifyErr := audit.VerifyLogFiles(snap.Files, verifier, pass)
 	// Checked before the read error and before any verdict, because a rotation landing
 	// mid-pass produces those too: a pruned sibling reads as an open failure, a re-pointed
 	// base as a PASS over an incomplete chain or a spurious CHAIN BREAK. "Re-run" is the
 	// only honest answer to any of them, and it is NOT a finding, so it exits 2 not 1.
 	// The held findings are DISCARDED with it — they describe a chain that was never read
-	// as a whole, and the re-run reports the real ones.
+	// as a whole, and the re-run reports the real ones. The collected records go with
+	// them, for the same reason: a sequence assembled from a chain nobody could read is
+	// not evidence of an order.
 	if err := snap.CheckUnchanged(); err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: %v; no verdict was reached — re-run "+
-			"(against a quiescent log, or a copy of the chain)\n", err)
-		return auditVerifyUsageExit
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: %v; no verdict was reached — re-run "+
+			"(against a quiescent log, or a copy of the chain)\n", t.logPath, err)
+		return audit.VerifyResult{}, nil, auditVerifyUsageExit
 	}
 	held.release()
 	if verifyErr != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log: %v\n", verifyErr)
-		return auditVerifyUsageExit
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log %s: %v\n", t.logPath, verifyErr)
+		return audit.VerifyResult{}, nil, auditVerifyUsageExit
 	}
 
 	if res.Total == 0 {
@@ -247,14 +353,10 @@ Flags:
 		fmt.Println("Checked 0 record(s). The log is empty; note that an empty or fully " +
 			"truncated log cannot be distinguished from a never-written one without an " +
 			"external high-water mark (ship records to an append-only sink).")
-		return 0
+		return res, recs, 0
 	}
-
 	printVerifySummary(res)
-	if !res.OK() {
-		return 1
-	}
-	return 0
+	return res, recs, 0
 }
 
 // heldFindingsCap bounds what a bracketed pass withholds. A rotation racing the pass

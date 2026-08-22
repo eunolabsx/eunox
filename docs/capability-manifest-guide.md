@@ -3024,6 +3024,7 @@ degrades the security posture.
 | Enforce drift as fatal                        | set `strictDrift: true` per route or under `defaults:` (aborts session on FM-1/FM-2/FM-4/FM-6; FM-5 always fatal) |
 | Observe without enforcing                     | set `enforcement: audit` per route or under `defaults:` |
 | Verify HMAC signatures in the audit log       | `eunox audit-verify --audit-log audit.jsonl --audit-key-path audit.key` |
+| Reconstruct a task across enforcement points   | `eunox audit-verify --audit-log edge.jsonl --audit-key-path edge.key --audit-log core.jsonl --audit-key-path core.key --task-id <id>` — one verdict per tape, then the task's records as one sequence attributed by `pep` (threat model §3.14) |
 | Inspect denial counts (split by posture)      | `eunox stats` (BLOCKED = enforced; OBSERVED = `enforcement: audit` denials that were forwarded — read these before flipping to `enforce`) |
 | Generate a support bundle for a bug report    | `eunox doctor --config eunox.yaml [--live]` — prints redacted binary identity, config, manifest digests, and the last 50 audit records. Nothing leaves your machine; paste the output manually. |
 

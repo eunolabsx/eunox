@@ -532,6 +532,10 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// Upstream has exited: stop the SIGKILL fallback (if armed) so a clean shutdown
 	// emits no spurious "sending SIGKILL" line and the timer is freed promptly.
 	p.stopKillTimer()
+	// The invariant newSession states — never Wait while a StdoutPipe read is in flight — scopes
+	// to a reader that can still make progress. On awaitUpstreamDrain's give-up path the
+	// subprocess is already SIGKILLed and the drain timed out, so Wait's pipe close is what
+	// unwedges the reader rather than a race with it.
 	p.waitUpstream()
 
 	// ── 8. Release this session's per-session enforcement state ─────────────────

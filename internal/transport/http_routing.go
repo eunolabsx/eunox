@@ -7,6 +7,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -91,17 +92,43 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// jsonSchemaShape declares whether the body being decoded is one whose every member this
+// package defines, or one belonging to a protocol that may carry members eunox does not
+// model. It is a parameter rather than a per-endpoint default so a new POST body has to
+// answer the question rather than inherit whichever answer its neighbour happened to need.
+type jsonSchemaShape bool
+
+const (
+	// openSchema is the JSON-RPC envelope on /mcp. MCP may add members this build does not
+	// model and those bytes are forwarded to the upstream verbatim, so refusing an unknown
+	// or repeated member here would refuse traffic a conforming peer is entitled to send —
+	// and the enforcement-versus-upstream differential that WOULD matter is closed where the
+	// forwarded bytes are re-read (DecodeParams), not by narrowing the envelope.
+	openSchema jsonSchemaShape = false
+	// closedSchema is a body this package defines end to end — today /control/kill's alone.
+	// Its members select WHICH kill runs, so a member resolved by a rule the reviewer of the
+	// body cannot see is the substitution the trailing-token guard already refuses one value
+	// out: encoding/json matches names case-insensitively and keeps the LAST duplicate, so
+	// {"sessionId":"s1","all":true,"sessionId":""} reads as a targeted kill and executes a
+	// deployment-wide one, and a misspelled "session_id" is dropped in silence with "all"
+	// left standing.
+	closedSchema jsonSchemaShape = true
+)
+
 // decodeStrictJSON is the single safe way to read a JSON POST body in this package. It
 // gates the Content-Type (415), then decodes exactly one JSON value into v, requiring
 // io.EOF after it: a body carrying a trailing token is rejected with 400 rather than
 // silently truncated — otherwise a multi-token /mcp body could 202-ack an invalid
 // initialize notification, or a /control/kill body could execute a narrower kill while
-// ignoring a smuggled trailing {"all":true}. On a refused content type, a decode failure,
-// or trailing data it writes the response itself and returns false; the caller must return
-// immediately. The 400 legs are recorded via recordRefusal (codeInvalidRequest) through
-// the same rate-limited pre-session path as the 415 leg, so a malformed body leaves the
-// same trace other transport-level refusals do; the 413 leg is not recorded since
-// MaxBytesReader already bounds that flood's cost.
+// ignoring a smuggled trailing {"all":true}. Under closedSchema it additionally refuses an
+// ambiguous member name (capability.RefuseAmbiguousJSONKeys, the same primitive the two
+// reviewed-document loaders use) and an unrecognized one, closing the two shapes that
+// express that same smuggled value INSIDE one valid JSON object rather than after it. On a
+// refused content type, a decode failure, or trailing data it writes the response itself
+// and returns false; the caller must return immediately. The 400 legs are recorded via
+// recordRefusal (codeInvalidRequest) through the same rate-limited pre-session path as the
+// 415 leg, so a malformed body leaves the same trace other transport-level refusals do;
+// the 413 leg is not recorded since MaxBytesReader already bounds that flood's cost.
 //
 // route is threaded to requireJSONContentType and recordRefusal so the /mcp caller's
 // records carry its route stamp; /control/kill has no route and passes nil, which
@@ -110,11 +137,44 @@ func (p *HTTPProxy) handleMCP(w http.ResponseWriter, r *http.Request) {
 // The content-type gate lives HERE rather than at each handler so every JSON POST body in
 // this package gets it by construction — a mux wrapper is the wrong shape since GET/DELETE
 // carry no body.
-func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string, route *UpstreamRoute) bool {
+func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v interface{}, invalidBodyMsg string, route *UpstreamRoute, shape jsonSchemaShape) bool {
 	if !p.requireJSONContentType(w, r, route) {
 		return false
 	}
-	dec := json.NewDecoder(r.Body)
+	body := io.Reader(r.Body)
+	if shape == closedSchema {
+		// Buffered rather than streamed because the ambiguity walk needs the whole document:
+		// it reads member names the decode then RESOLVES, so it cannot share the decoder that
+		// consumes them. Bounded by the caller's MaxBytesReader exactly as the stream is, and
+		// only on this shape, so /mcp keeps its streaming profile.
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return false
+			}
+			p.recordRefusal(r.Context(), r, route, codeInvalidRequest, catBody, map[string]interface{}{
+				"reason": "unreadable_body",
+			})
+			http.Error(w, invalidBodyMsg, http.StatusBadRequest)
+			return false
+		}
+		// Deliberately BEFORE the decode: the walk's whole point is that the decoder resolves
+		// what it refuses, so a verdict taken from the decoded struct is the resolution.
+		if err := capability.RefuseAmbiguousJSONKeys(raw); err != nil {
+			p.recordRefusal(r.Context(), r, route, codeInvalidRequest, catBody, map[string]interface{}{
+				"reason": "ambiguous_member_name",
+			})
+			http.Error(w, invalidBodyMsg+": ambiguous member name", http.StatusBadRequest)
+			return false
+		}
+		body = bytes.NewReader(raw)
+	}
+	dec := json.NewDecoder(body)
+	if shape == closedSchema {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(v); err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -318,7 +378,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	// A single JSON-RPC POST body is exactly one JSON value; decodeStrictJSON fails closed
 	// on any trailing token BEFORE dispatching, so a multi-token body can't 202-ack an
 	// invalid initialize notification with the trailer silently dropped.
-	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body", route) {
+	if !p.decodeStrictJSON(w, r, &msg, "invalid JSON-RPC body", route, openSchema) {
 		return
 	}
 
@@ -1075,11 +1135,22 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 		SessionID string `json:"sessionId"`
 		All       bool   `json:"all"`
 	}
-	// Reject a body carrying a trailing JSON token (e.g. a smuggled {"all":true} after a
-	// legitimate {"sessionId":"..."}): without this the kill actually executed could differ
-	// from what a body-only reviewer would expect. /control/kill has no route concept, so
-	// nil: its refusal stays on the proxy-wide sink.
-	if !p.decodeStrictJSON(w, r, &body, "invalid request body", nil) {
+	// closedSchema, because this body's members select WHICH kill runs: it rejects a trailing
+	// JSON token (a smuggled {"all":true} after a legitimate {"sessionId":"..."}) and the two
+	// ways the same smuggling fits INSIDE one valid object — an ambiguous member name, and an
+	// unmodelled one. Without all three the kill actually executed could differ from what a
+	// body-only reviewer would expect. /control/kill has no route concept, so nil: its
+	// refusal stays on the proxy-wide sink.
+	if !p.decodeStrictJSON(w, r, &body, "invalid request body", nil, closedSchema) {
+		return
+	}
+	// Same rationale as the trailing-token refusal one object out: running the All arm and
+	// discarding sessionId turns a body a reviewer reads as a targeted kill into a
+	// deployment-wide stop, and the record then names a scope the body only half-describes.
+	// Fail-safe in effect, but the endpoint's contract is that the kill executed is the one
+	// the body names, so an incoherent body is refused rather than resolved by field order.
+	if body.All && body.SessionID != "" {
+		http.Error(w, "sessionId and all are mutually exclusive; pass exactly one", http.StatusBadRequest)
 		return
 	}
 	if body.All {

@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // rotateChainInPlace simulates the rename-then-reopen half of rotate() without a live
@@ -55,7 +54,7 @@ func TestChainSnapshot_RotationDuringPassIsReported(t *testing.T) {
 	rotateChainInPlace(t, logPath)
 
 	// The verdict the pass would report on its own: vacuously clean.
-	res, err := VerifyLogFiles(snap.Files, verifierFor(t, keyPath), "", time.Time{}, &strings.Builder{})
+	res, err := VerifyLogFiles(snap.Files, verifierFor(t, keyPath), VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLogFiles: %v", err)
 	}

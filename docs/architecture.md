@@ -386,6 +386,14 @@ Mechanics:
   verifies the whole rotated set (every sidecar plus the current base log) as
   one chain, so deletion of an entire interior rotated file is caught too. Full
   treatment in the threat model (§3.4 Audit Log Tampering).
+- One chain is one WRITER's, though: each enforcement point signs its own tape,
+  and their records do not form a chain together (`seq` and `prev_hmac` are per
+  writer). `audit-verify` takes `--audit-log` once per tape and verifies each as
+  its own chain with its own verdict; with `--task-id` it then prints the
+  records those tapes share for one task as one sequence, attributed by the
+  `pep` each writer stamped. That sequence follows each tape's own proven `seq`
+  order and interleaves the tapes by the writers' own clocks; it is a
+  reconstruction, never a verdict — see threat model §3.14.
 - Size-based rotation is built in. When the active log would exceed
   `--audit-rotate-size`, it is renamed to a sidecar suffixed with a
   nanosecond-resolution UTC timestamp (`audit.jsonl.20060102T150405.000000000Z`)

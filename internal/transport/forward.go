@@ -225,7 +225,7 @@ func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.Enf
 
 // recordResourceExhausted records a host request refused because a concurrency pool was
 // saturated, so a DoS-probe flood against either transport leaves a trace on the tape rather
-// than only a JSON-RPC server-busy reply. Shared by all three saturation sites so they can't
+// than only a JSON-RPC server-busy reply. Shared by every saturation site so they can't
 // record divergent shapes. The identifier is left EMPTY (no target parsed yet) so
 // deriveTargetFields can't synthesize a phantom target. rec may be nil (skipped).
 //

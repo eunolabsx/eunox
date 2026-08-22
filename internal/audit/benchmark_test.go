@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // benchCorpus writes a signed audit log of n records shaped like real traffic (a
@@ -149,7 +148,7 @@ func BenchmarkVerifyLog(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		res, err := VerifyLog(bytes.NewReader(joined), verifier, "", time.Time{}, io.Discard)
+		res, err := VerifyLog(bytes.NewReader(joined), verifier, VerifyOptions{Out: io.Discard})
 		if err != nil {
 			b.Fatalf("VerifyLog: %v", err)
 		}

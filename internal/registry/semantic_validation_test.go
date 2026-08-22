@@ -87,6 +87,23 @@ func TestValidateRejectsASemanticallyInvalidContract(t *testing.T) {
 			wantErr: "decides nothing",
 		},
 		{
+			// The corpus is authoring-time input a manifest pins by digest, so a table that
+			// self-validates here ships as a reviewed entry an operator copies verbatim.
+			// U+017F folds to "s" for the runtime matcher but not for strings.ToLower.
+			name: "byArgument keys colliding only under the matcher's fold",
+			effect: &capability.EffectContract{
+				Class: capability.EffectIrreversible,
+				ByArgument: &capability.EffectByArgument{
+					Argument: "sql",
+					Cases: map[string]capability.EffectCase{
+						"select":      {Class: capability.EffectIrreversible},
+						"\u017felect": {Class: capability.EffectReversible},
+					},
+				},
+			},
+			wantErr: "match the same argument value",
+		},
+		{
 			name: "byArgument case-variant keys",
 			effect: &capability.EffectContract{
 				Class: capability.EffectIrreversible,

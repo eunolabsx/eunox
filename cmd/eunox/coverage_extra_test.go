@@ -3327,4 +3327,15 @@ func TestCmdValidate_ProtocolVersionRequiresLive(t *testing.T) {
 	if code := cmdValidate([]string{"--config", cfgPath, "--upstream-protocol-version", "2026-07-28"}); code != 2 {
 		t.Errorf("under --config: exit %d, want 2 (each route's own protocolVersion is used, so the flag must be refused)", code)
 	}
+
+	// The help said "Ignored under --config" against the refusal directly above it, which is
+	// the drift that makes a rejected invocation read as a supported one.
+	help := captureStdout(t, func() {
+		if code := cmdValidate([]string{"-h"}); code != 0 {
+			t.Errorf("-h must exit 0, got %d", code)
+		}
+	})
+	if strings.Contains(help, "Ignored under --config") {
+		t.Error("--upstream-protocol-version help must not say it is ignored under --config; the combination is refused")
+	}
 }

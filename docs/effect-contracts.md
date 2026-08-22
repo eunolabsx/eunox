@@ -168,8 +168,11 @@ Two behaviors worth knowing:
   **it is not a SQL parser**. Pair it with a read-only role and multi-statement execution
   disabled at the driver; never make it the sole control.
 - Two case keys that fold together (`DROP` and `drop`) are **rejected at load**: one value
-  cannot resolve to two effects, and leaving the tie to map order would make the verdict
-  nondeterministic.
+  cannot resolve to two effects, and the tie would otherwise be broken by the matcher's own
+  rule — the smallest key by byte order, which can be the *weaker* row — rather than by the
+  author. The fold is the matcher's: Unicode simple case folding after trimming, not a
+  lower-casing, so `select` and `ſelect` (U+017F LATIN SMALL LETTER LONG S) collide too —
+  the argument `SELECT` matches both at runtime.
 - A row that **raises** the class does not inherit the base contract's
   `compensatingAction`. Compensable is the only class that may carry one, and that
   invariant holds on the *resolved* effect, not just the authored one — otherwise an

@@ -91,7 +91,8 @@ func TestValidateEffectContract(t *testing.T) {
 		},
 		{
 			// The padded key is the point: matching trims and folds case, so " drop " and
-			// "DROP" select the same row and which one wins would be map-iteration order.
+			// "DROP" select the same row and which one wins falls to lookup's byte-order
+			// tiebreak rather than to the author.
 			// (gocritic's mapKey check reads padding as a typo; here it is the input under
 			// test.)
 			name: "byArgument case-variant keys",
@@ -101,6 +102,21 @@ func TestValidateEffectContract(t *testing.T) {
 					"DROP":                        {Class: EffectIrreversible},
 					paddedCaseKey("drop"):         {Class: EffectReversible},
 					"delete_from_audit_immutable": {Class: EffectIrreversible},
+				},
+			}},
+			wantErr: "match the same argument value",
+		},
+		{
+			// U+017F LATIN SMALL LETTER LONG S is already lower case, so a ToLower-based
+			// dedup saw two distinct keys here while the matcher's EqualFold matches both
+			// against the argument "SELECT" — a table certified unambiguous at load that
+			// resolves by byte order at runtime, and can hand the call the WEAKER row.
+			name: "byArgument keys colliding only under the matcher's fold",
+			effect: &EffectContract{ByArgument: &EffectByArgument{
+				Argument: "sql",
+				Cases: map[string]EffectCase{
+					"select":      {Class: EffectIrreversible},
+					"\u017felect": {Class: EffectReversible},
 				},
 			}},
 			wantErr: "match the same argument value",
@@ -251,5 +267,60 @@ func TestValidateEffectCeiling(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
+	}
+}
+
+// TestValidateEffectByArgument_CollisionErrorNamesTheOffendingRune pins the message half of
+// the refusal. The pair this check exists to catch differs by one non-ASCII rune that renders
+// indistinguishably from its ASCII fold, so a message quoting the two keys unescaped tells the
+// author their table declares "select" and "select" — a true statement they cannot act on.
+func TestValidateEffectByArgument_CollisionErrorNamesTheOffendingRune(t *testing.T) {
+	t.Parallel()
+	err := ValidateEffectContract(&EffectContract{ByArgument: &EffectByArgument{
+		Argument: "sql",
+		Cases: map[string]EffectCase{
+			"select":      {Class: EffectIrreversible},
+			"\u017felect": {Class: EffectReversible},
+		},
+	}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `\u017f`, "the colliding key's non-ASCII rune must be escaped into the message, or the two keys read as identical")
+}
+
+// TestValidateEffectByArgument_AcceptedTableResolvesEveryKeyToItsOwnRow asserts the
+// certificate the load-time dedup exists to issue, against the MATCHER rather than against
+// the fold the validator happens to use: in any table validation accepts, every declared key
+// resolves to its own row. The check and lookup folded differently (ToLower at load,
+// EqualFold at runtime), so {"select", "ſelect"} was certified unambiguous and then had one
+// row shadow the other by byte order — silently handing the call the wrong effect class.
+func TestValidateEffectByArgument_AcceptedTableResolvesEveryKeyToItsOwnRow(t *testing.T) {
+	t.Parallel()
+	// Case variants that ToLower folds, ones only EqualFold folds (U+017F, U+212A), padded
+	// spellings, and genuinely distinct verbs — so the sweep covers accepted and refused
+	// tables alike rather than only the shape under repair.
+	keys := []string{"select", "SELECT", "Select", "ſelect", " select ", "drop", "DROP", "k", "K", "K", "insert"}
+	for _, a := range keys {
+		for _, b := range keys {
+			if a == b {
+				continue
+			}
+			tbl := &EffectByArgument{Argument: "sql", Cases: map[string]EffectCase{
+				a: {Class: EffectIrreversible},
+				b: {Class: EffectReversible},
+			}}
+			if err := ValidateEffectContract(&EffectContract{ByArgument: tbl}); err != nil {
+				continue // Refused as ambiguous: nothing is certified, so nothing to check.
+			}
+			for key, want := range tbl.Cases {
+				got, hit := tbl.lookup(strings.TrimSpace(key))
+				if !hit {
+					t.Errorf("table %q/%q was accepted, but lookup(%q) matched no row", a, b, key)
+					continue
+				}
+				if got.Class != want.Class {
+					t.Errorf("table %q/%q was accepted, but lookup(%q) resolved to class %q, not its own row's %q", a, b, key, got.Class, want.Class)
+				}
+			}
+		}
 	}
 }

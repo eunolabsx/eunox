@@ -294,8 +294,8 @@ var jsonFieldNamesCache sync.Map // reflect.Type -> map[string]bool
 // case-variant siblings won would change from JSON's last-wins to byte order — a parser
 // differential introduced by the very check meant to tighten things. Matching folds
 // through FoldJSONKey, the same fold encoding/json's own field binder uses (see its doc:
-// strings.ToLower/EqualFold under-fold runes like U+017F), so this rejects exactly the
-// keys the decode would have ignored, no more.
+// strings.ToLower under-folds runes like U+017F, which the binder itself does not), so this
+// rejects exactly the keys the decode would have ignored, no more.
 func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra ...string) error {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {

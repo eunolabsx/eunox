@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // newestRotatedSibling returns the chronologically newest rotated sibling of
@@ -100,7 +99,7 @@ func logLines(t *testing.T, logPath string) [][]byte {
 func verifyBytes(t *testing.T, lines [][]byte, verifier *Sink) VerifyResult {
 	t.Helper()
 	joined := bytes.Join(lines, []byte("\n"))
-	res, err := VerifyLog(bytes.NewReader(joined), verifier, "", time.Time{}, &strings.Builder{})
+	res, err := VerifyLog(bytes.NewReader(joined), verifier, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}

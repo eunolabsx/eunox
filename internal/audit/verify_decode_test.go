@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 )
 
 // signedTestLine builds one canonical signed record line under key, with rec's
@@ -173,7 +172,7 @@ func TestVerifyLog_UnknownFieldMatchesVerifyRecord(t *testing.T) {
 	}
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(tampered), verifier, "", time.Time{}, &out)
+	res, err := VerifyLog(bytes.NewReader(tampered), verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -234,7 +233,7 @@ func TestVerifyLog_ChainStateSurvivesAnUnverifiableRecord(t *testing.T) {
 
 	var out strings.Builder
 	res, err := VerifyLog(bytes.NewReader(bytes.Join([][]byte{line1, tampered2, line3}, []byte("\n"))),
-		verifier, "", time.Time{}, &out)
+		verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}

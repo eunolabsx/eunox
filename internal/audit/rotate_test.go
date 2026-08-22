@@ -350,7 +350,7 @@ func TestWriteRecordPartialWriteTruncatesOrphan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	res, err := VerifyLog(bytes.NewReader(data), s, "", time.Time{}, io.Discard)
+	res, err := VerifyLog(bytes.NewReader(data), s, VerifyOptions{Out: io.Discard})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
