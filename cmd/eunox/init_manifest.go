@@ -397,6 +397,14 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox init: --config-output requires --output (the config references the manifest file)\n")
 		return initUsageExit
 	}
+	// --force names files to overwrite, and with the manifest going to stdout there are none.
+	// Rejected rather than left inert, per the binary-wide rule stated at cmdContracts' own
+	// unpaired-flag guard: an operator who believed they had named an --output otherwise gets
+	// the manifest on stdout with nothing saying the invocation was incoherent.
+	if *force && *output == "" {
+		fmt.Fprintf(os.Stderr, "eunox init: --force requires --output (there is no file to overwrite when the manifest goes to stdout)\n")
+		return initUsageExit
+	}
 
 	positional := fs.Args()
 	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, positional, *protocolVersion)
@@ -419,7 +427,8 @@ Flags:
 	manifest := generateInitManifestYAML(info.Tools, *name, info.ServerVersion, *pinDescriptions)
 
 	if *output == "" {
-		// --config-output-without--output was already rejected up front.
+		// Both flags that only mean something with a file to write — --config-output and
+		// --force — were already rejected up front, so this branch owes them nothing.
 		fmt.Print(manifest)
 		return 0
 	}

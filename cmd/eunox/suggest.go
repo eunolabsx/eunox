@@ -590,11 +590,12 @@ func targetLess(a, b *observedTarget) bool {
 	return a.name < b.name
 }
 
-// suggestUsageExit is suggest's exit code for a usage, config, or audit-log-read error,
-// matching the binary's proxy/validate/stats/audit-verify convention (2 = usage error, so it
-// reads as distinguishable from an operation-specific failure — here, --output write
-// failure, exit 1). Was the other way around; pre-1.0 permits the clean swap over a
-// compat shim. `kill` is the one deliberate exception, documented in its own usage block.
+// suggestUsageExit is suggest's exit code for every failure it can report — usage, config,
+// audit-log read, and the --output write — matching the binary's proxy/validate/stats/
+// audit-verify convention (2 = usage error). Was the other way around; pre-1.0 permits the
+// clean swap over a compat shim. Unlike validate (drift) and audit-verify (a failed chain),
+// suggest reserves nothing for exit 1: a refused --output is a file error, not a finding
+// about the tape. `kill` is the one deliberate exception, documented in its own usage block.
 const suggestUsageExit = 2
 
 // cmdSuggest runs the `suggest` subcommand, returning the exit code (rather than calling
@@ -621,8 +622,8 @@ tighten every entry, then 'eunox validate' it before enforcing.
 
 Exit codes:
   0  Draft manifest generated (to stdout or --output).
-  1  --output was set but writing the file failed.
-  2  Usage, config, or audit-log-read error.
+  2  Usage, config, or audit-log-read error, or a failure writing --output. There
+     is no findings code: the draft describes the tape, it does not judge it.
 
 Flags:
 `)
@@ -639,6 +640,13 @@ Flags:
 	logPath, code, done := parseAndResolveAuditLog("suggest", fs, args, configPath, auditLogPath, nil, suggestUsageExit)
 	if done {
 		return code
+	}
+	// Rejected before the tape is read, and rejected at all for init's reason: --force names a
+	// file to overwrite, the draft goes to stdout when --output is unset, and the binary-wide
+	// rule (see cmdContracts) is that an unpaired flag is a usage error rather than a no-op.
+	if *force && *output == "" {
+		fmt.Fprintf(os.Stderr, "eunox suggest: --force requires --output (there is no file to overwrite when the draft goes to stdout)\n")
+		return suggestUsageExit
 	}
 	r, closeChain, code, done := openAuditChainOrExit("suggest", logPath, suggestUsageExit)
 	if done {

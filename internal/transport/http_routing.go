@@ -1082,6 +1082,15 @@ func (p *HTTPProxy) handleKill(w http.ResponseWriter, r *http.Request) {
 	if !p.decodeStrictJSON(w, r, &body, "invalid request body", nil) {
 		return
 	}
+	// Same rationale as the trailing-token refusal one object out: running the All arm and
+	// discarding sessionId turns a body a reviewer reads as a targeted kill into a
+	// deployment-wide stop, and the record then names a scope the body only half-describes.
+	// Fail-safe in effect, but the endpoint's contract is that the kill executed is the one
+	// the body names, so an incoherent body is refused rather than resolved by field order.
+	if body.All && body.SessionID != "" {
+		http.Error(w, "sessionId and all are mutually exclusive; pass exactly one", http.StatusBadRequest)
+		return
+	}
 	if body.All {
 		// Propagate a kill-store write failure (fail closed): returning {"ok":true} on a
 		// failed emergency stop would leave the operator believing the system is safe. Which

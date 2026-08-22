@@ -56,3 +56,29 @@ func TestHandleKill_DimensionDistinguishesSessionAllFromGlobal(t *testing.T) {
 		t.Error("a session named \"all\" must not be indistinguishable from a deployment-wide stop")
 	}
 }
+
+// TestHandleKill_RejectsSessionIDWithAll is the single-object twin of the trailing-token
+// refusal: that guard stops a smuggled SECOND JSON value, but one valid object naming both
+// fields expresses the same half-described kill. Running the All arm and dropping sessionId
+// resolves the ambiguity by a field order no reviewer of the body can see, turning a body
+// that reads as a targeted kill into a deployment-wide stop.
+func TestHandleKill_RejectsSessionIDWithAll(t *testing.T) {
+	t.Parallel()
+	proxy := newHTTPProxy(httpProxyOptions{Port: 3000, ControlToken: testControlToken})
+	req := httptest.NewRequest(http.MethodPost, "/control/kill", bytes.NewBufferString(`{"sessionId":"s1","all":true}`))
+	req.Header.Set("Content-Type", CTJSON)
+	req.Header.Set(ControlTokenHeader, testControlToken)
+	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:9999"
+	rr := httptest.NewRecorder()
+	proxy.handleKill(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (body=%q)", rr.Code, rr.Body.String())
+	}
+	// The refusal has to precede the kill, not merely change the response: the whole point is
+	// that the deployment-wide stop the All arm would have run never happens.
+	if status := killStatusForTest(t, proxy); status.GlobalActive {
+		t.Error("an incoherent body must not activate the global kill switch")
+	}
+}

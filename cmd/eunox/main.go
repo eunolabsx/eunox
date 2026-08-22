@@ -1993,7 +1993,9 @@ func auditLogMissingHint(cmdName, logPath string) string {
 // for a read-only reporting command, returning one concatenated reader (oldest record
 // first) and a closer. audit.OpenLogChain opens one file at a time, so the fd count stays
 // bounded even under keep-all retention. On error the returned message is the full text to
-// print to stderr verbatim; the caller prints it and exits 1.
+// print to stderr verbatim; the caller prints it and exits with its own usage code (2 for
+// both callers, via openAuditChainOrExit) — a log this command cannot read is a
+// configuration failure, not a finding, so it must not collide with a findings code.
 func openAuditChain(cmdName, logPath string) (reader io.Reader, closeAll func(), err error) {
 	files, ferr := audit.LogChainFiles(logPath)
 	if ferr != nil {
