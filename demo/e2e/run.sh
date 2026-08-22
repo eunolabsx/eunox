@@ -11,14 +11,19 @@
 #   1. [stdio] full enforcement matrix — every target type, condition, and the
 #      redactFields directive; server-initiated sampling round-trip (ALLOW).
 #   2. [stdio] sampling DENY — a manifest without the opt-in denies sampling.
-#   3. [http]  transport, session isolation, kill-switch, malformed
+#   3. [stdio] protocol-revision interop matrix — {host 2025-11-25, 2026-07-28}
+#      x {upstream 2025-11-25, 2026-07-28}. Matched pairs serve the enforced
+#      surface; mismatched pairs are refused -32022 in both directions.
+#   4. [cli]   init and validate --live open a 2026-07-28-only upstream through
+#      the revision-selected opener, and the handshake opener is refused there.
+#   5. [http]  transport, session isolation, kill-switch, malformed
 #      body, 404 route, and per-route policy isolation through an HTTP gateway.
-#   4. audit-verify — the HMAC chain over the SHARED audit tape stays intact
-#      across all three proxy invocations (cross-restart continuity).
-#   5. audit record assertions — decisions, denial codes, condition types,
+#   6. audit-verify — the HMAC chain over the SHARED audit tape stays intact
+#      across every proxy invocation (cross-restart continuity).
+#   7. audit record assertions — decisions, denial codes, condition types,
 #      target types, and obligations are recorded as expected.
 #
-# All legs share one signed audit tape so step 4 exercises chain continuity
+# All legs share one signed audit tape so step 6 exercises chain continuity
 # across separate proxy processes. No Docker required; needs only Go + curl.
 #
 # Usage:  bash demo/e2e/run.sh           # from the repo root
@@ -64,8 +69,20 @@ go build -o "$SERVER_BIN" "$REPO_ROOT/demo/e2e/mock-server" || exit 1
 go build -o "$HOST_BIN"   "$REPO_ROOT/demo/e2e/mock-host"   || exit 1
 
 # ── config generation (absolute paths; nothing committed needs editing) ──────
+# gen_stdio_config OUT UPSTREAM_REVISION POLICY...
+#
+# UPSTREAM_REVISION sets BOTH sides of the upstream leg: the mock is launched speaking it,
+# and the proxy is pinned to address it as that revision. They are one parameter because a
+# config where the two disagree tests a misconfiguration, not a revision — and the interop
+# matrix needs the disagreement to be between the HOST and the leg, never inside the leg.
 gen_stdio_config() {
-  local out="$1"; shift
+  local out="$1" upstream_rev="$2"; shift 2
+  local pin=""
+  # `auto` (no pin) is the handshake revision, and leaving the key out for it is what keeps
+  # the old-revision cells byte-identical to the config every release so far generated.
+  if [ "$upstream_rev" != "2025-11-25" ]; then
+    pin="    protocolVersion: \"$upstream_rev\""
+  fi
   {
     cat <<EOF
 schemaVersion: "0.1"
@@ -77,7 +94,8 @@ upstreams:
   - name: main
     transport: stdio
     command: "$SERVER_BIN"
-    args: ["--transport", "stdio"]
+    args: ["--transport", "stdio", "--protocol-version", "$upstream_rev"]
+${pin:+$pin}
     policy:
 EOF
     local p
@@ -91,8 +109,13 @@ EOF
 # top of the comprehensive policy. The HTTP gateway (below) cannot enforce
 # sampling, so it loads policy.yaml alone — which the proxy now requires (an
 # opt-in on an http upstream is rejected at load).
-gen_stdio_config "$WORK/stdio-full.yaml"       policy.yaml policy-sampling.yaml
-gen_stdio_config "$WORK/stdio-nosampling.yaml" policy-no-sampling.yaml
+gen_stdio_config "$WORK/stdio-full.yaml"       2025-11-25 policy.yaml policy-sampling.yaml
+gen_stdio_config "$WORK/stdio-nosampling.yaml" 2025-11-25 policy-no-sampling.yaml
+
+# The interop matrix drives one config per upstream revision, both on the comprehensive
+# policy so a cell's outcome is attributable to the revision and nothing else.
+gen_stdio_config "$WORK/stdio-up-old.yaml" 2025-11-25 policy.yaml
+gen_stdio_config "$WORK/stdio-up-new.yaml" 2026-07-28 policy.yaml
 
 cat >"$WORK/gateway.yaml" <<EOF
 schemaVersion: "0.1"
@@ -124,7 +147,76 @@ note "[stdio] sampling DENY"
 "$HOST_BIN" --mode stdio --suite sampling-deny \
   --proxy-bin "$PROXY_BIN" --config "$WORK/stdio-nosampling.yaml" || overall=1
 
-# ── 3: http leg (start upstreams + gateway, drive, tear down) ────────────────
+# ── 3: protocol-revision interop matrix ─────────────────────────────────────
+#
+# Four cells over stdio, where all four are reachable today. The matrix is NOT run over
+# HTTP: a 2026-07-28 host has no `initialize` to open a session with, and HTTP session
+# creation is still anchored on that handshake, so the two new-host cells would be
+# asserting the absence of a feature rather than the revision boundary. Both remain
+# outstanding on the HTTP transport.
+#
+# The mismatched cells assert the refusal because refusal is the whole of the boundary
+# this build implements: no method is translated across a mismatched pair, in either
+# direction. When translation is activated, the cells that stop refusing are the diff.
+run_matrix_cell() {
+  local host_rev="$1" up_rev="$2" suite="$3" config="$4"
+  "$HOST_BIN" --mode stdio --suite "$suite" \
+    --host-protocol-version "$host_rev" --upstream-protocol-version "$up_rev" \
+    --proxy-bin "$PROXY_BIN" --config "$config" || overall=1
+}
+
+note "[interop] host 2025-11-25 x upstream 2025-11-25 (matched)"
+run_matrix_cell 2025-11-25 2025-11-25 interop-matched  "$WORK/stdio-up-old.yaml"
+
+note "[interop] host 2026-07-28 x upstream 2026-07-28 (matched)"
+run_matrix_cell 2026-07-28 2026-07-28 interop-matched  "$WORK/stdio-up-new.yaml"
+
+note "[interop] host 2026-07-28 x upstream 2025-11-25 (mismatched)"
+run_matrix_cell 2026-07-28 2025-11-25 interop-mismatch "$WORK/stdio-up-old.yaml"
+
+note "[interop] host 2025-11-25 x upstream 2026-07-28 (mismatched)"
+run_matrix_cell 2025-11-25 2026-07-28 interop-mismatch "$WORK/stdio-up-new.yaml"
+
+# ── 4: CLI probes against a 2026-07-28-only upstream ────────────────────────
+#
+# `init`, `validate --live` and the session-start drift check all open an upstream leg
+# through the same revision-selected opener the proxy uses. The matrix above covers the
+# proxy's leg; this covers the CLI's, against an upstream that speaks ONLY the declaring
+# revision — the case where opening with `initialize` would fail outright, so a passing
+# probe is evidence the pin selected the opener rather than the default surviving.
+note "[cli] init / validate --live against a 2026-07-28-only upstream"
+
+cli_probe_ok() {
+  local desc="$1"; shift
+  if out="$("$@" 2>&1)"; then
+    echo "PASS  $desc"
+  else
+    echo "FAIL  $desc"
+    printf '%s\n' "$out" | tail -20
+    overall=1
+  fi
+}
+
+cli_probe_ok "eunox init introspects a 2026-07-28-only upstream" \
+  "$PROXY_BIN" init --transport stdio --upstream-protocol-version 2026-07-28 \
+  -- "$SERVER_BIN" --transport stdio --protocol-version 2026-07-28
+
+cli_probe_ok "eunox validate --live walks a 2026-07-28-only route" \
+  "$PROXY_BIN" validate --config "$WORK/stdio-up-new.yaml" --live
+
+# The negative that gives the two above their meaning: the same upstream, probed with the
+# handshake opener, must FAIL. Without it a probe that silently fell back to `initialize`
+# would pass every assertion here.
+if out="$("$PROXY_BIN" init --transport stdio --upstream-protocol-version auto \
+       -- "$SERVER_BIN" --transport stdio --protocol-version 2026-07-28 2>&1)"; then
+  echo "FAIL  the handshake opener is refused by a 2026-07-28-only upstream"
+  printf '%s\n' "$out" | tail -5
+  overall=1
+else
+  echo "PASS  the handshake opener is refused by a 2026-07-28-only upstream"
+fi
+
+# ── 5: http leg (start upstreams + gateway, drive, tear down) ────────────────
 note "[http] transport, sessions, kill-switch, per-route isolation"
 "$SERVER_BIN" --transport http --port "$PORT_MAIN" >"$WORK/up-main.log" 2>&1 &
 BG_PIDS+=("$!")
@@ -156,8 +248,8 @@ fi
 kill "$PROXY_PID" 2>/dev/null || true
 wait "$PROXY_PID" 2>/dev/null || true
 
-# ── 4: audit-verify the shared, cross-restart HMAC chain ─────────────────────
-note "audit-verify (HMAC chain across all three proxy invocations)"
+# ── 6: audit-verify the shared, cross-restart HMAC chain ─────────────────────
+note "audit-verify (HMAC chain across every proxy invocation)"
 if vt_out="$("$PROXY_BIN" audit-verify --audit-log "$AUDIT_LOG" --audit-key-path "$AUDIT_KEY" 2>&1)"; then
   summary="$(printf '%s\n' "$vt_out" | grep -i '^Checked' || true)"
   echo "PASS  audit-verify: ${summary:-ok}"
@@ -167,7 +259,7 @@ else
   overall=1
 fi
 
-# ── 5: audit record content assertions ──────────────────────────────────────
+# ── 7: audit record content assertions ──────────────────────────────────────
 note "audit record assertions"
 "$HOST_BIN" --mode audit --audit-log "$AUDIT_LOG" || overall=1
 

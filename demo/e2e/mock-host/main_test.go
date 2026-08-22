@@ -1244,17 +1244,20 @@ func TestRunAuditCheck_InProcess(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 
+	// The revisions mirror the real tape the suite produces: the interop matrix drives cells
+	// under both, and a pre-negotiation refusal legitimately carries none.
 	recs := []auditRecord{
 		{
 			Decision: "allow", Target: "get_secret_record", Method: "tools/call",
-			TargetType:  "tool",
-			Obligations: []string{"redactFields:ssn", "redactFields:nested.token", "redactFields:api_key"},
+			TargetType:       "tool",
+			Obligations:      []string{"redactFields:ssn", "redactFields:nested.token", "redactFields:api_key"},
+			ProtocolRevision: revisionHandshake,
 		},
-		{Decision: "deny", DenialCode: "AUTHORIZATION_FAILED", Target: "write_file", Method: "tools/call", TargetType: "tool"},
-		{Decision: "deny", DenialCode: "VALUE_NOT_PERMITTED", ConditionType: "allowedValues", Target: "read_file", Method: "tools/call", TargetType: "tool"},
-		{Decision: "deny", DenialCode: "RATE_LIMITED", Target: "rate_limited", Method: "tools/call", TargetType: "tool"},
-		{Decision: "allow", Target: "file:///data/reports/q3.pdf", Method: "resources/read", TargetType: "resource"},
-		{Decision: "allow", Target: "code_review", Method: "prompts/get", TargetType: "prompt"},
+		{Decision: "deny", DenialCode: "AUTHORIZATION_FAILED", Target: "write_file", Method: "tools/call", TargetType: "tool", ProtocolRevision: revisionHandshake},
+		{Decision: "deny", DenialCode: "VALUE_NOT_PERMITTED", ConditionType: "allowedValues", Target: "read_file", Method: "tools/call", TargetType: "tool", ProtocolRevision: revisionDeclaring},
+		{Decision: "deny", DenialCode: "RATE_LIMITED", Target: "rate_limited", Method: "tools/call", TargetType: "tool", ProtocolRevision: revisionDeclaring},
+		{Decision: "allow", Target: "file:///data/reports/q3.pdf", Method: "resources/read", TargetType: "resource", ProtocolRevision: revisionDeclaring},
+		{Decision: "allow", Target: "code_review", Method: "prompts/get", TargetType: "prompt", ProtocolRevision: revisionHandshake},
 		{Decision: "allow", Method: "sampling/createMessage", TargetType: "sampling"},
 	}
 
@@ -1273,6 +1276,84 @@ func TestRunAuditCheck_InProcess(t *testing.T) {
 	runAuditCheck(logPath, s)
 	if s.fail != 0 {
 		t.Errorf("runAuditCheck happy path: want 0 fail, got %d (pass=%d)", s.fail, s.pass)
+	}
+}
+
+// writeAuditFixture writes recs as JSONL and returns the path.
+func writeAuditFixture(t *testing.T, recs []auditRecord) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	var buf bytes.Buffer
+	for i := range recs {
+		line, err := json.Marshal(&recs[i])
+		if err != nil {
+			t.Fatalf("marshal record %d: %v", i, err)
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The protocol-revision assertion has to FAIL on the two shapes it exists to catch, or it is
+// decoration: a tape covering only one revision (a matrix cell that silently did not run) and
+// a record stamped with a revision nobody published.
+func TestRunAuditCheck_ProtocolRevisionNegatives(t *testing.T) {
+	cases := []struct {
+		name string
+		recs []auditRecord
+	}{
+		{
+			name: "only one revision on the tape",
+			recs: []auditRecord{
+				{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionHandshake},
+				{Decision: "deny", Method: "tools/call", ProtocolRevision: revisionHandshake},
+			},
+		},
+		{
+			name: "a revision nobody published",
+			recs: []auditRecord{
+				{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionHandshake},
+				{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionDeclaring},
+				{Decision: "allow", Method: "tools/call", ProtocolRevision: "2099-01-01"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &suite{}
+			runAuditCheck(writeAuditFixture(t, tc.recs), s)
+			if s.fail == 0 {
+				t.Fatalf("runAuditCheck accepted %s (pass=%d)", tc.name, s.pass)
+			}
+		})
+	}
+}
+
+// A record with no revision is not a failure: a refusal recorded before negotiation ran has
+// nothing to stamp, and the tape has to be able to say so.
+//
+// Asserted as a DIFFERENTIAL because suite keeps counts rather than messages — the same
+// fixture with and without the unstamped record must fail identically, which isolates that
+// record's contribution without depending on what else the minimal fixture fails.
+func TestRunAuditCheck_AbsentProtocolRevisionIsNotAFailure(t *testing.T) {
+	stamped := []auditRecord{
+		{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionHandshake},
+		{Decision: "allow", Method: "tools/call", ProtocolRevision: revisionDeclaring},
+	}
+	withUnstamped := append(append([]auditRecord{}, stamped...),
+		auditRecord{Decision: "deny", DenialCode: "UNSUPPORTED_PROTOCOL_VERSION", Method: "tools/call"})
+
+	base := &suite{}
+	runAuditCheck(writeAuditFixture(t, stamped), base)
+	got := &suite{}
+	runAuditCheck(writeAuditFixture(t, withUnstamped), got)
+
+	if got.fail != base.fail {
+		t.Fatalf("an unstamped record changed the failure count: %d -> %d", base.fail, got.fail)
 	}
 }
 

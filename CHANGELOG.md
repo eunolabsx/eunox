@@ -46,6 +46,26 @@ Section conventions:
   stateless variant when session creation stops being anchored on the handshake. Old-revision
   behavior is unchanged and asserted so — both mocks emit none of the newer revision's result
   members when serving `2025-11-25`.
+- **A protocol-revision interop matrix in the end-to-end suite.** `demo/e2e/mock-server`
+  takes `--protocol-version` and `demo/e2e/mock-host` takes `--host-protocol-version`, so one
+  binary pair drives all four cells of {host 2025-11-25, 2026-07-28} x {upstream 2025-11-25,
+  2026-07-28} through the real proxy over stdio. Matched pairs assert the enforced surface —
+  filtered lists, an allowed call, deny-by-default, a condition denial, and, on the declaring
+  revision, that the methods it removes are unroutable and the ones it adds deny fail-closed
+  until their responders land. Mismatched pairs assert the `-32022` refusal in both
+  directions, that the message names both revisions, and that a policy-DENIED call is refused
+  on revision rather than on policy, so the refusal is known to precede enforcement rather
+  than merely to happen. A further leg runs `eunox init` and `eunox validate --live` against
+  an upstream speaking only 2026-07-28, with the negative that gives them meaning — the
+  handshake opener against that same upstream, asserted to fail — and the audit leg now
+  asserts decisions were recorded under both revisions and none under an unpublished one.
+
+  The declaring mock REFUSES a request carrying no `io.modelcontextprotocol/protocolVersion`
+  declaration rather than serving it anyway. That is what makes the matched new-revision cell
+  evidence that eunox declares the revision on every request it sends such a leg; a lenient
+  mock would have passed whether or not the proxy declared anything. On the same principle the
+  mock sends `cacheScope: "public"` on its list results and the host asserts it arrives as
+  `private`: the two halves are one property, and only the pair proves the clamp ran.
 
 - **`pep` on every audit record** (signed, `omitempty`): the policy-enforcement point that
   wrote it — the protocol binding it enforces at plus the operator's name for the instance,
