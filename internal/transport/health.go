@@ -43,13 +43,24 @@ import (
 //     caller honours, and nothing is folded. A proxy with no JWT layer folds no JWKS verdict; there
 //     is no key fetching to be healthy or unhealthy about.
 //
-// What the two must NOT differ on is the direction their ZERO value fails: a sample that reaches
-// fold before being filled in must report a degradation. That is a seam contract nothing reaches
-// today and the reason to state it is the next optional subsystem (a second sink, an effect-receipt
-// verifier): it arrives with two shipped precedents, and until this was written they failed in
-// OPPOSITE directions — capability.KeyFetchHealth{} reported an outage while audit.Health{} was a
-// healthy sink with nothing wrong. Either choice above is defensible; a zero value that reports
-// green is not, whichever one is made.
+// What the two must NOT differ on is the direction their ZERO value fails: a reporter that reaches
+// fold before the subsystem behind it has anything to report must degrade. Either choice above is
+// defensible; a value that reports green while nothing has spoken is not, whichever one is made.
+// It is checked over every implementation in the module rather than left as prose (see
+// health_conformance_test.go), because prose is what the two shipped samples had while they failed
+// in OPPOSITE directions — capability.KeyFetchHealth{} reported an outage while audit.Health{} was
+// a healthy sink with nothing wrong.
+//
+// What the seam does NOT answer is EXPECTATION. Absence reaches fold as the caller's own wiring —
+// a reporter handed over or not — so "no JWT layer was configured" and "one was configured and
+// failed to build" are the same call site with the same outcome, and the audit half carries its own
+// Present field rather than the seam answering presence once for everything. Deliberate while the
+// wiring makes the second unreachable — a JWT layer that fails to build is fatal at startup, and a
+// sink that fails to open is fatal too unless --require-audit=off, where it arrives absent and the
+// sample degrades, which is what either reading of that case wants: threading an expectation changes
+// every implementation of an interface two packages satisfy, and the shape it should take is the
+// third optional subsystem's to decide, not a guess made ahead of it. The conformance table is
+// where that subsystem lands, since it must classify itself there before it can fold anything.
 //
 // What differs per subsystem is only how the proxy REACHES it, which is a property of what it
 // holds rather than a second pattern: every killswitch.Manager answers the seam live (in-memory

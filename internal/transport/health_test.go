@@ -368,18 +368,6 @@ func TestHealthSnapshot_JWKSBreaker(t *testing.T) {
 	})
 }
 
-// Every degradable subsystem answers the readiness verdict through ONE seam. Asserted as a
-// compile-time constraint rather than left to whichever pattern a new subsystem's author reads
-// first: the alternative was two precedents eight lines apart in snapshot(), one asserting an
-// interface and one reaching through concrete types across three packages, with nothing failing
-// when a third subsystem picked between them arbitrarily.
-var (
-	// The JWT layer answers with a SAMPLE rather than live, which is the half of the rule that
-	// keeps a rendered field and the verdict beside it from being two independent readings.
-	_ healthReporter = capability.KeyFetchHealth{}
-	_ healthReporter = (*killswitch.InMemory)(nil)
-)
-
 // TestHealthSnapshot_SubsystemVerdictsFoldTheSameWay pins the fold: a degraded subsystem sets
 // its OWN field and the summary, and never one without the other — the discrepancy a scraper
 // reading the field could not detect.

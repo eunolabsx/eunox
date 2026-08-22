@@ -21,11 +21,6 @@ import (
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
-// The sink answers the seam with a SAMPLE, the same half of the rule the JWT layer follows: the
-// counters /healthz renders and the verdict beside them come from one reading, so a record dropped
-// mid-scrape cannot put a zero count next to a degraded verdict.
-var _ healthReporter = audit.Health{}
-
 // TestHealthSnapshot_AuditVerdictComesFromTheSink pins the fold rather than a predicate of the
 // transport's own: what flips the summary is whatever audit.Health.HealthStatus answers.
 func TestHealthSnapshot_AuditVerdictComesFromTheSink(t *testing.T) {
@@ -59,18 +54,6 @@ func TestHealthSnapshot_AuditVerdictComesFromTheSink(t *testing.T) {
 		snap.fold(audit.Health{Present: true}, &snap.AuditHealthy)
 		assert.True(t, snap.AuditHealthy)
 		assert.Equal(t, statusOK, snap.Status)
-	})
-
-	// The seam's fail-safe rule, asserted rather than described: a sample that reaches fold before
-	// being filled in must degrade. It is the property the two shipped samples used to disagree on
-	// — capability.KeyFetchHealth{} reported an outage while audit.Health{} was a healthy sink —
-	// and what the next optional subsystem folded here inherits.
-	t.Run("a zero sample degrades", func(t *testing.T) {
-		t.Parallel()
-		snap := healthSnapshot{Status: statusOK, AuditConfigured: true, AuditHealthy: true}
-		snap.fold(audit.Health{}, &snap.AuditHealthy)
-		assert.False(t, snap.AuditHealthy, "an unfilled sample must never report green")
-		assert.Equal(t, statusDegraded, snap.Status)
 	})
 }
 
