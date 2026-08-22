@@ -47,11 +47,11 @@ const (
 	ctSSE  = "text/event-stream"
 
 	// httpWriteTimeout is a Slowloris backstop, not the response budget: it is the FLOOR of
-	// the window rearmWriteDeadline arms before a POST-path leg writes its response (widened
-	// to the upstream budget + writeSlack when that is larger, never cleared), and the SSE
-	// path re-arms a bounded per-chunk sseWriteTimeout around every frame (handleMCPGet) — a
-	// long-lived stream must outlive any single-call budget, but one write must still never
-	// block forever.
+	// the window every handler leg re-arms before writing its response — the upstream budget
+	// on the POST path, the teardown bound on DELETE and /control/kill, each + writeSlack and
+	// taken only when larger, never cleared — while the SSE path re-arms a bounded per-chunk
+	// sseWriteTimeout around every frame (handleMCPGet): a long-lived stream must outlive any
+	// single-call budget, but one write must still never block forever.
 	httpReadTimeout  = 30 * time.Second
 	httpWriteTimeout = 30 * time.Second
 
