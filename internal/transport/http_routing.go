@@ -1263,28 +1263,54 @@ func (s *httpSession) leg() hostLeg {
 // primitives" is blind to an arm that calls neither, which is how an entry point came to
 // negotiate nothing at all.
 func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg) (capability.Revision, bool) {
-	// One branch for both halves — the leg's revisions and the leg's unblocker — so a caller
-	// cannot supply a session's facts while its blocked initiator goes unanswered. The
-	// pre-session arms pass a nil session: `initialize` exists only in the handshake-bearing
-	// revision, so that is their context, and nothing they answer reaches an upstream.
-	leg, unblock := sessionlessLeg(), (func(context.Context, mcp.RPCMsg))(nil)
+	// One value for both halves — the leg's revisions and the leg's peer — so a caller cannot
+	// supply a session's facts while its blocked initiator goes unanswered. An established
+	// session IS its own peer, which is what keeps this off the allocating path: it holds the
+	// route and the proxy the recorder resolves through, and it is what answers the upstream
+	// request a refused host RESPONSE would have completed (a protocol refusal is not an
+	// emergency stop, and eunox can answer at its own revision without relaying anything the
+	// host said).
+	//
+	// The pre-session arms pass a nil session: `initialize` exists only in the handshake-bearing
+	// revision, so that is their context, and nothing they answer reaches an upstream. Branched
+	// rather than built unconditionally, since evaluating the sessionless peer's literal would
+	// put its allocation back on every established request.
+	leg, peer := sessionlessLeg(), hostGatePeer(nil)
 	if sess != nil {
-		leg, unblock = sess.leg(), sess.unblockRefusedServerReply
+		leg, peer = sess.leg(), sess
+	} else {
+		peer = &sessionlessGatePeer{proxy: p, route: route}
 	}
-	return hostMessageGate{
-		leg:      leg,
-		recorder: func() auditRecorder { return p.revisionRefusalRecorder(sess, route) },
+	rev, refusal, ok := hostMessageGate{leg: leg, peer: peer}.negotiate(r.Context(), msg)
+	if !ok {
 		// writeDispatchResult, not a second spelling of it: "a zero RPCMsg is acked bodyless,
 		// never written as a `{"jsonrpc":""}` frame" is one rule on this transport, and the
 		// refusal is one more caller of it.
-		refuse: func(resp mcp.RPCMsg) { writeDispatchResult(w, resp) },
-		// A refused host RESPONSE would have answered a request the upstream is blocked on;
-		// unblock it rather than let it hang. A protocol refusal is not an emergency stop, and
-		// eunox can answer with its own error at its own revision without relaying anything the
-		// host said.
-		unblock: unblock,
-	}.negotiate(r.Context(), msg)
+		writeDispatchResult(w, refusal)
+	}
+	return rev, ok
 }
+
+// sessionlessGatePeer is the shared prologue's peer for HTTP's two PRE-SESSION arms — the
+// session-creating `initialize` and the id-less POST — which address a route but have no session.
+//
+// The one place this wiring allocates, and deliberately: those arms have no long-lived value that
+// knows both the proxy and the route, and a message that establishes a session is not on the path
+// the per-request cost is measured on. See hostGatePeer.
+type sessionlessGatePeer struct {
+	proxy *HTTPProxy
+	route *UpstreamRoute
+}
+
+// revisionRefusalRecorder resolves the refusal's recorder with no session to name, which is the
+// honest subject here: nothing has been established for this message to belong to.
+func (s *sessionlessGatePeer) revisionRefusalRecorder() auditRecorder {
+	return s.proxy.revisionRefusalRecorder(nil, s.route)
+}
+
+// unblockRefusedServerReply answers nothing: a pre-session message reaches no upstream, so there
+// is no blocked initiator for its refusal to owe.
+func (*sessionlessGatePeer) unblockRefusedServerReply(context.Context, mcp.RPCMsg) {}
 
 // routeHostServerResponse routes a host POST that is neither request nor notification: a
 // response to a server-initiated request the proxy broadcast, which must reach the blocked
@@ -1338,9 +1364,15 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 // Nil-limiter tolerance mirrors recordRefusal's: a proxy built without one (tests) records
 // unbounded rather than not at all.
 func (p *HTTPProxy) revisionRefusalRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
-	rec := asRecorder(p.sink)
-	if route != nil {
+	// p is nil only on a bare-struct-literal session (as tests build) reaching this through
+	// httpSession.revisionRefusalRecorder; the limits below already tolerate one, and a refusal
+	// with no recorder still reaches its peer on the wire.
+	var rec auditRecorder
+	switch {
+	case route != nil:
 		rec = asRecorder(route.sink)
+	case p != nil:
+		rec = asRecorder(p.sink)
 	}
 	// sess is threaded even though this leg writes no stderr line today: the whole reason the
 	// accessor takes a nilable session is that a leg holding one must name it, and this one holds

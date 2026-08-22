@@ -1315,25 +1315,25 @@ func (p *StdioProxy) noticeWriter() noticeWriter {
 // also gets its -32022 reply (JSON-RPC forbids replying to a notification). Called only from
 // serveHost, the single goroutine that owns the pin.
 //
-// The negotiation itself, its refusal, and the debt a refused host RESPONSE owes its blocked
+// The negotiation itself, its record, and the debt a refused host RESPONSE owes its blocked
 // initiator are hostMessageGate's — shared with the HTTP prologue, so this transport holds only
 // what is genuinely its own: the pin, the stamp, and what a stream peer is sent when JSON-RPC
-// forbids a reply.
+// forbids a reply. That last one is why the gate hands the refusal BACK rather than writing it;
+// see negotiate.
 func (p *StdioProxy) negotiateHostRevision(ctx context.Context, msg mcp.RPCMsg) (context.Context, bool) {
 	pinned := p.hostRevision()
-	rev, ok := hostMessageGate{
-		leg:      hostLeg{contextRev: pinned, upstreamRev: p.upstreamRev, sessionID: p.sessionID},
-		recorder: p.revisionRefusalRecorder,
-		// A zero response is one JSON-RPC forbids replying to, and this transport's peer reads a
-		// stream: there is nothing to send in its place, so silence IS the disposition.
-		refuse: func(resp mcp.RPCMsg) {
-			if !resp.IsZero() {
-				_ = p.hostWriter.Write(resp)
-			}
-		},
-		unblock: p.unblockRefusedServerReply,
+	rev, refusal, ok := hostMessageGate{
+		leg: hostLeg{contextRev: pinned, upstreamRev: p.upstreamRev, sessionID: p.sessionID},
+		// This proxy IS the peer: both hooks the refusal path needs are methods on it, so the
+		// prologue's wiring costs an admitted message nothing at all.
+		peer: p,
 	}.negotiate(ctx, msg)
 	if !ok {
+		// A zero response is one JSON-RPC forbids replying to, and this transport's peer reads a
+		// stream: there is nothing to send in its place, so silence IS the disposition.
+		if !refusal.IsZero() {
+			_ = p.hostWriter.Write(refusal)
+		}
 		return ctx, false
 	}
 	// Guarded on the pin being UNSET. It is write-once by construction — resolveHostRevision

@@ -702,8 +702,9 @@ opened at another (a mid-context flip).
   Because that difference is SIEM-facing during an emergency stop, the ordering and its
   exception are pinned by tests on both transports rather than left to prose. The head of
   that order is one implementation both transports call (`hostMessageGate.negotiate`), with
-  a source guard failing the build on a hand-placed copy — the transports may inject how
-  their peer is written to, not the sequence.
+  a source guard failing the build on a hand-placed copy. What a transport supplies is its
+  peer — where the refusal's record goes, and how a blocked upstream request is answered —
+  and what that peer is sent when JSON-RPC forbids a reply; never the sequence.
 - **The upstream leg speaks one revision, decided before it opens, and its handshake is
   checked rather than trusted.** The revision eunox addresses an upstream as used to be a
   constant while the operator's `protocolVersion` pin only relabelled the leg afterwards, so

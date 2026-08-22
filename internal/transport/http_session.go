@@ -365,6 +365,15 @@ func (s *httpSession) unblocker() serverRequestUnblocker {
 // revoked session's refused reply may still unblock its initiator — that costs nothing the kill
 // protects, since what a kill forbids is DELIVERING the host's reply and this answer is eunox's
 // own. See this file's package-level rule for the drops that deliberately do not answer.
+// revisionRefusalRecorder resolves the -32022 refusal's recorder for a message on this session:
+// the other half of the shared prologue's hostGatePeer, answered from state the session already
+// holds so an established request pays nothing for wiring only a refusal reads. Through the proxy
+// that created it and the route it is bound to — which handleSessionPost has already checked is
+// the route this request addressed.
+func (s *httpSession) revisionRefusalRecorder() auditRecorder {
+	return s.proxy.revisionRefusalRecorder(s, s.route)
+}
+
 func (s *httpSession) unblockRefusedServerReply(ctx context.Context, msg mcp.RPCMsg) {
 	if !msg.IsResponse() {
 		return
