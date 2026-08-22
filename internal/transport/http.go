@@ -474,18 +474,18 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	// ahead of a rejected one already bound and re-pointed — a panic the caller cannot act on
 	// without knowing which half of its map this constructor got through.
 	for name, route := range p.routes {
-		// Routes is a caller-populated map, which requireUsableOptions cannot reach into (it walks
-		// interface FIELDS), so the nil value it may hold is refused here rather than dereferenced
-		// on the next line — a diagnosis-free constructor panic three lines under the guard that
-		// exists to replace one.
+		// requireUsableOptions descends into a container's elements, but this one's are POINTERS
+		// and that is its stop: what a caller-built subsystem holds inside itself is its own
+		// package's business. So the nil value this map may hold is refused here rather than
+		// dereferenced on the next line — a diagnosis-free constructor panic three lines under the
+		// guard that exists to replace one.
 		requireUsable(fmt.Sprintf("HTTPGatewayOptions.Routes[%q]", name), route)
 		// The one interface held INSIDE a route, and the last one in either options graph outside a
 		// check. It used to be closed by visibility alone — UpstreamRoute's fields are unexported,
 		// so only BuildRoutes and WrapRoutesWithJWT can populate them and neither produces a typed
 		// nil today — which is an argument about the callers that exist rather than a rule. Named
-		// here rather than reached by descending the map, because the walk deliberately does not
-		// look through a pointer: what a caller-built subsystem holds inside itself is its own
-		// package's business, and a route is this package's.
+		// here for the reason above, and held to it by the declaration in wiring_test.go: a second
+		// pointer-element container option fails the build rather than inheriting these two lines.
 		requireUsable(fmt.Sprintf("HTTPGatewayOptions.Routes[%q].pdp", name), route.pdp)
 		// And a route already claimed by another proxy is refused rather than taken over: the
 		// assignments below are IN PLACE on a value the caller still holds, so a second proxy over
