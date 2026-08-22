@@ -257,12 +257,15 @@ func ValidateFlowLabelNamespace(ns string) error {
 // strings. Native-first is what keeps a policy that uses only the native axis producing
 // byte-identical audit fields to before the second axis existed.
 //
-// Malformed entries are DROPPED rather than surfaced, matching the fail-safe direction the
-// declared-label path needs: every caller here is unioning taint IN, so dropping an entry
-// cannot manufacture an allowance, and the boundaries that parse untrusted input
-// (ParseContextManifest, the token claims) reject a malformed label before it reaches here.
-// The paths where a dropped label WOULD shrink an obligation — the engine's own store read
-// and label record — validate explicitly and fail closed instead.
+// Malformed entries are DROPPED rather than surfaced, and the boundaries that parse untrusted
+// input (ParseContextManifest, the token claims) reject a malformed label before it reaches
+// here, so on the shipped path there is nothing to drop. A caller that reaches this with one
+// anyway owns the direction: unioning taint IN (the declared and forced sets) cannot
+// manufacture an allowance by dropping an entry, and the two callers that instead NARROW
+// (computeAllowedLabelCap, which only ever removes an allowance, and DeclassifyLabelsOf,
+// which re-appends what was dropped for exactly this reason) are safe for their own stated
+// reasons rather than this one. The paths where a dropped label WOULD shrink an obligation —
+// the engine's own store read and label record — validate explicitly and fail closed instead.
 func NormalizeFlowLabels(labels []string) []string {
 	if len(labels) == 0 {
 		return nil

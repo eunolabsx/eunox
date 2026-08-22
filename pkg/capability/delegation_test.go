@@ -453,4 +453,37 @@ func TestDelegationGrant_LabelCountIsBounded(t *testing.T) {
 	err = overCap.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "allowLabels")
+
+	// Reachable through the exported chain boundary, not only through Validate: an embedder
+	// assembling a chain directly never goes through ParseDelegationGrants, and asserting the
+	// bound on the grant alone left that entry point admitting an unbounded list.
+	_, err = capability.ValidateDelegationChain(nil, []capability.DelegationGrant{over})
+	require.Error(t, err, "the count bound must hold at every boundary that accepts a chain")
+	assert.Contains(t, err.Error(), "more than the maximum")
+}
+
+// TestDelegationChain_ImportedForcedLabelsAreNotUnknown pins the two-axis half of the forced-label
+// path. UnknownForcedLabels must report exactly what ForcedLabels' normalization DROPS: a label
+// on either axis survives it, so reporting an imported one would hard-deny every delegated call
+// carrying it — turning a taxonomy this route does not police into an outage rather than the
+// extra denials the axis is designed to produce.
+func TestDelegationChain_ImportedForcedLabelsAreNotUnknown(t *testing.T) {
+	chain, err := capability.ValidateDelegationChain(nil, []capability.DelegationGrant{{
+		Subject: "agent-a",
+		Labels:  []string{"confidential", "purview:highly-confidential"},
+	}})
+	require.NoError(t, err, "a grant forcing an imported label is well-formed")
+	assert.Empty(t, chain.UnknownForcedLabels(), "a label on either axis is not unknown")
+	assert.Equal(t,
+		[]string{"confidential", "purview:highly-confidential"},
+		chain.ForcedLabels(),
+		"both axes survive normalization, native-first then imported sorted")
+
+	// The complement: a label on NEITHER axis is still surfaced, which is what stops a
+	// programmatically-built chain silently shedding taint its delegators imposed.
+	unchecked := &capability.DelegationChain{Grants: []capability.DelegationGrant{{
+		Subject: "agent-a",
+		Labels:  []string{"Purview:x", "quarantined"},
+	}}}
+	assert.Equal(t, []string{"Purview:x", "quarantined"}, unchecked.UnknownForcedLabels())
 }

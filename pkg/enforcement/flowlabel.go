@@ -148,7 +148,7 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 		return &ConditionError{
 			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypeFlowLabel,
-			Message:       fmt.Sprintf("delegation chain forces unknown flow label(s) %v; valid native labels are %v — a forced label cannot be normalized away, since dropping it would remove taint the delegators imposed", unknown, flowLabelVocab),
+			Message:       fmt.Sprintf("delegation chain forces flow label(s) %v usable on neither axis; a label must be one of the native classes %v or an imported %q-separated 'namespace:value' — a forced label cannot be normalized away, since dropping it would remove taint the delegators imposed", unknown, capability.NativeFlowLabelVocabulary(), capability.FlowLabelNamespaceSep),
 		}
 	}
 	forced := req.Delegation.ForcedLabels()
@@ -196,7 +196,8 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	return nil
 }
 
-// unionLabels merges declared into present, deduplicated, in fixed vocabulary order. Returns
+// unionLabels merges declared into present, deduplicated, in canonical order (native classes
+// in vocabulary order, then imported sorted — see NormalizeFlowLabels). Returns
 // present unchanged when there's nothing to add.
 //
 // Delegates to capability.NormalizeDeclaredLabels rather than a second dedupe-and-order copy,

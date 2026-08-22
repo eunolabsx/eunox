@@ -359,8 +359,12 @@ func (c *DelegationChain) ForcedLabels() []string {
 	return c.computeForcedLabels()
 }
 
-// UnknownForcedLabels returns the raw grant labels that are not native flow labels, in the
-// order the chain declares them.
+// UnknownForcedLabels returns the raw grant labels usable on NEITHER axis, in the order the
+// chain declares them.
+//
+// The predicate must mirror exactly what ForcedLabels' normalization keeps, which is both
+// axes: reporting an imported label here would hard-deny every delegated call carrying one,
+// turning a taxonomy this route does not police into an outage rather than extra denials.
 //
 // ForcedLabels normalizes against the vocabulary, which silently DROPS anything unrecognized.
 // That is right for a cooperating client's voluntary attribution (an unknown label there can
@@ -380,7 +384,7 @@ func (c *DelegationChain) UnknownForcedLabels() []string {
 	var unknown []string
 	for i := range c.Grants {
 		for _, l := range c.Grants[i].Labels {
-			if !IsFlowLabel(l) {
+			if ValidateFlowLabel(l) != nil {
 				unknown = append(unknown, l)
 			}
 		}
@@ -434,10 +438,11 @@ func (c *DelegationChain) EffectClassCap() (class, subject string, ok bool) {
 // claim parser trims to "ssn" and the other boundary leaves as " ssn" matches no key, so the
 // delegator's masking obligation evaporates instead of failing loudly.
 //
-// Labels/AllowLabels are deliberately left alone. They are matched against the closed flow-label
-// vocabulary, which Validate refuses anything outside — so a padded entry rejects the grant at
-// both boundaries alike rather than going silently inert, and trimming would ACCEPT a spelling
-// the claim path rejects.
+// Labels/AllowLabels are deliberately left alone. Validate refuses anything outside the two
+// flow-label axes, and padding puts an entry outside both (a leading space is in neither the
+// native vocabulary nor a well-formed namespace), so a padded entry rejects the grant at both
+// boundaries alike rather than going silently inert, and trimming would ACCEPT a spelling the
+// claim path rejects.
 func (g *DelegationGrant) normalize() {
 	g.Subject = strings.TrimSpace(g.Subject)
 	g.Targets = trimmedListPtr(g.Targets)

@@ -115,7 +115,8 @@ type EnforceResponse struct {
 	// is added). Both are populated by the engine only for flow-relevant constraints
 	// (those carrying a flowLabel condition or a labelOutput directive) and are stamped
 	// onto the audit record so a source->sink flow reconstructs from the tape. Sorted
-	// in the fixed vocabulary order for a deterministic record; nil on a non-flow call.
+	// in canonical order (see NormalizeFlowLabels) for a deterministic record; nil on a
+	// non-flow call.
 	LabelsOut     []string `json:"labelsOut,omitempty"`
 	CarriedLabels []string `json:"carriedLabels,omitempty"`
 	// Declassification is the authorized second phase of a flow-label clear: the labels an
