@@ -258,13 +258,13 @@ type Status struct {
 
 // buildStatus assembles a *Status from the raw cache maps, sorting both id slices for
 // deterministic output. Shared by both backends so the two cannot drift.
-func buildStatus(globalActive bool, killedAgents, killedSessions, revokedJTIs map[string]bool) *Status {
-	return &Status{
-		GlobalActive:   globalActive,
-		KilledAgents:   sortedKeys(killedAgents),
-		KilledSessions: sortedKeys(killedSessions),
-		RevokedJTIs:    sortedKeys(revokedJTIs),
+func buildStatusOf(globalActive bool, held func(*killDimension) map[string]bool) *Status {
+	st := &Status{GlobalActive: globalActive}
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		*dim.slot(st) = sortedKeys(held(dim))
 	}
+	return st
 }
 
 // sortedKeys returns m's keys sorted, so a marshaled Status is stable regardless of Go's

@@ -97,3 +97,94 @@ func TestKillCheck_RevokedTokenDeniesWhileAgentAndSessionAreClean(t *testing.T) 
 	assert.Nil(t, p.CheckKill(ctx, "sess-1"),
 		"a request with no token has no token dimension to match; it must not inherit another's revocation")
 }
+
+// A client that ROTATES its bearer mid-session must still be reclaimable on the credential it
+// is currently presenting.
+//
+// The session's claims are captured once, at initialize, and the owner binding compares `sub` —
+// which survives rotation. So the reclaim sweep was matching the token the session STARTED with
+// while every request was being decided against the current one: revoking the token actually in
+// use denied its traffic and reclaimed nothing, pinning the upstream and the maxSessions slot
+// until exit under sessionIdleTimeoutMs: 0. That is the configuration the on-delivery reclaim
+// exists for, so the gap was exactly where it hurts.
+func TestRevocationReclaim_FollowsARotatedCredential(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           newTestManifestPDPWithKS(ks),
+		KS:            ks,
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sid := initSession(t, srv)
+	sess := proxy.getSession(sid)
+	require.NotNil(t, sess)
+	// Established on one credential...
+	sess.claims = &pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-first"}
+	// ...then a request arrives on a rotated one, same subject so the owner binding passes.
+	sess.noteRequestAnchor(&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-rotated"})
+
+	// An unrelated credential still reclaims nothing.
+	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-unrelated"))
+	proxy.sweepKilledSessions()
+	assert.Equal(t, 1, proxy.sessionCount(), "an unrelated revocation must not reclaim this session")
+
+	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-rotated"))
+	proxy.sweepKilledSessions()
+	waitForSessions(t, proxy, 0)
+}
+
+// And the credential the session was ESTABLISHED with still reclaims it after a rotation: both
+// tokens were used on this session, and forgetting the first would make rotation a way to shed
+// the association with a credential that is being revoked.
+func TestRevocationReclaim_StillFollowsTheEstablishingCredential(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           newTestManifestPDPWithKS(ks),
+		KS:            ks,
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sid := initSession(t, srv)
+	sess := proxy.getSession(sid)
+	require.NotNil(t, sess)
+	sess.claims = &pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-first"}
+	sess.noteRequestAnchor(&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-rotated"})
+
+	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-first"))
+	proxy.sweepKilledSessions()
+	waitForSessions(t, proxy, 0)
+}
+
+// A request presenting NO token must not clear the association: otherwise an unauthenticated
+// request becomes a way to make a session unreclaimable on the credential it last held.
+func TestRevocationReclaim_AnUntokenedRequestDoesNotClearTheAssociation(t *testing.T) {
+	t.Parallel()
+	sess := &httpSession{}
+	sess.noteLiveTokenID(&pdp.JWTClaims{TokenID: "jti-held"})
+	sess.noteLiveTokenID(nil)
+	sess.noteLiveTokenID(&pdp.JWTClaims{})
+
+	live := sess.liveTokenID.Load()
+	require.NotNil(t, live, "a request with no token must leave the last known credential in place")
+	assert.Equal(t, "jti-held", *live)
+}

@@ -1923,7 +1923,7 @@ func (rec *auditRecord) queueSize() int64 {
 	for _, o := range rec.Obligations {
 		n += int64(len(o))
 	}
-	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.Delegate))
+	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.TokenID) + len(rec.Delegate))
 	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
 	n += int64(len(rec.PEP) + len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
 	n += int64(len(rec.DenialCode) + len(rec.ConditionType) + len(rec.ProtocolRevision))

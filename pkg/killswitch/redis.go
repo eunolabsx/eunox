@@ -1108,7 +1108,7 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 		}
 	case killLive:
 	}
-	return buildStatus(r.globalActive, r.killedAgents, r.killedSessions, r.revokedJTIs), nil
+	return buildStatusOf(r.globalActive, func(d *killDimension) map[string]bool { return d.cache(r) }), nil
 }
 
 // publish broadcasts msg on the kill-switch channel. The durable write and cache update

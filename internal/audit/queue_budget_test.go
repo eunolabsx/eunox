@@ -12,10 +12,14 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestQueueSize_CountsVariableEnvelopeStrings is the regression: the envelope
@@ -58,6 +62,8 @@ func TestQueueSize_CountsVariableEnvelopeStrings(t *testing.T) {
 		// both are variable-length on that path and must be counted like the rest.
 		{"DenialCode", func(r *auditRecord) { r.DenialCode = strings.Repeat("D", fill) }},
 		{"ConditionType", func(r *auditRecord) { r.ConditionType = strings.Repeat("C", fill) }},
+		// TokenID is the JWT `jti`, IdP-supplied and bounded like the other identity claims.
+		{"TokenID", func(r *auditRecord) { r.TokenID = strings.Repeat("j", fill) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -276,4 +282,64 @@ func TestQueuedBytes_ReturnsToZeroAfterDrain(t *testing.T) {
 	if dropped := sink.Health().Dropped; dropped != 0 {
 		t.Errorf("Health().Dropped = %d, want 0 (the test load is far below the budget)", dropped)
 	}
+}
+
+// TestQueueSize_EveryStringFieldIsCountedOrDeclaredFixed is the guard the table above cannot
+// be: a hand-written list of fields is exactly what goes stale when a field is added, and the
+// failure is silent — `token_id` shipped uncounted, so an 8 KiB IdP-supplied value was heap the
+// 256 MiB budget could not see, and the shed-instead-of-OOM guarantee held for fewer records
+// than it promised.
+//
+// Reflective over auditRecord, so a new field is covered the day it is added. A field is
+// permitted to go uncounted only by being DECLARED fixed-width with a reason — the flat
+// auditRecordEnvelopeEstimate already covers those, and folding a variable-length one in is the
+// bug this closes.
+func TestQueueSize_EveryStringFieldIsCountedOrDeclaredFixed(t *testing.T) {
+	t.Parallel()
+	const fill = 4096
+	base := (&auditRecord{}).queueSize()
+
+	for name, why := range fixedWidthRecordFields {
+		require.NotEmptyf(t, why, "%s is exempted from the queue estimate without saying why", name)
+	}
+
+	typ := reflect.TypeOf(auditRecord{})
+	checked := 0
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		if f.Type.Kind() != reflect.String && f.Type != reflect.TypeOf([]string(nil)) {
+			continue
+		}
+		if _, exempt := fixedWidthRecordFields[f.Name]; exempt {
+			continue
+		}
+		checked++
+		t.Run(f.Name, func(t *testing.T) {
+			rec := &auditRecord{}
+			v := reflect.ValueOf(rec).Elem().Field(i)
+			if f.Type.Kind() == reflect.String {
+				v.SetString(strings.Repeat("z", fill))
+			} else {
+				v.Set(reflect.ValueOf([]string{strings.Repeat("z", fill)}))
+			}
+			assert.Equalf(t, base+int64(fill), rec.queueSize(),
+				"a %d-byte %s is not counted by queueSize, so the queue can hold heap the byte budget cannot see. "+
+					"Count it, or declare it in fixedWidthRecordFields with the reason it cannot grow.", fill, f.Name)
+		})
+	}
+	require.NotZero(t, checked, "no countable field was walked; the guard is asserting nothing")
+}
+
+// fixedWidthRecordFields are the record's string fields whose length this build controls, so the
+// flat auditRecordEnvelopeEstimate covers them. Each names WHY it cannot grow — an entry added
+// to silence the guard rather than because the field is bounded reintroduces the hole.
+var fixedWidthRecordFields = map[string]string{
+	"Time":             "RFC3339Nano, stamped by the sink",
+	"Decision":         "one of a closed set this package writes",
+	"KeyID":            "16 hex characters of the signing key id",
+	"PrevHMAC":         "sha256: plus a fixed-width digest",
+	"HMAC":             "sha256: plus a fixed-width digest",
+	"RequestID":        "a UUID the engine mints",
+	"ProtocolRevision": "drawn from capability.PublishedRevisions, a closed set",
+	"PEP":              "the operator's enforcement-point name, validated and bounded at construction",
 }

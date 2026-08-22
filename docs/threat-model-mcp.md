@@ -244,6 +244,15 @@ last-wins to a value the holder controls, and a revoked credential would keep se
 revocation still listed as active. Watching it is what makes the revocation binding, and an
 ambiguous `jti` is a rejected token.
 
+Revoking a token **reclaims** the sessions holding it, not merely their next request — including
+one whose client **rotated** its bearer mid-session. A session's claims are captured once, at
+`initialize`, and the owner binding compares `sub`, which survives rotation; matching the reclaim
+sweep on those claims alone would deny the rotated credential's traffic while reclaiming nothing,
+pinning the upstream and the `maxSessions` slot until exit under `sessionIdleTimeoutMs: 0` — the
+configuration the on-delivery reclaim exists for. The sweep therefore matches on the credential
+the session was established with **and** the one it most recently presented. A request carrying
+no token does not clear that association, or an unauthenticated request would be a way to shed it.
+
 A token revocation does **not** expire, unlike a session tombstone: a credential revoked for
 cause must not be re-admitted by a clock. It stops being consulted when the token's own `exp`
 passes, which is the holder's clock and not the operator's, so `--revive --jti` (Redis only) is

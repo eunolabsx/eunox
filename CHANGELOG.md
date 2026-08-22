@@ -46,9 +46,11 @@ Section conventions:
   revoked credential would keep serving. An ambiguous `jti` is a rejected token.
 
   Revoking a token **reclaims** the sessions holding it, not just their next request: the
-  existing on-delivery reclaim re-asks the kill switch about each held session and finds the new
-  dimension with no change, which matters most under `sessionIdleTimeoutMs: 0` where no reaper
-  would find them later.
+  on-delivery reclaim re-asks the kill switch about each held session, which matters most under
+  `sessionIdleTimeoutMs: 0` where no reaper would find them later. It follows a client that
+  **rotated** its bearer mid-session too — a session's claims are captured once at `initialize`
+  and the owner binding compares `sub`, so matching on those alone would deny the rotated
+  credential's traffic while reclaiming nothing.
 
 - **New signed audit field `token_id`.** The JWT `jti`, stamped from a validated token. It
   answers a different question from `agent_id`/`user_id` beside it: which CREDENTIAL authorized
@@ -57,23 +59,7 @@ Section conventions:
   Omitted when the token carries no `jti` and for every request with no token, so an existing
   deployment's records are byte-identical until its IdP issues one.
 
-### Changed
-
-- **`killswitch.Checker.ShouldBlock` takes a `killswitch.Subject`** — `{AgentID, SessionID,
-  JTI}` — instead of positional identity strings. Passed by value and allocation-free
-  (benchmarked), since the kill check runs ahead of every policy evaluation. Adding the token
-  dimension required no signature change anywhere, which was the point: each dimension used to
-  be a positional string, so a new one meant editing every implementation, caller and test in
-  lockstep, and a transposition of two same-typed arguments still compiled.
-
-  The Redis backend's dimensions are likewise **declared once** (`pkg/killswitch/dimension.go`)
-  and its writer, pub/sub handler, reconcile scan, `Reset` and `Status` all iterate that
-  declaration. They previously hand-mirrored the (agent, session) pair across six sites; a
-  seventh dimension added by that method is six edits that must agree, and the one somebody
-  forgets does not fail — a `jti:kill:` event the handler does not know falls back to a full
-  SCAN, and a prefix `Reset` does not sweep is re-loaded by the next reconcile.
-
-- **The mismatched-revision translation boundary (ADR-0006, held structurally.** That revision splits what
+- **The 2026-07-28 JSON-RPC error-code partition, held structurally.** That revision splits what
   was one free range: -32000..-32019 stays implementation-defined, and -32020..-32099 becomes the
   specification's to assign as the protocol grows. Every code eunox mints now sits in the
   implementation-defined band, is one of JSON-RPC's own pre-defined codes used for what it means,
@@ -163,6 +149,20 @@ Section conventions:
   members its revision does not define.
 
 ### Changed
+
+- **`killswitch.Checker.ShouldBlock` takes a `killswitch.Subject`** — `{AgentID, SessionID,
+  JTI}` — instead of positional identity strings. Passed by value and allocation-free
+  (benchmarked), since the kill check runs ahead of every policy evaluation. Adding the token
+  dimension required no signature change anywhere, which was the point: each dimension used to
+  be a positional string, so a new one meant editing every implementation, caller and test in
+  lockstep, and a transposition of two same-typed arguments still compiled.
+
+  The Redis backend's dimensions are likewise **declared once** (`pkg/killswitch/dimension.go`)
+  and its writer, pub/sub handler, reconcile scan, `Reset` and `Status` all iterate that
+  declaration. They previously hand-mirrored the (agent, session) pair across six sites; a
+  seventh dimension added by that method is six edits that must agree, and the one somebody
+  forgets does not fail — a `jti:kill:` event the handler does not know falls back to a full
+  SCAN, and a prefix `Reset` does not sweep is re-loaded by the next reconcile.
 
 - **New denial code `UNTRANSLATABLE_ACROSS_REVISIONS`** for boundary refusals. It shares the
   spec-assigned `-32022` integer with `UNSUPPORTED_PROTOCOL_VERSION` but is distinguished in

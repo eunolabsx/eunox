@@ -12,9 +12,9 @@ import "time"
 //
 // # Why a table
 //
-// The two original axes were hand-mirrored across six places — the kill/revive writer, the
-// pub/sub handler, the reconcile commit, the reconcile union, Reset's key sweep and Status —
-// and the pair was spelled out at each. Adding a third by the same method is six edits that
+// The two original axes were hand-mirrored across eight places — both backends' reads, the
+// kill/revive writer, the pub/sub handler, the reconcile commit, the reconcile union, Reset's
+// key sweep and both backends' Status — and the pair was spelled out at each. Adding a third by the same method is six edits that
 // must agree, with no compiler check on any of them: a `jti:kill:` event the handler forgets is
 // a revocation that propagates to Redis, survives the reconcile, and silently never reaches one
 // replica's cache. That is a fail-OPEN on the emergency stop, and it is invisible until someone
@@ -26,10 +26,10 @@ import "time"
 // # Why the caches stay named fields
 //
 // The obvious next step — one `map[string]map[string]bool` keyed by dimension name — would
-// remove the accessors below. It is not taken because ShouldBlock is the hot path, taken ahead
-// of every policy evaluation on every request, and a nested map puts a second lookup in front
-// of each dimension. So the READ path keeps three direct field accesses and the COLD paths
-// reach them through these accessors, which is where the uniformity is actually worth having.
+// remove the accessors below. It is not taken because the sets are reached under each holder's
+// own lock and a nested map puts a second lookup in front of every dimension on the read path,
+// which runs ahead of every policy evaluation on every request. The named fields stay; what the
+// table supplies is the ACCESSOR, so no path has to know which field a dimension lives in.
 type killDimension struct {
 	// name is the pub/sub channel word and the durable key's middle segment — one value, so a
 	// writer cannot publish on one dimension's channel while writing another's key.
@@ -45,8 +45,20 @@ type killDimension struct {
 	// agent kill and a token revocation are durable revocations of a long-lived identity, and
 	// a revocation that quietly expires is one an operator did not withdraw.
 	expires bool
-	// cache returns the live cache map for this dimension. Read under r.mu by the caller.
-	cache func(r *Redis) map[string]bool
+	// cache and memCache return the live set for this dimension on each backend. Two
+	// accessors rather than one over an interface: both are called under the holder's own
+	// lock on paths that must not allocate an interface value, and the two backends store
+	// their sets in unrelated fields.
+	cache    func(r *Redis) map[string]bool
+	memCache func(m *InMemory) map[string]bool
+	// slot returns the field of a Status this dimension's ids are reported in.
+	//
+	// On the DECLARATION rather than a switch inside the snapshot builder: Status has a named
+	// field per dimension (it is a JSON contract, so the ids cannot become one anonymous map),
+	// and a builder that switched on the name would let a dimension added here go silently
+	// missing from every snapshot an operator reads to confirm what is in force. Required —
+	// TestKillDimensions_EveryEntryIsComplete fails an entry that omits it.
+	slot func(st *Status) *[]string
 	// replace installs a fresh cache map for this dimension, for the reconcile commit and
 	// Reset. Called under r.mu.
 	replace func(r *Redis, m map[string]bool)
@@ -76,6 +88,8 @@ var killDimensions = []killDimension{
 		idField:   "agentID",
 		keyPrefix: redisAgentPrefix,
 		cache:     func(r *Redis) map[string]bool { return r.killedAgents },
+		memCache:  func(m *InMemory) map[string]bool { return m.killedAgents },
+		slot:      func(st *Status) *[]string { return &st.KilledAgents },
 		replace:   func(r *Redis, m map[string]bool) { r.killedAgents = m },
 		event:     func(id string) Revocation { return Revocation{AgentID: id} },
 		subject:   func(s Subject) string { return s.AgentID },
@@ -87,6 +101,8 @@ var killDimensions = []killDimension{
 		keyPrefix: redisSessionPfx,
 		expires:   true,
 		cache:     func(r *Redis) map[string]bool { return r.killedSessions },
+		memCache:  func(m *InMemory) map[string]bool { return m.killedSessions },
+		slot:      func(st *Status) *[]string { return &st.KilledSessions },
 		replace:   func(r *Redis, m map[string]bool) { r.killedSessions = m },
 		event:     func(id string) Revocation { return Revocation{SessionID: id} },
 		subject:   func(s Subject) string { return s.SessionID },
@@ -97,6 +113,8 @@ var killDimensions = []killDimension{
 		idField:   "jti",
 		keyPrefix: redisJTIPrefix,
 		cache:     func(r *Redis) map[string]bool { return r.revokedJTIs },
+		memCache:  func(m *InMemory) map[string]bool { return m.revokedJTIs },
+		slot:      func(st *Status) *[]string { return &st.RevokedJTIs },
 		replace:   func(r *Redis, m map[string]bool) { r.revokedJTIs = m },
 		event:     func(id string) Revocation { return Revocation{JTI: id} },
 		subject:   func(s Subject) string { return s.JTI },

@@ -70,14 +70,11 @@ func (m *InMemory) ShouldBlock(_ context.Context, subj Subject) (bool, error) {
 	if m.globalActive {
 		return true, nil
 	}
-	if subj.AgentID != "" && m.killedAgents[subj.AgentID] {
-		return true, nil
-	}
-	if subj.SessionID != "" && m.killedSessions[subj.SessionID] {
-		return true, nil
-	}
-	if subj.JTI != "" && m.revokedJTIs[subj.JTI] {
-		return true, nil
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		if id := dim.subject(subj); id != "" && dim.memCache(m)[id] {
+			return true, nil
+		}
 	}
 	return false, nil
 }
@@ -212,7 +209,7 @@ func (m *InMemory) Reset(_ context.Context) error {
 func (m *InMemory) Status(_ context.Context) (*Status, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return buildStatus(m.globalActive, m.killedAgents, m.killedSessions, m.revokedJTIs), nil
+	return buildStatusOf(m.globalActive, func(d *killDimension) map[string]bool { return d.memCache(m) }), nil
 }
 
 // ObserveRevocations implements [Manager]. Every revocation is issued in-process, so an

@@ -105,7 +105,7 @@ func cmdKill(args []string) int {
 	redisAddr := fs.String("redis-addr", "", "Redis address (host:port). When set, the kill is written to the shared\nRedis kill-switch state instead of an HTTP endpoint — the only way to\nrevoke a stdio proxy started with --redis-addr.")
 	redisPassword := fs.String("redis-password", "", "Password for the Redis server (used with --redis-addr). Prefer the\nEUNOX_REDIS_PASSWORD env var; a non-empty flag value takes precedence over\nit, but leaving the flag empty does NOT override a set env var.")
 	redisTLS := fs.Bool("redis-tls", false, "Use TLS for the Redis connection (used with --redis-addr).")
-	sessionKillTTL := fs.Duration("killswitch-session-ttl", 0, fmt.Sprintf("How long this SESSION kill survives in Redis before it is garbage collected.\nRarely needed: the proxy publishes its own value to Redis at startup and this\ncommand adopts it, so the two cannot silently disagree. Pass this only to\noverride that, or when no proxy has published one yet (default %s).\nWhen the tombstone expires the kill is LIFTED. Negative disables expiry. If it\ndisagrees with the published value, the longer-lived of the two is used and the\nmismatch is reported. Rejected together with the 'all' target, --agent,\n--revive, or without --redis-addr: none of those writes a session tombstone\n(an agent kill never expires at all), so the flag would have no effect.", describeDefaultSessionKillTTL()))
+	sessionKillTTL := fs.Duration("killswitch-session-ttl", 0, fmt.Sprintf("How long this SESSION kill survives in Redis before it is garbage collected.\nRarely needed: the proxy publishes its own value to Redis at startup and this\ncommand adopts it, so the two cannot silently disagree. Pass this only to\noverride that, or when no proxy has published one yet (default %s).\nWhen the tombstone expires the kill is LIFTED. Negative disables expiry. If it\ndisagrees with the published value, the longer-lived of the two is used and the\nmismatch is reported. Rejected together with the 'all' target, --agent, --jti,\n--revive, or without --redis-addr: none of those writes a session tombstone\n(agent kills and token revocations never expire at all), so the flag would\nhave no effect.", describeDefaultSessionKillTTL()))
 	revive := fs.Bool("revive", false, "Lift a revocation instead of issuing one: <session-id> removes that session's\nkill tombstone, so a new connection reusing that id is no longer blocked. The\nprimary case is a stdio proxy pinning one long-lived --session-id; for an HTTP\nproxy/gateway, a session killed via the loopback endpoint was already torn\ndown locally, and reviving its tombstone here does not restore that\nconnection. With --agent it removes an agent kill, which is the only way to\nlift one since agent kills never expire. 'all' deactivates the global kill\nswitch (per-session and per-agent kills are left in place — revive those by\nid). Requires --redis-addr: the HTTP control endpoint is an emergency stop\nwith no undo, and an in-memory kill switch is cleared by restarting the proxy.")
 	sessionTarget := fs.String("session", "", "Target this SESSION id, instead of passing it as the positional argument.\nEquivalent in every way except one: the positional 'all' means the whole\ndeployment, so --session all is the only way to address a session whose id is\nliterally \"all\" (possible, since --session-id is operator-settable on a stdio\nproxy). Cannot be combined with the positional or --agent.")
 	jtiTarget := fs.String("jti", "", "Target this TOKEN id (the JWT `jti`) instead of a session or an agent: revokes\nexactly the one issued credential, leaving the same agent's other tokens\nserving. This is the dimension to reach for when a token LEAKS — killing the\nagent stops everything that identity holds, and killing a session stops one\nconnection, but neither is the credential that got out. Token revocations never\nexpire, so --revive is the only way to lift one (and --revive requires\n--redis-addr). Unlike --agent this works over either transport. A proxy only\nconsults it when it validates JWTs (--jwks-uri): a token id comes from the\nverified token and nowhere else. Cannot be combined with the positional,\n--session or --agent.")
@@ -196,6 +196,9 @@ func runRedisKillTransport(fs *flag.FlagSet, req redisKillRequest) int {
 			return 1
 		case req.target.kind == killTargetAgent:
 			fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --agent; agent kills never expire, so there is no lifetime to set; drop one of the two\n")
+			return 1
+		case req.target.kind == killTargetJTI:
+			fmt.Fprintf(os.Stderr, "eunox kill: --killswitch-session-ttl has no effect with --jti; token revocations never expire, so there is no lifetime to set; drop one of the two\n")
 			return 1
 		}
 	}
@@ -321,22 +324,20 @@ func (t killTarget) dimension() string {
 	}
 }
 
-// resolveKillTarget turns the positional argument and the two targeting flags into exactly
-// one target, or an error naming what to drop — accepting more than one and picking a
-// precedence would let an operator type two targets and have one silently ignored.
-// sessionSet/agentSet report whether the flag was actually PASSED, not whether its value is
-// non-empty: `--session "$SID"` with SID unset is a supplied target with an empty id, not an
-// absent one, and must not silently fall through to the positional or a default.
 // killFlagTarget is one --flag dimension as the command line presented it: which kind it
-// addresses, the id it carried, and whether it was passed at all (an empty value is a legal id
-// to REJECT, not an absent flag).
+// addresses, the id it carried, and whether `set` reports the flag was actually PASSED — not
+// whether its value is non-empty. `--session "$SID"` with SID unset is a supplied target with
+// an empty id, not an absent one, and must not silently fall through to the positional or a
+// default.
 type killFlagTarget struct {
 	kind  killTargetKind
 	value string
 	set   bool
 }
 
-// resolveKillTarget picks the single target an invocation names, or reports why it cannot.
+// resolveKillTarget picks the single target an invocation names, or reports why it cannot —
+// accepting more than one and picking a precedence would let an operator type two targets and
+// have one silently ignored.
 //
 // The flag dimensions arrive as a SLICE rather than a positional pair per dimension. With two
 // they were four parameters whose transposition — a value with the wrong `set` bool — compiled

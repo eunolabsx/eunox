@@ -102,6 +102,20 @@ type httpSession struct {
 	// decisions (e.g. sampling/createMessage) have no host request in scope, so they're
 	// attributed to these claims instead.
 	claims *pdp.JWTClaims
+	// liveTokenID is the `jti` of the most recent token a request on this session presented,
+	// which is NOT necessarily the one in claims above.
+	//
+	// claims is captured once, at initialize. A client may rotate its bearer mid-session — the
+	// owner binding compares `sub`, which survives rotation — and the reclaim sweep would then
+	// be matching the credential the session STARTED with while every request is decided
+	// against the current one. Revoking the token actually in use would deny its traffic and
+	// reclaim nothing, pinning the upstream and the maxSessions slot until exit under
+	// sessionIdleTimeoutMs: 0, which is the configuration the on-delivery reclaim exists for.
+	//
+	// Stored per request rather than by refreshing claims: claims is the identity the
+	// server-initiated leg decides against and the owner binding compares, and re-pointing it
+	// mid-session would change both. This is only ever read by the reclaim predicate.
+	liveTokenID atomic.Pointer[string]
 
 	// clientIP is captured at initialize; it's what an ipRange condition on the sampling
 	// opt-in evaluates against, since server-initiated sampling has no host request in scope.
@@ -320,6 +334,7 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
 // anchor from — so for a request that reaches dispatch, "the claims present at POST time" and
 // "the anchor the request resolved" are one answer, not two that could disagree.
 func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
+	s.noteLiveTokenID(cur)
 	rt := s.route
 	if rt == nil || !rt.taskAnchored {
 		return
@@ -327,6 +342,19 @@ func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 	if rt.decisionAnchor(s.id, cur) != rt.decisionAnchor(s.id, s.claims) {
 		s.spanned.Store(true)
 	}
+}
+
+// noteLiveTokenID records the credential this request presented, for the reclaim predicate.
+// See liveTokenID for why the session's captured claims are not enough.
+func (s *httpSession) noteLiveTokenID(cur *pdp.JWTClaims) {
+	if cur == nil || cur.TokenID == "" {
+		// An absent id is not recorded: leaving the previous one in place keeps the session
+		// reclaimable on the credential it was last KNOWN to hold, where clearing it would
+		// make a request with no token a way to shed the association.
+		return
+	}
+	id := cur.TokenID
+	s.liveTokenID.Store(&id)
 }
 
 // spansAnchors reports whether this session has resolved a state anchor other than the one its
@@ -894,7 +922,34 @@ func (p *HTTPProxy) sessionKilled(s *httpSession) bool {
 	if s.claims != nil {
 		ctx = pdp.WithJWTClaims(ctx, s.claims)
 	}
-	deny := s.route.pdp.CheckKill(ctx, s.id)
+	if killDenial(s.route.pdp.CheckKill(ctx, s.id)) {
+		return true
+	}
+	// Asked a second time for the credential the session is CURRENTLY presenting, when that
+	// differs from the one it was established with. See liveTokenID: a rotated bearer would
+	// otherwise leave the session denied on every request and reclaimed by nothing.
+	live := s.liveTokenID.Load()
+	if live == nil || s.claims != nil && *live == s.claims.TokenID {
+		return false
+	}
+	rotated := *s.claimsWithTokenID(*live)
+	return killDenial(s.route.pdp.CheckKill(pdp.WithJWTClaims(context.Background(), &rotated), s.id))
+}
+
+// claimsWithTokenID copies the session's captured claims with the token id replaced, so the
+// second kill check asks about the live credential without mutating what every other reader of
+// s.claims sees.
+func (s *httpSession) claimsWithTokenID(id string) *pdp.JWTClaims {
+	var c pdp.JWTClaims
+	if s.claims != nil {
+		c = *s.claims
+	}
+	c.TokenID = id
+	return &c
+}
+
+// killDenial reports whether a CheckKill result is a revocation rather than any other refusal.
+func killDenial(deny *capability.EnforceResponse) bool {
 	return deny != nil && deny.Denial != nil && deny.Denial.Code == capability.ErrCodeKillSwitch
 }
 

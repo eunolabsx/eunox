@@ -5,6 +5,7 @@ package killswitch
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -213,4 +214,80 @@ func startedOn(t *testing.T) (*Redis, *miniredis.Miniredis) {
 	r.Start(context.Background())
 	t.Cleanup(r.Stop)
 	return r, srv
+}
+
+// TestKillDimensions_EveryEntryIsComplete is the declaration's own guard.
+//
+// The table is what makes "declared once" true, and it is only as good as its entries: a
+// dimension missing an accessor does not fail loudly, it goes missing from ONE path. A nil
+// `slot` drops it from every Status an operator reads to confirm what is in force; a nil
+// `memCache` panics the in-memory backend's read; a nil `event` silently reclaims nothing.
+//
+// Reflective over the struct rather than a checklist, because a hand-written list of required
+// fields is the same thing being guarded against — one more place to remember when a field is
+// added to killDimension.
+func TestKillDimensions_EveryEntryIsComplete(t *testing.T) {
+	t.Parallel()
+	require.NotEmpty(t, killDimensions)
+	names := map[string]bool{}
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		t.Run(dim.name, func(t *testing.T) {
+			v := reflect.ValueOf(*dim)
+			typ := v.Type()
+			for f := range typ.NumField() {
+				field := typ.Field(f)
+				// `expires` is the one legitimately-false field: only sessions carry a TTL,
+				// so a zero value there is an answer rather than an omission.
+				if field.Name == "expires" {
+					continue
+				}
+				assert.Falsef(t, v.Field(f).IsZero(),
+					"killDimensions[%q].%s is unset; a dimension missing an accessor goes missing from one path rather than failing",
+					dim.name, field.Name)
+			}
+			assert.Equal(t, dim.keyPrefix, "killswitch:"+dim.name+":",
+				"the durable key prefix must be name-derived, or a writer and a scanner can disagree about where this dimension lives")
+		})
+		require.Falsef(t, names[dim.name], "two dimensions named %q; the pub/sub handler matches on the name", dim.name)
+		names[dim.name] = true
+	}
+}
+
+// Every name this package's own methods pass to mustDimension must be declared, or the panic it
+// documents as unreachable becomes reachable.
+func TestMustDimension_EveryNamePassedIsDeclared(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"agent", "session", "jti"} {
+		require.NotPanics(t, func() { _ = mustDimension(name) }, "mustDimension(%q)", name)
+	}
+	assert.Panics(t, func() { _ = mustDimension("nope") },
+		"an undeclared name must panic rather than returning a zero dimension that writes the bare prefix key")
+}
+
+// Every dimension appears in a Status snapshot, driven through the backend rather than through
+// buildStatusOf, so a backend whose accessor reaches the wrong set fails here too.
+func TestStatus_ReportsEveryDimension(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	m := NewInMemory()
+	require.NoError(t, m.KillAgent(ctx, "a-1"))
+	require.NoError(t, m.KillSession(ctx, "s-1"))
+	require.NoError(t, m.RevokeJTI(ctx, "t-1"))
+
+	st, err := m.Status(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a-1"}, st.KilledAgents)
+	assert.Equal(t, []string{"s-1"}, st.KilledSessions)
+	assert.Equal(t, []string{"t-1"}, st.RevokedJTIs)
+
+	// Each dimension's slot is DISTINCT: two entries pointing at one field would report the
+	// last writer's ids under both names and lose the other's entirely.
+	slots := map[*[]string]string{}
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		slot := dim.slot(st)
+		require.Emptyf(t, slots[slot], "dimensions %q and %q report into the same Status field", slots[slot], dim.name)
+		slots[slot] = dim.name
+	}
 }
