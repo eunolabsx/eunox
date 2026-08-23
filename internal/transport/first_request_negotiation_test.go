@@ -94,7 +94,7 @@ func TestFirstRequestNegotiation_InitializeArmsStillAssertTheHandshakeRevision(t
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			srv, _, _ := forwardingProxy(t, nil)
+			srv, _, _, tape := forwardingProxyWithTape(t, nil)
 			body, err := json.Marshal(mcp.RPCMsg{
 				JSONRPC: "2.0", ID: tc.id, Method: mcp.MethodInitialize,
 				Params: json.RawMessage(
@@ -107,21 +107,51 @@ func TestFirstRequestNegotiation_InitializeArmsStillAssertTheHandshakeRevision(t
 			resp, err := srv.Client().Do(req)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = resp.Body.Close() })
-
 			got := new(bytes.Buffer)
 			_, _ = got.ReadFrom(resp.Body)
 			assert.Empty(t, resp.Header.Get(SessionHeader),
 				"a refused initialize must not establish a session")
-			if tc.id == nil {
-				// A notification gets no body, so the refusal shows as the absence of a session
-				// and of an ack of readiness; the record is what carries the code.
-				assert.NotEqual(t, http.StatusOK, resp.StatusCode)
-				return
+
+			// Asserted on the RECORD, for both framings. A notification is acked bodyless
+			// whether it was refused or swallowed, and no notification ever sets the session
+			// header — so a status/header assertion holds either way and would keep passing if
+			// this arm stopped asserting the handshake revision entirely. The tape is the only
+			// place the refusal is visible for that framing.
+			rec := findAuditRecordByCode(tape(), capability.ErrCodeUnsupportedProtocolVersion)
+			require.NotNil(t, rec,
+				"answering initialize IS the negotiation; a declaration naming another revision must be refused and recorded")
+			if tc.id != nil {
+				assert.Contains(t, got.String(), capability.ErrCodeUnsupportedProtocolVersion,
+					"a request framing is refused on the wire as well as on the tape")
 			}
-			assert.Contains(t, got.String(), capability.ErrCodeUnsupportedProtocolVersion,
-				"answering initialize IS the negotiation; a declaration naming another revision contradicts it")
 		})
 	}
+}
+
+// A declaring peer's unservable POST lands on the tape.
+//
+// Relaxing negotiation MOVED this refusal: such a peer used to be turned away by the revision
+// gate, which records, and now reaches an arm below it. Without its own record an unauthenticated
+// off-host caller could sweep the declaring surface leaving no trace on HTTP, while the identical
+// bytes still recorded on stdio — the exact gap the negotiate-first ordering exists to close.
+func TestFirstRequestNegotiation_TheUnservableRefusalIsRecorded(t *testing.T) {
+	t.Parallel()
+	srv, _, _, tape := forwardingProxyWithTape(t, nil)
+
+	resp := declaringHostPOST(t, srv, capability.MethodToolsList)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	require.Equal(t, http.StatusNotImplemented, resp.StatusCode)
+
+	rec := findAuditRecordByCode(tape(), capability.ErrCodeEnforcementError)
+	require.NotNil(t, rec, "a declaring peer's unservable POST left no trace on the tape")
+
+	detail, ok := rec["details"].(map[string]interface{})
+	require.True(t, ok, "the record carries no details block")
+	unservable, ok := detail[detailUnservable].(map[string]interface{})
+	require.True(t, ok, "the record does not name WHY the peer could not be served")
+	assert.Equal(t, unservableSessionCreation, unservable["reason"])
+	assert.Equal(t, capability.Revision20260728.String(), unservable["revision"],
+		"an operator correlating a probe of the declaring surface needs the revision it declared")
 }
 
 // The mid-context flip refusal is untouched and governs from the SECOND message on — which is

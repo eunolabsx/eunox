@@ -473,12 +473,61 @@ func (p *HTTPProxy) refuseSessionlessPost(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if declaresPerRequestRevision(rev) {
+		p.recordUnservableRevision(r, route, rev, msg)
 		http.Error(w, "this build cannot serve a "+rev.String()+" host over HTTP yet: the revision has no session header, and creating a session on the first enforced request is not implemented",
 			http.StatusNotImplemented)
 		return
 	}
 	http.Error(w, SessionHeader+" header required", http.StatusBadRequest)
 }
+
+// recordUnservableRevision puts a declaring peer's unservable POST on the tape.
+//
+// Relaxing negotiation for a first message MOVED this refusal without meaning to: such a peer
+// used to be turned away by the revision gate, which records, and now reaches this arm, which
+// did not — so an unauthenticated off-host caller could sweep the declaring surface leaving no
+// trace on HTTP while the identical bytes still recorded on stdio. The negotiate-first ordering
+// above exists to close exactly that gap; a refusal added below it has to carry its own.
+//
+// ENFORCEMENT_ERROR rather than a code value of its own: eunox could not reach a verdict for a
+// reason internal to this BUILD rather than to the request — the peer's revision is speakable
+// and was negotiated, and there is simply no session-creation path for it yet. That is what the
+// code already means, its class is already the non-downgradable fault an observing route may not
+// forward past, and minting a signed code value for a state the next workstream removes would
+// outlive the state. The `unservable` detail carries the part a code cannot.
+//
+// The old-revision 400 beside it stays unrecorded, as it was before this change: a client that
+// omitted the session header it does need is a client protocol error, not a build limitation,
+// and folding the two under one code would make ENFORCEMENT_ERROR mean both.
+func (p *HTTPProxy) recordUnservableRevision(r *http.Request, route *UpstreamRoute, rev capability.Revision, msg mcp.RPCMsg) {
+	rec := p.routeRefusalLimits(nil, route).recorders(refusalSink(p, route)).forCategory(catUnservable)
+	if rec == nil {
+		return
+	}
+	identifier, method := auditIdentity(msg)
+	rec.RecordDeny(capability.WithProtocolRevision(r.Context(), rev), "", identifier, method,
+		capability.ErrCodeEnforcementError, "", unservableDetail(rev), false)
+}
+
+// unservableDetail names WHY a negotiated peer could not be served, in the shape unroutableDetail
+// uses for the same class of refusal: eunox's own, with no policy behind it.
+func unservableDetail(rev capability.Revision) map[string]interface{} {
+	return map[string]interface{}{
+		detailUnservable: map[string]interface{}{
+			"reason":   unservableSessionCreation,
+			"revision": rev.String(),
+		},
+	}
+}
+
+const (
+	// detailUnservable is the audit detail key naming a refusal eunox made because this build
+	// cannot serve the peer, as distinct from one the peer's own message earned.
+	detailUnservable = "unservable"
+	// unservableSessionCreation: the revision carries no session header and session creation on
+	// the first enforced request is not implemented (ADR-0004's remaining half).
+	unservableSessionCreation = "session_creation_unimplemented"
+)
 
 // handleSessionPost handles a host POST carrying an existing Mcp-Session-Id: it validates
 // the session/route binding and the per-route audience pin, then forwards a notification,
@@ -1479,14 +1528,23 @@ func headerRefusalSessionID(sess *httpSession) string {
 // contacting no upstream, so an unauthenticated peer drives one record per frame. Suppressed
 // refusals fold into the next admitted record rather than vanishing.
 func (p *HTTPProxy) headerMismatchRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
-	var rec auditRecorder
+	return p.routeRefusalLimits(sess, route).recorders(refusalSink(p, route)).forCategory(catHeaderMismatch)
+}
+
+// refusalSink picks the tape an envelope-level refusal is written to: the route's, which stamps
+// the route name and policy version, falling back to the proxy's for a refusal with no route in
+// scope.
+//
+// One home because two refusals now need it and a third will: a per-site copy of this selection
+// is how a record comes to name a different tape than its own leg's other records do.
+func refusalSink(p *HTTPProxy, route *UpstreamRoute) auditRecorder {
 	switch {
 	case route != nil:
-		rec = asRecorder(route.sink)
+		return asRecorder(route.sink)
 	case p != nil:
-		rec = asRecorder(p.sink)
+		return asRecorder(p.sink)
 	}
-	return p.routeRefusalLimits(sess, route).recorders(rec).forCategory(catHeaderMismatch)
+	return nil
 }
 
 // sessionlessGatePeer is the shared prologue's peer for HTTP's two PRE-SESSION arms — the

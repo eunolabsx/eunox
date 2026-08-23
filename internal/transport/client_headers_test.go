@@ -200,6 +200,13 @@ func TestForwardClientHeaders_SelectionIsByNameAndCopies(t *testing.T) {
 // last-request reader would answer about whichever of them happened to run last, and the
 // question here is what rode the ENFORCED call.
 func forwardingProxy(t *testing.T, allow []string) (*httptest.Server, *HTTPProxy, func(string) http.Header) {
+	srv, proxy, headersFor, _ := forwardingProxyWithTape(t, allow)
+	return srv, proxy, headersFor
+}
+
+// forwardingProxyWithTape is forwardingProxy plus the sink and log path, for the cells that
+// assert on what a refusal RECORDED rather than on what it answered.
+func forwardingProxyWithTape(t *testing.T, allow []string) (srv *httptest.Server, proxy *HTTPProxy, headersFor func(string) http.Header, tape func() []map[string]interface{}) {
 	t.Helper()
 	var mu sync.Mutex
 	seen := map[string]http.Header{}
@@ -218,8 +225,8 @@ func forwardingProxy(t *testing.T, allow []string) (*httptest.Server, *HTTPProxy
 	upSrv := httptest.NewServer(http.StripPrefix("/mcp", capture))
 	t.Cleanup(upSrv.Close)
 
-	sink, _ := newTempAuditSink(t)
-	proxy := newHTTPProxy(httpProxyOptions{
+	sink, logPath := newTempAuditSink(t)
+	proxy = newHTTPProxy(httpProxyOptions{
 		UpstreamURL: upSrv.URL,
 		PDP:         newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
 		Sink:        sink,
@@ -229,14 +236,19 @@ func forwardingProxy(t *testing.T, allow []string) (*httptest.Server, *HTTPProxy
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", proxy.handleMCP)
-	srv := httptest.NewServer(mux)
+	srv = httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
 	return srv, proxy, func(method string) http.Header {
-		mu.Lock()
-		defer mu.Unlock()
-		return seen[method]
-	}
+			mu.Lock()
+			defer mu.Unlock()
+			return seen[method]
+		}, func() []map[string]interface{} {
+			// Closed rather than synced: the sink drains on a background goroutine, and Close is
+			// what this package's other tape-reading tests use to make the write observable.
+			_ = sink.Close()
+			return readAuditRecords(t, logPath)
+		}
 }
 
 // callWithHeaders makes one enforced tools/call on an established session, carrying extra

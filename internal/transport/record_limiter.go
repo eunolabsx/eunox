@@ -103,6 +103,12 @@ const (
 	// is refused at the envelope, before the kill check, holding no session slot and
 	// contacting no upstream — so an unauthenticated peer can drive one record per frame.
 	catHeaderMismatch refusalCategory = "header_mismatch"
+	// catUnservable bounds the refusal for a peer whose revision this build SPEAKS but cannot
+	// serve on this transport — a 2026-07-28 host's sessionless POST, which negotiates fine and
+	// then finds no session and no way to create one. Metered for catRevision's reason and at the
+	// same cheapness: it is reachable pre-session by an unauthenticated peer at one record per
+	// frame, and it is the record that says someone is probing the declaring surface.
+	catUnservable refusalCategory = "unservable_revision"
 	// catUnroutable and catSmuggled are the two DECLARED-EXEMPT categories: they name a
 	// refusal so its non-metering is an answer on the record rather than an absent call. See
 	// refusalDeclarations for the reason, which is the same for both.
@@ -205,6 +211,7 @@ var refusalDeclarations = map[refusalCategory]refusalDeclaration{
 	catAudience:             {metering: meteringMetered},
 	catRevision:             {metering: meteringMetered},
 	catHeaderMismatch:       {metering: meteringMetered},
+	catUnservable:           {metering: meteringMetered},
 	catDisplaced:            {metering: meteringMetered},
 	catUnroutableID:         {metering: meteringMetered},
 	catServerRequestFailed:  {metering: meteringMetered},

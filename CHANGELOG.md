@@ -47,7 +47,11 @@ Section conventions:
 
   Session creation on that first request is the next step and is not yet built, so such a host
   is now told exactly that — with `501 Not Implemented` rather than a `400` demanding a header
-  its revision removed and a conformant client cannot produce.
+  its revision removed and a conformant client cannot produce. That refusal is recorded
+  (`ENFORCEMENT_ERROR`, metered on its own bucket, with an `unservable` detail naming the reason
+  and the declared revision): relaxing the gate moved the refusal below the revision gate that
+  used to record it, and an unauthenticated peer sweeping the declaring surface must not be able
+  to do so without leaving a trace on HTTP when the identical bytes record on stdio.
 
 - **The 2026-07-28 routing headers, held to the body they describe.** That revision requires
   `Mcp-Method` and `Mcp-Name` on every Streamable HTTP POST so an intermediary can route, meter
