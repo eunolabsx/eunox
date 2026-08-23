@@ -318,6 +318,8 @@ func TestCmdKill_NonLoopbackHostRefusedBeforeTheControlToken(t *testing.T) {
 		// one request carrying the token.
 		{name: "aliased name", host: "localhost.corp.example"},
 		{name: "empty host", host: ""},
+		// Unbracketing is not an admission: the predicate still runs on what was inside.
+		{name: "bracketed routable literal", host: "[2001:db8::1]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var code int
@@ -343,7 +345,9 @@ func TestCmdKill_NonLoopbackHostRefusedBeforeTheControlToken(t *testing.T) {
 // refuse the hosts the endpoint actually accepts. Port 1 is not listening, so reaching a
 // connection error proves the loopback check passed and the request was attempted.
 func TestCmdKill_LoopbackSpellingsStillReachTheEndpoint(t *testing.T) {
-	for _, host := range []string{"127.0.0.1", "::1", "localhost", "LOCALHOST", "127.0.0.53"} {
+	// [::1] is the spelling a copied URL authority carries; net.JoinHostPort re-brackets
+	// the bare form, so admitting it must not produce the unparseable [[::1]]:1.
+	for _, host := range []string{"127.0.0.1", "::1", "[::1]", "localhost", "LOCALHOST", "127.0.0.53"} {
 		t.Run(host, func(t *testing.T) {
 			var code int
 			stderr := captureStderr(t, func() {

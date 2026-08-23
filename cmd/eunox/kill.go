@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -26,6 +27,18 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
+
+// unbracketHost strips the brackets an IPv6 literal may arrive wrapped in, yielding the bare
+// form net.ParseIP accepts and net.JoinHostPort re-brackets. `--host '[::1]'` is the spelling
+// a copied URL authority carries, and internal/transport reduces a request's Host the same way
+// before asking the same loopback predicate -- so the sending and receiving ends of this one
+// request cannot disagree about what a host string reduces to.
+func unbracketHost(host string) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return host[1 : len(host)-1]
+	}
+	return host
+}
 
 // killControlURL builds the http://host:port/control/kill URL. net.JoinHostPort brackets
 // an IPv6 literal; "%s:%d" would emit the unparseable ::1:3000.
@@ -102,7 +115,7 @@ func cmdKill(args []string) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
 	fs.Usage = func() { printKillUsage(fs, args) }
 	port := fs.Int("port", 3000, "Port the HTTP proxy is listening on (HTTP transport).")
-	host := fs.String("host", "127.0.0.1", "Host the HTTP proxy is bound to (HTTP transport).")
+	host := fs.String("host", "127.0.0.1", "Host the HTTP proxy is bound to (HTTP transport). Must be a loopback\nspelling (127.0.0.1, ::1, [::1], localhost): /control/kill accepts loopback\nsources only, so anything else is rejected before the control token is read\nrather than presented to whatever is listening there. Use --redis-addr to\nrevoke across a remote deployment.")
 	redisAddr := fs.String("redis-addr", "", "Redis address (host:port). When set, the kill is written to the shared\nRedis kill-switch state instead of an HTTP endpoint — the only way to\nrevoke a stdio proxy started with --redis-addr.")
 	redisPassword := fs.String("redis-password", "", "Password for the Redis server (used with --redis-addr). Prefer the\nEUNOX_REDIS_PASSWORD env var; a non-empty flag value takes precedence over\nit, but leaving the flag empty does NOT override a set env var.")
 	redisTLS := fs.Bool("redis-tls", false, "Use TLS for the Redis connection (used with --redis-addr).")
@@ -219,10 +232,19 @@ func killViaControlEndpoint(host string, port int, controlToken, controlTokenPat
 	// port. Refused ahead of everything else, so a doomed invocation costs no disclosure of
 	// the real proxy's emergency-stop bearer token.
 	//
-	// A name aliased to 127.0.0.1 in /etc/hosts is refused too, and deliberately: telling it
-	// from a typo needs a lookup, and a lookup this command then dials the NAME through is a
-	// resolve-to-loopback/dial-to-elsewhere window on the one request carrying the token.
-	// The literal is always available.
+	// What is admitted is the loopback literals plus `localhost`, through the predicate the
+	// endpoint's own Host pin applies (capability.IsLoopbackHost), so the two ends of this
+	// request cannot disagree about what a loopback host is. A FOREIGN name aliased to a
+	// loopback address is refused even where it would have worked: telling it from a typo
+	// needs a lookup, and a lookup this command then dials the NAME through is a
+	// resolve-here/dial-elsewhere window on the one request carrying the token.
+	//
+	// Residual: `localhost` is a name too, resolved by the OS at dial time, so a machine
+	// whose loopback name resolution has been rewritten (/etc/hosts, an NSS module,
+	// HOSTALIASES) still receives the token. Accepted rather than closed by refusing the
+	// spelling every operator types: rewriting resolution for this process takes root or
+	// its own UID, both of which already read the 0600 token file it is about to send.
+	host = unbracketHost(host)
 	if !capability.IsLoopbackHost(host) {
 		fmt.Fprintf(os.Stderr, "eunox kill: --host %q is not a loopback address, and /control/kill only accepts loopback sources -- this invocation cannot succeed and would hand the control token to whatever is listening there. Pass a loopback host (127.0.0.1, ::1, localhost), or use --redis-addr to revoke across a remote deployment.\n", host)
 		return 1

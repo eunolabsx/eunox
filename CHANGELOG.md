@@ -252,6 +252,33 @@ Section conventions:
 
 ### Fixed
 
+- **`eunox kill` no longer presents the control token to a `--host` that can never accept it.**
+  `/control/kill` is source-IP loopback-gated server-side, so a non-loopback `--host` could never
+  succeed — but the request that proved it carried the running proxy's emergency-stop bearer
+  token, over plaintext `http://`, to whatever was listening there: a typo'd host, or a local
+  process that grabbed the port. The refusal now runs ahead of everything else, before the token
+  is resolved, and names `--redis-addr` as the transport for a remote deployment. The admitted
+  set is the loopback literals plus `localhost` (`[::1]` included), through the predicate the
+  endpoint's own `Host` pin applies; a foreign name aliased to a loopback address is refused even
+  where it would have worked, since telling it from a typo needs a lookup this command would then
+  dial the *name* through.
+
+- **A lost pub/sub notification no longer reports a `--revive` as a kill.** All four `--revive`
+  arms route through the same warning, whose tail was worded for the kill direction alone — so an
+  operator who had just *lifted* a revocation on a PUBLISH-less Redis ACL was told "the kill still
+  takes effect", on the emergency path. The tail is operation-neutral now; the verb was always in
+  the message's prefix.
+
+- **An empty kill target is refused instead of forwarded.** `eunox kill --session "$SID"` with
+  `SID` unset reached the transports, which answer it as a generic backend rejection or a `400`
+  naming no flag — neither pointing at the unset variable. `resolveKillTarget` refuses it, which
+  is what the proxy's own `--session-id` guard already claimed happened on the kill side.
+
+- **`eunox doctor --live` without `--config` is rejected rather than silently inert.** It exited 0
+  with a skip note buried in section 5, against the rule the rest of the binary follows for an
+  unpaired flag. It now exits 2 (doctor's usage code, leaving 1 for its one *finding*: a config
+  that would not load).
+
 - **The per-session gate refusal is now rate-limited.** Its exemption rested on session ids being
   unguessable per-session UUIDs handed only to their creator, so driving the record needed a live
   victim id. Deriving worker ids from caller identity ended that: anyone who can name a victim's
@@ -268,6 +295,11 @@ Section conventions:
   operator has could see it. A duplicate is now refused and the losing request adopts the winner.
 
 ### Changed
+
+- **`eunox proxy` documents its exit codes.** It was the last subcommand with no `Exit codes:`
+  block, and its split is the least guessable in the binary: `2` is a flag *parse* failure alone,
+  while the flag-combination and flag-value errors a sibling subcommand classifies as `2` are
+  exit `1` here. No behavior change.
 
 - **`Mcp-Session-Id` is no longer captured from a 2026-07-28 upstream.** That revision removed
   the header; an id a lenient upstream sends anyway is not a session to hold, and holding it
