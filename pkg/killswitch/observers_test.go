@@ -435,6 +435,38 @@ func TestRedis_ObserveRevocations_UnregisterIdempotent(t *testing.T) {
 	assert.Equal(t, int32(0), calls.Load(), "unregistered observer must not be notified")
 }
 
+// TestRedis_ObserveRevocations_LateRegistrationIsNotReplayed pins the real contract the
+// interface doc now states. The reconcile emits only what its scan ADDS to the local view,
+// so a kill the view already held when an observer registered is never delivered — not by
+// the next reconcile, not ever. A consumer that trusted "a late registration is found by the
+// next reconcile" and skipped its own initial sweep would leak whatever the pre-registration
+// kill should have reclaimed, permanently.
+func TestRedis_ObserveRevocations_LateRegistrationIsNotReplayed(t *testing.T) {
+	t.Parallel()
+	r, mr := newTestRedis(t)
+	// Written straight into miniredis with no publish, so the initial snapshot is what
+	// takes it into the local view — before any observer exists.
+	require.NoError(t, mr.Set(redisAgentPrefix+"agent-before-observer", "1"))
+	r.Start(context.Background())
+	defer r.Stop()
+
+	var seen atomic.Int32
+	r.ObserveRevocations(func(Revocation) { seen.Add(1) })
+
+	// Two reconciles' worth of scans over a view that already holds the kill.
+	require.NoError(t, r.refreshState(context.Background()))
+	require.NoError(t, r.refreshState(context.Background()))
+
+	assert.Equal(t, int32(0), seen.Load(),
+		"a kill the view already held is not replayed to a late-registering observer; it must sweep its own holdings once")
+
+	// The same observer still sees a kill the view gains AFTER it registered, so this is a
+	// replay gap rather than a dead registration.
+	require.NoError(t, r.KillAgent(context.Background(), "agent-after-observer"))
+	assert.Eventually(t, func() bool { return seen.Load() > 0 }, 5*time.Second, 20*time.Millisecond,
+		"a revocation gained after registration must still be delivered")
+}
+
 // newMiniredisT starts a miniredis server for the test and returns its address,
 // cleaning up on test completion.
 func newMiniredisT(t *testing.T) string {

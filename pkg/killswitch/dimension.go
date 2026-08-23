@@ -34,10 +34,16 @@ type killDimension struct {
 	// name is the pub/sub channel word and the durable key's middle segment — one value, so a
 	// writer cannot publish on one dimension's channel while writing another's key.
 	name string
-	// entity and idField are the operator-facing halves of an error message: the method name
-	// ("KillAgent") and the parameter it names ("agentID").
-	entity  string
-	idField string
+	// killMethod, reviveMethod and idField are the operator-facing halves of an error
+	// message: the two method names and the parameter they name ("agentID").
+	//
+	// The method names are DECLARED rather than composed from a verb and an entity word:
+	// this axis's kill method is RevokeJTI, so "Kill"+"JTI" named a method that does not
+	// exist and sent an operator looking for it. The in-memory backend spells all six by
+	// hand and got them right, so the two backends disagreed on the same misuse.
+	killMethod   string
+	reviveMethod string
+	idField      string
 	// keyPrefix is the durable Redis key prefix, always name-derived; held as its own field
 	// so the existing constants stay the single spelling of what is already in Redis.
 	keyPrefix string
@@ -83,41 +89,44 @@ type killDimension struct {
 // disagree about that.
 var killDimensions = []killDimension{
 	{
-		name:      "agent",
-		entity:    "Agent",
-		idField:   "agentID",
-		keyPrefix: redisAgentPrefix,
-		cache:     func(r *Redis) map[string]bool { return r.killedAgents },
-		memCache:  func(m *InMemory) map[string]bool { return m.killedAgents },
-		slot:      func(st *Status) *[]string { return &st.KilledAgents },
-		replace:   func(r *Redis, m map[string]bool) { r.killedAgents = m },
-		event:     func(id string) Revocation { return Revocation{AgentID: id} },
-		subject:   func(s Subject) string { return s.AgentID },
+		name:         "agent",
+		killMethod:   "KillAgent",
+		reviveMethod: "ReviveAgent",
+		idField:      "agentID",
+		keyPrefix:    redisAgentPrefix,
+		cache:        func(r *Redis) map[string]bool { return r.killedAgents },
+		memCache:     func(m *InMemory) map[string]bool { return m.killedAgents },
+		slot:         func(st *Status) *[]string { return &st.KilledAgents },
+		replace:      func(r *Redis, m map[string]bool) { r.killedAgents = m },
+		event:        func(id string) Revocation { return Revocation{AgentID: id} },
+		subject:      func(s Subject) string { return s.AgentID },
 	},
 	{
-		name:      "session",
-		entity:    "Session",
-		idField:   "sessionID",
-		keyPrefix: redisSessionPfx,
-		expires:   true,
-		cache:     func(r *Redis) map[string]bool { return r.killedSessions },
-		memCache:  func(m *InMemory) map[string]bool { return m.killedSessions },
-		slot:      func(st *Status) *[]string { return &st.KilledSessions },
-		replace:   func(r *Redis, m map[string]bool) { r.killedSessions = m },
-		event:     func(id string) Revocation { return Revocation{SessionID: id} },
-		subject:   func(s Subject) string { return s.SessionID },
+		name:         "session",
+		killMethod:   "KillSession",
+		reviveMethod: "ReviveSession",
+		idField:      "sessionID",
+		keyPrefix:    redisSessionPfx,
+		expires:      true,
+		cache:        func(r *Redis) map[string]bool { return r.killedSessions },
+		memCache:     func(m *InMemory) map[string]bool { return m.killedSessions },
+		slot:         func(st *Status) *[]string { return &st.KilledSessions },
+		replace:      func(r *Redis, m map[string]bool) { r.killedSessions = m },
+		event:        func(id string) Revocation { return Revocation{SessionID: id} },
+		subject:      func(s Subject) string { return s.SessionID },
 	},
 	{
-		name:      "jti",
-		entity:    "JTI",
-		idField:   "jti",
-		keyPrefix: redisJTIPrefix,
-		cache:     func(r *Redis) map[string]bool { return r.revokedJTIs },
-		memCache:  func(m *InMemory) map[string]bool { return m.revokedJTIs },
-		slot:      func(st *Status) *[]string { return &st.RevokedJTIs },
-		replace:   func(r *Redis, m map[string]bool) { r.revokedJTIs = m },
-		event:     func(id string) Revocation { return Revocation{JTI: id} },
-		subject:   func(s Subject) string { return s.JTI },
+		name:         "jti",
+		killMethod:   "RevokeJTI",
+		reviveMethod: "ReviveJTI",
+		idField:      "jti",
+		keyPrefix:    redisJTIPrefix,
+		cache:        func(r *Redis) map[string]bool { return r.revokedJTIs },
+		memCache:     func(m *InMemory) map[string]bool { return m.revokedJTIs },
+		slot:         func(st *Status) *[]string { return &st.RevokedJTIs },
+		replace:      func(r *Redis, m map[string]bool) { r.revokedJTIs = m },
+		event:        func(id string) Revocation { return Revocation{JTI: id} },
+		subject:      func(s Subject) string { return s.JTI },
 	},
 }
 

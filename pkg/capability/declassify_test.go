@@ -185,6 +185,23 @@ func TestDeclassifyApproval_Covers(t *testing.T) {
 			&capability.DeclassifyApproval{Labels: []string{capability.FlowLabelPII}, Target: "tool:sanitize"},
 			"tool:sanitize", []string{capability.FlowLabelPII}, false,
 		},
+		{
+			// Validate accepts a padded target (it checks a trimmed local copy it never
+			// writes back), and a programmatically built approval skips the claim
+			// decoder's trim — so Covers must trim too, or the grant validates and then
+			// covers nothing, which is the silent-escalation shape Validate exists to
+			// prevent.
+			"padded target still covers the canonical spelling",
+			&capability.DeclassifyApproval{Labels: []string{capability.FlowLabelPII}, Target: "  tool:sanitize\t", Approver: "alice"},
+			"tool:sanitize", []string{capability.FlowLabelPII}, true,
+		},
+		{
+			// Trimming must not turn a whitespace-only target into a wildcard: it is no
+			// target at all, exactly as Validate reads it.
+			"whitespace-only target covers nothing",
+			&capability.DeclassifyApproval{Labels: []string{capability.FlowLabelPII}, Target: "   ", Approver: "alice"},
+			"tool:sanitize", []string{capability.FlowLabelPII}, false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,6 +210,26 @@ func TestDeclassifyApproval_Covers(t *testing.T) {
 				t.Fatalf("Covers = %v, want %v", got, tc.ok)
 			}
 		})
+	}
+}
+
+// TestDeclassifyApproval_LedgerIDAgreesWithCovers pins the third reader of Target on the
+// same normalization. A single-use grant is burned by LedgerID and authorized by Covers;
+// if only one of them trimmed, two differently-padded spellings of one target would cover
+// the same action while burning into separate ledger buckets — a once-grant usable twice.
+func TestDeclassifyApproval_LedgerIDAgreesWithCovers(t *testing.T) {
+	t.Parallel()
+	padded := capability.DeclassifyApproval{
+		Labels: []string{capability.FlowLabelPII}, Target: " tool:sanitize ",
+		Approver: "alice", Once: true, ID: "appr-1",
+	}
+	canonical := padded
+	canonical.Target = "tool:sanitize"
+	if padded.LedgerID() != canonical.LedgerID() {
+		t.Fatalf("LedgerID = %q, want the canonical spelling's %q", padded.LedgerID(), canonical.LedgerID())
+	}
+	if !padded.Covers("tool:sanitize", []string{capability.FlowLabelPII}) {
+		t.Fatal("the padded grant must cover the canonical target it burns under")
 	}
 }
 

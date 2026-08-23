@@ -254,6 +254,59 @@ func TestKillDimensions_EveryEntryIsComplete(t *testing.T) {
 	}
 }
 
+// TestKillDimensions_MethodNamesExistOnTheInterface pins the operator-facing half of an
+// empty-id error against the interface it names. The names used to be COMPOSED as
+// verb+entity, which spelled the jti axis's kill method "KillJTI" — a method that does not
+// exist (it is RevokeJTI), so the one backend that composed them pointed an operator at
+// nothing while the one that spelled them by hand was right. Reflection over Manager is what
+// makes a wrong name a failing build rather than a wrong error string.
+func TestKillDimensions_MethodNamesExistOnTheInterface(t *testing.T) {
+	t.Parallel()
+	mgr := reflect.TypeOf((*Manager)(nil)).Elem()
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		for _, name := range []string{dim.killMethod, dim.reviveMethod} {
+			_, ok := mgr.MethodByName(name)
+			assert.Truef(t, ok, "killDimensions[%q] names %q, which Manager does not declare", dim.name, name)
+		}
+	}
+}
+
+// TestEmptyID_BothBackendsNameTheSameMethod pins the two backends against each other on one
+// misuse: the in-memory backend spells the six method names by hand and the Redis backend
+// reads them off the declaration, so a divergence here means one of the two is naming a
+// method the operator cannot find.
+func TestEmptyID_BothBackendsNameTheSameMethod(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	r, _ := startedOn(t)
+	m := NewInMemory()
+	cases := []struct {
+		name  string
+		redis func(context.Context, string) error
+		mem   func(context.Context, string) error
+	}{
+		{"KillAgent", r.KillAgent, m.KillAgent},
+		{"ReviveAgent", r.ReviveAgent, m.ReviveAgent},
+		{"KillSession", r.KillSession, m.KillSession},
+		{"ReviveSession", r.ReviveSession, m.ReviveSession},
+		{"RevokeJTI", r.RevokeJTI, m.RevokeJTI},
+		{"ReviveJTI", r.ReviveJTI, m.ReviveJTI},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rerr := tc.redis(ctx, "")
+			merr := tc.mem(ctx, "")
+			require.Error(t, rerr)
+			require.Error(t, merr)
+			assert.Equal(t, merr.Error(), rerr.Error(),
+				"the two backends must name the same method for the same misuse")
+			assert.Contains(t, rerr.Error(), tc.name,
+				"the error must name the method the operator actually called")
+		})
+	}
+}
+
 // Every name this package's own methods pass to mustDimension must be declared, or the panic it
 // documents as unreachable becomes reachable.
 func TestMustDimension_EveryNamePassedIsDeclared(t *testing.T) {

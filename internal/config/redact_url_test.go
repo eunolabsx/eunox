@@ -123,6 +123,35 @@ func TestRedactURL_MalformedNeverLeaksPassword(t *testing.T) {
 	}
 }
 
+// TestRedactURL_OpaqueWithQuery pins the opaque-with-query shape, which no branch handles
+// on purpose: RedactURL's own query scrub runs and is then DISCARDED, because a non-empty
+// u.Opaque returns the ORIGINAL string through redactURLFallback (the opaque body can hide
+// a credential the positional scrubs never reach). The safe outcome therefore comes out of
+// the fallback chain incidentally, so it is pinned here rather than left to be re-derived —
+// any future short-circuit that returns u.String() for an opaque URL breaks these.
+func TestRedactURL_OpaqueWithQuery(t *testing.T) {
+	cases := map[string]string{
+		// No '@' anywhere: the fallback has no "://" to anchor on, so redactRawQuery
+		// replaces the query WHOLESALE — names included, unlike the hierarchical path,
+		// since an opaque body cannot be safely tokenized on '='/'&'.
+		"scheme:x?token=sk-live-9f3c2a": "scheme:x?<redacted query>",
+		"https:host/p?token=abc":        "https:host/p?<redacted query>",
+		// The fragment goes with it, matching the hierarchical scrub.
+		"scheme:x?y=1#frag=z": "scheme:x?<redacted query>",
+		// An '@' ANYWHERE in the value — here in the query VALUE, not the opaque body, so
+		// the opaque-'@' guard does not fire — reaches the fallback's no-scheme arm, which
+		// cannot locate the credential and replaces the whole value. Over-redaction is the
+		// fail-safe direction for a shape whose authority boundary is undefined.
+		"scheme:x?y=a@b":                    "<redacted unparseable URL>",
+		"mailto:ops@example.com?subject=hi": "<redacted unparseable URL>",
+	}
+	for in, want := range cases {
+		if got := RedactURL(in); got != want {
+			t.Errorf("RedactURL(%q): got %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestRedactURLFallback_Cases pins the parse-failure fallback (moved here with the
 // redactor from cmd/eunox/doctor.go during consolidation).
 func TestRedactURLFallback_Cases(t *testing.T) {

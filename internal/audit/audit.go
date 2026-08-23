@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -182,28 +181,6 @@ const auditGenesisPrev = "sha256:genesis"
 // auditIntegrityFailureCode is the DenialCode on every synthetic integrity marker
 // (writeIntegrityMarker).
 const auditIntegrityFailureCode = "AUDIT_INTEGRITY_FAILURE"
-
-// tailFailure enumerates the mutually exclusive ways Open's tail-verification
-// check (during resume) can fail, so the outcomes share one variable
-// instead of independent bools that could (incorrectly) all be set.
-type tailFailure int
-
-const (
-	tailFailNone tailFailure = iota
-	tailFailHMACMismatch
-	tailFailKeyUnknown
-	// tailFailUnsigned: the tail carries no _hmac at all. Either a pre-HMAC log
-	// written before signing existed, or a signed record whose signature was stripped
-	// — indistinguishable from the record alone, and the second is the one splice a
-	// write-capable attacker can make WITHOUT the key. It is therefore treated exactly
-	// like an unparseable tail: the chain is not resumed onto it.
-	tailFailUnsigned
-	// tailFailUndecodable: the tail was refused by the strict decoder (malformed, an
-	// unknown top-level field, or trailing bytes), so no HMAC comparison ever ran. It
-	// restarts the chain exactly like a mismatch does; it is a distinct kind purely so
-	// the marker on the tape names what actually happened.
-	tailFailUndecodable
-)
 
 // auditChannelSize bounds the queue feeding the background drainer. When full,
 // records are dropped (counted by Health().Dropped) and the drainer emits an
@@ -632,310 +609,6 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	return f, max(0, written-recoveredPartialBytes), recoveredPartialBytes, tail, nil
 }
 
-// highestSeqAcrossChain returns the seq the resumed counter must start past, computed
-// across the base log AND every rotated sibling so a startup path that cannot trust the
-// tail never reissues an existing seq. See highestSeqAcrossChainCapped for how unreadable
-// files are folded in as a safe over-estimate. complete is false when the log directory
-// could not be listed, so the rotated siblings' seqs are unknown and the returned value
-// bounds only the base log — the caller must treat the seed as unbounded, not as a
-// confident maximum.
-func highestSeqAcrossChain(logPath string) (highest uint64, ok, complete bool) {
-	return highestSeqAcrossChainCapped(logPath, rescanBufferBytes)
-}
-
-// highestSeqAcrossChainCapped is highestSeqAcrossChain with the per-line scan cap injected
-// for deterministic tests. It over-estimates PAST the true
-// on-disk max as: the highest seq actually READ anywhere in the chain (exact) PLUS the
-// total BYTES of every file that could not be read. Each unread record occupies >= 1 byte,
-// so the unread byte total bounds how many higher seqs an unreadable file can hold beyond
-// the readable max; folding those bytes ADDITIVELY — rather than taking the max of per-file
-// byte sizes, as scanning each file independently would — is what keeps a single rotated
-// sibling's byte count from masquerading as a global seq. seq is monotonic across the WHOLE
-// chain while each file's size is bounded by the rotation size, so after enough rotations
-// (or with a small configured rotate size) the global seq exceeds any one file's byte size:
-// the old per-file max then seeded BELOW the true max and reissued seqs. The additive fold
-// seeds past the true max whenever ANY file in the chain is readable (the readable max is
-// the anchor the unread bytes extend). The one residual — a chain whose files are ALL
-// unreadable AND whose earlier history was pruned — cannot reconstruct the pruned records'
-// seq span from the surviving bytes and may restart low, but always under a
-// chain_resume_failed marker (the break is never silent). Like scanSeqContribution it never
-// verifies HMACs or seeds prev_hmac; it only advances the monotonic counter. ok is false
-// only when nothing — no parseable record and no unread bytes — was found anywhere on disk.
-// complete is false when the log directory could not be listed at all: the fold then saw
-// only the base log, so the result cannot be trusted as a chain-wide maximum.
-func highestSeqAcrossChainCapped(logPath string, bufCap int) (highest uint64, ok, complete bool) {
-	var maxParsed, unreadBytes uint64
-	var parsedAny, sawUnread bool
-	fold := func(path string) {
-		p, parsed, ub := scanSeqContribution(path, bufCap)
-		if parsed {
-			parsedAny = true
-			if p > maxParsed {
-				maxParsed = p
-			}
-		}
-		if ub > 0 {
-			sawUnread = true
-			unreadBytes = satAddU64(unreadBytes, ub)
-		}
-	}
-	fold(logPath)
-	// A directory-listing failure leaves only the base's contribution, which does NOT
-	// bound the rotated siblings' seqs — the seed can land below the true on-disk maximum
-	// and reissue history. Report it through complete so the caller surfaces the
-	// uncertainty in-band instead of presenting a partial fold as a confident maximum.
-	// A directory that does not exist yet is the ordinary fresh-install case (no siblings
-	// to miss), so it stays complete.
-	complete = true
-	if sibs, err := sortedRotatedSiblings(logPath); err == nil {
-		for _, sib := range sibs {
-			fold(sib)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		// errors.Is, not os.IsNotExist: the latter does not unwrap, and this error comes
-		// from a helper chain (sortedRotatedSiblings -> scanLogDir) that returns os.ReadDir's
-		// raw *fs.PathError only by convention. The moment any layer adds context with %w,
-		// a genuinely-absent directory would stop being recognized and every fresh install
-		// would stamp seed_unbounded on the tape. rotate.go classifies the same error from
-		// the same helper this way.
-		complete = false
-	}
-	return satAddU64(maxParsed, unreadBytes), parsedAny || sawUnread, complete
-}
-
-// satAddU64 adds two uint64 values, saturating at the maximum rather than wrapping, so a
-// pathologically large unread-byte total can never wrap the seed back down to a small value
-// (which would then reissue existing seqs — the very failure the seed exists to prevent).
-func satAddU64(a, b uint64) uint64 {
-	if a > ^uint64(0)-b {
-		return ^uint64(0)
-	}
-	return a + b
-}
-
-// seedSeqPastOnDiskMax advances s.seq past the highest seq already on disk (base +
-// rotated siblings) so a chain that could not READ its tail — a write-only base, or a
-// newest rotated sibling that could not be opened — restarts with a marker whose seq,
-// and every record after it, is past every existing seq rather than restarting at genesis
-// and reissuing them (a duplicate-seq cascade audit-verify cannot distinguish from
-// tampering; the package's own scanSeqContribution comment calls a duplicate "WORSE than
-// a gap"). It deliberately leaves s.prevHMAC at genesis: the break is real and
-// audit-verify must see the prev_hmac discontinuity — only the seq counter is advanced,
-// monotonic and gap-detectable. A best-effort scan finding nothing leaves s.seq unchanged
-// (a genuinely unreadable log, already handled by the read-error seed path).
-//
-// It is deliberately NOT used by the paths where the tail WAS read but could not be
-// trusted — a parse failure, an HMAC mismatch, a retired key, an unsigned tail. Those
-// restart at genesis on purpose: the seqs on disk are then attacker-influenced (both the
-// tail's own seq and, since highestSeqAcrossChain parses every line without verifying
-// any, the maximum this function would find), so seeding from them would let a forged
-// record inflate the counter. Trusting no on-disk seq is the fail-closed direction; the
-// resulting duplicate seqs against the untrusted prefix are themselves a signal
-// audit-verify surfaces. See resumeChainFromTail and the threat model's section 3.4.
-//
-// On the paths that DO use it, the folded values are still unverified — an unreadable
-// tail is exactly the case where nothing can be verified — so what an unverified value
-// must never do is inflate the counter to the point where the next `s.seq + 1` wraps back
-// to 0 and reissues genesis. The seed is clamped to maxSeedableSeq for that, far above any
-// reachable real history and far below the wrap. bounded is false when the fold could not
-// see the whole chain, so the caller can mark the uncertainty on the tape rather than
-// trusting a partial seed.
-func (s *Sink) seedSeqPastOnDiskMax() (bounded bool) {
-	highest, ok, complete := highestSeqAcrossChain(s.logPath)
-	if ok && highest > maxSeedableSeq {
-		// No real deployment reaches maxSeedableSeq records; a value this large is a
-		// corrupt or planted seq, and honoring it would push the counter into the wrap
-		// zone. Clamp and say so — the clamped seed still lands past every plausible
-		// genuine record, so the monotonic guarantee holds for real history.
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log %q holds an implausible sequence number (%d); it is corrupt or planted. Seeding the resumed counter at %d instead — run 'eunox audit-verify' and reconcile against your external sink.\n", s.logPath, highest, maxSeedableSeq)
-		highest = maxSeedableSeq
-	}
-	if ok && highest > s.seq {
-		s.seq = highest
-	}
-	return complete
-}
-
-// maxSeedableSeq caps the value seedSeqPastOnDiskMax will adopt from unverified on-disk
-// bytes. 2^62 is ~4.6e18 records — unreachable by any real log (millennia at a million
-// records per second) — while leaving writeRecord's `s.seq + 1` two orders of magnitude of
-// headroom below the uint64 wrap. Without the cap, a single planted
-// {"seq":18446744073709551615} line seeds the counter at the maximum and the very next
-// write reissues seq 0/1, which audit-verify cannot distinguish from tampering.
-const maxSeedableSeq uint64 = 1 << 62
-
-// tailResumeResult is resumeChainFromTail's report of how the existing tail
-// record (if any) resolved: which integrity marker Open must write, and the
-// seq/hmac a forensic reader needs to locate the record in question.
-type tailResumeResult struct {
-	tailFailKind     tailFailure
-	tailParseFailure bool
-	tailParseBytes   int
-	tailSeq          uint64
-	tailHMAC         string
-}
-
-// resumeChainFromTail parses and verifies last — the most recent existing audit
-// record, or "" when the log is new/empty — and on success seeds s.seq/
-// s.prevHMAC so the chain continues from it. Split out of
-// Open to keep both functions under the complexity budget; the fields it
-// mutates on s belong to a single-threaded Open (opt application has already
-// run, the drainer has not started), so no locking is needed here either.
-func (s *Sink) resumeChainFromTail(last string) tailResumeResult {
-	if last == "" {
-		return tailResumeResult{}
-	}
-	var prev auditRecord
-	if err := json.Unmarshal([]byte(last), &prev); err != nil {
-		// The tail did not parse as JSON (a partial write, power loss, or
-		// corruption). The chain restarts from genesis (seq 1, sha256:genesis),
-		// which audit-verify later reports as a break against the real prior
-		// records on disk. Warn and mark it in-band: stderr alone is lost to
-		// container log rotation and is not part of the tamper-evident trail, so
-		// a deliberate truncation erasing a break would otherwise be silent. The
-		// marker is written by the caller, chained from genesis.
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail failed to parse (%v); the last record may be truncated or corrupt. Restarting the chain from genesis — run 'eunox audit-verify' and reconcile against your external sink.\n", err)
-		// Deliberately restart from genesis (seq 0), NOT past the on-disk max: the tail is
-		// untrusted, and an attacker who appended a forged record with a chosen huge seq
-		// must not be able to inflate the resumed counter (see the
-		// IntegrityFailedTail_DoesNotInheritAttackerSeq guarantee). The resulting
-		// duplicate-seq cascade against the real prior records is itself a tamper signal
-		// audit-verify surfaces — the fail-closed choice here is to trust NO on-disk seq.
-		return tailResumeResult{tailParseFailure: true, tailParseBytes: len(last)}
-	}
-	// An unsigned tail is never chained onto. Appending an unsigned record is the one
-	// splice a write-capable attacker can make WITHOUT the signing key (truncate to a
-	// chosen record, append an unsigned record as the new tail), so resuming from it
-	// would seed seq/prev_hmac from bytes nothing certifies. A genuinely pre-HMAC log
-	// is the same shape and gets the same treatment — restart the chain from genesis
-	// and record the boundary in-band — so the migration is: move a pre-HMAC log aside
-	// before upgrading, or accept a chain restart and a permanently INVALID prefix
-	// (audit-verify counts every HMAC-less record invalid).
-	if prev.HMAC == "" {
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail carries no _hmac, so it cannot be verified: either a pre-signing log or a record whose signature was stripped. The chain cannot be resumed and restarts from genesis — move a pre-signing log aside before upgrading, and run 'eunox audit-verify' plus a reconcile against your external sink otherwise.\n")
-		return tailResumeResult{tailFailKind: tailFailUnsigned, tailSeq: prev.Seq}
-	}
-	// Verify the tail's HMAC before chaining onto it: otherwise an attacker who
-	// truncates to a chosen record, or appends a crafted tail, seeds the resumed
-	// seq/prev_hmac from unverified bytes.
-	// Warn rather than abort so a corrupted local log does not block enforcement
-	// (the documented audit-failure tradeoff).
-	if ok, err := s.VerifyRecord([]byte(last)); err != nil || !ok {
-		if errors.Is(err, errKeyIDNotInRing) {
-			// The tail names a key_id absent from the verification ring — the
-			// expected state right after a key rotation retired the signing key,
-			// NOT evidence of tampering. Folding this into tail_hmac_mismatch
-			// (below) would misdiagnose a routine rotation as a tamper event and
-			// point the operator at the wrong remediation. Distinguish it with its
-			// own marker and message instead.
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail was signed by a retired key no longer in the verification ring; this is expected immediately after a key rotation. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' with the retired key still available to confirm the tail is intact.\n")
-			return tailResumeResult{tailFailKind: tailFailKeyUnknown, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
-		}
-		if errors.Is(err, errStrictDecodeRefused) {
-			// The strict decoder refused the line, so VerifyRecord returned BEFORE
-			// computing any MAC. Recording this as tail_hmac_mismatch asserted a
-			// comparison that never ran and pointed the operator at a tampering
-			// remediation for what is usually a malformed or forward-versioned record.
-			// The chain still restarts from genesis — only the label differs.
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail could not be decoded for verification (malformed, an unknown field, or trailing bytes), so its signature was never checked. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' and reconcile against your external sink.\n")
-			return tailResumeResult{tailFailKind: tailFailUndecodable, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
-		}
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: audit log tail failed HMAC verification; the last record may have been tampered with or truncated. The chain cannot be resumed and restarts from genesis — run 'eunox audit-verify' and reconcile against your external sink.\n")
-		// Mark it in-band too (stderr is lost to log rotation and not in the
-		// tamper-evident trail); the signed marker is written by the caller.
-		return tailResumeResult{tailFailKind: tailFailHMACMismatch, tailSeq: prev.Seq, tailHMAC: prev.HMAC}
-	}
-	// A tape has exactly one writer at a time (Open holds the lock across the whole
-	// process's life), so a VERIFIED tail naming a different enforcement point means this
-	// file was written by another one before this process started: an instance renamed, or
-	// two enforcement points pointed at one path in turn. Nothing about the chain is wrong
-	// — it resumes normally, and because the stamp is per record rather than a file-level
-	// header, the boundary stays legible on the tape with no marker to write — but the log
-	// as a whole has stopped answering "which enforcement point produced this", and the
-	// usual cause is a copied config, which is worth one line at startup. Only a tail that
-	// NAMES one is compared: a tape predating the stamp, or written before the operator
-	// configured one, is an ordinary first-time configuration, not a change.
-	if prev.PEP != "" && prev.PEP != s.pep {
-		// Rendered rather than %q'd straight: an unset stamp prints as an empty pair of
-		// quotes, which reads as a name that is the empty string rather than as none.
-		mine := "no enforcement point at all"
-		if s.pep != "" {
-			mine = fmt.Sprintf("%q", s.pep)
-		}
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: the audit log tail was written by enforcement point %q, but this instance stamps %s; the chain resumes normally and every record still names its own writer, but this log has stopped belonging to a single enforcement point — give each one its own audit.log, or reconcile the names.\n", prev.PEP, mine)
-	}
-	// Chain onto the tail only when it verified (handled above by returning
-	// early on any failure). A failed tail is attacker-controllable (a
-	// syntactically valid record with arbitrary seq/_hmac needs no signing key),
-	// so seeding s.seq/s.prevHMAC from it would inject a fabricated seq jump and
-	// chosen prev_hmac — that path already returned above, leaving seq 0/
-	// prevHMAC "" so the chain restarts from genesis while the marker records
-	// the event for forensics.
-	s.seq = prev.Seq
-	s.prevHMAC = prev.HMAC
-	// Zero value: the struct's tail fields exist to tell a forensic reader WHICH record
-	// a failure marker is about, and a clean resume writes no marker. Populating them
-	// here would invite a later success-path diagnostic to read a field that is only
-	// meaningful on the failure paths.
-	return tailResumeResult{}
-}
-
-// startupResume is resolveStartupResume's report: which tail line the chain resumes
-// from, and whether that resolution failed closed (so Open writes a chain_resume_failed
-// marker) and whether the reseed it performed could see the whole chain.
-type startupResume struct {
-	last              string
-	chainResumeFailed bool
-	seedUnbounded     bool
-	failReason        string
-}
-
-// resolveStartupResume decides which line the chain resumes from, handling the two ways
-// that resolution can fail closed: an unreadable base tail, and an empty base whose newest
-// rotated sibling is unreadable. Both seed the seq counter past the on-disk maximum rather
-// than restarting at genesis, and both report chainResumeFailed so the caller marks the
-// break in-band. Split out of Open to keep that function within the cyclomatic-complexity
-// budget; it mutates s.seq through seedSeqPastOnDiskMax, which is safe because Open is
-// single-threaded here (opt application has run, the drainer has not started).
-func (s *Sink) resolveStartupResume(tail tailResume, logPath string) startupResume {
-	r := startupResume{last: tail.last}
-	switch {
-	case !tail.readable:
-		// A write-only (0200) log opened append-only: its tail cannot be read, so the
-		// chain genuinely cannot be resumed. Restarting from genesis would renumber seq
-		// from 1 and reissue every seq already on disk — a tamper-shaped duplicate-seq
-		// cascade, worse than a gap — so seed past the highest seq anywhere in the chain
-		// and mark the break in-band instead. prev_hmac stays the genesis sentinel: the
-		// real tail could not be read, so the cryptographic link honestly cannot continue,
-		// and the marker is the single break rather than a per-record one.
-		r.seedUnbounded = !s.seedSeqPastOnDiskMax()
-		r.chainResumeFailed = true
-		r.failReason = auditReasonTailReadFailed
-		fmt.Fprintf(os.Stderr, "[eunox] WARNING: could not read audit log tail of %q (the log is write-only, so its tail cannot be probed); the chain cannot be resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
-	case r.last == "":
-		// logPath is empty or absent: a brand-new install, a just-rotated base, or a
-		// reopen-fallback that renamed the base away. In the latter two the chain
-		// tail lives in the newest rotated sibling. Resuming from the empty base
-		// would restart at genesis and silently orphan every prior record with no
-		// detectable gap, so fall back to the sibling's tail and warn.
-		sib, l, unreadableNewer := newestRotatedSiblingWithTail(logPath)
-		switch {
-		case sib != "":
-			r.last = l
-			fmt.Fprintf(os.Stderr, "[eunox] audit chain resumed from rotated file %q because the base log %q was empty on startup\n", sib, logPath)
-		case unreadableNewer:
-			// The newest rotated sibling exists but could not be read, so resuming from an
-			// older one (or genesis) would reissue its seqs. Fail closed exactly as a base
-			// read failure does: seed past the on-disk max and record the break in-band.
-			r.seedUnbounded = !s.seedSeqPastOnDiskMax()
-			r.chainResumeFailed = true
-			r.failReason = auditReasonTailReadFailed
-			fmt.Fprintf(os.Stderr, "[eunox] WARNING: the newest rotated audit sibling of %q could not be read; the chain cannot be safely resumed and a chain_resume_failed marker is appended (seq continues past the on-disk maximum) — run 'eunox audit-verify' and reconcile against your external sink.\n", logPath)
-		}
-	}
-	return r
-}
-
 // Open opens (or creates) the audit log and loads (or generates) the HMAC
 // signing key. logPath, keyPath, and rotateSizeBytes may be zero for defaults.
 //
@@ -1043,7 +716,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	}
 	// Resume the chain from the existing tail so seq stays monotonic and prev_hmac
 	// links across restarts. Only a tail that verifies under a held key is resumed
-	// onto; anything else (unparseable, HMAC mismatch, retired key, or unsigned)
+	// onto; every other outcome — see the tailFailure vocabulary for the current set —
 	// restarts the chain from genesis and leaves a signed marker naming the reason.
 	//
 	// The tail was read once, through the open append handle, by the partial-tail
@@ -1056,15 +729,16 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	tr := s.resumeChainFromTail(resume.last)
 	// Emit the integrity marker before the drainer starts: Open is single-threaded
 	// here, so writeRecord has no contention and the marker becomes the first
-	// appended line, chained from the resumed tail like the first real record. The
-	// first five cases are mutually exclusive (a read failure leaves last=="" so no
-	// parse/HMAC attempt; the parse must succeed before the signature checks; and the
-	// unsigned tail, the HMAC mismatch, and the unknown-key tail are distinct outcomes
-	// of that same step), so at most one of THEM is written. All of them chain from
-	// genesis: none of those tails is resumable, so there is no seq/prev_hmac to
-	// continue from. The tail_partial_write_recovered marker is independent of these
-	// (it concerns the dropped fragment, not the resumed record) and may fire alongside
-	// one of them.
+	// appended line, chained from the resumed tail like the first real record. Every
+	// marker below EXCEPT tail_partial_write_recovered is mutually exclusive with the
+	// others by construction rather than by count (a read failure leaves last=="" so no
+	// parse or verification is attempted; the parse must succeed before verification
+	// runs; and each way verification can refuse — unsigned, non-canonical, strict-decode
+	// refused, unknown key, HMAC mismatch — returns from that one step), so at most one
+	// of THEM is written. All of them chain from genesis: none of those tails is
+	// resumable, so there is no seq/prev_hmac to continue from. The
+	// tail_partial_write_recovered marker is independent (it concerns the dropped
+	// fragment, not the resumed record) and may fire alongside one of them.
 	// wroteMarker says whether any writeIntegrityMarker call below appended a line, so
 	// the fsync further down only pays for a startup that put something new on disk — a
 	// clean startup (the common case: no tail failure, no partial-write recovery) has
@@ -1113,11 +787,17 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 		// HMAC comparison ever ran. Carry the claimed seq/hmac anyway — they are the
 		// lenient decode's view and still locate the record.
 		s.writeIntegrityMarker("tail_strict_decode_refused", map[string]interface{}{"claimed_tail_seq": tr.tailSeq, "claimed_tail_hmac": tr.tailHMAC})
+	case tailFailNonCanonical:
+		// Distinct from both: the line decoded cleanly but its bytes are not the ones the
+		// writer emits, which the check catches before any MAC is computed. Carry the
+		// claimed seq/hmac — read from the rewritten bytes, so they locate the record
+		// without vouching for it.
+		s.writeIntegrityMarker("tail_non_canonical", map[string]interface{}{"claimed_tail_seq": tr.tailSeq, "claimed_tail_hmac": tr.tailHMAC})
 	}
 	if recoveredPartialBytes > 0 {
 		// A partial trailing write was truncated above. Record the recovery so the
 		// event is on the tamper-evident trail and an anomalous rate of partial writes
-		// is visible. Unlike the four cases above this is NOT mutually exclusive with
+		// is visible. Unlike every case above this is NOT mutually exclusive with
 		// them: the recovery concerns the dropped fragment, while those markers concern
 		// the COMPLETE record the chain resumes from, so both can legitimately fire. It
 		// chains from the resumed tail like any appended record.
@@ -1226,11 +906,18 @@ func (s *Sink) syntheticDenyMarker(code string, details map[string]interface{}) 
 //     (malformed, an unknown top-level field, or trailing bytes), so its signature
 //     was never checked — distinct from tail_hmac_mismatch, which asserts a key
 //     rejected it. Details carry claimed_tail_seq and claimed_tail_hmac.
+//   - tail_non_canonical: the prior tail decoded to a well-formed record whose bytes
+//     are not the ones the writer emits for those fields (a duplicate, re-spelled or
+//     reordered key, an added zero-valued field, an alternate escape, or inserted
+//     whitespace), so — the check running before any MAC is computed — its signature
+//     was never checked either. Distinct from tail_strict_decode_refused, which says
+//     the line could not be read at all rather than that it was rewritten. Details
+//     carry claimed_tail_seq and claimed_tail_hmac.
 //   - tail_partial_write_recovered: a partial (non-newline-terminated) trailing
 //     write was truncated so the next append starts clean; details carry
 //     recovered_bytes.
 //
-// The first five are mutually exclusive (at most one per start); the partial-write
+// All but the last are mutually exclusive (at most one per start); the partial-write
 // recovery is independent and may accompany one of them. All reuse the
 // AUDIT_INTEGRITY_FAILURE deny shape (no new top-level field) and are chained and
 // signed like any record, so audit-verify and any external sink surface them —
@@ -1256,26 +943,12 @@ func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{})
 	s.writeRecord(&marker)
 }
 
-// errAuditFileShrunk reports that an audit log file was non-empty at Stat but returned
-// zero bytes at ReadAt — truncated/rotated out between the two syscalls. Wrapped in
-// readLastAuditLine's error so the caller can recognize the race; the sibling scan treats
-// it like any other tail-read error.
-var errAuditFileShrunk = errors.New("audit log shrank between stat and read")
-
 // auditScanBufferBytes is the line-buffer ceiling every audit-JSONL reader uses.
 // Details is capped at auditDetailsTotalCap (1 MiB) and the envelope is far
 // smaller, so every record stays well under this 4 MiB bound and never trips
 // bufio.ErrTooLong. Centralizing ties the buffer to the record caps rather than
 // leaving independent literals that could drift past 4 MiB.
 const auditScanBufferBytes = 4 << 20
-
-// rescanBufferBytes is the WIDE per-line buffer scanSeqContribution uses on the
-// chain-resume error path so its single pass reads PAST a record larger than the
-// ~1 MiB cap, while still bounding memory: a line longer than this is refused rather
-// than accumulated unbounded, so a corrupt or tampered log cannot drive the resume
-// scan to OOM. Generous relative to the record cap, so any plausibly-large record is
-// read, yet a hard ceiling on the one-shot startup allocation.
-const rescanBufferBytes = 64 << 20
 
 // NewLineScanner returns a bufio.Scanner sized to hold one audit record, for the
 // readers that scan a log line by line (audit-verify, stats, suggest), keeping
@@ -1287,63 +960,6 @@ func NewLineScanner(r io.Reader) *bufio.Scanner {
 	// records are far smaller.
 	scanner.Buffer(make([]byte, 0, 64<<10), auditScanBufferBytes)
 	return scanner
-}
-
-// readLastAuditLine returns the last non-blank line of an audit log file, reading only
-// a bounded tail rather than scanning a large log.
-//
-// Its one caller is the rotated-sibling scan (newestRotatedSiblingWithTail): the ACTIVE
-// log's tail is read through the already-open append handle at startup (see tailResume),
-// which is what removed this function's original chain-resume role and the second open
-// that came with it. The three-case contract below is still what that caller needs — an
-// unreadable sibling must not be mistaken for an empty one — so it is stated, not
-// inherited:
-//
-//   - ("", nil): the file is genuinely empty or absent — the chain resumes from a
-//     rotated sibling or the genesis sentinel.
-//   - ("", err): an I/O error (Stat/ReadAt failure on a present file, or the file
-//     shrank to empty between the two — errAuditFileShrunk). The caller MUST NOT
-//     treat this as empty: resuming from genesis on a non-empty log leaves an
-//     unmarked chain gap. A MISSING file is reported as ("", nil), since absence
-//     is the normal brand-new-install case.
-//   - (line, nil): the extracted last record line.
-func readLastAuditLine(path string) (string, error) {
-	// Guarded like the other whole-file reads, and for a sharper reason than theirs: this
-	// is Open's chain-resume path AND its callers walk rotated siblings found by a
-	// directory scan, so a substituted path would otherwise seed the resumed chain from
-	// attacker-chosen bytes — or, for a planted FIFO, block forever inside open(2).
-	f, err := openDiscoveredAuditFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Absent file: the normal brand-new-install / freshly-rotated case, not an
-			// I/O error. Report empty so the caller resumes from genesis or a sibling.
-			return "", nil
-		}
-		// Every other refusal (including a non-regular substitution) is an unreadable
-		// file, which the callers fail closed on rather than treating as empty.
-		return "", err
-	}
-	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if info.Size() == 0 {
-		return "", nil
-	}
-	// Details is capped at 1 MiB and the envelope is far smaller, so a record (plus
-	// its preceding boundary newline) is always captured within this tail. Sized from
-	// auditScanBufferBytes rather than a second 4 MiB literal: the tail window and the
-	// line-scan ceiling must agree, or a record one reader accepts is one the other
-	// truncates.
-	size := info.Size()
-	start := tailWindowStart(size, auditScanBufferBytes)
-	buf := make([]byte, size-start)
-	n, err := f.ReadAt(buf, start)
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-	return interpretAuditTail(buf, n, err, size, start)
 }
 
 // openDiscoveredAuditFile opens an audit-log path for a whole-file READ, refusing every
@@ -1369,73 +985,6 @@ func openDiscoveredAuditFile(path string) (*os.File, error) {
 		return nil, statErr
 	}
 	return f, nil
-}
-
-// scanSeqContribution reads path once and separates the two distinct ways a file can inform
-// the resumed seq counter, which callers combine differently:
-//
-//   - parsedMax/parsed: the largest seq actually decoded from a record (exact and
-//     authoritative). parsed is false when the file opened and read cleanly but held no
-//     parseable record (empty/blank/all-unparseable).
-//   - unreadBytes: the file's byte size when it could NOT be fully read — the open was
-//     refused (a write-only 0200 log fails EACCES on every restart; a symlinked path fails
-//     under config.OpenNoFollow, same as every other audit-file open) or the scan aborted
-//     on an over-cap line (bufio.ErrTooLong) or a mid-file read fault — so the true max is
-//     unknown and bounded only by the byte count (>= 1 byte per record). Zero when the file
-//     read cleanly to EOF.
-//
-// Returning (0, false) for an unreadable non-empty file would seed the counter at genesis
-// (seq 1) and reissue every on-disk seq — a tamper-shaped duplicate-seq cascade, WORSE than
-// a gap — so an unopenable file reports its stat(2) size instead (stat needs no read
-// permission). It never verifies HMACs and never seeds prev_hmac: it only advances the
-// monotonic seq counter, so an unsigned or forged on-disk record can at worst inflate the
-// counter (harmless), never inject a trusted chain link.
-func scanSeqContribution(path string, bufCap int) (parsedMax uint64, parsed bool, unreadBytes uint64) {
-	// Refused for the same reason readLastAuditLine carries O_NOFOLLOW: this scan runs on
-	// the resume path, so a substituted path would otherwise feed the counter from an
-	// attacker-chosen file. A refusal takes the stat fallback below, which reports a size —
-	// inflation only, which the seq fold already tolerates.
-	f, err := openDiscoveredAuditFile(path)
-	if err != nil {
-		if info, statErr := os.Stat(path); statErr == nil {
-			if sz := uint64(info.Size()); sz > 0 { //nolint:gosec // G115: file size is non-negative
-				return 0, false, sz
-			}
-		}
-		return 0, false, 0
-	}
-	defer func() { _ = f.Close() }()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, min(64<<10, bufCap)), bufCap)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var rec auditRecord
-		if json.Unmarshal(line, &rec) != nil {
-			continue
-		}
-		parsed = true
-		if rec.Seq > parsedMax {
-			parsedMax = rec.Seq
-		}
-	}
-	if scanner.Err() == nil {
-		// Clean EOF: parsedMax is the confident true max; nothing was left unread.
-		return parsedMax, parsed, 0
-	}
-	// The scan aborted — a line over the cap or a mid-file read fault — so parsedMax is only
-	// a LOWER bound: a higher-seq record may sit beyond the offending line. Report the file
-	// size as the unread over-estimate too, so the caller seeds past the on-disk maximum
-	// rather than from an under-count (a duplicate seq reads as tampering; a gap only as
-	// loss). This genuinely-undeterminable case is the only one that falls back to size.
-	if info, statErr := f.Stat(); statErr == nil {
-		if sz := uint64(info.Size()); sz > 0 { //nolint:gosec // G115: file size is non-negative
-			return parsedMax, parsed, sz
-		}
-	}
-	return parsedMax, parsed, 0
 }
 
 // RecordAllow enqueues an allow audit record for asynchronous serialization and
