@@ -389,6 +389,18 @@ enforcement allowlist would need.
 
 Run 'eunox init --upstream-url <url>' to scaffold a starter config + manifest.
 
+Exit codes:
+  0  The proxy served and shut down cleanly (SIGINT/SIGTERM, or the host closed
+     the stdio session). -h also exits 0.
+  1  The proxy did not serve: an incoherent flag combination, an out-of-range
+     flag value, a config or manifest that would not load, a subsystem that
+     would not come up, or a fatal error while serving.
+  2  The command line did not PARSE — an unknown flag, or a value the flag
+     package itself rejects. Narrower than the sibling subcommands' 2: the
+     flag-combination and flag-value errors they classify as usage errors are
+     reported here as 1, so on this command 2 means "the command line did not
+     parse" and 1 means "it parsed, and the proxy refused to start".
+
 Flags:
 `)
 	fs.SetOutput(w)
@@ -486,10 +498,8 @@ func cmdProxy(args []string) (exitCode int) {
 	if sessionIDSet && *f.sessionID == "" {
 		// An explicitly-empty value (e.g. a unit file pinning --session-id "$SID" for a
 		// later `eunox kill "$SID"` where $SID turned out unset) must not silently fall
-		// through to a random UUID: resolveKillTarget already refuses the identical mistake
-		// on the kill side ("a supplied target with an empty id … must not silently fall
-		// through to the positional or a default"), and both killswitch backends reject
-		// empty ids outright. Minting a
+		// through to a random UUID: resolveKillTarget refuses the identical mistake on the
+		// kill side, and both killswitch backends reject empty ids outright. Minting a
 		// fresh id here instead would make the pinned emergency kill match nothing.
 		fmt.Fprintf(os.Stderr, "eunox proxy: --session-id was passed but empty; unset the flag entirely for a random UUID, or pass a non-empty id\n")
 		return 1
