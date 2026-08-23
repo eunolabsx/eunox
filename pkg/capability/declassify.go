@@ -183,14 +183,16 @@ type DeclassifyApproval struct {
 // approval never covers anything — Validate rejects those at the token boundary, and this
 // stays independently fail-closed for a programmatically built approval.
 func (a *DeclassifyApproval) Covers(target string, want []string) bool {
-	// Approver is checked TRIMMED, matching Validate: a whitespace-only approver is not a
-	// named human, and Covers is the check that actually decides whether a label is
-	// cleared. A programmatically built approval never passes through Validate, so the two
-	// must agree on what "named" means or the authorization test is the looser of the pair.
-	if a == nil || strings.TrimSpace(a.Approver) == "" || a.Target == "" || len(a.Labels) == 0 || len(want) == 0 {
+	// Approver and Target are both checked TRIMMED, matching Validate: a whitespace-only
+	// approver is not a named human, and the target Validate accepted is the trimmed one
+	// (it validates a local copy it never writes back). A programmatically built approval
+	// never passes through Validate OR the claim decoder's trim, so a padded
+	// " tool:publish_report" would otherwise validate and then cover nothing — the "grant
+	// that quietly evaluated to covers nothing" failure Validate exists to prevent.
+	if a == nil || strings.TrimSpace(a.Approver) == "" || a.normalizedTarget() == "" || len(a.Labels) == 0 || len(want) == 0 {
 		return false
 	}
-	if a.Target != target {
+	if a.normalizedTarget() != target {
 		return false
 	}
 	granted := make(map[string]bool, len(a.Labels))
@@ -224,7 +226,7 @@ func (a *DeclassifyApproval) Validate() error {
 	if err := checkExternalFlowLabels(a.Labels, "declassify approval 'labels'"); err != nil {
 		return err
 	}
-	target := strings.TrimSpace(a.Target)
+	target := a.normalizedTarget()
 	if target == "" {
 		return fmt.Errorf("declassify approval must name the action it covers in 'target'")
 	}
@@ -261,7 +263,16 @@ func (a *DeclassifyApproval) LedgerID() string {
 	if a == nil || !a.Once || a.ID == "" {
 		return ""
 	}
-	return CompositeKey("once", a.ID, a.Target)
+	return CompositeKey("once", a.ID, a.normalizedTarget())
+}
+
+// normalizedTarget is the ONE spelling of this approval's target every check reads, so
+// Validate cannot accept a padded value that Covers then matches nothing against and
+// LedgerID burns into a bucket of its own. The claim decoder trims before Validate runs,
+// so this only ever changes the answer for an approval an embedder built directly — which
+// is precisely the case none of the three would otherwise agree on.
+func (a *DeclassifyApproval) normalizedTarget() string {
+	return strings.TrimSpace(a.Target)
 }
 
 // DeclassifyLedgerWindowSec is how long a burned single-use approval is remembered.

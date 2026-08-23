@@ -937,12 +937,12 @@ func (r *Redis) setBlock(ctx context.Context, kill bool, dim *killDimension, id 
 	if r.wiringErr != nil {
 		return r.wiringErr
 	}
-	verb := "Kill"
-	if !kill {
-		verb = "Revive"
-	}
 	if id == "" {
-		return fmt.Errorf("killswitch: %s%s: %s must not be empty", verb, dim.entity, dim.idField)
+		method := dim.killMethod
+		if !kill {
+			method = dim.reviveMethod
+		}
+		return fmt.Errorf("killswitch: %s: %s must not be empty", method, dim.idField)
 	}
 	key := dim.keyPrefix + id
 	var err error
@@ -1051,8 +1051,8 @@ func (r *Redis) Reset(ctx context.Context) error {
 
 	r.mu.Lock()
 	r.globalActive = false
-	for _, dim := range killDimensions {
-		dim.replace(r, make(map[string]bool))
+	for i := range killDimensions {
+		killDimensions[i].replace(r, make(map[string]bool))
 	}
 	r.cacheGen++
 	r.mu.Unlock()

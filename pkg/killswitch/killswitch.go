@@ -167,8 +167,12 @@ type Manager interface {
 	// not a work list — the consumer's correct response is to re-ask ShouldBlock, not
 	// reimplement the (agent, session, global) matching.
 	//
-	// Delivery is BEST-EFFORT, not a substitute for a periodic sweep: a dropped pub/sub
-	// message or a late registration leaves state to be found by the next reconcile.
+	// Delivery is BEST-EFFORT and covers only kills this backend's view gains AFTER fn is
+	// registered. A dropped pub/sub message is recovered — the next reconcile emits the
+	// revocation the message would have carried — but a kill the view ALREADY held when fn
+	// registered is never delivered, because the reconcile emits only what its scan ADDS.
+	// A consumer that registers after it starts holding things must therefore sweep its own
+	// holdings once after registering; nothing here will replay what it missed.
 	//
 	// The returned unregister is idempotent. A kill switch commonly OUTLIVES its consumer,
 	// so a registration with no way out keeps a dead closure reachable forever; a consumer
@@ -256,7 +260,7 @@ type Status struct {
 	RevokedJTIs []string `json:"revokedJtis"`
 }
 
-// buildStatus assembles a *Status from the raw cache maps, sorting both id slices for
+// buildStatusOf assembles a *Status from the raw cache maps, sorting every id slice for
 // deterministic output. Shared by both backends so the two cannot drift.
 func buildStatusOf(globalActive bool, held func(*killDimension) map[string]bool) *Status {
 	st := &Status{GlobalActive: globalActive}
