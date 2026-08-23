@@ -155,6 +155,13 @@ note "[stdio] sampling DENY"
 # asserting the absence of a feature rather than the revision boundary. Both remain
 # outstanding on the HTTP transport.
 #
+# The blocker has NARROWED, though, and the distinction matters for whoever enables these
+# next: such a host now gets past NEGOTIATION over HTTP (its first request establishes a
+# context rather than contradicting an asserted one), and is refused 501 by the arm that
+# will mint its session. What is missing is creation itself, not the revision boundary —
+# so these cells become runnable over HTTP the moment that lands, with no change here
+# beyond dropping this note.
+#
 # The mismatched cells assert the refusal because refusal is the whole of the boundary
 # this build implements: no method is translated across a mismatched pair, in either
 # direction. When translation is activated, the cells that stop refusing are the diff.

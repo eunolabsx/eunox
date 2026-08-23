@@ -236,20 +236,27 @@ HTTP session without `initialize`, and none of that touches it. Under the plan's
 struct is explicitly admissible, and the rest changes no existing deployment's behavior — a new
 revocation dimension alters nothing until an operator revokes something.
 
-**What has NOT landed:** session creation on the first enforced request. That IS D3, and it is
-now **unblocked** — ADR-0004 was ratified `Final` on 2026-08-23. It remains the half with real
-wire consequences (a 2026-07-28 HTTP peer being served at all, and what happens to an
-unauthenticated one), so it is the next thing to build rather than something already done.
+**What has landed since ratification:** the NEGOTIATION half. `sessionlessLeg` now takes the
+message: an `initialize` arm asserts the handshake revision (answering `initialize` IS the
+negotiation), and every other pre-session message asserts nothing, so its declaration
+ESTABLISHES a context rather than being checked against one. A declaring host's first request is
+no longer refused `UNSUPPORTED_PROTOCOL_VERSION` above session creation — which was the reason a
+2026-07-28 host was unservable over HTTP at all, and the reason it was never `Mcp-Session-Id`.
+Omission still resolves to `2025-11-25`, and the mid-context flip refusal governs unchanged from
+the second message on; establishing is not flipping, and only establishing was relaxed.
 
-Ratification added one decision the addendum had not made, and W3 is what surfaced it: HTTP's
-sessionless arm asserts the handshake revision as its context (`sessionlessLeg()`), so a
-declaring peer's first request is refused `UNSUPPORTED_PROTOCOL_VERSION` **before** session
-creation is reached — which is why a 2026-07-28 host is unservable over HTTP today, and why the
-reason is not `Mcp-Session-Id`. ADR-0004's second addendum decides it: on the sessionless path a
-first message's declaration ESTABLISHES the context rather than being checked against one,
-omission still resolves to `2025-11-25`, the pin attaches to the worker the request mints, and
-the `initialize` arm keeps asserting the handshake revision because answering `initialize` IS
-the negotiation. Building the negotiation half FIRST is what makes the rest testable at all.
+Two things fall out of it. W3's routing-header check becomes REACHABLE for a declaring peer over
+HTTP for the first time, so it now runs against real traffic rather than only unit cells. And the
+sessionless refusal became revision-aware — the branch W3 wrote and then deleted as unreachable
+code standing in for this decision is now reachable and correct, so a 2026-07-28 host is told
+that session creation on first request is unimplemented rather than being told to send a header
+its revision removed.
+
+**What has NOT landed:** session creation itself — the worker keyed on the resolved state anchor,
+the unauthenticated-subprocess refusal, and `--require-audit=strict` relocated to the
+first-request path. That is the remaining half with real wire consequences (a 2026-07-28 HTTP
+peer being SERVED, not merely negotiated), and it is now unblocked in every direction: D3 is
+`Final` and the negotiation half it depends on is in.
 
 Scope:
 

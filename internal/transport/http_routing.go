@@ -457,23 +457,77 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 //
 // Negotiated FIRST, as every other arm on this transport is: this was the one host-leg refusal
 // taken ahead of the revision, so a peer whose declaration this build cannot honor got a bare
-// 400 and nothing on the tape, while the identical bytes on any other path were recorded as
+// 400 and nothing on the tape, while the identical bytes on every other path were recorded as
 // UNSUPPORTED_PROTOCOL_VERSION. Nothing durable is pinned here — there is no session to pin on,
 // which is the whole subject of this refusal.
 //
-// That ordering is also what keeps the 400 from ever instructing a 2026-07-28 host to send
-// `Mcp-Session-Id`, a header its revision retired and which it cannot produce. Such a peer is
-// refused above: a sessionless POST has no context to have pinned a revision in, so it resolves
-// to the default and the declaration disagrees. Which is to say the reason a declaring host is
-// unservable over HTTP today is the context pin, not this header — and the remedy is session
-// creation on first request, which is ADR-0004's to decide. A revision-aware branch here would
-// be unreachable code standing in for that decision.
+// The refusal is then revision-aware, because a declaring peer now REACHES it: this arm asserts
+// no context (sessionlessLeg), so a 2026-07-28 declaration establishes one instead of being
+// refused above. Demanding `Mcp-Session-Id` of such a peer would instruct it to send a header
+// its revision removed and a conformant client cannot produce. What it actually needs is session
+// creation on the first enforced request — decided in ADR-0004 and not yet built — so the
+// refusal names that, and its own status, rather than a remedy that cannot work.
 func (p *HTTPProxy) refuseSessionlessPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) {
-	if _, ok := p.negotiateHostRevision(w, r, route, nil, msg); !ok {
+	rev, ok := p.negotiateHostRevision(w, r, route, nil, msg)
+	if !ok {
+		return
+	}
+	if declaresPerRequestRevision(rev) {
+		p.recordUnservableRevision(r, route, rev, msg)
+		http.Error(w, "this build cannot serve a "+rev.String()+" host over HTTP yet: the revision has no session header, and creating a session on the first enforced request is not implemented",
+			http.StatusNotImplemented)
 		return
 	}
 	http.Error(w, SessionHeader+" header required", http.StatusBadRequest)
 }
+
+// recordUnservableRevision puts a declaring peer's unservable POST on the tape.
+//
+// Relaxing negotiation for a first message MOVED this refusal without meaning to: such a peer
+// used to be turned away by the revision gate, which records, and now reaches this arm, which
+// did not — so an unauthenticated off-host caller could sweep the declaring surface leaving no
+// trace on HTTP while the identical bytes still recorded on stdio. The negotiate-first ordering
+// above exists to close exactly that gap; a refusal added below it has to carry its own.
+//
+// ENFORCEMENT_ERROR rather than a code value of its own: eunox could not reach a verdict for a
+// reason internal to this BUILD rather than to the request — the peer's revision is speakable
+// and was negotiated, and there is simply no session-creation path for it yet. That is what the
+// code already means, its class is already the non-downgradable fault an observing route may not
+// forward past, and minting a signed code value for a state the next workstream removes would
+// outlive the state. The `unservable` detail carries the part a code cannot.
+//
+// The old-revision 400 beside it stays unrecorded, as it was before this change: a client that
+// omitted the session header it does need is a client protocol error, not a build limitation,
+// and folding the two under one code would make ENFORCEMENT_ERROR mean both.
+func (p *HTTPProxy) recordUnservableRevision(r *http.Request, route *UpstreamRoute, rev capability.Revision, msg mcp.RPCMsg) {
+	rec := p.routeRefusalLimits(nil, route).recorders(refusalSink(p, route)).forCategory(catUnservable)
+	if rec == nil {
+		return
+	}
+	identifier, method := auditIdentity(msg)
+	rec.RecordDeny(capability.WithProtocolRevision(r.Context(), rev), "", identifier, method,
+		capability.ErrCodeEnforcementError, "", unservableDetail(rev), false)
+}
+
+// unservableDetail names WHY a negotiated peer could not be served, in the shape unroutableDetail
+// uses for the same class of refusal: eunox's own, with no policy behind it.
+func unservableDetail(rev capability.Revision) map[string]interface{} {
+	return map[string]interface{}{
+		detailUnservable: map[string]interface{}{
+			"reason":   unservableSessionCreation,
+			"revision": rev.String(),
+		},
+	}
+}
+
+const (
+	// detailUnservable is the audit detail key naming a refusal eunox made because this build
+	// cannot serve the peer, as distinct from one the peer's own message earned.
+	detailUnservable = "unservable"
+	// unservableSessionCreation: the revision carries no session header and session creation on
+	// the first enforced request is not implemented (ADR-0004's remaining half).
+	unservableSessionCreation = "session_creation_unimplemented"
+)
 
 // handleSessionPost handles a host POST carrying an existing Mcp-Session-Id: it validates
 // the session/route binding and the per-route audience pin, then forwards a notification,
@@ -1356,18 +1410,33 @@ const (
 	killDimensionJTI = "jti"
 )
 
-// sessionlessLeg is the leg every pre-session arm negotiates against: `initialize` exists only
-// in the handshake-bearing revision, so that is the context, and nothing this arm answers
-// reaches an upstream.
+// sessionlessLeg is the leg a pre-session arm negotiates against. Nothing these arms answer
+// reaches an upstream, so the only question is what CONTEXT the message is held to — and that
+// is per-arm rather than a property of being sessionless (ADR-0004 §Addendum 2026-08-23).
 //
-// It is also why the same stray bytes are refused under DIFFERENT codes on the two transports,
-// which is a property of the legs rather than a drift between them: these arms exist only to
-// answer `initialize`, so a declaration naming any other revision contradicts the context and
-// is refused UNSUPPORTED_PROTOCOL_VERSION. stdio has no such arm — its first message may
-// legitimately declare any revision, since a peer there need never handshake — so the identical
-// line resolves, is dropped by the fail-closed routing default as UNROUTABLE_METHOD, and
-// (see StdioProxy.negotiateHostRevision) does not pin the connection on its way out.
-func sessionlessLeg() hostLeg { return hostLeg{contextRev: handshakeRevision} }
+// An `initialize` arm asserts the handshake revision, because answering `initialize` IS the
+// negotiation: a declaration naming any other revision there genuinely contradicts the context
+// the message is establishing, and is refused UNSUPPORTED_PROTOCOL_VERSION.
+//
+// Every OTHER pre-session message asserts nothing, and its declaration ESTABLISHES the context
+// instead of being checked against one. A first message cannot FLIP a context — it opens one —
+// so holding it to the handshake revision refused a declaring peer for contradicting a context
+// it had never opened, which is why a 2026-07-28 host was unservable over HTTP at all: the
+// refusal landed above session creation, so nothing could reach the path that would mint it.
+// The mid-context flip refusal is untouched and governs from the second message on, which is
+// where a peer probing for the more permissive table actually lives; and omission still
+// resolves to capability.DefaultRevision, so nothing widens by leaving a declaration out.
+//
+// This is also what narrows a divergence between the transports to the `initialize` arms alone:
+// stdio has no pre-session context to assert (a peer there need never handshake), so the same
+// stray bytes resolve, are dropped by the fail-closed routing default as UNROUTABLE_METHOD, and
+// (see StdioProxy.negotiateHostRevision) do not pin the connection on their way out.
+func sessionlessLeg(msg mcp.RPCMsg) hostLeg {
+	if msg.Method == mcp.MethodInitialize {
+		return hostLeg{contextRev: handshakeRevision}
+	}
+	return hostLeg{}
+}
 
 // leg is the established session's answer to the same question.
 func (s *httpSession) leg() hostLeg {
@@ -1405,11 +1474,11 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	// emergency stop, and eunox can answer at its own revision without relaying anything the
 	// host said).
 	//
-	// The pre-session arms pass a nil session: `initialize` exists only in the handshake-bearing
-	// revision, so that is their context, and nothing they answer reaches an upstream. Branched
+	// The pre-session arms pass a nil session; what context they hold the message to is
+	// sessionlessLeg's question, and it depends on the message rather than on the arm. Branched
 	// rather than built unconditionally, since evaluating the sessionless peer's literal would
 	// put its allocation back on every established request.
-	leg, peer := sessionlessLeg(), hostGatePeer(nil)
+	leg, peer := sessionlessLeg(msg), hostGatePeer(nil)
 	if sess != nil {
 		leg, peer = sess.leg(), sess
 	} else {
@@ -1459,14 +1528,23 @@ func headerRefusalSessionID(sess *httpSession) string {
 // contacting no upstream, so an unauthenticated peer drives one record per frame. Suppressed
 // refusals fold into the next admitted record rather than vanishing.
 func (p *HTTPProxy) headerMismatchRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
-	var rec auditRecorder
+	return p.routeRefusalLimits(sess, route).recorders(refusalSink(p, route)).forCategory(catHeaderMismatch)
+}
+
+// refusalSink picks the tape an envelope-level refusal is written to: the route's, which stamps
+// the route name and policy version, falling back to the proxy's for a refusal with no route in
+// scope.
+//
+// One home because two refusals now need it and a third will: a per-site copy of this selection
+// is how a record comes to name a different tape than its own leg's other records do.
+func refusalSink(p *HTTPProxy, route *UpstreamRoute) auditRecorder {
 	switch {
 	case route != nil:
-		rec = asRecorder(route.sink)
+		return asRecorder(route.sink)
 	case p != nil:
-		rec = asRecorder(p.sink)
+		return asRecorder(p.sink)
 	}
-	return p.routeRefusalLimits(sess, route).recorders(rec).forCategory(catHeaderMismatch)
+	return nil
 }
 
 // sessionlessGatePeer is the shared prologue's peer for HTTP's two PRE-SESSION arms — the
