@@ -65,6 +65,9 @@ silent edits.
 >
 > **ADR-0006 was ratified 2026-08-22** — the first `Final` under this lifecycle,
 > and therefore the first record that is binding and append-only.
+> **ADR-0004 followed on 2026-08-23**, with a second addendum settling what a
+> first request negotiates when there is no handshake to negotiate it — the gap
+> that made its own session-creation decision unbuildable.
 
 ## Index
 
@@ -73,7 +76,7 @@ silent edits.
 | [0001](./0001-jwt-claims-intersect-manifest.md) | JWT capability claims intersect the manifest, never expand it | Draft |
 | [0002](./0002-oauth-protected-resource-metadata.md) | Serve OAuth protected-resource metadata in HTTP and gateway modes | Draft |
 | [0003](./0003-redis-killswitch-fail-open.md) | Redis kill switch fails closed by default on a Redis outage (opt-in fail-open) | Draft |
-| [0004](./0004-bearer-identity-session-anchor.md) | Anchor client correlation and revocation on bearer identity, not the protocol session | Draft |
+| [0004](./0004-bearer-identity-session-anchor.md) | Anchor client correlation and revocation on bearer identity, not the protocol session | Final |
 | [0005](./0005-upstream-credential-delegation.md) | Resolve upstream credentials per request via a provider seam, prefer delegation over a shared static token | Draft |
 | [0006](./0006-dual-revision-translation-boundary.md) | Speak both MCP revisions per peer; translate the stateless-safe subset, refuse the rest | Final |
 | [0007](./0007-mrtr-signed-continuation.md) | Meter multi round-trip requests once per logical call, via a signed continuation | Draft |

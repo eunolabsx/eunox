@@ -1,6 +1,6 @@
 # ADR-0004: Anchor client correlation and revocation on bearer identity, not the protocol session
 
-- **Status:** Draft
+- **Status:** Final (ratified 2026-08-23)
 - **Date:** 2026-06-23
 - **Deciders:** eunox maintainers
 
@@ -196,3 +196,56 @@ the `--require-audit=strict` gate — hangs off the session-creating
 - **`--require-audit=strict` relocates to the first-request path** with
   unchanged semantics: identity is established before any enforced action, or
   the request is refused.
+
+## Addendum (2026-08-23): what a first request negotiates
+
+Implementing the addendum above surfaced one more thing it did not decide, and
+without it the decision cannot be built. Recorded here, before ratification,
+because a `Final` record is append-only and this is a gap rather than an
+amendment.
+
+W3 established the blocker concretely: a 2026-07-28 host cannot be served over
+HTTP today, and **not** because of `Mcp-Session-Id`. HTTP's sessionless arm
+asserts the handshake revision as its context (`sessionlessLeg()`,
+`internal/transport/http_routing.go`), on the stated grounds that "these arms
+exist only to answer `initialize`". That holds while it does. It stops holding
+the moment a first enforced request may mint a worker — the declaration then
+disagrees with an asserted context and is refused `UNSUPPORTED_PROTOCOL_VERSION`
+before session creation is ever reached. So the first-request path decided above
+is unreachable until this seam is decided too.
+
+- **On the sessionless path, a first message's declaration ESTABLISHES the
+  context; it is not checked against one.** This is [ADR-0006](./0006-dual-revision-translation-boundary.md)'s
+  own rule — a context pins from the first resolved message whose method that
+  revision defines — applied to the arm that had nowhere to pin and substituted
+  a default instead. A first message cannot *flip* a context; it opens one. The
+  mid-context flip refusal is unaffected and governs from the second message on,
+  which is where a peer probing for the more permissive table actually lives.
+- **Omission still resolves to `2025-11-25`.** ADR-0006's rule is unchanged and
+  remains the reason nothing widens by leaving a declaration out: the newer table
+  is reached only by an explicit declaration, never by silence.
+- **The pin attaches to the worker the request mints, keyed on the same resolved
+  state anchor.** A first message that mints nothing — a notification, or a
+  request refused by any gate above creation — resolves a revision for itself and
+  pins nothing, since nothing accumulates for a later message to contradict.
+- **The session-creating `initialize` arm keeps asserting the handshake
+  revision.** Answering `initialize` *is* the negotiation, so a declaration
+  naming any other revision there genuinely does contradict its context. What
+  changes is that the assertion becomes per-arm rather than a property of being
+  sessionless.
+
+Gate order is unchanged and load-bearing: the revision is resolved first (a
+message whose revision is unresolved has no table to be looked up in), then the
+unauthenticated-subprocess refusal and `--require-audit=strict` decide whether a
+worker is minted at all.
+
+## Ratification
+
+**Final as of 2026-08-23**, by maintainer consensus. Binding and append-only
+from here; a later decision supersedes it rather than editing it.
+
+The record commits to the anchor (bearer identity, not the protocol session),
+the scope-key/revocation-key split, session creation on first enforced request,
+and the negotiation rule above. Implementation status is tracked in
+[the execution plan](../mcp-2026-07-28-execution.md), not here — a record that
+doubles as a status board goes stale while reading as binding.

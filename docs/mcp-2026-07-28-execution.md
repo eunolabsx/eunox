@@ -59,7 +59,7 @@ criterion is the ADR reaching **Final** under the ADR lifecycle
 |---|---|---|---|
 | D1 | Translation boundary: which methods eunox translates across a mismatched host/upstream revision pair, and which pairs it refuses. Also: `server/discover` filter reuse, `x-mcp-header` posture, `Mcp-Session-Id` retirement, and the mixed-revision-per-connection rule. | [ADR-0006](adr/0006-dual-revision-translation-boundary.md) (**Final**, ratified 2026-08-22) | W3, W4, W13's mismatch cells — **unblocked**. The boundary is implemented and ratified. The `x-mcp-header` allowlist and the `Mcp-Session-Id` retirement have since landed with W3; what remains under D1 is the discovery-filter parity property (W4) and the "never required" half of the session-header retirement, which turns out to be D3's rather than D1's — see W3. |
 | D2 | MRTR metering: the signed continuation — key sourcing, anchor binding, lifetime, replay bound, what re-evaluates per retry, and the commit-once quota rule. | [ADR-0007](adr/0007-mrtr-signed-continuation.md) (Draft) | W6 |
-| D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (Draft; the session-creation addendum is written and awaiting ratification) | W2's session-creation half, and through it W6/W7. **Does not block W2's revocation half**, which is D3-independent and has landed — see W2. |
+| D3 | Session creation without `initialize`: what mints the internal HTTP session, how requests map to it, what happens unauthenticated, and where `--require-audit=strict` gates. Also, since ratification: what a first request NEGOTIATES when there is no handshake to negotiate it. | [ADR-0004](adr/0004-bearer-identity-session-anchor.md) (**Final**, ratified 2026-08-23) | W2's session-creation half, and through it W6/W7 — **unblocked**. |
 | D4 | Stream and deferred-effect enforcement: `subscriptions/listen` open/deny semantics, notification filtering, cancel rehoming; tasks anchor binding and the kill×tasks interaction. | [ADR-0008](adr/0008-stream-and-task-enforcement.md) (Draft) | W7, W8 |
 
 W1's table refactor and W2's subject-struct reshape are behavior-neutral and may
@@ -225,7 +225,8 @@ As landed, differing from the scope above in three places:
 
 ### W2 — Bearer identity, session creation, revocation (plan §2) — XL — **PARTIALLY LANDED**
 
-**Depends on:** D3. **Blocks:** W6, W7; the HTTP transport for 2026-07-28 entirely.
+**Depends on:** D3 (**Final** as of 2026-08-23 — unblocked). **Blocks:** W6, W7; the HTTP
+transport for 2026-07-28 entirely.
 
 **What has landed:** everything except session creation on first request. The revocation half
 — the subject struct, `jti` decoding, `RevokeJTI`/`ReviveJTI` on both backends, the operator
@@ -235,11 +236,20 @@ HTTP session without `initialize`, and none of that touches it. Under the plan's
 struct is explicitly admissible, and the rest changes no existing deployment's behavior — a new
 revocation dimension alters nothing until an operator revokes something.
 
-**What has NOT landed, and why:** session creation on the first enforced request. That IS D3,
-it is the half ADR-0004's addendum was written for, and ADR-0004 is still `Draft` — `Final` is
-maintainer consensus and never a lone merge. It is also the half with real wire consequences (a
-2026-07-28 HTTP peer being served at all, and what happens to an unauthenticated one), which is
-exactly what the plan says waits.
+**What has NOT landed:** session creation on the first enforced request. That IS D3, and it is
+now **unblocked** — ADR-0004 was ratified `Final` on 2026-08-23. It remains the half with real
+wire consequences (a 2026-07-28 HTTP peer being served at all, and what happens to an
+unauthenticated one), so it is the next thing to build rather than something already done.
+
+Ratification added one decision the addendum had not made, and W3 is what surfaced it: HTTP's
+sessionless arm asserts the handshake revision as its context (`sessionlessLeg()`), so a
+declaring peer's first request is refused `UNSUPPORTED_PROTOCOL_VERSION` **before** session
+creation is reached — which is why a 2026-07-28 host is unservable over HTTP today, and why the
+reason is not `Mcp-Session-Id`. ADR-0004's second addendum decides it: on the sessionless path a
+first message's declaration ESTABLISHES the context rather than being checked against one,
+omission still resolves to `2025-11-25`, the pin attaches to the worker the request mints, and
+the `initialize` arm keeps asserting the handshake revision because answering `initialize` IS
+the negotiation. Building the negotiation half FIRST is what makes the rest testable at all.
 
 Scope:
 
@@ -284,9 +294,10 @@ Tests:
 
 Exit criteria:
 
-- [ ] ADR-0004 updated with the session-creation half and graduated to Final. *(The addendum is
-      WRITTEN — ADR-0004 §Addendum (2026-08-07) — so what remains is ratification, which is not a
-      criterion an implementing PR can close for itself.)*
+- [x] ADR-0004 updated with the session-creation half and graduated to Final. *(Ratified
+      2026-08-23. Two addenda: §(2026-08-07) decides what mints the worker, and §(2026-08-23)
+      decides what a first request NEGOTIATES — the gap W3 surfaced, without which the first is
+      unreachable. The record is binding and append-only from here.)*
 - [x] Subject struct landed; adding JTI required no signature change beyond the struct field
       (demonstrated by the diff itself). *(`killswitch.Subject`; `ShouldBlock` benchmarked
       allocation-free at 0 B/op. The Redis backend's dimensions became a declaration too —
@@ -359,10 +370,12 @@ As landed, differing from the scope above in three places:
   never stamps the retired header on a stateless leg. No response to a declaring host carries
   it — structurally, since answering `initialize` IS the negotiation and a 2026-07-28
   declaration on it is refused. What this workstream found is that the reason a declaring host
-  is unservable over HTTP is **not** this header at all: a sessionless POST has no context to
-  have pinned a revision in, so it resolves to the default and any declaration disagrees —
-  refused at negotiation, above the session question entirely. Session creation on first
-  request is what changes that, and it is ADR-0004's decision (W2's unlanded half). A
+  is unservable over HTTP is **not** this header at all: HTTP's sessionless arm ASSERTS the
+  handshake revision as its context (`sessionlessLeg()`, on the grounds that those arms exist
+  only to answer `initialize`), so a declaring peer's request contradicts a context it never
+  opened and is refused at negotiation, above the session question entirely. That is now
+  decided — ADR-0004's second addendum, added at ratification precisely because this finding
+  showed the session-creation half could not be built without it. A
   revision-aware branch in the sessionless refusal was written and then removed as unreachable
   code standing in for that decision; the residual is pinned by a test that changes the day
   session creation lands.
@@ -452,7 +465,7 @@ Exit criteria:
 
 ### W6 — Multi round-trip requests (plan §6) — XL
 
-**Depends on:** W1, W2, D2. The largest and riskiest workstream.
+**Depends on:** W1, W2, D2 (D3 is `Final`; W2's session-creation half is the remaining gate). The largest and riskiest workstream.
 
 Scope:
 
@@ -521,7 +534,7 @@ from blocking the release wholesale — the fallback is itself a D2 line item.
 
 ### W7 — `subscriptions/listen` (plan §7) — L
 
-**Depends on:** W1, W2, D4.
+**Depends on:** W1, W2, D4 (D3 is `Final`; W2's session-creation half is the remaining gate).
 
 Scope:
 
