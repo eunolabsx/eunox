@@ -1424,10 +1424,18 @@ func (s *httpSession) teardownDone() <-chan struct{} {
 func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 	// This method is the leg's outbound seam for notifications, which never reach the upstream
 	// CALL the translation wrapper covers. See translateNotificationForLeg.
-	msg, ok := translateNotificationForLeg(msg, requestRevision(ctx), s.upstreamRev)
-	if !ok {
+	outbound, err := translateNotificationForLeg(msg, requestRevision(ctx), s.upstreamRev)
+	if err != nil {
+		// Reported for the reason stdio's identical arm is: JSON-RPC forbids answering the peer,
+		// and the fault is this build's translation layer rather than the message, so a silent
+		// drop leaves an operator with a notification that simply never arrived.
+		if line, ok := s.noticeWriter().admitNotice(siteNotifyUntranslatable); ok {
+			line.writef("[eunox] HTTP session %s: notification %q could not be translated for the upstream leg, dropped: %v\n",
+				s.id, audit.BoundEnvelopeField(msg.Method), err)
+		}
 		return
 	}
+	msg = outbound
 	if s.upHTTPClient != nil {
 		// Remote-HTTP upstream: host ids are forwarded unchanged, so a cancel already
 		// correlates -- do not rewrite it.
@@ -1464,7 +1472,15 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		}
 		msg = rewritten
 	}
-	_ = s.upWriter.Write(msg)
+	// Same obligation as the remote arm above, on the same declared site: a poisoned MsgWriter
+	// (write timeout) or a subprocess that closed stdin mid-teardown drops every forward -- a
+	// notifications/cancelled aborting an in-flight call included -- while the host got its 202.
+	if err := s.upWriter.Write(msg); err != nil {
+		if line, ok := s.noticeWriter().admitNotice(siteUpstreamNotifyFailed); ok {
+			line.writef("[eunox] HTTP session %s: notification %q write to upstream failed: %v\n",
+				s.id, audit.BoundEnvelopeField(msg.Method), err)
+		}
+	}
 }
 
 // inFlightDrainPoll is how often releaseSessionState re-checks the in-flight counter

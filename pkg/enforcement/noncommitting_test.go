@@ -75,6 +75,16 @@ func TestNonCommittingConditionVerdict_FailsClosedWithoutAHandler(t *testing.T) 
 	_, ok = enforcement.New().NonCommittingConditionVerdict(context.Background(), nil, req)
 	assert.False(t, ok, "a nil condition has nothing to dispatch on")
 
+	// A typed nil survives `cond == nil` as a non-nil interface, and ConditionType() has a
+	// VALUE receiver — so the registry lookup auto-dereferences it. Refused, not panicked on,
+	// matching the guard every sibling seam (runPureConditions, castCondition, the handler half
+	// of this same function) already applies.
+	var typedNil *capability.AllowedValuesCondition
+	assert.NotPanics(t, func() {
+		_, ok = enforcement.New().NonCommittingConditionVerdict(context.Background(), typedNil, req)
+	}, "a typed-nil condition must fail closed, not panic the composing layer")
+	assert.False(t, ok, "a typed-nil condition has nothing to dispatch on")
+
 	// A nil engine is a legitimate state for an embedder (the fields are unexported), and it
 	// answers from the built-ins rather than panicking on what is a refusal path.
 	var nilEngine *enforcement.Engine

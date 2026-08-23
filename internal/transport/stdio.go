@@ -1223,11 +1223,27 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 	}
 	// The boundary applies to notifications too, and they do not reach it through the upstream
 	// call — this write IS the leg's outbound seam for them. See translateNotificationForLeg.
-	outbound, ok := translateNotificationForLeg(msg, requestRevision(ctx), p.upstreamRev)
-	if !ok {
+	outbound, err := translateNotificationForLeg(msg, requestRevision(ctx), p.upstreamRev)
+	if err != nil {
+		// A drop with no diagnostic: the peer cannot be answered (JSON-RPC forbids it) and the
+		// fault is this build's translation layer rather than the message, so an operator's only
+		// evidence would otherwise be a notification that never arrived.
+		if line, ok := p.noticeWriter().admitNotice(siteNotifyUntranslatable); ok {
+			line.writef("[eunox] notification %q could not be translated for the upstream leg, dropped: %v\n",
+				audit.BoundEnvelopeField(msg.Method), err)
+		}
 		return false
 	}
-	_ = p.upWriter.Write(outbound)
+	// The same obligation HTTP's two arms carry, on the same declared site: once a write timeout
+	// has poisoned the writer, or the child has closed stdin, every forward is dropped -- a
+	// notifications/cancelled aborting an in-flight call included -- and this leg is the last
+	// place that can say so.
+	if err := p.upWriter.Write(outbound); err != nil {
+		if line, ok := p.noticeWriter().admitNotice(siteUpstreamNotifyFailed); ok {
+			line.writef("[eunox] notification %q write to upstream failed: %v\n",
+				audit.BoundEnvelopeField(outbound.Method), err)
+		}
+	}
 	return false
 }
 

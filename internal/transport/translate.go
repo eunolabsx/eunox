@@ -521,13 +521,17 @@ func refuseServerRequestAcrossRevisions(method string, hostRev capability.Revisi
 // boundary already ADMITTED this one at negotiation: reaching a translation failure here means
 // the params are malformed in a way the gate could not see, which is the same disposition every
 // other unforwardable notification takes.
-func translateNotificationForLeg(msg mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, bool) {
+func translateNotificationForLeg(msg mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
 	if hostRev == upstreamAddressedRevision(legRev) {
-		return msg, true
+		return msg, nil
 	}
 	translated, err := translateRequest(msg, hostRev, legRev)
 	if err != nil {
-		return mcp.RPCMsg{}, false
+		// The CAUSE travels with the drop rather than being flattened to "no": this is the one
+		// unforwardable-notification disposition whose reason is eunox's own translation layer
+		// rather than the peer's message, so the leg dropping it is the only place that can say
+		// which notification was lost and why.
+		return mcp.RPCMsg{}, err
 	}
-	return translated, true
+	return translated, nil
 }

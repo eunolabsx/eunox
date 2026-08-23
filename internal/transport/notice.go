@@ -100,6 +100,7 @@ const (
 	siteUpstreamError            noticeSite = "upstream-error"
 	siteInitiatorUnanswerable    noticeSite = "initiator-unanswerable"
 	siteUpstreamNotifyFailed     noticeSite = "upstream-notification-failed"
+	siteNotifyUntranslatable     noticeSite = "notification-untranslatable"
 	siteUpstreamPostFailed       noticeSite = "upstream-post-failed"
 	siteRedactionFault           noticeSite = "redaction-fault"
 	siteDeclassifyCommit         noticeSite = "declassify-commit"
@@ -327,9 +328,9 @@ var meteredNotices = map[noticeSite]noticeSiteDeclaration{
 
 	// (2) FAILURE: an operator-facing account of something broken in transit. Metered because a
 	// peer or a dead upstream can drive them per frame, classed apart from traffic so that flood
-	// cannot take the last token from a class it does not belong to. All SIX meet the windowed
+	// cannot take the last token from a class it does not belong to. All SEVEN meet the windowed
 	// sites' criterion — a dead upstream drives every one of them per frame, the unanswerable
-	// initiator included — and all six are deliberately reported per occurrence anyway; see
+	// initiator included — and all seven are deliberately reported per occurrence anyway; see
 	// uncollapsedNamesTheFailingCall, which is the whole of that judgment. None holds a site floor:
 	// what a sibling needs here is its HOLDER's arrival, which is the class reserve one axis over.
 	siteUpstreamlessForward:      {class: classFailure, collapse: collapsePerOccurrence, collapseWhy: uncollapsedNamesTheFailingCall, floor: floorClassUnprotected},
@@ -337,6 +338,7 @@ var meteredNotices = map[noticeSite]noticeSiteDeclaration{
 	siteUpstreamError:            {class: classFailure, collapse: collapsePerOccurrence, collapseWhy: uncollapsedNamesTheFailingCall, floor: floorClassUnprotected},
 	siteInitiatorUnanswerable:    {class: classFailure, collapse: collapsePerOccurrence, collapseWhy: uncollapsedNamesTheFailingCall, floor: floorClassUnprotected},
 	siteUpstreamNotifyFailed:     {class: classFailure, collapse: collapsePerOccurrence, collapseWhy: uncollapsedNamesTheFailingCall, floor: floorClassUnprotected},
+	siteNotifyUntranslatable:     {class: classFailure, collapse: collapsePerOccurrence, collapseWhy: uncollapsedNamesTheFailingCall, floor: floorClassUnprotected},
 	siteUpstreamPostFailed:       {class: classFailure, collapse: collapsePerOccurrence, collapseWhy: uncollapsedNamesTheFailingCall, floor: floorClassUnprotected},
 
 	// (3) OBLIGATION: a security obligation that did not hold. Still metered — an upstream returning
