@@ -6867,3 +6867,30 @@ func TestHTTPInitialize_AdmitsTheHandshakeRevisionDeclaration(t *testing.T) {
 		t.Errorf("declaring the handshake revision on initialize must be admitted, got %v", err)
 	}
 }
+
+// TestHTTPForwardNotification_LocalModeWriteErrorIsReported is the regression for the
+// subprocess arm's swallowed write error. A poisoned MsgWriter (write timeout) or a
+// subprocess that closed stdin mid-teardown drops every forwarded notification — a
+// notifications/cancelled aborting an in-flight call included — while the host already has
+// its 202. The remote arm reports that on siteUpstreamNotifyFailed; this arm ended in
+// `_ = s.upWriter.Write(msg)` and left nothing on stderr until the reaper collected the
+// session.
+func TestHTTPForwardNotification_LocalModeWriteErrorIsReported(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	sess := newTestSession(&httpSession{
+		id:       "sess-drop",
+		done:     make(chan struct{}),
+		upWriter: mcp.NewMsgWriter(&failingWriter{}),
+		proxy:    &HTTPProxy{stderr: &out},
+	})
+
+	// Not notifications/cancelled: that arm drops the frame at rewriteCancelToNonce when the
+	// target request is no longer in flight, so it never reaches the write this pins.
+	sess.forwardNotification(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/initialized"})
+
+	got := out.String()
+	if !strings.Contains(got, "sess-drop") || !strings.Contains(got, "notifications/initialized") {
+		t.Errorf("a dropped notification must not be silent; stderr = %q", got)
+	}
+}

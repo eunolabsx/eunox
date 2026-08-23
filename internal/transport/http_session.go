@@ -1464,7 +1464,15 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 		}
 		msg = rewritten
 	}
-	_ = s.upWriter.Write(msg)
+	// Same obligation as the remote arm above, on the same declared site: a poisoned MsgWriter
+	// (write timeout) or a subprocess that closed stdin mid-teardown drops every forward -- a
+	// notifications/cancelled aborting an in-flight call included -- while the host got its 202.
+	if err := s.upWriter.Write(msg); err != nil {
+		if line, ok := s.noticeWriter().admitNotice(siteUpstreamNotifyFailed); ok {
+			line.writef("[eunox] HTTP session %s: notification %q write to upstream failed: %v\n",
+				s.id, audit.BoundEnvelopeField(msg.Method), err)
+		}
+	}
 }
 
 // inFlightDrainPoll is how often releaseSessionState re-checks the in-flight counter

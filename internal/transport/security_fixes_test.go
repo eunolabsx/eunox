@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -335,5 +336,64 @@ func TestHandleMCPPost_ShutdownReturns503(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("initialize during shutdown = %d, want 503 (retryable), not 500", resp.StatusCode)
+	}
+}
+
+// gatedSSEWriter runs gate exactly once, on the handler's first write, and then behaves as a
+// plain recorder. The SSE loop's first write is the open keepalive, which happens after the
+// subscriber channel is registered and before the select — the one instant at which a test can
+// make an arm ready without racing the handler.
+type gatedSSEWriter struct {
+	*httptest.ResponseRecorder
+	gate func()
+	once sync.Once
+}
+
+func (w *gatedSSEWriter) Write(p []byte) (int, error) {
+	w.once.Do(w.gate)
+	return w.ResponseRecorder.Write(p)
+}
+
+// TestHandleMCPGet_ExpiredTokenDeliversNoData is the regression for the message arm's missing
+// wall-clock re-anchor. expTimer runs on the MONOTONIC clock, which does not advance while the
+// host is suspended, so on resume the timer has not fired although exp has passed in wall-clock
+// terms. The keepalive arm re-checked for that; the arm that moves DATA did not, and kept
+// delivering to an expired token for up to sseKeepaliveInterval.
+//
+// The suspend itself needs a clock seam this package does not have, so the pin is its
+// consequence with both arms READY: the token is already expired (tokenExpiry fires at once) and
+// the gate fills the subscriber buffer just before the select. Go picks between ready arms at
+// random, so pre-fix the ch arm wrote a data frame on about half of these rounds and post-fix on
+// none of them.
+func TestHandleMCPGet_ExpiredTokenDeliversNoData(t *testing.T) {
+	fu := newFakeUpstream()
+	fakeServer := httptest.NewServer(fu)
+	defer fakeServer.Close()
+
+	proxy, srv := newTestRemoteProxy(t, fakeServer.URL, httpProxyOptions{})
+	sessID := proxyInitSession(t, proxy, srv)
+	sess := proxy.getSession(sessID)
+	if sess == nil {
+		t.Fatal("session not found after initialize")
+	}
+
+	for round := 0; round < 40; round++ {
+		req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+		req.Header.Set(SessionHeader, sessID)
+		req = req.WithContext(pdp.WithJWTClaims(req.Context(), &pdp.JWTClaims{
+			Subject:   "user-1",
+			ExpiresAt: time.Now().Add(-time.Hour),
+		}))
+
+		rec := &gatedSSEWriter{ResponseRecorder: httptest.NewRecorder(), gate: func() {
+			for i := 0; i < sseSubscriberBufferSize; i++ {
+				sess.broadcast(mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/message"})
+			}
+		}}
+		proxy.handleMCPGet(rec, req, proxy.routes[""])
+
+		if strings.Contains(rec.Body.String(), "data:") {
+			t.Fatalf("round %d: SSE stream delivered data to an expired token: %q", round, rec.Body.String())
+		}
 	}
 }
