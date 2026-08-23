@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -56,12 +57,34 @@ func TestResolveKillTarget(t *testing.T) {
 		{name: "all three", pos: []string{"x"}, session: "y", sessionSet: true, agent: "z", agentSet: true, wantErrPart: "more than one target"},
 		{name: "two positionals", pos: []string{"a", "b"}, wantErrPart: "exactly one argument"},
 		// An explicitly-passed but empty flag is a SUPPLIED target, not an absent one:
-		// counting it as absent would silently drop a target the operator typed.
+		// counting it as absent would silently drop a target the operator typed. It is
+		// counted and then REFUSED, since an id-bearing dimension with no id names
+		// nothing — the transports answer that as a generic backend rejection or a 400
+		// with no flag in it, neither of which points at the unset shell variable.
 		{
-			name:       "explicitly empty session flag still counts as a target",
-			session:    "",
-			sessionSet: true,
-			want:       killTarget{kind: killTargetSession},
+			name:        "explicitly empty session flag is counted and then refused",
+			session:     "",
+			sessionSet:  true,
+			wantErrPart: "the session target is empty",
+		},
+		{
+			name:        "explicitly empty agent flag is refused",
+			agent:       "",
+			agentSet:    true,
+			wantErrPart: "the agent target is empty",
+		},
+		{
+			name:        "explicitly empty jti flag is refused",
+			jti:         "",
+			jtiSet:      true,
+			wantErrPart: "the jti target is empty",
+		},
+		{
+			// The positional reaches the same refusal: `eunox kill "$SID"` with SID unset
+			// is the shape that made this worth refusing at all.
+			name:        "empty positional is refused",
+			pos:         []string{""},
+			wantErrPart: "the session target is empty",
 		},
 		{
 			name:        "explicitly empty session flag conflicts with a positional",
@@ -275,6 +298,62 @@ func TestCmdKill_AgentRejectedBeforeTheHTTPTransport(t *testing.T) {
 	require.Equal(t, 1, code)
 	require.Contains(t, stderr, "--agent requires --redis-addr")
 	require.NotContains(t, stderr, "request failed", "the rejection must happen before any HTTP request is attempted")
+}
+
+// TestCmdKill_NonLoopbackHostRefusedBeforeTheControlToken pins that a --host the control
+// endpoint can never accept is refused BEFORE the token is resolved. /control/kill is
+// source-IP loopback-gated server-side, so the request only ever proves what the CLI
+// already knows — while carrying the real proxy's emergency-stop bearer token, over
+// plaintext http://, to whatever grabbed that host:port (a typo'd host, or a local process
+// that took the port first).
+func TestCmdKill_NonLoopbackHostRefusedBeforeTheControlToken(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		host string
+	}{
+		{name: "routable literal", host: "203.0.113.9"},
+		{name: "name that is not a loopback spelling", host: "proxy.internal"},
+		// An aliased name is refused too: telling it from a typo needs a lookup, and a
+		// lookup this command then dials the NAME through is a resolve/dial window on the
+		// one request carrying the token.
+		{name: "aliased name", host: "localhost.corp.example"},
+		{name: "empty host", host: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var code int
+			stderr := captureStderr(t, func() {
+				// A token path that does not exist: if the refusal did not come first,
+				// the failure would name the unreadable token file instead of the host.
+				code = cmdKill([]string{
+					"--host", tc.host, "--port", "1",
+					"--control-token-path", filepath.Join(t.TempDir(), "no-such.token"),
+					"all",
+				})
+			})
+			require.Equal(t, 1, code)
+			require.Contains(t, stderr, "not a loopback address")
+			require.Contains(t, stderr, "--redis-addr", "the refusal must name the transport that CAN revoke remotely")
+			require.NotContains(t, stderr, "no-such.token", "the token must not be resolved for an invocation that cannot succeed")
+			require.NotContains(t, stderr, "request failed", "no request may be attempted")
+		})
+	}
+}
+
+// TestCmdKill_LoopbackSpellingsStillReachTheEndpoint is the other half: the guard must not
+// refuse the hosts the endpoint actually accepts. Port 1 is not listening, so reaching a
+// connection error proves the loopback check passed and the request was attempted.
+func TestCmdKill_LoopbackSpellingsStillReachTheEndpoint(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1", "localhost", "LOCALHOST", "127.0.0.53"} {
+		t.Run(host, func(t *testing.T) {
+			var code int
+			stderr := captureStderr(t, func() {
+				code = cmdKill([]string{"--host", host, "--port", "1", "--control-token", "tok", "all"})
+			})
+			require.Equal(t, 1, code)
+			require.NotContains(t, stderr, "not a loopback address")
+			require.Contains(t, stderr, "request failed")
+		})
+	}
 }
 
 // TestKillUsage_DocumentsTargetingFlags keeps the new dimensions discoverable: the usage

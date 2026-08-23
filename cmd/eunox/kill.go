@@ -23,6 +23,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/eunolabs/eunox/internal/transport"
+	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
@@ -82,7 +83,7 @@ Exit codes:
   0  The revocation (or --revive) was accepted by the proxy or written to Redis.
      This includes the case where the write landed but the real-time
      notification to other instances did not: the state is durable and every
-     running proxy converges on its next reconcile tick, so the kill takes
+     running proxy converges on its next reconcile tick, so the change takes
      effect and the degradation is reported on stderr rather than as a failure.
   1  Anything else. Unlike the binary's other subcommands, kill does NOT split
      usage errors out as 2: the only question its caller has under pressure is
@@ -212,6 +213,21 @@ func runRedisKillTransport(fs *flag.FlagSet, req redisKillRequest) int {
 // killViaControlEndpoint POSTs the kill to a running HTTP proxy's loopback /control/kill
 // endpoint. Kill-only — --revive and the agent dimension are rejected before this is reached.
 func killViaControlEndpoint(host string, port int, controlToken, controlTokenPath string, target killTarget) int {
+	// /control/kill is source-IP loopback-gated server-side, so a non-loopback --host can
+	// never succeed — but the request that proves it carries the control token, in plaintext
+	// http://, to whatever answers there: a typo'd host, or a local process that grabbed the
+	// port. Refused ahead of everything else, so a doomed invocation costs no disclosure of
+	// the real proxy's emergency-stop bearer token.
+	//
+	// A name aliased to 127.0.0.1 in /etc/hosts is refused too, and deliberately: telling it
+	// from a typo needs a lookup, and a lookup this command then dials the NAME through is a
+	// resolve-to-loopback/dial-to-elsewhere window on the one request carrying the token.
+	// The literal is always available.
+	if !capability.IsLoopbackHost(host) {
+		fmt.Fprintf(os.Stderr, "eunox kill: --host %q is not a loopback address, and /control/kill only accepts loopback sources -- this invocation cannot succeed and would hand the control token to whatever is listening there. Pass a loopback host (127.0.0.1, ::1, localhost), or use --redis-addr to revoke across a remote deployment.\n", host)
+		return 1
+	}
+
 	// The endpoint distinguishes the dimensions by KEY, not by the id's spelling, so
 	// {"sessionId":"all"} (via --session all) is unambiguous. Built from the target's own kind
 	// rather than an if/else pair, so a dimension the endpoint accepts cannot be one the CLI
@@ -369,6 +385,14 @@ func resolveKillTarget(pos []string, flags ...killFlagTarget) (killTarget, error
 	case 0:
 		return killTarget{}, fmt.Errorf("no target given: pass <session-id|all>, --session <session-id>, --agent <agent-id>, or --jti <token-id>")
 	case 1:
+		// An id-bearing dimension with an empty id names nothing. Refused HERE rather than
+		// left to the transports, which answer it as a generic backend rejection (Redis) or
+		// a 400 with no flag in it (the control endpoint) -- neither of which points at the
+		// unset shell variable that is how an emergency kill arrives empty. The global
+		// switch is the one dimension that legitimately carries no id.
+		if found[0].kind != killTargetGlobal && found[0].id == "" {
+			return killTarget{}, fmt.Errorf("the %s target is empty: pass a non-empty id (an unset shell variable expands to nothing, so a quoted \"$VAR\" lands here)", found[0].dimension())
+		}
 		return found[0], nil
 	default:
 		return killTarget{}, fmt.Errorf("more than one target given: pass exactly one of <session-id|all>, --session, --agent, or --jti, and drop the others")
@@ -533,7 +557,11 @@ func killWriteOutcome(what string, err error) error {
 		// running PROXY's own --killswitch-reconcile-interval, and this command has no proxy's
 		// configuration in hand — printing its own default would state a number that is wrong
 		// for exactly the deployment that tuned it, in the message an operator acts on.
-		fmt.Fprintf(os.Stderr, "eunox kill: %s: the revocation IS written to the shared Redis state, but the real-time notification to running proxies failed (%v). Each running proxy converges on its next reconcile tick (--killswitch-reconcile-interval), so the kill still takes effect and this does not need re-running.\n",
+		// Operation-NEUTRAL past the "%s: " prefix, which is where the verb already is: all
+		// four --revive arms route through here too, and a tail saying "the kill still takes
+		// effect" told an operator who had just LIFTED a revocation the opposite of what
+		// happened -- on the emergency path, inviting exactly the wrong next move.
+		fmt.Fprintf(os.Stderr, "eunox kill: %s: the change IS written to the shared Redis state, but the real-time notification to running proxies failed (%v). Each running proxy converges on its next reconcile tick (--killswitch-reconcile-interval), so the change still takes effect and this does not need re-running.\n",
 			what, err)
 		return nil
 	default:
