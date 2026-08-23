@@ -109,6 +109,15 @@ const (
 	// same cheapness: it is reachable pre-session by an unauthenticated peer at one record per
 	// frame, and it is the record that says someone is probing the declaring surface.
 	catUnservable refusalCategory = "unservable_revision"
+	// catSessionGate bounds the per-session gate refusals — the audience pin and the owner
+	// binding — on an already-resolved session. It was DELIBERATELY unmetered, on the premise
+	// that reaching it needs a live session id and those are unguessable per-session UUIDs
+	// handed only to their creator. Session creation on the first enforced request made that
+	// premise false: a declaring peer's worker id is DERIVED from its own claims, so any caller
+	// who can name a victim's issuer, subject and agent id can address that worker and drive one
+	// audit record per attempt with no session of its own — the zero-session flood catAudience
+	// is bounded against, restored by a change three files away.
+	catSessionGate refusalCategory = "session_gate"
 	// catUnroutable and catSmuggled are the two DECLARED-EXEMPT categories: they name a
 	// refusal so its non-metering is an answer on the record rather than an absent call. See
 	// refusalDeclarations for the reason, which is the same for both.
@@ -212,6 +221,7 @@ var refusalDeclarations = map[refusalCategory]refusalDeclaration{
 	catRevision:             {metering: meteringMetered},
 	catHeaderMismatch:       {metering: meteringMetered},
 	catUnservable:           {metering: meteringMetered},
+	catSessionGate:          {metering: meteringMetered},
 	catDisplaced:            {metering: meteringMetered},
 	catUnroutableID:         {metering: meteringMetered},
 	catServerRequestFailed:  {metering: meteringMetered},

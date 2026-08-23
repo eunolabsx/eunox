@@ -182,6 +182,11 @@ type httpSession struct {
 	// session can be killed more than once.
 	evictOnce sync.Once
 	evicted   chan struct{}
+	// established is closed when this worker stops COMING UP, on either outcome. A request that
+	// found it in the registry mid-establishment waits here; see awaitEstablished for why that
+	// wait became necessary once worker ids are derivable from a caller's own claims.
+	established     chan struct{}
+	establishedOnce sync.Once
 
 	// lastActive updates on every POST and when an SSE stream is OPENED, not while one is held
 	// (a long-lived stream is spared by hasSubscribers() instead). Atomic so the reaper reads
@@ -497,6 +502,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		noticeFloor:    newNoticeReserve(noticeClasses),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
+		established:    make(chan struct{}),
 		sessCtx:        sessCtx,
 		sessCancel:     sessCancel,
 		claims:         pdp.JWTClaimsPtr(ctx),
@@ -1023,12 +1029,45 @@ func (p *HTTPProxy) sweepKilledSessions() {
 // stale id a later session reused.
 func (p *HTTPProxy) finishEstablishing(sess *httpSession) {
 	sess.initInProgress.Store(false)
+	// Released here, at the ONE point establishment ends on either outcome, so a request that
+	// found this worker in the registry stops waiting whether it came up or was torn down. A
+	// waiter re-checks the registry afterwards rather than trusting the signal to mean success.
+	sess.markEstablished()
 	if p.getSession(sess.id) != sess {
 		return
 	}
 	if p.sessionKilled(sess) {
 		p.reclaimKilledSession(sess)
 	}
+}
+
+// markEstablished releases everything waiting for this worker to finish coming up. Idempotent:
+// finishEstablishing is deferred on paths that can also be reached during teardown.
+func (s *httpSession) markEstablished() {
+	s.establishedOnce.Do(func() { close(s.established) })
+}
+
+// awaitEstablished blocks until this worker has finished establishing, reporting whether it is
+// still a live registration afterwards.
+//
+// Needed because registerSession PUBLISHES before the session-start drift check runs, and the
+// worker id is now DERIVABLE from a caller's own claims — so a second request can find a worker
+// mid-establishment and be served on it before FM-5 has compared the upstream's tool list against
+// the manifest, and before RecordObservedToolHashes has set the Tier-2 surface baseline. With
+// minted UUIDs no second request could name the id at all, which is why publishing early was safe
+// before and is not now.
+//
+// The re-check after waiting is the point: establishment can END in teardown (a failed drift
+// check tears the session down), so the signal means "no longer coming up", never "came up".
+func (p *HTTPProxy) awaitEstablished(ctx context.Context, sess *httpSession) bool {
+	if sess.initInProgress.Load() {
+		select {
+		case <-sess.established:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return p.getSession(sess.id) == sess
 }
 
 // reclaimKilledSession tears down one session the kill switch names. Shared by the idle

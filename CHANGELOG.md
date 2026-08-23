@@ -50,6 +50,12 @@ Section conventions:
   would fork its own upstream. Serving it per-request against a remote upstream is permitted by
   ADR-0004 and is deferred — a different shape, and refusing it meanwhile takes nothing away.
 
+  Only a **request** may mint a worker: a sessionless notification is dropped and acked bodyless,
+  since a message that can never be answered must not fork an upstream. The worker id is
+  percent-encoded and bounded, so a claim cannot forge a console line or collapse two identities
+  onto one recorded `session_id`; and a request that finds a worker still coming up waits for it,
+  rather than running against an upstream whose startup drift check has not passed.
+
 - **A 2026-07-28 host's first HTTP request now gets past negotiation.** What a pre-session
   message is held to became a property of the MESSAGE rather than of being sessionless: an
   `initialize` arm asserts the handshake revision, because answering `initialize` *is* the
@@ -245,6 +251,14 @@ Section conventions:
   members its revision does not define.
 
 ### Fixed
+
+- **The per-session gate refusal is now rate-limited.** Its exemption rested on session ids being
+  unguessable per-session UUIDs handed only to their creator, so driving the record needed a live
+  victim id. Deriving worker ids from caller identity ended that: anyone who can name a victim's
+  issuer, subject and agent id can address that worker, be refused by the owner binding, and drive
+  one audit record per attempt while holding no session at all. Bounded on the route's bucket
+  rather than the addressed session's — the session named is the caller's target, not its own, so
+  charging it would let an attacker spend a victim's share.
 
 - **A duplicate session registration overwrote rather than being refused.** `registerSession`
   assigned into the session map, which was correct while every id was a minted UUID and became a

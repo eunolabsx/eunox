@@ -46,7 +46,10 @@ package transport
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
+	"strings"
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
@@ -55,55 +58,126 @@ import (
 )
 
 // firstRequestWorkerKey names the worker a declaring peer's request maps to, and reports whether
-// the caller presented the stable identity one can be keyed on.
+// the caller presented the identity one can be keyed on.
 //
 // Resolved through the route's own anchor resolver, so a task-anchored route keys its workers on
 // the task exactly as it keys the decision turn and the engine keys its state — one resolution,
-// three consumers, no chance of two of them disagreeing about which subject this request belongs
-// to.
+// three consumers, no chance of two of them disagreeing about which subject a request belongs to.
 func firstRequestWorkerKey(route *UpstreamRoute, ctx context.Context) (string, bool) {
 	claims := pdp.JWTClaimsPtr(ctx)
-	identity := stableCallerIdentity(claims)
+	identity, ok := stableCallerIdentity(claims)
+	if !ok {
+		return "", false
+	}
 	anchor := route.decisionAnchor(identity, claims)
-	// A task-anchored route resolving to the task needs no agent id; every other case does.
 	if anchor.ID == "" {
 		return "", false
 	}
 	return workerKey(route.name, anchor), true
 }
 
-// workerKey renders a route and an anchor as one map key, printably.
+// stableCallerIdentity is the correlator a worker and its policy state are keyed on.
 //
-// NOT enforcement.StateAnchor.Key(), which separates with NUL. This string becomes the worker's
-// id, and a worker's id is signed into the audit record's `session_id` — through
-// SanitizeAuditField, which rewrites control runes. A NUL key would therefore be recorded as
-// something other than itself, and two distinct workers could sanitize onto one recorded id.
+// It is the OWNER BINDING's tuple — issuer and subject — plus the agent the token speaks for.
+// Not `agent_id` alone, and that is a correctness requirement rather than a preference: every
+// request on a worker passes ownerMismatch, which compares (iss, sub) against the claims the
+// worker was created with. A key coarser than that binding hands the first caller a worker every
+// OTHER caller sharing its agent id is then permanently refused on — an `AUTHORIZATION_FAILED`
+// per attempt, forever, for traffic that is entirely legitimate. So the key is at least as fine
+// as every per-session gate applied to it, which is the invariant to preserve if a gate is added.
 //
-// Unambiguous without escaping because only the LAST component is free: a route name matches
-// `^[a-zA-Z0-9_-]+$` so it carries no colon, the anchor kind is a closed vocabulary, and the
-// caller-supplied id is terminal — so no two (route, kind, id) triples can render alike however
-// the id is spelled.
-func workerKey(routeName string, anchor enforcement.StateAnchor) string {
-	return routeName + ":" + string(anchor.Kind) + ":" + anchor.ID
+// `jti` is deliberately absent. Revocation wants the finest revocable thing and cross-request
+// policy wants the most stable correlator; under short-lived rotating credentials a jti-keyed
+// worker would be a new upstream per refresh, and a jti-keyed `sequenceBlock` could never
+// correlate a read with the write that followed it (ADR-0004). Issuer, subject and agent id all
+// survive rotation.
+func stableCallerIdentity(claims *pdp.JWTClaims) (string, bool) {
+	if claims == nil {
+		return "", false
+	}
+	if claims.AgentID == "" && claims.Subject == "" {
+		return "", false
+	}
+	// Components joined with a separator each one's own encoding cannot produce, so the tuple is
+	// injective before workerKey encodes the whole. Encoding here AND there would be lossless but
+	// doubly escaped, and unreadable in a log for no gain.
+	return safeKeyComponent(claims.Issuer) + "/" +
+		safeKeyComponent(claims.Subject) + "/" +
+		safeKeyComponent(claims.AgentID), true
 }
 
-// stableCallerIdentity is the correlator a worker and its policy state are keyed on: the agent
-// the token speaks for, never the token instance.
+// workerKey renders a route and an anchor as one map key.
 //
-// `jti` is deliberately not it. Revocation wants the finest revocable thing and cross-request
-// policy wants the most stable correlator; under short-lived rotating credentials a jti-keyed
-// worker would be a new upstream per token, and a jti-keyed `sequenceBlock` could never correlate
-// a read with the write that followed it (ADR-0004).
-func stableCallerIdentity(claims *pdp.JWTClaims) string {
-	if claims == nil {
-		return ""
+// NOT enforcement.StateAnchor.Key(), which separates with NUL. This string becomes the worker's
+// id, and a worker's id is both PRINTED to an operator's console and signed into the audit
+// record's `session_id` — the latter through SanitizeAuditField, which maps every control rune
+// and invalid UTF-8 byte to a space. A key carrying either would be recorded as something other
+// than itself, and two distinct workers could collapse onto one recorded id.
+//
+// The anchor id is encoded HERE rather than only in stableCallerIdentity, because the anchor has
+// two arms and only one of them came through that function: a task-anchored route resolves to the
+// validated `task_id` claim verbatim, which is as caller-supplied as the rest. Encoding at the one
+// point every worker id is built is what makes "a worker id is printable and injective" a property
+// of the type rather than of remembering which arm produced it.
+//
+// Unambiguous without escaping the other components: a route name matches `^[a-zA-Z0-9_-]+$` and
+// the anchor kind is a closed vocabulary, so neither can carry the `:` they are joined on.
+func workerKey(routeName string, anchor enforcement.StateAnchor) string {
+	return routeName + ":" + string(anchor.Kind) + ":" + safeKeyComponent(anchor.ID)
+}
+
+// maxKeyComponentBytes bounds one caller-supplied component of a worker key.
+//
+// The claims are validated, but "validated" says the IdP signed them — not that it bounded them.
+// The key becomes a map key, an audit field and a log line, so an unbounded component is an
+// unbounded allocation per identity on all three.
+const maxKeyComponentBytes = 128
+
+// safeKeyComponent renders a caller-supplied claim so it can be a worker id: printable, bounded,
+// and INJECTIVE, so two identities can never become one worker or one recorded session_id.
+//
+// Percent-encoded rather than sanitized. Sanitizing is what the audit writer does on the way out
+// and it is lossy by design — `"a\tb"` and `"a\x01b"` both become `"a b"` — so a key that relied
+// on it would let two distinct callers share a worker, its accumulated quota and its upstream.
+// Encoding is reversible, so distinct inputs stay distinct, and it removes the log-injection
+// surface at the same time: an `agent_id` of `"x\n[eunox] ..."` cannot forge a console line
+// because no byte outside the unreserved set survives to be printed.
+//
+// Over the length bound the encoding is truncated and a digest of the WHOLE input appended, so
+// injectivity survives truncation. `~` is outside the unreserved set, so it cannot appear in the
+// encoded prefix and cannot be confused for one.
+func safeKeyComponent(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '.', c == '_':
+			b.WriteByte(c)
+		default:
+			const hexDigits = "0123456789ABCDEF"
+			b.WriteByte('%')
+			b.WriteByte(hexDigits[c>>4])
+			b.WriteByte(hexDigits[c&0x0F])
+		}
 	}
-	return claims.AgentID
+	out := b.String()
+	if len(out) <= maxKeyComponentBytes {
+		return out
+	}
+	sum := sha256.Sum256([]byte(s))
+	return out[:maxKeyComponentBytes] + "~" + hex.EncodeToString(sum[:8])
 }
 
 // firstRequestSession resolves the worker a declaring peer's enforced request runs on, creating
 // it when this is the first request that reached it. It writes the refusal and returns nil when
 // the request may not have one.
+//
+// msg must be a REQUEST — its caller drops every other framing before reaching here, since a
+// message that cannot be answered must not fork an upstream. The refusals below still route
+// through writeDispatchResult rather than writeJSONMsg so that precondition is not the only
+// thing standing between a framing and a reply JSON-RPC forbids.
 //
 // The gate order mirrors handleSessionCreatingInitialize's exactly, and for its reasons: the reap
 // generation is captured BEFORE anything that can block, the kill switch is consulted before an
@@ -122,9 +196,17 @@ func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, 
 		p.refuseUnkeyableFirstRequest(ctx, w, r, route, rev, msg)
 		return nil
 	}
-	// The common case by far: every request after the first on this identity.
+	// The common case by far: every request after the first on this identity. A worker still
+	// COMING UP is waited for rather than joined — registerSession publishes before the
+	// session-start drift check runs, and this id is derivable from the caller's own claims, so
+	// without the wait a second request could be served on a worker whose FM-5 check has not
+	// compared the upstream's tools against the manifest and whose Tier-2 baseline is unset.
 	if sess := p.getSession(key); sess != nil && sess.route == route {
-		return sess
+		if p.awaitEstablished(ctx, sess) {
+			return sess
+		}
+		// It was torn down while coming up (a failed drift check does that). Fall through and
+		// try to create one, exactly as if it had never been there.
 	}
 	if deny := route.pdp.CheckKill(ctx, key); deny != nil {
 		// verifiedSession, not claimedSession: the key is eunox's OWN derivation from claims a
@@ -132,16 +214,16 @@ func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, 
 		// hazard that field guards against. It names a worker about to exist rather than one
 		// that does, and it is the subject the kill check just consulted, so stamping it as fact
 		// is honest and is what makes the record correlate with the traffic that follows.
-		writeJSONMsg(w, recordKillDenial(ctx, p.preSessionKillRecorder(route), deny, msg, verifiedSession(key)))
+		writeDispatchResult(w, recordKillDenial(ctx, p.preSessionKillRecorder(route), deny, msg, verifiedSession(key)))
 		return nil
 	}
 	identifier, method := auditIdentity(msg)
 	if denied, blocked := p.creationAudienceDenial(ctx, route, msg, identifier, method); blocked {
-		writeJSONMsg(w, denied)
+		writeDispatchResult(w, denied)
 		return nil
 	}
 	if denied, blocked := p.creationStrictAuditDenial(ctx, route, msg, identifier, method); blocked {
-		writeJSONMsg(w, denied)
+		writeDispatchResult(w, denied)
 		return nil
 	}
 	return p.createFirstRequestSession(ctx, w, r, route, key, rev, startGen)
@@ -182,7 +264,7 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 		// A concurrent first request on the same identity already registered one. Adopt it:
 		// both requests are the same subject by construction, so the loser has nothing of its
 		// own to preserve, and its upstream is already torn down by the failed create.
-		if existing := p.getSession(key); existing != nil && existing.route == route {
+		if existing := p.getSession(key); existing != nil && existing.route == route && p.awaitEstablished(ctx, existing) {
 			return existing
 		}
 		p.writeSessionCreateError(ctx, w, r, route, err)

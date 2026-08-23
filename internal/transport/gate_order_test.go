@@ -545,11 +545,13 @@ var negotiationPrimitives = map[string]string{
 // actually disposed of is a build failure rather than silence. The site-count assertion below
 // closes the direction where that promise would rot without anyone noticing.
 var hostMessageDispositions = map[string]int{
-	"dispatchRequest":       3,
-	"admit":                 2,
-	"recordKillDenial":      5,
-	"recordKillDrop":        6,
-	"recordSessionGateDeny": 5,
+	"dispatchRequest":  3,
+	"admit":            2,
+	"recordKillDenial": 5,
+	"recordKillDrop":   6,
+	// 6 since the session-gate record became metered: it takes its resolved recorder as a
+	// parameter now, like every other bounded refusal, rather than reaching route.sink itself.
+	"recordSessionGateDeny": 6,
 }
 
 // dispositionPrologue is the INVERTED guard's table: every function that disposes of a host
