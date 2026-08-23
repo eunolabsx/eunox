@@ -59,7 +59,7 @@ const declassifyLedgerWindowSec = capability.DeclassifyLedgerWindowSec
 // the codebase's one atomic admission primitive; the flow store's Get-then-Add would let two
 // concurrent callers both win, double-spending the grant.
 func (e *Engine) declassifyLedgerKey(ledgerID string) string {
-	return compositeCounterKey("declassify", e.counterKeyNamespace, ledgerID)
+	return capability.CompositeKey("declassify", e.counterKeyNamespace, ledgerID)
 }
 
 // declassifyLedgerBucket is the one-slot quota a single-use grant draws on: the first

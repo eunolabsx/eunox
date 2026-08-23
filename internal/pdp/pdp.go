@@ -2888,6 +2888,38 @@ func clampCacheScope(key string, raw json.RawMessage) json.RawMessage {
 	return privateCacheScope
 }
 
+// refuseListKeyVariant fails an envelope closed when a sibling key folds to the list key
+// but is not spelled it — {"Tools":[...]} with no "tools" sibling.
+//
+// decodeOrderedObject's fold gate cannot catch this: its rule fires on a COLLISION, and a
+// lone variant collides with nothing, so it is a legal distinct key. The encoder then does
+// exactly what it does for any sibling — writes the upstream array verbatim — and appends
+// the pruned (often empty) list under the canonical spelling. A case-insensitive host (the
+// Go MCP SDK's struct binding, .NET with PropertyNameCaseInsensitive) binds the variant as
+// the real list and renders the catalog this proxy never pruned — the same catalog-integrity
+// smuggle the collision gate exists for (docs/threat-model-mcp.md §3.8), one spelling over.
+//
+// It is reachable through the passthrough splice: filterListResult fails closed when the
+// canonical key is absent, but a passthrough inner (the wiretap PDP, or a nil delegate)
+// carries the envelope's keys forward with no entries, and the JWT intersection splices its
+// claim-filtered result back through this encoder. Guarding HERE rather than at that one
+// caller is what makes the property structural — a future filter path reaching this encoder
+// inherits it.
+//
+// Refusing costs a conformant upstream nothing: a case variant of a protocol-reserved list
+// key is not a shape a spec-conformant server emits, and both callers treat an encoder
+// error as fail-closed. keys is in document order, so two identical envelopes name the same
+// offender and fail identically.
+func refuseListKeyVariant(keys []string, fieldName string) error {
+	folded := capability.FoldJSONKey(fieldName)
+	for _, k := range keys {
+		if k != fieldName && capability.FoldJSONKey(k) == folded {
+			return fmt.Errorf("list envelope carries top-level key %q, a case variant of the list key %q, which a case-insensitive host may bind as the real list — the array this proxy never pruned (fail closed)", k, fieldName)
+		}
+	}
+	return nil
+}
+
 // encodeOrderedObjectWithList re-emits a JSON object in keys order, substituting
 // the marshaled entries array for the value of fieldName while every other field
 // keeps its original bytes verbatim. For a conformant (unique-key) object the only
@@ -2910,12 +2942,17 @@ func clampCacheScope(key string, raw json.RawMessage) json.RawMessage {
 // envelope carrying duplicate or fold-colliding keys outright, because the proxy cannot know
 // which of the two values a host binds. (This once described collapsing them last-wins,
 // matching encoding/json — a description that now contradicts the gate above it, in the file
-// where duplicate-key handling IS the security-critical behavior.)
+// where duplicate-key handling IS the security-critical behavior.) The other half of that
+// question — a LONE case variant of the list key, which collides with nothing and so trips
+// no rule of that decoder's — is refused here; see refuseListKeyVariant.
 //
 // A nil/empty entries slice is emitted as [] (never null) so the list field stays an array.
 // If fieldName is not among keys it is appended, so the encoded object always carries
 // the list field (an envelope is never returned with the list silently dropped).
 func encodeOrderedObjectWithList(keys []string, values map[string]json.RawMessage, fieldName string, entries []json.RawMessage) ([]byte, error) {
+	if err := refuseListKeyVariant(keys, fieldName); err != nil {
+		return nil, err
+	}
 	if entries == nil {
 		entries = []json.RawMessage{}
 	}

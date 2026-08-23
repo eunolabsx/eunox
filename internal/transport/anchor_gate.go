@@ -171,7 +171,3 @@ func (a *anchorGate) held() func() {
 	a.handoffs.Add(1)
 	return sync.OnceFunc(func() { <-a.turn })
 }
-
-// size reports how many gates are live. Test-only visibility into the refcounting that keeps a
-// long-lived gateway from accumulating one entry per session it has ever served.
-func (g *anchorGates) size() int { return g.reg.size() }
