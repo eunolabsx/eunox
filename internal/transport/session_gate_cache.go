@@ -329,12 +329,3 @@ func (c *gateCache) close() {
 	}
 	c.entries = nil
 }
-
-// size reports how many anchors this cache holds. Test-only: the cap and the
-// release-on-teardown are what keep a long-lived session from pinning one route gate per
-// task it has ever served, invisible from the outside otherwise.
-func (c *gateCache) size() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.entries)
-}

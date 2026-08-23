@@ -25,28 +25,27 @@ func setUpstreamProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
-// signalUpstreamGroup sends sig to the process group led by proc; a false return means
-// the caller must fall back to signalling the direct child alone (setUpstreamProcessGroup's
-// Setpgid is best-effort, and if it failed the child is still in the parent's group, so
-// kill(-pid) would fail with ESRCH rather than accidentally signalling the proxy's own group).
-func signalUpstreamGroup(proc *os.Process, sig os.Signal) bool {
+// signalUpstreamGroup sends sig to the process group led by proc, best-effort: every caller
+// has already signalled the direct child, so a group signal that finds nothing (Setpgid is
+// best-effort, and if it failed the child is still in the parent's group and kill(-pid) fails
+// with ESRCH) leaves the child signalled and nothing further to do.
+func signalUpstreamGroup(proc *os.Process, sig os.Signal) {
 	// Pid <= 1, not <= 0: POSIX defines kill(-1, sig) as "every process the caller may
 	// signal", not "the group led by pid 1" — in a PID namespace the upstream can
 	// legitimately be pid 1, and -1 would broadcast SIGKILL across the container.
 	if proc == nil || proc.Pid <= 1 {
-		return false
+		return
 	}
 	sysSig, ok := sig.(syscall.Signal)
 	if !ok {
-		return false
+		return
 	}
-	return syscall.Kill(-proc.Pid, sysSig) == nil
+	_ = syscall.Kill(-proc.Pid, sysSig)
 }
 
-// killUpstreamGroup SIGKILLs the process group led by proc; see signalUpstreamGroup for
-// why a false return is a fallback signal rather than an error.
-func killUpstreamGroup(proc *os.Process) bool {
-	return signalUpstreamGroup(proc, syscall.SIGKILL)
+// killUpstreamGroup SIGKILLs the process group led by proc.
+func killUpstreamGroup(proc *os.Process) {
+	signalUpstreamGroup(proc, syscall.SIGKILL)
 }
 
 // getpgid returns the process-group id of pid. Test-facing, to assert directly that the

@@ -678,8 +678,8 @@ func (p *StdioProxy) upstreamLabel() string {
 // through a wrapper (`npx`, `uvx`, a shell script) execs or forks the real server as a
 // grandchild holding the same stdout pipe, and killing only the wrapper leaves that
 // pipe open forever — so the EOF every post-kill wait here is waiting for never
-// arrives. killUpstreamGroup falls back to the direct child when no group was
-// established (see procgroup_unix.go).
+// arrives. The direct child is signalled first regardless, so an upstream for which no
+// group was established is still killed (see procgroup_unix.go).
 func (p *StdioProxy) killUpstream() {
 	if p.upHTTP != nil {
 		p.upHTTP.close()
@@ -1223,7 +1223,7 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 	}
 	// The boundary applies to notifications too, and they do not reach it through the upstream
 	// call — this write IS the leg's outbound seam for them. See translateNotificationForLeg.
-	outbound, err := translateNotificationForLeg(msg, resolveRevision(capability.ProtocolRevisionFromContext(ctx)), p.upstreamRev)
+	outbound, err := translateNotificationForLeg(msg, requestRevision(ctx), p.upstreamRev)
 	if err != nil {
 		// A drop with no diagnostic: the peer cannot be answered (JSON-RPC forbids it) and the
 		// fault is this build's translation layer rather than the message, so an operator's only
