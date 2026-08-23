@@ -171,7 +171,7 @@ Flags:
 	auditLog := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 	auditKey := fs.String("audit-key-path", "", "Path to the HMAC signing key (default: ~/.eunox/audit.key). Only used\nto report whether the key is loadable; signatures are not re-verified here.")
 	auditTail := fs.Int("audit-tail", defaultDoctorAuditTail, "Number of trailing audit records to include (values redacted). 0 ⟹ skip.")
-	live := fs.Bool("live", false, "Connect to each declared upstream and include the drift report.\nRequires --config.")
+	live := fs.Bool("live", false, "Connect to each declared upstream and include the drift report.\nRequires --config; passed without one, the invocation is rejected rather\nthan producing a bundle with the section skipped.")
 	output := fs.String("output", "", "Write the bundle to this file instead of stdout. The conventional name\nis eunox-doctor-<timestamp>.txt; --output auto picks one automatically.")
 
 	// doctor deliberately stops here rather than resolving --audit-log: an unresolvable
@@ -182,6 +182,16 @@ Flags:
 			return doctorUsageExit
 		}
 		return code
+	}
+	// --live introspects the upstreams a config declares, and there are none without one.
+	// Rejected rather than left inert, per the binary-wide rule stated at cmdContracts'
+	// unpaired-flag guard: this exited 0 with a skip note buried in section 5, so an
+	// operator who believed they had named a --config got a bundle with no drift report and
+	// nothing saying the invocation was incoherent. Knowable at parse time, so refused here
+	// rather than after the audit tail is read.
+	if *live && *configPath == "" {
+		fmt.Fprintln(os.Stderr, "eunox doctor: --live requires --config (there are no declared upstreams to introspect without one)")
+		return doctorUsageExit
 	}
 	// An unloadable config is NOT fatal here: it's carried into the bundle and every other
 	// section still renders. Exit status stays non-zero though, so `doctor --config X &&
@@ -307,13 +317,12 @@ func writeDoctorBundle(w io.Writer, opts doctorOptions) {
 	wln(w, doctorSep)
 	wln(w, "5. Live upstream check")
 	wln(w, doctorSep)
-	switch {
-	case !opts.live:
-		wln(w, "(skipped — pass --live to introspect each declared upstream)")
-	case opts.configPath == "":
-		wln(w, "(skipped — --live requires --config)")
-	default:
+	// No config-less --live arm: cmdDoctor rejects that invocation at parse time rather
+	// than rendering a skip note for it.
+	if opts.live {
 		writeDoctorLive(w, cfg, cfgErr)
+	} else {
+		wln(w, "(skipped — pass --live to introspect each declared upstream)")
 	}
 
 	wln(w)

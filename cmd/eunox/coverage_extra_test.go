@@ -1662,6 +1662,31 @@ func TestPrintProxyUsage_WiretapClaimIsHonest(t *testing.T) {
 	}
 }
 
+// TestPrintProxyUsage_DocumentsExitCodes holds proxy to the convention every other
+// subcommand's help follows. Its own split is the least guessable in the binary — 2 is
+// reserved for a flag PARSE failure alone, while the flag-combination and flag-value errors
+// a sibling reports as 2 are exit 1 here — so leaving it undocumented meant a supervisor
+// script had to derive it from the source.
+func TestPrintProxyUsage_DocumentsExitCodes(t *testing.T) {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	out := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
+
+	if !strings.Contains(out, "Exit codes:") {
+		t.Fatalf("proxy usage must document its exit codes; got:\n%s", out)
+	}
+	// Every code the command can actually return must be named, and no other.
+	for _, want := range []string{"\n  0 ", "\n  1 ", "\n  2 "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the exit-code block does not document %q:\n%s", strings.TrimSpace(want), out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "3 ") {
+			t.Errorf("proxy documents an exit code no invocation can produce: %q", strings.TrimSpace(line))
+		}
+	}
+}
+
 // ───────────────────────── buildCallCounterAndKillSwitch ───────────────────
 
 func TestBuildCallCounterAndKillSwitch_InMemory(t *testing.T) {
