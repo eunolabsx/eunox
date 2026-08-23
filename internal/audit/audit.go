@@ -716,7 +716,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	}
 	// Resume the chain from the existing tail so seq stays monotonic and prev_hmac
 	// links across restarts. Only a tail that verifies under a held key is resumed
-	// onto; anything else (unparseable, HMAC mismatch, retired key, or unsigned)
+	// onto; every other outcome — see the tailFailure vocabulary for the current set —
 	// restarts the chain from genesis and leaves a signed marker naming the reason.
 	//
 	// The tail was read once, through the open append handle, by the partial-tail
@@ -729,15 +729,16 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	tr := s.resumeChainFromTail(resume.last)
 	// Emit the integrity marker before the drainer starts: Open is single-threaded
 	// here, so writeRecord has no contention and the marker becomes the first
-	// appended line, chained from the resumed tail like the first real record. The
-	// first five cases are mutually exclusive (a read failure leaves last=="" so no
-	// parse/HMAC attempt; the parse must succeed before the signature checks; and the
-	// unsigned tail, the HMAC mismatch, and the unknown-key tail are distinct outcomes
-	// of that same step), so at most one of THEM is written. All of them chain from
-	// genesis: none of those tails is resumable, so there is no seq/prev_hmac to
-	// continue from. The tail_partial_write_recovered marker is independent of these
-	// (it concerns the dropped fragment, not the resumed record) and may fire alongside
-	// one of them.
+	// appended line, chained from the resumed tail like the first real record. Every
+	// marker below EXCEPT tail_partial_write_recovered is mutually exclusive with the
+	// others by construction rather than by count (a read failure leaves last=="" so no
+	// parse or verification is attempted; the parse must succeed before verification
+	// runs; and each way verification can refuse — unsigned, non-canonical, strict-decode
+	// refused, unknown key, HMAC mismatch — returns from that one step), so at most one
+	// of THEM is written. All of them chain from genesis: none of those tails is
+	// resumable, so there is no seq/prev_hmac to continue from. The
+	// tail_partial_write_recovered marker is independent (it concerns the dropped
+	// fragment, not the resumed record) and may fire alongside one of them.
 	// wroteMarker says whether any writeIntegrityMarker call below appended a line, so
 	// the fsync further down only pays for a startup that put something new on disk — a
 	// clean startup (the common case: no tail failure, no partial-write recovery) has
@@ -796,7 +797,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	if recoveredPartialBytes > 0 {
 		// A partial trailing write was truncated above. Record the recovery so the
 		// event is on the tamper-evident trail and an anomalous rate of partial writes
-		// is visible. Unlike the four cases above this is NOT mutually exclusive with
+		// is visible. Unlike every case above this is NOT mutually exclusive with
 		// them: the recovery concerns the dropped fragment, while those markers concern
 		// the COMPLETE record the chain resumes from, so both can legitimately fire. It
 		// chains from the resumed tail like any appended record.

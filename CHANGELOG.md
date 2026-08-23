@@ -252,6 +252,43 @@ Section conventions:
 
 ### Fixed
 
+- **A rewritten audit tail is no longer reported as a failed signature comparison.** Verification
+  checks a record's canonical on-disk form — that its bytes are the ones the writer emits for the
+  fields it decoded to — **before** it computes any MAC, exactly as it strict-decodes before one.
+  The startup resume recognized the strict-decode refusal and the retired-key case and gave each
+  its own marker, but left the canonical refusal falling through to the default arm: a tail whose
+  bytes were rewritten after signing (a duplicate, re-spelled or reordered key, an added
+  zero-valued field, an alternate escape, inserted whitespace) was recorded as
+  `tail_hmac_mismatch` — a signed marker asserting a comparison that never ran.
+
+  The new kind is `tail_non_canonical`, carrying the same `claimed_tail_seq` / `claimed_tail_hmac`
+  read from the rewritten bytes. It is deliberately distinct from `tail_strict_decode_refused`:
+  that kind says the line could not be **read**, this one says it read fine and was **rewritten**,
+  which is the byte-rewrite attack the canonical check exists to refuse rather than a malformed or
+  forward-versioned line. **Operators with a SIEM rule keyed on `tail_hmac_mismatch` should add
+  this kind to it** — the event it fires on used to arrive under that name.
+
+  Fail-closed behavior is unchanged in every case: the chain still restarts from genesis and the
+  record is never resumed onto. Only the forensic label on the tape changes. See the threat model
+  §3.4 (rev 1.86).
+
+- **`DeclassifyApproval.Covers` compared its target untrimmed while `Validate` accepted a padded
+  one.** `Validate` checks a trimmed local copy it never writes back, and a programmatically built
+  approval passes through neither it nor the claim decoder's trim — so a grant naming
+  `" tool:publish_report"` validated and then covered nothing, the silent "grant that quietly
+  evaluated to covers nothing" failure `Validate` exists to prevent. All three readers of the
+  field now share one normalization, `LedgerID` included: with only `Covers` trimmed, two
+  differently-padded spellings of one target would cover the same action while burning into
+  separate ledger buckets, making a `once` grant usable twice. Claim-borne approvals were already
+  trimmed upstream, so no shipped path changes.
+
+- **The Redis kill switch named a method that does not exist** in the error for an empty id. It
+  composed the name as verb + entity word, which spells the token axis `KillJTI` — the method is
+  `RevokeJTI` — sending an operator looking for something that was never there, while the
+  in-memory backend spelled all six by hand and got them right. The names are declared per
+  dimension now, checked against the `Manager` interface by reflection, so a wrong one fails the
+  build instead of an incident.
+
 - **The per-session gate refusal is now rate-limited.** Its exemption rested on session ids being
   unguessable per-session UUIDs handed only to their creator, so driving the record needed a live
   victim id. Deriving worker ids from caller identity ended that: anyone who can name a victim's
