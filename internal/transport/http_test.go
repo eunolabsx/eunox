@@ -5621,7 +5621,7 @@ func TestHTTPProxy_NewSessionInitializeHonorsContext(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := proxy.newSession(ctx, proxy.routes[""], "", proxy.currentReapGen())
+	_, err := proxy.newSession(ctx, proxy.routes[""], "", proxy.currentReapGen(), handshakeSeed())
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -5783,7 +5783,7 @@ func TestHTTPProxy_InitializeDeadline(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := proxy.newRemoteSession(ctx, route, "", proxy.currentReapGen())
+	_, err := proxy.newRemoteSession(ctx, route, "", proxy.currentReapGen(), handshakeSeed())
 	elapsed := time.Since(start)
 
 	if err == nil {

@@ -107,12 +107,12 @@ func TestSessionHeaderRetirement_NoDeclaringResponseCarriesTheHeader(t *testing.
 
 // And the refusal a declaring host gets does not demand the retired header back.
 //
-// This cell was written in W3 to change on the day the negotiation half landed, and it has: a
-// declaring peer now REACHES this refusal instead of being turned away above it, so what the
-// refusal says became reachable and had to become honest. Demanding `Mcp-Session-Id` of a
-// 2026-07-28 host instructs it to send a header its revision removed and a conformant client
-// cannot produce; what it needs is session creation on the first enforced request, which is
-// decided (ADR-0004) and not yet built. It will change once more when that lands.
+// This cell was written in W3 to change as the D3 work landed, and it has twice: first when a
+// declaring peer stopped being turned away above this arm, and again now that the arm CREATES a
+// session rather than refusing for want of one. What it pins across both is the invariant that
+// outlives them — a 2026-07-28 host is never told to send `Mcp-Session-Id`, a header its revision
+// removed and a conformant client cannot produce. This request is refused for presenting no
+// identity, which is a fact about the credential and not about a session header.
 func TestSessionHeaderRetirement_TheSessionlessRefusalDoesNotDemandARetiredHeader(t *testing.T) {
 	t.Parallel()
 	srv, _, _ := forwardingProxy(t, nil)
@@ -122,11 +122,11 @@ func TestSessionHeaderRetirement_TheSessionlessRefusalDoesNotDemandARetiredHeade
 	body := new(bytes.Buffer)
 	_, _ = body.ReadFrom(resp.Body)
 
-	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode,
-		"a declaring host's request is not malformed; it is unservable on this build")
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"a declaring host's request is not malformed; this one presented no identity to key a worker on")
 	assert.NotContains(t, body.String(), SessionHeader,
 		"the refusal instructs a 2026-07-28 host to send a header its revision removed")
-	assert.Contains(t, body.String(), "not implemented")
+	assert.Contains(t, body.String(), "credential")
 
 	// The old revision is unchanged: it still gets the 400 naming the header it really does
 	// need, which is this release's regression invariant.

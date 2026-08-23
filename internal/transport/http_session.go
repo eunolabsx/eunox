@@ -182,6 +182,11 @@ type httpSession struct {
 	// session can be killed more than once.
 	evictOnce sync.Once
 	evicted   chan struct{}
+	// established is closed when this worker stops COMING UP, on either outcome. A request that
+	// found it in the registry mid-establishment waits here; see awaitEstablished for why that
+	// wait became necessary once worker ids are derivable from a caller's own claims.
+	established     chan struct{}
+	establishedOnce sync.Once
 
 	// lastActive updates on every POST and when an SSE stream is OPENED, not while one is held
 	// (a long-lived stream is spared by hasSubscribers() instead). Atomic so the reaper reads
@@ -456,13 +461,39 @@ func (s *httpSession) unblockGateRefusedServerReply(ctx context.Context, msg mcp
 // session registers before readUpstream starts so cleanup finds it even on immediate exit.
 // startGen is the reap generation observed before the caller's pre-spawn kill gate, since
 // everything from there through registerSession is inside the window it must detect.
-func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64) (*httpSession, error) {
+// sessionSeed is what a creating path supplies that the constructors cannot derive: the worker's
+// id, and the revision its context is pinned to.
+//
+// One value rather than two parameters because the two are one decision — how this worker came to
+// exist — and a caller that supplied a first-request key while leaving the handshake revision
+// pinned would build a worker that refuses every message the peer sends it.
+type sessionSeed struct {
+	id      string
+	hostRev capability.Revision
+}
+
+// handshakeSeed is the `initialize` path's: a minted UUID the host echoes back in
+// `Mcp-Session-Id`, on the revision that defines the handshake — opening one IS negotiating it,
+// so each later request is checked against this pin and one declaring a different revision is
+// refused rather than switching method tables mid-context.
+func handshakeSeed() sessionSeed {
+	return sessionSeed{id: uuid.New().String(), hostRev: handshakeRevision}
+}
+
+// firstRequestSeed is the declaring path's: the anchor-derived worker key (see
+// first_request_session.go) on the revision the request that minted it declared. There is no
+// handshake to have negotiated, so the FIRST request is what pins the context.
+func firstRequestSeed(key string, rev capability.Revision) sessionSeed {
+	return sessionSeed{id: key, hostRev: rev}
+}
+
+func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64, seed sessionSeed) (*httpSession, error) {
 	// Built before registerSession publishes the session, so a concurrent close() never races
 	// the write of sessCancel. Descends from Background, not the request ctx which ends when
 	// this handshake returns.
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	sess := &httpSession{
-		id:             uuid.New().String(),
+		id:             seed.id,
 		proxy:          p,
 		route:          route,
 		byUpstreamID:   make(map[string]chan upstreamResult),
@@ -471,16 +502,13 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		noticeFloor:    newNoticeReserve(noticeClasses),
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
+		established:    make(chan struct{}),
 		sessCtx:        sessCtx,
 		sessCancel:     sessCancel,
 		claims:         pdp.JWTClaimsPtr(ctx),
 		clientIP:       clientIP,
-		// Every session is minted by a host `initialize` today, and that method exists only
-		// in the older revision — so opening one IS negotiating it. Each request is checked
-		// against this pin, so one declaring a different revision is refused rather than
-		// switching method tables mid-context.
-		hostRev:     handshakeRevision,
-		upstreamRev: UpstreamOpenRevision(route.upstreamProtocolVersion),
+		hostRev:        seed.hostRev,
+		upstreamRev:    UpstreamOpenRevision(route.upstreamProtocolVersion),
 	}
 	// Cleared only when newSession returns, so the idle reaper spares the drift-check window.
 	sess.initInProgress.Store(true)
@@ -632,6 +660,12 @@ var errShuttingDown = errors.New("server shutting down")
 // currentReapGen. Handled like errShuttingDown/errSessionLimit: tear the upstream back down.
 var errRacedReap = errors.New("session raced a kill-switch reap; retry")
 
+// errSessionExists reports that a worker is already registered under this id — a concurrent
+// first request on the same caller identity won the race. Its caller adopts the winner rather
+// than surfacing this: both requests are the same subject by construction, so the loser has
+// nothing of its own to preserve.
+var errSessionExists = errors.New("a worker is already registered for this identity")
+
 // currentReapGen returns the reap generation in force now. A session-creating initialize calls
 // this once before its upstream handshake and passes the result to registerSession as startGen.
 func (p *HTTPProxy) currentReapGen() uint64 {
@@ -673,6 +707,15 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	// Seeds the hard idle ceiling from creation: the initialize POST counts as the first
 	// host request.
 	sess.lastRequest.Store(now)
+	// A worker already holds this id. Impossible for the `initialize` path, whose ids are minted
+	// UUIDs, and the reason this was a plain assignment; reachable for the first-request path,
+	// whose id is DERIVED from the caller's identity, so two concurrent first requests on one
+	// identity both arrive here. Assigning would publish the second and orphan the first — its
+	// upstream out of the registry, so nothing reaps it, and sessionCount unchanged so nothing
+	// notices. Refused instead, and its caller adopts the winner.
+	if _, taken := p.sessions[sess.id]; taken {
+		return errSessionExists
+	}
 	// Resolved here, after the checks above, so a refused session leaves no gate reference
 	// behind. The gate registry is leaf-level, so entering it under p.mu is no ordering hazard.
 	sess.holdDecisionGate()
@@ -986,12 +1029,45 @@ func (p *HTTPProxy) sweepKilledSessions() {
 // stale id a later session reused.
 func (p *HTTPProxy) finishEstablishing(sess *httpSession) {
 	sess.initInProgress.Store(false)
+	// Released here, at the ONE point establishment ends on either outcome, so a request that
+	// found this worker in the registry stops waiting whether it came up or was torn down. A
+	// waiter re-checks the registry afterwards rather than trusting the signal to mean success.
+	sess.markEstablished()
 	if p.getSession(sess.id) != sess {
 		return
 	}
 	if p.sessionKilled(sess) {
 		p.reclaimKilledSession(sess)
 	}
+}
+
+// markEstablished releases everything waiting for this worker to finish coming up. Idempotent:
+// finishEstablishing is deferred on paths that can also be reached during teardown.
+func (s *httpSession) markEstablished() {
+	s.establishedOnce.Do(func() { close(s.established) })
+}
+
+// awaitEstablished blocks until this worker has finished establishing, reporting whether it is
+// still a live registration afterwards.
+//
+// Needed because registerSession PUBLISHES before the session-start drift check runs, and the
+// worker id is now DERIVABLE from a caller's own claims — so a second request can find a worker
+// mid-establishment and be served on it before FM-5 has compared the upstream's tool list against
+// the manifest, and before RecordObservedToolHashes has set the Tier-2 surface baseline. With
+// minted UUIDs no second request could name the id at all, which is why publishing early was safe
+// before and is not now.
+//
+// The re-check after waiting is the point: establishment can END in teardown (a failed drift
+// check tears the session down), so the signal means "no longer coming up", never "came up".
+func (p *HTTPProxy) awaitEstablished(ctx context.Context, sess *httpSession) bool {
+	if sess.initInProgress.Load() {
+		select {
+		case <-sess.established:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return p.getSession(sess.id) == sess
 }
 
 // reclaimKilledSession tears down one session the kill switch names. Shared by the idle

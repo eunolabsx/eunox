@@ -55,8 +55,8 @@ func TestFirstRequestNegotiation_ADeclaringHostGetsPastNegotiation(t *testing.T)
 
 	assert.NotContains(t, body.String(), capability.ErrCodeUnsupportedProtocolVersion,
 		"a first message cannot contradict a context it never opened; refusing it here is what made a declaring host unservable")
-	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode,
-		"it reaches the arm's own refusal, which is where session creation on first request will land")
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"it reaches session creation, which refuses this one for presenting no identity to key a worker on")
 }
 
 // Omission still resolves to the surface eunox already shipped. This is the half that must NOT
@@ -131,16 +131,17 @@ func TestFirstRequestNegotiation_InitializeArmsStillAssertTheHandshakeRevision(t
 // A declaring peer's unservable POST lands on the tape.
 //
 // Relaxing negotiation MOVED this refusal: such a peer used to be turned away by the revision
-// gate, which records, and now reaches an arm below it. Without its own record an unauthenticated
-// off-host caller could sweep the declaring surface leaving no trace on HTTP, while the identical
-// bytes still recorded on stdio — the exact gap the negotiate-first ordering exists to close.
+// gate, which records, and now reaches session creation below it. Without its own record an
+// unauthenticated off-host caller could sweep the declaring surface leaving no trace on HTTP,
+// while the identical bytes still recorded on stdio — the exact gap the negotiate-first ordering
+// exists to close.
 func TestFirstRequestNegotiation_TheUnservableRefusalIsRecorded(t *testing.T) {
 	t.Parallel()
 	srv, _, _, tape := forwardingProxyWithTape(t, nil)
 
 	resp := declaringHostPOST(t, srv, capability.MethodToolsList)
 	t.Cleanup(func() { _ = resp.Body.Close() })
-	require.Equal(t, http.StatusNotImplemented, resp.StatusCode)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 
 	rec := findAuditRecordByCode(tape(), capability.ErrCodeEnforcementError)
 	require.NotNil(t, rec, "a declaring peer's unservable POST left no trace on the tape")
@@ -149,7 +150,7 @@ func TestFirstRequestNegotiation_TheUnservableRefusalIsRecorded(t *testing.T) {
 	require.True(t, ok, "the record carries no details block")
 	unservable, ok := detail[detailUnservable].(map[string]interface{})
 	require.True(t, ok, "the record does not name WHY the peer could not be served")
-	assert.Equal(t, unservableSessionCreation, unservable["reason"])
+	assert.Equal(t, unservableUnauthenticated, unservable["reason"])
 	assert.Equal(t, capability.Revision20260728.String(), unservable["revision"],
 		"an operator correlating a probe of the declaring surface needs the revision it declared")
 }

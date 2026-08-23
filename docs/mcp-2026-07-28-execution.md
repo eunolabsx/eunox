@@ -252,11 +252,32 @@ code standing in for this decision is now reachable and correct, so a 2026-07-28
 that session creation on first request is unimplemented rather than being told to send a header
 its revision removed.
 
-**What has NOT landed:** session creation itself — the worker keyed on the resolved state anchor,
-the unauthenticated-subprocess refusal, and `--require-audit=strict` relocated to the
-first-request path. That is the remaining half with real wire consequences (a 2026-07-28 HTTP
-peer being SERVED, not merely negotiated), and it is now unblocked in every direction: D3 is
-`Final` and the negotiation half it depends on is in.
+**Session creation on the first enforced request has since landed too.** A 2026-07-28 host is now
+SERVED over HTTP with no `initialize` anywhere in the exchange. The worker is keyed on the
+resolved state anchor (`enforcement.ResolveStateAnchor`, route-namespaced) — the same subject
+stateful policy keys on, so the worker map and the accumulated state cannot disagree about a
+request, and a rotated credential lands on the same worker because `jti` stays revocation-only.
+The kill gate, the audience pin and `--require-audit=strict` all run BEFORE the upstream is
+spawned, and a first request re-enters through the established-session arm rather than growing a
+creating path's own copy of the per-request gates.
+
+Two things it found on the way. `registerSession` ASSIGNED into the session map, which was
+correct while every id was a minted UUID and became a leak once ids are derived: two concurrent
+first requests on one identity both registered, the second published over the first, and the
+first's upstream was left outside the registry with nothing to reap it and `sessionCount`
+unchanged, so no counter an operator has could see it. It now refuses a duplicate and the loser
+adopts the winner. And the worker key is rendered PRINTABLY rather than through
+`StateAnchor.Key()`'s NUL separator, because the key becomes the worker's id and a worker's id is
+signed into the audit record's `session_id` through a sanitizer that rewrites control runes — a
+NUL key would be recorded as something other than itself, and two workers could collapse onto one
+recorded id.
+
+**What has NOT landed:** unauthenticated declaring traffic. ADR-0004 permits serving it
+per-request against a REMOTE upstream, which costs no subprocess; that is a different shape (an
+ephemeral worker owned by one request) and is deferred. Both upstream kinds refuse it meanwhile,
+which takes nothing away — no declaring peer was served over HTTP at all before this — and is the
+fail-closed direction. The e2e interop matrix's HTTP cells are also still stdio-only, and what
+they need now is a mock-host that authenticates rather than anything from the proxy.
 
 Scope:
 
