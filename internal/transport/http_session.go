@@ -456,13 +456,39 @@ func (s *httpSession) unblockGateRefusedServerReply(ctx context.Context, msg mcp
 // session registers before readUpstream starts so cleanup finds it even on immediate exit.
 // startGen is the reap generation observed before the caller's pre-spawn kill gate, since
 // everything from there through registerSession is inside the window it must detect.
-func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64) (*httpSession, error) {
+// sessionSeed is what a creating path supplies that the constructors cannot derive: the worker's
+// id, and the revision its context is pinned to.
+//
+// One value rather than two parameters because the two are one decision — how this worker came to
+// exist — and a caller that supplied a first-request key while leaving the handshake revision
+// pinned would build a worker that refuses every message the peer sends it.
+type sessionSeed struct {
+	id      string
+	hostRev capability.Revision
+}
+
+// handshakeSeed is the `initialize` path's: a minted UUID the host echoes back in
+// `Mcp-Session-Id`, on the revision that defines the handshake — opening one IS negotiating it,
+// so each later request is checked against this pin and one declaring a different revision is
+// refused rather than switching method tables mid-context.
+func handshakeSeed() sessionSeed {
+	return sessionSeed{id: uuid.New().String(), hostRev: handshakeRevision}
+}
+
+// firstRequestSeed is the declaring path's: the anchor-derived worker key (see
+// first_request_session.go) on the revision the request that minted it declared. There is no
+// handshake to have negotiated, so the FIRST request is what pins the context.
+func firstRequestSeed(key string, rev capability.Revision) sessionSeed {
+	return sessionSeed{id: key, hostRev: rev}
+}
+
+func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64, seed sessionSeed) (*httpSession, error) {
 	// Built before registerSession publishes the session, so a concurrent close() never races
 	// the write of sessCancel. Descends from Background, not the request ctx which ends when
 	// this handshake returns.
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	sess := &httpSession{
-		id:             uuid.New().String(),
+		id:             seed.id,
 		proxy:          p,
 		route:          route,
 		byUpstreamID:   make(map[string]chan upstreamResult),
@@ -475,12 +501,8 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		sessCancel:     sessCancel,
 		claims:         pdp.JWTClaimsPtr(ctx),
 		clientIP:       clientIP,
-		// Every session is minted by a host `initialize` today, and that method exists only
-		// in the older revision — so opening one IS negotiating it. Each request is checked
-		// against this pin, so one declaring a different revision is refused rather than
-		// switching method tables mid-context.
-		hostRev:     handshakeRevision,
-		upstreamRev: UpstreamOpenRevision(route.upstreamProtocolVersion),
+		hostRev:        seed.hostRev,
+		upstreamRev:    UpstreamOpenRevision(route.upstreamProtocolVersion),
 	}
 	// Cleared only when newSession returns, so the idle reaper spares the drift-check window.
 	sess.initInProgress.Store(true)
@@ -632,6 +654,12 @@ var errShuttingDown = errors.New("server shutting down")
 // currentReapGen. Handled like errShuttingDown/errSessionLimit: tear the upstream back down.
 var errRacedReap = errors.New("session raced a kill-switch reap; retry")
 
+// errSessionExists reports that a worker is already registered under this id — a concurrent
+// first request on the same caller identity won the race. Its caller adopts the winner rather
+// than surfacing this: both requests are the same subject by construction, so the loser has
+// nothing of its own to preserve.
+var errSessionExists = errors.New("a worker is already registered for this identity")
+
 // currentReapGen returns the reap generation in force now. A session-creating initialize calls
 // this once before its upstream handshake and passes the result to registerSession as startGen.
 func (p *HTTPProxy) currentReapGen() uint64 {
@@ -673,6 +701,15 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	// Seeds the hard idle ceiling from creation: the initialize POST counts as the first
 	// host request.
 	sess.lastRequest.Store(now)
+	// A worker already holds this id. Impossible for the `initialize` path, whose ids are minted
+	// UUIDs, and the reason this was a plain assignment; reachable for the first-request path,
+	// whose id is DERIVED from the caller's identity, so two concurrent first requests on one
+	// identity both arrive here. Assigning would publish the second and orphan the first — its
+	// upstream out of the registry, so nothing reaps it, and sessionCount unchanged so nothing
+	// notices. Refused instead, and its caller adopts the winner.
+	if _, taken := p.sessions[sess.id]; taken {
+		return errSessionExists
+	}
 	// Resolved here, after the checks above, so a refused session leaves no gate reference
 	// behind. The gate registry is leaf-level, so entering it under p.mu is no ordering hazard.
 	sess.holdDecisionGate()

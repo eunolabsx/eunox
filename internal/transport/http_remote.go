@@ -28,8 +28,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -219,7 +217,7 @@ func (s *httpSession) mcpEndpointURL() string {
 // performs the initialize handshake, stores the upstream session ID, registers in p.sessions.
 // startGen is the reap generation the CALLER observed before its pre-spawn kill gate (see
 // handleMCPPost and newSession).
-func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64) (*httpSession, error) {
+func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64, seed sessionSeed) (*httpSession, error) {
 	// Share the route's *http.Transport (connection pool) across sessions so a
 	// session-creating initialize reuses a warm connection; the *http.Client is per-session.
 	client := newUpstreamClient(route.sharedUpstreamTransport(p.upstreamTimeMs))
@@ -228,7 +226,7 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 	// when initialize returns, which must not cancel later per-call teardown.
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	sess := &httpSession{
-		id:    uuid.New().String(),
+		id:    seed.id,
 		proxy: p,
 		route: route,
 		// byUpstreamID and hostToUp are left nil: they never apply on the remote-HTTP
@@ -247,10 +245,8 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		upHTTPClient:   client,
 		claims:         pdp.JWTClaimsPtr(ctx),
 		clientIP:       clientIP,
-		// See newSession: a session is minted by `initialize`, which is the older revision's
-		// method, so opening one negotiates that revision for the context's life.
-		hostRev:     handshakeRevision,
-		upstreamRev: UpstreamOpenRevision(route.upstreamProtocolVersion),
+		hostRev:        seed.hostRev,
+		upstreamRev:    UpstreamOpenRevision(route.upstreamProtocolVersion),
 	}
 	// Marks initializing until this returns (after the drift check) so the idle reaper
 	// doesn't tear it down mid-establishment — same guard as local-subprocess newSession.

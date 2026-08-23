@@ -155,12 +155,14 @@ note "[stdio] sampling DENY"
 # asserting the absence of a feature rather than the revision boundary. Both remain
 # outstanding on the HTTP transport.
 #
-# The blocker has NARROWED, though, and the distinction matters for whoever enables these
-# next: such a host now gets past NEGOTIATION over HTTP (its first request establishes a
-# context rather than contradicting an asserted one), and is refused 501 by the arm that
-# will mint its session. What is missing is creation itself, not the revision boundary —
-# so these cells become runnable over HTTP the moment that lands, with no change here
-# beyond dropping this note.
+# The blocker has moved twice and is no longer about the revision boundary at all. Such a
+# host now gets past negotiation over HTTP, and the arm below it MINTS the worker its
+# request runs on — a 2026-07-28 host is served over HTTP with no `initialize` anywhere in
+# the exchange. What these cells still need is a HOST that authenticates: the revision has
+# no handshake, so identity comes from the bearer alone and an unidentified request has no
+# stable subject to key a worker on. That is mock-host and harness work (a JWKS, a signed
+# token carrying mcp.agent_id), not a proxy gap, and it is what enabling these cells means
+# now. The in-process coverage is internal/transport/first_request_creation_test.go.
 #
 # The mismatched cells assert the refusal because refusal is the whole of the boundary
 # this build implements: no method is translated across a mismatched pair, in either

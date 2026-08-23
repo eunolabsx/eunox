@@ -244,43 +244,46 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 	}
 }
 
-// initStrictAuditDenial applies the --require-audit=strict gate to the session-creating
-// initialize branch. Creating a session is a privileged side effect (spawns/contacts an
-// upstream), so a degraded trail refuses it fail-closed, mirroring the other enforced paths.
-// Returns the JSON-RPC denial and true when the gate blocks.
-func (p *HTTPProxy) initStrictAuditDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
+// creationStrictAuditDenial applies the --require-audit=strict gate to a request that would
+// CREATE a session. Creating one is a privileged side effect (spawns/contacts an upstream), so a
+// degraded trail refuses it fail-closed, mirroring the other enforced paths. Returns the
+// JSON-RPC denial and true when the gate blocks.
+//
+// identifier and method are the request's own. The session-creating `initialize` passes
+// "initialize" for both, since it addresses no sub-target and the three collapse (see
+// dispatchList for the same pattern); the first-request path passes what its message actually
+// carries, which is a real tool or resource.
+func (p *HTTPProxy) creationStrictAuditDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg, identifier, method string) (mcp.RPCMsg, bool) {
 	fp := forwardParams{
 		rec:              asRecorder(route.sink),
-		sessionID:        "", // no session exists yet on the creating initialize
+		sessionID:        "", // no session exists yet on either creating path
 		strictAuditState: p.strictAudit(),
 		limits:           refusalLimits{notices: p.routeNoticeWriter(route)},
 	}
-	// initialize addresses no sub-target, so audit id/method/denial target all collapse to
-	// "initialize" (see dispatchList for the same pattern). Zero decision: nothing exists yet
-	// to have cleared a flow label.
-	return fp.strictAuditDenial(ctx, msg, mcp.MethodInitialize, mcp.MethodInitialize, mcp.MethodInitialize, capability.EnforceResponse{})
+	// Zero decision: nothing exists yet to have cleared a flow label.
+	return fp.strictAuditDenial(ctx, msg, identifier, method, method, capability.EnforceResponse{})
 }
 
-// initAudienceDenial applies the per-route JWT audience pin to the session-creating
-// initialize, before any upstream is spawned/contacted: a token valid only for another
-// route's audience (accepted by the gateway's shared union validator) must not create a
-// session here. Mirrors initStrictAuditDenial; non-JWT routes never block.
+// creationAudienceDenial applies the per-route JWT audience pin to a request that would create
+// a session, before any upstream is spawned/contacted: a token valid only for another route's
+// audience (accepted by the gateway's shared union validator) must not create one here. Mirrors
+// creationStrictAuditDenial, identifier/method included; non-JWT routes never block.
 //
 // The record is rate-limited via preSessionAudienceRecorder (catAudience): a caller
 // holding one valid token for any sibling route's audience reaches this on every route
 // its own audience fails, with no session ever created — an unbounded write here would be
 // the same audit-queue-flooding primitive the pre-session kill records are bounded
 // against, degrading the sink and, under --require-audit=strict, denying every route.
-func (p *HTTPProxy) initAudienceDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
+func (p *HTTPProxy) creationAudienceDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg, identifier, method string) (mcp.RPCMsg, bool) {
 	deny := route.pdp.CheckAudience(ctx)
 	if deny == nil {
 		return mcp.RPCMsg{}, false
 	}
 	d := normalizeDenial(deny.Denial)
 	if rec := p.preSessionAudienceRecorder(route); rec != nil {
-		rec.RecordDeny(ctx, "", mcp.MethodInitialize, mcp.MethodInitialize, d.Code, d.ConditionType, d.Details, false)
+		rec.RecordDeny(ctx, "", identifier, method, d.Code, d.ConditionType, d.Details, false)
 	}
-	return denialResult(msg.ID, d.Code, d.ConditionType, mcp.MethodInitialize, ""), true
+	return denialResult(msg.ID, d.Code, d.ConditionType, method, ""), true
 }
 
 // handleHTTPUpstreamRequest handles server-initiated JSON-RPC requests from the upstream

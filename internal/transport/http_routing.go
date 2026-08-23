@@ -303,14 +303,14 @@ func (p *HTTPProxy) handleSessionCreatingInitialize(w http.ResponseWriter, r *ht
 	// session on this route. Initialize doesn't flow through the Decide*/list/sampling
 	// paths that embed the same pin, so without this gate a cross-audience token could
 	// spin up this route's upstream and read its serverInfo.
-	if denied, blocked := p.initAudienceDenial(ctx, route, msg); blocked {
+	if denied, blocked := p.creationAudienceDenial(ctx, route, msg, mcp.MethodInitialize, mcp.MethodInitialize); blocked {
 		writeJSONMsg(w, denied)
 		return
 	}
 	// --require-audit=strict: creating a session spawns/contacts an upstream — a
 	// privileged side effect — so once the audit trail has degraded, refuse new sessions
 	// fail-closed rather than run traffic that can't be fully recorded.
-	if denied, blocked := p.initStrictAuditDenial(ctx, route, msg); blocked {
+	if denied, blocked := p.creationStrictAuditDenial(ctx, route, msg, mcp.MethodInitialize, mcp.MethodInitialize); blocked {
 		writeJSONMsg(w, denied)
 		return
 	}
@@ -349,9 +349,9 @@ func (p *HTTPProxy) handleSessionCreatingInitialize(w http.ResponseWriter, r *ht
 	// race the reader goroutine.
 	clientIP := p.sourceIP(r)
 	if route.transport == "http" {
-		sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen)
+		sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen, handshakeSeed())
 	} else {
-		sess, err = p.newSession(initCtx, route, clientIP, startGen)
+		sess, err = p.newSession(initCtx, route, clientIP, startGen, handshakeSeed())
 	}
 	if err != nil {
 		p.writeSessionCreateError(ctx, w, r, route, err)
@@ -443,7 +443,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		p.refuseSessionlessPost(w, r, route, msg)
+		p.handleSessionlessPost(w, r, route, msg)
 		return
 	}
 	// Past both early returns above, so this is the one arm whose forwards are made on a host's
@@ -453,80 +453,58 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 	p.handleSessionPost(w, grantHostHeaders(r, route), route, sessionID, msg)
 }
 
-// refuseSessionlessPost answers a host POST that carries no session and creates none.
+// handleSessionlessPost answers a host POST that carries no session id.
 //
 // Negotiated FIRST, as every other arm on this transport is: this was the one host-leg refusal
 // taken ahead of the revision, so a peer whose declaration this build cannot honor got a bare
-// 400 and nothing on the tape, while the identical bytes on every other path were recorded as
-// UNSUPPORTED_PROTOCOL_VERSION. Nothing durable is pinned here — there is no session to pin on,
-// which is the whole subject of this refusal.
+// 400 and nothing on the tape while the identical bytes on every other path were recorded as
+// UNSUPPORTED_PROTOCOL_VERSION.
 //
-// The refusal is then revision-aware, because a declaring peer now REACHES it: this arm asserts
-// no context (sessionlessLeg), so a 2026-07-28 declaration establishes one instead of being
-// refused above. Demanding `Mcp-Session-Id` of such a peer would instruct it to send a header
-// its revision removed and a conformant client cannot produce. What it actually needs is session
-// creation on the first enforced request — decided in ADR-0004 and not yet built — so the
-// refusal names that, and its own status, rather than a remedy that cannot work.
-func (p *HTTPProxy) refuseSessionlessPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) {
+// The revision then decides what a sessionless POST MEANS, which is the whole of D3. On
+// 2025-11-25 the session header is real and the peer simply omitted it, so the 400 naming it is
+// the right answer and this release's regression invariant. On a declaring revision there is no
+// such header to omit: the request is a FIRST REQUEST, and it mints or joins the worker it runs
+// on (first_request_session.go).
+func (p *HTTPProxy) handleSessionlessPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) {
 	rev, ok := p.negotiateHostRevision(w, r, route, nil, msg)
 	if !ok {
 		return
 	}
-	if declaresPerRequestRevision(rev) {
-		p.recordUnservableRevision(r, route, rev, msg)
-		http.Error(w, "this build cannot serve a "+rev.String()+" host over HTTP yet: the revision has no session header, and creating a session on the first enforced request is not implemented",
-			http.StatusNotImplemented)
+	if !declaresPerRequestRevision(rev) {
+		http.Error(w, SessionHeader+" header required", http.StatusBadRequest)
 		return
 	}
-	http.Error(w, SessionHeader+" header required", http.StatusBadRequest)
-}
-
-// recordUnservableRevision puts a declaring peer's unservable POST on the tape.
-//
-// Relaxing negotiation for a first message MOVED this refusal without meaning to: such a peer
-// used to be turned away by the revision gate, which records, and now reaches this arm, which
-// did not — so an unauthenticated off-host caller could sweep the declaring surface leaving no
-// trace on HTTP while the identical bytes still recorded on stdio. The negotiate-first ordering
-// above exists to close exactly that gap; a refusal added below it has to carry its own.
-//
-// ENFORCEMENT_ERROR rather than a code value of its own: eunox could not reach a verdict for a
-// reason internal to this BUILD rather than to the request — the peer's revision is speakable
-// and was negotiated, and there is simply no session-creation path for it yet. That is what the
-// code already means, its class is already the non-downgradable fault an observing route may not
-// forward past, and minting a signed code value for a state the next workstream removes would
-// outlive the state. The `unservable` detail carries the part a code cannot.
-//
-// The old-revision 400 beside it stays unrecorded, as it was before this change: a client that
-// omitted the session header it does need is a client protocol error, not a build limitation,
-// and folding the two under one code would make ENFORCEMENT_ERROR mean both.
-func (p *HTTPProxy) recordUnservableRevision(r *http.Request, route *UpstreamRoute, rev capability.Revision, msg mcp.RPCMsg) {
-	rec := p.routeRefusalLimits(nil, route).recorders(refusalSink(p, route)).forCategory(catUnservable)
-	if rec == nil {
-		return
+	sess := p.firstRequestSession(w, r, route, rev, msg)
+	if sess == nil {
+		return // the refusal is written by whichever gate refused
 	}
-	identifier, method := auditIdentity(msg)
-	rec.RecordDeny(capability.WithProtocolRevision(r.Context(), rev), "", identifier, method,
-		capability.ErrCodeEnforcementError, "", unservableDetail(rev), false)
+	// Re-entered through the ESTABLISHED-session arm rather than dispatched here, so a first
+	// request runs every per-request gate a second request runs — the audience pin, the owner
+	// binding, the in-flight accounting, the decision turn — instead of a creating path growing
+	// its own copy of them. Its negotiation runs a second time and resolves identically: the
+	// worker is pinned to the revision this request just declared.
+	p.handleSessionPost(w, grantHostHeaders(r, route), route, sess.id, msg)
 }
 
 // unservableDetail names WHY a negotiated peer could not be served, in the shape unroutableDetail
 // uses for the same class of refusal: eunox's own, with no policy behind it.
-func unservableDetail(rev capability.Revision) map[string]interface{} {
+func unservableDetail(rev capability.Revision, reason string) map[string]interface{} {
 	return map[string]interface{}{
 		detailUnservable: map[string]interface{}{
-			"reason":   unservableSessionCreation,
+			"reason":   reason,
 			"revision": rev.String(),
 		},
 	}
 }
 
 const (
-	// detailUnservable is the audit detail key naming a refusal eunox made because this build
-	// cannot serve the peer, as distinct from one the peer's own message earned.
+	// detailUnservable is the audit detail key naming a refusal eunox made because this
+	// DEPLOYMENT cannot serve the peer, as distinct from one the peer's own message earned.
 	detailUnservable = "unservable"
-	// unservableSessionCreation: the revision carries no session header and session creation on
-	// the first enforced request is not implemented (ADR-0004's remaining half).
-	unservableSessionCreation = "session_creation_unimplemented"
+	// unservableUnauthenticated: a declaring request presented no credential carrying a stable
+	// agent identity, so there is no subject to key a worker on and each request would fork its
+	// own upstream. See first_request_session.go.
+	unservableUnauthenticated = "unauthenticated_first_request"
 )
 
 // handleSessionPost handles a host POST carrying an existing Mcp-Session-Id: it validates

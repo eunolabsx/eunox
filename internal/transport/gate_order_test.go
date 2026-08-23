@@ -593,6 +593,11 @@ var dispositionPrologue = map[string]string{
 	// An UPSTREAM-initiated message. Host-side negotiation governs host messages, and this is
 	// not one — the upstream leg's revision is pinned once per route at its own handshake.
 	"readUpstream": "drops an upstream-initiated notification on a revoked session; not a host message",
+	// Session creation for a declaring peer. Reached only from handleSessionlessPost, which
+	// negotiates and hands the RESOLVED revision down — deliberately, since what a sessionless
+	// POST means is the revision's answer and creation is one of the two branches it picks
+	// between. Taking the revision as a parameter is what keeps this arm from re-deriving it.
+	"firstRequestSession": "handleSessionlessPost negotiates and passes the resolved revision in",
 }
 
 // TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue is the derivation-style guard

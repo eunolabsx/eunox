@@ -27,6 +27,29 @@ Section conventions:
 
 ### Added
 
+- **A 2026-07-28 host is served over HTTP, with no `initialize` anywhere in the exchange.** The
+  revision has no handshake, so the first enforced request mints the internal worker that owns
+  the upstream — same registration, pinning and reaping as before, with the old-revision
+  `initialize` path untouched.
+
+  The worker is keyed on the **resolved state anchor** (`enforcement.ResolveStateAnchor`,
+  namespaced by route), which is the same subject stateful policy keys on — so the worker map and
+  the accumulated state cannot disagree about a request. A minted id would have been worse than
+  untidy: a declaring peer echoes no session header, so every request would mint a new worker,
+  fork a new upstream, and accumulate its state where nothing else ever reaches — quotas that
+  never bind, `sequenceBlock` antecedents that never correlate, and no error anywhere. `jti` stays
+  revocation-only, so a rotated credential lands on the same worker instead of forking one per
+  token refresh.
+
+  The kill switch, the per-route audience pin and `--require-audit=strict` all run **before** the
+  upstream is spawned. A first request then re-enters through the established-session arm rather
+  than through a creating path with its own copy of the per-request gates.
+
+  **Unauthenticated declaring traffic is refused** on both upstream kinds, answered `401`: with no
+  handshake and no credential there is no stable identity to key a worker on, so each request
+  would fork its own upstream. Serving it per-request against a remote upstream is permitted by
+  ADR-0004 and is deferred — a different shape, and refusing it meanwhile takes nothing away.
+
 - **A 2026-07-28 host's first HTTP request now gets past negotiation.** What a pre-session
   message is held to became a property of the MESSAGE rather than of being sessionless: an
   `initialize` arm asserts the handshake revision, because answering `initialize` *is* the
@@ -220,6 +243,15 @@ Section conventions:
   refusal rather than as an allow followed by a contradiction. A 2025-11-25 peer's results are
   untouched, structurally: the first branch returns before reading anything, because these are
   members its revision does not define.
+
+### Fixed
+
+- **A duplicate session registration overwrote rather than being refused.** `registerSession`
+  assigned into the session map, which was correct while every id was a minted UUID and became a
+  leak the moment ids are derived from caller identity: two concurrent first requests on one
+  identity both registered, the second published over the first, and the first's upstream was
+  left outside the registry — nothing to reap it, and `sessionCount` unchanged, so no counter an
+  operator has could see it. A duplicate is now refused and the losing request adopts the winner.
 
 ### Changed
 
