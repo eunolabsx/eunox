@@ -63,13 +63,13 @@ func TestSequenceHistoryKey_ColonCollisionResistant(t *testing.T) {
 // counter kinds so gateway routes sharing one CallCounter cannot drain or interfere
 // with each other's maxCalls/sequenceBlock buckets under a session-id collision.
 func TestCounterKeyNamespace_DisjoinsRoutes(t *testing.T) {
-	if compositeCounterKey("maxcalls", "routeA", "s", "tool", "x") ==
-		compositeCounterKey("maxcalls", "routeB", "s", "tool", "x") {
+	if capability.CompositeKey("maxcalls", "routeA", "s", "tool", "x") ==
+		capability.CompositeKey("maxcalls", "routeB", "s", "tool", "x") {
 		t.Fatal("maxCalls key must disjoin distinct route namespaces for the same tuple")
 	}
 	// An empty namespace (single-upstream) keeps a stable, collision-resistant key.
-	if compositeCounterKey("maxcalls", "", "s", "tool", "x") ==
-		compositeCounterKey("maxcalls", "", "s", "tool", "y") {
+	if capability.CompositeKey("maxcalls", "", "s", "tool", "x") ==
+		capability.CompositeKey("maxcalls", "", "s", "tool", "y") {
 		t.Fatal("distinct tools must not collide under an empty namespace")
 	}
 }
@@ -89,8 +89,8 @@ func TestMaxCallsCounterKey_ColonCollisionResistant(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			kx := compositeCounterKey("maxcalls", tc.x[0], tc.x[1], tc.x[2])
-			ky := compositeCounterKey("maxcalls", tc.y[0], tc.y[1], tc.y[2])
+			kx := capability.CompositeKey("maxcalls", tc.x[0], tc.x[1], tc.x[2])
+			ky := capability.CompositeKey("maxcalls", tc.y[0], tc.y[1], tc.y[2])
 			if kx == ky {
 				t.Fatalf("maxCalls key collides for %v and %v: both = %q", tc.x, tc.y, kx)
 			}
@@ -104,10 +104,10 @@ func TestMaxCallsCounterKey_ColonCollisionResistant(t *testing.T) {
 // component just as a colon can, so length-prefixing — not any one-byte sentinel
 // — is what makes the encoding injective for arbitrary content.
 func TestCompositeCounterKey_NulSeparatorWouldNotSuffice(t *testing.T) {
-	a := compositeCounterKey("seq", "a\x00b", "c")
-	b := compositeCounterKey("seq", "a", "b\x00c")
+	a := capability.CompositeKey("seq", "a\x00b", "c")
+	b := capability.CompositeKey("seq", "a", "b\x00c")
 	if a == b {
-		t.Fatalf("compositeCounterKey collides for NUL-bearing components: both = %q", a)
+		t.Fatalf("capability.CompositeKey collides for NUL-bearing components: both = %q", a)
 	}
 }
 
@@ -118,7 +118,7 @@ func TestCompositeCounterKey_PrefixPreserved(t *testing.T) {
 	if got := seqKeyForTest("", "s", "tool", "t"); !strings.HasPrefix(got, "seq:") {
 		t.Errorf("sequenceHistoryKey = %q, want \"seq:\" prefix", got)
 	}
-	if got := compositeCounterKey("maxcalls", "s", "tool", "t"); !strings.HasPrefix(got, "maxcalls:") {
+	if got := capability.CompositeKey("maxcalls", "s", "tool", "t"); !strings.HasPrefix(got, "maxcalls:") {
 		t.Errorf("maxCalls key = %q, want \"maxcalls:\" prefix", got)
 	}
 }
@@ -1007,7 +1007,7 @@ func TestMaxCalls_LogicalKeyExcludesWindow(t *testing.T) {
 	// The window travels as the windowSec argument, never folded into the logical
 	// key — so the backend appends it exactly once and the physical key carries it
 	// once, not twice.
-	wantKey := compositeCounterKey("maxcalls", "", "sess-1", "tool", "export")
+	wantKey := capability.CompositeKey("maxcalls", "", "sess-1", "tool", "export")
 	if counter.gotKey != wantKey {
 		t.Errorf("maxCalls logical key = %q, want %q (window must not be in the key)", counter.gotKey, wantKey)
 	}

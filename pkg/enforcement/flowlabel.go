@@ -43,7 +43,7 @@ func (e *Engine) flowKey(req *capability.EnforceRequest) string {
 // task anchoring it addresses only the key a task-less request on that session would have
 // written, which is exactly what teardown should reclaim.
 func (e *Engine) flowSessionKey(sessionID string) string {
-	return compositeCounterKey("flow", e.counterKeyNamespace, sessionID)
+	return capability.CompositeKey("flow", e.counterKeyNamespace, sessionID)
 }
 
 // handleFlowLabel enforces the sink half of information-flow control: denies when the
