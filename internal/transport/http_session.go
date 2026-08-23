@@ -1424,10 +1424,18 @@ func (s *httpSession) teardownDone() <-chan struct{} {
 func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 	// This method is the leg's outbound seam for notifications, which never reach the upstream
 	// CALL the translation wrapper covers. See translateNotificationForLeg.
-	msg, ok := translateNotificationForLeg(msg, resolveRevision(capability.ProtocolRevisionFromContext(ctx)), s.upstreamRev)
-	if !ok {
+	outbound, err := translateNotificationForLeg(msg, resolveRevision(capability.ProtocolRevisionFromContext(ctx)), s.upstreamRev)
+	if err != nil {
+		// Reported for the reason stdio's identical arm is: JSON-RPC forbids answering the peer,
+		// and the fault is this build's translation layer rather than the message, so a silent
+		// drop leaves an operator with a notification that simply never arrived.
+		if line, ok := s.noticeWriter().admitNotice(siteNotifyUntranslatable); ok {
+			line.writef("[eunox] HTTP session %s: notification %q could not be translated for the upstream leg, dropped: %v\n",
+				s.id, audit.BoundEnvelopeField(msg.Method), err)
+		}
 		return
 	}
+	msg = outbound
 	if s.upHTTPClient != nil {
 		// Remote-HTTP upstream: host ids are forwarded unchanged, so a cancel already
 		// correlates -- do not rewrite it.

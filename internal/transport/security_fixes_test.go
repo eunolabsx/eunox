@@ -4,6 +4,9 @@
 package transport
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // TestLoopbackOnly_DNSRebindingHostRejected pins the DNS-rebinding guard on the
@@ -358,13 +362,18 @@ func (w *gatedSSEWriter) Write(p []byte) (int, error) {
 // wall-clock re-anchor. expTimer runs on the MONOTONIC clock, which does not advance while the
 // host is suspended, so on resume the timer has not fired although exp has passed in wall-clock
 // terms. The keepalive arm re-checked for that; the arm that moves DATA did not, and kept
-// delivering to an expired token for up to sseKeepaliveInterval.
+// delivering to an expired token for up to sseKeepaliveInterval past exp.
 //
 // The suspend itself needs a clock seam this package does not have, so the pin is its
 // consequence with both arms READY: the token is already expired (tokenExpiry fires at once) and
-// the gate fills the subscriber buffer just before the select. Go picks between ready arms at
-// random, so pre-fix the ch arm wrote a data frame on about half of these rounds and post-fix on
-// none of them.
+// the gate delivers a server-initiated request into the subscriber buffer just before the
+// select. Go picks between ready arms at random, so pre-fix the ch arm wrote a data frame on
+// about half of these rounds and post-fix on none of them.
+//
+// A server-initiated REQUEST rather than a notification, because it pins the OTHER half of the
+// change: the message is already consumed from the buffer when the check fires, so
+// removeSubAndDrain will not recover it and the arm must fail it back to the upstream itself.
+// With an id-less notification `unblock` short-circuits and deleting that call would still pass.
 func TestHandleMCPGet_ExpiredTokenDeliversNoData(t *testing.T) {
 	fu := newFakeUpstream()
 	fakeServer := httptest.NewServer(fu)
@@ -376,8 +385,14 @@ func TestHandleMCPGet_ExpiredTokenDeliversNoData(t *testing.T) {
 	if sess == nil {
 		t.Fatal("session not found after initialize")
 	}
+	// The unblocker answers the blocked initiator through the session's upstream sink; a remote
+	// session has none, so give it a capturing one to read the disposition back off.
+	uw := &mockUpstreamWriter{}
+	sess.upWriter = mcp.NewMsgWriter(&writerAdapter{uw})
 
-	for round := 0; round < 40; round++ {
+	const rounds = 40
+	expiredWhileDelivering := 0
+	for round := 0; round < rounds; round++ {
 		req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
 		req.Header.Set(SessionHeader, sessID)
 		req = req.WithContext(pdp.WithJWTClaims(req.Context(), &pdp.JWTClaims{
@@ -385,15 +400,36 @@ func TestHandleMCPGet_ExpiredTokenDeliversNoData(t *testing.T) {
 			ExpiresAt: time.Now().Add(-time.Hour),
 		}))
 
+		id := json.RawMessage(fmt.Sprintf(`"srv-%d"`, round))
 		rec := &gatedSSEWriter{ResponseRecorder: httptest.NewRecorder(), gate: func() {
-			for i := 0; i < sseSubscriberBufferSize; i++ {
-				sess.broadcast(mcp.RPCMsg{JSONRPC: "2.0", Method: "notifications/message"})
-			}
+			sess.broadcastServerRequest(context.Background(), mcp.RPCMsg{
+				JSONRPC: "2.0", ID: &id, Method: capability.MethodSamplingCreateMessage,
+			})
 		}}
 		proxy.handleMCPGet(rec, req, proxy.routes[""])
 
 		if strings.Contains(rec.Body.String(), "data:") {
 			t.Fatalf("round %d: SSE stream delivered data to an expired token: %q", round, rec.Body.String())
 		}
+	}
+
+	// Whichever arm won each round, the upstream must never be left blocked: the expiry check
+	// answers a request it consumed, removeSubAndDrain answers one still buffered.
+	if len(uw.messages) != rounds {
+		t.Fatalf("blocked initiators answered = %d, want %d: a server-initiated request was left hanging", len(uw.messages), rounds)
+	}
+	for _, m := range uw.messages {
+		if m.Error == nil {
+			t.Fatalf("an unblocking reply carried no error: %+v", m)
+		}
+		if strings.Contains(m.Error.Message, "token expired") {
+			expiredWhileDelivering++
+		}
+	}
+	// Pre-fix the ch arm delivered instead of failing back, so this counter stayed at zero while
+	// every round was answered by the drain. Its being non-zero is what proves the arm's own
+	// fail-back runs; over 40 rounds a fair select misses it with probability 2^-40.
+	if expiredWhileDelivering == 0 {
+		t.Errorf("no round failed a consumed server-initiated request back with the expiry reason; the message arm's fail-back never ran")
 	}
 }
