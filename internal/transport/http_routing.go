@@ -457,19 +457,24 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 //
 // Negotiated FIRST, as every other arm on this transport is: this was the one host-leg refusal
 // taken ahead of the revision, so a peer whose declaration this build cannot honor got a bare
-// 400 and nothing on the tape, while the identical bytes on any other path were recorded as
+// 400 and nothing on the tape, while the identical bytes on every other path were recorded as
 // UNSUPPORTED_PROTOCOL_VERSION. Nothing durable is pinned here — there is no session to pin on,
 // which is the whole subject of this refusal.
 //
-// That ordering is also what keeps the 400 from ever instructing a 2026-07-28 host to send
-// `Mcp-Session-Id`, a header its revision retired and which it cannot produce. Such a peer is
-// refused above: a sessionless POST has no context to have pinned a revision in, so it resolves
-// to the default and the declaration disagrees. Which is to say the reason a declaring host is
-// unservable over HTTP today is the context pin, not this header — and the remedy is session
-// creation on first request, which is ADR-0004's to decide. A revision-aware branch here would
-// be unreachable code standing in for that decision.
+// The refusal is then revision-aware, because a declaring peer now REACHES it: this arm asserts
+// no context (sessionlessLeg), so a 2026-07-28 declaration establishes one instead of being
+// refused above. Demanding `Mcp-Session-Id` of such a peer would instruct it to send a header
+// its revision removed and a conformant client cannot produce. What it actually needs is session
+// creation on the first enforced request — decided in ADR-0004 and not yet built — so the
+// refusal names that, and its own status, rather than a remedy that cannot work.
 func (p *HTTPProxy) refuseSessionlessPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) {
-	if _, ok := p.negotiateHostRevision(w, r, route, nil, msg); !ok {
+	rev, ok := p.negotiateHostRevision(w, r, route, nil, msg)
+	if !ok {
+		return
+	}
+	if declaresPerRequestRevision(rev) {
+		http.Error(w, "this build cannot serve a "+rev.String()+" host over HTTP yet: the revision has no session header, and creating a session on the first enforced request is not implemented",
+			http.StatusNotImplemented)
 		return
 	}
 	http.Error(w, SessionHeader+" header required", http.StatusBadRequest)
@@ -1356,18 +1361,33 @@ const (
 	killDimensionJTI = "jti"
 )
 
-// sessionlessLeg is the leg every pre-session arm negotiates against: `initialize` exists only
-// in the handshake-bearing revision, so that is the context, and nothing this arm answers
-// reaches an upstream.
+// sessionlessLeg is the leg a pre-session arm negotiates against. Nothing these arms answer
+// reaches an upstream, so the only question is what CONTEXT the message is held to — and that
+// is per-arm rather than a property of being sessionless (ADR-0004 §Addendum 2026-08-23).
 //
-// It is also why the same stray bytes are refused under DIFFERENT codes on the two transports,
-// which is a property of the legs rather than a drift between them: these arms exist only to
-// answer `initialize`, so a declaration naming any other revision contradicts the context and
-// is refused UNSUPPORTED_PROTOCOL_VERSION. stdio has no such arm — its first message may
-// legitimately declare any revision, since a peer there need never handshake — so the identical
-// line resolves, is dropped by the fail-closed routing default as UNROUTABLE_METHOD, and
-// (see StdioProxy.negotiateHostRevision) does not pin the connection on its way out.
-func sessionlessLeg() hostLeg { return hostLeg{contextRev: handshakeRevision} }
+// An `initialize` arm asserts the handshake revision, because answering `initialize` IS the
+// negotiation: a declaration naming any other revision there genuinely contradicts the context
+// the message is establishing, and is refused UNSUPPORTED_PROTOCOL_VERSION.
+//
+// Every OTHER pre-session message asserts nothing, and its declaration ESTABLISHES the context
+// instead of being checked against one. A first message cannot FLIP a context — it opens one —
+// so holding it to the handshake revision refused a declaring peer for contradicting a context
+// it had never opened, which is why a 2026-07-28 host was unservable over HTTP at all: the
+// refusal landed above session creation, so nothing could reach the path that would mint it.
+// The mid-context flip refusal is untouched and governs from the second message on, which is
+// where a peer probing for the more permissive table actually lives; and omission still
+// resolves to capability.DefaultRevision, so nothing widens by leaving a declaration out.
+//
+// This is also what narrows a divergence between the transports to the `initialize` arms alone:
+// stdio has no pre-session context to assert (a peer there need never handshake), so the same
+// stray bytes resolve, are dropped by the fail-closed routing default as UNROUTABLE_METHOD, and
+// (see StdioProxy.negotiateHostRevision) do not pin the connection on their way out.
+func sessionlessLeg(msg mcp.RPCMsg) hostLeg {
+	if msg.Method == mcp.MethodInitialize {
+		return hostLeg{contextRev: handshakeRevision}
+	}
+	return hostLeg{}
+}
 
 // leg is the established session's answer to the same question.
 func (s *httpSession) leg() hostLeg {
@@ -1405,11 +1425,11 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	// emergency stop, and eunox can answer at its own revision without relaying anything the
 	// host said).
 	//
-	// The pre-session arms pass a nil session: `initialize` exists only in the handshake-bearing
-	// revision, so that is their context, and nothing they answer reaches an upstream. Branched
+	// The pre-session arms pass a nil session; what context they hold the message to is
+	// sessionlessLeg's question, and it depends on the message rather than on the arm. Branched
 	// rather than built unconditionally, since evaluating the sessionless peer's literal would
 	// put its allocation back on every established request.
-	leg, peer := sessionlessLeg(), hostGatePeer(nil)
+	leg, peer := sessionlessLeg(msg), hostGatePeer(nil)
 	if sess != nil {
 		leg, peer = sess.leg(), sess
 	} else {

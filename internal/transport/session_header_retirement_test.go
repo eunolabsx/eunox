@@ -105,17 +105,14 @@ func TestSessionHeaderRetirement_NoDeclaringResponseCarriesTheHeader(t *testing.
 	}
 }
 
-// And the refusal a declaring host DOES get today does not demand the retired header back.
+// And the refusal a declaring host gets does not demand the retired header back.
 //
-// This is the D3 residual stated as a test rather than left in prose. A declaring peer is not
-// servable over HTTP yet, but the reason is NOT this header: a sessionless POST has no context
-// to have pinned a revision in, so it resolves to the default and the declaration disagrees —
-// refused at negotiation, above the session question entirely. What matters for the retirement
-// is the shape of what comes back: a protocol refusal naming the revisions this build speaks,
-// never an instruction to send a header 2026-07-28 removed and a conformant host cannot produce.
-//
-// The cell changes the day session creation on first request lands, which is when it should be
-// re-read rather than deleted.
+// This cell was written in W3 to change on the day the negotiation half landed, and it has: a
+// declaring peer now REACHES this refusal instead of being turned away above it, so what the
+// refusal says became reachable and had to become honest. Demanding `Mcp-Session-Id` of a
+// 2026-07-28 host instructs it to send a header its revision removed and a conformant client
+// cannot produce; what it needs is session creation on the first enforced request, which is
+// decided (ADR-0004) and not yet built. It will change once more when that lands.
 func TestSessionHeaderRetirement_TheSessionlessRefusalDoesNotDemandARetiredHeader(t *testing.T) {
 	t.Parallel()
 	srv, _, _ := forwardingProxy(t, nil)
@@ -125,10 +122,11 @@ func TestSessionHeaderRetirement_TheSessionlessRefusalDoesNotDemandARetiredHeade
 	body := new(bytes.Buffer)
 	_, _ = body.ReadFrom(resp.Body)
 
+	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode,
+		"a declaring host's request is not malformed; it is unservable on this build")
 	assert.NotContains(t, body.String(), SessionHeader,
 		"the refusal instructs a 2026-07-28 host to send a header its revision removed")
-	assert.Contains(t, body.String(), capability.ErrCodeUnsupportedProtocolVersion,
-		"a declaring host must be refused as a protocol disagreement, not as a missing session")
+	assert.Contains(t, body.String(), "not implemented")
 
 	// The old revision is unchanged: it still gets the 400 naming the header it really does
 	// need, which is this release's regression invariant.

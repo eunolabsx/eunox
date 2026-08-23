@@ -27,6 +27,28 @@ Section conventions:
 
 ### Added
 
+- **A 2026-07-28 host's first HTTP request now gets past negotiation.** What a pre-session
+  message is held to became a property of the MESSAGE rather than of being sessionless: an
+  `initialize` arm asserts the handshake revision, because answering `initialize` *is* the
+  negotiation and a declaration naming another revision there contradicts the very context the
+  message is opening. Every other pre-session message asserts nothing, so its declaration
+  **establishes** a context instead of being checked against one — a first message cannot *flip*
+  a context, it opens one.
+
+  This is why a 2026-07-28 host could not be served over HTTP at all, and why the reason was
+  never `Mcp-Session-Id`: the sessionless arm asserted the handshake revision, so a declaring
+  peer was refused `UNSUPPORTED_PROTOCOL_VERSION` **above** session creation and nothing could
+  reach the path that would mint one.
+
+  Omission still resolves to 2025-11-25, so nothing widens by leaving a declaration out, and the
+  mid-context flip refusal governs unchanged from the second message on — which is where a peer
+  probing for the more permissive table actually lives. Establishing is not flipping, and only
+  establishing was relaxed. (ADR-0004 §Addendum 2026-08-23, ratified with the record.)
+
+  Session creation on that first request is the next step and is not yet built, so such a host
+  is now told exactly that — with `501 Not Implemented` rather than a `400` demanding a header
+  its revision removed and a conformant client cannot produce.
+
 - **The 2026-07-28 routing headers, held to the body they describe.** That revision requires
   `Mcp-Method` and `Mcp-Name` on every Streamable HTTP POST so an intermediary can route, meter
   and log a request without parsing its body. eunox is precisely that intermediary — and its own
