@@ -418,9 +418,9 @@ func TestTranslateNotificationForLeg(t *testing.T) {
 	t.Run("the declaration is added toward a declaring leg", func(t *testing.T) {
 		t.Parallel()
 		notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsCancelled, Params: json.RawMessage(`{"requestId":"7"}`)}
-		got, ok := translateNotificationForLeg(notif, capability.Revision20251125, capability.Revision20260728)
-		if !ok {
-			t.Fatal("a translatable notification was dropped")
+		got, err := translateNotificationForLeg(notif, capability.Revision20251125, capability.Revision20260728)
+		if err != nil {
+			t.Fatalf("a translatable notification was dropped: %v", err)
 		}
 		declared, present, err := mcp.DeclaredRevisionOf(got)
 		if err != nil {
@@ -440,9 +440,9 @@ func TestTranslateNotificationForLeg(t *testing.T) {
 			JSONRPC: "2.0", Method: methodNotificationsProgress,
 			Params: json.RawMessage(`{"progressToken":"p","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`),
 		}
-		got, ok := translateNotificationForLeg(notif, capability.Revision20260728, capability.Revision20251125)
-		if !ok {
-			t.Fatal("a translatable notification was dropped")
+		got, err := translateNotificationForLeg(notif, capability.Revision20260728, capability.Revision20251125)
+		if err != nil {
+			t.Fatalf("a translatable notification was dropped: %v", err)
 		}
 		if strings.Contains(string(got.Params), capability.MetaKeyProtocolVersion) {
 			t.Errorf("params = %s, want the declaration removed for a leg that negotiates once", got.Params)
@@ -456,9 +456,9 @@ func TestTranslateNotificationForLeg(t *testing.T) {
 		t.Parallel()
 		params := json.RawMessage(`{"requestId":"7","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`)
 		notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsCancelled, Params: params}
-		got, ok := translateNotificationForLeg(notif, capability.Revision20260728, capability.Revision20260728)
-		if !ok {
-			t.Fatal("a matched-pair notification was dropped")
+		got, err := translateNotificationForLeg(notif, capability.Revision20260728, capability.Revision20260728)
+		if err != nil {
+			t.Fatalf("a matched-pair notification was dropped: %v", err)
 		}
 		if string(got.Params) != string(params) {
 			t.Errorf("params rewritten on a matched pair:\n got %s\nwant %s", got.Params, params)
@@ -471,7 +471,7 @@ func TestTranslateNotificationForLeg(t *testing.T) {
 		// at negotiation — so a translation failure here can only be dropped. What must not
 		// happen is forwarding it untranslated.
 		notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsCancelled, Params: json.RawMessage(`"scalar"`)}
-		if _, ok := translateNotificationForLeg(notif, capability.Revision20251125, capability.Revision20260728); ok {
+		if _, err := translateNotificationForLeg(notif, capability.Revision20251125, capability.Revision20260728); err == nil {
 			t.Error("a notification whose params could not be translated was admitted for forwarding")
 		}
 	})

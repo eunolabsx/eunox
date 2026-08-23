@@ -297,7 +297,7 @@ Section conventions:
 
   Fail-closed behavior is unchanged in every case: the chain still restarts from genesis and the
   record is never resumed onto. Only the forensic label on the tape changes. See the threat model
-  §3.4 (rev 1.88).
+  §3.4 (rev 1.89).
 
 - **`DeclassifyApproval.Covers` compared its target untrimmed while `Validate` accepted a padded
   one.** `Validate` checks a trimmed local copy it never writes back, and a programmatically built

@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -636,4 +637,77 @@ func TestServeHost_ConcurrencyCapRejectsWhenSaturated(t *testing.T) {
 	if ok, suppressed := run.proxy.hostSaturation.admit(); !ok || suppressed != 1 {
 		t.Fatalf("the proxy's gate must re-arm and carry the elided refusal; ok=%v suppressed=%d, want true/1", ok, suppressed)
 	}
+}
+
+// TestStdioForwardHostNotification_WriteErrorIsReported is the stdio counterpart of the HTTP
+// subprocess arm's regression. Both legs write a forwarded notification straight out — there is
+// no upstream CALL to carry the failure — so once a write timeout has poisoned the MsgWriter, or
+// the child has closed stdin, every forward is dropped with nothing on stderr and nothing on the
+// tape. A notifications/cancelled lost this way leaves the call it was aborting running.
+func TestStdioForwardHostNotification_WriteErrorIsReported(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	p, _ := newStdioProxy(stdioServe{
+		upSink: mcp.NewMsgWriter(&failingWriter{}),
+		stderr: &out,
+	}, strings.NewReader(""))
+
+	// progress rather than initialized (swallowed, never forwarded) or cancelled (dropped by
+	// the nonce rewrite when the target request is not in flight): this is the plain forward.
+	p.forwardHostNotification(context.Background(),
+		mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress})
+
+	if got := out.String(); !strings.Contains(got, methodNotificationsProgress) ||
+		!strings.Contains(got, "write to upstream failed") {
+		t.Errorf("a dropped notification must not be silent; stderr = %q", got)
+	}
+}
+
+// TestForwardNotification_UntranslatableIsReported covers the OTHER silent drop in the same two
+// functions: a notification the revision-translation layer cannot rewrite for the upstream leg.
+// JSON-RPC forbids answering the peer and the fault is this build's translation layer rather
+// than the message, so a bare drop left an operator with a notification that simply never
+// arrived. Both transports report it on the one declared site.
+func TestForwardNotification_UntranslatableIsReported(t *testing.T) {
+	t.Parallel()
+	// A progress notification whose params are a scalar: admitted at negotiation, unrewritable
+	// here. The host context is the default revision and the leg is addressed as the declaring
+	// one, so the translation runs rather than short-circuiting on a matched pair. Not a cancel,
+	// which stdio drops at the nonce rewrite before the translation is reached.
+	notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress, Params: json.RawMessage(`"scalar"`)}
+
+	t.Run("stdio", func(t *testing.T) {
+		t.Parallel()
+		var out bytes.Buffer
+		p, _ := newStdioProxy(stdioServe{upSink: &mockUpstreamWriter{}, stderr: &out}, strings.NewReader(""))
+		p.upstreamRev = capability.Revision20260728
+
+		p.forwardHostNotification(context.Background(), notif)
+
+		if got := out.String(); !strings.Contains(got, "could not be translated") {
+			t.Errorf("an untranslatable notification was dropped silently; stderr = %q", got)
+		}
+	})
+
+	t.Run("http", func(t *testing.T) {
+		t.Parallel()
+		var out bytes.Buffer
+		uw := &mockUpstreamWriter{}
+		sess := newTestSession(&httpSession{
+			id:          "sess-xlate",
+			done:        make(chan struct{}),
+			upWriter:    mcp.NewMsgWriter(&writerAdapter{uw}),
+			upstreamRev: capability.Revision20260728,
+			proxy:       &HTTPProxy{stderr: &out},
+		})
+
+		sess.forwardNotification(context.Background(), notif)
+
+		if got := out.String(); !strings.Contains(got, "could not be translated") {
+			t.Errorf("an untranslatable notification was dropped silently; stderr = %q", got)
+		}
+		if len(uw.messages) != 0 {
+			t.Errorf("an untranslatable notification reached the upstream: %+v", uw.messages)
+		}
+	})
 }

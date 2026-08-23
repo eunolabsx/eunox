@@ -1104,6 +1104,15 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	for {
 		select {
 		case msg := <-ch:
+			// The same wall-clock re-anchor the keepalive arm applies, on the arm that moves
+			// DATA: expTimer is monotonic, so after a host suspend this arm would otherwise keep
+			// delivering to an expired token until the next keepalive tick. Fail the delivery
+			// rather than dropping it, for the reason the write-failure arm below does: this
+			// message is already consumed, so removeSubAndDrain will not recover it.
+			if !tokenExpiresAt.IsZero() && !time.Now().Before(tokenExpiresAt) {
+				sess.failServerRequestDelivery(r.Context(), msg, "proxy: token expired before delivering server-initiated request")
+				return
+			}
 			data, err := json.Marshal(msg)
 			if err != nil {
 				// Unserializable. If it's a server-initiated request, the upstream is now

@@ -35,7 +35,10 @@ func NonCommittingConditionVerdict(ctx context.Context, cond capability.Conditio
 // A nil engine answers from the built-ins, so an embedder holding an unwired *Engine (the
 // fields are unexported, a legitimate state) gets this build's semantics instead of a panic.
 func (e *Engine) NonCommittingConditionVerdict(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (*ConditionError, bool) {
-	if cond == nil {
+	// isTypedNil for the reason the handler half below applies it, one seam over: every
+	// ConditionType() has a VALUE receiver, so a nil pointer boxed in the interface survives
+	// == nil and panics on the auto-dereference this lookup performs.
+	if cond == nil || isTypedNil(cond) {
 		return nil, false
 	}
 	if e == nil {
