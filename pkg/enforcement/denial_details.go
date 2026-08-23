@@ -287,7 +287,7 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 	case map[string]interface{}:
 		return boundDetailMap(t, budget, depth+1)
 	case []interface{}:
-		return boundDetailSlice(in2any(t), budget,
+		return boundDetailSlice(t, budget,
 			func(s string) interface{} { return s },
 			func(e interface{}) interface{} { return boundDetailValue(e, budget, depth+1) })
 	case []string:
@@ -324,10 +324,6 @@ func boundDetailValue(v interface{}, budget *int, depth int) interface{} {
 		return v
 	}
 }
-
-// in2any is the identity on []interface{}, present only so the []interface{} arm can
-// instantiate the same generic helper the []string arm uses.
-func in2any(v []interface{}) []interface{} { return v }
 
 // chargeBoundedString bounds s and charges the result against budget, reporting false when
 // that exhausts it — the one place subtract-then-check lives, so no caller can charge and

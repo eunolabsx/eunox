@@ -197,14 +197,6 @@ type Clock interface {
 // gate (documented in docs/capability-manifest-guide.md).
 const sequenceHistoryWindowSec = 86400 // 24h
 
-// compositeCounterKey joins prefix and the variadic parts into one counter key,
-// length-prefixing each part so it is injective for arbitrary byte content — no ":" or NUL a
-// part contains can forge a different tuple's key. Delegates to capability.CompositeKey, the
-// repo's one anti-forgery key encoding, under this counter-side name.
-func compositeCounterKey(prefix string, parts ...string) string {
-	return capability.CompositeKey(prefix, parts...)
-}
-
 // sequenceHistoryMaxEntries caps how many per-(session, tool) call markers the history
 // retains. sequenceBlock only asks "did this tool run at least once?", so one marker
 // suffices; more would grow the slice unboundedly for a one-bit question.

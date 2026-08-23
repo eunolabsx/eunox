@@ -1424,7 +1424,7 @@ func (s *httpSession) teardownDone() <-chan struct{} {
 func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 	// This method is the leg's outbound seam for notifications, which never reach the upstream
 	// CALL the translation wrapper covers. See translateNotificationForLeg.
-	msg, ok := translateNotificationForLeg(msg, resolveRevision(capability.ProtocolRevisionFromContext(ctx)), s.upstreamRev)
+	msg, ok := translateNotificationForLeg(msg, requestRevision(ctx), s.upstreamRev)
 	if !ok {
 		return
 	}

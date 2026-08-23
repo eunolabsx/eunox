@@ -111,11 +111,3 @@ func (r *keyedRegistry[T]) reapLocked(v T) {
 		delete(r.entries, e.key)
 	}
 }
-
-// size reports how many values are live. Test-only, to make the refcounting that keeps a
-// long-lived proxy from accumulating one entry per anchor it has ever served observable.
-func (r *keyedRegistry[T]) size() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.entries)
-}

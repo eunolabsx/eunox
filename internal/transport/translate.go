@@ -452,8 +452,8 @@ func resultCrossesToHost(method string, resp mcp.RPCMsg, hostRev, legRev capabil
 //
 // The host revision comes from the CONTEXT, not from a field, because it is decided per request
 // (capability.WithProtocolRevision, stamped by each transport's negotiation) while the leg
-// revision is fixed for the leg's life. resolveRevision handles the empty carrier the same way
-// every other reader of it does.
+// revision is fixed for the leg's life. requestRevision handles the empty carrier, so this
+// reader cannot resolve it differently from any other dispatch decision.
 //
 // A matched pair returns inner untouched at the first branch of each translate step, so nothing
 // about the byte stream a matched pair produces changes — the release's own regression
@@ -465,7 +465,7 @@ func withCrossRevisionTranslation(legRev capability.Revision, inner func(context
 		return nil
 	}
 	return func(ctx context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
-		hostRev := resolveRevision(capability.ProtocolRevisionFromContext(ctx))
+		hostRev := requestRevision(ctx)
 		if hostRev == upstreamAddressedRevision(legRev) {
 			return inner(ctx, msg)
 		}
