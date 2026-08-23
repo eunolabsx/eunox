@@ -128,6 +128,7 @@ func ClassifyWireCode(code int) WireCodeBand {
 // pre-registered entry with no emitter would be this file asserting a spec fact nothing checks.
 var SpecAssignedWireCodes = map[int]string{
 	JSONRPCCodeUnsupportedProtocolVersion: "the peer's protocol revision could not be established or could not be bridged",
+	JSONRPCCodeHeaderMismatch:             "a Streamable HTTP POST's routing headers disagree with the body they describe",
 }
 
 // MintableWireCode reports whether eunox may put code in a JSON-RPC error it produces, and why

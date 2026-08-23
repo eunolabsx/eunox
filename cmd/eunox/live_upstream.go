@@ -52,12 +52,10 @@ func fetchLiveTools(ctx context.Context, baseURL, authHeader string, tlsSkipVeri
 	// Capture the session id and arm the terminating DELETE BEFORE the err gate: a lenient
 	// upstream may have already allocated a server-side session even on a failed open,
 	// so it must be closed on every error path, not only success.
-	var sessID string
-	if respHdr != nil {
-		if sessID = respHdr.Get(transport.SessionHeader); sessID != "" {
-			//nolint:contextcheck // teardown deliberately uses the helper's own bounded background context: it runs from the defer as the probe's request context is being canceled.
-			defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, rev, os.Stderr)
-		}
+	sessID := transport.UpstreamSessionID(rev, respHdr)
+	if sessID != "" {
+		//nolint:contextcheck // teardown deliberately uses the helper's own bounded background context: it runs from the defer as the probe's request context is being canceled.
+		defer transport.DeleteMCPHTTPSession(client, endpoint, sessID, authHeader, rev, os.Stderr)
 	}
 	if err != nil {
 		return LiveUpstreamInfo{}, fmt.Errorf("%s: %w", opener.Method, err)

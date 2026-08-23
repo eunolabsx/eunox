@@ -443,10 +443,36 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
+		p.refuseSessionlessPost(w, r, route, msg)
 		return
 	}
-	p.handleSessionPost(w, r, route, sessionID, msg)
+	// Past both early returns above, so this is the one arm whose forwards are made on a host's
+	// behalf — and therefore the only one that carries a grant (client_headers.go). Derived here,
+	// at the call site, because contextcheck requires an r.Context() derivation to be visible
+	// where it happens rather than buried in the callee.
+	p.handleSessionPost(w, grantHostHeaders(r, route), route, sessionID, msg)
+}
+
+// refuseSessionlessPost answers a host POST that carries no session and creates none.
+//
+// Negotiated FIRST, as every other arm on this transport is: this was the one host-leg refusal
+// taken ahead of the revision, so a peer whose declaration this build cannot honor got a bare
+// 400 and nothing on the tape, while the identical bytes on any other path were recorded as
+// UNSUPPORTED_PROTOCOL_VERSION. Nothing durable is pinned here — there is no session to pin on,
+// which is the whole subject of this refusal.
+//
+// That ordering is also what keeps the 400 from ever instructing a 2026-07-28 host to send
+// `Mcp-Session-Id`, a header its revision retired and which it cannot produce. Such a peer is
+// refused above: a sessionless POST has no context to have pinned a revision in, so it resolves
+// to the default and the declaration disagrees. Which is to say the reason a declaring host is
+// unservable over HTTP today is the context pin, not this header — and the remedy is session
+// creation on first request, which is ADR-0004's to decide. A revision-aware branch here would
+// be unreachable code standing in for that decision.
+func (p *HTTPProxy) refuseSessionlessPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, msg mcp.RPCMsg) {
+	if _, ok := p.negotiateHostRevision(w, r, route, nil, msg); !ok {
+		return
+	}
+	http.Error(w, SessionHeader+" header required", http.StatusBadRequest)
 }
 
 // handleSessionPost handles a host POST carrying an existing Mcp-Session-Id: it validates
@@ -1395,8 +1421,52 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 		// never written as a `{"jsonrpc":""}` frame" is one rule on this transport, and the
 		// refusal is one more caller of it.
 		writeDispatchResult(w, refusal)
+		return rev, false
 	}
-	return rev, ok
+	// The routing headers are checked HERE — inside the adapter every POST arm already calls —
+	// rather than at those three call sites, so a fourth arm cannot forward a request whose
+	// halves disagree by forgetting to ask. It runs AFTER negotiation because the check is
+	// revision-gated and the revision is what negotiation resolves; it runs BEFORE the
+	// dispatcher's own gates because a disagreeing pair is a fact about the HTTP envelope, not
+	// a verdict about the call, and the message must not reach an upstream to find out.
+	if err := checkRoutingHeaders(rev, r, msg); err != nil {
+		ctx := capability.WithProtocolRevision(r.Context(), rev)
+		writeDispatchResult(w, refuseHeaderMismatch(ctx,
+			p.headerMismatchRecorder(sess, route), headerRefusalSessionID(sess), msg, err))
+		return rev, false
+	}
+	return rev, true
+}
+
+// headerRefusalSessionID names the session a header refusal is recorded against, or "" for a
+// POST that has not resolved one. Read off the SESSION rather than the header the peer sent:
+// this refusal is about a peer's headers disagreeing with its body, so a claimed-but-unresolved
+// session id on the record would be one more caller-supplied string in a refusal that already
+// exists because the caller's strings disagreed.
+func headerRefusalSessionID(sess *httpSession) string {
+	if sess == nil {
+		return ""
+	}
+	return sess.id
+}
+
+// headerMismatchRecorder returns the route's sink when the header-mismatch bucket admits a
+// record now, and nil when it does not — refuseHeaderMismatch writes nothing for a nil recorder,
+// so the wire refusal is unaffected and only the tape write is bounded.
+//
+// Bounded for catRevision's reason and at the same cheapness: a POST carrying a disagreeing
+// `Mcp-Method` is refused at the envelope, before the kill check, holding no session slot and
+// contacting no upstream, so an unauthenticated peer drives one record per frame. Suppressed
+// refusals fold into the next admitted record rather than vanishing.
+func (p *HTTPProxy) headerMismatchRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
+	var rec auditRecorder
+	switch {
+	case route != nil:
+		rec = asRecorder(route.sink)
+	case p != nil:
+		rec = asRecorder(p.sink)
+	}
+	return p.routeRefusalLimits(sess, route).recorders(rec).forCategory(catHeaderMismatch)
 }
 
 // sessionlessGatePeer is the shared prologue's peer for HTTP's two PRE-SESSION arms — the

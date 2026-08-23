@@ -63,12 +63,14 @@ func TestWireCodes_ReservedBandIsOnlyReachedByASpecAssignedCode(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, map[int]string{
 		capability.JSONRPCCodeUnsupportedProtocolVersion: "the peer's protocol revision could not be established or could not be bridged",
+		capability.JSONRPCCodeHeaderMismatch:             "a Streamable HTTP POST's routing headers disagree with the body they describe",
 	}, capability.SpecAssignedWireCodes,
 		"a code added here is eunox claiming the MCP specification already assigned it this meaning; that claim is reviewed, not derived")
 
-	assert.Equal(t, capability.WireCodeBandSpecReserved,
-		capability.ClassifyWireCode(capability.JSONRPCCodeUnsupportedProtocolVersion),
-		"-32022 is in the reserved band, which is exactly why it needs the explicit assignment")
+	for _, code := range []int{capability.JSONRPCCodeUnsupportedProtocolVersion, capability.JSONRPCCodeHeaderMismatch} {
+		assert.Equalf(t, capability.WireCodeBandSpecReserved, capability.ClassifyWireCode(code),
+			"%d is in the reserved band, which is exactly why it needs the explicit assignment", code)
+	}
 
 	for _, code := range capability.AllDenialCodes {
 		wire, _ := capability.DenialWireCode(code)

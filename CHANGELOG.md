@@ -27,6 +27,53 @@ Section conventions:
 
 ### Added
 
+- **The 2026-07-28 routing headers, held to the body they describe.** That revision requires
+  `Mcp-Method` and `Mcp-Name` on every Streamable HTTP POST so an intermediary can route, meter
+  and log a request without parsing its body. eunox is precisely that intermediary — and its own
+  decision has never been affected, because it decides on the body. The hazard is the request it
+  FORWARDS: a pair whose halves disagree is metered and logged as one call while being executed
+  as another, by an upstream, a sidecar, or a log pipeline that trusts the cheap half. A proxy is
+  the one place that can be caught once, for all of them.
+
+  A disagreement is refused as `HEADER_MISMATCH` (wire code -32020, the integer the specification
+  assigns to this meaning) rather than as a parse error — an enforcement-confusion attempt gets
+  its own name on the tape. `Mcp-Method` is required unconditionally; `Mcp-Name` is required only
+  for a method that ADDRESSES something named, and verified whenever it is present: `tools/list`
+  names no target eunox could agree with, but a value sent anyway is still a claim about this
+  request that a downstream reader may act on. The audit detail names which header disagreed and
+  deliberately not the value it carried — that string is the caller's, and the record already
+  names the method and the target the body really carried — the latter supplied by the check that
+  compared against it, since the general identifier rule blanks the target for every
+  target-resolving method and that is every method an `Mcp-Name` mismatch is reachable on.
+
+  On the upstream leg eunox emits both, DERIVED from the body it is actually sending rather than
+  relayed from the one it received: the two are not always the same request. A target an HTTP
+  header cannot carry fails the call rather than being trimmed to fit, since altering it would
+  manufacture the very disagreement the check refuses. "Cannot carry" covers surrounding
+  whitespace, not just control bytes: Go trims spaces and tabs off every header value it writes
+  and off every one it reads, so such a target survives in neither direction — refused on both
+  legs as inexpressible, rather than reported as a mismatch the peer did not cause.
+
+  Only for a peer on the revision that defines the headers. A 2025-11-25 POST is byte-identical.
+
+- **`forwardClientHeaders`: host headers do not cross unless you name them.** The same revision
+  blesses a custom-header passthrough, which through a proxy is a channel to an upstream eunox
+  does not police. Nothing crosses by default, in either direction; a per-upstream
+  `forwardClientHeaders` list opts named headers into the host→upstream direction. There is no
+  wildcard — a wildcard is the default this posture exists to refuse, spelled as a configuration
+  — and no header eunox itself sets on the outbound request may be listed (`Authorization`, the
+  routing headers, the negotiated version, `Mcp-Session-Id`, `Cookie`, `Host`, the hop-by-hop
+  set, or whatever this route's own `upstreamAuthHeader` names). Listing one fails startup with
+  the reason rather than silently overriding a control eunox is accountable for.
+
+  A grant rides the forwards made **on behalf of** the host request that carried it, and nothing
+  else: eunox's own upstream requests — the opener, its completion, the session-start drift probe,
+  the terminating DELETE — carry no host header. The response direction has no key at all: eunox
+  builds its host-facing response and copies no upstream header into it, which is stronger than an
+  allowlist and raises no per-upstream question. HTTP-transport only, and no `defaults:` inheritance — the key grants a passthrough
+  rather than tuning one, and a default would make granting it to every route the shorter thing
+  to write.
+
 - **Per-token revocation: `eunox kill --jti <token-id>`.** The kill switch gains its finest
   dimension — one issued bearer token, rather than an identity or a connection. It is the one to
   reach for when a credential LEAKS: killing the agent stops everything that identity holds and
@@ -149,6 +196,20 @@ Section conventions:
   members its revision does not define.
 
 ### Changed
+
+- **`Mcp-Session-Id` is no longer captured from a 2026-07-28 upstream.** That revision removed
+  the header; an id a lenient upstream sends anyway is not a session to hold, and holding it
+  would make eunox stamp a retired header on every later request — an intermediary
+  re-introducing, in its own name, the state the revision sheds. The gate is on the READ, so an
+  id never captured is an id never sent, by the ordinary POST and by the terminating DELETE
+  alike (which correctly sends nothing at all: a stateless upstream has no session to
+  terminate). Unchanged for 2025-11-25 legs.
+
+- **A sessionless host POST is negotiated before it is refused.** It was the one host-leg
+  refusal taken ahead of the revision, so a peer whose declaration this build cannot honor got a
+  bare `400 Mcp-Session-Id header required` with nothing on the audit tape, while identical
+  bytes on every other arm were recorded `UNSUPPORTED_PROTOCOL_VERSION` (-32022). Such a
+  request is now refused with that code and recorded, which is also what keeps the 400 from ever instructing a 2026-07-28 host to send a header its revision removed.
 
 - **`killswitch.Checker.ShouldBlock` takes a `killswitch.Subject`** — `{AgentID, SessionID,
   JTI}` — instead of positional identity strings. Passed by value and allocation-free

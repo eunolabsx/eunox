@@ -862,6 +862,103 @@ handshake check, and the unchanged `auto` bytes),
 `internal/audit/protocol_revision_test.go` (sign-and-verify round-trip plus the tamper
 leg).
 
+### 3.17 Routing-Header Confusion (Metering One Call While Executing Another)
+
+**Threat.** 2026-07-28 requires `Mcp-Method` and `Mcp-Name` on every Streamable HTTP
+POST so an intermediary can route, meter and log a request **without parsing its body**.
+That is a real convenience and a real hazard in one instrument: the moment anything
+downstream acts on the cheap half, a request whose two halves disagree is metered,
+logged and rate-limited as one call while being EXECUTED as another. `Mcp-Method:
+tools/list` over a `tools/call` body is a call that appears in a sidecar's records as a
+catalog read.
+
+eunox is precisely the gateway those headers exist for, and its own decision has never
+been affected — it has always decided on the parsed body. So the exposure here is not
+that eunox is confused; it is that eunox **forwards** a disagreeing pair to an upstream,
+a sidecar, or a log pipeline that trusts the header. A proxy is also where the same
+revision's blessed **custom-header passthrough** becomes a smuggling surface: every
+header a host can set would otherwise become a channel to an upstream that eunox does
+not police, past a boundary whose whole purpose is that nothing crosses unexamined.
+
+**Mitigation.**
+
+- **A disagreeing pair is refused, once, for every downstream reader.** Both headers are
+  checked against the same decode of the same bytes the dispatcher acts on — re-reading
+  either later would reintroduce the differential. `Mcp-Method` is required
+  unconditionally (every request and notification names a method). `Mcp-Name` is required
+  only for a method that ADDRESSES something named and is verified whenever present: a
+  value sent on `tools/list` names no target eunox could agree with, but it is still a
+  claim about this request that a downstream reader may act on, so it is refused rather
+  than ignored.
+- **Recorded as an enforcement-confusion attempt, not a parse error.** The code is
+  `HEADER_MISMATCH` (JSON-RPC -32020, the integer the specification assigns to this
+  meaning — see the reserved-band rule in §3.16's wire-code partition), so an operator
+  grepping the tape for someone probing the boundary finds it under its own name. The
+  structured detail names WHICH header disagreed; the value it carried is deliberately
+  absent from the signed record, since it is attacker-chosen and the record already names
+  the method and the target the body really carried. That target is supplied by the check
+  that compared against it, not re-derived: the general identifier rule blanks the target for
+  any method that RESOLVES a target type — so a catalog read is never stamped with a tool named
+  after the method it arrived as — and that is every method an `Mcp-Name` mismatch is reachable
+  on, so without this the record would carry no target at all and the justification for omitting
+  the header value would be false.
+- **What eunox emits upstream is derived, never relayed.** The pair on an outbound POST is
+  computed from the body actually being sent, through the same derivation the inbound check
+  uses. The request eunox forwards is not always the one it received — a `*/list` may have
+  been filtered, a stdio host's message never had headers, and the opener and drift probe are
+  eunox's own — so relaying would propagate a claim about a different body. A target that
+  cannot be carried by an HTTP header **fails the call**: trimming or escaping it to fit would
+  manufacture the disagreement this section refuses, with eunox's signature on it. "Cannot be
+  carried" covers surrounding whitespace, not only control bytes — Go's client TRIMS spaces and
+  tabs off every value it writes, and its server trims them off every value it reads, so such a
+  target survives in neither direction. Both legs refuse it as inexpressible rather than
+  reporting a mismatch: inbound the comparison could never succeed, and blaming the host would
+  blame it for a difference its own HTTP stack created; outbound there is no header eunox could
+  send that would not name a different target than the body does.
+- **Host headers are stripped by default, in both directions.** Nothing a host sends crosses
+  to an upstream unless an operator named it, per upstream, in `forwardClientHeaders`. There
+  is no wildcard — a wildcard is the default this posture exists to refuse, spelled as a
+  configuration. No name eunox itself sets on the outbound request may be listed
+  (`Authorization`, the routing headers, the negotiated version, `Mcp-Session-Id`, `Cookie`,
+  `Host`, the hop-by-hop set): a forwarded header that collides with one of those is not a
+  passthrough but an override of a control eunox is accountable for, and it is refused at
+  startup where an operator can see it. Granted headers are applied BEFORE eunox's own, so
+  the precedence is structural rather than a consequence of the configuration check, and the
+  reserved question is asked again at request time as the backstop for names eunox does not
+  itself set. The grant is stamped on the one handler arm that forwards a host's own message, so
+  it rides forwards made **on behalf of** that request and nothing else: eunox's own upstream
+  requests — the opener, its completion, the session-start drift probe, the terminating DELETE —
+  are eunox talking for itself and carry no host header. The **response** direction has no key
+  at all: eunox builds its host-facing response and copies no upstream header into it, which is
+  stronger than an allowlist and needs no per-upstream question.
+- **Scoped to the revision that defines the headers.** A 2025-11-25 POST is unchanged —
+  that revision has no such headers, so requiring or reading them would refuse ordinary
+  traffic.
+
+**Residual.** The check establishes that the header and the body agree; it does not make
+the header trustworthy on its own for anything eunox does not verify. A downstream reader
+still learns only what the pair says about a request eunox admitted. And a granted header
+is granted: `forwardClientHeaders` moves the decision to the operator, and eunox does not
+inspect the values of a header it was told to forward.
+
+Resolving a target is also not free: it is `DecodeParams`' walk — the duplicate-key scan plus the
+decode, both linear in the whole params document, bounded only by the request-body cap. It is
+deliberately not a cheaper reader, because what eunox names in the header must be what the
+upstream reads out of the same bytes, and a second decoder spelling is the differential this
+section exists to close. The reachable cost today is ONE additional walk per forwarded
+target-addressing call, on a leg an operator pinned to a declaring revision; the inbound check's
+walk is not reachable over HTTP until session creation on first request lands. An enumeration
+resolves no target and pays nothing. `BenchmarkRoutingTargetOf` carries the numbers.
+
+**Coverage.** `internal/transport/routing_headers_test.go` (the mismatch matrix, the
+bound-and-stripped reflection, the spec code, the record naming the body's target, the emitted
+pair driven back through the inbound check, acceptance holding if and only if a value survives the
+wire byte-exact, and the inexpressible-target refusal on both legs — plus both upstream bridge
+paths), `internal/transport/client_headers_test.go` (the smuggling test: unlisted host headers
+never reach the upstream; the default forwards nothing; every header eunox sends is reserved;
+eunox's derived routing headers win; eunox's own opener carries no host header),
+`internal/config/forward_headers_test.go` (every refused allowlist entry).
+
 ---
 
 ## 4. Explicit Out-of-Scope Threats
@@ -1377,6 +1474,8 @@ We aim to acknowledge security reports within 48 hours and to provide an initial
 | 1.80    | 2026-08-22 | Eunolabs Platform Security | **Three invocations the stated contract calls incoherent stop being resolved silently.** **Half-described kill (§3.7):** `/control/kill` got its trailing-token refusal precisely so the kill EXECUTED cannot differ from the one a body reviewer reads, but that guard sees only a smuggled second JSON VALUE. Three shapes expressed the same half-described kill INSIDE one valid object and reached the handler as a bare `{"all":true}`: naming both `sessionId` and `"all":true` (the `all` arm ran first and discarded the session id), repeating `sessionId` after it (`encoding/json` keeps the last duplicate and binds names case-insensitively, so a `SESSIONID` spelling did it too), and misspelling it as `session_id` (dropped in silence). Each is a targeted kill turned into a deployment-wide stop, with the signed activation record naming a scope the body only half-describes. Fail-safe in blast-radius terms and therefore not urgent, but each resolves the ambiguity by a rule no reviewer of the body can see — field order, last-duplicate-wins, a silently-ignored member — which is the property the trailing-token guard exists to deny. That endpoint's body is now decoded as a CLOSED schema (ambiguous member names refused through the same primitive the reviewed-document loaders use, run before the decode that would resolve them; unmodelled members refused; the field pair refused), while `/mcp`'s JSON-RPC envelope stays open, since MCP may carry members this build does not model and those bytes cross to the upstream verbatim. The trailing-DOCUMENT variant was tested and none of these was. **Inert `--force` (§ none — CLI contract):** `eunox init` and `eunox suggest` accepted `--force` with no `--output`, where it names no file to overwrite and does nothing. The binary's stated rule, enforced everywhere else and written down at `contracts`' own unpaired-flag guard, is that an unpaired flag is REJECTED rather than silently inert — so an operator who believed they had named an output file got the manifest on stdout with nothing saying the invocation was incoherent. Both now exit 2, before the live upstream fetch and before the tape read respectively. **Exit-code and flag-help drift (§ none):** `suggest`'s usage block and its exit-code constant both documented exit 1 for a failed `--output` write while the code returns 2 (and a test pins 2), so a script written against the documented contract waited on a code it can never observe; `validate --upstream-protocol-version` help said "Ignored under --config" when the combination is in fact refused with exit 2; and `openAuditChain`'s doc named exit 1 where both callers exit with their own usage code. All three corrected to what the code does. No audit field, denial code, manifest token or schema version changes. **Operator-visible:** a `/control/kill` body naming both, and `init`/`suggest --force` without `--output`, are refused where they were previously accepted — all in the fail-safe direction. |
 | 1.81    | 2026-08-22 | Eunolabs Platform Security | **Two fail-closed seams where a discipline applied everywhere else had one leg left out, plus one documented-contract race.** **Wrapped-nil inner policy (§3.5):** `JWTPDP.innerEnforces` type-switched on `case nil`, which matches an *untyped* nil interface only. A `JWTPDPOptions.Inner` holding a typed nil — `(*ManifestPDP)(nil)`, the shape a consumer wiring one conditionally produces — fell to the default arm, was treated as a real policy backstop for an identity-only token, and the first such request dereferenced the nil receiver: a panicked request goroutine, on stdio the process, in place of the deny the wrapper owes. The package guards this exact shape at `CommitDeclassified` on both PDPs, and the transport's `requireUsableOptions` exists for it, so what shipped was the one leg of that convention left open. Normalized at CONSTRUCTION (`normalizedInner`, through `capability.IsNilValue`) rather than at each guard, since both constructors route through one assembler and the field is never reassigned — which makes the package's ~20 existing `p.inner != nil` guards correct for it rather than each needing its own reflection. Not reachable through the shipped wiring, which always passes concrete PDPs; filed because the failure mode inverts the package's core invariant. **Undelivered server-initiated request (§3.7):** the `!delivered` `ENFORCEMENT_ERROR` deny wrote straight through the leg's sink, reaching neither `refusalDeclarations` nor the call-site walk that holds every other transport refusal to a declared bucket or a declared exemption — and the walk surveys the *resolver* functions, so it could not see a bare writer. On HTTP with a local upstream the record is drivable by the upstream alone at one audit deny per request with no host cooperation (outrun the 16-slot SSE buffer, or hold no GET stream open), which is precisely the axis its siblings `displaced_server_request` and `failed_server_request` are metered on. It now resolves through `forCategory(undelivered_server_request)`, a new metered category, using the leg's own wiring — its tape paired with its buckets — so the record cannot name a tape the leg's other drop records do not. Its OWN category rather than the `failed_server_request` its asynchronous counterpart charges, for the reason `unroutable_server_request_id` has one: the two are not equally cheap to reach. This one needs no host at any point and an upstream drives one per request, while `failed_server_request`'s writers each need a request that was tracked and taken — so sharing a bucket would let the cheap flood suppress `failServerRequestDelivery`'s correction, and without that correction the earlier ALLOW stands on the tamper-evident tape claiming a delivery that never happened. The aggregate grows by one category's share rather than eroding the existing ones (§3.7). The exemption argument (it replaces the per-request record the leg writes anyway) is defensible, but per this package's own philosophy that judgment has to be an answer on the record rather than the absence of a call. **Poison-hook read (§3.9):** `MsgWriter.Write` fired its teardown hook off-lock deliberately (re-entrancy) but also *read the field* off-lock, while `SetPoisonHook` writes it under the writer's mutex — a data race under the concurrency contract both methods document, latent only because the in-tree caller installs before serving. The field is now read under the lock and called after it, on the poisoning frame alone so the ordinary write path is unchanged. **No audit-shape change:** the undelivered deny keeps its code, target and detail merge; what changes is that it can now be suppressed under a flood, folding into the next admitted record of its category exactly as its siblings do. |
 | 1.82    | 2026-08-22 | Eunolabs Platform Security | **A filtered catalog stops telling a shared cache it may be reused. L-6 mitigated for `*/list`, and its applicability line corrected.** eunox narrows every `*/list` it enforces to what one caller may see, and preserved the upstream's sibling fields verbatim — so a 2026-07-28 upstream's `cacheScope: public` reached the host on a response whose contents were authorization-context-specific, and a shared cache downstream of the proxy honoring it could serve one identity's narrowed view to another. Every filtered response is now clamped to `private`, applied at the ONE encoder all three filter paths reach (the manifest filters, the JWT claim filter, and the JWT intersection's splice), so the property holds by construction rather than by three call sites remembering. Anything other than `private` is clamped rather than only `public`: `cacheScope` is an open union, so an unrecognized or non-string value is an ambiguity, and the narrow reading is the only one that cannot leak. The clamp never ADDS the member — 2025-11-25 does not define it, and old-revision output stays byte-stable — and the wiretap passthrough is exempt by design, forwarding a catalog that is identical for every caller. L-6's status line also stopped saying "not yet applicable": that caveat predated the `protocolVersion` pin, and an operator reading it today to decide whether to pin a route was being told this could not affect them. What the clamp does NOT cover is now stated on the finding rather than implied by its title: a `resources/read` reply masked by a delegation chain's composed `redactFields` is caller-specific and carries its upstream `cacheScope` verbatim, because the clamp sits on the list-filter encoder and that reply does not pass through one. No new audit field, code value, manifest token or schema-version change. |
+| 1.83    | 2026-08-22 | Eunolabs Platform Security | **The 2026-07-28 routing headers are held to the body they describe, and the revision's blessed header passthrough is closed by default (new §3.17).** `Mcp-Method` and `Mcp-Name` exist so an intermediary can route, meter and log a Streamable HTTP POST without parsing it. eunox is that intermediary and has always decided on the body, so its own verdict was never at risk — what was, is every downstream reader eunox forwards to: a pair whose halves disagree is metered and logged as one call while being executed as another, and a proxy is the one place that can be caught once for all of them. A disagreement is now refused as `HEADER_MISMATCH` — a NEW structured audit code value, wire code -32020, the integer the specification itself assigns to this meaning, which is what makes minting into the revision's reserved band admissible here and nowhere else. `Mcp-Method` is required unconditionally; `Mcp-Name` is required only for a method that addresses something named but verified whenever present, since a value on a method that names nothing is still a claim a downstream reader may act on. The structured detail names which header disagreed and deliberately NOT the value it carried: that string is attacker-chosen, and the record already names the method and target the body really carried. The record also names the TARGET the body carried, supplied by the check that compared against it: the general identifier rule blanks the target for every method that resolves one, which is every method an `Mcp-Name` mismatch is reachable on, so the tape would otherwise have carried no target at all and the argument for omitting the header value would have been false. On the upstream leg eunox emits the pair DERIVED from the body it is sending rather than relayed from the one it received — the two are not always the same request — and a target an HTTP header cannot carry fails the call rather than being trimmed to fit, since altering it would manufacture the disagreement the check refuses. That covers surrounding whitespace and not only control bytes: Go trims spaces and tabs off every header value it writes AND off every one it reads, so such a target survives in neither direction and both legs refuse it as inexpressible rather than reporting a mismatch the peer did not cause. Separately, the revision's custom-header passthrough is a smuggling surface through a proxy: host headers are now stripped by default in both directions, with a per-upstream `forwardClientHeaders` allowlist (no wildcard, and no name eunox itself sets on the outbound request — refused at startup, with a request-time backstop and an apply-before-eunox's-own ordering that makes the precedence structural). The grant rides only the forwards made on behalf of the host request that carried it: eunox's own opener, drift probe and terminating DELETE carry no host header. The response direction has no key at all, eunox copying no upstream header into a response it builds itself. Also in this change: `Mcp-Session-Id` is no longer captured from a 2026-07-28 upstream, so eunox cannot stamp a retired header on a stateless leg in its own name; and a sessionless host POST is now negotiated before it is refused, which was the one host-leg refusal taken ahead of the revision — identical bytes elsewhere recorded `UNSUPPORTED_PROTOCOL_VERSION` while this arm answered a bare 400 with nothing on the tape. All of it is scoped to peers on the revision that defines the headers; 2025-11-25 traffic is byte-identical. New audit code value; no new audit FIELD, manifest token or schema-version change. |
+
 ---
 
 _Questions or corrections: open a GitHub issue tagged `security`, or email security@eunolabs.ai._

@@ -98,6 +98,11 @@ const (
 	// suppressed_refusal_count) and keeps identical bytes treated identically on the two
 	// transports, which is the property that stops the pair drifting.
 	catRevision refusalCategory = "revision"
+	// catHeaderMismatch bounds the 2026-07-28 routing-header refusal (-32020). Metered for
+	// catRevision's reason and at the same cheapness: a POST with a disagreeing `Mcp-Method`
+	// is refused at the envelope, before the kill check, holding no session slot and
+	// contacting no upstream — so an unauthenticated peer can drive one record per frame.
+	catHeaderMismatch refusalCategory = "header_mismatch"
 	// catUnroutable and catSmuggled are the two DECLARED-EXEMPT categories: they name a
 	// refusal so its non-metering is an answer on the record rather than an absent call. See
 	// refusalDeclarations for the reason, which is the same for both.
@@ -199,6 +204,7 @@ var refusalDeclarations = map[refusalCategory]refusalDeclaration{
 	catKill:                 {metering: meteringMetered},
 	catAudience:             {metering: meteringMetered},
 	catRevision:             {metering: meteringMetered},
+	catHeaderMismatch:       {metering: meteringMetered},
 	catDisplaced:            {metering: meteringMetered},
 	catUnroutableID:         {metering: meteringMetered},
 	catServerRequestFailed:  {metering: meteringMetered},

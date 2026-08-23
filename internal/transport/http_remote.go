@@ -313,9 +313,7 @@ func (s *httpSession) initRemoteUpstream(ctx context.Context) error {
 	// return headers alongside an error, and the upstream may already have ALLOCATED a
 	// session on such a response — close() must be able to DELETE it on every failure
 	// path below. A true transport error returns a nil header, so the guard skips it.
-	if respHdr != nil {
-		s.upstreamSessID = respHdr.Get(SessionHeader)
-	}
+	s.upstreamSessID = UpstreamSessionID(s.upstreamRev, respHdr)
 	if err != nil {
 		return fmt.Errorf("sending %s: %w", initReq.Method, err)
 	}
@@ -386,6 +384,11 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 		// unlike the client.Do path below — which would otherwise leak to stderr/the doctor bundle.
 		return mcp.RPCMsg{}, nil, fmt.Errorf("building request: %w", scrubURLError(err))
 	}
+	// Granted host headers go on FIRST, so every header eunox is accountable for below
+	// overwrites a forwarded one by construction rather than by configuration (client_headers.go).
+	if err := applyForwardedHeaders(ctx, req); err != nil {
+		return mcp.RPCMsg{}, nil, err
+	}
 	req.Header.Set("Content-Type", CTJSON)
 	// The spec requires the client to advertise both JSON and SSE content types so the
 	// server may answer either way.
@@ -398,6 +401,11 @@ func DoMCPHTTP(ctx context.Context, client *http.Client, endpoint string, msg mc
 	// keep in step with the rest.
 	if !openerNegotiatesVersion(rev, msg.Method) {
 		setNegotiatedVersionHeader(req, rev)
+	}
+	// Before anything is sent: an unsendable routing header fails the CALL, so a request whose
+	// headers could not describe it honestly never reaches the upstream at all.
+	if err := setRoutingHeaders(req, rev, msg); err != nil {
+		return mcp.RPCMsg{}, nil, err
 	}
 	if sessID != "" {
 		req.Header.Set(SessionHeader, sessID)
@@ -582,6 +590,26 @@ func scanSSELines(data []byte, atEOF bool) (advance int, token []byte, err error
 // It returns the decoded JSON-RPC response and the response headers.
 func (s *httpSession) doRemoteHTTP(ctx context.Context, msg mcp.RPCMsg, sessID string) (mcp.RPCMsg, http.Header, error) {
 	return DoMCPHTTP(ctx, s.upHTTPClient, s.mcpEndpointURL(), msg, sessID, s.route.upstreamAuthHeader, s.upstreamRev)
+}
+
+// UpstreamSessionID returns the upstream session id a response header establishes for a leg at
+// rev, or "" for a revision that retired the header.
+//
+// 2026-07-28 is stateless: it removed `Mcp-Session-Id` entirely, so an id from an upstream on
+// that revision is not a session to hold. Reading it anyway would make eunox stamp a retired
+// header on every later request to that upstream — an intermediary re-introducing the very
+// state the revision sheds, and doing it in eunox's name.
+//
+// The gate is on the READ rather than on each of the sends. An id never captured is an id never
+// sent, by DoMCPHTTP and by the terminating DELETE alike (which then correctly sends nothing at
+// all: a stateless upstream has no session to terminate). Three legs capture — the gateway
+// session, the stdio bridge and the CLI probe — and gating each send instead would have been
+// four places that must agree about one question.
+func UpstreamSessionID(rev capability.Revision, hdr http.Header) string {
+	if hdr == nil || declaresPerRequestRevision(rev) {
+		return ""
+	}
+	return hdr.Get(SessionHeader)
 }
 
 // setNegotiatedVersionHeader stamps MCP-Protocol-Version on a post-handshake upstream request.

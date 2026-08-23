@@ -224,3 +224,43 @@ func RevisionRefusalResponse(id *json.RawMessage, code, message string) RPCMsg {
 		},
 	}
 }
+
+// headerMismatchData is the `data` block a routing-header refusal carries, built once for the
+// same reason revisionRefusalData is: this refusal is reachable pre-authentication, so minting
+// JSON per request is what the cache exists to avoid.
+//
+// It names the two HEADERS rather than the published revisions. A header mismatch is not a
+// revision problem — telling a host which revisions eunox speaks would answer a question it did
+// not ask and did not get wrong.
+var headerMismatchData = buildHeaderMismatchData()
+
+func buildHeaderMismatchData() json.RawMessage {
+	data, _ := json.Marshal(struct {
+		Code     string   `json:"code"`
+		Required []string `json:"required"`
+	}{Code: capability.ErrCodeHeaderMismatch, Required: []string{"Mcp-Method", "Mcp-Name"}})
+	return data
+}
+
+// HeaderMismatchResponse builds the spec's -32020 refusal for a Streamable HTTP POST whose
+// routing headers disagree with the body they describe.
+//
+// The integer is DERIVED from capability.DenialWireCode rather than written here, so the
+// symbolic code and the integer a host branches on are paired in the one place that owns that
+// mapping. Its sibling above hardcodes the integer it shares with a second code; this one has a
+// code of its own and no reason to.
+//
+// message is the mismatch's own text, already bounded and control-stripped where it quotes what
+// the peer sent.
+func HeaderMismatchResponse(id *json.RawMessage, message string) RPCMsg {
+	wire, _ := capability.DenialWireCode(capability.ErrCodeHeaderMismatch)
+	return RPCMsg{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &RPCError{
+			Code:    wire,
+			Message: capability.ErrCodeHeaderMismatch + ": " + message,
+			Data:    headerMismatchData,
+		},
+	}
+}

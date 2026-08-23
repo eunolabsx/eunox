@@ -39,6 +39,10 @@ type UpstreamRoute struct {
 	upstreamURL           string
 	upstreamAuthHeader    string
 	upstreamTLSSkipVerify bool
+	// forwardClientHeaders is this route's host-header allowlist, canonical and sorted
+	// (config.CanonicalForwardClientHeaders). Empty — the default — forwards none, which is
+	// the posture rather than an unset value: see internal/config/forward_headers.go.
+	forwardClientHeaders []string
 	// upstreamProtocolVersion is the operator's explicit protocol-revision pin for this
 	// upstream; empty opens the leg with the handshake. Per route, not per proxy, because
 	// a gateway's upstreams migrate on independent schedules.
@@ -357,6 +361,7 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			upstreamURL:           u.UpstreamURL,
 			upstreamAuthHeader:    u.UpstreamAuthHeader,
 			upstreamTLSSkipVerify: u.UpstreamTLSSkipVerify,
+			forwardClientHeaders:  config.CanonicalForwardClientHeaders(u.ForwardClientHeaders),
 			// Empty when the operator wrote `auto` (or omitted the key): the handshake's own
 			// reported version wins. LoadGatewayConfig has already refused anything that is
 			// neither, so nothing this build cannot speak reaches the pin.
