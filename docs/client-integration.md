@@ -776,7 +776,7 @@ uses depends on how the proxy you want to stop shares its kill-switch state:
 
 | Proxy shape | How to revoke |
 | --- | --- |
-| HTTP proxy / gateway (`transport: http`) | `eunox kill --port <N> all` — POSTs to the loopback `/control/kill` endpoint. |
+| HTTP proxy / gateway (`transport: http`) | `eunox kill --port <N> all` — POSTs to the loopback `/control/kill` endpoint. `--host` must be a loopback spelling (`127.0.0.1`, `::1`, `localhost`); the endpoint is source-IP loopback-gated, so a remote host cannot succeed and the CLI refuses it rather than presenting the control token to whatever answers there. Use `--redis-addr` to revoke across a remote deployment. |
 | stdio proxy started with `--redis-addr` | `eunox kill --redis-addr <host:port> all` — writes the kill straight to the shared Redis state the proxy reads; the same command fans a revocation out to every instance on that Redis. |
 | stdio proxy with the default in-memory switch | No out-of-band channel — it is a single process wrapping one upstream, so stop that process (the client's "disconnect", or kill the `eunox` PID). |
 

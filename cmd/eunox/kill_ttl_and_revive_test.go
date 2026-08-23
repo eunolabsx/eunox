@@ -566,7 +566,13 @@ func TestReviveViaRedis_PublishOnlyFailureIsSuccessWithAWarning(t *testing.T) {
 					err = reviveViaRedis(context.Background(), ks, tc.target)
 				})
 				require.Contains(t, stderr, tc.verb, "the warning must name the operation it is about")
-				require.Contains(t, stderr, "IS written", "the warning's whole job is to say the revocation landed")
+				require.Contains(t, stderr, "IS written", "the warning's whole job is to say the write landed")
+				// Every --revive arm routes through the same warning, so its tail must be
+				// operation-NEUTRAL: telling an operator who just LIFTED a revocation that
+				// "the kill still takes effect" inverts what happened, on the emergency
+				// path, and invites exactly the wrong next move.
+				require.NotContains(t, stderr, "the kill still takes effect")
+				require.Contains(t, stderr, "the change still takes effect")
 				require.Contains(t, stderr, errPublishOnly.Error(), "the cause stays reachable for an operator diagnosing the ACL")
 				// The FLAG, never a duration: convergence happens on each running proxy's own
 				// --killswitch-reconcile-interval, and this command holds no proxy's config,

@@ -583,14 +583,21 @@ func TestWriteDoctorBundle_LiveSkippedWithoutFlag(t *testing.T) {
 	}
 }
 
-func TestWriteDoctorBundle_LiveRequiresConfig(t *testing.T) {
-	var buf bytes.Buffer
-	writeDoctorBundle(&buf, withLoadedConfig(doctorOptions{
-		live:      true,
-		auditTail: 0,
-	}))
-	if !strings.Contains(buf.String(), "--live requires --config") {
-		t.Errorf("expected --live-requires-config note:\n%s", buf.String())
+// TestCmdDoctor_LiveWithoutConfigIsRejected pins the binary-wide unpaired-flag rule on
+// doctor's one pairing: --live introspects the upstreams a config declares, so without one
+// it used to exit 0 with a skip note buried in section 5 — a bundle carrying no drift
+// report and nothing saying the invocation was incoherent. Rejected at parse time now,
+// with doctor's usage code (2), which is what keeps exit 1 meaning doctor's one FINDING.
+func TestCmdDoctor_LiveWithoutConfigIsRejected(t *testing.T) {
+	var code int
+	stderr := captureStderr(t, func() {
+		_ = captureStdout(t, func() { code = cmdDoctor([]string{"--live", "--audit-tail", "0"}) })
+	})
+	if code != doctorUsageExit {
+		t.Errorf("exit = %d, want %d (an unpaired flag is rejected, not silently inert)", code, doctorUsageExit)
+	}
+	if !strings.Contains(stderr, "--live requires --config") {
+		t.Errorf("stderr = %q, want it to name the unpaired flag", stderr)
 	}
 }
 
