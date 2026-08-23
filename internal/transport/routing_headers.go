@@ -40,6 +40,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/textproto"
 	"strings"
 
 	"github.com/eunolabs/eunox/internal/mcp"
@@ -85,6 +86,11 @@ type headerMismatch struct {
 	// reason completes "the <header> header …" and is composed from this build's own
 	// vocabulary plus, at most, a bounded quote of what the peer sent.
 	reason string
+	// target is what the BODY addresses, carried so the record can name it. auditIdentity
+	// cannot: it holds only the method, and blanks the identifier for exactly the
+	// target-resolving methods an Mcp-Name mismatch is reachable on. Empty for a method that
+	// addresses nothing named, and for params this build could not read.
+	target string
 }
 
 func (m headerMismatch) Error() string {
@@ -108,10 +114,15 @@ func checkRoutingHeaders(rev capability.Revision, r *http.Request, msg mcp.RPCMs
 	if msg.IsResponse() {
 		return nil
 	}
-	if err := checkMethodHeader(r, msg); err != nil {
+	// Decoded ONCE, here, and shared by both halves and by the record. The name check needs it
+	// to compare against; the method check needs it only so a Mcp-Method refusal can still name
+	// the target its body addressed. Non-target and list-shaped methods return before any decode
+	// happens, so the common path is unchanged.
+	target, named, decodeErr := routingTargetOf(msg)
+	if err := checkMethodHeader(r, msg, target); err != nil {
 		return err
 	}
-	return checkNameHeader(r, msg)
+	return checkNameHeader(r, target, named, decodeErr)
 }
 
 // checkMethodHeader holds Mcp-Method to the body's own method.
@@ -119,18 +130,22 @@ func checkRoutingHeaders(rev capability.Revision, r *http.Request, msg mcp.RPCMs
 // Required unconditionally: every request and notification names a method, so an absent header
 // is a peer omitting something its revision requires, and a downstream reader that routed on it
 // would route on nothing.
-func checkMethodHeader(r *http.Request, msg mcp.RPCMsg) error {
+func checkMethodHeader(r *http.Request, msg mcp.RPCMsg, target string) error {
+	fail := func(reason string) error {
+		return headerMismatch{header: RoutingHeaderMethod, reason: reason, target: target}
+	}
 	got := r.Header.Get(RoutingHeaderMethod)
 	if got == "" {
-		return headerMismatch{header: RoutingHeaderMethod, reason: "is required on this revision and was not sent"}
+		return fail("is required on this revision and was not sent")
+	}
+	if !headerExpressible(msg.Method) {
+		return fail(fmt.Sprintf("cannot describe this body: the method it invokes (%q) does not survive an HTTP header field verbatim",
+			boundRoutingHeader(msg.Method)))
 	}
 	if got != msg.Method {
 		// The BODY's method is not quoted: it is the peer's too, but quoting both doubles what
 		// a refusal reflects for no added diagnosis — the header is what disagreed.
-		return headerMismatch{
-			header: RoutingHeaderMethod,
-			reason: fmt.Sprintf("says %q, which is not the method this body invokes", boundRoutingHeader(got)),
-		}
+		return fail(fmt.Sprintf("says %q, which is not the method this body invokes", boundRoutingHeader(got)))
 	}
 	return nil
 }
@@ -146,32 +161,32 @@ func checkMethodHeader(r *http.Request, msg mcp.RPCMsg) error {
 // refused: the extractable set is the enforced methods, and a future method that names a target
 // in a shape this file does not know would otherwise be refused for eunox's ignorance rather
 // than for a disagreement.
-func checkNameHeader(r *http.Request, msg mcp.RPCMsg) error {
-	got := r.Header.Get(RoutingHeaderName)
-	want, named, err := routingTargetOf(msg)
-	if err != nil {
+func checkNameHeader(r *http.Request, want string, named bool, decodeErr error) error {
+	if decodeErr != nil {
 		// Unreadable params are not this check's refusal to make: the dispatcher decodes the
 		// same bytes and denies them with a target-bearing INVALID_REQUEST, which says more.
 		// Refusing here would replace that with a header complaint about a malformed body.
 		return nil
 	}
+	fail := func(reason string) error {
+		return headerMismatch{header: RoutingHeaderName, reason: reason, target: want}
+	}
+	got := r.Header.Get(RoutingHeaderName)
 	if !named {
 		if got == "" {
 			return nil
 		}
-		return headerMismatch{
-			header: RoutingHeaderName,
-			reason: fmt.Sprintf("says %q, but this method addresses nothing named", boundRoutingHeader(got)),
-		}
+		return fail(fmt.Sprintf("says %q, but this method addresses nothing named", boundRoutingHeader(got)))
+	}
+	if !headerExpressible(want) {
+		return fail(fmt.Sprintf("cannot describe this body: the target it addresses (%q) does not survive an HTTP header field verbatim",
+			boundRoutingHeader(want)))
 	}
 	if got == "" {
-		return headerMismatch{header: RoutingHeaderName, reason: "is required for this method and was not sent"}
+		return fail("is required for this method and was not sent")
 	}
 	if got != want {
-		return headerMismatch{
-			header: RoutingHeaderName,
-			reason: fmt.Sprintf("says %q, which is not the target this body addresses", boundRoutingHeader(got)),
-		}
+		return fail(fmt.Sprintf("says %q, which is not the target this body addresses", boundRoutingHeader(got)))
 	}
 	return nil
 }
@@ -255,7 +270,7 @@ func asHeaderMismatch(err error, out *headerMismatch) bool {
 // traffic needs the real one. Which header disagreed rides in the structured detail.
 func refuseHeaderMismatch(ctx context.Context, rec auditRecorder, sessionID string, msg mcp.RPCMsg, err error) mcp.RPCMsg {
 	if rec != nil {
-		identifier, method := auditIdentity(msg)
+		identifier, method := headerRefusalIdentity(msg, err)
 		rec.RecordDeny(ctx, sessionID, identifier, method,
 			capability.ErrCodeHeaderMismatch, "", headerMismatchDetail(err), false)
 	}
@@ -319,19 +334,39 @@ func setRoutingHeaders(req *http.Request, rev capability.Revision, msg mcp.RPCMs
 // error reaches an operator's console, and the reason it was rejected is precisely that it
 // holds bytes that drive a terminal.
 func setRoutingHeader(req *http.Request, name, value string) error {
-	if !sendableHeaderValue(value) {
-		return fmt.Errorf("cannot forward: %s would have to carry %q, which is not a valid HTTP header field value; the header must be byte-exact with the body and eunox will not alter it to fit", name, boundRoutingHeader(value))
+	if !headerExpressible(value) {
+		return fmt.Errorf("cannot forward: %s would have to carry %q, which does not survive an HTTP header field verbatim; the header must be byte-exact with the body and eunox will not alter it to fit", name, boundRoutingHeader(value))
 	}
 	req.Header.Set(name, value)
 	return nil
 }
 
-// sendableHeaderValue reports whether v may be sent verbatim as an HTTP header field value.
+// headerExpressible reports whether v survives an HTTP header field BYTE-EXACT, in both
+// directions.
+//
+// Two rules, and the second is the one that is easy to miss. net/http refuses to write a value
+// holding a control byte — that is sendableHeaderValue below. It also TRIMS leading and trailing
+// spaces and tabs off every value it writes, while Go's server trims them off every value it
+// reads. So a target with surrounding whitespace survives in NEITHER direction: emitting one
+// would put a header on the wire that no longer names what the body names, and comparing an
+// inbound one against the body would refuse a conformant host over a difference its own HTTP
+// stack created.
+//
+// Neither difference is one eunox may paper over, so both directions refuse rather than trim: a
+// value eunox altered to fit would be a header that describes a different call than the body
+// does, manufactured by the component whose job is to catch exactly that. A target that cannot
+// be described by the header its revision requires is one this proxy does not forward.
+func headerExpressible(v string) bool {
+	return sendableHeaderValue(v) && v == textproto.TrimString(v)
+}
+
+// sendableHeaderValue reports whether v may be sent as an HTTP header field value at all.
 //
 // Byte-wise and no laxer than net/http's own rule, which the transport would apply anyway —
 // stated here so the refusal names the header and the reason instead of surfacing as a generic
 // write failure from inside the client, and so it happens before any part of the request goes
-// out. High bytes are permitted, as they are there: a UTF-8 tool name is sendable.
+// out. High bytes are permitted, as they are there: a UTF-8 tool name is sendable. It is the
+// WRITABILITY half alone; byte-exactness is headerExpressible's question.
 func sendableHeaderValue(v string) bool {
 	for i := 0; i < len(v); i++ {
 		if b := v[i]; (b < 0x20 && b != '\t') || b == 0x7f {
@@ -339,4 +374,31 @@ func sendableHeaderValue(v string) bool {
 		}
 	}
 	return true
+}
+
+// headerRefusalIdentity names a refused message on the tape: the target its BODY addresses when
+// one was read, and auditIdentity's answer otherwise.
+//
+// auditIdentity deliberately blanks the identifier for a method that RESOLVES a target type — it
+// holds only the method name, and stamping that would name a tool after the method it was called
+// by. This refusal is where that limitation bites hardest: every method an `Mcp-Name` mismatch is
+// reachable on is a target-resolving one, so the record was landing with no target at all. It is
+// also the one place the target is already in hand, carried on the mismatch by the check that
+// compared against it — so what the record names is exactly what was compared, not a second
+// decode that could answer differently.
+//
+// Supplying it is what makes the record correlate with the surrounding traffic, which is the
+// reason the header's own attacker-chosen value is left off it.
+func headerRefusalIdentity(msg mcp.RPCMsg, err error) (identifier, method string) {
+	identifier, method = auditIdentity(msg)
+	if identifier != "" {
+		return identifier, method
+	}
+	var m headerMismatch
+	if asHeaderMismatch(err, &m) && m.target != "" {
+		// Bounded and control-stripped like every other foreign value that reaches a record:
+		// this one is the caller's too, and the tape is signed.
+		return boundRoutingHeader(m.target), method
+	}
+	return identifier, method
 }

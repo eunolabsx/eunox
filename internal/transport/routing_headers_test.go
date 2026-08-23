@@ -429,24 +429,28 @@ func TestRoutingHeaders_UnsendableTargetRefusesBeforeContactingTheUpstream(t *te
 	assert.Zero(t, atomic.LoadInt32(&hits), "the upstream was contacted for a request eunox could not describe honestly")
 }
 
-// sendableHeaderValue must be no laxer than the rule the transport applies itself, and every
-// value it accepts must arrive byte-exact.
+// eunox accepts a routing-header value if and only if it survives an HTTP header BYTE-EXACT.
 //
-// Both halves matter and they fail differently. Laxer, and the refusal stops being what catches
-// an unsendable value: the call fails anyway, but as a generic transport error naming no header
-// and after the connection is up. Not byte-exact, and the header stops describing the body —
-// which is the disagreement this whole file exists to prevent, produced by eunox itself.
+// Both directions matter and they fail differently. Accept something the transport will not
+// write, and the refusal stops being what catches it: the call fails anyway, but as a generic
+// transport error naming no header and after the connection is up. Accept something the
+// transport ALTERS, and the header stops describing the body — the disagreement this file exists
+// to prevent, manufactured by eunox itself. Refuse something that would have survived, and
+// legitimate traffic is rejected.
 //
-// Probed through a real round trip rather than through (*http.Request).Write, which does NOT
-// validate: it runs the value through a newline-to-space replacer, so a header carrying CRLF
-// comes out silently ALTERED and looks acceptable. Only Transport.roundTrip rejects it.
-func TestRoutingHeaders_SendabilityMatchesWhatTheTransportWillAccept(t *testing.T) {
+// The altering case is the one a naive probe misses. net/http trims leading and trailing spaces
+// and tabs off every value it writes, and reports no error doing it, so `" read_file "` is
+// "accepted" by the transport and arrives as `"read_file"`. (Nor does (*http.Request).Write
+// validate at all — it runs values through a newline-to-space replacer, so even CRLF comes out
+// silently altered and looks fine. Only a real round trip through Transport shows either.)
+func TestRoutingHeaders_SendabilityMatchesWhatSurvivesTheWire(t *testing.T) {
 	t.Parallel()
 	srv, lastHeaders := capturingUpstream(t)
 
 	for _, v := range []string{
 		"read_file", "file:///etc/hosts", "tool with spaces", "caf\u00e9-tool", "a\tb",
 		"read\r\nX-Injected: 1", "read\nX", "read\rX", "read\x00file", "read\x7ffile", "\x1b[31mred",
+		" read_file", "read_file ", " read_file ", "\tread_file", "read_file\t",
 	} {
 		t.Run(fmt.Sprintf("%q", v), func(t *testing.T) {
 			out := httptest.NewRequest(http.MethodPost, srv.URL, http.NoBody)
@@ -459,17 +463,91 @@ func TestRoutingHeaders_SendabilityMatchesWhatTheTransportWillAccept(t *testing.
 			if resp != nil {
 				_ = resp.Body.Close()
 			}
+			survivesVerbatim := rtErr == nil && lastHeaders().Get(RoutingHeaderName) == v
 
-			if ourVerdict {
-				require.NoError(t, rtErr,
-					"accepted a value the transport refuses to write; the refusal would surface as a generic transport error naming no header")
-				assert.Equal(t, v, lastHeaders().Get(RoutingHeaderName),
-					"a value eunox declared sendable did not arrive byte-exact; the header no longer describes the body")
-				return
-			}
-			assert.Error(t, rtErr,
-				"refused a value the transport would have sent verbatim; this rejects legitimate traffic")
+			assert.Equal(t, survivesVerbatim, ourVerdict,
+				"eunox accepts a routing-header value exactly when it survives the wire byte-exact; "+
+					"accepted=%v, survives=%v (transport error %v)", ourVerdict, survivesVerbatim, rtErr)
 		})
+	}
+}
+
+// A target the body names but no HTTP header can carry is refused for THAT reason — on both
+// legs, and neither by trimming it nor by reporting a mismatch it did not cause.
+//
+// The inbound half is the subtle one. Go's server trims a header value on the way IN, so a host
+// whose target genuinely ends in a space cannot make Mcp-Name equal it: the comparison always
+// fails, and reporting "which is not the target this body addresses" blames the host for a
+// difference its own HTTP stack created. Refusing as inexpressible is the honest answer — and
+// still a refusal, because every downstream reader of that header would be told a different
+// target than the body names, and there is no header eunox could send that would not mislead.
+func TestRoutingHeaders_ATargetNoHeaderCanCarryIsRefusedAsSuch(t *testing.T) {
+	t.Parallel()
+	for _, target := range []string{"read_file ", " read_file", "read\tfile\t", "read\nfile"} {
+		t.Run(fmt.Sprintf("%q", target), func(t *testing.T) {
+			t.Parallel()
+			msg := declaringPOST(t, capability.MethodToolsCall, map[string]interface{}{"name": target})
+
+			// Inbound: the header carries what a conformant host's stack would actually send —
+			// the trimmed form — so a naive comparison reports a mismatch.
+			inbound := headerRequest(capability.MethodToolsCall, strings.TrimSpace(target))
+			err := checkRoutingHeaders(capability.Revision20260728, inbound, msg)
+			require.Error(t, err, "a target no header can carry must not be forwarded")
+			assert.Contains(t, err.Error(), "does not survive an HTTP header field verbatim",
+				"the refusal blames the host for a difference its HTTP stack created")
+
+			// Outbound: the call fails before anything is sent, rather than emitting a trimmed
+			// header that names something the body does not.
+			out := httptest.NewRequest(http.MethodPost, "http://upstream.invalid/mcp", http.NoBody)
+			assert.Error(t, setRoutingHeaders(out, capability.Revision20260728, msg))
+			assert.Empty(t, out.Header.Get(RoutingHeaderName), "a refused value must not be left on the request")
+		})
+	}
+}
+
+// The record names the target the BODY addressed.
+//
+// This is the fact both the code comment and the threat model rest on when they justify leaving
+// the attacker-chosen header VALUE off the signed record: the operator can still correlate,
+// because the real target is there. auditIdentity alone cannot supply it — it holds only the
+// method and blanks the identifier for exactly the target-resolving methods an Mcp-Name mismatch
+// is reachable on — so without this the record carried neither target and the justification was
+// false.
+func TestRoutingHeaders_RefusalRecordNamesTheBodysTarget(t *testing.T) {
+	t.Parallel()
+	msg := declaringPOST(t, capability.MethodToolsCall, map[string]interface{}{"name": "read_file"})
+	err := checkRoutingHeaders(capability.Revision20260728,
+		headerRequest(capability.MethodToolsCall, "some_other_tool"), msg)
+	require.Error(t, err)
+
+	// Asserted on the RECORD the refusal path actually writes, not on the helper: a helper that
+	// resolves the target while refuseHeaderMismatch keeps calling auditIdentity leaves the tape
+	// exactly as empty as before, with a green test over the part that was never wrong.
+	sink, logPath := newTempAuditSink(t)
+	refuseHeaderMismatch(context.Background(), asRecorder(sink), "sess-1", msg, err)
+	require.NoError(t, sink.Close())
+
+	rec := findAuditRecordByCode(readAuditRecords(t, logPath), capability.ErrCodeHeaderMismatch)
+	require.NotNil(t, rec, "the refusal wrote no record")
+	assert.Equal(t, "read_file", rec["target"],
+		"the record must name the target the body carried, which is what an operator correlates on — "+
+			"and is the whole justification for leaving the attacker-chosen header value off it")
+
+	// A method that addresses nothing named acquires no target — auditIdentity's own answer
+	// stands. `tools/list` resolves a target TYPE without naming an entry in it, which is the
+	// case auditIdentity blanks so a catalog read is never stamped with a tool named after the
+	// method it arrived as. The peer's invented header value must not become that target either.
+	listMsg := declaringPOST(t, capability.MethodToolsList, nil)
+	listErr := checkRoutingHeaders(capability.Revision20260728,
+		headerRequest(capability.MethodToolsList, "invented"), listMsg)
+	require.Error(t, listErr)
+	listSink, listPath := newTempAuditSink(t)
+	refuseHeaderMismatch(context.Background(), asRecorder(listSink), "sess-1", listMsg, listErr)
+	require.NoError(t, listSink.Close())
+	listRec := findAuditRecordByCode(readAuditRecords(t, listPath), capability.ErrCodeHeaderMismatch)
+	require.NotNil(t, listRec)
+	if target, present := listRec["target"]; present {
+		assert.Empty(t, target, "an enumeration names no entry; the record must not invent one")
 	}
 }
 

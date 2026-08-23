@@ -42,12 +42,17 @@ Section conventions:
   names no target eunox could agree with, but a value sent anyway is still a claim about this
   request that a downstream reader may act on. The audit detail names which header disagreed and
   deliberately not the value it carried — that string is the caller's, and the record already
-  names the method and target the body really carried.
+  names the method and the target the body really carried — the latter supplied by the check that
+  compared against it, since the general identifier rule blanks the target for every
+  target-resolving method and that is every method an `Mcp-Name` mismatch is reachable on.
 
   On the upstream leg eunox emits both, DERIVED from the body it is actually sending rather than
-  relayed from the one it received: the two are not always the same request. A target that cannot
-  be expressed as an HTTP header field value fails the call rather than being trimmed to fit,
-  since altering it would manufacture the very disagreement the check refuses.
+  relayed from the one it received: the two are not always the same request. A target an HTTP
+  header cannot carry fails the call rather than being trimmed to fit, since altering it would
+  manufacture the very disagreement the check refuses. "Cannot carry" covers surrounding
+  whitespace, not just control bytes: Go trims spaces and tabs off every header value it writes
+  and off every one it reads, so such a target survives in neither direction — refused on both
+  legs as inexpressible, rather than reported as a mismatch the peer did not cause.
 
   Only for a peer on the revision that defines the headers. A 2025-11-25 POST is byte-identical.
 
@@ -61,9 +66,11 @@ Section conventions:
   set, or whatever this route's own `upstreamAuthHeader` names). Listing one fails startup with
   the reason rather than silently overriding a control eunox is accountable for.
 
-  The response direction has no key at all: eunox builds its host-facing response and copies no
-  upstream header into it, which is stronger than an allowlist and raises no per-upstream
-  question. HTTP-transport only, and no `defaults:` inheritance — the key grants a passthrough
+  A grant rides the forwards made **on behalf of** the host request that carried it, and nothing
+  else: eunox's own upstream requests — the opener, its completion, the session-start drift probe,
+  the terminating DELETE — carry no host header. The response direction has no key at all: eunox
+  builds its host-facing response and copies no upstream header into it, which is stronger than an
+  allowlist and raises no per-upstream question. HTTP-transport only, and no `defaults:` inheritance — the key grants a passthrough
   rather than tuning one, and a default would make granting it to every route the shorter thing
   to write.
 

@@ -121,15 +121,37 @@ func TestForwardClientHeaders_DefaultForwardsNothingAndEveryHeaderEunoxSendsIsRe
 
 // A granted header rides a forward made on behalf of a host request, and nothing else.
 //
-// eunox's own upstream requests — the opener, the drift probe, the terminating DELETE — are not
-// made for a host, so they carry no host header. Asserted on the carrier rather than through a
-// live call, because what makes it true is that the ctx is stamped on the host leg alone: a
-// call built from any other context has nothing to apply.
-func TestForwardClientHeaders_ARequestWithNoGrantCarriesNothing(t *testing.T) {
+// eunox's OWN upstream requests — the opener, its completion notification, the session-start
+// drift probe — are not made for a host, and must carry no host header. Driven through the real
+// session-creating path, because that is where the scope was wrong: the grant used to be stamped
+// at the handler ENTRY, above the session-creating `initialize` branch, so the context that
+// became the session's carried it and eunox's own opener went out with the host's header on it.
+// A carrier-level test could not see that; only the live handshake can.
+func TestForwardClientHeaders_EunoxsOwnUpstreamRequestsCarryNoHostHeader(t *testing.T) {
 	t.Parallel()
-	req := httptest.NewRequest(http.MethodPost, "http://upstream.invalid/mcp", http.NoBody)
-	require.NoError(t, applyForwardedHeaders(context.Background(), req))
-	assert.Empty(t, req.Header, "a context carrying no grant put headers on an upstream request")
+	srv, proxy, headersFor := forwardingProxy(t, []string{"X-Tenant-Id"})
+
+	// The header is present on the very request that CREATES the session, which is the shape
+	// that leaked: initSession sends it, and the opener it triggers must still be clean.
+	sid := initSessionWithHeaders(t, srv, map[string]string{"X-Tenant-Id": "acme"})
+	require.NotNil(t, proxy.getSession(sid))
+
+	opener := headersFor(mcp.MethodInitialize)
+	require.NotNil(t, opener, "the upstream opener never ran; the test proves nothing")
+	assert.Empty(t, opener.Get("X-Tenant-Id"),
+		"eunox's own upstream opener carried a host header; the grant is a channel between a host and an upstream, not a property of the leg")
+
+	if done := headersFor(mcp.MethodNotificationsInitialized); done != nil {
+		assert.Empty(t, done.Get("X-Tenant-Id"), "the opener's completion carried a host header")
+	}
+
+	// Not vacuous: a forward made ON BEHALF of a host request does carry it, so the grant is
+	// scoped rather than simply broken.
+	callWithHeaders(t, srv, sid, map[string]string{"X-Tenant-Id": "acme"})
+	forwarded := headersFor(capability.MethodToolsCall)
+	require.NotNil(t, forwarded)
+	assert.Equal(t, "acme", forwarded.Get("X-Tenant-Id"),
+		"a forward made for a host request must carry what the operator granted")
 }
 
 // The runtime backstop: a reserved name that somehow reached the carrier is dropped rather than
@@ -237,4 +259,28 @@ func callWithHeaders(t *testing.T, srv *httptest.Server, sid string, headers map
 	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	_ = resp.Body.Close()
+}
+
+// initSessionWithHeaders establishes a session with extra host headers on the very request that
+// creates it — the shape that matters here, since that request's context becomes the session's.
+func initSessionWithHeaders(t *testing.T, srv *httptest.Server, headers map[string]string) string {
+	t.Helper()
+	body, err := json.Marshal(mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: mcp.MethodInitialize,
+		Params: json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{}}`),
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp", bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", CTJSON)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	require.Equal(t, http.StatusOK, resp.StatusCode, "initialize")
+	sid := resp.Header.Get(SessionHeader)
+	require.NotEmpty(t, sid, "initialize returned no session id")
+	return sid
 }

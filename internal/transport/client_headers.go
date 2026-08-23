@@ -110,3 +110,22 @@ func applyForwardedHeaders(ctx context.Context, req *http.Request) error {
 	}
 	return nil
 }
+
+// grantHostHeaders returns r carrying this route's granted host headers, so every forward made on
+// behalf of THIS request inherits them and nothing else does.
+//
+// Called from the one handler arm that forwards a host's own message, deliberately, rather than at
+// the transport's entry. An entry-level stamp also reaches the SESSION-CREATING arm, whose context
+// becomes the session's — so eunox's own opener, its `notifications/initialized` and its
+// session-start drift probe all went out carrying a host header. Those are eunox talking for
+// itself, not forwarding for anyone, and a grant is a channel between a host and an upstream
+// rather than a property of the leg.
+//
+// Nothing is granted by default, in which case this allocates nothing and returns r unchanged.
+func grantHostHeaders(r *http.Request, route *UpstreamRoute) *http.Request {
+	granted := selectForwardableHeaders(route.forwardClientHeaders, r.Header)
+	if granted == nil {
+		return r
+	}
+	return r.WithContext(withForwardedHeaders(r.Context(), granted))
+}

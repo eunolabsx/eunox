@@ -372,13 +372,6 @@ func (p *HTTPProxy) handleSessionCreatingInitialize(w http.ResponseWriter, r *ht
 // handleMCPPost processes a JSON-RPC request from the MCP host for the given
 // upstream route.
 func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route *UpstreamRoute) {
-	// Carry this route's granted host headers on the request context, so every forward made on
-	// behalf of THIS host request inherits them and nothing else does. Stamped once, at the
-	// entry, rather than at each derivation: every later ctx here descends from r.Context().
-	// Nothing is granted by default, in which case this allocates nothing and is a no-op.
-	if granted := selectForwardableHeaders(route.forwardClientHeaders, r.Header); granted != nil {
-		r = r.WithContext(withForwardedHeaders(r.Context(), granted))
-	}
 	// SEC-04: cap request body to prevent memory exhaustion from large payloads.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var msg mcp.RPCMsg
@@ -453,7 +446,11 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 		p.refuseSessionlessPost(w, r, route, msg)
 		return
 	}
-	p.handleSessionPost(w, r, route, sessionID, msg)
+	// Past both early returns above, so this is the one arm whose forwards are made on a host's
+	// behalf — and therefore the only one that carries a grant (client_headers.go). Derived here,
+	// at the call site, because contextcheck requires an r.Context() derivation to be visible
+	// where it happens rather than buried in the callee.
+	p.handleSessionPost(w, grantHostHeaders(r, route), route, sessionID, msg)
 }
 
 // refuseSessionlessPost answers a host POST that carries no session and creates none.
@@ -1441,14 +1438,6 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	return rev, true
 }
 
-// headerMismatchRecorder returns the route's sink when the header-mismatch bucket admits a
-// record now, and nil when it does not — refuseHeaderMismatch writes nothing for a nil
-// recorder, so the wire refusal is unaffected and only the tape write is bounded.
-//
-// Bounded for catRevision's reason and at the same cheapness: a POST carrying a disagreeing
-// `Mcp-Method` is refused at the envelope, before the kill check, holding no session slot and
-// contacting no upstream, so an unauthenticated peer drives one record per frame. Suppressed
-// refusals fold into the next admitted record rather than vanishing.
 // headerRefusalSessionID names the session a header refusal is recorded against, or "" for a
 // POST that has not resolved one. Read off the SESSION rather than the header the peer sent:
 // this refusal is about a peer's headers disagreeing with its body, so a claimed-but-unresolved
@@ -1461,6 +1450,14 @@ func headerRefusalSessionID(sess *httpSession) string {
 	return sess.id
 }
 
+// headerMismatchRecorder returns the route's sink when the header-mismatch bucket admits a
+// record now, and nil when it does not — refuseHeaderMismatch writes nothing for a nil recorder,
+// so the wire refusal is unaffected and only the tape write is bounded.
+//
+// Bounded for catRevision's reason and at the same cheapness: a POST carrying a disagreeing
+// `Mcp-Method` is refused at the envelope, before the kill check, holding no session slot and
+// contacting no upstream, so an unauthenticated peer drives one record per frame. Suppressed
+// refusals fold into the next admitted record rather than vanishing.
 func (p *HTTPProxy) headerMismatchRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
 	var rec auditRecorder
 	switch {
