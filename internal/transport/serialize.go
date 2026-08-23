@@ -349,8 +349,3 @@ func (q *ticketQueue) advanceLocked() {
 		q.serving++
 	}
 }
-
-// size reports how many anchor queues are live. Test-only: the drop-at-zero behavior is
-// what keeps a long-lived proxy from accumulating an entry per anchor it has ever served,
-// and that is invisible from the outside.
-func (g *decisionSerializer) size() int { return g.queues.size() }
