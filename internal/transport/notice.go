@@ -24,6 +24,7 @@ package transport
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -80,8 +81,31 @@ const (
 	classObligation
 )
 
-// noticeClasses is the set the bucket table is keyed by.
-var noticeClasses = []noticeClass{classTraffic, classFailure, classObligation}
+// noticeClasses is the set the bucket table is keyed by, DERIVED from the site declarations rather
+// than typed out beside them. A hand-written list is two lists that must agree: one naming a class
+// no site charges builds a bucket nothing spends, and one MISSING a class some site declares routes
+// every one of that class's sites to the floor-rate fallback — silently, at 1/s shared with every
+// other unclassified site, which is the class separation this budget exists for quietly undone.
+//
+// It PROJECTS the map's values where a key-collecting derivation would not, so the dedup is
+// load-bearing: without it this is one entry per SITE where one per class is meant, which builds
+// duplicate bucket keys and multiplies the sizing.
+var noticeClasses = declaredNoticeClasses()
+
+func declaredNoticeClasses() []noticeClass {
+	out := make([]noticeClass, 0, len(noticeSiteClass))
+	for _, class := range noticeSiteClass {
+		// classUnclassified is filtered rather than registered: registering it would hand a site
+		// that forgot its class a full class bucket, and move every genuinely undeclared site off
+		// the floor-rate fallback onto it, since they all resolve to the same key.
+		if class == classUnclassified {
+			continue
+		}
+		out = append(out, class)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
 
 // label names a class in the suppression rollup. A count that spans one class must say which,
 // since the reader cannot infer it from the line the count rides on.
@@ -139,15 +163,17 @@ const (
 const noticeScopeProxy = "proxy"
 
 // noticeLimiter is the proxy's stderr-diagnostic admission control: one token bucket per notice
-// class, plus a floor-rate fallback for any site with no declared class.
+// class, plus a floor-rate fallback for any site with no declared class. One table per proxy —
+// there is no tier below it, so a route or a session selects nothing.
 type noticeLimiter struct {
 	buckets  map[noticeClass]*recordRateLimiter
 	fallback *recordRateLimiter
 }
 
-// newNoticeLimiter builds the proxy's notice table, sized for tenants tenants (routes on a gateway;
-// 1 for stdio). Each tenant is given room for its own per-class share rather than a division of a
-// fixed budget, so adding a route does not shrink an existing one's burst to nothing.
+// newNoticeLimiter builds the proxy's notice table, sized for the given number of tenants (routes
+// on a gateway; 1 for stdio). Each tenant is given room for its own per-class share rather than a
+// division of a fixed budget, so adding a route does not shrink an existing route's burst to
+// nothing — the budget is not split per route, so this is the whole of what tenancy costs.
 func newNoticeLimiter(tenants int) *noticeLimiter {
 	tenants = max(tenants, 1)
 	rate, burst := float64(perClassNoticeRatePerSec*tenants), float64(perClassNoticeBurst*tenants)

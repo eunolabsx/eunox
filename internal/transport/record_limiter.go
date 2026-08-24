@@ -268,8 +268,10 @@ func (r refusalRecorders) notices() noticeWriter { return r.limits.notices }
 // suppressed (the refusal itself still stands — only the tape write is bounded), rec when nothing
 // was elided since the last admitted one, and a rollup-stamping wrapper when something was.
 //
-// A nil limiter panics here: a live sink with no bucket beside it is a construction bug, and a
-// "defensive" fallback would write the unbounded records the bucket exists to prevent.
+// A nil limiter is NOT guarded here, and deliberately not claimed to be: forCategory returns the
+// plain sink before reaching this call, so the panic an earlier doc promised was never reachable
+// (see preSessionRefusalRecorders, which states the same). What keeps a live sink from writing
+// unbounded kill records is that every production constructor builds the table.
 func admitRefusalRecord(rec auditRecorder, limiter *categoryRecordLimiter, category refusalCategory) auditRecorder {
 	if rec == nil {
 		// Nothing to write, so nothing to bound: leave the bucket's tokens for a site that has a

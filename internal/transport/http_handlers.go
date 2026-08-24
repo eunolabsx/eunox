@@ -234,7 +234,7 @@ func (p *HTTPProxy) dispatchParams(sess *httpSession, sourceIP string) dispatchP
 			upstreamTimeMs:   p.upstreamTimeMs,
 			callUpstream:     withResultShape(rt.audit, withCrossRevisionTranslation(sess.upstreamRev, sess.callUpstream)),
 			strictAuditState: p.strictAudit(),
-			limits:           p.routeRefusalLimits(sess, rt),
+			limits:           p.routeRefusalLimits(),
 		},
 		pdp:              rt.pdp,
 		sourceIP:         sourceIP,
@@ -258,7 +258,7 @@ func (p *HTTPProxy) creationStrictAuditDenial(ctx context.Context, route *Upstre
 		rec:              asRecorder(route.sink),
 		sessionID:        "", // no session exists yet on either creating path
 		strictAuditState: p.strictAudit(),
-		limits:           refusalLimits{notices: p.routeNoticeWriter(route)},
+		limits:           refusalLimits{notices: p.noticeWriter()},
 	}
 	// Zero decision: nothing exists yet to have cleared a flow label.
 	return fp.strictAuditDenial(ctx, msg, identifier, method, method, capability.EnforceResponse{})

@@ -68,11 +68,13 @@ type httpSession struct {
 	// instead of dropping it (which would hang the upstream).
 	serverReqs serverReqTracker
 
-	// upstreamDenies bounds the refusal records THIS session's upstream can drive (see
-	// newUpstreamRefusalLimiter). Per session because each session has its own upstream, and the
-	// proxy-wide table let one dead subprocess drain a category's share and suppress a sibling
-	// session's record that a live in-flight request was lost. nil on a bare-struct-literal
-	// session (as tests build), which records unbounded rather than panicking.
+	// upstreamDenies bounds the refusal records THIS session's upstream can drive. It is the
+	// PROXY-WIDE table, shared with every sibling session: the stated residual of that is a dead
+	// subprocess spending a category's budget its siblings share, eliding a sibling's record that a
+	// live in-flight request was lost into a suppressed_refusal_count on somebody else's record.
+	// Held as a field all the same, since which table a leg charges is the wiring's to decide, not
+	// something each call site should reach for. nil on a bare-struct-literal session (as tests
+	// build), which records unbounded rather than panicking.
 	upstreamDenies *categoryRecordLimiter
 
 	upstreamCaps          map[string]interface{}
@@ -386,7 +388,7 @@ func (s *httpSession) unblocker() serverRequestUnblocker {
 // that created it and the route it is bound to — which handleSessionPost has already checked is
 // the route this request addressed.
 func (s *httpSession) revisionRefusalRecorder() auditRecorder {
-	return s.proxy.revisionRefusalRecorder(s, s.route)
+	return s.proxy.revisionRefusalRecorder(s.route)
 }
 
 // unblockRefusedServerReply answers the upstream request a revision-refused host reply would
@@ -1361,7 +1363,7 @@ func (s *httpSession) errOut() io.Writer {
 // cannot elide this one's first line of a class. Nil-safe throughout for a bare-struct-literal
 // session.
 func (s *httpSession) noticeWriter() noticeWriter {
-	return s.proxy.sessionNoticeWriter(s, s.route)
+	return s.proxy.noticeWriter()
 }
 
 // shutdownBudget is this session's configured teardown budget (--shutdown-grace), or a 5s
@@ -1615,9 +1617,9 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 // back by handleMCPPost). Such a request blocks the upstream until answered, so with no
 // subscriber able to receive it, fail closed: untrack the ID and reply an error so the upstream
 // unblocks, rather than let it hang until teardown.
-// The refusal wiring is the SESSION's own (see newUpstreamRefusalLimiter): every category charged
-// below is driven by this session's upstream, so the buckets it charges are per session and the
-// caller no longer has to carry them in from the proxy.
+// The refusal wiring is resolved from the SESSION (see refusalRecorders) rather than carried in by
+// the caller: every category charged below is driven by this session's upstream, and which table
+// bounds them is the session's wiring to answer.
 func (s *httpSession) broadcastServerRequest(ctx context.Context, msg mcp.RPCMsg) bool {
 	u := s.unblocker()
 	// See forwardServerRequestToHost: an id the tracker will not retain must be REFUSED here, never
@@ -1725,12 +1727,11 @@ func (s *httpSession) failServerRequestDelivery(ctx context.Context, msg mcp.RPC
 }
 
 // refusalRecorders is this session's wiring for a refusal record's recorder: the route's sink and
-// this session's OWN upstream-driven bucket table, with forCategory applying each category's own
-// declaration.
+// the proxy-wide bucket table, with forCategory applying each category's own declaration.
 //
-// Per session rather than the proxy-wide pre-session table: every category this leg charges is
-// driven by this session's upstream, and a shared table let one dead subprocess suppress another
-// session's record that a live in-flight request was lost. See newUpstreamRefusalLimiter.
+// The categories this leg charges are driven by this session's UPSTREAM rather than by a host peer,
+// so nothing caps how many it issues over a session's life — which is why they are metered at all.
+// They share one table with every sibling session; see upstreamDenies for the residual that leaves.
 func (s *httpSession) refusalRecorders() refusalRecorders {
 	// Nil-route tolerant like every other accessor a bare-struct-literal session reaches
 	// (noticeWriter, upstreamDenies): every unblocker() now resolves this, including the

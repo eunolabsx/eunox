@@ -420,7 +420,7 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 }
 
 // preSessionRefusalRecorders is the PRE-SESSION leg's recorder wiring for the shared notification
-// gate and for the two named recorders above: a category refusalDeclarations calls metered charges
+// gate and for the two named recorders above: a category the declaration calls metered charges
 // its bucket, one declared exempt gets the plain sink.
 //
 // Per CATEGORY rather than per leg because this leg's refusals disagree. Its kill and audience
@@ -437,7 +437,7 @@ func (p *HTTPProxy) preSessionKillRecorder(route *UpstreamRoute) auditRecorder {
 // bucket; the earlier claim that it "panics inside admitRefusalRecord like one" was never reachable,
 // since forCategory returns before that call.
 func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalRecorders {
-	return p.routeRefusalLimits(nil, route).recorders(asRecorder(route.sink))
+	return p.routeRefusalLimits().recorders(asRecorder(route.sink))
 }
 
 // routeRefusalRecorders is the ESTABLISHED-session leg's wiring: the route's sink, metering no
@@ -447,11 +447,9 @@ func (p *HTTPProxy) preSessionRefusalRecorders(route *UpstreamRoute) refusalReco
 //
 // It takes a notice bucket all the same: every argument above is about what a VERDICT may cost, and
 // the routing refusal's stderr line is not one — this leg can be driven at a refused frame per POST,
-// and the notice is the only unbuffered syscall in that loop. The channel is the SESSION's, since
-// this leg is reached with one in hand and the route table alone lets a sibling's dead upstream take
-// its floor (see noticeReserve); sess may be nil for a leg that genuinely has none.
-func (p *HTTPProxy) routeRefusalRecorders(sess *httpSession, route *UpstreamRoute) refusalRecorders {
-	return refusalLimits{notices: p.sessionNoticeWriter(sess, route)}.recorders(asRecorder(route.sink))
+// and the notice is the only unbuffered syscall in that loop.
+func (p *HTTPProxy) routeRefusalRecorders(route *UpstreamRoute) refusalRecorders {
+	return refusalLimits{notices: p.noticeWriter()}.recorders(asRecorder(route.sink))
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's
@@ -493,13 +491,11 @@ func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier,
 //
 // ONE writer for both spellings of a refusal record — the wrapper above and recordRefusal, which
 // stamps inline because it is already building the details map it hands to the sink. They were two
-// hand-copied branches, and they had already disagreed: the wrapper stamped the floored marker while
-// the inline path did not, so a floored pre-session record reached the tape byte-identical to one the
-// tier had room for. Copying the branch to fix that is how the next field added to the rollup
-// repeats it.
+// hand-copied branches, and they had already disagreed once. Copying the branch is how the next
+// field added to the rollup repeats that.
 //
-// scope empty falls back to the proxy-wide value, which is what a hand-built wrapper in a test gets;
-// every table's constructor sets one.
+// The two keys are always written together: a count whose scope a reader has to infer from the
+// stamp beside it is a count that gets misread.
 func stampRefusalRollup(details map[string]interface{}, suppressed uint64) map[string]interface{} {
 	if details == nil {
 		details = make(map[string]interface{}, 2)
