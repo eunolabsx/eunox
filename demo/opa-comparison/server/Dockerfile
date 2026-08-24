@@ -6,7 +6,7 @@
 #
 #   docker build -f demo/opa-comparison/server/Dockerfile -t opa-cmp-server .
 
-FROM golang:1.26 AS builder
+FROM golang:1.27 AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
