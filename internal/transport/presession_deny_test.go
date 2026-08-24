@@ -36,7 +36,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	const attempts = 5000
 	catBurst := perCategoryDenyBurstSize
 	for i := 0; i < attempts; i++ {
-		if l.admitRefusal(catAuth).ok {
+		if ok, _ := l.admitRefusal(catAuth); ok {
 			admitted++
 		}
 	}
@@ -47,8 +47,7 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	// The suppressed refusals are not lost: the next admitted record carries the count, so
 	// an operator sees both that the attack happened and its scale.
 	now = base.Add(time.Second)
-	verdict := l.admitRefusal(catAuth)
-	ok, suppressed := verdict.ok, verdict.suppressed
+	ok, suppressed := l.admitRefusal(catAuth)
 	if !ok {
 		t.Fatal("a refill second must admit again")
 	}
@@ -57,8 +56,8 @@ func TestPreSessionDenyLimiter_BoundsBurstAndCountsSuppressed(t *testing.T) {
 	}
 
 	// And the count resets, so the following record does not double-report.
-	if v := l.admitRefusal(catAuth); !v.ok || v.suppressed != 0 {
-		t.Fatalf("after reporting, the suppressed counter must reset; ok=%v suppressed=%d", v.ok, v.suppressed)
+	if ok, suppressed := l.admitRefusal(catAuth); !ok || suppressed != 0 {
+		t.Fatalf("after reporting, the suppressed counter must reset; ok=%v suppressed=%d", ok, suppressed)
 	}
 }
 
@@ -201,10 +200,10 @@ func TestRefusalLimiter_OneCategoryFloodDoesNotEraseAnother(t *testing.T) {
 }
 
 // TestRefusalCategories_AllHaveTheirOwnBucket pins that every METERED category gets a bucket of
-// its own: one falling through to the shared unknown bucket would share it with every other
+// its own: one falling through to the shared fallback bucket would share it with every other
 // unregistered category, quietly re-creating the cross-category suppression the split removed.
 //
-// Which categories exist, and which are metered at all, is refusalDeclarations' question now — see
+// Which categories exist, and which are metered at all, is exemptRefusals' question now — see
 // refusal_metering_test.go. This is the half about the table built from that answer.
 func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
 	t.Parallel()
@@ -212,8 +211,8 @@ func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
 	seen := map[*recordRateLimiter]refusalCategory{}
 	for _, cat := range refusalCategories {
 		b := lim.bucket(cat)
-		if b == lim.unknown {
-			t.Errorf("category %q fell through to the shared unknown bucket", cat)
+		if b == lim.fallback {
+			t.Errorf("category %q fell through to the shared fallback bucket", cat)
 			continue
 		}
 		if other, dup := seen[b]; dup {
@@ -221,13 +220,13 @@ func TestRefusalCategories_AllHaveTheirOwnBucket(t *testing.T) {
 		}
 		seen[b] = cat
 	}
-	// Every metered declaration must reach the table the limiter is built from.
-	for cat, decl := range refusalDeclarations {
-		if decl.metering != meteringMetered {
+	// Every metered category must reach the table the limiter is built from.
+	for _, cat := range allRefusalCategories {
+		if _, exempt := exemptRefusals[cat]; exempt {
 			continue
 		}
 		if _, registered := lim.buckets[cat]; !registered {
-			t.Errorf("category %q is declared metered but has no bucket", cat)
+			t.Errorf("category %q is metered but has no bucket", cat)
 		}
 	}
 }
@@ -246,11 +245,11 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 
 	// Drain the burst.
 	for i := 0; i < catBurst; i++ {
-		if !l.admitRefusal(catAuth).ok {
+		if ok, _ := l.admitRefusal(catAuth); !ok {
 			t.Fatalf("burst token %d should have been admitted", i)
 		}
 	}
-	if l.admitRefusal(catAuth).ok {
+	if ok, _ := l.admitRefusal(catAuth); ok {
 		t.Fatal("the bucket must be empty after the burst is drained")
 	}
 
@@ -258,7 +257,7 @@ func TestPreSessionDenyLimiter_RefillIsRateBounded(t *testing.T) {
 	now = base.Add(time.Second)
 	admitted := 0
 	for i := 0; i < catRate*10; i++ {
-		if l.admitRefusal(catAuth).ok {
+		if ok, _ := l.admitRefusal(catAuth); ok {
 			admitted++
 		}
 	}
@@ -276,10 +275,10 @@ func TestPreSessionDenyLimiter_BackwardsClockDoesNotGrantTokens(t *testing.T) {
 	l := newRefusalRecordLimiter()
 	l.setNow(func() time.Time { return now })
 	for i := 0; i < perCategoryDenyBurstSize; i++ {
-		l.admitRefusal(catAuth)
+		_, _ = l.admitRefusal(catAuth)
 	}
 	now = base.Add(-time.Hour)
-	if l.admitRefusal(catAuth).ok {
+	if ok, _ := l.admitRefusal(catAuth); ok {
 		t.Fatal("a backwards clock step must not refill the bucket")
 	}
 }

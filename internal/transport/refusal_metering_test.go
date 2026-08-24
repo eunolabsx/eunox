@@ -27,7 +27,8 @@ import (
 // category's declaration disagrees with its function is the contradiction this closes.
 var meteringCallSites = map[string]struct {
 	categoryArg int
-	implements  refusalMetering
+	// implementsMetered is true for a resolver that charges a bucket unconditionally.
+	implementsMetered bool
 	// readsDeclaration marks a resolver that applies whichever disposition the category DECLARES
 	// (refusalRecorders.forCategory) rather than a fixed one. Such a site cannot contradict a
 	// declaration — that is the whole point of it — so only the naming half is checked and
@@ -39,9 +40,9 @@ var meteringCallSites = map[string]struct {
 	// nothing is left for the marker to mark.
 	readsDeclaration bool
 }{
-	"admitRefusalRecord":   {categoryArg: 2, implements: meteringMetered},
-	"recordRefusal":        {categoryArg: 4, implements: meteringMetered},
-	"recordPreSessionDeny": {categoryArg: 2, implements: meteringMetered},
+	"admitRefusalRecord":   {categoryArg: 2, implementsMetered: true},
+	"recordRefusal":        {categoryArg: 4, implementsMetered: true},
+	"recordPreSessionDeny": {categoryArg: 2, implementsMetered: true},
 	"forCategory":          {categoryArg: 0, readsDeclaration: true},
 	// The server-initiated leg's drop records resolve through dropReport.recordDrop, which threads
 	// its own category parameter into forCategory — so the sites the walk must see are ITS callers,
@@ -49,27 +50,22 @@ var meteringCallSites = map[string]struct {
 	"recordDrop": {categoryArg: 1, readsDeclaration: true},
 }
 
-// TestRefusalMetering_EveryCategoryDeclaresOne is the build-time half: an entry missing its
-// disposition, or an exemption with no reason, fails here rather than shipping as a silent
-// default. The zero value is deliberately "undeclared" so neither answer can be inherited.
-func TestRefusalMetering_EveryCategoryDeclaresOne(t *testing.T) {
+// TestRefusalMetering_EveryCategoryIsInTheVocabulary is the build-time half: every category
+// CONSTANT must appear in allRefusalCategories, the one list the metered set is derived from.
+// Read off the source rather than hand-listed here, so a new constant missing from that list is
+// caught by the guard instead of by whoever remembers to extend a second list beside the first.
+//
+// A category outside it holds no bucket and falls to the floor-rate fallback — bounded, but at a
+// rate nobody chose and shared with every other unregistered category.
+func TestRefusalMetering_EveryCategoryIsInTheVocabulary(t *testing.T) {
 	t.Parallel()
-	for cat, decl := range refusalDeclarations {
-		switch decl.metering {
-		case meteringUndeclared:
-			t.Errorf("refusal category %q declares no metering disposition; metered and deliberately-exempt are both answers, and no entry may inherit either", cat)
-		case meteringExempt:
-			assert.NotEmpty(t, decl.why, "category %q is exempt with no reason; the reason IS the exemption, and one without it is indistinguishable from an oversight", cat)
-		case meteringMetered:
-			assert.Empty(t, decl.why, "category %q is metered but carries an exemption reason; a metered category needs none, and one here reads as a disagreement with its own disposition", cat)
-		}
-	}
-	// Every category CONSTANT must be declared. Read off the source rather than hand-listed here,
-	// so a new constant that is never declared is caught by the guard instead of by whoever
-	// remembers to extend a second list beside the first.
 	for name, cat := range declaredCategoryConstants(t) {
-		_, declared := refusalDeclarations[cat]
-		assert.True(t, declared, "refusal category constant %s (%q) has no entry in refusalDeclarations", name, cat)
+		assert.Contains(t, allRefusalCategories, cat,
+			"refusal category constant %s (%q) is missing from allRefusalCategories, so it holds no bucket of its own", name, cat)
+	}
+	for cat, why := range exemptRefusals {
+		assert.NotEmpty(t, why, "category %q is exempt with no reason; the reason IS the exemption, and one without it is indistinguishable from an oversight", cat)
+		assert.Contains(t, allRefusalCategories, cat, "exempt category %q is not in the vocabulary the metered set is derived from", cat)
 	}
 }
 
@@ -79,13 +75,16 @@ func TestRefusalMetering_EveryCategoryDeclaresOne(t *testing.T) {
 func TestRefusalMetering_DerivedListIsTheMeteredSubset(t *testing.T) {
 	t.Parallel()
 	for _, cat := range refusalCategories {
-		assert.Equal(t, meteringMetered, refusalDeclarations[cat].metering,
-			"category %q charges a bucket but is not declared metered", cat)
+		assert.NotContains(t, exemptRefusals, cat,
+			"category %q charges a bucket but is declared exempt", cat)
 	}
-	for cat, decl := range refusalDeclarations {
-		if decl.metering == meteringExempt {
-			assert.NotContains(t, refusalCategories, cat,
-				"category %q is declared exempt yet holds a bucket; it would divide the aggregate budget by a share nothing spends", cat)
+	for cat := range exemptRefusals {
+		assert.NotContains(t, refusalCategories, cat,
+			"category %q is declared exempt yet holds a bucket", cat)
+	}
+	for _, cat := range allRefusalCategories {
+		if _, exempt := exemptRefusals[cat]; !exempt {
+			assert.Contains(t, refusalCategories, cat, "metered category %q holds no bucket", cat)
 		}
 	}
 	assert.True(t, slices.IsSorted(refusalCategories),
@@ -146,33 +145,34 @@ func TestRefusalMetering_CallSitesAgreeWithTheDeclarations(t *testing.T) {
 				}
 				checked++
 				sited[cat] = true
-				declared, isDeclared := refusalDeclarations[cat]
-				if !isDeclared {
-					t.Errorf("%s: %s names category %q, which declares no metering disposition", name, fn.Name, cat)
+				if !slices.Contains(allRefusalCategories, cat) {
+					t.Errorf("%s: %s names category %q, which is missing from allRefusalCategories", name, fn.Name, cat)
 					return true
 				}
+				_, exempt := exemptRefusals[cat]
 				if site.readsDeclaration {
 					// It applies whatever the category declares, so there is no disposition to
 					// disagree with — only the naming, checked above.
 					return true
 				}
-				if declared.metering != site.implements {
+				if exempt == site.implementsMetered {
 					t.Errorf("%s: %s implements %s metering but category %q declares the opposite. "+
 						"A refusal's disposition is a decision on the record, not a property of which helper a call site reached for.",
-						name, fn.Name, meteringName(site.implements), cat)
+						name, fn.Name, meteringName(site.implementsMetered), cat)
 				}
 				return true
 			})
 		}
 	}
 	require.Positive(t, checked, "no refusal recorder call found in any non-test file; this guard would pass vacuously")
-	for cat, decl := range refusalDeclarations {
+	for _, cat := range allRefusalCategories {
 		// catSaturation's site is recordSessionCapDeny, which hardcodes the category rather than
 		// taking one; recordResourceExhausted charges its pool's own gate instead of a bucket.
 		if cat == catSaturation {
 			continue
 		}
-		assert.True(t, sited[cat], "category %q is declared %s but no call site names it; a declaration nothing reaches is an answer to a question nobody asks", cat, meteringName(decl.metering))
+		_, exempt := exemptRefusals[cat]
+		assert.True(t, sited[cat], "category %q is declared %s but no call site names it; a declaration nothing reaches is an answer to a question nobody asks", cat, meteringName(!exempt))
 	}
 }
 
@@ -190,9 +190,9 @@ func TestRefusalMetering_StdioLimiterHasABucketPerDeclaredCategory(t *testing.T)
 	lim := newRefusalRecordLimiterFor(stdioRefusalCategories)
 	require.NotEmpty(t, stdioRefusalCategories)
 	for _, cat := range stdioRefusalCategories {
-		assert.Equal(t, meteringMetered, refusalDeclarations[cat].metering,
+		assert.NotContains(t, exemptRefusals, cat,
 			"stdio declares it charges %q, which is not a metered category", cat)
-		assert.NotEqual(t, lim.unknown, lim.bucket(cat),
+		assert.NotEqual(t, lim.fallback, lim.bucket(cat),
 			"stdio charges %q but its limiter builds no bucket for it", cat)
 	}
 	// The one category that reaches stdio through a SHARED helper rather than its own file, which
@@ -213,7 +213,7 @@ func TestRefusalMetering_SizedLimiterKeepsTheAggregateShare(t *testing.T) {
 	assert.Equal(t, float64(perCategoryDenyBurstSize), one.bucket(catRevision).burst)
 	// An unregistered category is bounded rather than unbounded — the safe direction for the
 	// fallback the guards above keep unreachable.
-	assert.Equal(t, one.unknown, one.bucket(catAuth))
+	assert.Equal(t, one.fallback, one.bucket(catAuth))
 }
 
 // categoryConstant resolves a catXxx identifier to its value. The name→value table is DERIVED
@@ -295,13 +295,9 @@ func parameterNames(fn *ast.FuncDecl) map[string]bool {
 	return names
 }
 
-func meteringName(m refusalMetering) string {
-	switch m {
-	case meteringMetered:
+func meteringName(metered bool) string {
+	if metered {
 		return "metered"
-	case meteringExempt:
-		return "exempt"
-	default:
-		return "undeclared"
 	}
+	return "exempt"
 }

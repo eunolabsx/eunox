@@ -4,7 +4,7 @@
 // The not-delivered deny is a REFUSAL record, charges the category it declares, and does not share
 // that category with the correction record.
 //
-// It used to write straight through the leg's sink, reaching neither refusalDeclarations nor the
+// It used to write straight through the leg's sink, reaching neither the metering declaration nor the
 // call-site walk that keeps every other refusal honest — while an HTTP upstream alone can drive one
 // per request (outrun the SSE buffer, or hold no GET stream open), with no host cooperation at all.
 // That is the same axis catDisplaced and catServerRequestFailed's writers are metered on.
@@ -101,7 +101,7 @@ func TestUndeliveredServerRequest_RecordChargesItsCategory(t *testing.T) {
 func TestUndeliveredServerRequest_FloodLeavesTheCorrectionRecordWritable(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
-	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
+	lim := newRefusalRecordLimiter()
 	now := time.Now()
 	lim.setNow(func() time.Time { return now })
 

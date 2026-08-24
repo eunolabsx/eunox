@@ -640,7 +640,7 @@ func TestGateOrder_NegotiationIsReachedOnlyThroughTheSharedPrologue(t *testing.T
 					return true
 				}
 				calls++
-				if got := string(qualifiedFuncName(fn)); got != caller {
+				if got := qualifiedFuncName(fn); got != caller {
 					t.Errorf("%s: %s calls %s directly; every entry point must reach negotiation through %s, or the gate order is hand-placed again",
 						name, got, ident.Name, caller)
 				}

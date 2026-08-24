@@ -1109,7 +1109,7 @@ func benchmarkDecisionTurn(b *testing.B, tier turnTier) {
 
 // BenchmarkRefusalRecorders_ForCategory is the number behind forCategory's map probe, which is on
 // every refusal record's recorder resolution and was worth measuring rather than removing: the
-// disposition is read from refusalDeclarations at resolution time, and a pre-resolved per-leg table
+// disposition is read from exemptRefusals at resolution time, and a pre-resolved per-leg table
 // would be a second copy of the answer this package exists to have one of.
 //
 // The metered arm holds its bucket FULL by advancing an injected clock each iteration. Sharing one

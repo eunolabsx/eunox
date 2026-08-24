@@ -92,12 +92,6 @@ type UpstreamRoute struct {
 	// meteredNotices). Per route rather than per session or per proxy because that is what those
 	// faults are per: this route has one receipt verifier and one policy engine behind it, so "the
 	// pin is stale" and "the flow store is down" are facts about it rather than about whoever
-	// happened to call.
-	// Assigned by BuildRoutes AND re-assigned by NewHTTPProxyGateway beside the notice table, so a
-	// route reaching a proxy some other way cannot arrive with a working bucket table and no
-	// windows — which would silently restore the per-frame flood with every guard still green.
-	noticeCollapse *keyReserve[noticeSite]
-
 	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route: the
 	// transport needs it to pick which key a request's decision turn is taken on, since
 	// under task anchoring that isn't the session. Read-only after BuildRoutes.
@@ -371,15 +365,10 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			// package's no-policy-default posture; an AlwaysAllowPDP placeholder would
 			// silently allow everything if a future change left it unreplaced.
 			pdp: pdp.DenyAllPDP{},
-			// Parentless here and re-parented by NewHTTPProxyGateway, which is where the
-			// aggregate exists. Built HERE all the same, so a route this exported constructor
-			// hands to something other than a proxy is bounded rather than holding a nil table
-			// that falls back to whatever aggregate it is later asked about.
-			notices: newRouteNoticeLimiter(nil),
-			// Built here as well as at the proxy, so a route this exported constructor hands to
-			// something other than a proxy collapses its faults exactly as one inside a gateway
-			// does.
-			noticeCollapse: newNoticeCollapse(),
+			// Built HERE and replaced by NewHTTPProxyGateway with the proxy's own table, so a
+			// route this exported constructor hands to something other than a proxy is bounded
+			// rather than holding a nil table.
+			notices: newNoticeLimiter(1),
 		}
 
 		// The upstream's own receipt-signing key domain, loaded ONCE at startup from a

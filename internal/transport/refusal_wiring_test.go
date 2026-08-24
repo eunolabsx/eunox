@@ -81,7 +81,7 @@ func TestPreSessionGate_DeclaredExemptRefusalsSpendNoKillToken(t *testing.T) {
 }
 
 // TestRefusalRecorders_ApplyTheDeclarationNotTheLegsDefault pins the property that makes the fix
-// structural rather than a corrected call site: the resolver READS refusalDeclarations, so a
+// structural rather than a corrected call site: the resolver READS exemptRefusals, so a
 // category added later cannot be metered by a leg that meters, or exempted by one that does not,
 // against what it declares.
 func TestRefusalRecorders_ApplyTheDeclarationNotTheLegsDefault(t *testing.T) {
@@ -92,7 +92,7 @@ func TestRefusalRecorders_ApplyTheDeclarationNotTheLegsDefault(t *testing.T) {
 	route := &UpstreamRoute{name: "up1", sink: &routeSink{sink: sink, upstream: "up1"}}
 	recs := proxy.preSessionRefusalRecorders(route)
 
-	for cat, decl := range refusalDeclarations {
+	for _, cat := range allRefusalCategories {
 		charged := 0
 		// A metered category runs out; an exempt one never does.
 		for range perCategoryDenyBurstSize + 50 {
@@ -100,7 +100,7 @@ func TestRefusalRecorders_ApplyTheDeclarationNotTheLegsDefault(t *testing.T) {
 				charged++
 			}
 		}
-		if decl.metering == meteringExempt {
+		if _, exempt := exemptRefusals[cat]; exempt {
 			assert.Equal(t, perCategoryDenyBurstSize+50, charged,
 				"category %q is declared exempt but its resolved recorder was suppressed; the wiring is metering what the declaration does not", cat)
 			continue

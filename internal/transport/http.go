@@ -506,8 +506,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	}
 	for _, route := range p.routes {
 		route.boundProxy = true
-		route.notices = newRouteNoticeLimiter(p.notices)
-		route.noticeCollapse = newNoticeCollapse()
+		route.notices = p.notices
 	}
 	// Registered at construction (not Serve) so a kill delivered during startup is not lost —
 	// the buffered slot coalesces it, served by the worker's first tick. Unregister is kept
@@ -827,34 +826,20 @@ func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
 		return noticeWriter{}
 	}
 	if route == nil || route.notices == nil {
-		// No collapse windows on this arm, deliberately: the faults they collapse are a route's own
-		// (its upstream's receipt pin, its policy engine's flow store), and a leg with no route has
-		// no source to attribute one to. Nothing on this arm writes a collapsed line.
 		return noticeWriter{out: p.errOut(), limits: p.notices}
 	}
-	return noticeWriter{out: p.errOut(), limits: route.notices, collapse: route.noticeCollapse}
+	return noticeWriter{out: p.errOut(), limits: route.notices}
 }
 
-// sessionNoticeWriter is routeNoticeWriter for a leg holding the SESSION: the same route table,
-// plus that session's reserved floor under it (see noticeReserve).
-//
-// One accessor taking a nilable session rather than the reserve being attached wherever a session
-// happens to be in scope: which floor a line may fall back on is a property of the leg's wiring,
-// and a leg that has a session but resolves its channel from the route alone loses the floor
-// silently. A nil session is a pre-session leg — it has no floor and needs none, since a refusal
-// taken before a session exists is attributable to no session.
+// sessionNoticeWriter is routeNoticeWriter for a leg holding the SESSION.
 //
 // A session's table comes from the SESSION's own route, not from the caller's, so the pair cannot
-// be mismatched: reserving against one tenant's floor while charging another's bucket is a fault
-// nothing downstream could detect, and taking two arguments is what would make it expressible.
-// route is consulted only for a leg that has no session to ask.
+// be mismatched. route is consulted only for a leg that has no session to ask.
 func (p *HTTPProxy) sessionNoticeWriter(sess *httpSession, route *UpstreamRoute) noticeWriter {
 	if sess == nil {
 		return p.routeNoticeWriter(route)
 	}
-	w := p.routeNoticeWriter(sess.route)
-	w.reserve = sess.noticeFloor
-	return w
+	return p.routeNoticeWriter(sess.route)
 }
 
 // routeRefusalLimits pairs this proxy's two admission controls for a leg serving route: the

@@ -4,7 +4,7 @@
 package transport
 
 import (
-	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,8 +12,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // withFakeClock pins a gate's bucket to a caller-driven clock and returns the setter, so a
@@ -327,279 +325,49 @@ func TestPreSessionLimiterAndSaturationGate_DoNotShareABucket(t *testing.T) {
 		t.Fatal("the saturation bucket must be drained for this test to mean anything")
 	}
 	// The pre-session bucket is untouched by that.
-	if !preSession.admitRefusal(catAuth).ok {
+	if ok, _ := preSession.admitRefusal(catAuth); !ok {
 		t.Fatal("a saturation flood must not spend the pre-session refusal budget")
 	}
 }
 
-// TestUpstreamRefusalFloor_SiblingKeepsItsFirstRecord is the gap the per-session TABLE alone left,
-// one axis over from the notice half's.
-//
-// The child and the parent are the same rate, so a session flooding one category is paced by its
-// own bucket to exactly the rate the parent refills at, and a sibling's FIRST record arrives to find
-// the parent empty. What is elided there is evidence — the record saying a live in-flight request
-// was evicted — not stderr legibility, which is why the floor is worth its cost here even though a
-// floored record is an audit WRITE.
-//
-// The refusal this floor answers is the PARENT's, which is the opposite of the notice half's, and
-// for a reason rather than by symmetry: a record holder owns its whole table, so its own bucket
-// refusing means it outran its own budget, and its peers contend one tier up.
-func TestUpstreamRefusalFloor_SiblingKeepsItsFirstRecord(t *testing.T) {
+// TestExemptCategory_IsUnboundedOnBothSpellings pins the one property the exemption exists for: a
+// declared-exempt category charges no bucket on either spelling of the write. Falling to the
+// floor-rate fallback instead made it the MOST throttled refusal in the table — the exact inversion
+// of what the declaration says, under the flood the exemption exists for.
+func TestExemptCategory_IsUnboundedOnBothSpellings(t *testing.T) {
 	t.Parallel()
 	at := time.Now()
-	aggregate := newRefusalRecordLimiter()
-	aggregate.setNow(func() time.Time { return at })
-
-	drain := func(lim *categoryRecordLimiter, n int) int {
-		lim.setNow(func() time.Time { return at })
-		admitted := 0
-		for range n {
-			if admitRefusalRecord(&fwdRecorder{}, lim, catDisplaced) != nil {
-				admitted++
-			}
-		}
-		return admitted
-	}
-
-	a := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	require.Positive(t, drain(a, 200), "A's leading edge reaches the tape")
-	require.LessOrEqual(t, aggregate.bucket(catDisplaced).tokens, 1.0,
-		"A's flood must have drained the shared parent; otherwise this test proves nothing")
-
-	b := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	assert.Equal(t, 1, drain(b, 5),
-		"a sibling session's first record must survive a flood that has emptied the parent; a table alone paces A to exactly the parent's refill rate")
-	assert.Zero(t, drain(b, 5),
-		"and it is one record per category per interval, not a second budget")
-}
-
-// TestUpstreamRefusalFloor_IsPerCategory keeps the record floor from being spent on the wrong
-// evidence: a session whose upstream floods one category must not thereby lose the floor for the
-// category that says a LIVE in-flight request was evicted.
-func TestUpstreamRefusalFloor_IsPerCategory(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	aggregate := newRefusalRecordLimiter()
-	aggregate.setNow(func() time.Time { return at })
-	flooder := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	flooder.setNow(func() time.Time { return at })
-	for range 200 {
-		_ = admitRefusalRecord(&fwdRecorder{}, flooder, catServerRequestFailed)
-	}
-
-	sibling := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	sibling.setNow(func() time.Time { return at })
-	assert.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sibling, catServerRequestFailed),
-		"the flooded category's own floor still delivers this session's first record")
-	assert.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sibling, catDisplaced),
-		"and a category this session has not written keeps its own floor; categories do not share one")
-}
-
-// TestUpstreamRefusalFloor_AggregateStillHoldsTheTotal is the bound that makes a floored AUDIT
-// write affordable at all. The parent exists because per-session buckets multiply the sustained
-// write rate into one 4096-deep queue by the session count under a --require-audit that defaults to
-// strict, so the floor must not reopen that: a floored record DEBITS the tier that refused it, so
-// it displaces the flooder's next record rather than adding to the total.
-func TestUpstreamRefusalFloor_AggregateStillHoldsTheTotal(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	aggregate := newRefusalRecordLimiter()
-	aggregate.setNow(func() time.Time { return at })
-
-	const sessions = 50
-	admitted := 0
-	for range sessions {
-		lim := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-		lim.setNow(func() time.Time { return at })
-		for range 20 {
-			if admitRefusalRecord(&fwdRecorder{}, lim, catDisplaced) != nil {
-				admitted++
-			}
-		}
-	}
-	assert.LessOrEqual(t, admitted, perCategoryDenyBurstSize+sessions,
-		"N sessions must not multiply the sustained audit-write rate by N: the parent bounds the total and the floor adds at most one record per session per interval")
-	assert.GreaterOrEqual(t, admitted, sessions,
-		"every session's first record is the whole point; a bound that elides it is the gap this closes")
-	assert.GreaterOrEqual(t, aggregate.bucket(catDisplaced).tokens, -float64(perCategoryDenyBurstSize),
-		"the debt the floors ran up is clamped at one burst, so the aggregate recovers rather than staying shut")
-}
-
-// TestRecordFloor_NotClaimedWhenTheHoldersOwnBucketRefused pins the direction the record half's
-// floorTier declares, which is the notice half's inverted. A session that outran its OWN table is
-// not owed an arrival: nobody else caused that refusal, and flooring it would hand every flooding
-// session a bonus record per interval on top of its share.
-func TestRecordFloor_NotClaimedWhenTheHoldersOwnBucketRefused(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	// No aggregate: every refusal below is this session's own bucket refusing.
-	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
-	lim.setNow(func() time.Time { return at })
-
-	admitted := 0
-	for range 200 {
-		if admitRefusalRecord(&fwdRecorder{}, lim, catDisplaced) != nil {
-			admitted++
-		}
-	}
-	assert.LessOrEqual(t, admitted, perCategoryDenyBurstSize,
-		"a holder's own budget is the whole answer to its own flood; a floor on top is a second budget")
-}
-
-// TestFloorTier_ZeroValueFloorsNothing pins the enum's fail-safe default. floorNowhere is what a
-// table that never declared where its holder's peers contend resolves to, and the safe answer for
-// "nobody decided" is the one that hands out no writes outside a bucket.
-func TestFloorTier_ZeroValueFloorsNothing(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	table := newTieredBuckets(1, 1, recordReserveInterval, []refusalCategory{catDisplaced}, nil, "test", floorNowhere)
-	table.setNow(func() time.Time { return at })
-	reserve := newKeyReserve([]refusalCategory{catDisplaced})
+	limiter := newRefusalRecordLimiter()
+	limiter.setNow(func() time.Time { return at })
+	require.Contains(t, exemptRefusals, catUnroutable, "this test is about a category the table declares exempt")
+	require.NotContains(t, limiter.buckets, catUnroutable, "which is therefore absent from the bucket table")
 
 	admitted := 0
 	for range 20 {
-		if table.admitWithFloor(catDisplaced, reserve.forKey(catDisplaced)).ok {
+		if ok, _ := limiter.admitRefusal(catUnroutable); ok {
 			admitted++
 		}
 	}
-	assert.Equal(t, 1, admitted, "an undeclared floor tier must consult no floor at all")
-}
+	assert.Equal(t, 20, admitted, "an exempt category charges no bucket on the admission both spellings share")
 
-// TestReserveSlot_ReArmIsMonotonicAndHasNoEpochSentinel pins the two ways a naive encoding of "when
-// was this last claimed" goes wrong, both of which the floor's whole purpose is sensitive to.
-func TestReserveSlot_ReArmIsMonotonicAndHasNoEpochSentinel(t *testing.T) {
-	t.Parallel()
-
-	t.Run("a backwards wall-clock step does not lock the reserve", func(t *testing.T) {
-		// time.Now() carries a monotonic reading; a wall-clock step moves only the wall part, which
-		// is what an NTP correction or a VM resume does. An interval measured on the wall clock
-		// would refuse every floored write for the length of the step, while every bucket in the
-		// same table kept refilling — the exact elision the floor exists to close.
-		var slot reserveSlot
-		now := time.Now()
-		require.True(t, slot.claim(now, recordReserveInterval))
-		stepped := now.Add(-10 * time.Minute)
-		assert.False(t, slot.claim(stepped, recordReserveInterval),
-			"a step alone must not re-arm the reserve either")
-		assert.True(t, slot.claim(now.Add(recordReserveInterval), recordReserveInterval),
-			"the monotonic reading is what decides; a wall-clock comparison would still be counting down from the step")
-	})
-
-	t.Run("the Unix epoch is not a never-claimed sentinel", func(t *testing.T) {
-		// An int64 nanosecond encoding has no value outside the clock's range to mean "unclaimed",
-		// so a clock reading exactly the epoch stored 0 and read back as never claimed — an
-		// unbounded bypass of both tiers, driven by a fake clock this package already uses
-		// elsewhere (time.Unix(0, ns)).
-		var slot reserveSlot
-		epoch := time.Unix(0, 0)
-		require.True(t, slot.claim(epoch, recordReserveInterval))
-		assert.False(t, slot.claim(epoch, recordReserveInterval), "the reserve is one write per interval, whatever the clock reads")
-	})
-}
-
-// TestReserveSlot_OneReadingPerAdmission pins claim's contract against the two-tier case, which is
-// the one where "which clock" is answerable more than one way.
-//
-// The instant comes from the bucket the caller ADMITTED THROUGH, not from each tier's own clock:
-// re-sampling per tier would let a floor's interval be measured against a different instant than
-// the refill that refused it, and setNow deliberately does not descend, so a floor slaved to the
-// parent's clock would be uncontrollable from the tier a test drives.
-func TestReserveSlot_OneReadingPerAdmission(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	aggregate := newRefusalRecordLimiter()
-	// The parent is left on the REAL clock on purpose: freezing the tier admitted through must be
-	// enough to control the floor's re-arm.
-	sess := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	sess.setNow(func() time.Time { return at })
-	for range 200 {
-		_ = admitRefusalRecord(&fwdRecorder{}, newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories), catDisplaced)
+	// The control, on the same drained table: a METERED category is still bounded, so what the
+	// exemption buys is not a hole in the admission.
+	metered := 0
+	for range 20 {
+		if ok, _ := limiter.admitRefusal(catOrigin); ok {
+			metered++
+		}
 	}
+	assert.Positive(t, metered)
+	assert.Less(t, metered, 20, "a metered category is still bounded by its own bucket")
 
-	require.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sess, catDisplaced), "the floor delivers the first one")
-	assert.Nil(t, admitRefusalRecord(&fwdRecorder{}, sess, catDisplaced),
-		"a frozen entry tier must hold the reserve spent however long the wall clock runs")
-	at = at.Add(2 * recordReserveInterval)
-	sess.setNow(func() time.Time { return at })
-	assert.NotNil(t, admitRefusalRecord(&fwdRecorder{}, sess, catDisplaced),
-		"and advancing that same tier is what re-arms it")
+	// And the recorder-resolving spelling agrees, which is the property that was only true because
+	// it read the declaration a second time.
+	assert.NotNil(t, refusalRecorders{rec: &fwdRecorder{}, limits: refusalLimits{records: limiter}}.forCategory(catUnroutable),
+		"the exemption resolves the same on either spelling, from one reader")
 }
 
-// TestBorrow_DebtNeverExceedsOneBurst pins the clamp against a FRACTIONAL balance, which is the
-// only shape that catches a clamp tested before the decrement rather than after it — and the shape
-// every real clock produces, since a partial refill is the normal state of a flooded bucket.
-func TestBorrow_DebtNeverExceedsOneBurst(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	b := newRecordRateLimiter(2, 5)
-	b.now = func() time.Time { return at }
-	for range 10 {
-		_, _, _ = b.admit()
-	}
-	// A partial refill, so the balance is not a whole number of tokens.
-	at = at.Add(150 * time.Millisecond)
-	for range 50 {
-		b.borrow()
-	}
-	assert.GreaterOrEqual(t, b.tokens, -5.0,
-		"the debt is clamped at one burst; testing the pre-decrement balance overshoots by a token and adds (1/rate) seconds to the tier's recovery")
-}
-
-// TestUpstreamRefusalFloor_DelegatedCategoryStillFloors is the gap a reserve keyed on the table's
-// OWN categories left. A narrowed session table (a remote upstream reaches at most one of the four)
-// delegates the rest wholly to the aggregate, and a floor built from the same narrowed set gives
-// those exactly no reserve — the elision this floor exists to close, surviving for one session kind
-// while the aggregate's own floorTier claimed to serve it.
-func TestUpstreamRefusalFloor_DelegatedCategoryStillFloors(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	aggregate := newRefusalRecordLimiter()
-	aggregate.setNow(func() time.Time { return at })
-
-	flooder := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	flooder.setNow(func() time.Time { return at })
-	for range 200 {
-		_ = admitRefusalRecord(&fwdRecorder{}, flooder, catDisplaced)
-	}
-
-	narrowed := newUpstreamRefusalLimiter(aggregate, remoteUpstreamRefusalCategories)
-	narrowed.setNow(func() time.Time { return at })
-	require.Nil(t, narrowed.buckets[catDisplaced], "this test is about a category the narrowed table has no bucket for")
-	assert.NotNil(t, admitRefusalRecord(&fwdRecorder{}, narrowed, catDisplaced),
-		"a delegated category contends with its peers at the tier it delegates TO, so its floor must be claimable there")
-}
-
-// TestUpstreamRefusalFloor_RecordSaysItWasFloored keeps the evidence legible. A record that exists
-// only because the reserve delivered it is otherwise byte-identical to one the tier had room for,
-// so an auditor reading the tape during a saturation sees clean records and no sign that sibling
-// holders' records are being dropped wholesale.
-func TestUpstreamRefusalFloor_RecordSaysItWasFloored(t *testing.T) {
-	t.Parallel()
-	at := time.Now()
-	aggregate := newRefusalRecordLimiter()
-	aggregate.setNow(func() time.Time { return at })
-	flooder := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	flooder.setNow(func() time.Time { return at })
-	for range 200 {
-		_ = admitRefusalRecord(&fwdRecorder{}, flooder, catDisplaced)
-	}
-
-	rec := &fwdRecorder{}
-	sibling := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-	sibling.setNow(func() time.Time { return at })
-	floored := admitRefusalRecord(rec, sibling, catDisplaced)
-	require.NotNil(t, floored, "the sibling's first record is delivered on its reserve")
-	floored.RecordDeny(context.Background(), "s", "", "roots/list", capability.ErrCodeEnforcementError, "", nil, false)
-
-	require.Len(t, rec.records, 1)
-	assert.Equal(t, true, rec.records[0].details[detailRefusalFloored],
-		"a floored record must say so: its arrival is the one that does not mean the tier had room")
-
-	// An ordinary admitted record must NOT carry it, or the marker says nothing.
-	plain := &fwdRecorder{}
-	quiet := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
-	quiet.setNow(func() time.Time { return at })
-	admitRefusalRecord(plain, quiet, catDisplaced).RecordDeny(context.Background(), "s", "", "roots/list", capability.ErrCodeEnforcementError, "", nil, false)
-	require.Len(t, plain.records, 1)
-	assert.NotContains(t, plain.records[0].details, detailRefusalFloored)
-}
+// noticesTo builds an unbounded diagnostic channel writing to w, which is what a leg under test
+// wants: the bounding is exercised by the notice tests, and every other test would otherwise have
+// its expected lines silently eaten once it crossed a class budget.
+func noticesTo(w io.Writer) noticeWriter { return noticeWriter{out: w} }
