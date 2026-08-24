@@ -510,26 +510,28 @@ func TestWiring_PositionalSubsystemsAreRefusedToo(t *testing.T) {
 	})
 }
 
-// TestWiring_ARouteBindsToOneProxy pins the refusal that keeps a caller-owned route map from being
-// silently taken over.
+// TestWiring_ARouteMapMayBeSharedByTwoProxies pins that a caller-owned Routes map carries no
+// per-proxy state.
 //
-// NewHTTPProxyGateway re-parents each route's notice table and replaces its collapse windows IN
-// PLACE, on values the caller still holds. A second proxy over the same map therefore repointed the
-// first proxy's per-route buckets at its own aggregate — so a flood on one silenced the other's
-// diagnostics — and re-armed windows that were mid-incident, with every guard on both reading green.
-func TestWiring_ARouteBindsToOneProxy(t *testing.T) {
+// It used to: NewHTTPProxyGateway re-parented each route's own notice table and replaced its
+// collapse windows IN PLACE, on values the caller still holds, so a second proxy over the same map
+// repointed the first's buckets at its own aggregate and re-armed windows that were mid-incident.
+// That was refused with a panic. With the notice budget held once per PROXY and routes holding
+// none of it, there is nothing to take over and the refusal is gone — asserted here rather than
+// left implicit, since re-introducing per-route diagnostic state must re-introduce the guard too.
+func TestWiring_ARouteMapMayBeSharedByTwoProxies(t *testing.T) {
 	t.Parallel()
 	routes := map[string]*UpstreamRoute{"a": {name: "a"}}
 
 	first := NewHTTPProxyGateway(HTTPGatewayOptions{Routes: routes})
-	require.NotNil(t, first.routes["a"].notices, "the first proxy claims the route and wires it")
+	require.NotNil(t, first.notices, "the proxy holds the one notice table")
 
-	assert.PanicsWithValue(t,
-		"eunox: HTTPGatewayOptions.Routes[\"a\"] is already bound to another HTTPProxy: a route holds "+
-			"per-upstream diagnostic state that a second proxy would take over, silencing the first's "+
-			"lines and re-arming its collapse windows. Build routes per proxy.",
-		func() { NewHTTPProxyGateway(HTTPGatewayOptions{Routes: routes}) },
-		"the second construction must be refused rather than quietly repointing the first proxy's tables")
+	assert.NotPanics(t, func() { NewHTTPProxyGateway(HTTPGatewayOptions{Routes: routes}) },
+		"a route holds no per-proxy state, so a second proxy over the same map takes nothing over")
+
+	second := NewHTTPProxyGateway(HTTPGatewayOptions{Routes: routes})
+	assert.NotSame(t, first.notices, second.notices,
+		"each proxy bounds its own diagnostics; sharing a Routes map must not share a budget")
 
 	// And a nil VALUE in the same map is the other way that map reaches the loop unusable.
 	assert.Panics(t, func() {

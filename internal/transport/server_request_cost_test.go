@@ -10,7 +10,6 @@ import (
 	"go/ast"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -78,45 +77,4 @@ func findMethod(t *testing.T, recv, name string) *ast.FuncDecl {
 	}
 	t.Fatalf("no method (*%s).%s in this package", recv, name)
 	return nil
-}
-
-// TestRemoteSession_RefusalTableHoldsOnlyWhatItCanReach covers the remote-upstream session's own
-// bucket table.
-//
-// A remote upstream issues no server-initiated requests through this proxy — there is no upstream
-// reader to receive one and no sink to answer one through — so three of the four upstream-driven
-// categories are unreachable there and their buckets were four rate limiters and four map entries
-// per session for records nothing can write.
-func TestRemoteSession_RefusalTableHoldsOnlyWhatItCanReach(t *testing.T) {
-	t.Parallel()
-	aggregate := newRefusalRecordLimiter()
-	remote := newUpstreamRefusalLimiter(aggregate, remoteUpstreamRefusalCategories)
-
-	assert.Len(t, remote.buckets, 1, "a remote session must not retain buckets for categories its mode cannot reach")
-	_, held := remote.buckets[catServerRequestFailed]
-	assert.True(t, held, "the host reply this mode cannot relay is the drop it actually produces, so that category stays session-scoped")
-
-	// A category it does NOT hold is delegated WHOLLY to the aggregate, which is the proxy-wide
-	// bound those records had before the per-session split existed — never the floor-rate `unknown`
-	// bucket, which would silently make an unlisted category the most suppressed one on the proxy.
-	for range perCategoryDenyBurstSize {
-		ok := remote.admitWithFloor(catDisplaced, nil).ok
-		require.True(t, ok)
-	}
-	ok := remote.admitWithFloor(catDisplaced, nil).ok
-	assert.False(t, ok, "an unlisted category charges the aggregate's bucket for that category, so it is bounded at the pre-split rate")
-	assert.Greater(t, aggregate.bucket(catDisplaced).burst, float64(perBucketFloor),
-		"and the bucket it charged is the aggregate's real one, not the floor-rate fallback")
-}
-
-// TestUpstreamRefusalCategories_LocalSessionKeepsTheWholeSet is the control: narrowing the REMOTE
-// set must not narrow the subprocess one, whose upstream genuinely drives all four.
-func TestUpstreamRefusalCategories_LocalSessionKeepsTheWholeSet(t *testing.T) {
-	t.Parallel()
-	local := newUpstreamRefusalLimiter(newRefusalRecordLimiter(), upstreamRefusalCategories)
-	assert.Len(t, local.buckets, len(upstreamRefusalCategories))
-	for _, cat := range upstreamRefusalCategories {
-		_, held := local.buckets[cat]
-		assert.True(t, held, "category %q is driven by a subprocess upstream and must stay session-scoped", cat)
-	}
 }

@@ -434,7 +434,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				// other method. Answered as the drop it must be anyway — there is no session
 				// here, so nothing to forward it on — rather than discarding the verdict and
 				// letting a future forwardable pre-session method be dropped in silence.
-				if line, ok := p.routeNoticeWriter(route).admitNotice(siteUpstreamlessNotification); ok {
+				if line, ok := p.noticeWriter().admitNotice(siteUpstreamlessNotification); ok {
 					line.writef(
 						"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
 						audit.SanitizeAuditField(msg.Method))
@@ -530,7 +530,7 @@ const (
 // message that vanishes with no trace is the one an operator most needs to see when a host is
 // mysteriously getting nothing done.
 func (p *HTTPProxy) dropUnworkableSessionlessMessage(r *http.Request, route *UpstreamRoute, rev capability.Revision, msg mcp.RPCMsg) {
-	rec := p.routeRefusalLimits(nil, route).recorders(refusalSink(p, route)).forCategory(catUnservable)
+	rec := p.routeRefusalLimits().recorders(refusalSink(p, route)).forCategory(catUnservable)
 	if rec == nil {
 		return
 	}
@@ -650,7 +650,7 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// below: no point reserving a slot for a notification about to be dropped.
 	if msg.IsNotification() {
 		gate := hostNotificationGate{
-			recorders:   p.routeRefusalRecorders(sess, route),
+			recorders:   p.routeRefusalRecorders(route),
 			subject:     verifiedSession(sessionID),
 			established: true,
 			audit:       route.audit,
@@ -985,7 +985,7 @@ func (p *HTTPProxy) enforceSessionGates(ctx context.Context, route *UpstreamRout
 // caller's TARGET rather than the caller's own — that is the whole point of the gate — so
 // charging it would let an attacker spend a victim's share and silence the victim's own records.
 func (p *HTTPProxy) sessionGateRecorder(route *UpstreamRoute) auditRecorder {
-	return p.routeRefusalLimits(nil, route).recorders(refusalSink(p, route)).forCategory(catSessionGate)
+	return p.routeRefusalLimits().recorders(refusalSink(p, route)).forCategory(catSessionGate)
 }
 
 // handleMCPGet opens a server-sent events stream for upstream notifications.
@@ -1536,7 +1536,7 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	if err := checkRoutingHeaders(rev, r, msg); err != nil {
 		ctx := capability.WithProtocolRevision(r.Context(), rev)
 		writeDispatchResult(w, refuseHeaderMismatch(ctx,
-			p.headerMismatchRecorder(sess, route), headerRefusalSessionID(sess), msg, err))
+			p.headerMismatchRecorder(route), headerRefusalSessionID(sess), msg, err))
 		return rev, false
 	}
 	return rev, true
@@ -1562,8 +1562,8 @@ func headerRefusalSessionID(sess *httpSession) string {
 // `Mcp-Method` is refused at the envelope, before the kill check, holding no session slot and
 // contacting no upstream, so an unauthenticated peer drives one record per frame. Suppressed
 // refusals fold into the next admitted record rather than vanishing.
-func (p *HTTPProxy) headerMismatchRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
-	return p.routeRefusalLimits(sess, route).recorders(refusalSink(p, route)).forCategory(catHeaderMismatch)
+func (p *HTTPProxy) headerMismatchRecorder(route *UpstreamRoute) auditRecorder {
+	return p.routeRefusalLimits().recorders(refusalSink(p, route)).forCategory(catHeaderMismatch)
 }
 
 // refusalSink picks the tape an envelope-level refusal is written to: the route's, which stamps
@@ -1596,7 +1596,7 @@ type sessionlessGatePeer struct {
 // revisionRefusalRecorder resolves the refusal's recorder with no session to name, which is the
 // honest subject here: nothing has been established for this message to belong to.
 func (s *sessionlessGatePeer) revisionRefusalRecorder() auditRecorder {
-	return s.proxy.revisionRefusalRecorder(nil, s.route)
+	return s.proxy.revisionRefusalRecorder(s.route)
 }
 
 // unblockRefusedServerReply answers nothing: a pre-session message reaches no upstream, so there
@@ -1654,7 +1654,7 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 //
 // Nil-limiter tolerance mirrors recordRefusal's: a proxy built without one (tests) records
 // unbounded rather than not at all.
-func (p *HTTPProxy) revisionRefusalRecorder(sess *httpSession, route *UpstreamRoute) auditRecorder {
+func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder {
 	// p is nil only on a bare-struct-literal session (as tests build) reaching this through
 	// httpSession.revisionRefusalRecorder; the limits below already tolerate one, and a refusal
 	// with no recorder still reaches its peer on the wire.
@@ -1670,5 +1670,5 @@ func (p *HTTPProxy) revisionRefusalRecorder(sess *httpSession, route *UpstreamRo
 	// a live session on the established-POST path. A nil here would be a floorless channel waiting
 	// for the first diagnostic anyone adds to the -32022 refusal — which catRevision's own doc
 	// describes as the cheapest refusal an unauthenticated peer can drive.
-	return p.routeRefusalLimits(sess, route).recorders(rec).forCategory(catRevision)
+	return p.routeRefusalLimits().recorders(rec).forCategory(catRevision)
 }

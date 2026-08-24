@@ -255,8 +255,8 @@ type HTTPProxy struct {
 	//   - the pre-session refusals it was built for — the only audit writes an UNAUTHENTICATED
 	//     caller can trigger, and so a lever on --require-audit=strict;
 	//   - the -32022 revision refusal, which an ESTABLISHED session's traffic reaches;
-	//   - and every session's own upstream-driven table, for which this is the aggregate parent
-	//     holding the total at the pre-split ceiling (see newUpstreamRefusalLimiter).
+	//   - and every session's upstream-driven refusals, which charge this table directly rather
+	//     than a per-session one of their own.
 	//
 	// Left named for the first because the field is threaded through the leg wiring in a dozen
 	// places and a rename buys nothing the doc does not; what mattered was that the doc claimed
@@ -467,18 +467,10 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		sessions:           make(map[string]*httpSession),
 		revoked:            make(chan struct{}, 1),
 	}
-	// Each route's diagnostic table is RE-PARENTED onto this proxy's aggregate, so a peer looping
-	// an unmapped method against one route cannot silence another's lines. BuildRoutes already
-	// built each one (parentless, so a route that never reaches a proxy is still bounded); what it
-	// could not do is name the aggregate, which belongs to a proxy that did not exist yet.
-	// Both per-route diagnostic facilities are assigned here, not just the one that needs the
-	// aggregate: a route arriving through the exported Routes seam from somewhere other than
-	// BuildRoutes would otherwise get a repaired bucket table beside nil collapse windows, which
-	// reads as correctly wired and silently restores the per-frame flood.
-	// Validated over the WHOLE map before anything is mutated. The loop below writes in place
-	// on values the caller still holds, so validating and mutating in one pass left the routes
-	// ahead of a rejected one already bound and re-pointed — a panic the caller cannot act on
-	// without knowing which half of its map this constructor got through.
+	// Routes hold no per-proxy diagnostic state: the notice budget is the proxy's one table, so a
+	// route is validated here and never written to. Two proxies may therefore legitimately share a
+	// Routes map, which is why the bind check this loop used to carry is gone with the per-route
+	// table it protected.
 	for name, route := range p.routes {
 		// requireUsableOptions descends into a container's elements, but this one's are POINTERS
 		// and that is its stop: what a caller-built subsystem holds inside itself is its own
@@ -493,21 +485,6 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 		// here for the reason above, and held to it by the declaration in wiring_test.go: a second
 		// pointer-element container option fails the build rather than inheriting these two lines.
 		requireUsable(fmt.Sprintf("HTTPGatewayOptions.Routes[%q].pdp", name), route.pdp)
-		// And a route already claimed by another proxy is refused rather than taken over: the
-		// assignments below are IN PLACE on a value the caller still holds, so a second proxy over
-		// the same map silently repoints the first's diagnostics and re-arms its collapse windows.
-		// See UpstreamRoute.boundProxy. Build a fresh set (BuildRoutes) per proxy.
-		if route.boundProxy {
-			panic(fmt.Sprintf(
-				"eunox: HTTPGatewayOptions.Routes[%q] is already bound to another HTTPProxy: a route holds "+
-					"per-upstream diagnostic state that a second proxy would take over, silencing the first's "+
-					"lines and re-arming its collapse windows. Build routes per proxy.", name))
-		}
-	}
-	for _, route := range p.routes {
-		route.boundProxy = true
-		route.notices = newRouteNoticeLimiter(p.notices)
-		route.noticeCollapse = newNoticeCollapse()
 	}
 	// Registered at construction (not Serve) so a kill delivered during startup is not lost —
 	// the buffered slot coalesces it, served by the worker's first tick. Unregister is kept
@@ -812,63 +789,27 @@ func (p *HTTPProxy) serveCtx() context.Context {
 	return context.Background()
 }
 
-// routeNoticeWriter is the diagnostic channel for a leg serving route: the configured stderr writer
-// and the route's OWN class table, which charges this proxy's aggregate as its parent (see
-// newRouteNoticeLimiter) — one tenant's flood must not silence another's, which is the whole reason
-// that table exists.
+// noticeWriter is the diagnostic channel every HTTP leg writes through: the configured stderr
+// writer and this proxy's one class table.
 //
-// ONE accessor taking a nilable route rather than a route-less twin beside it: every HTTP leg that
-// writes a diagnostic has its route in hand, so a second spelling had no caller left once they were
-// all converted, and the pair could only drift. A nil route (a leg that genuinely has none) falls
-// back to the aggregate directly, and a nil receiver to an unbounded channel, which is what a proxy
+// ONE accessor with no route or session parameter, because the budget has no tier below the proxy
+// for either to select. The route- and session-taking pair this replaced resolved the same table on
+// both branches once the per-route tables were removed, which is a parameter a reader has to check
+// to discover means nothing. A nil receiver resolves to an unbounded channel, which is what a proxy
 // assembled by a bare struct literal in a test gets.
-func (p *HTTPProxy) routeNoticeWriter(route *UpstreamRoute) noticeWriter {
+func (p *HTTPProxy) noticeWriter() noticeWriter {
 	if p == nil {
 		return noticeWriter{}
 	}
-	if route == nil || route.notices == nil {
-		// No collapse windows on this arm, deliberately: the faults they collapse are a route's own
-		// (its upstream's receipt pin, its policy engine's flow store), and a leg with no route has
-		// no source to attribute one to. Nothing on this arm writes a collapsed line.
-		return noticeWriter{out: p.errOut(), limits: p.notices}
-	}
-	return noticeWriter{out: p.errOut(), limits: route.notices, collapse: route.noticeCollapse}
+	return noticeWriter{out: p.errOut(), limits: p.notices}
 }
 
-// sessionNoticeWriter is routeNoticeWriter for a leg holding the SESSION: the same route table,
-// plus that session's reserved floor under it (see noticeReserve).
-//
-// One accessor taking a nilable session rather than the reserve being attached wherever a session
-// happens to be in scope: which floor a line may fall back on is a property of the leg's wiring,
-// and a leg that has a session but resolves its channel from the route alone loses the floor
-// silently. A nil session is a pre-session leg — it has no floor and needs none, since a refusal
-// taken before a session exists is attributable to no session.
-//
-// A session's table comes from the SESSION's own route, not from the caller's, so the pair cannot
-// be mismatched: reserving against one tenant's floor while charging another's bucket is a fault
-// nothing downstream could detect, and taking two arguments is what would make it expressible.
-// route is consulted only for a leg that has no session to ask.
-func (p *HTTPProxy) sessionNoticeWriter(sess *httpSession, route *UpstreamRoute) noticeWriter {
-	if sess == nil {
-		return p.routeNoticeWriter(route)
-	}
-	w := p.routeNoticeWriter(sess.route)
-	w.reserve = sess.noticeFloor
-	return w
-}
-
-// routeRefusalLimits pairs this proxy's two admission controls for a leg serving route: the
-// proxy-wide category buckets its refusal RECORDS charge, and that route's own diagnostic table.
-// The leg that meters no record (routeRefusalRecorders) takes the notice channel alone, and an
-// established session's upstream-driven refusals charge its own per-session table instead (see
-// newUpstreamRefusalLimiter).
-//
-// Nilable route for the reason routeNoticeWriter takes one, and nilable session for the reason
-// sessionNoticeWriter does: a leg that has one names it, so the per-session floor is not lost by a
-// leg resolving its channel from the route alone.
-func (p *HTTPProxy) routeRefusalLimits(sess *httpSession, route *UpstreamRoute) refusalLimits {
+// routeRefusalLimits pairs this proxy's two admission controls: the proxy-wide category buckets a
+// refusal RECORD charges, and the proxy's diagnostic channel. The leg that meters no record
+// (routeRefusalRecorders) takes the notice channel alone.
+func (p *HTTPProxy) routeRefusalLimits() refusalLimits {
 	if p == nil {
 		return refusalLimits{}
 	}
-	return refusalLimits{records: p.preSessionDenies, notices: p.sessionNoticeWriter(sess, route)}
+	return refusalLimits{records: p.preSessionDenies, notices: p.noticeWriter()}
 }

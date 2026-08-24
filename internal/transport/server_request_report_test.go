@@ -20,7 +20,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -126,7 +125,7 @@ func TestBroadcastServerRequest_NoSubscriberRecordsADestroyedAnswer(t *testing.T
 		route:          &UpstreamRoute{name: "up1", sink: nil},
 		proxy:          newTestHTTPProxy(),
 		done:           make(chan struct{}),
-		upstreamDenies: newUpstreamRefusalLimiter(nil, upstreamRefusalCategories),
+		upstreamDenies: newRefusalRecordLimiter(),
 	})
 	// The route's own sink is what a session's refusal records resolve through; substitute the
 	// capture recorder by driving the seam the session builds.
@@ -141,115 +140,6 @@ func TestBroadcastServerRequest_NoSubscriberRecordsADestroyedAnswer(t *testing.T
 
 	require.Len(t, rec.records, 1, "the answer to an undeliverable request was itself destroyed, which is what leaves the upstream wedged")
 	assert.Equal(t, string(dropHTTPRefusalUndeliverable), rec.records[0].details[detailTransport])
-}
-
-// TestUpstreamRefusalBuckets_ArePerSession is the regression for one session's flood eliding
-// another's record.
-//
-// All four upstream-driven categories used to charge one proxy-wide table, so session A's dead
-// subprocess drained catRefusalUndeliverable at its ~2/s share and session B's genuinely lost
-// in-flight refusal was folded into a suppressed_refusal_count on a record stamped with A's route.
-// Each category has its own bucket for exactly that reason between categories; the session is the
-// same argument one dimension out, and saturationGate already states it for its own records.
-func TestUpstreamRefusalBuckets_ArePerSession(t *testing.T) {
-	t.Parallel()
-	drain := func(rec *fwdRecorder, lim *categoryRecordLimiter, rounds int) {
-		var reqs serverReqTracker
-		u := serverRequestUnblocker{
-			reqs: &reqs, sink: brokenSink(), notices: noticesTo(io.Discard),
-			report: dropReport{
-				recs: refusalLimits{records: lim}.recorders(rec),
-				subj: verifiedSession("s"),
-				legs: httpServerRequestLegs,
-			},
-		}
-		for i := range rounds {
-			id := mcp.RawJSON(jsonNumber(i))
-			_, _ = reqs.track(mcp.RPCMsg{ID: id, Method: "roots/list"}, io.Discard)
-			u.unblock(context.Background(), id, "refused")
-		}
-	}
-
-	// Session A empties its own bucket many times over.
-	a, aLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
-	drain(a, aLim, 200)
-	require.NotEmpty(t, a.records)
-	assert.LessOrEqual(t, len(a.records), perCategoryDenyBurstSize+1, "A's own flood is still bounded by A's bucket")
-
-	// Session B, with one lost in-flight refusal, must still be recorded.
-	b, bLim := &fwdRecorder{}, newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
-	drain(b, bLim, 1)
-	assert.Len(t, b.records, 1,
-		"a sibling session's flood must not elide the record that says THIS session lost a live in-flight request")
-}
-
-// TestUpstreamRefusalBuckets_StillChargeTheAggregate is the other half, and the reason the split is
-// not simply "a full share each". It isolates the TIER arithmetic: it drives admit directly, so no
-// holder floor is in play (see TestUpstreamRefusalFloor_AggregateStillHoldsTheTotal for the same
-// property through the production entry point, floor included).
-//
-// Per-session buckets alone multiply the sustained write rate into the ONE shared audit queue by the
-// session count — at the default maxSessions that is 4096/s sustained against a 4096-deep queue,
-// and --require-audit defaults to strict, so overflowing it latches AuditDegraded and denies every
-// route. The session tier decides fairness; the proxy-wide parent keeps the total bounded.
-func TestUpstreamRefusalBuckets_StillChargeTheAggregate(t *testing.T) {
-	t.Parallel()
-	aggregate := newRefusalRecordLimiter()
-	admitted := 0
-	// Many sessions, each with its own full-share table, all flooding the same category.
-	for range 50 {
-		lim := newUpstreamRefusalLimiter(aggregate, upstreamRefusalCategories)
-		for range 20 {
-			if lim.admitWithFloor(catDisplaced, nil).ok {
-				admitted++
-			}
-		}
-	}
-	assert.LessOrEqual(t, admitted, perCategoryDenyBurstSize+1,
-		"N sessions must not multiply the aggregate audit-write rate by N; the per-session tier bounds fairness, the parent bounds the total")
-	assert.Positive(t, admitted, "the leading edge must still reach the tape")
-}
-
-// TestUpstreamRefusalBuckets_RollupNamesItsOwnScope is the regression for a per-session tally
-// claiming proxy-wide reach on the signed tape.
-//
-// The scope value is what tells a reader whether a count of 5000 spans every route or one session's
-// upstream; a per-session table stamping the proxy-wide value is the same misreading the route stamp
-// caused before the scope was recorded at all.
-func TestUpstreamRefusalBuckets_RollupNamesItsOwnScope(t *testing.T) {
-	t.Parallel()
-	rec := &fwdRecorder{}
-	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
-	// Exhaust the burst so the next admitted record carries a rollup.
-	for range perCategoryDenyBurstSize + 20 {
-		_ = admitRefusalRecord(rec, lim, catDisplaced)
-	}
-	lim.setNow(func() time.Time { return time.Now().Add(time.Hour) })
-	rolled := admitRefusalRecord(rec, lim, catDisplaced)
-	require.NotNil(t, rolled)
-	rolled.RecordDeny(context.Background(), "s", "", "roots/list", capability.ErrCodeEnforcementError, "", nil, false)
-
-	last := rec.records[len(rec.records)-1]
-	assert.Equal(t, suppressedScopeSessionCategory, last.details[detailSuppressedRefusalScope],
-		"a per-session tally stamped proxy_category tells a reader it spans every route")
-	assert.Positive(t, last.details[detailSuppressedRefusalCount])
-}
-
-// TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory keeps the per-session table honest: a
-// category it charges but does not build falls to the shared `unknown` bucket, which is bounded at
-// the floor rate and shared with every other unregistered category.
-func TestUpstreamRefusalLimiter_HasABucketPerUpstreamCategory(t *testing.T) {
-	t.Parallel()
-	lim := newUpstreamRefusalLimiter(nil, upstreamRefusalCategories)
-	require.NotEmpty(t, upstreamRefusalCategories)
-	for _, cat := range upstreamRefusalCategories {
-		assert.Equal(t, meteringMetered, refusalDeclarations[cat].metering,
-			"the per-session table charges %q, which is not a metered category", cat)
-		assert.NotEqual(t, lim.unknown, lim.bucket(cat), "no bucket built for %q", cat)
-	}
-	// The share is still a share of the AGGREGATE, not of the four this table happens to hold —
-	// splitting a bucket per session must not also widen each one.
-	assert.Equal(t, float64(perCategoryDenyRatePerSec), lim.bucket(catDisplaced).ratePerSec)
 }
 
 // TestInitiatorWriter_AnswersTheConcreteWriterByName pins the half of the nil-writer question that

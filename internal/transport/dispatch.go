@@ -722,7 +722,7 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 	if tables.enforces(msg.Method) {
 		// Unmetered by DECLARATION (catSmuggled), not by omission — and named to the resolver, so
 		// the declaration is what decides rather than whichever recorder this leg happened to
-		// build. See refusalDeclarations and refusalRecorders.
+		// build. See exemptRefusals and refusalRecorders.
 		if rec := g.recorders.forCategory(catSmuggled); rec != nil {
 			// auditIdentity for the same reason its siblings use it: every enforced method
 			// resolves a target type, so naming one here fabricates a policy target for a
@@ -1224,7 +1224,7 @@ func completeToolsListing(params, result json.RawMessage) bool {
 
 // dispatchUnmapped is the request-framed entry to the fail-closed routing default. Its refusal
 // wiring is this leg's sink paired with this leg's limits, so the request framing is governed by
-// refusalDeclarations exactly as the notification framing is — it used to be handed an
+// the exemption declaration exactly as the notification framing is — it used to be handed an
 // already-resolved recorder that never met the declaration at all.
 func dispatchUnmapped(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mcp.RPCMsg {
 	return refuseUnroutable(ctx, d.forwardParams, d.limits.recorders(d.rec), verifiedSession(d.sessionID), msg, unroutableFramingRequest)

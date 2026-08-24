@@ -182,14 +182,6 @@ type StdioProxy struct {
 	// down one pipe can make this process do. No parent: stdio serves ONE upstream, so this table
 	// is both the tenant's and the aggregate. See noticeLimiter.
 	notices *noticeLimiter
-	// noticeFloor reserves on the SITE axis alone: this proxy is one holder with no sibling to be
-	// starved by, so it needs no per-class floor, but the line a class-mate's flood must not elide
-	// is written here exactly as it is on the HTTP transport. nil on a bare-struct-literal proxy.
-	noticeFloor *noticeReserve
-	// noticeCollapse holds this proxy's per-site collapse windows (see collapseWindowed in
-	// meteredNotices). One per proxy because this transport serves ONE upstream, which is the scope
-	// those faults are per — the same reason the gateway holds them per route.
-	noticeCollapse *keyReserve[noticeSite]
 
 	// serverPool bounds, dispatches and drains this proxy's SERVER-initiated request
 	// handlers, the upstream-facing twin of hostSem/hostSaturation. readUpstream hands each
@@ -386,8 +378,6 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 		hostWriter:            mcp.NewMsgWriter(os.Stdout),
 		refusalLimiter:        newRefusalRecordLimiterFor(stdioRefusalCategories),
 		notices:               newNoticeLimiter(1),
-		noticeFloor:           newNoticeReserve(nil),
-		noticeCollapse:        newNoticeCollapse(),
 	}
 	if opts.SerializeDecisions {
 		p.decideGate = newDecisionSerializer()
@@ -1310,7 +1300,7 @@ func (p *StdioProxy) refusalLimits() refusalLimits {
 // noticeWriter is this transport's diagnostic channel: the configured stderr writer and the class
 // table that bounds it, as one value — so a leg cannot carry the writer without the bound.
 func (p *StdioProxy) noticeWriter() noticeWriter {
-	return noticeWriter{out: p.errOut(), limits: p.notices, reserve: p.noticeFloor, collapse: p.noticeCollapse}
+	return noticeWriter{out: p.errOut(), limits: p.notices}
 }
 
 // negotiateHostRevision resolves one host message's revision and pins the context from its

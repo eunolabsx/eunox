@@ -232,12 +232,10 @@ func (p *HTTPProxy) newRemoteSession(ctx context.Context, route *UpstreamRoute, 
 		// byUpstreamID and hostToUp are left nil: they never apply on the remote-HTTP
 		// path, which is plain request/response through doRemoteHTTP.
 		//
-		// upstreamDenies is NOT, but it is narrowed: a remote upstream issues no server-initiated
-		// requests through this proxy, so the three categories a server-initiated request drives
-		// are unreachable here and their buckets would bound nothing. See
-		// remoteUpstreamRefusalCategories for what is kept and on what grounds.
-		upstreamDenies: newUpstreamRefusalLimiter(p.preSessionDenies, remoteUpstreamRefusalCategories),
-		noticeFloor:    newNoticeReserve(noticeClasses),
+		// upstreamDenies is NOT: it is the proxy-wide table every session shares. A remote upstream
+		// issues no server-initiated requests through this proxy, so most of the upstream-driven
+		// categories are unreachable here and simply never spend a token.
+		upstreamDenies: p.preSessionDenies,
 		done:           make(chan struct{}),
 		evicted:        make(chan struct{}),
 		established:    make(chan struct{}),

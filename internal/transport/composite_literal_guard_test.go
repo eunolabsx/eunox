@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"slices"
@@ -322,3 +323,25 @@ func callName(call *ast.CallExpr) string {
 func dedupeSorted(in []string) []string {
 	return slices.Compact(slices.Sorted(slices.Values(in)))
 }
+
+// qualifiedFuncName renders a declaration as `*T.name` for a method and the bare name for a
+// package function.
+//
+// Qualified rather than bare because this package has same-named twins — readUpstream on each
+// transport — and a bare key silently hands the second the first's answer.
+//
+// go/types renders the receiver rather than a hand-rolled switch: the hand-rolled one answered "?"
+// for anything that was not an Ident or a StarExpr, so every method on a GENERIC receiver keyed as
+// `*?.name` and collided with every other generic type's same-named method.
+func qualifiedFuncName(fn *ast.FuncDecl) string {
+	if fn.Recv != nil && len(fn.Recv.List) > 0 {
+		return exprString(fn.Recv.List[0].Type) + "." + fn.Name.Name
+	}
+	return fn.Name.Name
+}
+
+// exprString renders an expression as Go source: `*T`, `T`, or `*T[K]` for a generic one.
+//
+// go/types rather than a hand-rolled switch, which answered "?" for anything that was not an Ident
+// or a StarExpr — so every method on a GENERIC receiver keyed as `*?.name`.
+func exprString(e ast.Expr) string { return types.ExprString(e) }

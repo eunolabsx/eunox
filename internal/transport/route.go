@@ -66,38 +66,6 @@ type UpstreamRoute struct {
 	// after BuildRoutes.
 	receipts *capability.EffectReceiptVerifier
 
-	// notices is this route's stderr-diagnostic table: one bucket per notice CLASS, charging the
-	// proxy's aggregate as its parent. Per route so one tenant's flood of the cheapest peer-driven
-	// line cannot suppress another tenant's — the rule saturationGate states for its own records,
-	// one axis out.
-	//
-	// BuildRoutes builds it PARENTLESS and NewHTTPProxyGateway re-parents it, because the aggregate
-	// belongs to a proxy that does not exist yet at build time. Built at both points rather than
-	// only the second, so a route from this exported constructor that never reaches a proxy is
-	// bounded on its own rather than nil — a nil table falls back to the aggregate DIRECTLY, which
-	// on a gateway means one route holding the budget sized for all of them.
-	notices *noticeLimiter
-
-	// boundProxy records that a proxy has claimed this route's per-upstream diagnostic state, so a
-	// SECOND one is refused rather than silently taking it over. NewHTTPProxyGateway re-parents
-	// notices and replaces noticeCollapse in place, and Routes is a map the caller owns and can
-	// legitimately still hold: standing up a second proxy over it re-pointed every route's bucket
-	// table at proxy B's aggregate — so a flood on B silenced A's diagnostics — and re-armed A's
-	// in-flight collapse windows, restoring the per-frame flood they exist to remove, with every
-	// guard on both proxies still reading green. Written only during construction, which is
-	// single-threaded per proxy and happens before either serves.
-	boundProxy bool
-
-	// noticeCollapse holds this UPSTREAM's per-site collapse windows (see collapseWindowed in
-	// meteredNotices). Per route rather than per session or per proxy because that is what those
-	// faults are per: this route has one receipt verifier and one policy engine behind it, so "the
-	// pin is stale" and "the flow store is down" are facts about it rather than about whoever
-	// happened to call.
-	// Assigned by BuildRoutes AND re-assigned by NewHTTPProxyGateway beside the notice table, so a
-	// route reaching a proxy some other way cannot arrive with a working bucket table and no
-	// windows — which would silently restore the per-frame flood with every guard still green.
-	noticeCollapse *keyReserve[noticeSite]
-
 	// taskAnchored mirrors the engine's WithTaskAnchoredState for this route: the
 	// transport needs it to pick which key a request's decision turn is taken on, since
 	// under task anchoring that isn't the session. Read-only after BuildRoutes.
@@ -371,15 +339,6 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 			// package's no-policy-default posture; an AlwaysAllowPDP placeholder would
 			// silently allow everything if a future change left it unreplaced.
 			pdp: pdp.DenyAllPDP{},
-			// Parentless here and re-parented by NewHTTPProxyGateway, which is where the
-			// aggregate exists. Built HERE all the same, so a route this exported constructor
-			// hands to something other than a proxy is bounded rather than holding a nil table
-			// that falls back to whatever aggregate it is later asked about.
-			notices: newRouteNoticeLimiter(nil),
-			// Built here as well as at the proxy, so a route this exported constructor hands to
-			// something other than a proxy collapses its faults exactly as one inside a gateway
-			// does.
-			noticeCollapse: newNoticeCollapse(),
 		}
 
 		// The upstream's own receipt-signing key domain, loaded ONCE at startup from a

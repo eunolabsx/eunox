@@ -1106,7 +1106,7 @@ func refusalForwardParams(subj killSubject, auditMode bool, strict strictAuditSt
 // a policy verdict never being metered, was read as covering a diagnostic line that is not a verdict
 // and that no policy DENY writes. fp's own rec is REPLACED rather than read, because this producer
 // has two entry points and letting each supply an already-resolved sink is what left the
-// request-framed one ungoverned by refusalDeclarations entirely.
+// request-framed one ungoverned by the exemption declaration entirely.
 func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorders, subj killSubject, msg mcp.RPCMsg, framing string) mcp.RPCMsg {
 	// Kill-switch checks run at each caller's boundary, so a killed session is reported as
 	// KILL_SWITCH before reaching here. msg.Method is attacker-controlled; sanitize once and reuse

@@ -284,7 +284,7 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 // declaring surface. Metered on the same bucket, under ENFORCEMENT_ERROR — eunox reached no
 // verdict, and the reason is the deployment's shape rather than the request's content.
 func (p *HTTPProxy) refuseUnkeyableFirstRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, rev capability.Revision, msg mcp.RPCMsg) {
-	if rec := p.routeRefusalLimits(nil, route).recorders(refusalSink(p, route)).forCategory(catUnservable); rec != nil {
+	if rec := p.routeRefusalLimits().recorders(refusalSink(p, route)).forCategory(catUnservable); rec != nil {
 		identifier, method := auditIdentity(msg)
 		rec.RecordDeny(ctx, "", identifier, method,
 			capability.ErrCodeEnforcementError, "", unservableDetail(rev, unservableUnauthenticated), false)
