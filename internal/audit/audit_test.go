@@ -2982,7 +2982,7 @@ func TestRecordBoundsAgentTaskID(t *testing.T) {
 
 	huge := strings.Repeat("A", 5<<20) // ~5 MiB attacker-controlled JWT claim
 	sink, err := Open(logPath, keyPath, 0, 0, WithIdentity(func(context.Context) Identity {
-		return Identity{AgentID: huge, TaskID: huge, UserID: huge, Delegate: huge}
+		return Identity{AgentID: huge, TaskID: huge, UserID: huge}
 	}))
 	if err != nil {
 		t.Fatalf("Open: %v", err)

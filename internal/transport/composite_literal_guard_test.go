@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"go/types"
 	"os"
@@ -345,3 +346,13 @@ func qualifiedFuncName(fn *ast.FuncDecl) string {
 // go/types rather than a hand-rolled switch, which answered "?" for anything that was not an Ident
 // or a StarExpr — so every method on a GENERIC receiver keyed as `*?.name`.
 func exprString(e ast.Expr) string { return types.ExprString(e) }
+
+// exprText renders an expression as source, for a guard's error message naming the argument it
+// could not resolve.
+func exprText(fset *token.FileSet, e ast.Expr) string {
+	var b strings.Builder
+	if err := printer.Fprint(&b, fset, e); err != nil {
+		return "<unprintable>"
+	}
+	return b.String()
+}

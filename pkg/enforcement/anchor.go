@@ -9,9 +9,6 @@ import "github.com/eunolabs/eunox/pkg/capability"
 // budgets) is addressed under an ANCHOR: the identity that state accrues to. The default is
 // the session; WithTaskAnchoredState keys it on the validated mcp.task_id claim instead, so
 // state survives a hop across enforcement points instead of resetting per session.
-//
-// Exception: the single-use declassify ledger carries no anchor at all — see
-// declassifyLedgerKey; anchoring it would turn "approve once" into "once per session/task".
 
 // AnchorKind names which identity a request's state accrues to. Closed set: session or task,
 // never unanchored.

@@ -773,9 +773,6 @@ type orderTrackingRecorder struct{}
 func (orderTrackingRecorder) RecordAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string) {
 }
 
-func (orderTrackingRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string, string) {
-}
-
 func (orderTrackingRecorder) RecordDeny(context.Context, string, string, string, string, string, map[string]interface{}, bool) {
 	fmt.Fprintln(os.Stderr, "RECORD_DENY_CALLED")
 }

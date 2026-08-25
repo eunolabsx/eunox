@@ -97,7 +97,7 @@ func TestStateAccumulation_TheFlowTokensAreTheNonAtomicOnes(t *testing.T) {
 	t.Parallel()
 	for _, token := range []string{
 		ConditionTypeFlowLabel, ConditionTypeSequenceBlock,
-		DirectiveTypeLabelOutput, DirectiveTypeDeclassify,
+		DirectiveTypeLabelOutput,
 	} {
 		class, ok := TokenStateAccumulation(token)
 		require.True(t, ok)
@@ -159,7 +159,6 @@ func TestDirectiveStateAccumulation_ReadsTheDirectiveRegistry(t *testing.T) {
 	}{
 		"labelOutput writes what a sink reads back": {&LabelOutputDirective{Labels: []string{FlowLabelPII}}, StateNonAtomic},
 		"value form resolves identically":           {LabelOutputDirective{Labels: []string{FlowLabelPII}}, StateNonAtomic},
-		"declassify clears it and burns a grant":    {&DeclassifyDirective{Labels: []string{FlowLabelPII}}, StateNonAtomic},
 		"redactFields masks one response":           {&RedactFieldsDirective{Fields: []string{"a.b"}}, StateNone},
 	} {
 		t.Run(name, func(t *testing.T) {

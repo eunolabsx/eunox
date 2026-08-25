@@ -78,12 +78,6 @@ func marshalDirective(directive Directive) ([]byte, error) {
 			directiveEnvelope
 			*alias
 		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
-	case *DeclassifyDirective:
-		type alias DeclassifyDirective
-		return json.Marshal(struct {
-			directiveEnvelope
-			*alias
-		}{directiveEnvelope{Type: typed.DirectiveType()}, (*alias)(typed)})
 	default:
 		return nil, fmt.Errorf("unsupported directive payload: %T", directive)
 	}
@@ -129,12 +123,11 @@ func unmarshalDirective(data []byte) (Directive, error) {
 //
 // State and Uses follow the same rules as the condition registry (tokenstate.go,
 // subsystem.go): redactFields masks one response and remembers nothing, while labelOutput
-// and declassify write/clear the flow-label set — non-atomic read-then-writes that need the
-// decision turn and must not have the flow path skipped out from under them.
+// writes the flow-label set — a non-atomic read-then-write that needs the decision turn and
+// must not have the flow path skipped out from under it.
 var directivePrototypes = map[string]tokenSpec[Directive]{
 	DirectiveTypeRedactFields: {New: func() Directive { return &RedactFieldsDirective{} }, Since: SchemaVersion01, State: StateNone, Uses: usesNothing},
 	DirectiveTypeLabelOutput:  {New: func() Directive { return &LabelOutputDirective{} }, Since: SchemaVersion02, State: StateNonAtomic, Uses: []EngineSubsystem{SubsystemFlowLabels}},
-	DirectiveTypeDeclassify:   {New: func() Directive { return &DeclassifyDirective{} }, Since: SchemaVersion02, State: StateNonAtomic, Uses: []EngineSubsystem{SubsystemFlowLabels}},
 }
 
 // knownDirectiveTypes is every discriminator in the registry, sorted so the

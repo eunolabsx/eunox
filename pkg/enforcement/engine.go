@@ -262,8 +262,7 @@ type Engine struct {
 	counterKeyNamespace string
 
 	// taskAnchored keys accumulated state (flow labels, sequenceBlock antecedents, maxCalls
-	// and cumulative blastRadius budgets — NOT the single-use declassify ledger, which is
-	// deliberately un-anchored) on the request's VALIDATED mcp.task_id claim instead of its
+	// and cumulative blastRadius budgets) on the request's VALIDATED mcp.task_id claim instead of its
 	// session, so state survives a hop across enforcement points. Opt-in and fail-safe: a
 	// request with no token falls back to session keying; an authenticated one with no
 	// task_id is refused rather than split across both. See anchor.go.
@@ -336,11 +335,8 @@ func WithCounterKeyNamespace(ns string) Option {
 
 // WithTaskAnchoredState keys accumulated enforcement state on the request's VALIDATED
 // mcp.task_id claim instead of on its session, so taint, sequenceBlock antecedents, and
-// quota/blast-radius budgets survive a hop across enforcement points (a delegated
-// sub-agent, or the same task re-entering through a fresh session).
-//
-// The single-use declassify ledger is NOT among them: it is keyed on the grant alone, since
-// a per-anchor ledger would make "approve clearing this once" mean once per task.
+// quota/blast-radius budgets survive a hop across enforcement points (the same task re-entering
+// through a fresh session).
 //
 // Changes what every budget MEANS (maxCalls: 20 becomes 20 per task, not per connection), so
 // it is opt-in. An unauthenticated request still anchors on its session; an authenticated
@@ -649,9 +645,9 @@ func sessionTargetKey(req *capability.EnforceRequest) (targetType, name string) 
 // TimestampFromContext), but the lookups are per-call on the hot path; one struct keeps them
 // registers-cheap. See the Benchmark*Conditions family for what "cheap" is measured against.
 //
-// matched is nil for the two exported denial builders reachable with no constraint in hand
-// (DelegationTargetDenial, and CollectObligations on a target-naming constraint), which is why
-// they keep their explicit parameters rather than taking one of these.
+// matched is nil for an exported denial builder reachable with no constraint in hand
+// (CollectObligations on a target-naming constraint), which is why those keep their explicit
+// parameters rather than taking one of these.
 type evalCtx struct {
 	req       *capability.EnforceRequest
 	matched   *capability.Constraint
@@ -1181,7 +1177,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 	// is held back to where the original ordering returned it, after runConditions below:
 	// returning it here would preempt the condition verdict, and its FAULT class would BLOCK
 	// a call an audit route should have denied-and-forwarded instead.
-	obligations, obligDeny := e.CollectObligations(ec.req.Delegation, ec.matched, ec.requestID, ec.now)
+	obligations, obligDeny := e.CollectObligations(ec.matched, ec.requestID, ec.now)
 	if WillForwardDeny(ctx, ec.matched) {
 		defer func() {
 			// `!= DecisionAllow`, not `== DecisionDeny`: an unset Decision is FORWARDED
@@ -1247,14 +1243,6 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 		}()
 	}
 
-	// The delegation authority gate. Sits after the obligation/carried-label defers, so a
-	// downgraded refusal still carries redactions and the label snapshot, and before the
-	// conditions, since it does not depend on them: the manifest may permit this target and
-	// every condition may pass while this delegate was never handed the call.
-	if delegDeny := e.checkDelegationTarget(ec); delegDeny != nil {
-		return *delegDeny
-	}
-
 	// PASS ONE: the pure predicates. The deferred (quota-consuming) conditions are
 	// collected but NOT committed here — the ceiling below has to be able to refuse the
 	// call before anything is charged to it.
@@ -1276,21 +1264,6 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 	// phantom antecedent nor a stranded flow label.
 	if ceilingDeny := e.checkEffectCeiling(ec, effect, carriedLabels); ceilingDeny != nil {
 		return *ceilingDeny
-	}
-
-	// The delegated consequence bound, reading the SAME resolved effect, after the policy's
-	// own ceiling so an action over both reports the more fundamental refusal.
-	if delegDeny := e.checkDelegationEffectClass(ec, effect); delegDeny != nil {
-		return *delegDeny
-	}
-
-	// The approval gate for the one directive that REMOVES a flow label, on the same
-	// pre-commit side of the line: an unapproved declassification must not spend a quota
-	// slot, write an antecedent, or touch the session's label set. Runs AFTER the ceiling so
-	// an over-bound call reports that first.
-	decl, declDeny := e.checkDeclassify(ctx, ec, carriedLabels)
-	if declDeny != nil {
-		return *declDeny
 	}
 
 	// PASS TWO: commit the deferred conditions, now that nothing left can refuse the call
@@ -1320,14 +1293,8 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 		// The allow tail always wants the antecedent: unlike the PDP's forwarded no-match
 		// deny, the target here is one the manifest names, so recording it mints no key the
 		// policy could not already have.
-		SourceCommitScope{Flow: flowRelevant, Antecedent: true}, carriedLabels, decl)
+		SourceCommitScope{Flow: flowRelevant, Antecedent: true}, carriedLabels)
 	if cerr != nil {
-		if cerr.Declassify {
-			// Reached AFTER the burn on the antecedent-fault path, so the grant may already
-			// be spent for a call about to hard-deny. Naming it here is the only way that
-			// reaches the tape; the id rides only when the commit got past the burn.
-			return declassifyRecordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), cerr.SpentApprovalID)
-		}
 		if cerr.Flow {
 			// No obligations: it refuses with a FAULT code, which no observing route downgrades
 			// to a forward, so there is no response to redact.
@@ -1336,22 +1303,6 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 		return recordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), obligations)
 	}
 
-	// The clear itself is NOT applied here; it is handed to the caller to commit once the
-	// call has run (see EnforceResponse.Declassification / CommitDeclassification).
-	//
-	// What is handed over is the INTERSECTION with what the anchor carries as of THIS
-	// decision, resolved inside the decision's critical section and never re-derived at
-	// commit time — a source read decided after this point is not in this set, so the
-	// commit cannot remove it. Re-reading at commit time would let one call's approved
-	// clear launder a concurrent read's brand-new taint.
-	//
-	// The handle's set is empty for a no-op clear (nothing to remove, so the commit is
-	// skipped and the tape records no declassification), but the grant is still spent —
-	// SpentApprovalID reports that, non-empty only for a single-use grant, minted only here
-	// past the burn.
-	//
-	// The handle is nil when the constraint carries no declassify directive, the caller's
-	// presence test.
 	return capability.EnforceResponse{
 		RequestID:   ec.requestID,
 		Decision:    capability.DecisionAllow,
@@ -1360,7 +1311,6 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 		AuditOnly:   ec.auditOnly(),
 		LabelsOut:   labelsOut,
 
-		Declassification: decl.handle(carriedLabels, labelsOut),
 		// The SAME resolution the two effect conditions and the ceiling read, handed on to
 		// the post-hoc receipt check rather than re-resolved there — one resolution per
 		// call, so the decision and the check cannot disagree about what the effect was.
@@ -1400,7 +1350,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 		// own selection, since any entry declaring the target redactable is reason to mask it.
 		var obligations []capability.Obligation
 		if WillForwardDeny(ctx, nil) {
-			obs, obligDeny := e.CollectObligations(req.Delegation, namingTargetConstraint(req, capabilities), requestID, now)
+			obs, obligDeny := e.CollectObligations(namingTargetConstraint(req, capabilities), requestID, now)
 			if obligDeny != nil {
 				return *obligDeny
 			}
@@ -1423,7 +1373,7 @@ func (e *Engine) ValidateAction(ctx context.Context, req *capability.EnforceRequ
 			// evaluateMatched applies the same rule.
 			var obligations []capability.Obligation
 			if WillForwardDeny(ctx, matched) {
-				obs, obligDeny := e.CollectObligations(req.Delegation, matched, requestID, now)
+				obs, obligDeny := e.CollectObligations(matched, requestID, now)
 				if obligDeny != nil {
 					return *obligDeny
 				}
@@ -1645,16 +1595,8 @@ var knownObligationTypes = map[string]bool{
 // obligation dropped, reaching the host unmasked. A caller that DOES act on the error
 // return (returning it as a hard block) simply ignores the accompanying slice, so this
 // costs those callers nothing.
-func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
+func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
 	var obligations []capability.Obligation
-	// The delegation chain's composed redactFields, first so it applies even to a
-	// constraint carrying no directives at all. A parameter rather than a read of
-	// req.Delegation, since one call site (the no-match fill) synthesizes a constraint
-	// from the target alone with no request to read from — a signature that cannot be
-	// called without deciding what the chain contributes makes forgetting it impossible.
-	if ob := delegatedRedaction(chain); ob != nil {
-		obligations = append(obligations, *ob)
-	}
 	for _, dir := range matched.Directives {
 		if dir == nil {
 			continue
@@ -1664,11 +1606,10 @@ func (e *Engine) CollectObligations(chain *capability.DelegationChain, matched *
 		if isTypedNil(dir) {
 			continue
 		}
-		// labelOutput and declassify are enforce-time state directives, not response
-		// obligations (their effect is the session-label write the engine performs on
-		// allow), so skip them before ToObligation.
-		switch dir.DirectiveType() {
-		case capability.DirectiveTypeLabelOutput, capability.DirectiveTypeDeclassify:
+		// labelOutput is an enforce-time state directive, not a response obligation (its
+		// effect is the session-label write the engine performs on allow), so skip it
+		// before ToObligation.
+		if dir.DirectiveType() == capability.DirectiveTypeLabelOutput {
 			continue
 		}
 		ob := dir.ToObligation()

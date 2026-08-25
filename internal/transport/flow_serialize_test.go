@@ -381,48 +381,6 @@ func TestAwaitHostDecisionsDrained_NoopWhenNoDecideGate(t *testing.T) {
 	}
 }
 
-// TestFinishDecision_HoldsTheTurnForADeclassifyingCall pins the one exception to releasing
-// the per-session decision turn before the forward.
-//
-// A declassifying call splits its flow-state write in two — the decision resolves what to
-// clear, the commit after the forward removes it — and another decision must not interleave
-// between them. Everything else releases immediately, which is what keeps the slow upstream
-// round trip off the lock.
-func TestFinishDecision_HoldsTheTurnForADeclassifyingCall(t *testing.T) {
-	t.Parallel()
-	for name, tc := range map[string]struct {
-		dec      capability.EnforceResponse
-		released bool
-	}{
-		"ordinary allow releases": {capability.EnforceResponse{Decision: capability.DecisionAllow}, true},
-		"deny releases":           {capability.EnforceResponse{Decision: capability.DecisionDeny}, true},
-		"declassifying allow holds": {capability.EnforceResponse{
-			Decision:         capability.DecisionAllow,
-			Declassification: capability.NewDeclassification([]string{capability.FlowLabelPII}, "ada@example.com", "apr-1", false),
-		}, false},
-		// A handle that authorizes NO clear (a burned grant on a no-op) has no second phase to
-		// keep the turn for, so it releases like any other call.
-		"spent grant with nothing pending releases": {capability.EnforceResponse{
-			Decision:         capability.DecisionAllow,
-			Declassification: capability.NewDeclassification(nil, "ada@example.com", "apr-1", true),
-		}, true},
-	} {
-		t.Run(name, func(t *testing.T) {
-			released := false
-			d := dispatchParams{forwardParams: forwardParams{endDecision: func() { released = true }}}
-			d.finishDecision(tc.dec)
-			if released != tc.released {
-				t.Fatalf("turn released = %v, want %v", released, tc.released)
-			}
-		})
-	}
-
-	// And a non-serialized request is a no-op either way rather than a nil call.
-	var d dispatchParams
-	d.finishDecision(capability.EnforceResponse{
-		Declassification: capability.NewDeclassification([]string{capability.FlowLabelPII}, "ada@example.com", "apr-1", false)})
-}
-
 // TestDecisionSerializer_KeysOnTheAnchor is the stdio half of the property the HTTP gate
 // registry provides: the FIFO turn is per ANCHOR, not per proxy. Two anchors accumulate no
 // shared state, so their decisions must not queue behind each other; two requests on one

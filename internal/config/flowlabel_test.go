@@ -310,19 +310,6 @@ capabilities:
 			wantErr: "does not declare",
 		},
 		{
-			name: "declassify is held to the same closure",
-			body: `name: p
-version: "0.1.0"
-capabilities:
-  - target: "tool:sanitize"
-    actions: [call]
-    directives:
-      - type: declassify
-        labels: ["purview:confidential"]
-`,
-			wantErr: "does not declare",
-		},
-		{
 			name: "malformed namespace declaration",
 			body: `name: p
 version: "0.1.0"

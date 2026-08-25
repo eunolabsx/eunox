@@ -240,7 +240,7 @@ func (w turnWait) window(deadline time.Time) time.Duration {
 //
 // The bound exists for one caller, the server-initiated (sampling) leg, and began as a
 // bound on a WEDGE: that leg used to run inline on the upstream reader — the only
-// goroutine that delivers upstream responses — while a declassifying host call holds its
+// goroutine that delivers upstream responses — while a host call holds its
 // turn across the whole upstream round trip, so a sampling request arriving mid-clear
 // parked the reader on a turn whose holder was waiting for a response only that reader
 // could deliver. That wedge is gone now that the leg runs on its own goroutine

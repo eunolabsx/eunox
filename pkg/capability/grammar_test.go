@@ -62,7 +62,7 @@ func TestTokenSince_FlowAndEffectTokensAreTheLaterRevision(t *testing.T) {
 	require.NotEqual(t, SchemaVersion01, SchemaVersion02)
 	for _, token := range []string{
 		ConditionTypeFlowLabel, ConditionTypeEffectClass, ConditionTypeBlastRadius,
-		DirectiveTypeLabelOutput, DirectiveTypeDeclassify,
+		DirectiveTypeLabelOutput,
 	} {
 		since, ok := TokenSince(token)
 		require.True(t, ok)

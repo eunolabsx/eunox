@@ -68,14 +68,10 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 		return condErr
 	}
 
-	// Compose the delegation chain's allow-set cap into the condition's own: intersection is
-	// the only safe composition, since the sink rule is "present and not allowed => deny", so
-	// a hop's cap can only remove entries. An empty capped set is the full quarantine.
-	effectiveAllow := delegatedAllowLabels(fl.Allow, req.Delegation)
+	effectiveAllow := fl.Allow
 
 	// Defense in depth: the loader rejects an unknown label, but a programmatically built
-	// condition can carry one — surfaced against the AUTHORED set so a manifest typo is still
-	// caught even if a delegation cap happened to remove the entry.
+	// condition can carry one.
 	for _, l := range fl.Allow {
 		if err := capability.ValidateFlowLabel(l); err != nil {
 			return &ConditionError{
@@ -131,29 +127,6 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	declared := capability.NormalizeDeclaredLabels(req.DeclaredLabels)
 	present = unionLabels(present, declared)
 
-	// Union in the taint every hop of the delegation chain forces onto this delegate's calls
-	// — the same one-directional rule as the client attribution above, but different
-	// provenance: this is what the delegators DECIDED this delegate is, on a verified token
-	// the delegate can't edit, vs. a cooperating agent describing its own inputs. Used for
-	// THIS check only, never persisted.
-	//
-	// An unrecognized forced label DENIES rather than being normalized away, which is what
-	// separates this set from the client attribution above. A voluntary declaration may be
-	// dropped safely — an unknown label there could only have added denials. A delegator's
-	// forced label is a decision, so dropping it REMOVES taint and lets a sink that should
-	// have denied allow. Surfaced against the RAW grants, mirroring the authored-'allow' check
-	// at the top of this function: ValidateDelegationChain already refuses such a token, so
-	// this fires only for an embedder that built a chain without it.
-	if unknown := req.Delegation.UnknownForcedLabels(); len(unknown) > 0 {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: capability.ConditionTypeFlowLabel,
-			Message:       fmt.Sprintf("delegation chain forces flow label(s) %v usable on neither axis; a label must be one of the native classes %v or an imported %q-separated 'namespace:value' — a forced label cannot be normalized away, since dropping it would remove taint the delegators imposed", unknown, capability.NativeFlowLabelVocabulary(), capability.FlowLabelNamespaceSep),
-		}
-	}
-	forced := req.Delegation.ForcedLabels()
-	present = unionLabels(present, forced)
-
 	// blocked = present labels not permitted here. present is vocabulary-ordered, so blocked
 	// is too.
 	var blocked []string
@@ -174,20 +147,12 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 					capability.FlowAuditDetailKey: true,
 					"blockedLabel":                blocked[len(blocked)-1],
 					"blockedLabels":               blocked,
-					// The EFFECTIVE allow-set (post-delegation-cap), not the authored one —
-					// recording the manifest's own list would send an operator to widen a
-					// rule that never refused the call.
-					"allowLabels": effectiveAllow,
+					"allowLabels":                 effectiveAllow,
 				}
 				if len(declared) > 0 {
 					// Separate from the proxy's observed state, so an auditor can tell what
 					// was OBSERVED from what the client claimed.
 					d["declared_labels"] = declared
-				}
-				if len(forced) > 0 {
-					// Separate again: an auditor must be able to tell observed,
-					// client-declared, and delegation-imposed taint apart.
-					d["delegated_labels"] = forced
 				}
 				return d
 			}(),
@@ -322,45 +287,13 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 	return out, nil
 }
 
-// intersectLabels returns the members of want present in held, in want's order.
-//
-// Bounds an approved declassification's clear to the taint the decision actually OBSERVED —
-// intersecting at commit time instead, against whatever the anchor holds a round trip later,
-// would silently widen the clear to cover a label a concurrent source added in between.
-func intersectLabels(want, held []string) []string {
-	if len(want) == 0 || len(held) == 0 {
-		return nil
-	}
-	var out []string
-	for _, w := range want {
-		for _, h := range held {
-			if w == h {
-				out = append(out, w)
-				break
-			}
-		}
-	}
-	return out
-}
-
 // SourceCommitError classifies which leg of the atomic source-call commit (recordSourceCall)
 // faulted, so the caller builds the matching deny: a flow-label write fault (Flow=true) is
-// HARD (an unlabeled forward would fail a later sink open), a declassify leg fault
-// (Declassify=true) is HARD via declassifyRecordFailureDenial, a sequenceBlock fault (both
-// false) is the plain antecedent deny.
-//
-// The declassify leg's fault is a BURN fault (a CallCounter write), not a clear fault — the
-// clear is phase two and doesn't run inside this commit. It sets Flow too, so a caller
-// checking Flow alone (the audit-mode antecedent path, which never declassifies) still routes
-// to a hard deny; Declassify is checked first so the two never disagree.
+// HARD (an unlabeled forward would fail a later sink open), while a sequenceBlock fault
+// (Flow=false) is the plain antecedent deny.
 type SourceCommitError struct {
-	Err        error
-	Flow       bool
-	Declassify bool
-	// SpentApprovalID names a single-use grant this commit BURNED before faulting, empty if
-	// nothing was spent — without it, a grant spent by a call that never ran would reach the
-	// tape named by nothing at all.
-	SpentApprovalID string
+	Err  error
+	Flow bool
 }
 
 // Error implements error.
@@ -376,17 +309,13 @@ func (e *SourceCommitError) Error() string { return e.Err.Error() }
 // leaves NEITHER committed. A transport serializing its decision phase makes the rollback
 // race-free; the engine itself takes no such guarantee for granted (see rollbackLabels).
 //
-// An APPROVED declassification contributes only the BURN of a single-use grant here — the
-// label clear is deferred to CommitDeclassification, run after the call actually completes
-// (see EnforceResponse.Declassification: a clear applied here would be invisible to every
-// concurrent decision for the whole upstream round trip). labelOutput's add stays here for the
-// mirror reason: a call that taints and then fails should leave EXTRA taint, which
-// over-blocks rather than under-blocks.
+// labelOutput's add stays here rather than after the call: a call that taints and then fails
+// should leave EXTRA taint, which over-blocks rather than under-blocks.
 //
 // Every write fails closed on its own fault, mapped to a SourceCommitError. recordLabels and
 // RecordSessionCall each self-guard when the policy doesn't need them, so a flow-only or
 // seq-only policy does exactly one write and needs no rollback.
-func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, scope SourceCommitScope, carriedLabels []string, decl declassifyOutcome) (labelsOut []string, cerr *SourceCommitError) {
+func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, scope SourceCommitScope, carriedLabels []string) (labelsOut []string, cerr *SourceCommitError) {
 	if e.anchorUnresolved(req) {
 		// evaluateMatched already refuses this well before the allow tail; this is a
 		// backstop, and also the entry point the PDP's audit-mode antecedent path uses for
@@ -403,25 +332,11 @@ func (e *Engine) recordSourceCall(ctx context.Context, req *capability.EnforceRe
 		}
 		added = labelsAdded(labelsOut, carriedLabels)
 	}
-	if len(decl.Labels) > 0 {
-		// A standing grant burns nothing; a single-use one is spent here atomically, and the
-		// loser of a concurrent race hard-denies.
-		if err := e.burnApproval(ctx, decl.LedgerID); err != nil {
-			e.rollbackLabels(ctx, req, added)
-			return nil, &SourceCommitError{Err: err, Flow: true, Declassify: true}
-		}
-	}
 	if err := e.recordAntecedentIn(ctx, scope, req); err != nil {
 		// Take the label add back out so the hard-denied call leaves no taint. Best-effort —
 		// a rollback fault leaves a stranded label, the accepted fail-closed residual
 		// (over-blocks, never leaks). Runs before the branch below since both arms need it.
 		e.rollbackLabels(ctx, req, added)
-		if decl.LedgerID != "" {
-			// A HARD deny: the plain antecedent-fault deny is SOFT (downgradable by
-			// --audit), and forwarding a call whose one-shot approval was just spent burns
-			// the approval for nothing.
-			return nil, &SourceCommitError{Err: err, Flow: true, Declassify: true, SpentApprovalID: decl.ApprovalID}
-		}
 		return nil, &SourceCommitError{Err: err, Flow: false}
 	}
 	return labelsOut, nil
@@ -463,12 +378,8 @@ func (e *Engine) recordAntecedentIn(ctx context.Context, scope SourceCommitScope
 // path: when a downgraded audit-mode source's deny is forwarded, its flow labels and
 // sequenceBlock antecedent must still be recorded atomically and surfaced on the forwarded
 // record. scope names which of the two this caller wants (see SourceCommitScope).
-//
-// Commits NO declassification: that path forwards a call whose verdict was a DENY, and the
-// approval check that authorizes a clear runs only on the allow tail — a downgraded observe
-// deny must never untaint a session.
 func (e *Engine) RecordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, scope SourceCommitScope, carriedLabels []string) ([]string, *SourceCommitError) {
-	return e.recordSourceCall(ctx, req, matched, scope, carriedLabels, declassifyOutcome{})
+	return e.recordSourceCall(ctx, req, matched, scope, carriedLabels)
 }
 
 // labelsAdded returns the labels in out not already in the pre-call carried set — the ones
@@ -518,80 +429,6 @@ func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequ
 	}
 	_ = e.flowStore.Remove(ctx, e.flowKey(req), added...)
 }
-
-// CommitDeclassification applies an approved declassification's label clear, for a call the
-// decision AUTHORIZED and the caller has now actually performed — the second half of a
-// two-phase clear (the decision authorizes and burns a single-use grant; this removes the
-// labels once the sanitizing call has run).
-//
-// The split matters under concurrency: clearing inside the decision would leave the label
-// absent for the whole upstream round trip (unbounded when --upstream-timeout is 0), letting a
-// concurrent sink the taint existed to stop be allowed and forwarded before the sanitizing
-// call even returned. Deferring removes the window rather than narrowing it, with no
-// dependency on any serialization — which is what makes it hold for a second eunox instance
-// on shared Redis, or an embedder with no turn of its own.
-//
-// It is also why nothing above the engine needs an undo any more: every refusal below the
-// decision now simply never calls this, so there's nothing to put back.
-//
-// A caller that never commits (crash, store fault, forgetful embedder) leaves the session as
-// tainted as it found it — over-blocking, resolved with another approval, the fail-closed
-// mirror of the burn's own accepted over-refusal.
-//
-// Clears decl's authorized set and NOTHING else — that set was already intersected against
-// what the anchor was carrying INSIDE the decision's critical section, and this does NOT
-// re-read the anchor. Re-reading would widen the clear to whatever the anchor holds a round
-// trip later, laundering a source read decided while the sanitizing call was still in flight
-// through an approval granted before that read existed — a set store can't tell one occurrence
-// of a label from another, so nothing downstream could catch it.
-//
-// Takes the decision's HANDLE, not a label slice: the old []string signature let any embedder
-// holding an *Engine clear any label with no approval, no burn, no escalation, nothing on the
-// tape. A handle is minted only by an authorizing decision, carries its set unexported, and is
-// single-use, so a wider clear can't be expressed and an authorization can't be replayed.
-//
-// A nil handle clears nothing without error — the no-declassification case, and also a handle
-// whose intersection came back empty.
-//
-// Anchoring follows the request (flowKey): the caller MUST hand a context that still carries
-// the request's validated claims, or the anchor resolves the SESSION key instead of the task
-// key — clearing the wrong bucket and reporting success. Detach cancellation only
-// (context.WithoutCancel), never the values.
-func (e *Engine) CommitDeclassification(ctx context.Context, req *capability.EnforceRequest, decl *capability.Declassification) (cleared []string, err error) {
-	if !decl.PendingClear() {
-		return nil, nil
-	}
-	if e == nil || e.skipFlow || e.flowStore == nil || req == nil || req.SessionID == "" {
-		// Reachable on an engine holding no flow state, or a PDP whose commit chain is a
-		// no-op — none of those may report a clear. Checked BEFORE the claim, so an engine
-		// that can't clear doesn't consume the handle, or a correctly-wired retry would
-		// find it already spent.
-		return nil, errNoFlowStateToClear
-	}
-	// One authorization, one clear — reporting a double-commit as a caller fault keeps it
-	// from looking like a healthy one, since the grant behind it was burned exactly once.
-	//
-	// Claimed BEFORE the store write: a Remove that faults leaves the authorization spent, so
-	// a retry is refused (over-refuses; the operator mints another approval) rather than
-	// re-applying a clear that may have already landed and deleting a label twice from a set
-	// store that can't tell the occurrences apart.
-	labels, err := decl.Claim()
-	if err != nil {
-		return nil, err
-	}
-	if err := e.flowStore.Remove(ctx, e.flowKey(req), labels...); err != nil {
-		// labels, not nil: the Remove may have taken effect before the error surfaced, so
-		// the caller reports which labels MAY have gone rather than claiming they did.
-		return labels, err
-	}
-	return labels, nil
-}
-
-// errNoFlowStateToClear is what an engine holding no flow state returns from a commit it was
-// asked to perform. An ERROR, not a silent empty result: a no-op clear is decided at decision
-// time (the handle's set comes back empty and the caller never commits), so reaching here with
-// labels in hand and no store is a wiring fault the caller must record as a failed commit.
-var errNoFlowStateToClear = fmt.Errorf("this decision point holds no flow-label state, so an approved declassification cannot be applied (wiring fault, not a store failure)")
 
 // ClearSessionLabels releases a session's accumulated flow-label set, called from the
 // transport's session teardown so an ended session retains no state. No-op with no store

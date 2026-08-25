@@ -118,44 +118,6 @@ type PolicyDecisionPoint interface {
 	// call it with a detached, bounded context.
 	ReleaseSession(ctx context.Context, sessionID string)
 
-	// CommitDeclassified applies an approved declassification's label clear, for a call the
-	// decision AUTHORIZED and the transport has now actually performed. decl is the
-	// decision's own handle (EnforceResponse.Declassification) — what the approval
-	// authorized, not what will necessarily change — and is the only thing that names a
-	// clearable set: the handle carries it unexported, so no caller of this can clear a label
-	// its decision did not authorize. A nil handle is the no-declassification case and is a
-	// no-op, which is every call in a deployment with no declassify directive.
-	//
-	// It is on this interface because the two halves sit on opposite sides of it. Decide
-	// resolves the approval, burns a single-use grant, and hands back the labels to clear;
-	// only the transport knows whether the call went on to reach the upstream and return a
-	// deliverable response. Applying the clear inside Decide instead made the labels
-	// invisible to every concurrent decision for the whole upstream round trip — a sink the
-	// taint existed to stop could be allowed and forwarded while the sanitizing call was
-	// still in flight — and no compensating undo could close that, because the window opened
-	// before the undo could possibly run.
-	//
-	// It follows that the transport must call this ONLY on the success path. Every refusal
-	// below the decision (--require-audit=strict, an upstream transport failure, a redaction
-	// failure) simply does not call it, and the labels were never gone.
-	//
-	// It returns what actually CHANGED — the intersection with what the anchor is carrying at
-	// commit time — because the caller stamps that onto the tape as a SIGNED assertion, and
-	// an approval to clear a label the session never held is a permitted no-op that must
-	// record no labels_cleared and no approver. An implementation that holds no flow state
-	// reports (nil, nil): it cleared nothing, which is the truth and is the safe state.
-	// An error means the clear may have partly landed; the labels that stay over-block a
-	// later sink, which is the fail-closed residual.
-	//
-	// CONTEXT CONTRACT: the caller must preserve the request's validated claims. An
-	// implementation resolves the state anchor from them (a task-anchored call is accounted
-	// against the TASK key), so a context detached with context.Background() would clear the
-	// wrong key — leaving the task tainted, dropping a label the session never asked to drop,
-	// and reporting success. Detach cancellation only (context.WithoutCancel), never the
-	// values. This differs from ReleaseSession above, which owns only session-anchored state
-	// and may be fully detached.
-	CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) (cleared []string, err error)
-
 	// HardenRefusal re-stamps a refusal that some OTHER layer produced with the verdicts
 	// THIS PDP would have contributed had it been consulted, and returns the composed
 	// refusal.
@@ -669,19 +631,6 @@ func (AlwaysAllowPDP) RecordObservedToolHashes(_ context.Context, result json.Ra
 // flow state to release.
 func (AlwaysAllowPDP) ReleaseSession(_ context.Context, _ string) {}
 
-// CommitDeclassified never clears anything: a wiretap PDP holds no flow store and
-// authorizes no declassification, so no decision it returns can carry a commit handle.
-//
-// Reaching it WITH labels therefore means some other layer authorized a clear this one
-// cannot perform, and that is reported as an error rather than as a silent empty result.
-// The two are different facts, and the caller writes a signed record from the difference: an
-// empty result means "the clear ran and moved nothing", which for a wiring fault would put
-// an ordinary allow on the tape for a policy whose sanitizing step never takes effect. The
-// old contract carried a `restored bool` for exactly this distinction.
-func (AlwaysAllowPDP) CommitDeclassified(_ context.Context, _ string, decl *capability.Declassification) ([]string, error) {
-	return nil, noFlowStateErr(decl, "audit-mode (wiretap) decision point")
-}
-
 // HardenRefusal returns the refusal unchanged: a wiretap PDP declares no pin, no ceiling
 // and no redaction, so it has nothing to compose onto another layer's verdict.
 func (AlwaysAllowPDP) HardenRefusal(_ context.Context, _ string, r capability.EnforceResponse, _ EnforceTarget, _ map[string]interface{}) capability.EnforceResponse {
@@ -796,30 +745,6 @@ func (DenyAllPDP) RecordObservedToolHashes(_ context.Context, result json.RawMes
 
 // ReleaseSession is a no-op: the fail-closed default holds no per-session flow state.
 func (DenyAllPDP) ReleaseSession(_ context.Context, _ string) {}
-
-// CommitDeclassified never clears anything: the fail-closed default allows nothing, so no
-// decision it returns can authorize a clear. Same reporting rule as AlwaysAllowPDP's.
-func (DenyAllPDP) CommitDeclassified(_ context.Context, _ string, decl *capability.Declassification) ([]string, error) {
-	return nil, noFlowStateErr(decl, "deny-all (no policy) decision point")
-}
-
-// noFlowStateErr builds the fault a decision point returns when it is handed a clear to apply
-// and holds no flow state to apply it to, or nil for a handle that authorizes no clear (where
-// "cleared nothing" and "nothing to clear" are genuinely the same state).
-//
-// It exists so the several no-op implementations report identically. Each of them means the
-// same thing — the policy's sanitizing step will not take effect on this path — and a silent
-// empty result would make that indistinguishable from an approved clear whose labels the
-// anchor was not carrying, which is a routine, healthy outcome.
-//
-// It does NOT claim the handle: this path clears nothing, so consuming the single-use
-// authorization would leave a correctly-wired retry with nothing to commit.
-func noFlowStateErr(decl *capability.Declassification, who string) error {
-	if !decl.PendingClear() {
-		return nil
-	}
-	return fmt.Errorf("%s holds no flow-label state, so the approved declassification of %v cannot be applied (wiring fault, not a store failure)", who, decl.Labels())
-}
 
 // HardenRefusal returns the refusal unchanged: the "no policy" default declares no pin, no
 // ceiling and no redaction, so it has nothing to compose onto another layer's verdict.
@@ -1181,12 +1106,6 @@ func (*ManifestPDP) CheckAudience(_ context.Context) *capability.EnforceResponse
 // written under the task's key instead, and that is deliberately not reclaimed here: it is
 // the state whose whole purpose is to outlive this session, and clearing it on disconnect
 // would let an agent launder a task's taint by reconnecting.
-//
-// A spent single-use declassify grant is NOT released here, and not because of the anchor: the
-// ledger is unanchored by construction (it lives in the call counter under the grant's own id),
-// so a burn belongs to the APPROVAL rather than to any session or task. Releasing it on
-// teardown would have made "once" mean once per connection, which is the property the ledger
-// was moved out of the label store to stop meaning.
 func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	// Drop the Tier-2 interface baseline first, and unconditionally: it is local state
 	// that must be reclaimed even for a PDP built without an engine, and leaving it
@@ -1197,33 +1116,6 @@ func (p *ManifestPDP) ReleaseSession(ctx context.Context, sessionID string) {
 		return
 	}
 	_ = p.engine.ClearSessionLabels(ctx, sessionID)
-}
-
-// CommitDeclassified applies the clear an approved declassification authorized, for a call
-// the transport has now performed. See the interface for why the commit has to be reachable
-// from there at all.
-//
-// The claims come from the context so the request resolves to the SAME anchor the decision
-// was accounted against: under task anchoring the call's state lives on the task's key, and
-// clearing the session's would leave the task tainted while dropping a label the session
-// never asked to drop. Every other field of the request is irrelevant here —
-// CommitDeclassification is a keyed read-then-Remove and evaluates no policy — so this
-// deliberately does not rebuild the decision's target or arguments.
-func (p *ManifestPDP) CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) ([]string, error) {
-	// p == nil covers a typed-nil (*ManifestPDP)(nil) reaching the transport's committer
-	// interface, where the caller's `!= nil` check passes and the dereference below would
-	// panic a request goroutine after the upstream call has already run.
-	if p == nil || p.engine == nil {
-		// A PDP with no engine holds no flow store, so the clear cannot happen. Reported as a
-		// fault, not as an empty result: see noFlowStateErr.
-		return nil, noFlowStateErr(decl, "manifest decision point with no engine")
-	}
-	// The claims come from the context so the request resolves to the SAME anchor the
-	// decision used; see the interface's context contract.
-	return p.engine.CommitDeclassification(ctx, &capability.EnforceRequest{
-		SessionID: sessionID,
-		Claims:    jwtClaimsAsMap(ctx),
-	}, decl)
 }
 
 // Decide evaluates a tools/call against the manifest: it selects the
@@ -1333,14 +1225,6 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// can only produce more denials — which is what makes honoring it need no trust
 		// decision.
 		DeclaredLabels: declaredLabelsFromContext(ctx),
-		// The human approvals the verified token granted. Nil for every request that is
-		// not a declassification, which is nearly all of them; without one, a declassify
-		// directive escalates rather than clearing a label.
-		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
-		// The attenuation the token's delegation chain declared, already asserted to narrow
-		// at every hop. Nil for every non-delegated request; when present it can only ever
-		// subtract from what the manifest already allowed.
-		Delegation: delegationFromContext(ctx),
 	}
 
 	matched := p.findConstraint(target, claims)
@@ -1353,7 +1237,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// above is positioned to catch.
 		resp := p.withForwardObligations(ctx, denyResponse(p.engineClock(), capability.ErrCodeAuthorizationFailed, "",
 			fmt.Sprintf("%s %q is not listed in the capability manifest", target.Type, target.Name)), target,
-			func() []capability.Directive { return p.directivesNamingTarget(target) }, req.Delegation)
+			func() []capability.Directive { return p.directivesNamingTarget(target) })
 		// Under --audit this deny is FORWARDED and the manifest-absent tool actually runs, so
 		// the state that call leaves behind has to be committed even though no constraint was
 		// selected to read it off. See recordUnmatchedForwardedState.
@@ -1414,11 +1298,7 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 		// manifest declared (a condition, argumentSchema, or action-check failure all reach
 		// here without having run collectObligations). The genuine-allow path collects them
 		// in evaluateMatched; mirror it for the downgraded deny.
-		//
-		// The chain comes off the REQUEST this decision is about — the one field that already
-		// says which delegation applies to it — rather than from a second read of the context
-		// beside it.
-		return p.withForwardObligationsFor(ctx, r, matched, req.Delegation)
+		return p.withForwardObligationsFor(ctx, r, matched)
 	}
 
 	// The constraint's actions list must contain the required action for this
@@ -1801,17 +1681,9 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 	if !p.anyLabelOutput {
 		return matched
 	}
-	// A DECLASSIFYING constraint is never augmented. validateDeclassifyCoherence refuses
-	// labelOutput and declassify on one constraint at load precisely because the two write
-	// the same session state in opposite directions on one call; synthesizing a labelOutput
-	// here would rebuild that shape at runtime out of two individually-coherent entries —
-	// a `tool:*` source and a specific sanitizer — and the outcome would then be decided by
-	// session history rather than by policy. The union exists so a sibling cannot SHADOW a
-	// source's taint; a declassify entry is not a source that forgot its label, it is the
-	// one action whose whole purpose is to remove one.
-	if len(capability.DeclassifyLabelsOf(matched)) > 0 {
-		return matched
-	}
+	// The union exists so a sibling cannot SHADOW a source's taint: synthesizing a labelOutput
+	// here out of two individually-coherent entries — a `tool:*` source and a specific
+	// sanitizer — would let session history rather than policy decide the outcome.
 	union := p.labelOutputNamingTarget(target)
 	if len(union) == 0 || labelSetContainsAll(labelOutputLabels(matched), union) {
 		return matched
@@ -1844,21 +1716,14 @@ func willForwardDeny(ctx context.Context, matched *capability.Constraint) bool {
 // carries none yet — a flow/record-fault deny already carries them. CollectObligations refuses
 // an unwired directive type with a FAULT code, which no observing route downgrades; honor it
 // (fail closed) rather than forwarding unredacted.
-//
-// chain is a PARAMETER rather than a read of delegationFromContext(ctx), so the caller states
-// which chain this response's redaction composes from. It is the same rule CollectObligations
-// itself applies one layer down, and it is here for a sharper reason: the harden path used to
-// build its request deliberately WITHOUT a chain while this helper read one off the context,
-// so one call had the chain out of scope for deciding and in scope for redacting, stated
-// nowhere the two met. Each caller now passes the chain its own request carries.
-func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capability.EnforceResponse, matched *capability.Constraint, chain *capability.DelegationChain) capability.EnforceResponse {
+func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capability.EnforceResponse, matched *capability.Constraint) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 {
 		return r
 	}
 	if !willForwardDeny(ctx, matched) || matched == nil {
 		return r
 	}
-	obs, deny := p.engine.CollectObligations(chain, matched, r.RequestID, r.DecidedAt)
+	obs, deny := p.engine.CollectObligations(matched, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
 	}
@@ -1881,17 +1746,15 @@ func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capabilit
 //
 // chain is a parameter for the reason it is on withForwardObligationsFor: which chain a
 // response's redaction composes from is a decision each call site makes in the open.
-func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget, naming namingSelector, chain *capability.DelegationChain) capability.EnforceResponse {
+func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget, naming namingSelector) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 || !enforcement.SkipQuota(ctx) {
 		return r
 	}
 	dirs := naming()
-	// No early return on `len(dirs) == 0`: a delegated caller whose hops compose a
-	// redactFields list must have it applied even when no manifest entry names this target,
-	// and CollectObligations already answers "is there anything to apply" — restating that
-	// question here meant asking the chain twice and gave a second place for the two to
+	// No early return on `len(dirs) == 0`: CollectObligations already answers "is there
+	// anything to apply", and restating that question here gave a second place for the two to
 	// disagree about when the response is forwarded unmasked.
-	obs, deny := p.engine.CollectObligations(chain, &capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
+	obs, deny := p.engine.CollectObligations(&capability.Constraint{Target: string(target.Type) + ":" + target.Name, Directives: dirs}, r.RequestID, r.DecidedAt)
 	if deny != nil {
 		return *deny
 	}
@@ -1972,18 +1835,10 @@ func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.Enf
 // jwtConditionArgs synthesizes the {"uri"}/{"name"} map DecideResourceRead and DecidePromptGet
 // build, so a contract naming one of those resolves to the same value here that the full path
 // would have resolved.
-//
-// Delegation is a PARAMETER rather than a field this function decides for its callers, and
-// that is the whole point of it being here. It used to be deliberately absent, on the argument
-// that a *VerdictFor seam may only HARDEN a refusal while a delegation refusal is downgradable
-// by design — sound for the VERDICT, and silently contradicted by the same path's obligation
-// fill, which read the chain off the context and applied its composed redactFields to the very
-// response this request decided. One call, chain out of scope for deciding and in scope for
-// redacting, with the reasoning living in this doc where the obligation helpers never passed.
 // Now every harden leg states which chain it is asking about (HardenRefusal resolves it ONCE,
 // onto hardenSelection), the obligation helpers take it off the request rather than the
 // context, and a seam that must not act on it simply is not handed it.
-func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, args, claims map[string]interface{}, chain *capability.DelegationChain) *capability.EnforceRequest {
+func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, args, claims map[string]interface{}) *capability.EnforceRequest {
 	return &capability.EnforceRequest{
 		SessionID:  sessionID,
 		TargetName: target.Name,
@@ -1994,7 +1849,6 @@ func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, 
 		},
 		Claims:         claims,
 		DeclaredLabels: declaredLabelsFromContext(ctx),
-		Delegation:     chain,
 	}
 }
 
@@ -2022,15 +1876,6 @@ func composeHardened(r, verdict capability.EnforceResponse) capability.EnforceRe
 		out.Denial = &denial
 	}
 	out.AuditOnly = out.AuditOnly && r.AuditOnly
-	// Carry the refusal being hardened's declassification handle when the harder verdict has
-	// none of its own. It is the one field whose LOSS is silent and unrecoverable: a handle on
-	// a refusal names a single-use grant the decision already burned, and this record is the
-	// only one that will ever name it, so replacing the response wholesale would spend an
-	// operator's approval with nothing on the tape to reconcile. Nothing else here needs
-	// carrying — the harder verdict is the authoritative one for every other field.
-	if out.Declassification == nil {
-		out.Declassification = r.Declassification
-	}
 	return out
 }
 
@@ -2081,56 +1926,7 @@ func (p *ManifestPDP) hardenOnEffectCeiling(ctx context.Context, sessionID strin
 	if matched == nil {
 		return r, false
 	}
-	return p.hardenViaVerdict(ctx, r, matched, hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation), p.engine.CeilingVerdictFor)
-}
-
-// hardenOnDelegatedEffectClass re-stamps a refusal that some OTHER layer produced as the
-// delegation chain's own effect-class refusal when a hop capped this delegate below the action's
-// resolved class. capped reports whether it fired.
-//
-// It is the delegation half of hardenOnEffectCeiling's wrapper problem, and it exists because
-// the harden path applied the chain to its OBLIGATIONS and not to its VERDICT: the forwarded
-// response was masked by the chain's composed redactFields while the refusal itself was taken as
-// if the caller held no delegation at all. What that cost is attribution, not authority — a
-// delegated caller over its hop's cap was refused either way, but under the wrapping layer's
-// generic AUTHORIZATION_FAILED, so nothing on the tape named the axis or the hop and no
-// delegation filter found the event.
-//
-// It runs LAST of the verdict legs, which INVERTS the full path's order (there the cap is
-// checked before the declassify gate). That is deliberate and is the seam's contract rather than
-// a faithfulness lapse: a delegation refusal is downgradable by design, the ceiling's escalation
-// and the unapproved-declassification refusal are both HARD, and a harden-only seam must never
-// preempt a harder verdict with a softer one. Placing it here means it speaks only when nothing
-// harder did — where its statement is the most specific one available.
-//
-// It commits nothing: the cap is a comparison against one ResolveEffect of the matched
-// constraint's contract, which is why it can run on a path the inner PDP deliberately never
-// reached.
-func (p *ManifestPDP) hardenOnDelegatedEffectClass(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
-	if r.Decision == capability.DecisionAllow || r.Denial == nil || !r.Denial.Downgradable() {
-		return r, false
-	}
-	// The overwhelmingly common case: no token, or a token declaring no delegation. Asked here
-	// so a non-delegated refusal builds no request and resolves no effect.
-	if sel.delegation.IsEmpty() {
-		return r, false
-	}
-	// A refusal ALREADY on this axis is left alone. The outer layer runs the delegation TARGET
-	// gate itself (DelegationTargetDenial, on the paths that never reach the engine), and the
-	// enforced path checks that gate FIRST — before the conditions and before the ceiling — so
-	// a call refused for reaching past its grant is refused there, not here. Composing the
-	// effect-class verdict onto it would rewrite `reason` and name a DIFFERENT hop, sending an
-	// operator to widen an effect cap while the target grant is what actually blocked the call.
-	// This leg exists to give a refusal an axis it did not have, never to relabel one that has
-	// it.
-	if enforcement.IsDelegationRefusal(r.Denial) {
-		return r, false
-	}
-	matched := sel.matched
-	if matched == nil {
-		return r, false
-	}
-	return p.hardenViaVerdict(ctx, r, matched, hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation), p.engine.DelegationEffectClassVerdictFor)
+	return p.hardenViaVerdict(ctx, r, matched, hardenRequest(ctx, sessionID, target, args, sel.claims), p.engine.CeilingVerdictFor)
 }
 
 // hardenViaVerdict is the tail both harden legs share: ask a non-committing *VerdictFor seam,
@@ -2161,17 +1957,14 @@ func (p *ManifestPDP) hardenViaVerdict(
 	}
 	out := composeHardened(r, *verdict)
 	if out.Denial != nil && !out.Denial.Downgradable() {
-		// Never forwarded (either effect-ceiling arm, and every declassify refusal), so there
-		// is no response to redact and obligations would be a claim that a redaction ran.
+		// Never forwarded (either effect-ceiling arm), so there is no response to redact and
+		// obligations would be a claim that a redaction ran.
 		out.Obligations = nil
 		return out, true
 	}
-	// Still downgradable (the delegated maxEffectClass cap, which is an authorization verdict
-	// and downgradable by design), so a route running --audit WILL forward it — and a
-	// forwarded response must carry the manifest's redactFields obligations or it reaches the
-	// host unmasked. The chain is the one this leg's request was built with, so the verdict
-	// and the redaction speak about the same delegation.
-	return p.withForwardObligationsFor(ctx, out, matched, req.Delegation), true
+	// Still downgradable, so a route running --audit WILL forward it — and a forwarded response
+	// must carry the manifest's redactFields obligations or it reaches the host unmasked.
+	return p.withForwardObligationsFor(ctx, out, matched), true
 }
 
 // namingSelector resolves the wider of HardenRefusal's two selections on demand. It is a
@@ -2190,14 +1983,6 @@ type hardenSelection struct {
 	// claims are the request's, resolved once — the input BOTH selections are judged under
 	// (matched applies them, naming deliberately does not).
 	claims map[string]interface{}
-
-	// delegation is the request's validated chain, resolved ONCE for every leg below. It sits
-	// here rather than being read from the context at each site because the harden path's two
-	// halves — what it DECIDES and what it REDACTS — used to answer that question separately
-	// and differently, which is a divergence nothing in the process ever compares. One
-	// resolution, threaded into hardenRequest and into the obligations fill, is what keeps them
-	// speaking about the same delegation.
-	delegation *capability.DelegationChain
 
 	// matched answers "which authored rule governs this call": findConstraint under the
 	// request's claims, then decideTarget's own action check, so a harden leg speaks only for
@@ -2231,10 +2016,9 @@ func (p *ManifestPDP) selectForHardening(ctx context.Context, target EnforceTarg
 		matched = nil
 	}
 	return hardenSelection{
-		claims:     claims,
-		delegation: delegationFromContext(ctx),
-		matched:    matched,
-		naming:     func() []capability.Directive { return p.directivesNamingTarget(target) },
+		claims:  claims,
+		matched: matched,
+		naming:  func() []capability.Directive { return p.directivesNamingTarget(target) },
 	}
 }
 
@@ -2276,15 +2060,7 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	if hardened, over := p.hardenOnEffectCeiling(ctx, sessionID, r, target, args, sel); over {
 		return hardened
 	}
-	if hardened, unapproved := p.hardenOnUnapprovedDeclassify(ctx, sessionID, r, target, args, sel); unapproved {
-		return hardened
-	}
-	// The delegation cap LAST of the verdict legs: it is the only one whose own refusal is
-	// downgradable, so it must not preempt either hard verdict above. See the leg's doc.
-	if hardened, capped := p.hardenOnDelegatedEffectClass(ctx, sessionID, r, target, args, sel); capped {
-		return hardened
-	}
-	out := p.withForwardObligations(ctx, r, target, sel.naming, sel.delegation)
+	out := p.withForwardObligations(ctx, r, target, sel.naming)
 	// The state half of the same forward. The obligations above keep an --audit downgrade from
 	// reaching the host unmasked; without this the same downgrade ran the target and committed
 	// neither its labelOutput taint nor its sequenceBlock antecedent, because the wrapping
@@ -2297,7 +2073,7 @@ func (p *ManifestPDP) HardenRefusal(ctx context.Context, sessionID string, r cap
 	// state this commits and the verdict it rides on speak about one call. Last, past every
 	// leg: a hard verdict returns above and commits nothing, as it must.
 	if override := p.recordUnmatchedForwardedState(ctx,
-		hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation), target, &out); override != nil {
+		hardenRequest(ctx, sessionID, target, args, sel.claims), target, &out); override != nil {
 		return *override
 	}
 	return out
@@ -2318,74 +2094,6 @@ func (p *ManifestPDP) EvaluateClaimCondition(ctx context.Context, cond capabilit
 // substituting the shipped predicate for it silently. A nil engine has overridden nothing.
 func (p *ManifestPDP) ConditionHandlerOverridden(condType string) bool {
 	return p.engine.ConditionHandlerOverridden(condType)
-}
-
-// hardenOnUnapprovedDeclassify replaces an outer layer's downgradable refusal with the
-// declassify escalation when the matched constraint clears a flow label and the request
-// carries no approval covering it.
-//
-// It exists for the same COMPOSED case hardenOnEffectCeiling does, and the failure it
-// closes is sharper. A wrapping PDP (the JWT layer) can refuse a call on its own terms and
-// short-circuit above the inner PDP, so evaluateMatched never runs and checkDeclassify
-// never fires. That refusal is a SOFT deny, which a route running --audit downgrades to a
-// forward — so adding a JWT would forward a declassification the same manifest hard-refuses
-// without one, inverting the rule that a token may only ever restrict. The forward is the
-// worst of the two outcomes here: it performs the action AND leaves the taint the policy
-// said the action clears.
-//
-// Like the ceiling's, it COMMITS nothing — but unlike the ceiling's it is not a pure
-// comparison either: answering "would this have been authorized" requires knowing whether a
-// single-use grant is still live, which is a ledger read. The read records nothing, so a
-// call refused here still leaves no spent approval behind; what it costs is one Peek per
-// covering grant on a path that only runs for an already-refused call.
-// It runs AFTER the ceiling so a call that is over the consequence bound reports that, the
-// same precedence the full path applies.
-//
-// It answers the question through the engine's non-committing DeclassifyVerdictFor rather
-// than deriving one here, exactly as the ceiling's sibling delegates to CeilingVerdictFor,
-// and the reason is that a hand-rolled answer HAD diverged twice. It resolved the approval
-// target itself (`string(target.Type) + ":" + target.Name`), which does not trim a padded
-// name — one of the three divergences canonicalApprovalTarget's doc records as already
-// paid for, each of which turned a correctly-scoped grant into a permanent, unsatisfiable
-// escalation. And it built its own DenialInfo without CarriedLabels, so the same logical
-// refusal had two record shapes depending on whether a JWT layer wrapped the call, with the
-// JWT-wrapped one missing the field an approver needs first ("what is this session already
-// carrying"). One resolver, one refusal builder, one record shape.
-func (p *ManifestPDP) hardenOnUnapprovedDeclassify(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}, sel hardenSelection) (capability.EnforceResponse, bool) {
-	if r.Decision == capability.DecisionAllow || r.Denial == nil || !r.Denial.Downgradable() {
-		return r, false
-	}
-	// No engine means no checkDeclassify on the unwrapped path either, so there is no verdict
-	// this could be weaker than — and nothing to read the ledger with.
-	if p.engine == nil {
-		return r, false
-	}
-	matched := sel.matched
-	if matched == nil {
-		return r, false
-	}
-	// The cheap structural test BEFORE the request is built. DeclassifyVerdictFor's first
-	// real gate is this same question, and it is false for every deployment that declares no
-	// declassify directive — i.e. essentially all of them — so asking it here keeps the
-	// throwaway argument map and two context walks off the denial path of every route that
-	// has nothing to declassify.
-	if len(capability.DeclassifyLabelsOf(matched)) == 0 {
-		return r, false
-	}
-	// The shared request shape, plus the approvals — the verdict turns on them, and the
-	// engine reads them off the request rather than the context.
-	req := hardenRequest(ctx, sessionID, target, args, sel.claims, sel.delegation)
-	req.DeclassifyApprovals = declassifyApprovalsFromContext(ctx)
-	// Every refusal arm the seam returns is the engine's own, including the hard
-	// `ledger_unavailable` one: a fault that left a downgradable verdict in place made an
-	// unreachable ledger the way to run, on an --audit route, a declassification the same
-	// manifest blocks without a token.
-	//
-	// The shared tail carries composeHardened's AuditOnly AND. Every declassify refusal is
-	// built hard (escalateResponse leaves AuditOnly false for the same reason the ceiling's
-	// escalation does), so for this caller it is a backstop rather than a live correction —
-	// which is an argument for sharing the composition, not for hand-writing a weaker one.
-	return p.hardenViaVerdict(ctx, r, matched, req, p.engine.DeclassifyVerdictFor)
 }
 
 // directivesNamingTarget collects the directives of every capability whose target type +
@@ -2419,8 +2127,7 @@ func (p *ManifestPDP) directivesNamingTarget(target EnforceTarget) []capability.
 //
 // The cost is stated rather than hidden: a policy differentiating labels per principal on
 // one target now taints every caller with the widest set. That over-blocks, which is the
-// direction every flow token but declassify fails in; differentiate by naming distinct
-// targets, or clear the label with an approved declassify.
+// direction every flow token fails in; differentiate by naming distinct targets.
 func (p *ManifestPDP) labelOutputNamingTarget(target EnforceTarget) []string {
 	var out []string
 	var seen map[string]struct{}
@@ -2542,16 +2249,6 @@ func (p *ManifestPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, 
 		return withCancelAuditPosture(denyResponse(p.engineClock(), capability.ErrCodeCapabilityDenied, "",
 			fmt.Sprintf("resource %q is present in the manifest but not with the %q action, so there is no subscription to it to cancel", uri, requiredActionFor(capability.TargetTypeResource))), c)
 	}
-	// The delegation target gate. A cancel is authorized by MATCH ALONE — no conditions, no
-	// quota, no session-state commit — and this belongs on the match side of that line
-	// rather than the metering side: it is authority, not accounting, so it commits nothing
-	// and cannot deny an unsubscribe by spending a budget. Without it this method's own
-	// documented invariant ("what a session may cancel is exactly what it may see listed")
-	// became false the moment the list filter learned about chains.
-	if deny := delegationTargetDenial(ctx, p.engineClock(),
-		EnforceTarget{Type: capability.TargetTypeResource, Name: uri}, c.IsAuditOnly()); deny != nil {
-		return *deny
-	}
 	return withCancelAuditPosture(newAllowResponse(p.engineClock()), c)
 }
 
@@ -2641,17 +2338,6 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 			Name: capability.MethodSamplingCreateMessage,
 		},
 		Claims: claims,
-		// Sampling is the one enforced method that drives the HOST's model, so it is the
-		// one a quarantined delegate most wants and the one whose omission is least
-		// visible: with this field unset every delegation gate short-circuits on
-		// IsEmpty() and a chain granting one read tool still reaches inference. The JWT
-		// layer already learned this exact lesson for mcp.capabilities ("sampling was the
-		// one enforced method that ignored it"); this is the same seam, so it carries the
-		// same field every other decision path carries.
-		Delegation: delegationFromContext(ctx),
-		// Approvals for the same reason: a declassify directive on the sampling opt-in
-		// must be satisfiable by the same grant that satisfies it anywhere else.
-		DeclassifyApprovals: declassifyApprovalsFromContext(ctx),
 	}
 
 	return p.evaluateAndRecord(ctx, req, matched)
@@ -2671,17 +2357,17 @@ func (p *ManifestPDP) DecidePromptGet(ctx context.Context, sessionID, promptName
 // read from ctx so a principal-scoped entry is hidden from an identity that does
 // not match it, keeping the visible list aligned with what the caller can invoke.
 func (p *ManifestPDP) FilterToolsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx), sessionIDFromContext(ctx), CompleteToolListingFromContext(ctx))
+	return filterToolsListResult(result, p, jwtClaimsAsMap(ctx), sessionIDFromContext(ctx), CompleteToolListingFromContext(ctx))
 }
 
 // FilterResourcesList implements ListFilterer for the manifest PDP.
 func (p *ManifestPDP) FilterResourcesList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterResourcesListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx))
+	return filterResourcesListResult(result, p, jwtClaimsAsMap(ctx))
 }
 
 // FilterPromptsList implements ListFilterer for the manifest PDP.
 func (p *ManifestPDP) FilterPromptsList(ctx context.Context, result json.RawMessage) ListFilterResult {
-	return filterPromptsListResult(result, p, jwtClaimsAsMap(ctx), delegationFromContext(ctx))
+	return filterPromptsListResult(result, p, jwtClaimsAsMap(ctx))
 }
 
 // emptyListEnvelope holds precomputed fail-closed envelopes keyed by list field
@@ -3033,13 +2719,13 @@ func replaceOrderedListField(envelope json.RawMessage, fieldName string, entries
 // list filter (anyCapCovers), which likewise defer conditions to the call leg; the
 // trade-off is that a resource whose read always denies on a uri allowedValues can
 // still be advertised. Fails closed to an empty list on error.
-func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain) ListFilterResult {
+func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
 	// The entry-ambiguity gate, the constraint lookup and the action check live in
 	// keepByManifestEntry, shared with prompts/list; only the id field differs. Here the
 	// smuggled key would be "uri" vs "URI", which decides which resource the host
 	// believes it is reading.
 	return filterListResult(resultBytes, listKeyResources,
-		keepByManifestEntry(mdp, claims, chain, capability.TargetTypeResource, "read", func(raw json.RawMessage) (string, bool) {
+		keepByManifestEntry(mdp, claims, capability.TargetTypeResource, "read", func(raw json.RawMessage) (string, bool) {
 			var entry struct {
 				URI string `json:"uri"`
 			}
@@ -3066,7 +2752,6 @@ func filterResourcesListResult(resultBytes json.RawMessage, mdp *ManifestPDP, cl
 func keepByManifestEntry(
 	mdp *ManifestPDP,
 	claims map[string]interface{},
-	chain *capability.DelegationChain,
 	targetType capability.TargetType,
 	requiredAction string,
 	entryID func(json.RawMessage) (string, bool),
@@ -3078,21 +2763,6 @@ func keepByManifestEntry(
 		id, ok := entryID(raw)
 		if !ok {
 			return false, ""
-		}
-		// An entry no hop of the caller's delegation chain admits is hidden, for the reason
-		// every other hide-here-and-deny-there rule in this file exists: the call leg will
-		// refuse it, and a catalog advertising an action the caller cannot take is a catalog
-		// the model will spend turns trying to use. Delegation narrows only, so this can
-		// only ever remove entries a wider caller would still see.
-		// Guarded on IsEmpty() rather than left to PermitsTarget's own nil fast path: the
-		// fast path skips the SCAN, but the string concat naming the target is built by the
-		// caller before the call happens, on every entry, on the overwhelming majority of
-		// requests that carry no chain at all — exactly the per-entry allocation the
-		// targetIndex map exists to keep off this path for a delegated caller.
-		if !chain.IsEmpty() {
-			if permitted, _ := chain.PermitsTarget(string(targetType) + ":" + id); !permitted {
-				return false, ""
-			}
 		}
 		c := mdp.findConstraint(EnforceTarget{Type: targetType, Name: id}, claims)
 		if c != nil && containsAction(c.Actions, requiredAction) {
@@ -4065,7 +3735,7 @@ func ToolsKeyAmbiguous(raw json.RawMessage) bool {
 	return toolsKeyAmbiguous(raw)
 }
 
-func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain, sessionID string, completeListing bool) ListFilterResult {
+func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, sessionID string, completeListing bool) ListFilterResult {
 	// Arm the pins over the WHOLE catalog first, then filter. Recording and poisoning
 	// happen here — in the one pass the observe route shares (armPinsFromToolsList) — so
 	// the two routes cannot drift, and so every poison discovered anywhere in the array is
@@ -4124,18 +3794,6 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 		if v.drop {
 			return false, ""
 		}
-		// Hidden when the caller's delegation chain does not reach it, mirroring the call
-		// leg's own delegation gate so the catalog never advertises a tool this delegate
-		// will be refused. Placed before the constraint lookup because it does not need
-		// one: the chain bounds the caller regardless of what the manifest says.
-		// Guarded on IsEmpty() for the same reason keepByManifestEntry is: the string concat
-		// naming the target would otherwise be built on every entry, on every request, even
-		// for the overwhelming majority that carry no delegation chain at all.
-		if !chain.IsEmpty() {
-			if permitted, _ := chain.PermitsTarget("tool:" + v.name); !permitted {
-				return false, ""
-			}
-		}
 		c := mdp.findConstraint(EnforceTarget{Type: capability.TargetTypeTool, Name: v.name}, claims)
 
 		// c is nil when the tool is absent from the manifest; guard every dereference
@@ -4176,14 +3834,14 @@ func filterToolsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims
 // and the JWT list filter (anyCapCovers), which likewise defer conditions to the
 // call leg; the trade-off is that a prompt whose get always denies on a name
 // allowedValues can still be advertised. Fails closed to an empty list on error.
-func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}, chain *capability.DelegationChain) ListFilterResult {
+func filterPromptsListResult(resultBytes json.RawMessage, mdp *ManifestPDP, claims map[string]interface{}) ListFilterResult {
 	// Shares keepByManifestEntry with resources/list, so the entry-ambiguity gate cannot
 	// be present on one flavor and missing on the other: a prompt entry carrying both
 	// "name" and "Name" would otherwise be kept under Go's decoded name while a host
 	// renders the other, and a prompt description reaches the model exactly as a tool
 	// description does. All three list flavors share the FM-5 surface.
 	return filterListResult(resultBytes, listKeyPrompts,
-		keepByManifestEntry(mdp, claims, chain, capability.TargetTypePrompt, "get", func(raw json.RawMessage) (string, bool) {
+		keepByManifestEntry(mdp, claims, capability.TargetTypePrompt, "get", func(raw json.RawMessage) (string, bool) {
 			var entry struct {
 				Name string `json:"name"`
 			}

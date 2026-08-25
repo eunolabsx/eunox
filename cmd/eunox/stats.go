@@ -93,27 +93,11 @@ func statsTarget(targetType, target, method string) string {
 // by audit_only so an operator running in audit mode (forwarded, would-be
 // denials) cannot misread observations as enforced blocks.
 type auditStatsSummary struct {
-	total        int
-	allowed      int
-	blocked      int // denials with audit_only=false (call was rejected)
-	observed     int // denials with audit_only=true  (call was forwarded)
-	escalated    int // decision=escalate: refused pending human approval (never forwarded)
-	declassified int // allows that cleared a flow label under a human approval (labels_cleared present)
-	// declassifyCommitFailed is the one to alert on: the call RAN and the clear did not
-	// land, so the session keeps taint it should have dropped and every later sink
-	// over-blocks until a new approval is issued.
-	declassifyCommitFailed int
-	// declassifyNotApplied is benign — the call was refused below the decision, so the
-	// labels were never removed — but it explains a spent grant beside it.
-	declassifyNotApplied int
-	// declassifyResultWithheld counts refusals where the action EXECUTED and eunox dropped
-	// its result (response redaction failed) — not a strict subset of the count above, and
-	// its remedy differs: the sanitizing work is already done, so a re-minted approval
-	// re-delivers rather than re-runs.
-	declassifyResultWithheld int
-	// spentApprovals counts single-use grants this log shows being burned — the
-	// reconciliation signal for "which of my outstanding one-shot approvals are still live?".
-	spentApprovals int
+	total     int
+	allowed   int
+	blocked   int // denials with audit_only=false (call was rejected)
+	observed  int // denials with audit_only=true  (call was forwarded)
+	escalated int // decision=escalate: refused pending human approval (never forwarded)
 	// handlerFaults counts records naming a condition handler whose contract violation the
 	// engine repaired. It is the ONLY operator-visible trace of that repair — the call was
 	// decided exactly as a conforming handler's would have been — so a run that never surfaces
@@ -146,13 +130,12 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 		}
 		out.total++
 		var rec struct {
-			Decision      string   `json:"decision"`
-			TargetType    string   `json:"target_type"`
-			Target        string   `json:"target"`
-			Method        string   `json:"method"`
-			DenialCode    string   `json:"denial_code"`
-			AuditOnly     bool     `json:"audit_only"`
-			LabelsCleared []string `json:"labels_cleared"`
+			Decision   string `json:"decision"`
+			TargetType string `json:"target_type"`
+			Target     string `json:"target"`
+			Method     string `json:"method"`
+			DenialCode string `json:"denial_code"`
+			AuditOnly  bool   `json:"audit_only"`
 		}
 		if err := json.Unmarshal(line, &rec); err != nil {
 			// Undecodable line: count in "other" so the total still reconciles
@@ -160,17 +143,11 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 			out.other++
 			continue
 		}
-		out.addDeclassifyDetails(line)
 		out.addHandlerFaultDetails(line)
 		out.addUnroutableDetails(line)
 		switch rec.Decision {
 		case "allow":
 			out.allowed++
-			// Counted separately, not bucketed apart: the record is a genuine allow, and
-			// this answers "how often did a human agree to drop taint".
-			if len(rec.LabelsCleared) > 0 {
-				out.declassified++
-			}
 		case "deny":
 			k := denialKey{tool: statsTarget(rec.TargetType, rec.Target, rec.Method), code: rec.DenialCode}
 			if rec.AuditOnly {
@@ -222,36 +199,9 @@ func decodeDetails(line, probe []byte) map[string]json.RawMessage {
 	return rec.Details
 }
 
-// declassifyProbe is the byte pattern addDeclassifyDetails scans a raw record for before
-// paying for a second decode, derived from the producer's own key prefix so the two can't drift.
-var declassifyProbe = []byte(audit.DeclassifyDetailPrefix)
-
-// addDeclassifyDetails tallies the declassification facts riding in a record's `details`
-// map. It probes the WHOLE line rather than capturing `details` on the outer struct — a
-// RawMessage would copy the caller's entire argument map on most records — and decodes only
-// on a hit. A miss reads as "no declassification facts", the safe direction.
-func (s *auditStatsSummary) addDeclassifyDetails(line []byte) {
-	details := decodeDetails(line, declassifyProbe)
-	if details == nil {
-		return
-	}
-	if _, ok := details[audit.DeclassifySpentApprovalKey]; ok {
-		s.spentApprovals++
-	}
-	if _, ok := details[audit.DeclassifyNotAppliedKey]; ok {
-		s.declassifyNotApplied++
-	}
-	if _, ok := details[audit.DeclassifyResultWithheldKey]; ok {
-		s.declassifyResultWithheld++
-	}
-	if _, ok := details[audit.DeclassifyCommitFailedKey]; ok {
-		s.declassifyCommitFailed++
-	}
-}
-
 // handlerFaultProbe is addHandlerFaultDetails' pre-filter, derived from the producer's own key
-// so the two cannot drift — the same shape declassifyProbe uses, and for the same reason: the
-// caller's whole argument map must not be decoded on every record to answer a rare question.
+// so the two cannot drift: the caller's whole argument map must not be decoded on every record
+// to answer a rare question.
 var handlerFaultProbe = []byte(audit.HandlerFaultKey)
 
 // addHandlerFaultDetails tallies records reporting a repaired condition-handler fault. A miss
@@ -309,13 +259,10 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 	}
 	wln(")")
 	if s.escalated > 0 {
-		wln("  (escalated = refused pending human approval — an action over the effect ceiling, or a declassification no approval covered: the call was NOT forwarded, and it needs a human, not a policy fix.)")
+		wln("  (escalated = refused pending human approval — an action over the effect ceiling: the call was NOT forwarded, and it needs a human, not a policy fix.)")
 	}
-	if s.declassified > 0 {
-		wf("  (declassified = %d allow(s) cleared a flow label under a human approval; every one names its approver in the record.)\n", s.declassified)
-	}
-	// An ATTENTION line for the same reason the declassification one is: it names a
-	// deployment fault an operator must act on, and it would otherwise be a raw JSONL key
+	// An ATTENTION line because it names a deployment fault an operator must act on that
+	// would otherwise be a raw JSONL key
 	// nobody greps for. A repaired call looks like every other call on this summary.
 	if s.handlerFaults > 0 {
 		wf("\n  ATTENTION: %d record(s) name a condition handler that broke the engine's commit contract\n", s.handlerFaults)
@@ -334,28 +281,6 @@ func printAuditStats(w io.Writer, s auditStatsSummary) {
 		wln("  (the method is not dispatched under the MCP revision the host negotiated, so no policy evaluated it;")
 		wln("   observe mode downgrades a policy verdict and these have none. If this dominates the tape, the host and")
 		wln("   the upstream are on revisions that do not share the methods being called.)")
-	}
-	// FIRST among the declassification notes: means a session is not in the state the
-	// policy describes — the approved clear did not land, so taint remains.
-	if s.declassifyCommitFailed > 0 {
-		wf("\n  ATTENTION: %d approved declassification(s) could not be applied after the call had already run\n", s.declassifyCommitFailed)
-		wln("  (the flow store faulted at the commit; those sessions keep taint the policy says the action cleared,")
-		wln("   so later sinks over-block until the action is retried under a new approval. Check the flow-store backend.)")
-	}
-	if s.declassifyNotApplied > 0 {
-		wf("  (declassify-not-applied = %d refused call(s) whose approved clear was therefore never made; the labels were never removed, so nothing is under-tainted.)\n",
-			s.declassifyNotApplied)
-	}
-	// Its own line, not "of those": can stand alone (a no-op clear leaves no not-applied
-	// labels), and the remedy differs — the work is done, only delivery failed.
-	if s.declassifyResultWithheld > 0 {
-		wf("  (declassify-result-withheld = %d refused call(s) whose action had already EXECUTED upstream, with the result dropped because response redaction failed;\n"+
-			"   the sanitizing work is done, so a fresh approval re-delivers rather than re-runs it. Check the redactFields paths against the real response shape.)\n",
-			s.declassifyResultWithheld)
-	}
-	if s.spentApprovals > 0 {
-		wf("  (single-use approvals spent = %d; each is burned for good, including on a clear that changed nothing or a call that was then refused. Reconcile these against your outstanding one-shot approvals — details.%s names each.)\n",
-			s.spentApprovals, audit.DeclassifySpentApprovalKey)
 	}
 	if s.observed > 0 {
 		wln("  (observed = audit-mode denials: the call was forwarded; the verdict is recorded but was not enforced.)")

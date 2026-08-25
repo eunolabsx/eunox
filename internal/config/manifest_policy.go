@@ -128,13 +128,6 @@ func (m *LocalManifest) NeedsDecisionTurn() bool {
 	return m.anyTokenState(capability.StateAccumulation.NeedsSerializedDecisions)
 }
 
-// HasDeclassify reports whether this policy carries a declassify directive — the one token
-// whose satisfaction depends on a channel (a validated JWT) not every host transport has. The
-// startup check consults it to refuse a manifest whose declassification could never be approved.
-func (m *LocalManifest) HasDeclassify() bool {
-	return m != nil && m.anyDirective(capability.IsDeclassifyDirective)
-}
-
 // HonorsAttributionInterface reports whether this policy admits the client-supplied
 // attribution interface (the `io.eunolabs.context-manifest` block in a request's `_meta`). It
 // is the grammar gate for a wire-side token that never appears in the manifest — it arrives on

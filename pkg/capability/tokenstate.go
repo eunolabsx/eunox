@@ -32,7 +32,7 @@ const (
 	StateAtomic StateAccumulation = "atomic"
 	// StateNonAtomic is a non-atomic read-then-write against shared state: one call commits
 	// what a later call reads back, with a window in between (the flow-label set, the
-	// antecedent history, a declassify's single-use ledger). What the decision turn exists for.
+	// antecedent history). What the decision turn exists for.
 	StateNonAtomic StateAccumulation = "nonAtomic"
 )
 

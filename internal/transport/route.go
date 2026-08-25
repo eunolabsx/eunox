@@ -155,32 +155,6 @@ func (r *routeSink) RecordAllow(ctx context.Context, sessionID, identifier, meth
 	})
 }
 
-// RecordDeclassifiedAllow stamps route identity onto the allow record for a call that
-// also performed an approved declassification (see *audit.Sink's method of the same name
-// for why the cleared labels and the approver travel together).
-func (r *routeSink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver, approvalID string) {
-	if r == nil || r.sink == nil {
-		return
-	}
-	r.sink.Record(ctx, audit.RecordParams{
-		Upstream:      r.upstream,
-		PolicyVersion: r.policyVersion,
-		PolicySHA256:  r.policySHA256,
-		SessionID:     sessionID,
-		Identifier:    identifier,
-		Method:        method,
-		Decision:      "allow",
-		Details:       details,
-		Obligations:   obligs,
-		AuditOnly:     auditOnly,
-		LabelsOut:     labelsOut,
-		CarriedLabels: carriedLabels,
-		LabelsCleared: labelsCleared,
-		Approver:      approver,
-		ApprovalID:    approvalID,
-	})
-}
-
 // RecordDeny stamps route identity onto a deny record (see RecordAllow).
 func (r *routeSink) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
 	if r == nil || r.sink == nil {
@@ -473,17 +447,6 @@ func startupFatalManifestCheck(u *config.UpstreamConfig, hostTransport string, m
 	// believe the route is audience-gated when it is not.
 	if hostTransport == config.HostTransportStdio && merged.Audience != "" {
 		return fmt.Errorf("upstream %q declares an audience pin in its policy manifest, but audience pins are a JWT concept enforced only in gateway (transport: http) mode with --jwks-uri; a stdio host cannot enforce it. Remove the manifest 'audience' field or run this upstream as an http gateway route", u.Name)
-	}
-	// A declassify directive is satisfiable only by a human approval carried on a
-	// validated JWT, which a stdio host can never present (--jwks-uri is rejected
-	// there). Every call would escalate forever with no way to approve it — the same
-	// "could never be satisfied" outcome validateDeclassify already refuses at the
-	// manifest level, refused here for the same reason the audience pin is.
-	//
-	// The axis is the HOST transport, not the upstream's: a stdio upstream behind an
-	// http gateway is fine, since the token arrives on the host leg.
-	if hostTransport == config.HostTransportStdio && merged.HasDeclassify() {
-		return fmt.Errorf("upstream %q declares a declassify directive in its policy manifest, but a declassification requires a human approval carried on a validated JWT, and a stdio host has no HTTP listener to present one to (--jwks-uri requires transport: http); every call to that capability would escalate forever with no way to approve it. Remove the directive or run this upstream as an http gateway route", u.Name)
 	}
 	return nil
 }

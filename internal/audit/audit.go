@@ -57,24 +57,6 @@ type auditRecord struct {
 	// carries no jti and for every request with no token, so an existing deployment's records
 	// are byte-identical until it starts issuing them.
 	TokenID string `json:"token_id,omitempty"`
-	// Delegate and DelegationDepth attribute a DELEGATED call to the sub-agent that actually
-	// made it. UserID names the human the token is for; on a chain user -> agent-a -> agent-b
-	// that human made none of these calls directly, and without these two the record is
-	// indistinguishable from one they did. Delegate is the CURRENT holder (the outermost
-	// RFC 8693 `act` actor) and DelegationDepth is how many hops the chain declares, so an
-	// auditor reconstructing "who invoked tool:wire_transfer" gets the acting identity plus
-	// whether it was reached through intermediaries.
-	//
-	// The terminal actor plus a depth, rather than the whole actor list: every top-level field
-	// on the tape is a size commitment, and the list is unbounded up to MaxDelegationDepth
-	// while these two are one bounded string and one small int. The full chain, when it is
-	// needed, is in the token the refusal path already names hops from.
-	//
-	// Delegate is IdP-supplied (structure-validated, not length-bounded at the source) and is
-	// bounded exactly like AgentID/TaskID/UserID. Both are omitted for the overwhelming
-	// majority of records, which carry no delegation at all.
-	Delegate        string `json:"delegate,omitempty"`
-	DelegationDepth int    `json:"delegation_depth,omitempty"`
 	// PEP names the policy-enforcement point that WROTE this record: the protocol binding
 	// it enforces at plus the operator's name for the instance ("mcp:edge-1"), from
 	// --audit-pep / audit.pep.
@@ -121,26 +103,6 @@ type auditRecord struct {
 	// Present only on flow-relevant decisions; omitted otherwise.
 	LabelsOut     []string `json:"labels_out,omitempty"`
 	CarriedLabels []string `json:"carried_labels,omitempty"`
-	// LabelsCleared and Approver are the declassification fields: the flow labels
-	// an APPROVED declassify directive removed from the session on this call, and the
-	// human who approved it. They appear together or not at all — the proxy performs no
-	// declassification without a named approver — and only on an allow, since an
-	// unapproved one escalates and clears nothing.
-	//
-	// Their presence is what makes a declassification a distinguishable event on the
-	// tape rather than an ordinary allow that quietly dropped a label: no other record
-	// shape carries labels_cleared. LabelsCleared spans the same two-axis vocabulary as
-	// LabelsOut and needs no length bound for the same reason — a clear can only name
-	// labels the manifest's own declassify directive listed, so the policy bounds it;
-	// Approver is IdP-supplied free text and is bounded like the other envelope strings.
-	// ApprovalID is the control plane's own identifier for the approval, echoed so a
-	// tape entry joins back to the workflow that produced it. It travels with the other
-	// two rather than in Details because a declassification's evidence must be one
-	// record shape, not a top-level pair plus a magic details key the transport
-	// hand-merges into a map it does not own.
-	LabelsCleared []string `json:"labels_cleared,omitempty"`
-	Approver      string   `json:"approver,omitempty"`
-	ApprovalID    string   `json:"approval_id,omitempty"`
 	// ProtocolRevision is the MCP protocol revision this decision was taken under, drawn
 	// from the closed published set (capability.PublishedRevisions) and never from
 	// caller-supplied text, so it needs no length bound. It is what makes a per-revision
@@ -483,27 +445,19 @@ type Option func(*Sink)
 // injected WithIdentity func.
 //
 // It is a struct rather than a positional tuple because it grew: three same-typed strings in a
-// row is a transposition waiting to happen, and adding the delegation attribution made it five
+// row is a transposition waiting to happen, and the identity attribution made it several
 // values of which two are new. Named fields also mean a future identity axis is a field, not a
 // fourth string every implementation and call site has to get in the right order.
 type Identity struct {
 	// AgentID and TaskID are the mcp.agent_id / mcp.task_id claims of a validated token.
 	AgentID string
 	TaskID  string
-	// UserID is the token SUBJECT (sub): the human or principal the agent acts for. On a
-	// delegated call it is still the human — which is precisely why Delegate exists.
+	// UserID is the token SUBJECT (sub): the human or principal the agent acts for.
 	UserID string
 	// TokenID is the validated token's RFC 7519 `jti`: WHICH credential authorized the call,
 	// as opposed to which identity it speaks for. Empty for a token that omits it and for
 	// every request with no token at all.
 	TokenID string
-	// Delegate is the identity currently HOLDING the token: the outermost RFC 8693 `act`
-	// actor. Empty for a token carrying no actor chain, which is nearly all of them.
-	Delegate string
-	// DelegationDepth is how many actors the chain declares (0 when there is none), so a
-	// record naming only the terminal delegate still says whether it was reached through
-	// intermediaries.
-	DelegationDepth int
 }
 
 // WithIdentity injects the caller-identity extractor read by Record. Supplied by the caller so
@@ -1015,32 +969,6 @@ func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method st
 	})
 }
 
-// RecordDeclassifiedAllow enqueues the allow record for a call that ALSO performed an
-// approved declassification: labelsCleared are the labels actually removed from the
-// session and approver is the human the approval named.
-//
-// It is a distinct entrypoint rather than two more parameters on RecordAllow because the
-// two fields are meaningless apart — a declassification with no approver is not one this
-// proxy performs — and a widened RecordAllow would let a call site pass one without the
-// other at every one of its call sites. Here the pairing is structural: the only way to
-// stamp labels_cleared is to name an approver in the same call.
-func (s *Sink) RecordDeclassifiedAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels, labelsCleared []string, approver, approvalID string) {
-	s.Record(ctx, RecordParams{
-		SessionID:     sessionID,
-		Identifier:    identifier,
-		Method:        method,
-		Decision:      "allow",
-		Details:       details,
-		Obligations:   obligs,
-		AuditOnly:     auditOnly,
-		LabelsOut:     labelsOut,
-		CarriedLabels: carriedLabels,
-		LabelsCleared: labelsCleared,
-		Approver:      approver,
-		ApprovalID:    approvalID,
-	})
-}
-
 // RecordDeny enqueues a deny audit record (see RecordAllow for the shared
 // semantics). denialCode and condType carry the structured denial taxonomy;
 // observe is the audit-mode flag — an observed deny is logged and forwarded rather
@@ -1106,9 +1034,6 @@ type RecordParams struct {
 	AuditOnly     bool
 	LabelsOut     []string
 	CarriedLabels []string
-	LabelsCleared []string
-	Approver      string
-	ApprovalID    string
 }
 
 // Record is the gateway-aware variant: p.Upstream, p.PolicyVersion, and
@@ -1149,10 +1074,6 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		id.TaskID = boundFieldTo(id.TaskID, auditEnvelopeFieldCap)
 		id.UserID = boundFieldTo(id.UserID, auditEnvelopeFieldCap)
 		id.TokenID = boundFieldTo(id.TokenID, auditEnvelopeFieldCap)
-		// Bounded with the other three: act.sub is IdP-supplied and structure-validated but
-		// not length-bounded at the source, so it is the same exposure they are. The depth is
-		// an int the chain validator already caps at MaxDelegationDepth.
-		id.Delegate = boundFieldTo(id.Delegate, auditEnvelopeFieldCap)
 	}
 
 	rec := auditRecord{
@@ -1166,10 +1087,6 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		TaskID:      id.TaskID,
 		UserID:      id.UserID,
 		TokenID:     id.TokenID,
-		// The acting delegate, for a call a sub-agent made on the human's behalf. Both are
-		// zero for every non-delegated request and omitempty keeps them off those records.
-		Delegate:        id.Delegate,
-		DelegationDepth: id.DelegationDepth,
 		// Route provenance (config route name, manifest version, computed digest) is
 		// operator-supplied and fixed for the lifetime of the route, unlike every other
 		// field here — so, unlike them, it is bounded ONCE by the caller (via
@@ -1229,16 +1146,7 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// decision keeps both fields omitted.
 		LabelsOut:     slices.Clone(p.LabelsOut),
 		CarriedLabels: slices.Clone(p.CarriedLabels),
-		LabelsCleared: slices.Clone(p.LabelsCleared),
-		// Bounded like the identity claims above and for the same reason: the approver
-		// comes from an IdP-minted claim, structure-validated (non-empty) but not
-		// length-bounded, so an unbounded one could push a record past the 4 MiB scanner
-		// buffer.
-		Approver: boundFieldTo(p.Approver, auditEnvelopeFieldCap),
-		// Bounded for the same reason as Approver: it is an opaque identifier minted by
-		// the operator's control plane and echoed verbatim.
-		ApprovalID: boundFieldTo(p.ApprovalID, auditEnvelopeFieldCap),
-		KeyID:      s.keyID,
+		KeyID:         s.keyID,
 	}
 
 	// The drop warnings are emitted OUTSIDE the lock. stderr can block indefinitely — a
@@ -1472,7 +1380,7 @@ func (rec *auditRecord) queueSize() int64 {
 	for _, o := range rec.Obligations {
 		n += int64(len(o))
 	}
-	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.TokenID) + len(rec.Delegate))
+	n += int64(len(rec.SessionID) + len(rec.AgentID) + len(rec.TaskID) + len(rec.UserID) + len(rec.TokenID))
 	n += int64(len(rec.Target) + len(rec.Method) + len(rec.TargetType))
 	n += int64(len(rec.PEP) + len(rec.Upstream) + len(rec.PolicyVersion) + len(rec.PolicySHA256))
 	n += int64(len(rec.DenialCode) + len(rec.ConditionType) + len(rec.ProtocolRevision))
@@ -1482,10 +1390,6 @@ func (rec *auditRecord) queueSize() int64 {
 	for _, l := range rec.CarriedLabels {
 		n += int64(len(l))
 	}
-	for _, l := range rec.LabelsCleared {
-		n += int64(len(l))
-	}
-	n += int64(len(rec.Approver) + len(rec.ApprovalID))
 	return n
 }
 
@@ -1572,119 +1476,25 @@ const (
 	UnroutableFramingUnmapped = "framing_unmapped"
 )
 
-// The four declassification detail keys. They report the facts a declassification's
-// top-level signed fields (labels_cleared / approver / approval_id) deliberately cannot:
-// those three appear together and ONLY when a clear actually changed the session's labels,
-// so on their own they leave a real approval spendable with nothing on the tape naming it,
-// and an authorized clear that never landed indistinguishable from a call that never asked
-// for one.
-//
-// Each has exactly ONE provenance, which is why there are four rather than one flag with a
-// mode. A consumer keyed on any of them knows what happened without also having to read the
-// record's decision:
-//
-//   - DeclassifySpentApprovalKey: this call BURNED a single-use grant. It is stamped
-//     whether or not the clear moved a label and whether or not the call went on to be
-//     refused, because the grant is spent in all three cases — that is the property `once`
-//     advertises. It is the key that answers "which of my outstanding single-use approvals
-//     are still live?", which neither approval_id (present only on a clear that changed
-//     something) nor a refusal-only key could.
-//   - DeclassifyNotAppliedKey: an approved clear did NOT take effect. Usually because the
-//     call was refused below the decision (the --require-audit=strict gate, an upstream
-//     transport failure, a redaction failure); also on an ALLOW whose upstream reply showed
-//     the action failing (an isError result, or a JSON-RPC error), where the response IS
-//     delivered but the transform never happened. Benign by construction either way — the
-//     labels were never removed, so the session is exactly as tainted as the calls it
-//     actually made — and recorded so a spent grant beside it is explicable. It is "the
-//     clear did not land", never "the request was rejected"; read the record's decision for
-//     that.
-//   - DeclassifyResultWithheldKey: the action EXECUTED and eunox withheld its result. It
-//     normally QUALIFIES the key above — both facts are true on that exit, and a consumer
-//     keyed on the benign case must still find the refusal — but it can ride alone on a
-//     no-op clear under a single-use grant, where the decision authorized labels the anchor
-//     was not carrying and there is therefore no not-applied set. Treat it as its own fact
-//     about a spent grant, not as a strict subset of the key above.
-//   - DeclassifyCommitFailedKey: the call RAN and the clear the policy authorized could not
-//     be applied. The session keeps taint it should have dropped, so a later sink
-//     over-blocks until the operator retries with a new approval. This is the direction the
-//     residual now fails in; it is not a fail-open, and it is counted by `eunox stats`.
-//
-// All four carry the reserved underscore prefix for EffectReceiptKey's reason, which binds
-// harder here: two of them ride an ALLOW record, and a tools/call allow's Details IS the
-// caller's argument map in audit mode, which `eunox suggest` mines as argument names. A bare
-// key would be drafted into an allowedValues condition on an argument no call carries.
-const (
-	DeclassifySpentApprovalKey = DeclassifyDetailPrefix + "spent_approval_id"
-	DeclassifyNotAppliedKey    = DeclassifyDetailPrefix + "not_applied"
-	DeclassifyCommitFailedKey  = DeclassifyDetailPrefix + "commit_failed"
-
-	// DeclassifyResultWithheldKey says the declassifying action EXECUTED and eunox withheld
-	// its result — the proxy could not discharge a redactFields obligation on the response,
-	// so the response was dropped and the call refused with ENFORCEMENT_ERROR.
-	//
-	// It exists because the three refusals below the decision are not one case. Two of them
-	// (the --require-audit=strict gate, an upstream transport failure) leave it genuinely
-	// unknown whether the upstream ran anything: strict blocks before the forward, and a
-	// transport failure can follow a side effect that already happened. Only the redaction
-	// exit is reached after a reply came back. That distinction is what an operator
-	// reconciling a burned `once` grant needs — it separates "retry it" from "the work is
-	// done, only the delivery failed" — and nothing else on the tape carries it: the refusal
-	// otherwise shares DeclassifyNotAppliedKey's shape with the two exits where the action may
-	// never have run.
-	//
-	// "A reply came back" is NOT this key's claim, and the producer gates the difference. A
-	// reply flagged isError, a reply carrying an error member beside a result (which JSON-RPC
-	// forbids and a hostile upstream may still emit), and bytes the proxy cannot interpret can
-	// all reach that exit and fail redaction — so an ungated stamp would let an upstream write
-	// "the work is done" onto the tamper-evident tape at will, and the operator would re-mint
-	// the approval to re-deliver work that never ran. It is therefore written only for a reply
-	// that passes the SAME success test the clear itself is gated on, and only for a decision
-	// that was an allow (a downgraded deny is forwarded under --audit and must never be
-	// reported as an executed declassification).
-	//
-	// The clear is still withheld on this exit, which is a decision rather than an inheritance
-	// from its two siblings. The sanitized result never reached the host, so nothing sanitized
-	// entered the session — which is the thing a flow label tracks — and the taint therefore
-	// still describes the session accurately. The cost is over-blocking a later sink plus a
-	// re-minted approval (the grant is burned with the decision and has no refund), paid for a
-	// proxy- or manifest-side defect; the alternative is dropping taint on the strength of a
-	// response no consumer ever saw. This key is what makes that cost legible on the tape
-	// instead of silent.
-	DeclassifyResultWithheldKey = DeclassifyDetailPrefix + "result_withheld"
-)
-
 // ReservedArgumentsKey holds the caller-supplied tool arguments whose names collided with
 // eunox's own reserved details namespace. The transport moves them here rather than letting
 // them land at the top of an allow record's details, where they would be indistinguishable
-// from the annotations the proxy writes — and where a client could forge the operator alert
-// `eunox stats` raises off DeclassifyCommitFailedKey.
+// from the annotations the proxy writes.
 //
 // They are quarantined rather than dropped: the argument really was sent, and an auditor
 // reconstructing the call should still see it. Reserved itself, so a miner skips the holder
 // too rather than drafting "_eunox_reserved_arguments" as a tool argument name.
 const ReservedArgumentsKey = "_eunox_reserved_arguments"
 
-// DeclassifyDetailPrefix is the common prefix of the four keys above, and all four are
-// BUILT from it rather than spelled out beside it. A consumer that has to scan for them —
-// `eunox stats` probes a record's raw details bytes for this substring before paying for a
-// decode, the same pre-filter the effect-receipt path uses — then cannot fall out of step
-// with the producer by one edited literal. Nothing else in the details namespace may start
-// with it.
-const DeclassifyDetailPrefix = "_eunox_declassify_"
-
 // reservedDetailKeys is the set of Details keys eunox itself injects into an allow record.
 // None is ever a caller-supplied tool argument.
 var reservedDetailKeys = map[string]bool{
-	TruncatedKey:                true,
-	UpstreamErrorCodeKey:        true,
-	EffectReceiptKey:            true,
-	HandlerFaultKey:             true,
-	UnroutableKey:               true,
-	DeclassifySpentApprovalKey:  true,
-	DeclassifyNotAppliedKey:     true,
-	DeclassifyCommitFailedKey:   true,
-	DeclassifyResultWithheldKey: true,
-	ReservedArgumentsKey:        true,
+	TruncatedKey:         true,
+	UpstreamErrorCodeKey: true,
+	EffectReceiptKey:     true,
+	HandlerFaultKey:      true,
+	UnroutableKey:        true,
+	ReservedArgumentsKey: true,
 }
 
 // IsReservedDetailKey reports whether a Details key is one eunox injects rather than one a

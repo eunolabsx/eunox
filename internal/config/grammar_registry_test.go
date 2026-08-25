@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -82,7 +81,7 @@ func TestConditionValidators_CoverEveryKnownCondition(t *testing.T) {
 // package's per-type validation table. A directive present in the registry and missing here
 // loads no manifest at all — the fail-closed default refuses it — so the failure is a
 // diagnostic one rather than a hole: before the table existed, the type switch's default arm
-// reported "the only supported directives are redactFields, labelOutput and declassify",
+// reported "the only supported directives are redactFields and labelOutput",
 // naming three directives that were not the problem and pointing an author away from the
 // fault.
 func TestDirectiveValidators_CoverEveryKnownDirective(t *testing.T) {
@@ -326,14 +325,6 @@ func TestBaseGrammarTokensLoadUnderBothRevisions(t *testing.T) {
 // TestGrammarTables_NoStrayPrefixes is a small guard on the message text the two gates
 // produce, so a rename that leaves the error naming a token that no longer exists shows up
 // here rather than in an operator's terminal.
-func TestGrammarTables_NoStrayPrefixes(t *testing.T) {
-	err := checkTokenRevision(0, capability.DirectiveTypeDeclassify, "directive", ManifestSchemaVersion01)
-	require.Error(t, err)
-	assert.True(t, strings.Contains(err.Error(), capability.DirectiveTypeDeclassify),
-		"the refusal must name the token it refused")
-	assert.NoError(t, checkTokenRevision(0, capability.DirectiveTypeDeclassify, "directive", ManifestSchemaVersion02))
-}
-
 // TestDirectiveValidator_TypeMismatchIsRefusedNotPanicked covers the failure mode that
 // appeared the moment dispatch moved off the concrete Go type. directiveValidators is keyed
 // by dir.DirectiveType() — a string the directive REPORTS — so a value whose report

@@ -72,8 +72,7 @@ import (
 // fail-closed "no policy" default), so every handler may dereference d.pdp directly.
 type dispatchParams struct {
 	forwardParams
-	// pdp is the decision point every handler decides with AND the committer handed to
-	// enforcedForwardCore for a declassification's clear — one field, not two kept in sync.
+	// pdp is the decision point every handler decides with.
 	pdp      pdp.PolicyDecisionPoint
 	sourceIP string
 	// buildInit answers a host `initialize` locally, injected per-transport so initialize can
@@ -93,16 +92,11 @@ type dispatchParams struct {
 }
 
 // finishDecision closes the decision critical section (if open) right after the PDP decision
-// and before the forward. One exception: a declassifying call keeps the turn until the
-// handler returns, because its flow-state write splits across the decision (resolves what to
-// clear) and the post-forward commit (removes it) — releasing early would let a concurrent
-// source land between the two and commit a fresh taint the commit then wrongly clears.
+// and before the forward, so no call holds the turn across its upstream round trip.
 //
-// Cost: head-of-line blocking on the anchor for one declassifying call, bounded by
-// --upstream-timeout (unbounded at 0). Paid only by calls that actually declassify; both
-// transports also defer this same idempotent release as a backstop.
-func (d dispatchParams) finishDecision(dec capability.EnforceResponse) {
-	if d.endDecision == nil || dec.Declassification.PendingClear() {
+// Idempotent; both transports also defer this same release as a backstop.
+func (d dispatchParams) finishDecision() {
+	if d.endDecision == nil {
 		return
 	}
 	d.endDecision()
@@ -892,8 +886,7 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	}
 	dec := d.pdp.Decide(decideCtx, d.sessionID, pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: params.Name}, params.Arguments, d.sourceIP)
 	// Close the decision critical section here so the forward below runs concurrently.
-	// A declassification-authorizing decision keeps the turn instead; see finishDecision.
-	d.finishDecision(dec)
+	d.finishDecision()
 
 	// In audit mode the allow record logs the full tool arguments; unlike resources/prompts,
 	// tools/call's details slot holds that argument map rather than an upstream_error_code note.
@@ -903,7 +896,7 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if (d.audit || dec.AuditOnly) && len(params.Arguments) > 0 {
 		toolDetails = quarantineReservedArgs(params.Arguments)
 	}
-	out := enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
+	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
 		func(ctx context.Context, upResp mcp.RPCMsg) map[string]interface{} {
 			// Record the upstream's forwarded error code so a rejected call isn't identical to
 			// a clean success on the tape. Merges into a COPY of toolDetails — never mutates
@@ -930,7 +923,7 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 
 // quarantineReservedArgs moves any key in eunox's reserved details namespace under a nested
 // holder, so a caller-supplied argument can never forge a proxy annotation on the tape — e.g.
-// spoofing the ATTENTION alert `eunox stats` prints for details._eunox_declassify_commit_failed.
+// spoofing an annotation `eunox stats` reads, such as details._eunox_upstream_error_code.
 // Quarantining (not dropping) keeps the record faithful: the argument was really sent.
 func quarantineReservedArgs(args map[string]interface{}) map[string]interface{} {
 	reserved := false
@@ -1018,8 +1011,8 @@ func dispatchResourcesRead(ctx context.Context, d dispatchParams, msg mcp.RPCMsg
 	// Interface method (not a type-assert to *pdp.ManifestPDP) so JWT-only PDPs
 	// also enforce resource reads.
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision(dec) // release the decision turn before the forward
-	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
+	d.finishDecision() // release the decision turn before the forward
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
 }
 
 // dispatchResourcesSubscribe enforces resources/subscribe under the same
@@ -1034,9 +1027,9 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 		return d.malformedDeny(ctx, msg, "resources/subscribe: uri must not be empty")
 	}
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision(dec) // release the decision turn before the forward
+	d.finishDecision() // release the decision turn before the forward
 	// recordObligations is false: a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
 
 // dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest entry
@@ -1057,9 +1050,9 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 		return d.malformedDeny(ctx, msg, "resources/unsubscribe: uri must not be empty")
 	}
 	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
-	d.finishDecision(dec) // release the decision turn before the forward
+	d.finishDecision() // release the decision turn before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
 }
 
 // dispatchPromptsGet enforces the capability manifest for prompts/get requests.
@@ -1075,9 +1068,9 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	}
 	// Interface method (not a type-assert to *pdp.ManifestPDP).
 	dec := d.pdp.DecidePromptGet(d.decideCtx(ctx), d.sessionID, params.Name, d.sourceIP)
-	d.finishDecision(dec) // release the decision turn before the forward
+	d.finishDecision() // release the decision turn before the forward
 	// auditID carries the "prompts/" display prefix; denialTarget is the bare name.
-	return enforcedForwardCore(ctx, d.forwardParams, d.pdp, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
 }
 
 // dispatchList forwards a */list request to the upstream and prunes the result to permitted

@@ -200,7 +200,7 @@ Two revisions are published, and a build parses both:
 | `schemaVersion` | What it adds |
 |---|---|
 | `"0.1"` | The base authorization vocabulary: targets, actions, `argumentSchema`, `principal`, the conditions in § 5, and the `redactFields` directive. |
-| `"0.2"` | Everything in `0.1`, plus the **flow + effect layer**: the [`flowLabel`](#flowlabel--the-information-flow-sink) condition, the [`labelOutput`](#labeloutput--the-information-flow-source) and [`declassify`](#declassify--clearing-a-label-under-human-approval) directives, the [`effectClass` / `blastRadius`](./effect-contracts.md) conditions, a constraint's [`effect`](./effect-contracts.md) contract, the top-level [`effectCeiling`](./effect-contracts.md), the top-level [`flowLabelNamespaces`](#5b-information-flow--flowlabel-labeloutput-declassify), and the [`${task.*}`](#task-context-variables) variables. |
+| `"0.2"` | Everything in `0.1`, plus the **flow + effect layer**: the [`flowLabel`](#flowlabel--the-information-flow-sink) condition, the [`labelOutput`](#labeloutput--the-information-flow-source) directive, the [`effectClass` / `blastRadius`](./effect-contracts.md) conditions, a constraint's [`effect`](./effect-contracts.md) contract, the top-level [`effectCeiling`](./effect-contracts.md), the top-level [`flowLabelNamespaces`](#5b-information-flow--flowlabel-labeloutput), and the [`${task.*}`](#task-context-variables) variables. |
 
 The revisions are **closed against each other in one direction only**: a `0.2`
 manifest may use every `0.1` token, and a `0.1` manifest that uses a `0.2` token
@@ -540,7 +540,7 @@ capability claim.
 | Verified by | the IdP's JWKS (`--jwks-uri`) |
 | `capabilities` shape | array of **shorthand strings** (`tool:read_file?path=/reports/*`) |
 | How conditions appear | encoded in the `?key=value` suffix grammar (§ 5.2, Pattern D) |
-| Extra machinery | `task_id`, `agent_id`, `declassify` ([§ 5b](#declassify--clearing-a-label-under-human-approval); `schemaVersion 0.2`) |
+| Extra machinery | `task_id`, `agent_id` |
 | Role | per-invocation narrowing in intersection mode |
 
 **Why conditions aren't enumerated in the published JWT schema.** In the IdP
@@ -1071,7 +1071,7 @@ Unknown types are denied at the proxy, so spelling matters.
 
 The conditions in this section are part of every grammar revision. Three more
 arrive with `schemaVersion: "0.2"` and live in their own sections because their
-semantics are cross-request rather than per-call: [`flowLabel`](#5b-information-flow--flowlabel-labeloutput-declassify)
+semantics are cross-request rather than per-call: [`flowLabel`](#5b-information-flow--flowlabel-labeloutput)
 (§ 5b), and [`effectClass` / `blastRadius`](./effect-contracts.md) (the effect
 layer, documented separately).
 
@@ -2197,7 +2197,7 @@ A `redactFields` object found inside `conditions` is rejected at load —
 `conditions`. An unknown directive `type` is likewise rejected at load
 (fail-closed) rather than silently dropped.
 
-## 5b. Information flow — `flowLabel`, `labelOutput`, `declassify`
+## 5b. Information flow — `flowLabel`, `labelOutput`
 
 > **`schemaVersion: "0.2"`.** All three tokens are refused under `0.1`.
 
@@ -2207,13 +2207,16 @@ is a property of the **flow** across a task, not of any one request — and it i
 the shape a prompt-injected agent exploits, because each individual call is
 inside its granted capabilities.
 
-Information-flow control is two halves plus an escape hatch:
+Information-flow control is two halves:
 
 - **`labelOutput`** (directive, the **source**): *"the output of this call carries
   these labels."*
 - **`flowLabel`** (condition, the **sink**): *"only these classes may reach here."*
-- **`declassify`** (directive, the **approved clear**): *"a human agreed this
-  action removes these labels."*
+
+There is no clearing directive: a label added to an anchor stays for that anchor's
+life. Taint is therefore monotonic, which over-blocks rather than under-blocks — if
+a sanitizing step must produce untainted output, give it a distinct target that no
+`labelOutput` names.
 
 Labels span **two axes**. Both are **flat** — a label is a tag, and there is no
 lattice or partial order on either.
@@ -2302,8 +2305,7 @@ target produces, and the target produces the same data whoever calls it — so a
 broad sibling that grants the call (a `tool:*` entry with no `labelOutput`) cannot
 shadow a principal-scoped source entry and drop the taint. A policy that
 differentiates labels per principal on one target therefore taints every caller
-with the widest set; differentiate by naming distinct targets, or clear the label
-with an approved [`declassify`](#declassify--clearing-a-label-under-human-approval).
+with the widest set; differentiate by naming distinct targets.
 
 Under `--audit` a *denied* call is forwarded and therefore runs, so the taint is
 committed there too — including when the deny was a **no-match** (nothing was
@@ -2345,314 +2347,6 @@ mid-session would be a fail-open the "for all flows" guarantee cannot tolerate.
 > source read on one replica and a sink on another do not see the same taint —
 > and the failure direction is *open*. `eunox validate` warns when a policy uses
 > flow tokens.
-
-### `declassify` — clearing a label under human approval
-
-`declassify` is the only token in the grammar that **removes** a flow label, and
-it is the only direction in the flow layer that can fail open. Adding taint can
-only ever produce more denials; clearing it can only ever produce more allows.
-Everything about how it behaves follows from that asymmetry.
-
-```yaml
-- target: tool:publish_sanitized_report
-  actions: [call]
-  directives:
-    - type: declassify
-      labels: [pii]
-```
-
-On an **approved** call, the named labels are removed from the session's
-accumulated set, so a later sink that would have denied now allows.
-
-**Without an approval covering every named label at this exact target, the call
-does not run.** It is refused with `ESCALATION_REQUIRED` — `decision: escalate`
-on the tape — not allowed-without-clearing. Forwarding it while quietly leaving
-the labels in place would let an author write a declassification the proxy never
-performs, and the next sink would deny for a reason the policy says should not
-apply: a policy that reads as broken rather than as enforced.
-
-The refusal is **hard**: a route running `--audit` cannot downgrade it to a
-forward. An audit-mode downgrade is coherent for a policy *verdict* being staged;
-"no human has approved dropping this label" is not a verdict being staged. This
-is the same non-negotiable that keeps an over-ceiling action from being
-performed-anyway-and-logged.
-
-Two shapes are refused at load, because in both the written intent and the
-enforced behavior would differ:
-
-- `declassify` **and** `labelOutput` on one constraint — they write the same
-  state in opposite directions on the same call, so evaluation order rather than
-  policy would decide the outcome. Split them into two capabilities.
-- **Two** `declassify` directives on one constraint — that reads as "either
-  approval suffices" and enforces as "one approval must cover the union". One
-  directive listing every label says the same thing unambiguously.
-
-Like `labelOutput`, it is valid on `tool:` and `resource:` targets only:
-clearing a label at an egress launders it at exactly the point the flow layer
-exists to gate.
-
-#### Where an approval comes from
-
-The proxy holds **no approval workflow** — that is the control-plane surface. It
-*verifies* approvals; a human (or the system acting for one) grants them. An
-approval rides the `mcp.declassify` claim of a token eunox has already verified
-for signature, issuer, audience, and expiry:
-
-```jsonc
-"mcp": {
-  "v": "0.2",
-  "declassify": [
-    {
-      "labels": ["pii"],                    // native labels this approval may drop
-      "target": "tool:publish_sanitized_report",  // the ONE action it covers
-      "approver": "alice@example.com",      // the accountable human — mandatory
-      "id": "apr-2026-08-01-014"            // optional control-plane record id
-    }
-  ]
-}
-```
-
-The claim is the carrier because it is the only approval channel already
-operator-controlled end to end: eunox consumes IdP tokens and never mints them,
-and the JWKS it validates against is the operator's — so an approval on a
-verified token needs no new key domain, no new trust root, and no fetch on the
-decision path.
-
-The rules the proxy enforces, each fail-closed:
-
-- **`target` is matched literally.** A glob in an approval target is refused: a
-  pattern would widen one human approval across every matching action, which is
-  the opposite of how a glob fails in a policy allowlist.
-- **`labels` must cover every label the directive clears.** A partial grant
-  escalates rather than clearing the covered subset — half-clearing leaves the
-  operator believing a label is gone while a later sink still sees it.
-- **`approver` is mandatory and non-empty.** An approval with no accountable
-  human is not human approval, and it is the value stamped on the tape.
-- **A malformed grant rejects the whole token**, rather than evaluating to a
-  grant that covers nothing — which would turn an IdP template mistake into a
-  permanent, invisible escalation loop with no error to grep for.
-- **No token means no approval**, so a deployment with no approval integration
-  escalates every declassification. That is the intended fail-closed default,
-  not a gap.
-
-The approval's lifetime is the **token's** lifetime — there is no separate expiry
-field, because a verified token already has one.
-
-> **`declassify` requires an HTTP host.** Approvals ride a validated JWT, and JWT
-> validation needs an HTTP listener (`--jwks-uri` requires `transport: http`), so a
-> **stdio host** can never present one. A `declassify` directive there could only
-> ever escalate, so it is **refused at startup** rather than left to fail on every
-> call. A stdio *upstream* behind an HTTP gateway is fine — the token arrives on the
-> host leg.
-
-#### `once` — a single-use approval
-
-A grant is **replayable by default**: the token is held by the agent, so an approval
-minted into it can be presented for as long as that token lives, at any action the
-grant's `target` names. Scope bounds that; scope is not lifetime.
-
-`once: true` closes it. The grant is **burned** on the first call that clears with
-it, and every later presentation is refused with `reason: approval_consumed` rather
-than clearing again:
-
-```jsonc
-{
-  "labels": ["pii"],
-  "target": "tool:publish_sanitized_report",
-  "approver": "alice@example.com",
-  "id": "apr-2026-08-01-014",   // REQUIRED under once — the ledger burns by id
-  "once": true
-}
-```
-
-- **`id` is mandatory** under `once`. The burn is keyed by id, not by the grant's
-  content: two approvals naming the same labels, target, and approver are two
-  separate human decisions, and a content key would let the first spend the second.
-  A `once` grant with no `id` **rejects the token** rather than silently degrading
-  to a standing approval.
-- **The grant is spent even when the clear is a no-op.** Presenting it on a session
-  that is not carrying the label still burns it. That is the property, not an
-  oversight: burning only on a clear that changed something would make the grant
-  replayable by ordering — present it once while clean, acquire the taint, present
-  it again to the clear that matters.
-- **A store fault escalates.** If the ledger cannot be read, "already used" cannot
-  be told from "never used", and treating that as fresh would make an unreachable
-  backend the way to replay every one-shot grant in a token. If the burn cannot be
-  written, the call hard-denies rather than clearing anyway.
-- **A token may carry several grants.** The proxy uses the first *live* one, so a
-  spent grant beside a fresh one is passed over rather than refused on.
-- **The burn is not scoped to anything.** Not the session, not the task. "Approve
-  clearing this once" means once: reconnecting does not restore it, a second session
-  does not get its own copy, and a different task does not either.
-- **A `once` grant may not ride a token that outlives the ledger.** The burn is
-  remembered for **seven days**, and a token valid for longer than that would present
-  the same grant again after the burn aged out — one human approval, two
-  declassifications. Such a token is **rejected at validation** (HTTP 401), naming the
-  grant, rather than admitted under a weaker promise than the field makes. So the
-  guarantee is unconditional for every token the proxy accepts: the burn is written no
-  earlier than the moment the token is presented, so it always outlives the token that
-  could replay it. The fix on the IdP side is the practice these docs already
-  recommend — mint a short-lived token per approval — or drop `once` and accept a
-  standing grant, which is replayable for the token's lifetime by design and therefore
-  unaffected by the bound.
-- **Concurrency is closed at the burn, not at the check.** Two calls presenting the
-  same live grant at the same moment can both *see* it as live; exactly one is
-  admitted, and the other is refused. Over-refusing one of two racing calls is the
-  only outcome that keeps "once" meaning once.
-- **A call refused after its burn does not get the use back.** The grant is spent.
-  That over-refuses (mint another approval) rather than handing a use back to a
-  caller whose action may still have been forwarded by an `--audit` route.
-- **A token carries at most 32 approvals**, and each approval is decoded with the same
-  three strict rules a delegation grant is: an unknown member, an explicit `null`, or a
-  duplicate key rejects the token. `"once": null` is the one that matters most — it
-  decodes to `false`, which is a *standing* grant, i.e. exactly the replay window `once`
-  exists to close. Omit the member instead of writing `null`.
-
-A standing grant (`once` unset) still behaves exactly as before, because an operator
-whose control plane already mints a short-lived token per approval has the property
-by other means and should not be made to keep a ledger for nothing.
-
-> **What is still not solved.** `once` bounds how many times an approval is
-> *usable*; it does not bound who holds the token. A token stolen before its grant
-> is spent still spends it. Short-lived tokens remain the right practice; this makes
-> a long-lived one bounded rather than standing.
-
-#### What lands on the tape
-
-An approved declassification is an **allow** record carrying three additive
-top-level fields no other record shape has:
-
-```jsonc
-{
-  "decision": "allow",
-  "target": "publish_sanitized_report",
-  "carried_labels": ["internal", "pii"],   // what the session held going in
-  "labels_cleared": ["pii"],               // what this call actually removed
-  "approver": "alice@example.com",         // who authorized it
-  "approval_id": "apr-2026-08-01-014"      // the control plane's own record id
-}
-```
-
-All three are **top-level signed fields**, covered by the record HMAC — so neither
-the cleared set, nor the approving human, nor the approval identifier can be
-rewritten after the fact. In particular `approval_id` is a field of its own and
-**not** a `details` key: it is what joins a tape entry back to the approval workflow,
-so a SIEM rule reading `details.approval_id` would always find nothing.
-
-`labels_cleared` reports what **changed**, not what was authorized: an approval to
-clear `pii` on a session that never carried it is a permitted no-op that records
-no `labels_cleared` and no `approver`. The tape must not claim a declassification
-that did not happen.
-
-A refused one is a `decision: escalate` record with `condition_type: declassify`,
-carrying the session's `carried_labels` and a `reason` — which is what an operator
-reads to decide whether the declassification should be approved at all. It carries
-`carried_labels` whether or not a JWT layer wrapped the call: a wrapping layer's
-own refusal is re-stamped as this same escalation, through the same builder, so
-one logical refusal has one record shape.
-
-#### When the clear is applied
-
-The decision **authorizes** the clear; it does not remove the label. The removal
-happens once the call has actually run and its response is deliverable.
-
-That ordering is what makes the clear safe under concurrency. The proxy releases
-its decision turn right after the decision, so the slow upstream call
-is not held under it — which means a clear applied inside the decision would be
-visible to every concurrent decision for the *whole* round trip. An egress decided
-in that window would read a clean label set and be forwarded while the sanitizing
-call was still in flight. Deferring the removal closes that: the labels stay until
-the action that clears them has completed.
-
-Two details keep the deferral from opening the opposite hole. **What** to clear is
-decided up front — the approved labels are intersected against what the anchor is
-carrying at decision time, so a taint asserted by some *other* call while the
-sanitizing one is in flight is not in the set and cannot be removed by it. And a
-declassifying call **keeps the decision turn** until its clear lands,
-so nothing interleaves between the two halves. Everything else still releases
-before the forward.
-
-That turn is taken on the **state anchor**, not on the connection: under
-`taskAnchoredState` the label set is keyed on the validated `mcp.task_id`, and two
-sessions sharing one task therefore share one turn. Without that, the second
-session's decisions would run unserialized against state the first is mid-way
-through changing. With task anchoring off (the default) the anchor is the session,
-so the behaviour is the per-session serialization it has always been.
-
-Two practical consequences for a policy author:
-
-- A call issued **concurrently** with a declassifying call still sees the old
-  taint; one issued after its response is back sees the cleared set, as always.
-- A declassifying call briefly serializes its own anchor — its session, or its
-  whole task under `taskAnchoredState` — bounded by `--upstream-timeout`. Do not
-  set that to `0` on a route that uses `declassify`.
-- While that turn is held, an upstream-initiated `sampling/createMessage` on the
-  same anchor is refused rather than queued behind it. Sampling is
-  deny-by-default and the alternative is stalling the session's whole response
-  path, but a policy that combines `declassify` with `system:sampling` should
-  expect the occasional refusal under load.
-
-The clear also requires the call to have **succeeded**. A sanitize whose upstream
-returns an error — a JSON-RPC error, or a tool result with `isError: true` — is
-recorded exactly like a refused one: nothing is cleared, because nothing was
-sanitized.
-
-#### Records for a clear that did not take effect
-
-Three gates below the decision can still refuse a call — `--require-audit=strict`,
-an upstream transport failure, and a redaction failure. None of them commits the
-clear, so nothing needs undoing and nothing is under-tainted. The deny record says
-what happened; so does an allow whose commit faulted:
-
-| detail key | meaning |
-| --- | --- |
-| `_eunox_declassify_spent_approval_id` | a **single-use** grant this call burned. Stamped on the allow and on any refusal, and whether or not a label moved — the grant is spent in every one of those cases |
-| `_eunox_declassify_not_applied` | the call was refused below the decision, so the approved clear was never made. Benign: the labels were never removed |
-| `_eunox_declassify_result_withheld` | the action **executed** and eunox dropped its result. Stamped only at the **redaction-failure** gate, and only when that gate's reply passes the same success test the commit path uses — so the sanitizing work is done and only the delivery failed. Usually rides beside the key above; stands alone on a no-op clear under a `once` grant |
-| `_eunox_declassify_commit_failed` | the call **ran** and the clear could not be applied. The session keeps taint the policy says the action dropped, so later sinks over-block until you retry under a new approval. It means a flow-store fault and nothing else — a clear the proxy somehow committed twice already landed, so it is logged as the proxy bug it is rather than stamped here |
-
-`_eunox_declassify_commit_failed` is the one to alert on. None of the four reuses
-`approval_id`, the top-level signed field, which keeps meaning "a declassification
-that actually took effect".
-
-The three gates are not one case, which is why the withheld-result key exists.
-`--require-audit=strict` blocks before the forward and an upstream transport failure
-can follow a side effect that already happened, so for both it is genuinely unknown
-whether the upstream ran anything. Only the redaction gate is reached after a reply
-came back. "A reply came back" is not the same as "the action succeeded", though, and
-the key claims the second: a reply flagged `isError`, a reply carrying an error member
-beside a result, or bytes eunox cannot interpret can all reach that gate and fail
-redaction, and an upstream can produce any of them at will. So the key is stamped only
-for a reply that passes the same success test the clear itself is gated on; anything
-else records the plain "clear did not take effect" shape.
-
-The clear is withheld either way — the sanitized result never reached the host, so
-nothing sanitized entered the session, which is what a flow label tracks — but the
-burned `once` grant then costs a re-minted approval for a proxy- or manifest-side
-defect. This key is what tells you whether that approval is retrying the work or
-re-delivering work already done. A non-zero count is also a signal in its own right: a
-`redactFields` path and the real response shape disagree.
-
-The `_eunox_` prefix marks a key eunox injects rather than one a caller sent: two
-of these ride an **allow** record, whose `details` is the caller's own argument map
-under `--audit`, and `eunox suggest` mines that map as argument names. A caller
-*can* send an argument with one of those names, so eunox moves any such argument
-under `_eunox_reserved_arguments` before writing the record — it is preserved, but
-it cannot land where it would read as something the proxy asserted.
-
-`_eunox_declassify_spent_approval_id` is what makes a `once` grant reconcilable.
-The grant is burned by the decision that accepted it — including on a clear that
-turns out to change nothing, since burning only on a clear that moved a label would
-make the grant replayable by ordering — while `labels_cleared`/`approver`/
-`approval_id` ride only on a clear that *did* change something. Without a separate
-key, a real approval could be spent with nothing on the tape naming it, and
-"which of my outstanding one-shot approvals are still live?" would be unanswerable.
-
-`eunox stats` counts all of it: escalations as the approval queue, declassifications
-as the number of times a human agreed to drop taint, single-use approvals spent as
-the reconciliation list, and failed commits called out on their own. A
-declassification count that has quietly become routine is the signal that a
-sanitizing step is being rubber-stamped.
 
 ## 5c. Task-context variables
 
@@ -2722,158 +2416,10 @@ never seen by the manifest loader, so an **unrecognized** reference such as
 `${STAGE}` cannot be reported as a bad reference. It stays an ordinary literal and
 matches itself, rather than voiding the grant with no error anywhere to look for.
 
-## 5d. Delegation attenuation — narrowing authority across a hop
-
-`principal` scoping answers *which caller does this capability apply to*. Delegation
-answers the other half: **what is left of that caller's authority after it hands work
-to a sub-agent**. A delegate is not a second principal with its own grants — it is its
-delegator's authority minus something, and the minus is what has to be checkable.
-
-Two claims on an already-verified token carry it, and neither has a manifest token:
-attenuation is a property of the caller, not of the policy.
-
-```jsonc
-{
-  "sub": "user@example.com",
-  // RFC 8693 §4.1 actor chain — WHO. Nested most-recent-actor-OUTERMOST.
-  "act": { "sub": "agent-b", "act": { "sub": "agent-a" } },
-  "mcp": {
-    "v": "0.2",
-    // WHAT each hop kept, ordered DELEGATOR-FIRST (agent-a, then agent-b).
-    "delegation": [
-      {
-        "subject": "agent-a",
-        "targets": ["tool:read_file", "tool:write_file"],
-        "redactFields": ["ssn"]
-      },
-      {
-        "subject": "agent-b",
-        "targets": ["tool:read_file"],       // narrower: write_file is gone
-        "labels": ["untrusted"],             // its calls carry this taint
-        "allowLabels": [],                   // and reach no labeled sink at all
-        "redactFields": ["ssn", "email"],    // sees at least as much masked
-        "maxEffectClass": "reversible"
-      }
-    ]
-  }
-}
-```
-
-### The five axes, and the direction each narrows
-
-| Field | Narrows by | Effect on a call |
-|---|---|---|
-| `targets` | **shrinking** | the target must be in every hop's list |
-| `labels` | **growing** | unioned into the call's flow check as forced taint |
-| `allowLabels` | **shrinking** | intersected with the sink's `flowLabel.allow` |
-| `redactFields` | **growing** | unioned with the constraint's own redaction |
-| `maxEffectClass` | **no higher** | the resolved effect class must be at or below it |
-
-Three of the five — `targets`, `allowLabels`, `maxEffectClass` — are also **asserted at
-the token boundary**, and a hop that moves one of those the other way is a **widening**
-whose token is **rejected outright** rather than clamped. Clamping would leave a
-mis-minted token working while quietly meaning something other than what it says, and the
-whole value of the chain is that "the delegate is no broader than its delegator" is a
-property someone can check rather than a convention someone follows.
-
-`labels` and `redactFields` are not asserted, and the difference is worth understanding
-before you write a chain. The asserted three are the axes whose value reads as a **claim
-of authority** — "I may reach these", "I may carry taint into these sinks", "I may cause
-up to this" — where declaring more than your delegator held is visible nonsense. The
-other two impose something on the hop **itself**, and the decision path **unions** them
-across every hop: a hop that names a different taint than its delegator adds to it, and a
-hop that names none inherits its delegator's untouched. Neither can widen by construction,
-so **you do not restate your ancestors' `labels` and `redactFields`** — a hop that omits
-them loses nothing.
-
-That assertion is not what the enforcement rests on, though. The decision path applies
-**every** hop's grant, not just the last one — so even a chain whose monotonicity check
-was somehow skipped cannot let hop 3 reach what hop 1 forbade. The assertion makes a
-broken chain loud at the boundary; the per-hop application makes it harmless regardless.
-
-### Absent versus present-empty
-
-`targets` and `allowLabels` distinguish **absent** (the key is omitted — this hop
-narrows nothing on that axis) from **present-empty** (`[]` — this hop grants nothing
-on that axis). They must not collapse, because present-empty is the strictest value
-expressible:
-
-- `"targets": []` — the delegate reaches **no action at all**.
-- `"allowLabels": []` — **no labeled flow reaches any sink**. This is the quarantine:
-  a sub-agent sharing a tainted task reaches nothing however it is injected, because
-  the intersection of any allow-set with the empty set is empty.
-
-An omitted key is the common case for a root hop that does not want to enumerate the
-delegator's whole surface: the manifest still bounds it.
-
-### Other rules
-
-- **Delegated targets are literal.** `*` in a grant is refused: it is the character an
-  author writes when they *mean* a pattern, and a pattern here would silently grant
-  nothing rather than the set of actions it appears to name. Every other character is
-  ordinary — a resource URI carrying `?`, `[` or `\` is a perfectly good delegated
-  target, and refusing those made an entire class of resource unexpressible.
-- **`act` and `mcp.delegation` must agree hop for hop** when both are present. A
-  mismatch means the token's two halves describe different delegations, and picking
-  either would be guessing. Grants without an `act` chain are accepted (an IdP that
-  does not implement RFC 8693 can still express attenuation, and a grant can only
-  narrow).
-- **Depth is capped at 8, and each list-valued member at 256 entries.** The chain is
-  attacker-influenced input the decision path walks once per enforced call, and each hop's
-  `targets` become a lookup index built per token.
-- **A grant is decoded strictly, and three shapes reject the token.** An unknown member
-  (`targts` would decode to *no* target restriction), an explicit `null` (`"targets": null`
-  is a nil pointer, which this grammar reads as unrestricted), and a duplicate key
-  (`targets` beside `Targets` is one field to a JSON decoder and the last one wins, so
-  which takes effect depends on member order). All three would produce a grant that reads
-  as a narrowing and is not one, so they fail loudly: the caller cannot authenticate,
-  rather than losing a control silently. Omit a member you do not want to set — do not
-  write `null`.
-- **The SAME ambiguity is checked one layer out, too.** The token's top-level `act`/`mcp`
-  claims, and the `mcp` block's own `capabilities`/`declassify`/`delegation`/`task_id`/
-  `agent_id`/`v` members, are also rejected if named more than one way — `{"mcp":
-  {"delegation":[...narrow],"Delegation":[...wide]}}` would otherwise hand the per-grant
-  decoder only the wide array, with nothing left to show a narrower candidate ever
-  existed. Unlike a grant's own strict decode this does not reject an unrecognized
-  claim — a token legitimately carries claims for other audiences (`roles`, `email`, …)
-  this build never reads, and an ambiguity there is not this build's business to refuse
-  a token over.
-- **`act` may carry the actor's `iss` and `client_id`** beside its `sub`. RFC 8693 defines
-  an actor object as a set of claims identifying the actor, and a token-exchange IdP
-  routinely writes its issuer there. Any other member is refused, so a misspelled `act`
-  (which would silently truncate the chain) is still caught.
-- **No experimental gate.** Every axis narrows, so a build that honors these claims can
-  only deny more than one that ignores them — there is no fail-open direction to gate
-  against. That is why this differs from `mcp.capabilities`, which *replaces* the
-  authorization surface and therefore fails open if ignored.
-
-### What lands on the tape, and in the listing
-
-A delegation refusal is a `decision: deny` with `code: AUTHORIZATION_FAILED` and
-`condition_type: delegation`, carrying `delegation: true`, a `reason`
-(`target_not_delegated` / `effect_class` / `unresolvable_target`), and the `delegate`
-that blocked it — with a chain several hops deep, "not permitted" says nothing about
-which delegator's grant to widen.
-
-A flow denial caused by forced taint records `delegated_labels` **separately** from
-`carried_labels` (what the proxy observed) and `declared_labels` (what the client
-asserted), so an auditor can tell why a call was tainted. `allowLabels` on such a
-record is the **effective** set the check ran against, not the manifest's — under a cap
-the two differ, and recording the manifest's would send an operator to widen a sink
-rule that was never what refused the call.
-
-`tools/list`, `resources/list`, and `prompts/list` are filtered by the chain too, so
-the catalog a delegate is shown never advertises an action its call leg will refuse.
-
-A delegation refusal **is** downgradable by `enforcement: audit` — it is an
-authorization verdict like the manifest's own no-match deny, and an observe route
-exists to show what enforcement would do before it does it, including on a delegation
-chain being rolled out.
-
 ## 5e. Cross-PEP state — `taskAnchoredState`
 
 Everything eunox accumulates — flow-label taint, `sequenceBlock` antecedents,
-`maxCalls` and cumulative `blastRadius` budgets, spent one-shot declassify grants — is
+`maxCalls` and cumulative `blastRadius` budgets — is
 keyed on an **anchor**: the identity the state accrues to. By default that is the
 **session**, which is exactly right for one proxy in front of one host↔upstream pair.
 

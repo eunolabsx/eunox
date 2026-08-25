@@ -51,8 +51,6 @@ const (
 	siteNotifyUntranslatable     noticeSite = "notification-untranslatable"
 	siteUpstreamPostFailed       noticeSite = "upstream-post-failed"
 	siteRedactionFault           noticeSite = "redaction-fault"
-	siteDeclassifyCommit         noticeSite = "declassify-commit"
-	siteDeclassifyDoubleCommit   noticeSite = "declassify-double-commit"
 	siteReceiptInconsistent      noticeSite = "effect-receipt-inconsistent"
 )
 
@@ -74,8 +72,8 @@ const (
 	// starved by one that is.
 	classFailure
 	// classObligation: a security obligation policy attached to a call did not hold — a redactFields
-	// directive that could not be applied, an approved declassification whose clear did not commit,
-	// a signed effect receipt contradicting the contract policy was written against. Apart from
+	// directive that could not be applied, or a signed effect receipt contradicting the contract
+	// policy was written against. Apart from
 	// classFailure because reaching one takes a call CARRYING an obligation, which a generic transit
 	// error does not.
 	classObligation
@@ -147,10 +145,8 @@ var noticeSiteClass = map[noticeSite]noticeClass{
 	// OBLIGATION: a security obligation that did not hold. A merely broken deployment can drive
 	// these at the request rate from a conforming peer, so within the class one obligation's
 	// failure can still elide another's.
-	siteRedactionFault:         classObligation,
-	siteDeclassifyCommit:       classObligation,
-	siteDeclassifyDoubleCommit: classObligation,
-	siteReceiptInconsistent:    classObligation,
+	siteRedactionFault:      classObligation,
+	siteReceiptInconsistent: classObligation,
 }
 
 const (

@@ -5,7 +5,9 @@ package enforcement_test
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -263,15 +265,6 @@ func TestTaskAnchor_HardeningVerdictsCarryNoSessionEvidence(t *testing.T) {
 	assert.Nil(t, verdict.CarriedLabels,
 		"the escalation must not report labels read from the very bucket the full path refuses to account against")
 	assert.NotContains(t, verdict.Denial.Details, "carried_labels")
-
-	unapproved := sinkCaps("publish", capability.FlowLabelPublic)[0]
-	unapproved.Directives = append(unapproved.Directives,
-		capability.DeclassifyDirective{Labels: []string{capability.FlowLabelPII}})
-	verdict = eng.DeclassifyVerdictFor(ctx, authed, &unapproved)
-	require.NotNil(t, verdict, "the declassify escalation itself must not stand down")
-	assert.Nil(t, verdict.CarriedLabels,
-		"the escalation must not report labels read from the very bucket the full path refuses to account against")
-	assert.NotContains(t, verdict.Denial.Details, "carried_labels")
 }
 
 // TestTaskAnchor_NoRollbackAcrossASharedTaskKey pins why the label rollback stands down under
@@ -407,4 +400,34 @@ func TestStateAnchor_AgreesWithTheEngineKey(t *testing.T) {
 		enforcement.ResolveStateAnchor(true, false, "", "session-c").Kind)
 	assert.Equal(t, capability.DecisionAllow,
 		e.ValidateAction(ctx, req("session-c", "x"), caps).Decision)
+}
+
+// faultyCounter injects backend faults into a real counter so a test can assert the engine's
+// fail-closed posture on an unreadable or unwritable quota backend.
+type faultyCounter struct {
+	inner         capability.CallCounter
+	failIncrement bool
+	failPeek      bool
+	failAdmit     bool
+}
+
+func (f *faultyCounter) IncrementAndGet(ctx context.Context, key string, windowSec, maxEntries int) (int64, error) {
+	if f.failIncrement {
+		return 0, errors.New("synthetic counter fault")
+	}
+	return f.inner.IncrementAndGet(ctx, key, windowSec, maxEntries)
+}
+
+func (f *faultyCounter) Peek(ctx context.Context, key string, windowSec int) (int64, error) {
+	if f.failPeek {
+		return 0, errors.New("synthetic peek fault")
+	}
+	return f.inner.Peek(ctx, key, windowSec)
+}
+
+func (f *faultyCounter) AdmitAll(ctx context.Context, buckets []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	if f.failAdmit {
+		return false, 0, 0, 0, errors.New("synthetic admit fault")
+	}
+	return f.inner.AdmitAll(ctx, buckets)
 }

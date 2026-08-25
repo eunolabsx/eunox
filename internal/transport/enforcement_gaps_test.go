@@ -2163,9 +2163,6 @@ type killCheckRecorder struct {
 	allows int
 }
 
-func (r *killCheckRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string, string) {
-}
-
 func (r *killCheckRecorder) RecordAllow(_ context.Context, _, _, _ string, _ map[string]interface{}, _ []string, _ bool, _, _ []string) {
 	r.allows++
 }
@@ -2262,9 +2259,6 @@ type degradedDeny struct {
 	details map[string]interface{}
 }
 
-func (r *degradedRecorder) RecordDeclassifiedAllow(context.Context, string, string, string, map[string]interface{}, []string, bool, []string, []string, []string, string, string) {
-}
-
 func (r *degradedRecorder) RecordAllow(_ context.Context, _, _, _ string, _ map[string]interface{}, _ []string, _ bool, _, _ []string) {
 	r.allows++
 }
@@ -2306,7 +2300,7 @@ func TestEnforcedForwardCore_StrictGateBeforeAuditOnlyRecord(t *testing.T) {
 		Denial:    &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed},
 	}
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}
-	resp := enforcedForwardCore(context.Background(), fp, nil, msg, dec, "tools/call", "secret_tool", "secret_tool", "tool", true,
+	resp := enforcedForwardCore(context.Background(), fp, msg, dec, "tools/call", "secret_tool", "secret_tool", "tool", true,
 		func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 
 	if rec.forward {
@@ -2348,7 +2342,7 @@ func TestStrictAuditDenial_StructuredDetailIsDiscrete(t *testing.T) {
 	// A clean allow that the strict gate then blocks on the degraded trail.
 	dec := capability.EnforceResponse{Decision: capability.DecisionAllow}
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}
-	resp := enforcedForwardCore(context.Background(), fp, nil, msg, dec, "tools/call", "tool_x", "tool_x", "tool", true,
+	resp := enforcedForwardCore(context.Background(), fp, msg, dec, "tools/call", "tool_x", "tool_x", "tool", true,
 		func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 
 	if resp.Error == nil || resp.Error.Code != denialToJSONRPCCode(capability.ErrCodeAuditUnavailable) {

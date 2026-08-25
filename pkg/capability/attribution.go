@@ -15,8 +15,7 @@ import (
 // did not know about, never remove ones the session join believes apply. That asymmetry is
 // the security property, not a simplification — an agent that could narrow its own taint
 // would defeat flow control with one field, the first thing a prompt injection would reach
-// for. The sound narrowing direction (a delegator narrowing a delegate) is attenuation, a
-// different mechanism that belongs to the delegation surface, not here.
+// for.
 
 // MetaKeyContextManifest is the reverse-DNS `_meta` key a cooperating client uses to
 // attribute a call's inputs. Namespaced so a non-supporting client, host, or upstream

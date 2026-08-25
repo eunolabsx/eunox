@@ -163,7 +163,7 @@ The controls compose so that a direct connection fails on every axis at once:
 ## Bottom line
 
 eunox earns its place as the chokepoint by what it does once traffic reaches it —
-policy enforcement, list filtering, per-caller delegation, tamper-evident audit —
+policy enforcement, list filtering, per-caller credential delegation, tamper-evident audit —
 but the surrounding controls are what make it *the* chokepoint. The single most
 leverage-efficient move, because it holds even on devices and networks you do not
 control, is **credential control**: stop distributing upstream secrets, mint only

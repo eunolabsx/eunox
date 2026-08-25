@@ -33,11 +33,10 @@ const maxConcurrentServerRequests = 32
 // connection's SERVER-initiated request handlers. Both transports own one.
 //
 // The handler must not run inline on the read loop — that used to be a cycle, not a slow
-// path: the reader is the only goroutine delivering upstream responses; a declassifying
-// host call holds the decision turn across its whole upstream round trip; and the sampling
-// leg used to take that turn BEFORE DecideSampling ran. A sampling/createMessage arriving
-// mid-clear parked the reader on a turn whose holder was waiting for a response only that
-// reader could deliver. Off the read loop, a blocked handler blocks only itself.
+// path: the reader is the only goroutine delivering upstream responses, and the sampling leg
+// takes the decision turn BEFORE DecideSampling runs. A sampling/createMessage arriving while
+// another request holds that turn parked the reader on a holder waiting for a response only
+// that reader could deliver. Off the read loop, a blocked handler blocks only itself.
 //
 // ORDERING, stated rather than left to be inferred: server-initiated requests used to
 // arrive in receipt order purely because they ran inline, and no longer do — two requests

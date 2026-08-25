@@ -61,11 +61,11 @@ const (
 	ErrCodeSamplingDenied = "SAMPLING_DENIED"
 	// ErrCodeEscalationRequired refuses an action needing human approval rather than a
 	// policy verdict alone: either an effectCeiling escalation (consequence exceeds the
-	// bound) or a declassify directive with no approval covering the labels it clears.
+	// bound).
 	// It is a REFUSAL, not a pending state — fail-closed to "not forwarded".
 	//
 	// A ceiling escalation is not satisfiable by retrying (it escalates again until the
-	// ceiling or contract changes); a declassify escalation IS, once a token carrying a
+	// ceiling or contract changes); an approval-gated escalation IS, once a token carrying a
 	// covering approval is presented — the audit record's condition_type distinguishes
 	// them. Shares -32003 with the other condition-failure codes on the wire; the
 	// symbolic code and decision=escalate are what distinguish it.

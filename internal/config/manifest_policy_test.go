@@ -159,10 +159,6 @@ func TestNeedsDecisionTurn(t *testing.T) {
 			Target: "tool:x", Actions: []string{"call"},
 			Directives: []capability.Directive{capability.LabelOutputDirective{Labels: []string{capability.FlowLabelPII}}},
 		}}}, true},
-		"a declassify directive splits its write across two phases": {&LocalManifest{Capabilities: []capability.Constraint{{
-			Target: "tool:x", Actions: []string{"call"},
-			Directives: []capability.Directive{capability.DeclassifyDirective{Labels: []string{capability.FlowLabelPII}}},
-		}}}, true},
 		"a sequenceBlock antecedent has the same shape": {&LocalManifest{Capabilities: []capability.Constraint{{
 			Target: "tool:x", Actions: []string{"call"},
 			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"tool:y"}}},
