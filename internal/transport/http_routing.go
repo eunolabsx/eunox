@@ -437,7 +437,7 @@ func (p *HTTPProxy) handleMCPPost(w http.ResponseWriter, r *http.Request, route 
 				if line, ok := p.noticeWriter().admitNotice(siteUpstreamlessNotification); ok {
 					line.writef(
 						"[eunox] SECURITY: pre-session notification %q was admitted for forwarding with no upstream to forward it to; dropped\n",
-						audit.SanitizeAuditField(msg.Method))
+						audit.SanitizeAuditField(audit.BoundEnvelopeField(msg.Method)))
 				}
 			}
 			w.WriteHeader(http.StatusAccepted)

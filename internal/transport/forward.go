@@ -585,6 +585,13 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 			reply = mcp.RPCMsg{}
 		}
 	}()
+	// Normalized at the boundary for the same reason the msg.ID rule above is: refuseUnroutable
+	// passes nil and is safe only because it also nils callUpstream, and coupling this call's
+	// safety to that separate fact in a separate function is the shape refusalError's doc warns
+	// about — a future nil-passing caller would panic on the allow path AFTER the quota commit.
+	if allowDetails == nil {
+		allowDetails = func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil }
+	}
 	observe := false
 	var denial *capability.DenialInfo // set on the deny path; reused by the observe branch below
 	// Fail closed on anything that is not an explicit allow, not just the literal
@@ -1182,7 +1189,12 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// behalf, and a refusal of its own says nothing about the host.
 	if refused := refuseServerRequestAcrossRevisions(msg.Method, resolveRevision(fp.revision)); refused != nil {
 		if fp.rec != nil {
-			fp.rec.RecordDeny(ctx, fp.sessionID, msg.Method, msg.Method,
+			// auditIdentity, not msg.Method twice: no policy evaluated this request, and a
+			// target-resolving method (sampling/createMessage resolves TargetTypeSystem) would
+			// stamp a fabricated target onto the signed tape — the same rule the host-side
+			// spelling (refuseHostRevision) and recordServerRequestDropped already follow.
+			identifier, method := auditIdentity(msg)
+			fp.rec.RecordDeny(ctx, fp.sessionID, identifier, method,
 				capability.ErrCodeUntranslatableAcrossRevisions, "", nil, false)
 		}
 		fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID,

@@ -583,9 +583,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 			killUpstreamCmd(sess.upCmd)
 			<-waited
 		}
-		p.mu.Lock()
-		delete(p.sessions, sess.id)
-		p.mu.Unlock()
+		p.unregisterSession(sess)
 		// Runs on EVERY teardown path (idle reap, DELETE, kill, shutdown, natural exit), so
 		// it's the one place that reclaims this session's flow-label state.
 		releaseSessionState(sess)
@@ -784,6 +782,20 @@ func (p *HTTPProxy) getSession(id string) *httpSession {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.sessions[id]
+}
+
+// unregisterSession removes sess from the registry only while the entry is still sess itself —
+// the identity comparison finishEstablishing already applies. The cleanup goroutines can park in
+// Wait for up to 2x shutdownMs after an explicit teardown already removed their entry, and the
+// first-request path DERIVES ids from caller identity, so the same identity can re-register a
+// successor under the same key inside that window; deleting by id alone would silently orphan
+// the successor's live upstream (invisible to the reaper, kill sweep, and closeAllSessions).
+func (p *HTTPProxy) unregisterSession(sess *httpSession) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sessions[sess.id] == sess {
+		delete(p.sessions, sess.id)
+	}
 }
 
 // sessionCount returns the number of REGISTERED sessions, for health/metrics. Not the capacity
