@@ -1681,9 +1681,11 @@ func (p *ManifestPDP) constraintWithUnionLabelOutput(matched *capability.Constra
 	if !p.anyLabelOutput {
 		return matched
 	}
-	// The union exists so a sibling cannot SHADOW a source's taint: synthesizing a labelOutput
-	// here out of two individually-coherent entries — a `tool:*` source and a specific
-	// sanitizer — would let session history rather than policy decide the outcome.
+	// The union exists so a SIBLING entry cannot shadow a source's taint. `labelOutput`
+	// describes the data a target produces, and the target produces the same data whoever
+	// calls it — so a broad entry that grants the call (a `tool:*` rule carrying no
+	// `labelOutput`) must not drop the taint a narrower, principal-scoped source declared.
+	// The synthesized constraint carries the union of every entry NAMING the target.
 	union := p.labelOutputNamingTarget(target)
 	if len(union) == 0 || labelSetContainsAll(labelOutputLabels(matched), union) {
 		return matched
@@ -1743,9 +1745,6 @@ func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capabilit
 // rather than this function reaching for directivesNamingTarget itself, so each site states
 // WHICH selection it is filling from: HardenRefusal passes its hardenSelection's, where the
 // two selections sit side by side and the widening is documented.
-//
-// chain is a parameter for the reason it is on withForwardObligationsFor: which chain a
-// response's redaction composes from is a decision each call site makes in the open.
 func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget, naming namingSelector) capability.EnforceResponse {
 	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 || !enforcement.SkipQuota(ctx) {
 		return r
@@ -1835,9 +1834,6 @@ func (p *ManifestPDP) hardenOnBrokenInterface(sessionID string, r capability.Enf
 // jwtConditionArgs synthesizes the {"uri"}/{"name"} map DecideResourceRead and DecidePromptGet
 // build, so a contract naming one of those resolves to the same value here that the full path
 // would have resolved.
-// Now every harden leg states which chain it is asking about (HardenRefusal resolves it ONCE,
-// onto hardenSelection), the obligation helpers take it off the request rather than the
-// context, and a seam that must not act on it simply is not handed it.
 func hardenRequest(ctx context.Context, sessionID string, target EnforceTarget, args, claims map[string]interface{}) *capability.EnforceRequest {
 	return &capability.EnforceRequest{
 		SessionID:  sessionID,
@@ -1964,6 +1960,12 @@ func (p *ManifestPDP) hardenViaVerdict(
 	}
 	// Still downgradable, so a route running --audit WILL forward it — and a forwarded response
 	// must carry the manifest's redactFields obligations or it reaches the host unmasked.
+	//
+	// UNREACHABLE today and deliberately kept: the effect ceiling is the only remaining verdict
+	// leg and both its arms carry BlockOverride, so the branch above always returns first.
+	// Deleting this arm would make the next downgradable leg added here a fail-open — a
+	// forwarded refusal whose redactFields obligations were dropped on the way out — with
+	// nothing at the call site to suggest they were ever applied.
 	return p.withForwardObligationsFor(ctx, out, matched), true
 }
 

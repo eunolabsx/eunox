@@ -570,11 +570,6 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 // deny to a logged forward (kill-switch always hard-blocks); a transport failure records the
 // upstream error code; success applies redactFields obligations (fail closed) and records an
 // allow with obligation tokens and allowDetails.
-//
-// committer is the decision point that MADE dec, passed rather than a field on fp so "these
-// two must be the same PDP" cannot silently drift — every call site is a dispatchParams
-// handler already holding it. nil means no decision point is in hand (session-creating
-// initialize, a test), so no clear can be committed.
 func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(context.Context, mcp.RPCMsg) map[string]interface{}) (reply mcp.RPCMsg) {
 	// A message with NO ID has no reply channel — JSON-RPC forbids answering it — and the zero
 	// RPCMsg is how this package spells "nothing to send" (see refusalResponse).
@@ -792,9 +787,6 @@ func refusalForwardParams(subj killSubject, auditMode bool, strict strictAuditSt
 // A nil sink is a MODE the core understands, where a stub that FAILED on use only looked
 // equivalent: the stub's error was consumed by the observe arm, which turned it into an
 // UPSTREAM_ERROR deny for an upstream that was never contacted. See forwardParams.callUpstream.
-//
-// The committer is nil: this refusal runs no decision, so there is none to commit and no decision
-// point that could be the wrong one.
 //
 // recs is the leg's refusal wiring, and BOTH halves of this refusal come out of it: the record's
 // recorder (resolved against catUnroutable's declaration) and the admission verdict on the stderr

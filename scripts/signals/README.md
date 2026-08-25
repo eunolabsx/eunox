@@ -75,8 +75,7 @@ is in not knowing which axes you care about.
 ## What is not collected
 
 - No client-side data. Ever. (Adding any would require an update to
-  [SECURITY.md][verify] and a CHANGELOG entry — see the no-telemetry
-  promise in `SECURITY.md`.)
+  [SECURITY.md][verify] — see the no-telemetry promise in `SECURITY.md`.)
 - No user identities beyond what GitHub already publishes.
 - No IP addresses.
 - No headers, request bodies, or anything from the proxy's runtime.

@@ -128,10 +128,13 @@ When a vulnerability is confirmed and patched we:
    `github.com/eunolabs/eunox` via `go.mod` — this is the primary notification
    channel for downstream users.
 
-2. **Add a `Security` entry to [`CHANGELOG.md`](./CHANGELOG.md)** in the same
-   commit that ships the fix. The entry includes: severity (CVSS score and
+2. **Record the fix in the release notes and, when the boundary itself moved, in
+   [`docs/threat-model-mcp.md`](./docs/threat-model-mcp.md)'s revision history** in
+   the same commit that ships the fix. The entry includes: severity (CVSS score and
    qualitative label), CVE ID, affected version range, what was bypassed or
-   exposed, and the fix.
+   exposed, and the fix. Pre-1.0 the project keeps no separate curated changelog —
+   per-release notes are generated from Conventional Commit prefixes on the
+   [GitHub Releases](https://github.com/eunolabs/eunox/releases) page.
 
 3. **Submit to the Go vulnerability database** within 7 days of the patched
    release. This ensures `govulncheck` surfaces the issue for any downstream

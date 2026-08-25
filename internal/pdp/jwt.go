@@ -453,7 +453,7 @@ func readTokenPayload(tokenStr string) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", err)))
 	}
-	// The caller's struct unmarshal resolves an "act"/"Act" (or mcp-block) collision
+	// The caller's struct unmarshal resolves a "mcp"/"MCP" (or mcp-block member) collision
 	// silently; confirm there was only one candidate before trusting either.
 	if err := rejectAmbiguousTopLevelClaims(payloadBytes); err != nil {
 		return nil, err
@@ -575,7 +575,7 @@ var watchedTopLevelClaims = []string{
 // them is trusted.
 //
 // The earlier struct unmarshals resolve any collision silently: encoding/json folds
-// field names case-insensitively and keeps the last one, so e.g. both "act" and "Act"
+// field names case-insensitively and keeps the last one, so e.g. both "mcp" and "MCP"
 // bind to whichever spelling was written LAST with no signal a sibling ever existed.
 // Not externally forgeable (the JWT is signed), but an IdP template mistake or a
 // migration that left two spellings live should be a rejected token, not a
@@ -1057,10 +1057,6 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		return *deny
 	}
 
-	// Applied HERE rather than left to the inner PDP: a JWT-only route has no
-	// manifest engine, and a policyless route's inner is the wiretap
-	// AlwaysAllowPDP, so on those routes the claim was validated at the token
-	// boundary and then applied to nothing — a caller whose grant reaches no
 	// No mcp.capabilities field: identity-only, deferring to the inner manifest
 	// PDP — safe only with a real backstop (innerEnforces), since an
 	// AlwaysAllowPDP/nil inner would grant every target to an identity-only token.

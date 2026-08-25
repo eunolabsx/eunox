@@ -238,13 +238,13 @@ func (w turnWait) window(deadline time.Time) time.Duration {
 // come up under w's rule, having ABANDONED the ticket so no later one queues behind it. An
 // unbounded w waits forever (what begin does).
 //
-// The bound exists for one caller, the server-initiated (sampling) leg, and began as a
-// bound on a WEDGE: that leg used to run inline on the upstream reader — the only
-// goroutine that delivers upstream responses — while a host call holds its
-// turn across the whole upstream round trip, so a sampling request arriving mid-clear
-// parked the reader on a turn whose holder was waiting for a response only that reader
-// could deliver. That wedge is gone now that the leg runs on its own goroutine
-// (serverRequestPool).
+// The bound exists for one caller, the server-initiated (sampling) leg, and began as a bound
+// on a WEDGE: that leg ran inline on the upstream reader — the only goroutine that delivers
+// upstream responses — while a declassifying host call held its turn across the whole upstream
+// round trip, so a sampling request arriving mid-clear parked the reader on a turn whose holder
+// was waiting for a response only that reader could deliver. That wedge is gone twice over: the
+// leg runs on its own goroutine (serverRequestPool), and with declassification removed no holder
+// keeps the turn past its decision. What remains is a bound on a WAIT.
 //
 // What's left is an UNBOUNDED WAIT — a different hazard, which is why the rule is
 // per-holder rather than per-arrival: without a bound the wait is limited only by

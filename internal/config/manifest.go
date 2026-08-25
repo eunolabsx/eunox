@@ -1030,10 +1030,9 @@ func validateLocalManifest(m *LocalManifest) error {
 				return err
 			}
 		}
-		// Cross-directive coherence for the flow pair, checked once per constraint rather
-		// than inside the per-directive loop (which sees one entry at a time).
 		// Reject two quota-consuming conditions addressing the same counter bucket before
-		// the per-condition pass. See validateQuotaBucketsDistinct.
+		// the per-condition pass, checked once per constraint rather than inside the
+		// per-condition loop (which sees one entry at a time).
 		if err := validateQuotaBucketsDistinct(i, c.Conditions); err != nil {
 			return err
 		}
