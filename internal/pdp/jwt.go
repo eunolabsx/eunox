@@ -76,14 +76,6 @@ type JWTClaims struct {
 	// wrapper pin its own audience after the shared validator accepts the token
 	// for the union of all routes — see routeAudience / WrapRoutesWithJWT.
 	Audiences []string
-	// Declassify holds validated human approvals from `mcp.declassify`, parsed and
-	// checked at the token boundary (not read from Extra) because it is the only
-	// thing that lets a declassify directive clear a flow label instead of escalating.
-	Declassify []capability.DeclassifyApproval
-	// Delegation holds the validated RFC 8693 `act` chain plus `mcp.delegation`
-	// grants, already asserted to narrow at every hop — a widening chain is a
-	// rejected token at ValidateToken, not a decision-time surprise.
-	Delegation *capability.DelegationChain
 	// ExpiresAt is the verified `exp`. A long-lived SSE stream is validated once at
 	// open, so the transport arms a timer at this instant to cut the stream at token
 	// expiry — the idle reaper alone would let an expired client keep reading.
@@ -111,28 +103,6 @@ func WithJWTClaims(ctx context.Context, claims *JWTClaims) context.Context {
 	return context.WithValue(ctx, jwtClaimsKey{}, claims)
 }
 
-// declassifyApprovalsFromContext returns the token's granted declassify approvals, or
-// nil (the default, without a token or approval) — which makes a deployment with no
-// approval integration escalate a declassify directive rather than silently perform it.
-// Reads the typed, validated JWTClaims rather than the flat input.claims map, since a
-// security-critical decision should not depend on the third-party-evaluator convenience view.
-func declassifyApprovalsFromContext(ctx context.Context) []capability.DeclassifyApproval {
-	if c, ok := jwtClaimsFromContext(ctx); ok {
-		return c.Declassify
-	}
-	return nil
-}
-
-// delegationFromContext returns the token's validated delegation chain, or nil (the
-// default) when there is none — reads the typed JWTClaims for the same reason
-// declassifyApprovalsFromContext does.
-func delegationFromContext(ctx context.Context) *capability.DelegationChain {
-	if c, ok := jwtClaimsFromContext(ctx); ok {
-		return c.Delegation
-	}
-	return nil
-}
-
 // jwtClaimsFromContext retrieves JWT claims from the context.
 func jwtClaimsFromContext(ctx context.Context) (*JWTClaims, bool) {
 	c, ok := ctx.Value(jwtClaimsKey{}).(*JWTClaims)
@@ -158,21 +128,12 @@ type mcpClaimSet struct {
 	Capabilities *[]string `json:"capabilities,omitempty"`
 	TaskID       string    `json:"task_id"`
 	AgentID      string    `json:"agent_id"`
-	// Declassify is held raw and decoded via capability.ParseDeclassifyApprovals so
-	// the grammar, validation, and unknown-field rejection live in that package.
-	Declassify json.RawMessage `json:"declassify,omitempty"`
-	// Delegation is held raw and decoded via capability.ParseDelegationGrants, for
-	// the same reason Declassify is.
-	Delegation json.RawMessage `json:"delegation,omitempty"`
 }
 
 // idpJWTPayload is the subset of IdP JWT claims relevant to MCP enforcement.
 // Standard fields (iss, sub, exp, iat, aud) are parsed separately by jwt.Claims.
 type idpJWTPayload struct {
 	MCP mcpClaimSet `json:"mcp"`
-	// Act is top-level rather than nested under mcp because it is a standard RFC
-	// 8693 §4.1 OAuth claim an IdP emits on its own terms; walked by ParseActorChain.
-	Act json.RawMessage `json:"act,omitempty"`
 }
 
 // JWTPDP validates IdP-issued JWTs and enforces capability claims.
@@ -382,8 +343,8 @@ func newJWTPDP(opts JWTPDPOptions, cache *capability.JWKSCache) *JWTPDP {
 // request goroutine (on stdio, the process) in place of the deny this wrapper owes.
 //
 // At CONSTRUCTION rather than at each guard, since both constructors route through newJWTPDP and
-// the field is never reassigned — the same discipline CommitDeclassified's receiver guard and the
-// transport's requireUsableOptions apply, with this the one leg of it left open.
+// the field is never reassigned — the same discipline the transport's requireUsableOptions
+// applies, with this the one leg of it left open.
 func normalizedInner(inner PolicyDecisionPoint) PolicyDecisionPoint {
 	if capability.IsNilValue(inner) {
 		return nil
@@ -492,7 +453,7 @@ func readTokenPayload(tokenStr string) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", err)))
 	}
-	// The caller's struct unmarshal resolves an "act"/"Act" (or mcp-block) collision
+	// The caller's struct unmarshal resolves a "mcp"/"MCP" (or mcp-block member) collision
 	// silently; confirm there was only one candidate before trusting either.
 	if err := rejectAmbiguousTopLevelClaims(payloadBytes); err != nil {
 		return nil, err
@@ -516,8 +477,6 @@ const (
 	jwtErrUnsupportedVersion   = "unsupported_version"
 	jwtErrCapabilitiesDisabled = "capabilities_disabled"
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
-	jwtErrInvalidDeclassify    = "invalid_declassify"
-	jwtErrInvalidDelegation    = "invalid_delegation"
 	// jwtErrAmbiguousClaims marks a top-level `mcp`/`act` claim, or an `mcp` member,
 	// spelled more than one way (see capability.ClaimMembers) — the payload IS valid
 	// JSON, but which spelling wins is invisible to the token's own author.
@@ -582,31 +541,6 @@ func ClassifyJWTError(err error) string {
 	}
 }
 
-// parseDelegationChain decodes and asserts a token's delegation state (the RFC 8693
-// `act` chain plus `mcp.delegation` grants) at the TOKEN boundary, like the declassify
-// approvals: a chain this build cannot read, or whose hops WIDEN, is a rejected token
-// rather than a silently-clamped one — clamping would leave the token meaning
-// something other than what it says. Unlike mcp.capabilities this is not behind the
-// experimental gate: every axis only narrows, so there is no fail-open direction to
-// gate against.
-//
-// Returns (nil, nil) for tokens declaring neither claim. Errors are Terminal-wrapped.
-func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, error) {
-	actors, err := capability.ParseActorChain(payload.Act)
-	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
-	}
-	grants, err := capability.ParseDelegationGrants(payload.MCP.Delegation)
-	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
-	}
-	chain, err := capability.ValidateDelegationChain(actors, grants)
-	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrInvalidDelegation, err))
-	}
-	return chain, nil
-}
-
 // watchedTopLevelClaims is every top-level claim THIS BUILD READS — one list rather
 // than a var plus a spliced call-site literal, so a claim can't be added to one and
 // missed in the other. Membership is "does this build read it", not "is it a
@@ -625,8 +559,8 @@ func parseDelegationChain(payload idpJWTPayload) (*capability.DelegationChain, e
 // Listed explicitly rather than reflected off jwt.Claims, so a go-jose release that
 // adds or renames a field can't silently widen or narrow this check.
 var watchedTopLevelClaims = []string{
-	// The proxy's own claim blocks.
-	"mcp", "act",
+	// The proxy's own claim block.
+	"mcp",
 	// Identity and audience: `sub` is what a manifest's principal: scoping reads, and
 	// `jti` is what per-token revocation is keyed on.
 	"sub", "iss", "aud", "jti",
@@ -641,7 +575,7 @@ var watchedTopLevelClaims = []string{
 // them is trusted.
 //
 // The earlier struct unmarshals resolve any collision silently: encoding/json folds
-// field names case-insensitively and keeps the last one, so e.g. both "act" and "Act"
+// field names case-insensitively and keeps the last one, so e.g. both "mcp" and "MCP"
 // bind to whichever spelling was written LAST with no signal a sibling ever existed.
 // Not externally forgeable (the JWT is signed), but an IdP template mistake or a
 // migration that left two spellings live should be a rejected token, not a
@@ -661,7 +595,7 @@ func rejectAmbiguousTopLevelClaims(payloadBytes []byte) error {
 		return nil
 	}
 	if _, err := capability.ClaimMembers(mcpBytes, "jwt mcp claim",
-		"v", "capabilities", "task_id", "agent_id", "declassify", "delegation"); err != nil {
+		"v", "capabilities", "task_id", "agent_id"); err != nil {
 		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
 	}
 	return nil
@@ -670,12 +604,10 @@ func rejectAmbiguousTopLevelClaims(payloadBytes []byte) error {
 // newValidatedClaims assembles the *JWTClaims ValidateToken returns, memoizing the
 // two derived views later requests reuse (parsedCaps, flatClaims) so decide/list-filter/
 // sampling calls hand out precomputed values instead of rebuilding them per request.
-func newValidatedClaims(capsList []string, capsPresent bool, declassify []capability.DeclassifyApproval, delegation *capability.DelegationChain, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
+func newValidatedClaims(capsList []string, capsPresent bool, payload idpJWTPayload, std jwt.Claims, rawClaims map[string]interface{}) *JWTClaims {
 	claims := &JWTClaims{
 		Capabilities:    capsList,
 		HasCapabilities: capsPresent,
-		Declassify:      declassify,
-		Delegation:      delegation,
 		TaskID:          payload.MCP.TaskID,
 		AgentID:         payload.MCP.AgentID,
 		Subject:         std.Subject,
@@ -736,35 +668,6 @@ func (p *JWTPDP) validateStandardClaims(stdClaims jwt.Claims, now time.Time) (in
 		return 0, capability.Terminal(jwtErr(jwtErrInvalidIssuer, fmt.Errorf("token issuer %q does not match expected %q", stdClaims.Issuer, p.issuer)))
 	}
 	return stdClaims.Expiry.Time().Unix(), nil
-}
-
-// parseDeclassifyApprovals decodes mcp.declassify and refuses a token whose single-use
-// grants would outlive the burn ledger's WINDOW — otherwise a long-lived token could
-// present the same grant again after the burn aged out and clear a second time on one
-// human approval. Refusing bounds the token's remaining lifetime against the same exp
-// validateStandardClaims just accepted, so a later burn always outlives any token that
-// could replay it. Runs at the token boundary for the same reason every claim-borne
-// narrowing does: an unenforceable grant is a rejected token, not a decision-time surprise.
-//
-// expUnix reuses validateStandardClaims' already-accepted exp rather than a second
-// dereference of stdClaims.Expiry, which is non-nil only because that check ran first.
-//
-// A non-positive expUnix stays the ZERO time rather than time.Unix(0, 0): the latter is
-// a real (non-zero) 1970 instant that would sail through the window check as a lifetime
-// decades in the past, admitting a `once` grant on a token with no established expiry.
-func (p *JWTPDP) parseDeclassifyApprovals(raw json.RawMessage, expUnix int64, now time.Time) ([]capability.DeclassifyApproval, error) {
-	approvals, err := capability.ParseDeclassifyApprovals(raw)
-	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, err))
-	}
-	var exp time.Time
-	if expUnix > 0 {
-		exp = time.Unix(expUnix, 0)
-	}
-	if err := capability.CheckDeclassifyApprovalLifetime(approvals, exp, now, p.leeway); err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrInvalidDeclassify, err))
-	}
-	return approvals, nil
 }
 
 // ValidateToken validates the Authorization: Bearer token in the request,
@@ -887,22 +790,6 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			}
 		}
 
-		// Parsed HERE, at the token boundary, so a grant this build cannot enforce
-		// rejects the TOKEN rather than evaluating later to "covers nothing" — which
-		// would turn an IdP template mistake into a permanent, invisible escalation
-		// loop with no error to grep for. Unlike mcp.capabilities this is NOT behind
-		// the experimental gate: it can only narrow, and it is already gated by the
-		// manifest carrying a declassify directive at all.
-		declassify, declErr := p.parseDeclassifyApprovals(payload.MCP.Declassify, tokenExpUnix, now)
-		if declErr != nil {
-			return nil, declErr
-		}
-
-		delegation, delegErr := parseDelegationChain(payload)
-		if delegErr != nil {
-			return nil, delegErr
-		}
-
 		// Sub is the primary identity anchor; without it a token cannot be
 		// attributed in audit records or matched against principal-scoped
 		// constraints.
@@ -922,7 +809,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, capability.Terminal(jwtErr(jwtErrSenderConstrained, fmt.Errorf("sender-constrained token (cnf) requires proof-of-possession, which the proxy does not verify; refusing to accept it as a plain bearer token (fail closed)")))
 		}
 
-		return newValidatedClaims(capsList, capabilitiesPresent, declassify, delegation, payload, stdClaims, rawClaims), nil
+		return newValidatedClaims(capsList, capabilitiesPresent, payload, stdClaims, rawClaims), nil
 	})
 	if err != nil {
 		return ctx, err
@@ -996,12 +883,6 @@ func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourc
 		return *deny
 	}
 	target := EnforceTarget{Type: capability.TargetTypeResource, Name: uri}
-	// Mirrors Decide's delegation gate: this method can resolve entirely inside the
-	// wrapper (exhaustive claim + nil/wiretap inner), so without it the chain would
-	// bound the subscribe but not the cancel.
-	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
-		return *deny
-	}
 	if claims.HasCapabilities {
 		// Matching only (no conditions) — anyCapCovers is the same predicate the
 		// list filter uses.
@@ -1176,19 +1057,6 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 		return *deny
 	}
 
-	// Applied HERE rather than left to the inner PDP: a JWT-only route has no
-	// manifest engine, and a policyless route's inner is the wiretap
-	// AlwaysAllowPDP, so on those routes the chain was validated at the token
-	// boundary and then applied to nothing — a delegate whose grant reaches no
-	// target was still allowed.
-	//
-	// Composed through withInnerVerdicts because the refusal is downgradable by
-	// design: on an --audit route it becomes a forward, and without composing it
-	// would carry none of the redaction/pin/ceiling the inner PDP would have added.
-	if deny := delegationTargetDenial(ctx, p.clock, target, false); deny != nil {
-		return p.withInnerVerdicts(ctx, sessionID, *deny, target, args)
-	}
-
 	// No mcp.capabilities field: identity-only, deferring to the inner manifest
 	// PDP — safe only with a real backstop (innerEnforces), since an
 	// AlwaysAllowPDP/nil inner would grant every target to an identity-only token.
@@ -1329,9 +1197,8 @@ func (p *JWTPDP) ConditionHandlerOverridden(condType string) bool {
 // jwtClaimEnforceRequest builds the EnforceRequest a capability claim's conditions
 // evaluate against. SessionID/TargetName/Target/Arguments/Claims are populated, since
 // they are the call's identity and already in scope; Context, Directives,
-// DeclaredLabels, DeclassifyApprovals, and Delegation stay zero deliberately — each
-// is authoritative on a different path (manifest, matched constraint, flow layer,
-// declassify seam, delegation gate) that runs one frame later with the real value,
+// and DeclaredLabels stay zero deliberately — each is authoritative on a different path
+// (manifest, matched constraint, flow layer) that runs one frame later with the real value,
 // so populating a partial view here would let a claim condition see a second,
 // stale one. A test fails when a field is added to EnforceRequest, so the next
 // addition is a deliberate choice, not a silent omission.
@@ -1837,31 +1704,15 @@ func (p *JWTPDP) filterList(ctx context.Context, result json.RawMessage, desc li
 	// Reuse the heads parsed once at validation, mirroring Decide, so list
 	// filtering never re-parses on the hot path.
 	parsed := parsedCapHeads(claims)
-	// The delegation chain narrows the catalog here too, mirroring the ManifestPDP
-	// filters — on a JWT-only/wiretap route the inner filter is a passthrough, so
-	// without this the listing would advertise more than the chain lets the
-	// delegate actually call.
-	chain := claims.Delegation
 	kept := make([]json.RawMessage, 0, len(innerRes.Entries))
 	for i, raw := range innerRes.Entries {
 		var covered bool
-		var id string
 		if i < len(innerRes.entryIDs) && innerRes.entryIDs[i] != "" {
 			// ID already decoded by the inner PDP's keep func — skip re-unmarshal.
 			// An empty ID means the inner decoded none, so fall back below.
-			id = innerRes.entryIDs[i]
-			covered = anyCapCoversName(id, desc.targetType, parsed)
+			covered = anyCapCoversName(innerRes.entryIDs[i], desc.targetType, parsed)
 		} else {
-			id, covered = entryCoveredByClaims(raw, parsed, desc.idField, desc.targetType)
-		}
-		if covered && !chain.IsEmpty() {
-			// An entry whose id couldn't be decoded can't be scoped against the
-			// chain, so drop rather than admit it (fail closed).
-			if id == "" {
-				covered = false
-			} else if permitted, _ := chain.PermitsTarget(string(desc.targetType) + ":" + id); !permitted {
-				covered = false
-			}
+			_, covered = entryCoveredByClaims(raw, parsed, desc.idField, desc.targetType)
 		}
 		if covered {
 			kept = append(kept, raw)
@@ -1928,18 +1779,6 @@ func (p *JWTPDP) ReleaseSession(ctx context.Context, sessionID string) {
 	}
 }
 
-// CommitDeclassified delegates to the inner PDP, which owns the flow store the clear
-// applies to — a token can only restrict, so the JWT layer clears no label of its
-// own. p == nil guards the typed-nil case, since this runs through the transport's
-// committer interface after the upstream call, where a panic is a crash with the
-// response already in hand.
-func (p *JWTPDP) CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) ([]string, error) {
-	if p == nil || p.inner == nil {
-		return nil, noFlowStateErr(decl, "JWT decision point with no inner policy")
-	}
-	return p.inner.CommitDeclassified(ctx, sessionID, decl)
-}
-
 // innerFilter intersects the inner PDP's list filter with the JWT claim filter. A
 // nil inner passes the result through (still counting entries via fieldName).
 func (p *JWTPDP) innerFilter(
@@ -1982,8 +1821,7 @@ func emptyListing(resultBytes json.RawMessage, listKey string) ListFilterResult 
 // evaluated (list entries carry no arguments), and it fails closed on a decode
 // error or on an ambiguous entry (entryKeysAmbiguous — a duplicate/case-variant key
 // like "name"/"Name" that Go and a case-sensitive host could decode differently).
-// Returns id alongside the verdict since the caller also needs it to scope against a
-// delegation chain, sparing a second unmarshal of the same bytes per entry.
+// Returns id alongside the verdict, sparing a second unmarshal of the same bytes per entry.
 func entryCoveredByClaims(raw json.RawMessage, parsed []capHead, idField string, targetType capability.TargetType) (id string, covered bool) {
 	if entryKeysAmbiguous(raw) {
 		return "", false

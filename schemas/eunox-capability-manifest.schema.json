@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://eunolabs.com/schemas/eunox-capability-manifest.schema.json",
   "title": "eunox capability manifest (schemaVersion 0.2)",
-  "description": "The typed, closed-vocabulary policy document eunox enforces. It is an ALLOWLIST: a request matching no capability is denied, so every grant is explicit and a misspelled key is a load error rather than a silently inert rule. This schema covers the published \"0.2\" grammar \u2014 the base authorization vocabulary plus the flow+effect layer (the flowLabel condition, the labelOutput and declassify directives, the effectClass and blastRadius conditions, a constraint's effect contract, the top-level effectCeiling, and ${task.*} variables). A \"0.1\" manifest is a strict subset: none of the flow+effect tokens is part of that revision, and the loader refuses one that uses them. This schema is an authoring aid; the loader is authoritative and enforces rules JSON Schema cannot express (glob well-formedness, effect-contract digest pins, the compensable/compensatingAction pairing, cross-condition quota-bucket collisions).",
+  "description": "The typed, closed-vocabulary policy document eunox enforces. It is an ALLOWLIST: a request matching no capability is denied, so every grant is explicit and a misspelled key is a load error rather than a silently inert rule. This schema covers the published \"0.2\" grammar \u2014 the base authorization vocabulary plus the flow+effect layer (the flowLabel condition, the labelOutput directive, the effectClass and blastRadius conditions, a constraint's effect contract, the top-level effectCeiling, and ${task.*} variables). A \"0.1\" manifest is a strict subset: none of the flow+effect tokens is part of that revision, and the loader refuses one that uses them. This schema is an authoring aid; the loader is authoritative and enforces rules JSON Schema cannot express (glob well-formedness, effect-contract digest pins, the compensable/compensatingAction pairing, cross-condition quota-bucket collisions).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -134,7 +134,7 @@
           }
         },
         "directives": {
-          "description": "Post-allow obligations. redactFields mutates the response; labelOutput and declassify write per-session information-flow state. A directive never affects the allow/deny decision \u2014 except declassify, whose approval requirement is checked before the call is allowed to proceed.",
+          "description": "Post-allow obligations. redactFields mutates the response; labelOutput writes per-session information-flow state. A directive never affects the allow/deny decision.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/directive"
@@ -569,26 +569,6 @@
               }
             }
           }
-        },
-        {
-          "title": "declassify",
-          "description": "schemaVersion 0.2. Clears the named labels from the session \u2014 the only token that REMOVES flow state, and the only directive whose absence of an approval changes the decision. Without a human approval covering every label at this exact target, the call ESCALATES (ESCALATION_REQUIRED) rather than running unclassified. Valid on tool: and resource: targets, and never on the same constraint as labelOutput.",
-          "additionalProperties": false,
-          "required": [
-            "labels"
-          ],
-          "properties": {
-            "type": {
-              "const": "declassify"
-            },
-            "labels": {
-              "type": "array",
-              "minItems": 1,
-              "items": {
-                "$ref": "#/$defs/flowLabel"
-              }
-            }
-          }
         }
       ]
     },
@@ -859,8 +839,7 @@
                       "type": {
                         "not": {
                           "enum": [
-                            "labelOutput",
-                            "declassify"
+                            "labelOutput"
                           ]
                         }
                       }

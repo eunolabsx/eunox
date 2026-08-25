@@ -258,7 +258,7 @@ func TestEnforcedForwardCore_SendsNothingForAMessageWithNoReplyChannel(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			fp := forwardParams{rec: &fwdRecorder{}, limits: refusalLimits{notices: noticesTo(io.Discard)}, callUpstream: tc.up}
-			got := enforcedForwardCore(context.Background(), fp, nil, notification, tc.dec,
+			got := enforcedForwardCore(context.Background(), fp, notification, tc.dec,
 				"tools/call", "tool:x", "x", "tool", false, func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 			assert.True(t, got.IsZero(),
 				"a message with no id has no reply channel; anything but the zero message reaches the host as `{\"jsonrpc\":\"\"}`")

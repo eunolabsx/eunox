@@ -6,7 +6,6 @@ package transport
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"go/ast"
 	"go/token"
 	"path/filepath"
@@ -134,13 +133,6 @@ func TestDispatchToolsCall_AnnotationsNeverLandInTheCallersArguments(t *testing.
 	assert.NotContains(t, got, audit.EffectReceiptKey, "no receipts configured here")
 }
 
-// successfulReply is the upstream reply shape declassifyCommitted accepts: no error member,
-// a result object, no isError flag. The withheld-result fact is gated on it, so a test
-// asserting that fact has to present one.
-func successfulReply() mcp.RPCMsg {
-	return mcp.RPCMsg{ID: mcp.RawJSON(`1`), Result: json.RawMessage(`{"ok":true}`)}
-}
-
 // TestDispatchToolsCall_NoInlineDetailsMergeSurvives keeps the "one merge, one semantic"
 // property from being undone by the next edit. The hazard is not a subtle one — a second
 // hand-rolled copy loop beside the helper is how the two semantics diverged in the first
@@ -250,22 +242,10 @@ func findFuncDecl(file *ast.File, name string) *ast.FuncDecl {
 // TestFlowDiscriminator_IsOneSharedConstant pins the property the flow discriminator's whole
 // purpose rests on: one filter finds every information-flow event on the tape.
 //
-// That held together across five independently typed string literals in two packages, where a
+// That held together across independently typed string literals in two packages, where a
 // rename or typo on either side splits an operator's filter and NOTHING fails — the tape stays
-// well-formed, signed and chain-verifiable, and the query quietly returns less. The records
-// that would vanish from it are the transport's declassification annotations, which nothing
-// else on the tape reports.
+// well-formed, signed and chain-verifiable, and the query quietly returns less.
 func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
-	// Every producer, reached through its own path, agrees on the key.
-	assert.Equal(t, map[string]interface{}{capability.FlowAuditDetailKey: true}, declassifyDetail())
-
-	for name, got := range map[string]map[string]interface{}{
-		"refusal below the decision": declassifyRefusalDetail(declassifiedAllow()),
-		"result withheld":            declassifyRedactionDetail(declassifiedAllow(), successfulReply()),
-	} {
-		assert.Equal(t, true, got[capability.FlowAuditDetailKey], "%s must carry the discriminator", name)
-	}
-
 	// And no producer in either package respells it. A bare "flow" string literal is the
 	// exact drift this constant retires, and the scan is over parsed literals rather than
 	// raw bytes so prose mentioning the key is not mistaken for a producer of it.
@@ -314,27 +294,31 @@ func TestFlowDiscriminator_IsOneSharedConstant(t *testing.T) {
 }
 
 // TestEnforcedForwardCore_AllowDetailsAreNotTheCallersMap is the same aliasing guard one
-// layer up: the allow record's details go through the merge too, so a declassification
-// annotation cannot rewrite the request it annotates.
+// layer up: the allow record's details go through the merge too, so an eunox annotation cannot
+// rewrite the request it annotates.
+//
+// The upstream-error annotation is the vehicle: it is written onto an ALLOW record (the policy
+// permitted the call and the upstream then failed), which is the shape this guard needs — an
+// eunox statement landing beside the caller's own arguments.
 func TestEnforcedForwardCore_AllowDetailsAreNotTheCallersMap(t *testing.T) {
-	rec, spy := &fwdRecorder{}, &commitSpy{}
+	rec := &fwdRecorder{}
 	fp := forwardParams{rec: rec, sessionID: "s",
 		callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
 			return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"ok":true}`)}, nil
 		}}
 
 	live := map[string]interface{}{"path": "/tmp/x"}
-	// Force the commit-failed annotation onto the allow, so the record carries an eunox
-	// statement beside the caller's arguments — the shape this guard needs.
-	spy.failErr = errors.New("flow store unreachable (test probe)")
 
-	enforcedForwardCore(context.Background(), fp, spy, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
-		declassifiedAllow(), "tools/call", "sanitize", "sanitize", "tool", false,
-		func(context.Context, mcp.RPCMsg) map[string]interface{} { return live })
+	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
+		capability.EnforceResponse{Decision: capability.DecisionAllow}, "tools/call", "sanitize", "sanitize", "tool", false,
+		func(context.Context, mcp.RPCMsg) map[string]interface{} {
+			// The caller's live map, returned as the allow details exactly as the tools/call
+			// closure does under --audit.
+			return live
+		})
 
 	assert.Equal(t, map[string]interface{}{"path": "/tmp/x"}, live,
-		"the commit-failed annotation must not be written into the caller's argument map")
+		"an eunox annotation must not be written into the caller's argument map")
 	require.Len(t, rec.records, 1)
-	assert.Contains(t, rec.records[0].details, audit.DeclassifyCommitFailedKey)
 	assert.Equal(t, "/tmp/x", rec.records[0].details["path"])
 }

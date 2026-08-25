@@ -387,10 +387,6 @@ func (e *Engine) checkEffectCeiling(ec evalCtx, eff *capability.ResolvedEffect, 
 // Does NOT reproduce a condition denial that would have fired first — the caller composes a
 // harder refusal for a call refused either way, never an allow.
 //
-// The delegated maxEffectClass deliberately does not compose here: it bounds the same axis
-// but a delegation refusal is downgradable by design, so there's no inversion for this to
-// close. The ceiling composes because its own refusal is HARD.
-//
 // The flow-label peek is a pure Get, taken only for a flow-relevant constraint, and its
 // failure is swallowed — this runs on an already-refused call, so a store fault must not
 // weaken it.

@@ -757,13 +757,14 @@ targeted-spec line when the global criteria hold; threat model gains the header
 confusion, continuation, and stream sections and closes L-6 (L-7 re-checked);
 ADR-0002 graduated to Final (its code shipped long since); ADR-0004 graduated
 in W2; ADR-0006/0007/0008 authored at their gates and graduated as their
-workstreams land; `CHANGELOG.md` entries accrue per workstream.
+workstreams land. (The curated `CHANGELOG.md` this plan referenced was removed pre-1.0;
+release notes are generated from Conventional Commit prefixes.)
 
 Exit criteria:
 
 - [ ] conformance.md states both targeted revisions with a complete per-method, per-revision matrix.
 - [ ] No ADR this plan touches remains Draft — each is Final, or In Review awaiting consensus. *(ADR-0006 Final 2026-08-22; the rest still Draft.)*
-- [ ] Threat model current; CHANGELOG complete for the release.
+- [ ] Threat model current for the release.
 
 ### W13 — Test and demo infrastructure — L — **LANDED** (scope deferred, criteria met)
 
@@ -899,8 +900,7 @@ makes that eventual deletion a subtraction.
    where a test itself asserted a now-revision-scoped detail, and the old×old
    cell is byte-stable.
 7. **Docs and ADRs:** conformance matrix flipped; threat model current with L-6
-   closed; ADR-0002 and ADR-0004 Final; ADR-0006–0008 Final; CHANGELOG
-   complete.
+   closed; ADR-0002 and ADR-0004 Final; ADR-0006–0008 Final.
 8. **Blanket criteria** hold repo-wide: race-clean tests, lint, fmt, license,
    NOTICE, and the 80% coverage gates.
 

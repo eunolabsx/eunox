@@ -4,6 +4,26 @@
 - **Date:** 2026-08-22
 - **Deciders:** eunox maintainers
 
+> **Premise change (2026-08-25).** Declassification was removed from the product
+> (threat model §3.13, withdrawn). Three of this ADR's load-bearing arguments rested on
+> it and no longer hold as written:
+>
+> 1. **"The existing exception applied to a second member of its class."** `finishDecision`
+>    no longer keeps the decision turn past the forward for any case — declassification was
+>    the only one, and the turn is now released after every decision. Holding it for an
+>    ingesting call would be NEW machinery, which is the opposite of what this section argues,
+>    and the head-of-line-blocking cost would be introduced here rather than inherited.
+> 2. **The `labels_cleared` precedent.** That field, `approver`, `approval_id` and
+>    `RecordDeclassifiedAllow` are gone, so there is no longer a shipped example of a
+>    post-forward-derived, signed, top-level record field. The append-only argument still
+>    stands on its own; the *precedent* does not.
+> 3. **Ordering against a concurrent declassify.** There is no concurrent declassify to order
+>    against. Flow-label taint is monotonic, so the only remaining ordering question is
+>    source-vs-sink, which this section itself says would not by itself require the turn.
+>
+> The label-ingestion problem is unaffected and the design may still be right — but the
+> concurrency section needs re-deriving from scratch before this ADR advances past Draft.
+
 ## Context
 
 The imported-sensitivity axis lets a policy name a class from an external

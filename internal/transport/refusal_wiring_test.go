@@ -179,7 +179,7 @@ func TestEnforcedForwardCore_NoIDRefusalsBuildNoEnvelope(t *testing.T) {
 			callUpstream: func(context.Context, mcp.RPCMsg) (mcp.RPCMsg, error) {
 				return mcp.RPCMsg{}, errors.New("upstream exited (test probe)")
 			}}
-		resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil, notification, allow,
+		resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, notification, allow,
 			capability.MethodToolsCall, "tool:x", "tool:x", "tool", false, nil)
 		assert.Nil(t, resp.Error, "a message with no id has no reply channel, so no error envelope may be built for it")
 		assert.Nil(t, resp.ID)
@@ -196,7 +196,7 @@ func TestEnforcedForwardCore_NoIDRefusalsBuildNoEnvelope(t *testing.T) {
 				// "content" present but not an array: ApplyRedactObligs fails closed on it.
 				return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"content":{}}`)}, nil
 			}}
-		resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil, notification, redacting,
+		resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, notification, redacting,
 			capability.MethodToolsCall, "tool:x", "tool:x", "tool", false, nil)
 		assert.Nil(t, resp.Error)
 		assert.Nil(t, resp.ID)
@@ -292,7 +292,7 @@ func TestUpstreamlessLeg_ObserveCannotDowngradeIntoAFabricatedOutage(t *testing.
 	}
 	require.True(t, dec.Denial.Downgradable(), "the premise: this denial WOULD be downgraded on a leg that could forward")
 
-	resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil,
+	resp := enforcedForwardCore(revisionContext(handshakeRevision), fp,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "x/bogus"}, dec, "x/bogus", "x/bogus", "x/bogus", "method", false, nil)
 
 	require.Len(t, rec.records, 1, "one refusal, one record: an upstream that was never contacted may not also produce a transport-failure deny")
@@ -312,7 +312,7 @@ func TestUpstreamlessLeg_AnAllowRefusesRatherThanNilCalling(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	fp := forwardParams{rec: rec, sessionID: "s", limits: refusalLimits{notices: noticesTo(io.Discard)}}
-	resp := enforcedForwardCore(revisionContext(handshakeRevision), fp, nil,
+	resp := enforcedForwardCore(revisionContext(handshakeRevision), fp,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall},
 		capability.EnforceResponse{Decision: capability.DecisionAllow},
 		capability.MethodToolsCall, "t", "t", "tool", false, func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
@@ -343,7 +343,7 @@ func TestFoldDecisionDetail_HandsOverAMapNoRecorderWillMutate(t *testing.T) {
 		Decision: capability.DecisionDeny,
 		Denial:   &capability.DenialInfo{Code: capability.ErrCodeCapabilityDenied, Details: engineOwned},
 	}
-	enforcedForwardCore(revisionContext(handshakeRevision), fp, nil,
+	enforcedForwardCore(revisionContext(handshakeRevision), fp,
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "x/bogus"}, dec, "x/bogus", "x/bogus", "x/bogus", "method", false, nil)
 
 	assert.Equal(t, map[string]interface{}{"argument": "path"}, engineOwned,

@@ -32,12 +32,17 @@ const maxConcurrentServerRequests = 32
 // serverRequestPool is the admission control and off-reader dispatch for one upstream
 // connection's SERVER-initiated request handlers. Both transports own one.
 //
-// The handler must not run inline on the read loop — that used to be a cycle, not a slow
-// path: the reader is the only goroutine delivering upstream responses; a declassifying
-// host call holds the decision turn across its whole upstream round trip; and the sampling
-// leg used to take that turn BEFORE DecideSampling ran. A sampling/createMessage arriving
-// mid-clear parked the reader on a turn whose holder was waiting for a response only that
-// reader could deliver. Off the read loop, a blocked handler blocks only itself.
+// The handler must not run inline on the read loop: the reader is the only goroutine that
+// delivers upstream responses, and the sampling leg takes the decision turn BEFORE
+// DecideSampling runs — so a sampling/createMessage arriving behind a queue of host decisions
+// would stall every in-flight call for the length of samplingTurnWait, repeatably. Off the read
+// loop, a blocked handler blocks only itself.
+//
+// It used to be worse than a stall: a declassifying host call held its turn across the whole
+// upstream round trip, so the reader could park on a holder waiting for a response only that
+// reader could deliver — a genuine cycle. Declassification is gone and finishDecision now
+// releases the turn before every forward, so no holder awaits an upstream response and the
+// cycle is unreachable. The bound below is on a WAIT, not a wedge.
 //
 // ORDERING, stated rather than left to be inferred: server-initiated requests used to
 // arrive in receipt order purely because they ran inline, and no longer do — two requests

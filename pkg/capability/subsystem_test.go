@@ -43,7 +43,7 @@ func TestTokenEngineSubsystems_EveryRegisteredTokenDeclaresOne(t *testing.T) {
 // policy of nothing but maxCalls must still skip both.
 func TestTokenEngineSubsystems_TheFlowTokensDeclareTheFlowStore(t *testing.T) {
 	t.Parallel()
-	for _, token := range []string{ConditionTypeFlowLabel, DirectiveTypeLabelOutput, DirectiveTypeDeclassify} {
+	for _, token := range []string{ConditionTypeFlowLabel, DirectiveTypeLabelOutput} {
 		assert.True(t, TokenUsesEngineSubsystem(token, SubsystemFlowLabels), "%q reads or writes the flow-label set", token)
 		assert.False(t, TokenUsesEngineSubsystem(token, SubsystemAntecedentHistory), "%q does not read the antecedent history", token)
 	}

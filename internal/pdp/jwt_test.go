@@ -3143,9 +3143,6 @@ func (condPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
 }
 func (condPDP) RecordObservedToolHashes(_ context.Context, _ json.RawMessage) int { return 0 }
 func (condPDP) ReleaseSession(_ context.Context, _ string)                        {}
-func (condPDP) CommitDeclassified(_ context.Context, _ string, _ *capability.Declassification) ([]string, error) {
-	return nil, nil
-}
 func (condPDP) FilterToolsList(_ context.Context, result json.RawMessage) ListFilterResult {
 	return ListFilterResult{Result: result}
 }
@@ -5400,12 +5397,13 @@ func signRawClaimsToken(t *testing.T, key testKey, sub string, exp time.Time, ra
 }
 
 // TestJWT_AmbiguousTopLevelClaimRejected is a regression for the ambiguity a struct
-// decode resolves silently: encoding/json binds "act" and "Act" to the SAME field and
+// decode resolves silently: encoding/json binds "mcp" and "MCP" to the SAME field and
 // keeps whichever appears last in the payload bytes, with nothing downstream able to
-// tell a second candidate ever existed. Before this test's fix, a payload carrying
-// {"act":{"sub":"narrow"},"Act":{"sub":"wide"}} decoded to whichever of the two
-// happened to sort last — silently, and a JWT is signed by the issuer, so this is the
+// tell a second candidate ever existed. A JWT is signed by the issuer, so this is the
 // issuer's own minting-pipeline mistake to make, not a third party's forgery.
+//
+// The claim under test is one this build READS, which is watchedTopLevelClaims' own
+// criterion: a duplicate of a claim nothing decodes resolves to a value nothing acts on.
 func TestJWT_AmbiguousTopLevelClaimRejected(t *testing.T) {
 	key := newTestKey(t, "k1")
 	srv := makeJWKSServer(t, key)
@@ -5414,13 +5412,12 @@ func TestJWT_AmbiguousTopLevelClaimRejected(t *testing.T) {
 	exp := time.Now().Add(time.Hour)
 
 	token := signRawClaimsToken(t, key, "agent-1", exp, map[string]interface{}{
-		"mcp": map[string]interface{}{"v": mcpClaimVersion},
-		"act": map[string]interface{}{"sub": "narrow-actor"},
-		"Act": map[string]interface{}{"sub": "wide-actor"},
+		"mcp": map[string]interface{}{"v": mcpClaimVersion, "agent_id": "narrow"},
+		"MCP": map[string]interface{}{"v": mcpClaimVersion, "agent_id": "wide"},
 	})
 	_, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
 	if err == nil {
-		t.Fatal("ValidateToken accepted a token with both act and Act claims; want a terminal rejection")
+		t.Fatal("ValidateToken accepted a token with both mcp and MCP claims; want a terminal rejection")
 	}
 	if got := ClassifyJWTError(err); got != "ambiguous_claims" {
 		t.Fatalf("error category = %q, want ambiguous_claims", got)
@@ -5442,8 +5439,7 @@ func TestJWT_AmbiguousTopLevelClaimRejected(t *testing.T) {
 
 // TestJWT_AmbiguousMcpMemberRejected covers the SAME ambiguity one layer further in:
 // duplicate/case-variant keys inside the mcp claim block itself. This is the shape that
-// would otherwise reach a per-grant decoder (ParseDelegationGrants,
-// ParseDeclassifyApprovals) with only ONE already-selected candidate and no sign a
+// would otherwise reach a per-member decoder with only ONE already-selected candidate and no sign a
 // second one existed — silently widening whichever of two grants happened to sort last.
 func TestJWT_AmbiguousMcpMemberRejected(t *testing.T) {
 	key := newTestKey(t, "k1")
@@ -5453,16 +5449,6 @@ func TestJWT_AmbiguousMcpMemberRejected(t *testing.T) {
 	exp := time.Now().Add(time.Hour)
 
 	for name, mcp := range map[string]map[string]interface{}{
-		"delegation/Delegation": {
-			"v":          mcpClaimVersion,
-			"delegation": []interface{}{map[string]interface{}{"subject": "worker", "targets": []string{"tool:read_file"}}},
-			"Delegation": []interface{}{map[string]interface{}{"subject": "worker"}},
-		},
-		"declassify/Declassify": {
-			"v":          mcpClaimVersion,
-			"declassify": []interface{}{},
-			"Declassify": []interface{}{map[string]interface{}{"labels": []string{"pii"}, "target": "tool:publish", "approver": "ops"}},
-		},
 		"capabilities/Capabilities": {
 			"v":            mcpClaimVersion,
 			"capabilities": []string{"tool:read"},
@@ -6148,63 +6134,6 @@ func TestJWTPDP_FilterList_NonEnforcingInnerSkipsSideEffectPass(t *testing.T) {
 	}
 	if res.Upstream != 1 {
 		t.Errorf("Upstream = %d, want the true pre-filter count 1", res.Upstream)
-	}
-}
-
-// TestJWT_OnceGrantRefusedWhenTokenOutlivesLedger is the token-boundary half of the `once`
-// guarantee. The burn lives in a WINDOWED ledger, so a grant riding a token that outlives
-// the window would be presented again once the burn aged out and clear a second time — one
-// human approval, two declassifications. The token is refused instead, with a message an
-// operator can act on, rather than admitted under a weaker promise than the field makes.
-func TestJWT_OnceGrantRefusedWhenTokenOutlivesLedger(t *testing.T) {
-	key := newTestKey(t, "k1")
-	srv := makeJWKSServer(t, key)
-	defer srv.Close()
-	p := makeJWTPDP(t, srv, "", "", nil)
-	window := time.Duration(capability.DeclassifyLedgerWindowSec) * time.Second
-
-	grant := func(once bool) []interface{} {
-		g := map[string]interface{}{
-			"labels": []string{"pii"}, "target": "tool:publish", "approver": "ops", "id": "apr-1",
-		}
-		if once {
-			g["once"] = true
-		}
-		return []interface{}{g}
-	}
-
-	// A long-lived token carrying a single-use grant: refused, classified as an invalid
-	// declassify claim rather than collapsed into a generic "invalid".
-	long := signRawClaimsToken(t, key, "agent-1", time.Now().Add(window+24*time.Hour),
-		map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion, "declassify": grant(true)}})
-	_, err := p.ValidateToken(context.Background(), "Bearer "+long)
-	if err == nil {
-		t.Fatal("ValidateToken accepted a once grant on a token that outlives the ledger window")
-	}
-	if got := ClassifyJWTError(err); got != jwtErrInvalidDeclassify {
-		t.Fatalf("error category = %q, want %q", got, jwtErrInvalidDeclassify)
-	}
-	if !strings.Contains(err.Error(), "apr-1") {
-		t.Fatalf("refusal must name the offending grant: %v", err)
-	}
-
-	// The same grant on a short-lived token — the practice the docs recommend — is admitted.
-	short := signRawClaimsToken(t, key, "agent-1", time.Now().Add(15*time.Minute),
-		map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion, "declassify": grant(true)}})
-	ctx, err := p.ValidateToken(context.Background(), "Bearer "+short)
-	if err != nil {
-		t.Fatalf("a once grant inside the ledger window must be admitted: %v", err)
-	}
-	if claims, ok := jwtClaimsFromContext(ctx); !ok || len(claims.Declassify) != 1 || !claims.Declassify[0].Once {
-		t.Fatalf("the admitted token must still carry its single-use grant, got %+v", claims)
-	}
-
-	// A STANDING grant is replayable for the token's lifetime by design, so the bound does
-	// not apply to it: the long-lived token above is accepted once `once` is dropped.
-	standing := signRawClaimsToken(t, key, "agent-1", time.Now().Add(window+24*time.Hour),
-		map[string]interface{}{"mcp": map[string]interface{}{"v": mcpClaimVersion, "declassify": grant(false)}})
-	if _, err := p.ValidateToken(context.Background(), "Bearer "+standing); err != nil {
-		t.Fatalf("a standing grant on a long-lived token must still validate: %v", err)
 	}
 }
 

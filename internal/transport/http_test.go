@@ -1634,9 +1634,6 @@ func (r recordingDecisionPoint) RecordObservedToolHashes(ctx context.Context, re
 func (r recordingDecisionPoint) ReleaseSession(ctx context.Context, sessionID string) {
 	r.inner.ReleaseSession(ctx, sessionID)
 }
-func (r recordingDecisionPoint) CommitDeclassified(ctx context.Context, sessionID string, decl *capability.Declassification) ([]string, error) {
-	return r.inner.CommitDeclassified(ctx, sessionID, decl)
-}
 func (r recordingDecisionPoint) FilterToolsList(ctx context.Context, result json.RawMessage) pdp.ListFilterResult {
 	return r.inner.FilterToolsList(ctx, result)
 }

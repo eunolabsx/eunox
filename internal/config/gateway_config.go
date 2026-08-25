@@ -387,7 +387,7 @@ type RouteDefaults struct {
 	UpstreamTimeoutMs int  `yaml:"upstreamTimeoutMs"`
 
 	// TaskAnchoredState keys every route's accumulated enforcement state (flow-label taint,
-	// sequenceBlock antecedents, quota budgets, spent declassify grants) on the caller's
+	// sequenceBlock antecedents, quota budgets) on the caller's
 	// VALIDATED mcp.task_id claim rather than its session, so state survives a hop between
 	// enforcement points. Off by default since it changes what every budget MEANS (a maxCalls
 	// of 20 becomes 20 per task, not per connection); a token with no task_id is DENIED
@@ -457,7 +457,7 @@ type UpstreamConfig struct {
 	// Per-route overrides. Pointer ⟹ "unset, inherit from defaults".
 	StrictDrift *bool `yaml:"strictDrift"`
 	// TaskAnchoredState overrides RouteDefaults.TaskAnchoredState for this route: the anchor
-	// is a property of a route's own topology (delegated sub-agents sharing a task vs. a
+	// is a property of a route's own topology (sub-agents sharing a task vs. a
 	// single host session), so forcing one anchor on both would strand or pool state wrongly.
 	TaskAnchoredState *bool `yaml:"taskAnchoredState"`
 }

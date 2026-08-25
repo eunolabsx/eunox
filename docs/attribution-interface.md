@@ -93,16 +93,14 @@ conservative join's over-blocking. What it buys is:
 
 ### What about narrowing?
 
-The sound narrowing direction exists, and it is a **different mechanism**: a *delegator*
-narrowing a *delegate's* authority is attenuation, where the party doing the narrowing is
-the one giving something up. That belongs to the delegation surface, where the narrowing
-travels in an attenuated credential the delegate cannot widen.
+The sound narrowing direction exists, and it is a **different mechanism**: attenuation, where
+the party doing the narrowing is the one giving something up, and the narrowing travels in a
+credential the narrowed party cannot widen.
 
 A client narrowing its own taint is not attenuation. It is self-attestation by the party
 under suspicion, and no amount of schema makes that safe. If a deployment wants per-argument
 sharpening it needs a *trusted* attributor — a harness the operator controls, attesting
-under its own credential — which is a credential-and-delegation question, not a `_meta`
-question.
+under its own credential — which is a credential question, not a `_meta` question.
 
 ## Failure behavior
 
@@ -141,11 +139,8 @@ details:
 unable to answer "did we see this, or were we told?" — which is the first question about any
 client-supplied input.
 
-A third source can add taint the same union-only way, and is recorded separately for the same
-reason: a delegation chain's `labels` (see the manifest guide's *Delegation attenuation*)
-appear as `delegated_labels`. The distinction between the three is the whole point — the
-client *asserted* it, the proxy *observed* it, or a delegator *imposed* it — and only the
-last is something the caller cannot choose to omit.
+The distinction between the two is the whole point — the client *asserted* it, or the proxy
+*observed* it — and only the second is something the caller cannot choose to omit.
 
 ## Reference client
 

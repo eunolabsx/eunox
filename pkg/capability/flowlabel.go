@@ -139,10 +139,8 @@ func SplitFlowLabel(label string) (namespace, value string, imported bool) {
 // It deliberately does NOT check that the namespace is one the policy declared. That
 // closure is the manifest loader's (validateFlowLabelNamespaceUse), because it is the one
 // layer holding the declaration — and the layers that cannot see a manifest at all are
-// exactly the ones where an undeclared namespace is provably harmless: a token's
-// delegation labels and a client's attribution block only ever ADD taint, and a delegation
-// allowLabels cap and a declassify approval only ever REMOVE an allowance. Every one of
-// those directions over-blocks on a typo, so refusing them here would buy no safety and
+// exactly the ones where an undeclared namespace is provably harmless: a client's attribution
+// block only ever ADDS taint. That direction over-blocks on a typo, so refusing it here would buy no safety and
 // would reject a legitimately-issued token naming a taxonomy this manifest happens not to
 // use.
 func ValidateFlowLabel(label string) error {
@@ -179,8 +177,7 @@ func ValidateFlowLabel(label string) error {
 }
 
 // MaxExternalFlowLabels bounds how many labels ONE externally-supplied list may carry — a
-// client's attribution block, a delegation hop's forced labels or allow-cap, a declassify
-// approval.
+// client's attribution block.
 //
 // The native axis bounded these implicitly at five: the vocabulary was closed, so a list of
 // 300,000 labels was rejected at its first entry. Opening the imported axis removed that
@@ -261,10 +258,7 @@ func ValidateFlowLabelNamespace(ns string) error {
 // input (ParseContextManifest, the token claims) reject a malformed label before it reaches
 // here, so on the shipped path there is nothing to drop. A caller that reaches this with one
 // anyway owns the direction: unioning taint IN (the declared and forced sets) cannot
-// manufacture an allowance by dropping an entry, and the two callers that instead NARROW
-// (computeAllowedLabelCap, which only ever removes an allowance, and DeclassifyLabelsOf,
-// which re-appends what was dropped for exactly this reason) are safe for their own stated
-// reasons rather than this one. The paths where a dropped label WOULD shrink an obligation —
+// manufacture an allowance by dropping an entry. The paths where a dropped label WOULD shrink an obligation —
 // the engine's own store read and label record — validate explicitly and fail closed instead.
 func NormalizeFlowLabels(labels []string) []string {
 	if len(labels) == 0 {
@@ -322,8 +316,7 @@ func IsLabelOutputDirective(d Directive) bool {
 }
 
 // ConstraintHasFlow reports whether c participates in information-flow control: a flowLabel
-// condition (sink), a labelOutput directive (source), or a declassify directive (the
-// verdict depends on session label state too). Single-sourced so the engine's allow-path
+// condition (sink) or a labelOutput directive (source). Single-sourced so the engine's allow-path
 // gate and the PDP's audit-mode antecedent gate can't drift on what counts as flow. Nil-safe.
 func ConstraintHasFlow(c *Constraint) bool {
 	if c == nil {
@@ -335,7 +328,7 @@ func ConstraintHasFlow(c *Constraint) bool {
 		}
 	}
 	for _, dir := range c.Directives {
-		if IsLabelOutputDirective(dir) || IsDeclassifyDirective(dir) {
+		if IsLabelOutputDirective(dir) {
 			return true
 		}
 	}

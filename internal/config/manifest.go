@@ -1030,13 +1030,9 @@ func validateLocalManifest(m *LocalManifest) error {
 				return err
 			}
 		}
-		// Cross-directive coherence for the flow pair, checked once per constraint rather
-		// than inside the per-directive loop (which sees one entry at a time).
-		if err := validateDeclassifyCoherence(i, c); err != nil {
-			return err
-		}
 		// Reject two quota-consuming conditions addressing the same counter bucket before
-		// the per-condition pass. See validateQuotaBucketsDistinct.
+		// the per-condition pass, checked once per constraint rather than inside the
+		// per-condition loop (which sees one entry at a time).
 		if err := validateQuotaBucketsDistinct(i, c.Conditions); err != nil {
 			return err
 		}
@@ -1642,15 +1638,6 @@ var directiveValidators = map[string]directiveValidator{
 		}
 		return validateLabelOutput(i, j, d.Labels, scope.flowNamespaces)
 	}),
-	capability.DirectiveTypeDeclassify: typedDirective(func(i, j int, target string, targetType capability.TargetType, d *capability.DeclassifyDirective, scope manifestScope) error {
-		// Same target restriction as labelOutput: a declassification is a TRANSFORM that sits
-		// where data is produced or read; clearing a label at an egress would launder it at
-		// exactly the point the flow layer exists to gate.
-		if err := requireSourceDirectiveTarget(i, target, targetType, capability.DirectiveTypeDeclassify); err != nil {
-			return err
-		}
-		return validateDeclassify(i, j, d.Labels, scope.flowNamespaces)
-	}),
 }
 
 // typedDirective adapts a per-type validator to the discriminator-keyed table, normalizing the
@@ -1773,10 +1760,10 @@ func requireResponseDirectiveTarget(i int, target string, targetType capability.
 	return nil
 }
 
-// requireSourceDirectiveTarget restricts the two flow-state directives — labelOutput and
-// declassify — to tool: and resource: source targets. A prompt: or system: target is not a
-// flow SOURCE (a sampling/createMessage request is an egress, a flowLabel SINK's place, not
-// one that asserts or clears taint) — this is why sampling can only ever be a flow sink.
+// requireSourceDirectiveTarget restricts the flow-state directive labelOutput to tool: and
+// resource: source targets. A prompt: or system: target is not a flow SOURCE (a
+// sampling/createMessage request is an egress, a flowLabel SINK's place, not one that asserts
+// taint) — this is why sampling can only ever be a flow sink.
 func requireSourceDirectiveTarget(i int, target string, targetType capability.TargetType, directive string) error {
 	if targetType != capability.TargetTypeTool && targetType != capability.TargetTypeResource {
 		return fmt.Errorf("capability at index %d: constraint %q carries a %s directive, which is valid only on tool: or resource: source targets (a %s target is not a flow source)", i, target, directive, targetType)
@@ -1819,16 +1806,6 @@ func validateLabelOutput(i, j int, labels []string, declared map[string]bool) er
 		return fmt.Errorf("capability at index %d, directive %d: labelOutput requires a non-empty 'labels' list naming the flow labels this call's output carries; an empty list records nothing", i, j)
 	}
 	return validateFlowLabelSet(fmt.Sprintf("capability at index %d, directive %d: labelOutput 'labels'", i, j), labels, declared)
-}
-
-// validateDeclassify checks a declassify directive's label list. An empty list is rejected
-// for a sharper reason than labelOutput's: it clears nothing yet still ESCALATES every call
-// it sits on, leaving a permanently-refused capability.
-func validateDeclassify(i, j int, labels []string, declared map[string]bool) error {
-	if len(labels) == 0 {
-		return fmt.Errorf("capability at index %d, directive %d: declassify requires a non-empty 'labels' list naming the flow labels this action clears; an empty list clears nothing while still requiring an approval, so the capability could never be satisfied", i, j)
-	}
-	return validateFlowLabelSet(fmt.Sprintf("capability at index %d, directive %d: declassify 'labels'", i, j), labels, declared)
 }
 
 // mergeFlowLabelNamespaces unions one file's declared sensitivity namespaces into the merged
@@ -1889,34 +1866,6 @@ func declaredFlowLabelNamespaces(m *LocalManifest) map[string]bool {
 		set[ns] = true
 	}
 	return set
-}
-
-// validateDeclassifyCoherence rejects the two constraint shapes a declassify directive cannot
-// mean anything sensible in, both load errors rather than runtime surprises:
-//
-//  1. declassify together with labelOutput on ONE constraint — the two write the same
-//     session state in opposite directions, and evaluation order would silently decide it.
-//  2. more than one declassify directive on one constraint — reads as "either approval
-//     suffices" but enforces as "one approval must cover the union", arrived at by accident.
-func validateDeclassifyCoherence(i int, c *capability.Constraint) error {
-	count := 0
-	for _, dir := range c.Directives {
-		if capability.IsDeclassifyDirective(dir) {
-			count++
-		}
-	}
-	if count == 0 {
-		return nil
-	}
-	if count > 1 {
-		return fmt.Errorf("capability at index %d: %d declassify directives on one constraint; list every label in a single declassify directive instead — one approval has to cover all of them, and two entries read as if either would do", i, count)
-	}
-	for _, dir := range c.Directives {
-		if capability.IsLabelOutputDirective(dir) {
-			return fmt.Errorf("capability at index %d: a constraint carries both labelOutput and declassify; they write the same session flow state in opposite directions on one call, so which one wins would be decided by evaluation order rather than by policy — split them into two capabilities", i)
-		}
-	}
-	return nil
 }
 
 // validatePrincipal checks a constraint's principal scoping: every claim name must be one

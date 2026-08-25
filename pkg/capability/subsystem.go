@@ -26,7 +26,7 @@ const (
 	// sequenceBlock can ask what preceded it. Gated by the engine's skipAntecedentRecording.
 	SubsystemAntecedentHistory EngineSubsystem = "antecedentHistory"
 	// SubsystemFlowLabels is the session/task-scoped flow-label set: the labels a source
-	// writes, a sink peeks, and a declassification clears. Gated by the engine's skipFlow.
+	// writes and a sink peeks. Gated by the engine's skipFlow.
 	SubsystemFlowLabels EngineSubsystem = "flowLabels"
 )
 

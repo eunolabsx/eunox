@@ -13,7 +13,6 @@ import (
 
 	"github.com/eunolabs/eunox/internal/audit"
 	"github.com/eunolabs/eunox/internal/pdp"
-	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 func TestAuditIdentity_FromClaims(t *testing.T) {
@@ -24,26 +23,9 @@ func TestAuditIdentity_FromClaims(t *testing.T) {
 	assert.Equal(t, "agent-1", id.AgentID)
 	assert.Equal(t, "task-9", id.TaskID)
 	assert.Equal(t, "user-7", id.UserID)
-	// An undelegated token carries no acting delegate and no depth, so both stay off the record.
-	assert.Empty(t, id.Delegate)
-	assert.Zero(t, id.DelegationDepth)
 
 	// Without claims: all empty.
 	assert.Equal(t, audit.Identity{}, auditIdentity(context.Background()))
-
-	// A delegated token: the CURRENT holder and the chain depth, alongside the human the
-	// token is for. Without these the record is indistinguishable from one the human made
-	// directly, which is the shape a delegated allow could not answer.
-	delegated := pdp.WithJWTClaims(context.Background(), &pdp.JWTClaims{
-		Subject: "user@example.com",
-		Delegation: &capability.DelegationChain{
-			Actors: []string{"agent-a", "agent-b"},
-		},
-	})
-	id = auditIdentity(delegated)
-	assert.Equal(t, "user@example.com", id.UserID)
-	assert.Equal(t, "agent-b", id.Delegate, "the outermost act actor is who holds the token now")
-	assert.Equal(t, 2, id.DelegationDepth)
 }
 
 // The token id answers a DIFFERENT question from the identity fields beside it: which
@@ -88,9 +70,6 @@ func TestAuditIdentity_PopulatesEveryField(t *testing.T) {
 		TaskID:  "task-9",
 		Subject: "user-7",
 		TokenID: "jti-3",
-		Delegation: &capability.DelegationChain{
-			Actors: []string{"agent-a", "agent-b"},
-		},
 	})
 	id := auditIdentity(ctx)
 

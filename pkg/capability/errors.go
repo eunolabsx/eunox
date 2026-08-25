@@ -60,15 +60,14 @@ const (
 	// explicitly to -32001 so the wire code, the mapping, and the docs stay in lockstep.
 	ErrCodeSamplingDenied = "SAMPLING_DENIED"
 	// ErrCodeEscalationRequired refuses an action needing human approval rather than a
-	// policy verdict alone: either an effectCeiling escalation (consequence exceeds the
-	// bound) or a declassify directive with no approval covering the labels it clears.
-	// It is a REFUSAL, not a pending state — fail-closed to "not forwarded".
+	// policy verdict alone: an effectCeiling escalation, where the call's consequence
+	// exceeds the bound. It is a REFUSAL, not a pending state — fail-closed to "not
+	// forwarded".
 	//
-	// A ceiling escalation is not satisfiable by retrying (it escalates again until the
-	// ceiling or contract changes); a declassify escalation IS, once a token carrying a
-	// covering approval is presented — the audit record's condition_type distinguishes
-	// them. Shares -32003 with the other condition-failure codes on the wire; the
-	// symbolic code and decision=escalate are what distinguish it.
+	// It is not satisfiable by retrying: the same call escalates again until the ceiling or
+	// the contract changes, so an operator sees it until they act. Shares -32003 with the
+	// other condition-failure codes on the wire; the symbolic code and decision=escalate are
+	// what distinguish it.
 	ErrCodeEscalationRequired = "ESCALATION_REQUIRED"
 	// ErrCodeUnsupportedProtocolVersion refuses a request whose MCP protocol revision
 	// cannot be established: none declared on a context that never negotiated one, a

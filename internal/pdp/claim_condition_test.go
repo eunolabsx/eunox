@@ -214,11 +214,9 @@ func TestEnforceRequestFields_ClaimPathPopulationIsDeliberate(t *testing.T) {
 		"Target":     true,
 		"Claims":     true,
 
-		"Context":             false, // the manifest path decides on network position, one frame later
-		"Directives":          false, // come from the matched manifest constraint; none is selected yet
-		"DeclaredLabels":      false, // the flow layer evaluates these over the full request
-		"DeclassifyApprovals": false, // the declassify seam does, likewise
-		"Delegation":          false, // the delegation gate does, likewise
+		"Context":        false, // the manifest path decides on network position, one frame later
+		"Directives":     false, // come from the matched manifest constraint; none is selected yet
+		"DeclaredLabels": false, // the flow layer evaluates these over the full request
 	}
 
 	req := jwtClaimEnforceRequest("sess-1",

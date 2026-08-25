@@ -15,21 +15,16 @@ import (
 )
 
 // auditIdentity returns the caller identity from ctx's validated JWT claims, or the zero
-// Identity when there are none. Delegate/DelegationDepth exist so a delegated allow is
-// attributable to the sub-agent that made the call, not only to the human it acts for.
+// Identity when there are none.
 func auditIdentity(ctx context.Context) audit.Identity {
 	c := pdp.JWTClaimsPtr(ctx)
 	if c == nil {
 		return audit.Identity{}
 	}
 	return audit.Identity{
-		AgentID:  c.AgentID,
-		TaskID:   c.TaskID,
-		UserID:   c.Subject,
-		TokenID:  c.TokenID,
-		Delegate: c.Delegation.Delegate(),
-		// len(Actors), not len(Grants): actors are the identities the token passed through,
-		// which is what a depth means to a reader tracing user -> a -> b.
-		DelegationDepth: c.Delegation.ActorDepth(),
+		AgentID: c.AgentID,
+		TaskID:  c.TaskID,
+		UserID:  c.Subject,
+		TokenID: c.TokenID,
 	}
 }

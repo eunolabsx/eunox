@@ -4,6 +4,14 @@
 - **Date:** 2026-08-07
 - **Deciders:** eunox maintainers
 
+> **Premise change (2026-08-25).** Declassification was removed from the product
+> (threat model §3.13, withdrawn), so the decision below that a `declassify` directive whose
+> call returns `input_required` is denied is now moot — the directive cannot appear in a
+> loadable policy. The "declassify x MRTR refusal is a real functional gap" consequence
+> disappears with it. The once-grant ledger this ADR draws its replay-protection analogy from
+> is also gone; the analogy needs a different reference point, though the mechanism it argues
+> for (a signed, single-use continuation) is unaffected.
+
 ## Context
 
 Under the 2026-07-28 revision, server-initiated requests are replaced by multi

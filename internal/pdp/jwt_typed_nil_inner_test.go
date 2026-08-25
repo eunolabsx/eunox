@@ -98,9 +98,4 @@ func TestJWTLegs_TypedNilInner_DoNotDereference(t *testing.T) {
 	assert.Zero(t, p.FilterToolsList(ctx, toolsListResult).Kept(),
 		"an identity-only token with no backstop sees no catalog")
 	p.ReleaseSession(ctx, "sess")
-	cleared, err := p.CommitDeclassified(ctx, "sess", nil)
-	// Nothing to clear, so nothing to fail: what is pinned here is that the commit leg reaches its
-	// own no-inner answer instead of dispatching on the wrapped nil.
-	assert.NoError(t, err)
-	assert.Empty(t, cleared)
 }

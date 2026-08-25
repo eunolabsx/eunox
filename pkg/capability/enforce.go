@@ -53,28 +53,6 @@ type EnforceRequest struct {
 	// attribution.go. Empty for every non-cooperating client, which is the default and
 	// costs nothing.
 	DeclaredLabels []string `json:"declaredLabels,omitempty"`
-	// DeclassifyApprovals carries the human approvals the request's VERIFIED token
-	// granted (the `mcp.declassify` claim), already parsed and validated. They are the
-	// only thing that lets a declassify directive clear a flow label instead of
-	// escalating. Empty on every request that is not a declassification — including every
-	// request with no token at all, which is why a deployment with no approval integration
-	// escalates rather than silently declassifying.
-	//
-	// It is a typed field rather than a lookup into Claims for the same reason
-	// DeclaredLabels is: the engine must not re-derive a security-critical input from an
-	// untyped claim map on the hot path, where a decode slip reads as "no approval"
-	// (harmless) or "some approval" (not).
-	DeclassifyApprovals []DeclassifyApproval `json:"declassifyApprovals,omitempty"`
-	// Delegation carries the attenuation the request's VERIFIED token declared across a
-	// delegation chain (its RFC 8693 `act` actors and its `mcp.delegation` grants), already
-	// decoded, validated, and asserted to narrow at every hop. Nil for every non-delegated
-	// request, which is nearly all of them.
-	//
-	// Like DeclassifyApprovals it is a typed field rather than a lookup into Claims, and for
-	// the same reason: every axis it carries bounds the decision, so re-deriving it from an
-	// untyped claim map on the hot path would put a decode slip between the operator's
-	// narrowing and its enforcement. See delegation.go.
-	Delegation *DelegationChain `json:"delegation,omitempty"`
 }
 
 // EnforceRequestContext carries request attributes used during enforcement.
@@ -119,23 +97,6 @@ type EnforceResponse struct {
 	// non-flow call.
 	LabelsOut     []string `json:"labelsOut,omitempty"`
 	CarriedLabels []string `json:"carriedLabels,omitempty"`
-	// Declassification is the authorized second phase of a flow-label clear: the labels an
-	// APPROVED declassify directive may remove, plus the approval that authorized them. Nil
-	// when nothing was authorized (the common case).
-	//
-	// AUTHORIZED, not applied, is the load-bearing distinction: the clear is performed by the
-	// CALLER via CommitDeclassification once the call has actually run. Applying it inside
-	// the decision would make the labels invisible to concurrent decisions for the whole
-	// upstream round trip, letting a sink the taint exists to stop be forwarded while the
-	// sanitizing call is still in flight. The handle is the ONLY thing the commit accepts —
-	// its authorized set is unexported, so the second phase cannot clear more than the first
-	// authorized — and a caller that never commits leaves the session as tainted as it found
-	// it (fail-closed).
-	//
-	// In-process only (json:"-"): a stateful, single-use decision artifact for the caller. The
-	// audit record's own top-level, HMAC-signed labels_cleared/approver/approval_id fields
-	// report what the commit actually CHANGED, never what was merely authorized here.
-	Declassification *Declassification `json:"-"`
 	// Effect is the contract the decision resolved against this call's arguments, stamped on
 	// an ALLOW so the effect-receipt verifier can compare what a server ATTESTS it did
 	// against what policy DECLARED — without this, that comparison would have to re-resolve
