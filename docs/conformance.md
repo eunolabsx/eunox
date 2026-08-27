@@ -479,7 +479,7 @@ and the upstream never contacted:
 | `resources/subscribe` / `resources/unsubscribe` | the newer revision replaced the pair with `subscriptions/listen`; bridging would make eunox hold the subscription correspondence for the connection's life |
 | `notifications/roots/list_changed` | announces a capability the newer revision deprecates, so it names a surface the upstream cannot read |
 | a result whose `resultType` is not `complete`, toward a `2025-11-25` host | that host has no `resultType` in its vocabulary, so it reads the result as a finished call, drops the `inputRequests` the upstream is waiting on, and the exchange desynchronizes **silently**. An unrecognized variant is refused for the same reason. Toward a *declaring* host the same result is refused too, but by the result-shape pass and for its own reason (`ENFORCEMENT_ERROR`): that host can read the member, and eunox still cannot enforce a variant it does not model |
-| a server-initiated request toward a `2026-07-28` host | that revision removed the mechanism; there is no way to ask the host and no honest answer eunox could give on its behalf. The upstream is answered rather than left blocked |
+| a server-initiated request toward a `2026-07-28` host | that revision removed the mechanism; there is no way to ask the host and no honest answer eunox could give on its behalf. The upstream is answered rather than left blocked. Its record names no policy target (the PDP never saw the request) and is rate-limited on a bucket of its own: once such a session is up, every server-initiated request the upstream issues takes this refusal, at the upstream's own rate, so elided records fold into the next admitted one as `suppressed_refusal_count` rather than being written one per frame |
 | a host *response* | on a mismatched pair the only request it could answer is a server-initiated one already refused at the leg |
 
 A method the requesting peer's **own** revision removed is not a boundary refusal: it is
@@ -700,7 +700,9 @@ tamper-evident tape):
   `elicitation/create`, upstream-initiated `tasks/*`; local subprocess upstreams)
   — not policy-enforced (no allow/deny decision), but kill-switch-checked,
   `--require-audit=strict`-gated, and audited: an allow record on delivery to a
-  client, or an `ENFORCEMENT_ERROR` deny if no client received it. The host's
+  client, or an `ENFORCEMENT_ERROR` deny if no client received it. Neither names a
+  policy target — the method on this leg is the upstream's own choice and no PDP
+  weighed it, so the record carries `method` and no `target_type`/`target`. The host's
   response is routed back to the upstream so the request completes.
 - **Transport-surface refusals** — requests turned away before (or independently
   of) a PDP decision: a rejected `Origin` (`ORIGIN_REJECTED`), an invalid bearer

@@ -41,16 +41,26 @@ func (f sinkFunc) Write(msg mcp.RPCMsg) error { return f(msg) }
 // and errOut receives the diagnostic beside it — the seam's own writer, since answering and
 // reporting the answer are one obligation and a params struct's errOut no longer reaches either.
 func answeringSeam(write func(mcp.RPCMsg) error, rec auditRecorder, legs serverRequestLegs, errOut io.Writer) serverRequestUnblocker {
+	return answeringSeamWith(write, rec, legs, errOut, newRefusalRecordLimiter())
+}
+
+// answeringSeamWith is answeringSeam over a caller-sized bucket table, for a metering test that
+// needs a table holding the categories under test alone. One builder rather than a second literal
+// per such test: a hand-mirrored copy is what let one carry the writer without the bound.
+func answeringSeamWith(write func(mcp.RPCMsg) error, rec auditRecorder, legs serverRequestLegs, errOut io.Writer, lim *categoryRecordLimiter) serverRequestUnblocker {
 	var sink mcp.MsgSink
 	if write != nil {
 		sink = sinkFunc(write)
 	}
+	// ONE refusalLimits feeding both fields, as both transports' unblocker() constructors do, so a
+	// diagnostic reached through the recorders' own channel writes where this leg's lines write.
+	recs := refusalLimits{records: lim, notices: noticesTo(errOut)}.recorders(rec)
 	return serverRequestUnblocker{
 		reqs:    &serverReqTracker{},
 		sink:    sink,
-		notices: noticesTo(errOut),
+		notices: recs.notices(),
 		report: dropReport{
-			recs: refusalLimits{records: newRefusalRecordLimiter()}.recorders(rec),
+			recs: recs,
 			subj: verifiedSession("s"),
 			legs: legs,
 		},

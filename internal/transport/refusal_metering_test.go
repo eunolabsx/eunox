@@ -195,10 +195,12 @@ func TestRefusalMetering_StdioLimiterHasABucketPerDeclaredCategory(t *testing.T)
 		assert.NotEqual(t, lim.fallback, lim.bucket(cat),
 			"stdio charges %q but its limiter builds no bucket for it", cat)
 	}
-	// The one category that reaches stdio through a SHARED helper rather than its own file, which
-	// is why the filename-scoped predecessor of this test could not see it.
+	// The two categories that reach stdio through a SHARED helper rather than its own file, which
+	// is why the filename-scoped predecessor of this test could not see them.
 	assert.Contains(t, stdioRefusalCategories, catDisplaced,
 		"trackServerRequest charges catDisplaced with whichever limiter its caller passes, and stdio passes its own")
+	assert.Contains(t, stdioRefusalCategories, catUntranslatableServerRequest,
+		"forwardServerRequest refuses at the translation boundary on either transport, and a stdio host pins a declaring revision like any other")
 }
 
 // TestRefusalMetering_SizedLimiterKeepsTheAggregateShare pins that building buckets for a SUBSET

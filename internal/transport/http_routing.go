@@ -207,14 +207,21 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 // writeSessionCreateError maps a newSession/newRemoteSession failure to the right HTTP
 // status. Transient/retryable conditions get a 503: errSessionLimit (concurrent-session
 // cap), errRacedReap (a global kill swept the registry mid-handshake; the upstream this
-// initialize started was already torn down), errShuttingDown (proxy draining). Anything
+// initialize started was already torn down), errShuttingDown (proxy draining),
+// errSessionExists (a concurrent first request on the same identity won the race and its
+// worker was gone again before this one could adopt it). Anything
 // else is an upstream-start failure — the raw error may carry a command path, IP:port, or
 // TLS detail, so it's logged to stderr and returned as a generic 500.
+//
+// errSessionExists reaches here only when the ADOPTION that normally absorbs it failed — see
+// createFirstRequestSession — which is the same benign lifecycle race as its two siblings and
+// wants the same answer. Falling to the default arm told the caller "failed to start upstream"
+// about an upstream that started fine, on a 500 no client retries, for a race a retry resolves.
 //
 // errSessionLimit is additionally recorded via recordSessionCapDeny, the same helper the
 // pre-spawn slot reservation uses, so the two ways to hit one cap can't produce two record
 // shapes — it's reachable WITHOUT an established session, so it's the cheaper flood and was
-// the one leaving no trace. The other two legs are benign lifecycle races, not attack
+// the one leaving no trace. The other three legs are benign lifecycle races, not attack
 // signal, so they stay status-only.
 func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
 	// Re-arm before ANY of the writes below. The initialize arm armed one window covering
@@ -234,6 +241,9 @@ func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.Response
 		http.Error(w, "session raced a kill-switch reap; retry", http.StatusServiceUnavailable)
 	case errors.Is(err, errShuttingDown):
 		http.Error(w, "server shutting down; retry", http.StatusServiceUnavailable)
+	case errors.Is(err, errSessionExists):
+		http.Error(w, "a concurrent request's worker for this identity was torn down before this one could join it; retry",
+			http.StatusServiceUnavailable)
 	default:
 		_, _ = fmt.Fprintf(p.errOut(), "[eunox] failed to start upstream: %v\n", err)
 		http.Error(w, "upstream unavailable", http.StatusInternalServerError)
@@ -572,7 +582,10 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// session's id could otherwise reach the forwarded notification, response routing, the
 	// re-initialize echo, or an enforced request against a victim's upstream. Runs before
 	// touchRequest so a refused request doesn't defer the victim session's idle reaping.
-	if gate, denied := p.enforceSessionGates(r.Context(), route, sess, sessionID, msg.Method, legHTTPPost); denied {
+	// auditIdentity, not msg.Method: this gate runs above dispatch and above every PDP, so its
+	// record may name no policy target. See recordSessionGateDeny.
+	gateID, gateMethod := auditIdentity(msg)
+	if gate, denied := p.enforceSessionGates(r.Context(), route, sess, sessionID, gateID, gateMethod, legHTTPPost); denied {
 		if msg.IsRequest() {
 			writeJSONMsg(w, denialResult(msg.ID, gate.code, gate.conditionType, msg.Method, ""))
 		} else {
@@ -951,7 +964,15 @@ func sessionOnlyGateVerdict(ctx context.Context, sess *httpSession) (sessionGate
 //
 // rec is the metered recorder; a nil one means the bucket refused this write, and the refusal
 // still happens either way. What the bucket bounds is the tape.
-func recordSessionGateDeny(ctx context.Context, rec auditRecorder, sessionID, method string, leg transportLeg, gate sessionGate) {
+//
+// identifier is what the record may CLAIM, and it is the caller's to supply: this gate runs before
+// dispatch and before any PDP, so the POST leg passes auditIdentity's answer while the GET and
+// DELETE legs — which carry no method at all — name nothing. Threading the method into both fields
+// let a caller who can address a victim's worker choose the target: the worker id is DERIVED from
+// claims (issuer, subject, agent id), so a POST body naming `tools/call` planted
+// `target_type: tool, target: tools/call` on the signed tape under that session's id, for a refusal
+// no policy produced — and AUTHORIZATION_FAILED is a policy class, so `eunox suggest` mines it.
+func recordSessionGateDeny(ctx context.Context, rec auditRecorder, sessionID, identifier, method string, leg transportLeg, gate sessionGate) {
 	if rec == nil {
 		return
 	}
@@ -959,7 +980,7 @@ func recordSessionGateDeny(ctx context.Context, rec auditRecorder, sessionID, me
 	if gate.reason != "" {
 		details["reason"] = gate.reason
 	}
-	rec.RecordDeny(ctx, sessionID, method, method, gate.code, gate.conditionType, details, false)
+	rec.RecordDeny(ctx, sessionID, identifier, method, gate.code, gate.conditionType, details, false)
 }
 
 // enforceSessionGates is the verdict-plus-record half used by the POST and SSE-GET
@@ -971,10 +992,10 @@ func recordSessionGateDeny(ctx context.Context, rec auditRecorder, sessionID, me
 // dispatch.go's gate order and in gate_order_test.go's dispositionPrologue). Negotiating first
 // would read and refuse against the VICTIM session's revision for a caller who has not cleared
 // the binding — an oracle for that revision, recorded under that session's id as fact.
-func (p *HTTPProxy) enforceSessionGates(ctx context.Context, route *UpstreamRoute, sess *httpSession, sessionID, method string, leg transportLeg) (sessionGate, bool) {
+func (p *HTTPProxy) enforceSessionGates(ctx context.Context, route *UpstreamRoute, sess *httpSession, sessionID, identifier, method string, leg transportLeg) (sessionGate, bool) {
 	gate, denied := route.sessionGateVerdict(ctx, sess)
 	if denied {
-		recordSessionGateDeny(ctx, p.sessionGateRecorder(route), sessionID, method, leg, gate)
+		recordSessionGateDeny(ctx, p.sessionGateRecorder(route), sessionID, identifier, method, leg, gate)
 	}
 	return gate, denied
 }
@@ -1010,7 +1031,7 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	// route is dereferenced unconditionally: handleMCP 404s an unknown route before
 	// dispatch, so a defensive nil guard here would be a fail-OPEN branch silently skipping
 	// the security gates for whatever construction reached this point without a route.
-	if _, denied := p.enforceSessionGates(r.Context(), route, sess, sessionID, "", legSSEGet); denied {
+	if _, denied := p.enforceSessionGates(r.Context(), route, sess, sessionID, "", "", legSSEGet); denied {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -1194,7 +1215,7 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		}
 		if denied {
 			p.mu.Unlock()
-			recordSessionGateDeny(r.Context(), p.sessionGateRecorder(route), sessionID, "", legHTTPDelete, gate)
+			recordSessionGateDeny(r.Context(), p.sessionGateRecorder(route), sessionID, "", "", legHTTPDelete, gate)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
