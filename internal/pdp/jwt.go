@@ -576,17 +576,19 @@ var watchedTopLevelClaims = []string{
 // `mcp` block each of its own members, at most once — before anything decoded from
 // them is trusted.
 //
-// The earlier struct unmarshals resolve any collision silently: encoding/json folds
-// field names case-insensitively and keeps the last one, so e.g. both "mcp" and "MCP"
-// bind to whichever spelling was written LAST with no signal a sibling ever existed.
-// Not externally forgeable (the JWT is signed), but an IdP template mistake or a
-// migration that left two spellings live should be a rejected token, not a
-// silently-resolved one — matching the per-grant decoders one layer in.
+// The earlier decodes resolve any collision silently, and NOT all the same way: go-jose's
+// vendored decoder matches a member name byte-exactly (so among "mcp" and "MCP" the
+// canonical spelling wins whatever the order, and two identical spellings resolve
+// last-wins), while a consumer on encoding/json folds names case-insensitively and keeps
+// the last. Which value governs therefore depends on which decoder reads the token, with
+// no signal to either that a sibling existed. Not externally forgeable (the JWT is
+// signed), but an IdP template mistake or a migration that left two spellings live should
+// be a rejected token, not a silently-resolved one.
 //
-// `sub` matters most: a payload with both "sub" and "Sub" would be enforced under
-// whichever identity sorts last, a value neither side of the exchange controls,
-// potentially widening a narrowly-scoped agent's token to a broader identity's
-// constraints.
+// `sub` matters most: it is what a manifest's principal: scoping reads, so a payload
+// naming it twice decides which constraints govern the call — up to resolving a
+// narrowly-scoped agent's token to a broader identity's — on a spelling neither side of
+// the exchange controls.
 //
 // It hands back the `mcp` block's members keyed by FoldJSONKey — nil when the payload
 // carries no `mcp` claim — because the scan has already computed that view and it is the
@@ -604,19 +606,28 @@ func rejectAmbiguousTopLevelClaims(payloadBytes []byte) (map[string]json.RawMess
 		return nil, nil
 	}
 	mcpMembers, err := capability.ClaimMembers(mcpBytes, "jwt mcp claim",
-		"v", "capabilities", "task_id", "agent_id")
+		"v", mcpMemberCapabilities, "task_id", "agent_id")
 	if err != nil {
 		return nil, capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
 	}
 	return mcpMembers, nil
 }
 
+// mcpMemberCapabilities is the `mcp` block member the null probe reads. Named so the watch
+// list that populates the member map and the key the probe looks up cannot drift apart: a
+// lookup for an unwatched name answers "absent" for every token, which is the probe going
+// silently dead.
+const mcpMemberCapabilities = "capabilities"
+
+// mcpCapabilitiesFolded is that member under ClaimMembers' own fold. Derived rather than
+// written out, for cacheScopeKeyFolded's reason — a hand-spelled fold that stopped matching
+// would fail silently, and this one gates a refusal.
+var mcpCapabilitiesFolded = capability.FoldJSONKey(mcpMemberCapabilities)
+
 // jsonNullMember reports whether a claim member's raw bytes are the JSON literal null — the
-// one value a *[]string decodes to exactly as it decodes an absent member. Trimmed rather
-// than compared outright, so the answer does not rest on whether the decoder that produced
-// raw kept the whitespace around the value.
+// one value a *[]string decodes to exactly as it decodes an absent member.
 func jsonNullMember(raw json.RawMessage) bool {
-	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+	return bytes.Equal(raw, []byte("null"))
 }
 
 // newValidatedClaims assembles the *JWTClaims ValidateToken returns, memoizing the
@@ -785,7 +796,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// gate admits it by design, the struct decode above never binds it, and an exact probe
 		// finds no member to reject, leaving the token admitted identity-only. A fold
 		// COLLISION was already refused with the payload, so at most one candidate is here.
-		if capsRaw, present := mcpMembers[capability.FoldJSONKey("capabilities")]; present && jsonNullMember(capsRaw) {
+		if capsRaw, present := mcpMembers[mcpCapabilitiesFolded]; present && jsonNullMember(capsRaw) {
 			return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("mcp.capabilities is present but null; a null capability claim is rejected — use [] for an empty (deny-all) allowlist or omit the field to defer to the manifest")))
 		}
 

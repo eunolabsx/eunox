@@ -5387,20 +5387,18 @@ func TestJWT_NullCapabilitiesVariantSpellingRejected(t *testing.T) {
 	exp := time.Now().Add(time.Hour)
 
 	cases := []struct {
-		name    string
-		mcpKey  string
-		capsKey string
-		// wantCode is empty where the shape is pinned as a rejection without pinning WHICH
-		// check refuses it.
+		name     string
+		mcpKey   string
+		capsKey  string
 		wantCode string
 	}{
 		{"variant member", "mcp", "Capabilities", jwtErrInvalidCapabilities},
 		// go-jose's decoder binds a member name EXACTLY, so a variant `mcp` block never
-		// reaches mcpClaimSet and the version check refuses this token first. Pinned as a
-		// rejection rather than as a category: were that decoder ever to fold names, the
-		// block would bind, the version check would pass, and the fold-space probe is then
-		// the check that refuses it. Either way the token never validates.
-		{"variant block", "MCP", "capabilities", ""},
+		// reaches mcpClaimSet and the VERSION check refuses this token above the probe.
+		// Pinned to that category rather than to a bare rejection: if that decoder ever
+		// folds names the block binds, the version check passes, and this row goes red
+		// naming the transition instead of staying green on a different refusal.
+		{"variant block", "MCP", "capabilities", jwtErrMissingClaims},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5414,10 +5412,8 @@ func TestJWT_NullCapabilitiesVariantSpellingRejected(t *testing.T) {
 				t.Fatalf("ValidateToken accepted a token with %s.%s = null (HasCapabilities=%v); want a terminal rejection",
 					tc.mcpKey, tc.capsKey, claims != nil && claims.HasCapabilities)
 			}
-			if tc.wantCode != "" {
-				if got := ClassifyJWTError(err); got != tc.wantCode {
-					t.Fatalf("error category = %q, want %q", got, tc.wantCode)
-				}
+			if got := ClassifyJWTError(err); got != tc.wantCode {
+				t.Fatalf("error category = %q, want %q", got, tc.wantCode)
 			}
 		})
 	}
