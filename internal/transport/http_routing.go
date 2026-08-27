@@ -207,9 +207,16 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 // writeSessionCreateError maps a newSession/newRemoteSession failure to the right HTTP
 // status. Transient/retryable conditions get a 503: errSessionLimit (concurrent-session
 // cap), errRacedReap (a global kill swept the registry mid-handshake; the upstream this
-// initialize started was already torn down), errShuttingDown (proxy draining). Anything
+// initialize started was already torn down), errShuttingDown (proxy draining),
+// errSessionExists (a concurrent first request on the same identity won the race and its
+// worker was gone again before this one could adopt it). Anything
 // else is an upstream-start failure — the raw error may carry a command path, IP:port, or
 // TLS detail, so it's logged to stderr and returned as a generic 500.
+//
+// errSessionExists reaches here only when the ADOPTION that normally absorbs it failed — see
+// createFirstRequestSession — which is the same benign lifecycle race as its two siblings and
+// wants the same answer. Falling to the default arm told the caller "failed to start upstream"
+// about an upstream that started fine, on a 500 no client retries, for a race a retry resolves.
 //
 // errSessionLimit is additionally recorded via recordSessionCapDeny, the same helper the
 // pre-spawn slot reservation uses, so the two ways to hit one cap can't produce two record
@@ -234,6 +241,9 @@ func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.Response
 		http.Error(w, "session raced a kill-switch reap; retry", http.StatusServiceUnavailable)
 	case errors.Is(err, errShuttingDown):
 		http.Error(w, "server shutting down; retry", http.StatusServiceUnavailable)
+	case errors.Is(err, errSessionExists):
+		http.Error(w, "a concurrent request's worker for this identity was torn down before this one could join it; retry",
+			http.StatusServiceUnavailable)
 	default:
 		_, _ = fmt.Fprintf(p.errOut(), "[eunox] failed to start upstream: %v\n", err)
 		http.Error(w, "upstream unavailable", http.StatusInternalServerError)

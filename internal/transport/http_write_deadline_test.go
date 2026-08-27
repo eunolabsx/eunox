@@ -234,6 +234,7 @@ func TestWriteSessionCreateError_ReArmsForTheTeardownItMayHaveJustPaid(t *testin
 		{name: "session limit", err: errSessionLimit},
 		{name: "raced reap", err: errRacedReap},
 		{name: "shutting down", err: errShuttingDown},
+		{name: "adoption of the race winner failed", err: errSessionExists},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

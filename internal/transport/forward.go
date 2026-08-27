@@ -1181,8 +1181,19 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// answer a blocked initiator wherever it can do so without acting on a second identity's
 	// behalf, and a refusal of its own says nothing about the host.
 	if refused := refuseServerRequestAcrossRevisions(msg.Method, resolveRevision(fp.revision)); refused != nil {
-		if fp.rec != nil {
-			fp.rec.RecordDeny(ctx, fp.sessionID, msg.Method, msg.Method,
+		// Through auditIdentity, the rule every refusal with no policy decision behind it shares:
+		// the sink derives target_type/target from the identifier, so passing the method straight
+		// through stamped `target_type: system, target: sampling/createMessage` onto the signed tape
+		// for a request the PDP never saw. The host-side spelling of this same refusal
+		// (refuseHostRevision) has always gone through it.
+		identifier, method := auditIdentity(msg)
+		// Metered, and through the unblocker's own wiring — this leg's tape paired with its buckets —
+		// exactly as recordForwardOutcome's refusal arm is. It used to write straight through fp.rec,
+		// reaching neither the declaration nor the walk that keeps refusals honest, while the UPSTREAM
+		// alone sets its rate: on a session whose host declared 2026-07-28, every server-initiated
+		// request it issues takes this arm, needing no host, no tracking and no delivery.
+		if rec := fp.unblocker.report.recs.forCategory(catUntranslatableServerRequest); rec != nil {
+			rec.RecordDeny(ctx, fp.sessionID, identifier, method,
 				capability.ErrCodeUntranslatableAcrossRevisions, "", nil, false)
 		}
 		fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID,

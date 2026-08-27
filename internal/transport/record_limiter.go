@@ -112,6 +112,17 @@ const (
 	// never reached its initiator. Its own bucket for catUnroutableID's reason: an upstream with a
 	// broken stdin drives one per request.
 	catRefusalUndeliverable refusalCategory = "undeliverable_server_refusal"
+	// catUntranslatableServerRequest bounds the record for a server-initiated request refused at the
+	// translation boundary — an upstream aimed one at a host whose revision removed the mechanism.
+	// Driven by the UPSTREAM alone: once such a session is up, EVERY server-initiated request it
+	// issues takes that arm, at its own send rate, with no host cooperation and no tracking, which is
+	// the axis catUndeliveredForward and catServerRequestFailed's writers are metered on.
+	//
+	// Its own bucket rather than the catRevision the host-side spelling of this same code charges:
+	// that one bounds a HOST peer's revision refusal — the record saying someone is probing the
+	// negotiated surface — and sharing would let an upstream flood elide it, which is the reason
+	// catUndeliveredForward does not share catServerRequestFailed's.
+	catUntranslatableServerRequest refusalCategory = "untranslatable_server_request"
 )
 
 // exemptBecausePolicyDenyCostsTheSame is the one reason both exemptions rest on.
@@ -133,6 +144,7 @@ var allRefusalCategories = []refusalCategory{
 	catSaturation, catKill, catAudience, catRevision, catHeaderMismatch, catUnservable,
 	catSessionGate, catUnroutable, catSmuggled, catServerRequestFailed,
 	catUndeliveredForward, catUnroutableID, catDisplaced, catRefusalUndeliverable,
+	catUntranslatableServerRequest,
 }
 
 // refusalCategories is the metered set the proxy-wide bucket table is keyed by.
@@ -160,8 +172,12 @@ const perBucketFloor = 1
 //
 // catDisplaced and its three neighbours reach stdio through trackServerRequest, a shared helper
 // both transports hand their own limiter to, so they live in neither transport's file.
+// catUntranslatableServerRequest reaches it the same way, through forwardServerRequest: a stdio
+// host pins 2026-07-28 like any other, and its subprocess upstream then has every server-initiated
+// request it issues refused at the boundary.
 var stdioRefusalCategories = []refusalCategory{
 	catRevision, catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
+	catUntranslatableServerRequest,
 }
 
 // newRefusalRecordLimiter builds the proxy-wide table: a bucket for every metered category.

@@ -181,25 +181,34 @@ func TestGateOrder_StdioDispatchedRecordsNameTheRevisionTheyRoutedBy(t *testing.
 // none had been resolved — indistinguishable on the tape from a pre-session refusal. The
 // transports now supply the session's revision as a fact and the shared leg does the stamping,
 // so a future server-initiated entry point inherits it rather than re-placing it.
+//
+// 2026-07-28 is the only revision that can show this: an empty carrier resolves to
+// capability.DefaultRevision, so a record stamped from a 2025-11-25 session is indistinguishable
+// from one stamped by the fallback. The record it consequently asserts on is this leg's BOUNDARY
+// refusal — that revision removed server-initiated requests, so nothing on this leg is forwarded
+// to such a host and no allow record exists to read the stamp off.
 func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 	t.Parallel()
 	sink, logPath := newTempAuditSink(t)
+	rec := asRecorder(&routeSink{sink: sink, upstream: "up1"})
 	fp := serverRequestParams{
-		rec:       &routeSink{sink: sink, upstream: "up1"},
+		rec:       rec,
 		sessionID: "sess",
 		pdp:       pdp.AlwaysAllowPDP{},
 		revision:  capability.Revision20260728,
 		forward:   func(context.Context, mcp.RPCMsg) bool { return true },
-		unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
+		// The leg's tape paired with its buckets, as both transports wire it: the boundary
+		// refusal's record resolves through this wiring, not through fp.rec.
+		unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, httpServerRequestLegs, io.Discard),
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"}, fp)
 	_ = sink.Close()
 
-	rec := findAuditRecordByMethod(readAuditRecords(t, logPath), "roots/list", "")
-	if rec == nil {
-		t.Fatal("the server-initiated forward left no record")
+	rec2 := findAuditRecordByMethod(readAuditRecords(t, logPath), "roots/list", "")
+	if rec2 == nil {
+		t.Fatal("the server-initiated leg left no record")
 	}
-	if got, _ := rec["protocol_revision"].(string); got != capability.Revision20260728.String() {
+	if got, _ := rec2["protocol_revision"].(string); got != capability.Revision20260728.String() {
 		t.Errorf("protocol_revision = %q, want %q — this leg's records must name the revision its session negotiated", got, capability.Revision20260728)
 	}
 }
