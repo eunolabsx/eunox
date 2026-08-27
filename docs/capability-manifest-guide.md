@@ -142,6 +142,18 @@ decoder would have ignored outright. Loading through `eunox` itself is unchanged
 manifest loader's recursive unknown-key walk still runs first, so a typo is
 still reported with its path and a "did you mean" suggestion.
 
+The **effect subtree** — `effect`, its `blastRadius`, its `byArgument` table and
+every case row, and the top-level `effectCeiling` — was the last nested policy
+object at that seam still decoding leniently, and both of its silent drops
+*widen*. A typo'd `byArguments` deletes the escalation table outright, so a base
+`class: reversible` applies to the very argument values the table existed to
+escalate; a typo'd `ref` skips the `effect.ref` integrity pin, so a block edited
+after it was pinned loads clean. `ValidateEffectContract` cannot catch either —
+it reads the decoded struct, not the key that never bound. All five objects now
+reject an unknown key at decode, naming the offending block
+(`effect: byArgument: case: unknown field "classs"`). Loading through `eunox` is
+again unchanged: the manifest loader already walked these same structs.
+
 Use the empty object `{}` for an explicit "any" subschema; only the `null` form is
 refused. The `type` keyword itself must name a real JSON-Schema type (`string`,
 `number`, `integer`, `boolean`, `object`, `array`, `null`) — an empty string, an

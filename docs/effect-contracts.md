@@ -98,6 +98,13 @@ capabilities:
   whose `blastRadius` `value` is written in a form that does not survive that is refused
   when it loads rather than published unpinnable. See
   [`registry/README.md`](../registry/README.md).
+- **An unknown key anywhere in the block is a load error**, in the `effect` object
+  itself, in `blastRadius`, in `byArgument`, in any case row, and in the top-level
+  `effectCeiling`. Both silent drops a lenient decode would allow widen the policy:
+  `byArguments` deletes the escalation table, leaving the base class applied to the
+  values the table existed to escalate, and a misspelled `ref` skips the integrity
+  pin above. This holds for `pkg/capability` used as a **library** too, not only for
+  manifests loaded through `eunox`.
 
 ## Operator surface
 
