@@ -6,18 +6,79 @@ package capability
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 )
 
-// A claim object decoded from a token an IdP minted is ambiguous in a way a plain struct
-// unmarshal resolves silently: encoding/json folds member names case-insensitively and keeps
-// the last one, so which member takes effect depends on source order rather than on anything
-// the author can see — the same ambiguity FoldJSONKey closes for the JSON-RPC envelope and the
-// tools/list scans. ClaimMembers REJECTS THE TOKEN for that rather than letting the decode pick.
+// A claim object an IdP minted can name one claim in two ways a plain struct unmarshal
+// resolves silently, and the two readers of these bytes disagree about which:
 //
-// A JWT is signed by its issuer, so this is the issuer's own minting-pipeline mistake to make
-// rather than a third party's forgery — but a claim resolved by member order is one nobody can
-// review, which is why it is refused rather than reported.
+//   - This scan and encoding/json work in FOLD space (see FoldJSONKey), where a member name
+//     is matched case-insensitively.
+//   - go-jose's vendored json fork — the decoder that actually reads a JWT payload — matches
+//     BYTE-EXACTLY, with no EqualFold fallback anywhere in it.
+//
+// So a COLLISION (`mcp` beside `MCP`) is resolved by member order for one reader and by
+// spelling for the other, and a LONE VARIANT (`MCP` alone) collides with nothing, resolves to
+// nothing, and binds to nothing — every check that reads the claim behaves as though the token
+// never carried it. ClaimMembers REJECTS THE TOKEN for both rather than letting either decode
+// pick, which is what makes the two readers agree about which claims a token carries.
+//
+// A JWT is signed by its issuer, so neither shape is a third party's forgery — but a claim
+// resolved by member order, or by nothing at all, is one nobody can review.
+
+var (
+	// ErrClaimNameVariant marks a watched claim spelled a way no decoder on this path binds:
+	// a lone case variant, which reads as an ABSENT claim rather than as the value the payload
+	// plainly carries.
+	ErrClaimNameVariant = errors.New("watched claim is spelled a way no decoder binds")
+	// ErrClaimNameCollision marks a watched claim named more than once. Separate from
+	// ErrClaimNameVariant because the two are different minting mistakes with different fixes
+	// — stop emitting two spellings, versus correct the one — and a caller classifying a
+	// refusal for an operator has only the sentinel to tell them apart. A failure carrying
+	// NEITHER sentinel is a malformed claim object, which is a third thing again.
+	ErrClaimNameCollision = errors.New("watched claim is named more than once")
+)
+
+// ClaimWatch is the validated set of canonical claim names ClaimMembers scans for.
+type ClaimWatch struct {
+	// byFold maps each name's fold to the name as the caller spelled it, which is what every
+	// other spelling of that claim is refused against.
+	byFold map[string]string
+}
+
+// NewClaimWatch validates names and returns the set ClaimMembers scans with. Build it ONCE
+// from the caller's own constants: the entries are a compile-time fact, and validating them
+// per token would put a caller's programming error on the request path, where a panic is a
+// dropped connection per request rather than a failed startup.
+//
+// Every name must be the CANONICAL spelling — the one the decoders reading those bytes
+// downstream bind — since it is what every other spelling is refused against. A single
+// mis-cased entry cannot be caught here (which spelling a foreign decoder binds is not
+// knowable from this package) and inverts the gate: the spelling every decoder binds is
+// refused and the one that binds nothing is admitted. Its guard is the caller's own test that
+// a payload spelling every watched name canonically is not refused for its spelling.
+//
+// Two names that fold together ARE caught, because that is the same ambiguity this package
+// refuses in the data, and the survivor would silently become the canonical spelling. It
+// panics rather than erroring: a watch list no token can reach should fail where a wiring
+// fault fails, at construction.
+func NewClaimWatch(names ...string) ClaimWatch {
+	if len(names) == 0 {
+		panic("capability.NewClaimWatch: no names, so the scan would report a pass over every claim object")
+	}
+	byFold := make(map[string]string, len(names))
+	for _, name := range names {
+		folded := FoldJSONKey(name)
+		if prior, dup := byFold[folded]; dup {
+			panic(fmt.Sprintf("capability.NewClaimWatch: %q and %q are the same claim to a JSON decoder, so which one is canonical depends on their order", prior, name))
+		}
+		byFold[folded] = name
+	}
+	return ClaimWatch{byFold: byFold}
+}
 
 // claimMember is one key/value pair of a claim object, in source order and WITHOUT the
 // duplicate collapsing an unmarshal into a map performs.
@@ -56,50 +117,102 @@ func claimObjectMembers(data []byte, context string) ([]claimMember, error) {
 		}
 		out = append(out, claimMember{key: key, value: raw})
 	}
+	// More() answers "is there another member", and a read error is not another member, so a
+	// truncated object leaves the loop exactly as a closed one does. Neither in-tree caller can
+	// reach that today (both hand over bytes a completed decode produced), but nothing in the
+	// exported contract obliges them to, and a scan that reports a pass over the part of an
+	// object it could read is the reads-as-absent failure this file exists to refuse.
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("%s: %w", context, err)
+	}
+	// Not dec.More(): it answers false for a trailing `}` or `]` as readily as for end of
+	// input, so it cannot tell a whole document from one with a second value after it.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: trailing data after the claim object", context)
+	}
 	return out, nil
 }
 
-// ClaimMembers validates that none of watch is spelled more than one way among data's
-// top-level JSON members, and returns each watched name's value keyed by FoldJSONKey(name)
-// — a name absent under every spelling is simply missing from the map.
+// ClaimMembers validates that each name in watch appears among data's top-level JSON members
+// at most once and spelled exactly as watch spells it, and returns each watched name's value
+// keyed by that name — a name absent under every spelling is simply missing from the map.
 //
-// The check asks "is there only one candidate for this claim at all". A JWT payload's `mcp`
-// claim and the `mcp` block's own `capabilities` member are decoded by go-jose's/encoding/json's
-// plain struct unmarshal — the case-insensitive-fold-and-keep-the-last-one rule — so an
-// ambiguity is resolved silently before anything downstream can see it:
-// `{"mcp":{"capabilities":[narrow],"Capabilities":[wide]}}` hands the decoder only the WIDE
-// array, with nothing left to indicate a narrower candidate ever existed. A JWT is signed by its
-// issuer, so this is not an externally forgeable ambiguity — but a minting pipeline that merges
-// claim sources (or a migration that renamed a claim and left both spellings live) produces it
-// easily, and the result is an authorization nobody can review.
+// Refusing a lone variant rather than honoring it is the rule two sibling guards already
+// apply to a protocol-reserved key (the tools/list envelope's list key, and the reserved
+// roots of a tool result). It is deliberately NOT the rule RefuseAmbiguousJSONKeys and the
+// strict corpus decode apply one layer down: those refuse a collision only, because the
+// stdlib decoder under them FOLDS, so a lone variant there binds to the field its author
+// meant. Here nothing binds it, which is the whole difference. Refusing costs a conforming
+// issuer nothing — RFC 7519 claim names are case-sensitive — and leaves the property
+// independent of whether any given decoder folds.
 //
-// It does NOT reject an unrecognized member: data may be a claim
+// Neither check rejects a member whose name is simply UNRECOGNIZED: data may be a claim
 // object other parties legitimately extend — a JWT's whole payload carries claims for
-// audiences besides this proxy, and even the proxy-owned `mcp` block is versioned
-// (`schemaVersion`-style) and may grow fields a running build predates. Only the small set of
-// names in watch is checked; everything else is ignored, ambiguous or not — an ambiguity in a
-// claim this build never reads is not this build's business to refuse a token over.
-func ClaimMembers(data []byte, context string, watch ...string) (map[string]json.RawMessage, error) {
+// audiences besides this proxy, and even a proxy-owned block is versioned and may grow fields
+// a running build predates. What the watch list DOES reserve is a fold-equivalence NAMESPACE:
+// a foreign claim that folds to a watched name is refused even with the canonical spelling
+// absent, since this scan cannot tell it from the watched claim mis-minted and guessing the
+// benign reading is what fails open. Everything outside that namespace is ignored, ambiguous
+// or not.
+//
+// One pass names every problem it finds. The producer these refusals exist for is a mapping
+// rule that title-cases claim names, which hits several at once, so reporting the first would
+// cost the operator a credential re-mint per claim to discover the next.
+func ClaimMembers(data []byte, context string, watch ClaimWatch) (map[string]json.RawMessage, error) {
+	if len(watch.byFold) == 0 {
+		panic("capability.ClaimMembers: unbuilt ClaimWatch, so the scan would report a pass over every claim object")
+	}
 	members, err := claimObjectMembers(data, context)
 	if err != nil {
 		return nil, err
 	}
-	want := make(map[string]bool, len(watch))
-	for _, w := range watch {
-		want[FoldJSONKey(w)] = true
-	}
-	out := make(map[string]json.RawMessage, len(want))
-	seen := make(map[string]string, len(want))
+	kept := make(map[string]claimMember, len(watch.byFold))
+	collided := make(map[string]bool, len(watch.byFold))
+	var collisions, variants []string
 	for _, m := range members {
-		folded := FoldJSONKey(m.key)
-		if !want[folded] {
+		canonical, watched := watch.byFold[FoldJSONKey(m.key)]
+		if !watched {
 			continue
 		}
-		if prior, dup := seen[folded]; dup {
-			return nil, fmt.Errorf("%s: members %q and %q are the same claim to a JSON decoder, so which one is enforced depends on their order; declare it once", context, prior, m.key)
+		if prior, dup := kept[canonical]; dup {
+			// One report per claim, not per extra member: the finding is that the claim has
+			// more than one candidate, and a payload repeating it a thousand times would
+			// otherwise build a message a thousand entries long.
+			if !collided[canonical] {
+				collided[canonical] = true
+				collisions = append(collisions, fmt.Sprintf("%q and %q (spell it %q)", prior.key, m.key, canonical))
+			}
+			continue
 		}
-		seen[folded] = m.key
-		out[folded] = m.value
+		kept[canonical] = m
+		if m.key != canonical {
+			variants = append(variants, fmt.Sprintf("%q (spell it %q)", m.key, canonical))
+		}
+	}
+	if len(collisions) > 0 || len(variants) > 0 {
+		return nil, claimNameError(context, collisions, variants)
+	}
+	out := make(map[string]json.RawMessage, len(kept))
+	for canonical, m := range kept {
+		out[canonical] = m.value
 	}
 	return out, nil
+}
+
+// claimNameError reports every mis-named claim in one error, carrying the COLLISION sentinel
+// when there is one: two candidates is the more severe ambiguity, and a caller stamping an
+// audit category needs one verdict per token however many findings the payload carries.
+func claimNameError(context string, collisions, variants []string) error {
+	var problems []string
+	if len(collisions) > 0 {
+		problems = append(problems, "named more than once, so which one is enforced depends on their order: "+strings.Join(collisions, ", "))
+	}
+	if len(variants) > 0 {
+		problems = append(problems, "spelled a way no decoder here binds, so the claim would be read as absent and every check that reads it silently skipped: "+strings.Join(variants, ", "))
+	}
+	sentinel := ErrClaimNameVariant
+	if len(collisions) > 0 {
+		sentinel = ErrClaimNameCollision
+	}
+	return fmt.Errorf("%s: %s: %w", context, strings.Join(problems, "; "), sentinel)
 }
