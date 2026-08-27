@@ -4,12 +4,14 @@
 // The translation boundary's server-initiated refusal: what it may name on the signed tape, and
 // which bucket its record charges.
 //
-// The arm had no test at all. It wrote straight through the leg's sink with the METHOD as the
-// identifier, which is both halves of what a refusal taken with no policy decision behind it owes
-// the tape: sampling/createMessage resolves a target type, so the sink stamped a policy target for
-// a request no PDP saw; and the write reached neither the metering declaration nor the call-site
-// walk that holds every other transport refusal to a declared bucket — while the UPSTREAM alone
-// sets its rate, once its host has declared a revision with no server-initiated mechanism.
+// Nothing was ABOUT the arm before this — the one test that reached it (gate_order_test.go's
+// revision stamp) asserted on a different property of the record it happened to produce. It wrote
+// straight through the leg's sink with the METHOD as the identifier, which is both halves of what a
+// refusal taken with no policy decision behind it owes the tape: sampling/createMessage resolves a
+// target type, so the sink stamped a policy target for a request no PDP saw; and the write reached
+// neither the metering declaration nor the call-site walk that holds every other transport refusal
+// to a declared bucket — while the UPSTREAM alone sets its rate, once its host has declared a
+// revision with no server-initiated mechanism.
 
 package transport
 
@@ -27,20 +29,10 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// untranslatableSeam is the answering wiring these tests hand the leg, the shape both transports'
-// unblocker() constructors produce: the leg's tape paired with its own bucket table, and an upstream
-// sink the caller can watch.
+// untranslatableSeam is the answering wiring these tests hand the leg: the shared seam builder both
+// transports' unblocker() constructors are modelled on, over a bucket table the caller sizes.
 func untranslatableSeam(write func(mcp.RPCMsg) error, rec auditRecorder, lim *categoryRecordLimiter) serverRequestUnblocker {
-	return serverRequestUnblocker{
-		reqs:    &serverReqTracker{},
-		sink:    sinkFunc(write),
-		notices: noticesTo(io.Discard),
-		report: dropReport{
-			recs: refusalLimits{records: lim}.recorders(rec),
-			subj: verifiedSession("s"),
-			legs: httpServerRequestLegs,
-		},
-	}
+	return answeringSeamWith(write, rec, httpServerRequestLegs, io.Discard, lim)
 }
 
 // untranslatableLeg is a server-initiated leg on a session whose HOST pinned 2026-07-28 — the
@@ -120,12 +112,11 @@ func TestUntranslatableServerRequest_RecordChargesItsCategory(t *testing.T) {
 
 	assert.Less(t, len(rec.records), frames,
 		"an upstream drives this record with no host cooperation; writing one per frame is the flood the declaration exists to bound")
-	// The bucket's own burst plus the one floored write its reserve admits per interval — the budget
-	// catUntranslatableServerRequest declares, not the floor-rate fallback an unregistered category
-	// would land in.
-	assert.LessOrEqual(t, len(rec.records), perCategoryDenyBurstSize+1)
-	assert.GreaterOrEqual(t, len(rec.records), perCategoryDenyBurstSize,
-		"a record resolved against a category the table holds no bucket for falls to the floor-rate fallback, which would admit far fewer")
+	// EXACTLY the burst: the clock is frozen, so no bucket refills, and the budget spent is the one
+	// catUntranslatableServerRequest declares rather than the floor-rate fallback an unregistered
+	// category lands in. Asserted exactly rather than with slack, since slack here would absorb an
+	// off-by-one admitting one more than the burst on the leading frame.
+	assert.Len(t, rec.records, perCategoryDenyBurstSize)
 	for i, r := range rec.records {
 		assert.Equal(t, "deny", r.decision, "record %d", i)
 		assert.Empty(t, r.identifier, "record %d names a policy target for a request no PDP evaluated", i)

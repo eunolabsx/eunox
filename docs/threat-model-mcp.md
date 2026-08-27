@@ -709,7 +709,12 @@ opened at another (a mid-context flip).
   The refusal is recorded under a code of its own, `UNTRANSLATABLE_ACROSS_REVISIONS`, sharing
   the spec's `-32022` integer with the establish-a-revision refusal but distinguished in
   `error.data.code` and in `denial_code` — so "this deployment is mid-migration" is greppable
-  separately from "this peer's revision could not be established". A method the requesting
+  separately from "this peer's revision could not be established". One spelling of it is
+  RATE-LIMITED and its tally is therefore a floor rather than a count: a server-initiated request
+  aimed at a host whose revision removed the mechanism is refused at the upstream's own send rate
+  with no host cooperation, so its record charges the `untranslatable_server_request` bucket and
+  elided writes fold into the next admitted record's `suppressed_refusal_count` (§3.7). The
+  host-side spelling is unaffected. A method the requesting
   peer's OWN revision removed is not a boundary refusal and keeps `UNROUTABLE_METHOD`: routing
   is a fact about one peer, the boundary a question about the pair, and reporting the first as
   the second points an operator at their migration for a call a matched pair would refuse just

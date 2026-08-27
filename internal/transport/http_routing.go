@@ -221,7 +221,7 @@ func (p *HTTPProxy) decodeStrictJSON(w http.ResponseWriter, r *http.Request, v i
 // errSessionLimit is additionally recorded via recordSessionCapDeny, the same helper the
 // pre-spawn slot reservation uses, so the two ways to hit one cap can't produce two record
 // shapes — it's reachable WITHOUT an established session, so it's the cheaper flood and was
-// the one leaving no trace. The other two legs are benign lifecycle races, not attack
+// the one leaving no trace. The other three legs are benign lifecycle races, not attack
 // signal, so they stay status-only.
 func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, err error) {
 	// Re-arm before ANY of the writes below. The initialize arm armed one window covering
