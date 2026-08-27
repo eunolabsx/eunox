@@ -464,7 +464,7 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 				// straight out of Start, so the normal teardown release never runs this path.
 				// Detached and bounded like the teardown release below, since a drift refusal
 				// is routinely reached with ctx already done (e.g. a Ctrl-C during startup).
-				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
+				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), msToDuration(p.shutdownMs))
 				p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // startup-refusal teardown: detached and bounded, matching Start's own release path.
 				releaseCancel()
 				return err
@@ -534,11 +534,11 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 	// draining the upstream reader does not cover a handler still mid-decision (a sink
 	// peeking the flow set touches no upstream) — without the drain, a release here could
 	// empty the taint between a source's committed write and a sink still deciding.
-	p.awaitHostDecisionsDrained(time.Duration(p.shutdownMs) * time.Millisecond)
+	p.awaitHostDecisionsDrained(msToDuration(p.shutdownMs))
 	// Same concern for server-initiated handlers, which run on their own goroutines rather
 	// than the reader step 7 just drained.
-	p.awaitServerRequestsDrained(time.Duration(p.shutdownMs) * time.Millisecond)
-	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Duration(p.shutdownMs)*time.Millisecond)
+	p.awaitServerRequestsDrained(msToDuration(p.shutdownMs))
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), msToDuration(p.shutdownMs))
 	p.pdp.ReleaseSession(releaseCtx, p.sessionID) //nolint:contextcheck // teardown: the host is gone; detached, bounded context is correct here too.
 	releaseCancel()
 
