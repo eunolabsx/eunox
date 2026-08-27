@@ -700,7 +700,9 @@ tamper-evident tape):
   `elicitation/create`, upstream-initiated `tasks/*`; local subprocess upstreams)
   — not policy-enforced (no allow/deny decision), but kill-switch-checked,
   `--require-audit=strict`-gated, and audited: an allow record on delivery to a
-  client, or an `ENFORCEMENT_ERROR` deny if no client received it. The host's
+  client, or an `ENFORCEMENT_ERROR` deny if no client received it. Neither names a
+  policy target — the method on this leg is the upstream's own choice and no PDP
+  weighed it, so the record carries `method` and no `target_type`/`target`. The host's
   response is routed back to the upstream so the request completes.
 - **Transport-surface refusals** — requests turned away before (or independently
   of) a PDP decision: a rejected `Origin` (`ORIGIN_REJECTED`), an invalid bearer

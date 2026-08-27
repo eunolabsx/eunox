@@ -558,9 +558,11 @@ var hostMessageDispositions = map[string]int{
 	"admit":            2,
 	"recordKillDenial": 5,
 	"recordKillDrop":   6,
-	// 6 since the session-gate record became metered: it takes its resolved recorder as a
-	// parameter now, like every other bounded refusal, rather than reaching route.sink itself.
-	"recordSessionGateDeny": 6,
+	// 7 since the session-gate record stopped deriving its identifier from the method: it takes
+	// the identifier and the method separately now, so the POST leg can pass auditIdentity's
+	// answer while the GET and DELETE legs name nothing. (It became 6 when the record became
+	// metered and started taking its resolved recorder as a parameter.)
+	"recordSessionGateDeny": 7,
 }
 
 // dispositionPrologue is the INVERTED guard's table: every function that disposes of a host

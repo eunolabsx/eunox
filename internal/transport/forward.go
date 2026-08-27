@@ -1088,14 +1088,18 @@ func samplingFlowDenial(message, reason string) capability.EnforceResponse {
 //
 // dec is the decision this gate refuses below, zero for the non-sampling leg. Its
 // decision-side annotations ride the deny record exactly as on the host path.
-func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context, msg mcp.RPCMsg, method string, dec capability.EnforceResponse) bool {
+//
+// identifier is what the record may CLAIM, which is not derivable here: the sampling caller has a
+// real policy target behind it and the non-sampling caller has no decision at all, so each supplies
+// its own (auditIdentity's answer, or the method the PDP just decided).
+func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context, msg mcp.RPCMsg, identifier, method string, dec capability.EnforceResponse) bool {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
 		return false
 	}
 	// Record BEFORE replying to the upstream (record-before-act), matching the other legs, so
 	// a crash between the two can't leave the upstream answered with no matching record.
-	fp.rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeAuditUnavailable, "",
+	fp.rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeAuditUnavailable, "",
 		mergeAuditDetails(detail, handlerFaultDetail(dec)), false)
 	fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, capability.ErrCodeAuditUnavailable), answerStrictAuditRefusal, method)
 	warnStrictAuditOnce(fp.errOutOrStderr(), fp.strictAuditWarned, reason)
@@ -1123,7 +1127,14 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // because that flood would otherwise spend the tokens bounding failServerRequestDelivery's
 // correction — the record that repairs a standing ALLOW, without which that allow stands on the
 // tamper-evident tape claiming a delivery that never happened.
-func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method string, delivered, auditOnly bool, dec capability.EnforceResponse, detail map[string]interface{}) {
+//
+// identifier is what these records may CLAIM as a target, supplied by the caller for
+// strictServerRequestAuditDenial's reason: the sampling legs name the method a PDP just decided,
+// the non-sampling leg names auditIdentity's answer for a request no PDP saw. The ALLOW is the one
+// on this leg where that mattered most — an upstream chooses the method, nothing gates which
+// methods it may name, and an allow record naming a policy target is one `eunox suggest` mines
+// into a proposed manifest grant.
+func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, identifier, method string, delivered, auditOnly bool, dec capability.EnforceResponse, detail map[string]interface{}) {
 	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, method, func() {
 		if !delivered {
 			// Through the unblocker's own wiring — this leg's tape paired with its buckets — rather
@@ -1131,14 +1142,14 @@ func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, method s
 			// fault refusalLimits exists to prevent. Nil when the leg has no tape, or when the
 			// bucket suppressed this record.
 			if rec := fp.unblocker.report.recs.forCategory(catUndeliveredForward); rec != nil {
-				rec.RecordDeny(ctx, fp.sessionID, method, method, capability.ErrCodeEnforcementError, "", detail, false)
+				rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeEnforcementError, "", detail, false)
 			}
 			return
 		}
 		if fp.rec == nil {
 			return
 		}
-		fp.rec.RecordAllow(ctx, fp.sessionID, method, method, detail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
+		fp.rec.RecordAllow(ctx, fp.sessionID, identifier, method, detail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
 	})
 }
 
@@ -1201,22 +1212,30 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		return
 	}
 	if msg.Method != samplingMethod {
+		// NOTHING on this leg is policy-enforced — no PDP decides any of the three records below —
+		// so every one of them takes auditIdentity's answer, resolved once here rather than at each
+		// arm. The method is the UPSTREAM's choice and neither transport's reader gates which
+		// methods it may name, so passing it through as the identifier let an upstream name
+		// `tools/call` and have the sink synthesize `target_type: tool, target: tools/call` from it:
+		// a policy target on a signed record for a call no policy weighed, and on the ALLOW arm one
+		// `eunox suggest` mines into a proposed manifest grant.
+		identifier, method := auditIdentity(msg)
 		if deny := fp.pdp.CheckKill(ctx, fp.sessionID); deny != nil {
 			denial := normalizeDenial(deny.Denial)
 			if fp.rec != nil {
-				fp.rec.RecordDeny(ctx, fp.sessionID, msg.Method, msg.Method, denial.Code, denial.ConditionType, nil, false)
+				fp.rec.RecordDeny(ctx, fp.sessionID, identifier, method, denial.Code, denial.ConditionType, nil, false)
 			}
-			fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerRevokedServerRequest, msg.Method)
+			fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerRevokedServerRequest, method)
 			return
 		}
 		// --require-audit=strict gates non-sampling server-initiated requests too: a degraded
 		// trail must fail closed here too, mirroring the sampling branch's gate below.
-		if fp.strictServerRequestAuditDenial(ctx, msg, msg.Method, capability.EnforceResponse{}) {
+		if fp.strictServerRequestAuditDenial(ctx, msg, identifier, method, capability.EnforceResponse{}) {
 			return
 		}
 		delivered := fp.forward(ctx, msg)
 		// Non-sampling methods are not policy-enforced, so there is no flow decision to record.
-		fp.recordForwardOutcome(ctx, msg.Method, delivered, fp.audit, capability.EnforceResponse{}, nil)
+		fp.recordForwardOutcome(ctx, identifier, method, delivered, fp.audit, capability.EnforceResponse{}, nil)
 		return
 	}
 
@@ -1232,13 +1251,13 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// --require-audit=strict gates this enforced method too. Scope: sampling needs the
 		// system:sampling opt-in, rejected at startup for HTTP upstreams, so this only bites
 		// stdio subprocess upstreams.
-		if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, dec) {
+		if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, samplingMethod, dec) {
 			return
 		}
 		delivered := fp.forward(ctx, msg)
 		// Carry the sampling decision's flow labels onto the tape, or the tape and state
 		// disagree for the sampling leg.
-		fp.recordForwardOutcome(ctx, samplingMethod, delivered, fp.audit, dec, handlerFaultDetail(dec))
+		fp.recordForwardOutcome(ctx, samplingMethod, samplingMethod, delivered, fp.audit, dec, handlerFaultDetail(dec))
 		return
 	}
 
@@ -1263,7 +1282,7 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// Strict mode gates the audit-mode observe forward too — an unrecorded observation has no
 	// audit value. Runs after the kill-switch hard-deny above so a kill still surfaces
 	// AUTHORIZATION_FAILED.
-	if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, dec) {
+	if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, samplingMethod, dec) {
 		return
 	}
 	// Record-before-act: recorded before both the stderr notice and the forward, so a crash
@@ -1286,5 +1305,5 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	//
 	// No commit: a downgraded deny is still a deny, and untainting on one would drop a label
 	// for a call policy refused (the same rule enforcedForwardCore's DecisionAllow gate states).
-	fp.recordForwardOutcome(ctx, samplingMethod, delivered, true, dec, handlerFaultDetail(dec))
+	fp.recordForwardOutcome(ctx, samplingMethod, samplingMethod, delivered, true, dec, handlerFaultDetail(dec))
 }
