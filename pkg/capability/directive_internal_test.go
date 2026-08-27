@@ -230,3 +230,43 @@ func TestUnmarshalDirective_StrictCheckAcceptsEveryMarshaledDirectiveType(t *tes
 		assert.NoError(t, err, "directive %q does not survive its own marshaling (marshaled: %s)", dt, data)
 	}
 }
+
+// ── number-preserving decode ────────────────────────────────────────────────
+
+// numericTestDirective exists only to make the directive decoder's number handling
+// observable: no shipped directive carries a numeric field, so the property has to be
+// pinned against a registered type rather than against the corpus.
+type numericTestDirective struct {
+	Threshold json.Number `json:"threshold"`
+	Any       any         `json:"any"`
+}
+
+func (numericTestDirective) DirectiveType() string { return "numericForTest" }
+func (numericTestDirective) ToObligation() Obligation {
+	return Obligation{Type: "numericForTest"}
+}
+
+// unmarshalDirective must decode with UseNumber, the same sequence unmarshalCondition
+// uses. Without it an `any`-typed policy literal above 2^53 widens to float64 and rounds
+// into a neighbouring value — the exact widening the condition decoder documents guarding
+// against, on its otherwise line-for-line twin.
+func TestUnmarshalDirective_PreservesExactNumericLiterals(t *testing.T) {
+	// Not parallel, and must not become so: it adds an entry to a package-global registry
+	// that sibling parallel tests range over, and marshalDirective has no arm for the fake.
+	const token = "numericForTest"
+	const literal = "9007199254740993"
+	directivePrototypes[token] = tokenSpec[Directive]{
+		New:   func() Directive { return &numericTestDirective{} },
+		Since: SchemaVersion01,
+		State: StateNone,
+		Uses:  usesNothing,
+	}
+	t.Cleanup(func() { delete(directivePrototypes, token) })
+
+	d, err := unmarshalDirective([]byte(`{"type":"` + token + `","threshold":` + literal + `,"any":` + literal + `}`))
+	require.NoError(t, err)
+	typed, ok := d.(*numericTestDirective)
+	require.True(t, ok, "decoded into %T", d)
+	assert.Equal(t, literal, typed.Threshold.String())
+	assert.Equal(t, json.Number(literal), typed.Any, "an interface-typed literal must stay json.Number, not widen to float64")
+}

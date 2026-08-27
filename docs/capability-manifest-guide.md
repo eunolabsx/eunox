@@ -190,6 +190,33 @@ the loader), the request is denied with `ENFORCEMENT_ERROR` rather than forwarde
 with the schema silently skipped — the tool-only guarantee does not rest on
 load-time validation alone.
 
+The **effect subtree** takes the same rule, and it needs a second one beside it.
+`effect`, its `blastRadius`, its `byArgument` table with every case row, and the
+top-level `effectCeiling` were the last nested policy objects at that seam still
+decoding leniently, and both of their silent drops *widen*: a typo'd `byArguments`
+deletes the escalation table outright, so a base `class: reversible` applies to the
+very argument values the table existed to escalate, and a typo'd `ref` skips the
+`effect.ref` integrity pin, so a block edited after it was pinned loads clean.
+`ValidateEffectContract` catches neither — it reads the decoded struct, not the key
+that never bound. An unknown key at **any depth** in either block is now a decode
+error.
+
+The second rule is for a key that is not misspelled but **ambiguous**. A lone case
+variant binds, so `{"class": …, "CLASS": …}` passes an unknown-key check by
+construction — both spellings name the same field — and `encoding/json` then keeps
+the **last** of them. That reproduces the very same two widenings from a document
+that reads as correct: a `"ByArgument": null` written below a correct table deletes
+it, a `"REF": ""` below a correct pin drops it, and the widened block re-digests to
+a value that validates against its own `effect.ref`. Two spellings of one member
+anywhere in an effect block are therefore refused outright, the same rule the
+contract-registry loader already applies to a corpus entry.
+
+Loading through `eunox` reports **unknown keys** exactly as before: the manifest
+loader's own walk covers these same structs and still runs first, so a typo keeps
+its path and its "did you mean" suggestion
+(`capabilities[0].effect.byArgument.cases["DROP"]: unknown field "classs"`), and it
+matches keys exactly, so it already refused an ambiguous one.
+
 `schemaVersion` is the manifest **grammar** version — the dialect of fields the
 document is written in, distinct from the policy-content `version`. A manifest
 with an absent or unsupported `schemaVersion` is refused at load (fail-closed)
