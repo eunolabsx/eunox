@@ -440,25 +440,27 @@ func decodeJWTClaimsPreservingNumbers(payloadBytes []byte) (map[string]interface
 }
 
 // readTokenPayload base64-decodes the payload segment ONCE and returns the
-// number-preserving raw claim map, having first rejected an ambiguous top-level or mcp-block
-// claim collision. Both readers want the same bytes, and this is the pre-auth flood path the
-// surrounding code otherwise memoizes — decoding twice per cold validation put a second
-// base64 pass and a second JSON scan on it for no new information.
-func readTokenPayload(tokenStr string) (map[string]interface{}, error) {
+// number-preserving raw claim map plus the `mcp` block's fold-keyed members, having first
+// rejected an ambiguous top-level or mcp-block claim collision. Both readers want the same
+// bytes, and this is the pre-auth flood path the surrounding code otherwise memoizes —
+// decoding twice per cold validation put a second base64 pass and a second JSON scan on it
+// for no new information.
+func readTokenPayload(tokenStr string) (rawClaims map[string]interface{}, mcpMembers map[string]json.RawMessage, err error) {
 	payloadBytes, err := jwtPayloadSegment(tokenStr)
 	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, err))
+		return nil, nil, capability.Terminal(jwtErr(jwtErrMalformedToken, err))
 	}
-	rawClaims, err := decodeJWTClaimsPreservingNumbers(payloadBytes)
+	rawClaims, err = decodeJWTClaimsPreservingNumbers(payloadBytes)
 	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", err)))
+		return nil, nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", err)))
 	}
 	// The caller's struct unmarshal resolves a "mcp"/"MCP" (or mcp-block member) collision
 	// silently; confirm there was only one candidate before trusting either.
-	if err := rejectAmbiguousTopLevelClaims(payloadBytes); err != nil {
-		return nil, err
+	mcpMembers, err = rejectAmbiguousTopLevelClaims(payloadBytes)
+	if err != nil {
+		return nil, nil, err
 	}
-	return rawClaims, nil
+	return rawClaims, mcpMembers, nil
 }
 
 // Stable JWT-failure category codes for the JWT_INVALID audit record's error_type
@@ -585,20 +587,36 @@ var watchedTopLevelClaims = []string{
 // whichever identity sorts last, a value neither side of the exchange controls,
 // potentially widening a narrowly-scoped agent's token to a broader identity's
 // constraints.
-func rejectAmbiguousTopLevelClaims(payloadBytes []byte) error {
+//
+// It hands back the `mcp` block's members keyed by FoldJSONKey — nil when the payload
+// carries no `mcp` claim — because the scan has already computed that view and it is the
+// only one that answers "does the token carry this member" for EVERY spelling rather than
+// for one. A reader that has to tell a present member from an absent one (the null-
+// capabilities probe) reads it there; an exact-key lookup in the raw claim map reports a
+// lone case variant as absent.
+func rejectAmbiguousTopLevelClaims(payloadBytes []byte) (map[string]json.RawMessage, error) {
 	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", watchedTopLevelClaims...)
 	if err != nil {
-		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
+		return nil, capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
 	}
 	mcpBytes, ok := top[capability.FoldJSONKey("mcp")]
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	if _, err := capability.ClaimMembers(mcpBytes, "jwt mcp claim",
-		"v", "capabilities", "task_id", "agent_id"); err != nil {
-		return capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
+	mcpMembers, err := capability.ClaimMembers(mcpBytes, "jwt mcp claim",
+		"v", "capabilities", "task_id", "agent_id")
+	if err != nil {
+		return nil, capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
 	}
-	return nil
+	return mcpMembers, nil
+}
+
+// jsonNullMember reports whether a claim member's raw bytes are the JSON literal null — the
+// one value a *[]string decodes to exactly as it decodes an absent member. Trimmed rather
+// than compared outright, so the answer does not rest on whether the decoder that produced
+// raw kept the whitespace around the value.
+func jsonNullMember(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 // newValidatedClaims assembles the *JWTClaims ValidateToken returns, memoizing the
@@ -739,7 +757,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		if err := tok.UnsafeClaimsWithoutVerification(&payload); err != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt payload unmarshal: %w", err)))
 		}
-		rawClaims, payloadErr := readTokenPayload(tokenStr)
+		rawClaims, mcpMembers, payloadErr := readTokenPayload(tokenStr)
 		if payloadErr != nil {
 			return nil, payloadErr
 		}
@@ -761,11 +779,14 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// A present `mcp.capabilities` of JSON null must be REJECTED, not treated as
 		// absent: the *[]string pointer can't tell absent from explicit null (both
 		// decode to nil), so a null token would otherwise bypass the exhaustive
-		// allowlist as identity-only. Probe the raw claims for the literal key.
-		if mcpRaw, ok := rawClaims["mcp"].(map[string]interface{}); ok {
-			if capRaw, present := mcpRaw["capabilities"]; present && capRaw == nil {
-				return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("mcp.capabilities is present but null; a null capability claim is rejected — use [] for an empty (deny-all) allowlist or omit the field to defer to the manifest")))
-			}
+		// allowlist as identity-only. Probed in FOLD space rather than through the exact
+		// rawClaims["mcp"]["capabilities"] pair it used to read: the payload chooses how it
+		// spells the member, and a LONE case variant collides with nothing — so the ambiguity
+		// gate admits it by design, the struct decode above never binds it, and an exact probe
+		// finds no member to reject, leaving the token admitted identity-only. A fold
+		// COLLISION was already refused with the payload, so at most one candidate is here.
+		if capsRaw, present := mcpMembers[capability.FoldJSONKey("capabilities")]; present && jsonNullMember(capsRaw) {
+			return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("mcp.capabilities is present but null; a null capability claim is rejected — use [] for an empty (deny-all) allowlist or omit the field to defer to the manifest")))
 		}
 
 		capabilitiesPresent := payload.MCP.Capabilities != nil

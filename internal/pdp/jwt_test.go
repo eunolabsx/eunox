@@ -5364,6 +5364,87 @@ func TestJWT_NullCapabilitiesRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("ValidateToken accepted a token with capabilities:null; want a terminal rejection")
 	}
+	if got := ClassifyJWTError(err); got != jwtErrInvalidCapabilities {
+		t.Fatalf("error category = %q, want %q", got, jwtErrInvalidCapabilities)
+	}
+}
+
+// TestJWT_NullCapabilitiesVariantSpellingRejected is the SAME regression one fold out: the
+// payload spells the member, and a probe that looks up one spelling reports a token plainly
+// carrying a null capabilities claim as carrying none — admitting it identity-only, which is
+// the outcome TestJWT_NullCapabilitiesRejected exists to refuse. A signed token makes this
+// the issuer's own minting mistake rather than a forgery, and surfacing that fail-closed is
+// the whole reason the probe reads the raw payload instead of the decoded struct.
+//
+// Distinct from TestJWT_AmbiguousMcpMemberRejected, which covers a fold COLLISION (two
+// spellings present): a LONE variant collides with nothing and is admitted by design, so
+// nothing upstream of the probe rejects these payloads.
+func TestJWT_NullCapabilitiesVariantSpellingRejected(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	pdp := makeJWTPDP(t, srv, "", "", nil)
+	exp := time.Now().Add(time.Hour)
+
+	cases := []struct {
+		name    string
+		mcpKey  string
+		capsKey string
+		// wantCode is empty where the shape is pinned as a rejection without pinning WHICH
+		// check refuses it.
+		wantCode string
+	}{
+		{"variant member", "mcp", "Capabilities", jwtErrInvalidCapabilities},
+		// go-jose's decoder binds a member name EXACTLY, so a variant `mcp` block never
+		// reaches mcpClaimSet and the version check refuses this token first. Pinned as a
+		// rejection rather than as a category: were that decoder ever to fold names, the
+		// block would bind, the version check would pass, and the fold-space probe is then
+		// the check that refuses it. Either way the token never validates.
+		{"variant block", "MCP", "capabilities", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A nil map value marshals to JSON null.
+			token := signRawClaimsToken(t, key, "agent-1", exp, map[string]interface{}{
+				tc.mcpKey: map[string]interface{}{"v": mcpClaimVersion, tc.capsKey: nil},
+			})
+			ctx, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
+			if err == nil {
+				claims := JWTClaimsPtr(ctx)
+				t.Fatalf("ValidateToken accepted a token with %s.%s = null (HasCapabilities=%v); want a terminal rejection",
+					tc.mcpKey, tc.capsKey, claims != nil && claims.HasCapabilities)
+			}
+			if tc.wantCode != "" {
+				if got := ClassifyJWTError(err); got != tc.wantCode {
+					t.Fatalf("error category = %q, want %q", got, tc.wantCode)
+				}
+			}
+		})
+	}
+}
+
+// TestJWT_CapabilitiesVariantSpellingStillValidates is the negative control for the fold-space
+// probe: it must refuse a NULL member under any spelling without refusing every token that
+// carries a member folding to `capabilities`. A non-null variant is out of the probe's scope —
+// this build's decoder does not bind it, so the token validates identity-only exactly as it did
+// before — and pinning that here is what makes a later change to it a deliberate one.
+func TestJWT_CapabilitiesVariantSpellingStillValidates(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+	pdp := makeJWTPDP(t, srv, "", "", nil)
+	exp := time.Now().Add(time.Hour)
+
+	token := signRawClaimsToken(t, key, "agent-1", exp, map[string]interface{}{
+		"mcp": map[string]interface{}{"v": mcpClaimVersion, "Capabilities": []string{"tool:read_file"}},
+	})
+	ctx, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
+	if err != nil {
+		t.Fatalf("a non-null capabilities member must not be refused by the null probe: %v", err)
+	}
+	if claims := JWTClaimsPtr(ctx); claims == nil || claims.HasCapabilities {
+		t.Fatalf("claims = %+v; want an identity-only token (HasCapabilities=false)", claims)
+	}
 }
 
 // signRawClaimsToken signs stdClaims plus every top-level entry of raw, exactly as
