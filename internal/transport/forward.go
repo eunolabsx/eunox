@@ -585,6 +585,13 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 			reply = mcp.RPCMsg{}
 		}
 	}()
+	// Normalized at the boundary for the same reason the msg.ID rule above is: refuseUnroutable
+	// passes nil and is safe only because it also nils callUpstream, and coupling this call's
+	// safety to that separate fact in a separate function is the shape refusalError's doc warns
+	// about — a future nil-passing caller would panic on the allow path AFTER the quota commit.
+	if allowDetails == nil {
+		allowDetails = func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil }
+	}
 	observe := false
 	var denial *capability.DenialInfo // set on the deny path; reused by the observe branch below
 	// Fail closed on anything that is not an explicit allow, not just the literal
@@ -1089,9 +1096,9 @@ func samplingFlowDenial(message, reason string) capability.EnforceResponse {
 // dec is the decision this gate refuses below, zero for the non-sampling leg. Its
 // decision-side annotations ride the deny record exactly as on the host path.
 //
-// identifier is what the record may CLAIM, which is not derivable here: the sampling caller has a
-// real policy target behind it and the non-sampling caller has no decision at all, so each supplies
-// its own (auditIdentity's answer, or the method the PDP just decided).
+// identifier is the record's claimed identity beside method: the non-sampling leg passes the
+// auditIdentity pair (no policy evaluated, so an upstream-chosen target-resolving method must
+// not stamp a fabricated target), the sampling leg its decision-backed method.
 func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context, msg mcp.RPCMsg, identifier, method string, dec capability.EnforceResponse) bool {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
@@ -1127,13 +1134,8 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // because that flood would otherwise spend the tokens bounding failServerRequestDelivery's
 // correction — the record that repairs a standing ALLOW, without which that allow stands on the
 // tamper-evident tape claiming a delivery that never happened.
-//
-// identifier is what these records may CLAIM as a target, supplied by the caller for
-// strictServerRequestAuditDenial's reason: the sampling legs name the method a PDP just decided,
-// the non-sampling leg names auditIdentity's answer for a request no PDP saw. The ALLOW is the one
-// on this leg where that mattered most — an upstream chooses the method, nothing gates which
-// methods it may name, and an allow record naming a policy target is one `eunox suggest` mines
-// into a proposed manifest grant.
+// identifier follows strictServerRequestAuditDenial's rule: the auditIdentity pair on the
+// non-sampling leg, the decision-backed method on the sampling one.
 func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, identifier, method string, delivered, auditOnly bool, dec capability.EnforceResponse, detail map[string]interface{}) {
 	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, method, func() {
 		if !delivered {
@@ -1178,6 +1180,14 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// a record written before any revision could be resolved, and this leg only runs on a
 	// session whose upstream handshake is complete.
 	ctx = capability.WithProtocolRevision(ctx, resolveRevision(fp.revision))
+	// The identity every NON-POLICY record on this leg claims. auditIdentity, not msg.Method
+	// twice: the method is upstream-controlled with no allowlist ahead of this function, so a
+	// target-resolving one (tools/call, resources/read, sampling/createMessage) would stamp a
+	// fabricated target onto the signed tape for a request no policy evaluated — the rule
+	// refuseHostRevision and recordServerRequestDropped already follow. Resolved once here so
+	// no record site below can spell it itself; the sampling branch's post-decision records
+	// keep the method identity, since DecideSampling really evaluated the system target.
+	identifier, method := auditIdentity(msg)
 	// The translation boundary, taken before the method split because it is about the LEG and
 	// not about what was asked for: a server-initiated request has no meaning for a host whose
 	// revision removed the whole mechanism, so every method on this leg is refused when the
@@ -1192,12 +1202,6 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// answer a blocked initiator wherever it can do so without acting on a second identity's
 	// behalf, and a refusal of its own says nothing about the host.
 	if refused := refuseServerRequestAcrossRevisions(msg.Method, resolveRevision(fp.revision)); refused != nil {
-		// Through auditIdentity, the rule every refusal with no policy decision behind it shares:
-		// the sink derives target_type/target from the identifier, so passing the method straight
-		// through stamped `target_type: system, target: sampling/createMessage` onto the signed tape
-		// for a request the PDP never saw. The host-side spelling of this same refusal
-		// (refuseHostRevision) has always gone through it.
-		identifier, method := auditIdentity(msg)
 		// Metered, and through the unblocker's own wiring — this leg's tape paired with its buckets —
 		// exactly as recordForwardOutcome's refusal arm is. It used to write straight through fp.rec,
 		// reaching neither the declaration nor the walk that keeps refusals honest, while the UPSTREAM
@@ -1212,14 +1216,6 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		return
 	}
 	if msg.Method != samplingMethod {
-		// NOTHING on this leg is policy-enforced — no PDP decides any of the three records below —
-		// so every one of them takes auditIdentity's answer, resolved once here rather than at each
-		// arm. The method is the UPSTREAM's choice and neither transport's reader gates which
-		// methods it may name, so passing it through as the identifier let an upstream name
-		// `tools/call` and have the sink synthesize `target_type: tool, target: tools/call` from it:
-		// a policy target on a signed record for a call no policy weighed, and on the ALLOW arm one
-		// `eunox suggest` mines into a proposed manifest grant.
-		identifier, method := auditIdentity(msg)
 		if deny := fp.pdp.CheckKill(ctx, fp.sessionID); deny != nil {
 			denial := normalizeDenial(deny.Denial)
 			if fp.rec != nil {

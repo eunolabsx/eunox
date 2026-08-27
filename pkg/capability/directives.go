@@ -4,6 +4,7 @@
 package capability
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -108,7 +109,16 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	if err := rejectUnknownJSONFields(data, target, fmt.Sprintf("directive %q", envelope.Type), "type"); err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(data, target); err != nil {
+	// Decode the ORIGINAL bytes with UseNumber, the same sequence unmarshalCondition uses
+	// and for the same reason: a numeric policy literal above 2^53 must stay json.Number
+	// rather than being widened to float64, which rounds it into a neighbouring value. No
+	// shipped directive carries a numeric field, so this is behavior-identical today —
+	// but the two decoders are otherwise line-for-line twins, and the first directive type
+	// to gain one would silently inherit the widening its condition counterpart guards
+	// against.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(target); err != nil {
 		return nil, fmt.Errorf("directive %q: %w", envelope.Type, err)
 	}
 	return target, nil

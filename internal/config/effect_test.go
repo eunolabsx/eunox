@@ -114,6 +114,29 @@ func TestEffectGrammarRejections(t *testing.T) {
 			wantErr: "unknown field",
 		},
 		{
+			// checkByArgumentKeys walks the table itself: each case row is a contract, and a
+			// typo in one is as silent as a typo in the base block — the row stops
+			// escalating and the base class applies to the very value it covered.
+			name:    "a misspelled key inside a byArgument table",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argumnt: op\n        cases:\n          DROP: {class: irreversible}\n",
+			wantErr: `byArgument: unknown field "argumnt"`,
+		},
+		{
+			name:    "a misspelled key inside a byArgument case row",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: op\n        cases:\n          DROP: {clazz: irreversible}\n",
+			wantErr: `cases["DROP"]: unknown field "clazz"`,
+		},
+		{
+			name:    "a misspelled key inside a case row's blastRadius",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: op\n        cases:\n          DROP: {class: irreversible, blastRadius: {valu: 5}}\n",
+			wantErr: `cases["DROP"].blastRadius: unknown field "valu"`,
+		},
+		{
+			name:    "a misspelled key inside the table's default row",
+			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: op\n        cases:\n          DROP: {class: irreversible}\n        default: {clazz: reversible}\n",
+			wantErr: `default: unknown field "clazz"`,
+		},
+		{
 			name:    "a byArgument table that decides nothing",
 			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: op\n",
 			wantErr: "decides nothing",
@@ -122,9 +145,16 @@ func TestEffectGrammarRejections(t *testing.T) {
 			// Matching trims and folds case, so two keys that fold together would leave
 			// which row wins to the matcher's tiebreak — the smallest key by byte order,
 			// which can be the weaker row — rather than to the author.
+			//
+			// Refused by the DECODER now rather than by validateEffectByArgument: the
+			// effect block rejects two spellings of one member at any depth, which lands
+			// first and covers strictly more (an EXACT duplicate key, which last-wins
+			// collapses before a validator can see two rows at all). The validator keeps
+			// the pairs folding alone does not reach — see the whitespace row below — and
+			// remains the check for a manifest assembled in-process rather than decoded.
 			name:    "a byArgument table whose cases collide under case folding",
 			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: q\n        cases:\n          DROP: {class: irreversible}\n          drop: {class: reversible}\n",
-			wantErr: "match the same argument value",
+			wantErr: `members "DROP" and "drop" of "byArgument.cases" are the same name`,
 		},
 		{
 			// U+017F LATIN SMALL LETTER LONG S is already lower case, so a ToLower-based
@@ -133,9 +163,12 @@ func TestEffectGrammarRejections(t *testing.T) {
 			// verbatim out of a reviewed contract corpus.
 			name:    "a byArgument table whose cases collide only under the matcher's fold",
 			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: q\n        cases:\n          select: {class: irreversible}\n          \u017felect: {class: reversible}\n",
-			wantErr: "match the same argument value",
+			wantErr: `are the same name to a JSON decoder`,
 		},
 		{
+			// The pair the decoder's fold cannot reach: these are distinct JSON members,
+			// and only the matcher's TRIM makes them collide. So this row is what keeps
+			// validateEffectByArgument's own report covered.
 			name:    "a byArgument table whose cases collide on surrounding whitespace",
 			caps:    "  - target: tool:t\n    actions: [call]\n    effect:\n      byArgument:\n        argument: q\n        cases:\n          DROP: {class: irreversible}\n          \"DROP \": {class: reversible}\n",
 			wantErr: "match the same argument value",
