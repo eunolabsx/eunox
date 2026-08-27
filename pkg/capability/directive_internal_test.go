@@ -251,6 +251,8 @@ func (numericTestDirective) ToObligation() Obligation {
 // into a neighbouring value — the exact widening the condition decoder documents guarding
 // against, on its otherwise line-for-line twin.
 func TestUnmarshalDirective_PreservesExactNumericLiterals(t *testing.T) {
+	// Not parallel, and must not become so: it adds an entry to a package-global registry
+	// that sibling parallel tests range over, and marshalDirective has no arm for the fake.
 	const token = "numericForTest"
 	const literal = "9007199254740993"
 	directivePrototypes[token] = tokenSpec[Directive]{
