@@ -583,11 +583,7 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 			killUpstreamCmd(sess.upCmd)
 			<-waited
 		}
-		p.unregisterSession(sess)
-		// Runs on EVERY teardown path (idle reap, DELETE, kill, shutdown, natural exit), so
-		// it's the one place that reclaims this session's flow-label state.
-		releaseSessionState(sess)
-		_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
+		p.finishSessionCleanup(sess)
 	}()
 
 	// Pass the proxy's serve context, not the request-scoped ctx, so kill-switch lookups on
@@ -629,9 +625,11 @@ func (p *HTTPProxy) runDriftCheckOrTeardown(ctx context.Context, sess *httpSessi
 		// to catch, so record it on the tamper-evident tape, not only stderr.
 		recordDriftRefused(ctx, asRecorder(route.sink), sess.id)
 		sess.close(p.shutdownMs) //nolint:contextcheck // teardown path: detached, bounded context by design.
-		p.mu.Lock()
-		delete(p.sessions, sess.id)
-		p.mu.Unlock()
+		// Compare-and-delete like every other removal that doesn't read-and-delete under one
+		// lock hold: close() can block long enough for the cleanup goroutine to free the key
+		// and a same-identity successor to register under it, and an unconditional delete
+		// here would orphan that successor's live upstream.
+		p.unregisterSession(sess)
 		return err
 	}
 	return nil
@@ -790,11 +788,40 @@ func (p *HTTPProxy) getSession(id string) *httpSession {
 // first-request path DERIVES ids from caller identity, so the same identity can re-register a
 // successor under the same key inside that window; deleting by id alone would silently orphan
 // the successor's live upstream (invisible to the reaper, kill sweep, and closeAllSessions).
-func (p *HTTPProxy) unregisterSession(sess *httpSession) {
+//
+// It reports whether sess was the id's LAST owner afterwards: removed here, or already removed
+// with no successor registered. Only then may the caller release the id-KEYED state (see
+// releaseSessionIDState) — a successor under the same derived key owns that state now, and a
+// predecessor's late release would silently drop its Tier-2 surface baseline and flow taint.
+func (p *HTTPProxy) unregisterSession(sess *httpSession) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.sessions[sess.id] == sess {
+	cur, ok := p.sessions[sess.id]
+	if cur == sess {
 		delete(p.sessions, sess.id)
+		return true
+	}
+	return !ok
+}
+
+// finishSessionCleanup is the tail both cleanup goroutines share once the upstream is gone.
+// Runs on EVERY teardown path (idle reap, DELETE, kill, shutdown, natural exit), so it's the
+// one place that reclaims this session's state.
+//
+// Unregisters BEFORE the drains: the hard idle ceiling reaps sessions with a wedged in-flight
+// call, and the registry entry (with its maxSessions slot) must not stay held for the drain
+// budget behind that wedge. Ownership is then RE-checked after the drains so the id-keyed
+// release commits on the freshest answer: a successor that registered meanwhile keeps the
+// id-keyed state, inheriting any residual taint — the conservative direction. The residual is
+// stated rather than closed: a successor registering during the release call itself is exposed
+// for that call's length, not the 2x-shutdownMs park. The "ended" line is gated with it, since
+// printing a live successor's id as ended inverts the start/end pairing operators correlate on.
+func (p *HTTPProxy) finishSessionCleanup(sess *httpSession) {
+	lastOwner := p.unregisterSession(sess)
+	releaseSessionObjectState(sess)
+	if lastOwner && p.getSession(sess.id) == nil {
+		releaseSessionIDState(sess)
+		_, _ = fmt.Fprintf(p.errOut(), "[eunox] HTTP session %s ended.\n", sess.id)
 	}
 }
 
@@ -1502,6 +1529,14 @@ const inFlightDrainPoll = 2 * time.Millisecond
 // can't empty the session's taint between a source's committed Add and a sink still deciding on
 // the same session — the fail-open a teardown racing live decisions would otherwise open.
 func releaseSessionState(sess *httpSession) {
+	releaseSessionObjectState(sess)
+	releaseSessionIDState(sess)
+}
+
+// releaseSessionObjectState reclaims what the session OBJECT holds — the in-flight drains, its
+// decision-gate references, its gate cache. Always owed on teardown, however many sessions have
+// carried this session's id, which is why it is split from the id-keyed half below.
+func releaseSessionObjectState(sess *httpSession) {
 	if sess.route == nil {
 		return
 	}
@@ -1531,7 +1566,19 @@ func releaseSessionState(sess *httpSession) {
 	}
 	// Gates cached for other anchors a spanning session resolved; see gateCache.close.
 	sess.decideCache.close()
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
+}
+
+// releaseSessionIDState clears the state the session's ID names in the PDP — the Tier-2 surface
+// baseline and the flow-label taint. Keyed by the id string, which under derived worker ids a
+// successor can share, so the cleanup goroutines call it only as the id's last owner
+// (unregisterSession's answer); an unconditional release here was the fail-open twin of the
+// unconditional delete: a predecessor unparking after 2x shutdownMs un-quarantined the live
+// successor's broken surface pin and emptied its taint set.
+func releaseSessionIDState(sess *httpSession) {
+	if sess.route == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sess.shutdownBudget())
 	defer cancel()
 	sess.route.pdp.ReleaseSession(ctx, sess.id)
 }
