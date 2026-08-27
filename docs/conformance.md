@@ -524,6 +524,20 @@ capability policy on top of a validated token.
 > rejected (HTTP 401). The IdP-side identity claims and standard validation below
 > work without the flag.
 
+> **Claim names are matched exactly.** eunox reads `mcp`, `sub`, `iss`, `aud`, `jti`,
+> `exp`, `nbf`, `iat` and `cnf`, and inside the `mcp` block `v`, `capabilities`,
+> `task_id` and `agent_id`. A token spelling one of them any other way — `Cnf`,
+> `JTI`, `Task_Id` — is rejected (HTTP 401, `error_type: non_canonical_claim`)
+> rather than validated with that claim quietly ignored, since a claim eunox cannot
+> bind is one it cannot enforce. RFC 7519 claim names are case-sensitive, so check
+> the casing in the IdP's claim template or mapping rule. The rule reserves the whole
+> case-equivalence namespace of those names, so a claim minted for somebody else that
+> merely differs in case from one of them — a `CNF` or `ISS` carrying another system's
+> value, with no canonical sibling — is refused too: eunox cannot tell it from the watched
+> claim mis-spelled. A claim whose name does not case-match any of them is untouched and
+> reaches a `policy` evaluator as `input.claims.<name>` under the name the issuer wrote, so
+> a custom claim's casing is the policy author's to match.
+
 ### Auth0
 
 1. Create an Auth0 API resource with identifier `https://mcp.example.com`.

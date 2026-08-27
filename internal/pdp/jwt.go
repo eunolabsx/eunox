@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -431,17 +432,27 @@ func decodeJWTClaimsPreservingNumbers(payloadBytes []byte) (map[string]interface
 	if err := dec.Decode(&claims); err != nil {
 		return nil, fmt.Errorf("decoding claims: %w", err)
 	}
-	// Reject trailing bytes (fail closed): a well-formed payload is one JSON object,
-	// and trailer bytes signal a non-conforming issuer.
-	if dec.More() {
+	// Reject trailing bytes (fail closed): a well-formed payload is one JSON object, and
+	// trailer bytes signal a non-conforming issuer. NOT dec.More(), which answers "is there
+	// another element of the current array or object" and so reports false for a trailing `}`
+	// or `]` exactly as it does for end of input — the two trailers it was written to catch.
+	// The claim scan below assumes the byte-exact decoders and it read the same ONE object.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("trailing data in JWT claims payload")
+	}
+	// A payload of the JSON literal `null` decodes into a map as a no-op, leaving a NIL map
+	// whose every exact-key read answers absent — including the `cnf` proof-of-possession
+	// check, which reads absent as not-constrained. The claim scan refuses that payload too,
+	// but in a different function, so the guarantee this one's contract states is its own.
+	if claims == nil {
+		return nil, fmt.Errorf("JWT claims payload is not a JSON object")
 	}
 	return claims, nil
 }
 
 // readTokenPayload base64-decodes the payload segment ONCE and returns the
-// number-preserving raw claim map plus the `mcp` block's fold-keyed members, having first
-// rejected an ambiguous top-level or mcp-block claim collision. Both readers want the same
+// number-preserving raw claim map plus the `mcp` block's members keyed by their canonical
+// name, having first refused any watched claim named twice or spelled a way nothing binds. Both readers want the same
 // bytes, and this is the pre-auth flood path the surrounding code otherwise memoizes —
 // decoding twice per cold validation put a second base64 pass and a second JSON scan on it
 // for no new information.
@@ -455,8 +466,9 @@ func readTokenPayload(tokenStr string) (rawClaims map[string]interface{}, mcpMem
 		return nil, nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt raw claims decode: %w", err)))
 	}
 	// The caller's struct unmarshal resolves a "mcp"/"MCP" (or mcp-block member) collision
-	// silently; confirm there was only one candidate before trusting either.
-	mcpMembers, err = rejectAmbiguousTopLevelClaims(payloadBytes)
+	// silently and binds neither spelling of a lone "MCP"; confirm there is exactly one
+	// candidate, under the name this build reads, before trusting anything decoded from it.
+	mcpMembers, err = rejectUnreadableClaimNames(payloadBytes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -479,10 +491,15 @@ const (
 	jwtErrUnsupportedVersion   = "unsupported_version"
 	jwtErrCapabilitiesDisabled = "capabilities_disabled"
 	jwtErrInvalidCapabilities  = "invalid_capabilities"
-	// jwtErrAmbiguousClaims marks a top-level `mcp`/`act` claim, or an `mcp` member,
-	// spelled more than one way (see capability.ClaimMembers) — the payload IS valid
-	// JSON, but which spelling wins is invisible to the token's own author.
-	jwtErrAmbiguousClaims   = "ambiguous_claims"
+	// jwtErrAmbiguousClaims marks a watched top-level claim, or an `mcp` member, spelled
+	// more than one way (see capability.ClaimMembers) — the payload IS valid JSON, but
+	// which spelling wins is invisible to the token's own author.
+	jwtErrAmbiguousClaims = "ambiguous_claims"
+	// jwtErrNonCanonicalClaim marks the mirror image: a watched claim spelled ONE way that
+	// is not the one any decoder here binds, so the claim reads as absent. Kept distinct
+	// from jwtErrAmbiguousClaims because the operator's fix differs — correct the spelling
+	// in the IdP's claim template, rather than stop emitting two of them.
+	jwtErrNonCanonicalClaim = "non_canonical_claim"
 	jwtErrSenderConstrained = "sender_constrained"
 	// jwtErrJWKSUnavailable marks a key-fetch failure rather than a bad token, so an
 	// IdP/JWKS outage is not recorded identically to a forged token in the audit trail.
@@ -543,9 +560,23 @@ func ClassifyJWTError(err error) string {
 	}
 }
 
+// topLevelClaimMCP and topLevelClaimCnf are the two watched claims read by exact key rather
+// than through a struct tag, named so the watch-list entry and the lookup cannot drift apart:
+// a lookup for a name that is not watched answers "absent" for every token, which is the
+// check going silently dead.
+const (
+	topLevelClaimMCP = "mcp"
+	topLevelClaimCnf = "cnf"
+)
+
 // watchedTopLevelClaims is every top-level claim THIS BUILD READS — one list rather
 // than a var plus a spliced call-site literal, so a claim can't be added to one and
-// missed in the other. Membership is "does this build read it", not "is it a
+// missed in the other. Each entry is the CANONICAL spelling, which is what makes it
+// double as the answer to "what may this claim be spelled": ClaimMembers refuses any
+// other spelling of a watched name, so an entry written with the wrong case would invert
+// the gate and refuse the spelling every decoder binds.
+//
+// Membership is "does this build read it", not "is it a
 // registered claim" (ClaimMembers' own criterion):
 //
 //   - `jti` is PRESENT, and it changed sides the moment revocation started reading it. While
@@ -554,63 +585,109 @@ func ClassifyJWTError(err error) string {
 //     `{"jti":"revoked","JTI":"clean"}` resolves last-wins to a value the holder chose — and
 //     a revoked credential keeps serving. Watching it is what makes the revocation binding.
 //   - `cnf` is deliberately PRESENT despite not being a go-jose std claim: it is read
-//     from the raw map (last-member-wins), and an ambiguous `cnf` fails OPEN —
-//     `{"cnf":{"jkt":…},"cnf":null}` resolves to null, which CnfIsSenderConstrained
-//     reads as absent, silently downgrading a PoP-bound token to a plain bearer token.
+//     from the raw map (last-member-wins), and BOTH shapes of a mis-minted `cnf` fail
+//     OPEN — `{"cnf":{"jkt":…},"cnf":null}` resolves to null and a lone `{"Cnf":{"jkt":…}}`
+//     binds to nothing, and CnfIsSenderConstrained reads either as absent, silently
+//     downgrading a PoP-bound token to a replayable plain bearer token.
 //
 // Listed explicitly rather than reflected off jwt.Claims, so a go-jose release that
 // adds or renames a field can't silently widen or narrow this check.
 var watchedTopLevelClaims = []string{
-	// The proxy's own claim block.
-	"mcp",
+	topLevelClaimMCP,
 	// Identity and audience: `sub` is what a manifest's principal: scoping reads, and
 	// `jti` is what per-token revocation is keyed on.
 	"sub", "iss", "aud", "jti",
 	// Temporal bounds: whether the token is live at all.
 	"exp", "nbf", "iat",
 	// Proof-of-possession: read from the raw claim map, and the one that fails open.
-	"cnf",
+	topLevelClaimCnf,
 }
 
-// rejectAmbiguousTopLevelClaims confirms the payload names each watched claim, and the
-// `mcp` block each of its own members, at most once — before anything decoded from
-// them is trusted.
+// topLevelClaimWatch and mcpMemberWatch are validated once, so a fold-ambiguous list fails at
+// process start rather than per token — and so the scan does not rebuild them per request.
+var (
+	topLevelClaimWatch = capability.NewClaimWatch(watchedTopLevelClaims...)
+	mcpMemberWatch     = capability.NewClaimWatch(watchedMCPMembers...)
+)
+
+// watchedMCPMembers is the same list for the proxy's own `mcp` claim block. Each entry is the
+// canonical spelling — here, the `mcpClaimSet` json tag go-jose binds — and a test derives the
+// whole list from that struct's tags, which is what a var rather than a call-site literal buys:
+// var-ness alone only lets a test enumerate what IS listed, and the hazard is the member that
+// is NOT. A field added to the block and left off this list would inherit the very decoder
+// differential the scan exists to close.
 //
-// The earlier decodes resolve any collision silently, and NOT all the same way: go-jose's
-// vendored decoder matches a member name byte-exactly (so among "mcp" and "MCP" the
-// canonical spelling wins whatever the order, and two identical spellings resolve
-// last-wins), while a consumer on encoding/json folds names case-insensitively and keeps
-// the last. Which value governs therefore depends on which decoder reads the token, with
-// no signal to either that a sibling existed. Not externally forgeable (the JWT is
-// signed), but an IdP template mistake or a migration that left two spellings live should
-// be a rejected token, not a silently-resolved one.
+// Derived by test rather than at run time for watchedTopLevelClaims' reason turned around: the
+// anti-reflection argument there is about a THIRD-PARTY struct moving under this build, and
+// `mcpClaimSet` is declared in this file, so the drift a derivation would hide cannot happen
+// and the drift a hand-written list hides is the live one.
+var watchedMCPMembers = []string{"v", mcpMemberCapabilities, "task_id", "agent_id"}
+
+// rejectUnreadableClaimNames confirms the payload names each watched claim, and the
+// `mcp` block each of its own members, at most once and under the one spelling this build
+// reads — before anything decoded from them is trusted. UNREADABLE covers both refusals
+// under one name because both leave a claim the token plainly carries unreadable by the
+// decoders downstream: a collision, where nothing can say WHICH value is the claim, and a
+// lone variant, where nothing binds the claim at all.
+//
+// The earlier decodes resolve a collision silently, and NOT the same way: go-jose's vendored
+// decoder matches a member name byte-exactly, so among "mcp" and "MCP" the canonical spelling
+// wins whatever the order, while a consumer on encoding/json folds names case-insensitively
+// and keeps the last. Which value governs therefore depends on which decoder reads the token,
+// with no signal to either that a sibling existed. Not externally forgeable (the JWT is
+// signed), but an IdP template mistake or a migration that left two spellings live should be a
+// rejected token, not a silently-resolved one. (Two IDENTICAL spellings never reach this scan
+// at all: go-jose's fork refuses a duplicate key outright, above here.)
 //
 // `sub` matters most: it is what a manifest's principal: scoping reads, so a payload
 // naming it twice decides which constraints govern the call — up to resolving a
 // narrowly-scoped agent's token to a broader identity's — on a spelling neither side of
 // the exchange controls.
 //
-// It hands back the `mcp` block's members keyed by FoldJSONKey — nil when the payload
-// carries no `mcp` claim — because the scan has already computed that view and it is the
-// only one that answers "does the token carry this member" for EVERY spelling rather than
-// for one. A reader that has to tell a present member from an absent one (the null-
-// capabilities probe) reads it there; an exact-key lookup in the raw claim map reports a
-// lone case variant as absent.
-func rejectAmbiguousTopLevelClaims(payloadBytes []byte) (map[string]json.RawMessage, error) {
-	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", watchedTopLevelClaims...)
+// A LONE variant is refused by the same scan, which is what makes the two decoders agree
+// about which claims a token carries: this scan folds, every reader of its result matches
+// byte-exactly, so admitting `{"Cnf":…}`/`{"JTI":…}`/`{"Nbf":…}` handed those readers a
+// token they saw as carrying no cnf, no jti and no lower time bound at all.
+//
+// It hands back the `mcp` block's members — nil when the payload carries no `mcp` claim —
+// because the scan has already computed that view and a reader that must tell a PRESENT
+// member from an absent one (the null-capabilities probe) cannot get it from the struct
+// decode, where both are nil.
+func rejectUnreadableClaimNames(payloadBytes []byte) (map[string]json.RawMessage, error) {
+	top, err := capability.ClaimMembers(payloadBytes, "jwt payload", topLevelClaimWatch)
 	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
+		return nil, capability.Terminal(jwtErr(claimScanErrCode(err), err))
 	}
-	mcpBytes, ok := top[capability.FoldJSONKey("mcp")]
+	mcpBytes, ok := top[topLevelClaimMCP]
 	if !ok {
 		return nil, nil
 	}
-	mcpMembers, err := capability.ClaimMembers(mcpBytes, "jwt mcp claim",
-		"v", mcpMemberCapabilities, "task_id", "agent_id")
+	mcpMembers, err := capability.ClaimMembers(mcpBytes, "jwt mcp claim", mcpMemberWatch)
 	if err != nil {
-		return nil, capability.Terminal(jwtErr(jwtErrAmbiguousClaims, err))
+		return nil, capability.Terminal(jwtErr(claimScanErrCode(err), err))
 	}
 	return mcpMembers, nil
+}
+
+// claimScanErrCode picks the audit category for a scan failure. Read from the sentinels
+// rather than from the message, so the tape names which mistake the token carries without the
+// free-form text a structured field may not hold.
+//
+// THREE outcomes, not two: beside the two minting mistakes the scan also fails on a claim
+// object that is not an object at all (`{"mcp":null}`, which struct-decodes to the zero value
+// and so reaches the scan rather than the unmarshal's own refusal). Defaulting that to
+// `ambiguous_claims` told an operator to stop emitting two spellings of a claim their token
+// spells once — and error_type is a closed set a SIEM matches on, with the message deliberately
+// never reaching the record, so the category is all they get.
+func claimScanErrCode(err error) string {
+	switch {
+	case errors.Is(err, capability.ErrClaimNameVariant):
+		return jwtErrNonCanonicalClaim
+	case errors.Is(err, capability.ErrClaimNameCollision):
+		return jwtErrAmbiguousClaims
+	default:
+		return jwtErrMalformedToken
+	}
 }
 
 // mcpMemberCapabilities is the `mcp` block member the null probe reads. Named so the watch
@@ -618,11 +695,6 @@ func rejectAmbiguousTopLevelClaims(payloadBytes []byte) (map[string]json.RawMess
 // lookup for an unwatched name answers "absent" for every token, which is the probe going
 // silently dead.
 const mcpMemberCapabilities = "capabilities"
-
-// mcpCapabilitiesFolded is that member under ClaimMembers' own fold. Derived rather than
-// written out, for cacheScopeKeyFolded's reason — a hand-spelled fold that stopped matching
-// would fail silently, and this one gates a refusal.
-var mcpCapabilitiesFolded = capability.FoldJSONKey(mcpMemberCapabilities)
 
 // jsonNullMember reports whether a claim member's raw bytes are the JSON literal null — the
 // one value a *[]string decodes to exactly as it decodes an absent member.
@@ -790,13 +862,11 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// A present `mcp.capabilities` of JSON null must be REJECTED, not treated as
 		// absent: the *[]string pointer can't tell absent from explicit null (both
 		// decode to nil), so a null token would otherwise bypass the exhaustive
-		// allowlist as identity-only. Probed in FOLD space rather than through the exact
-		// rawClaims["mcp"]["capabilities"] pair it used to read: the payload chooses how it
-		// spells the member, and a LONE case variant collides with nothing — so the ambiguity
-		// gate admits it by design, the struct decode above never binds it, and an exact probe
-		// finds no member to reject, leaving the token admitted identity-only. A fold
-		// COLLISION was already refused with the payload, so at most one candidate is here.
-		if capsRaw, present := mcpMembers[mcpCapabilitiesFolded]; present && jsonNullMember(capsRaw) {
+		// allowlist as identity-only. Read from the view the SCAN resolved rather than the
+		// rawClaims["mcp"]["capabilities"] pair it used to read, so the probe cannot disagree
+		// with the gate about which member it is reading: the scan refuses a collision and a
+		// variant spelling alike, so at most one candidate, canonically spelled, is here.
+		if capsRaw, present := mcpMembers[mcpMemberCapabilities]; present && jsonNullMember(capsRaw) {
 			return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("mcp.capabilities is present but null; a null capability claim is rejected — use [] for an empty (deny-all) allowlist or omit the field to defer to the manifest")))
 		}
 
@@ -835,7 +905,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// who captured it could replay it. An explicit `"cnf": null` is the one
 		// exception: CnfIsSenderConstrained treats it as absent, so it passes
 		// through like a token carrying no cnf at all.
-		if constrained, malformed := capability.CnfIsSenderConstrained(rawClaims["cnf"]); malformed {
+		if constrained, malformed := capability.CnfIsSenderConstrained(rawClaims[topLevelClaimCnf]); malformed {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("cnf claim is present but not a JSON object (RFC 7800 requires an object); rejecting (fail closed)")))
 		} else if constrained {
 			return nil, capability.Terminal(jwtErr(jwtErrSenderConstrained, fmt.Errorf("sender-constrained token (cnf) requires proof-of-possession, which the proxy does not verify; refusing to accept it as a plain bearer token (fail closed)")))

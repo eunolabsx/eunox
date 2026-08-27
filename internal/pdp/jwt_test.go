@@ -5376,9 +5376,10 @@ func TestJWT_NullCapabilitiesRejected(t *testing.T) {
 // the issuer's own minting mistake rather than a forgery, and surfacing that fail-closed is
 // the whole reason the probe reads the raw payload instead of the decoded struct.
 //
-// Distinct from TestJWT_AmbiguousMcpMemberRejected, which covers a fold COLLISION (two
-// spellings present): a LONE variant collides with nothing and is admitted by design, so
-// nothing upstream of the probe rejects these payloads.
+// The refusal now comes from the SCAN rather than the probe: a lone variant of a watched
+// claim is refused whatever its value, so these payloads never reach the null check. Kept
+// anyway — the null shape is the one where "read as absent" is indistinguishable from a
+// conforming identity-only token, so it must stay refused whatever layer owns the refusal.
 func TestJWT_NullCapabilitiesVariantSpellingRejected(t *testing.T) {
 	key := newTestKey(t, "k1")
 	srv := makeJWKSServer(t, key)
@@ -5392,13 +5393,14 @@ func TestJWT_NullCapabilitiesVariantSpellingRejected(t *testing.T) {
 		capsKey  string
 		wantCode string
 	}{
-		{"variant member", "mcp", "Capabilities", jwtErrInvalidCapabilities},
-		// go-jose's decoder binds a member name EXACTLY, so a variant `mcp` block never
-		// reaches mcpClaimSet and the VERSION check refuses this token above the probe.
-		// Pinned to that category rather than to a bare rejection: if that decoder ever
-		// folds names the block binds, the version check passes, and this row goes red
-		// naming the transition instead of staying green on a different refusal.
-		{"variant block", "MCP", "capabilities", jwtErrMissingClaims},
+		{"variant member", "mcp", "Capabilities", jwtErrNonCanonicalClaim},
+		// The variant BLOCK is refused by the top-level scan, before its members are read at
+		// all. Both rows now name the same category for that reason, and the value under test
+		// no longer decides the verdict — the refusal is on the NAME. What each row still
+		// pins is its first assertion: the token stays refused. That is the half that must
+		// survive any later relaxation of the spelling rule, since a null capabilities claim
+		// read as absent is indistinguishable from a conforming identity-only token.
+		{"variant block", "MCP", "capabilities", jwtErrNonCanonicalClaim},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5419,12 +5421,13 @@ func TestJWT_NullCapabilitiesVariantSpellingRejected(t *testing.T) {
 	}
 }
 
-// TestJWT_CapabilitiesVariantSpellingStillValidates is the negative control for the fold-space
-// probe: it must refuse a NULL member under any spelling without refusing every token that
-// carries a member folding to `capabilities`. A non-null variant is out of the probe's scope —
-// this build's decoder does not bind it, so the token validates identity-only exactly as it did
-// before — and pinning that here is what makes a later change to it a deliberate one.
-func TestJWT_CapabilitiesVariantSpellingStillValidates(t *testing.T) {
+// TestJWT_UnwatchedMcpMemberStillValidates is the negative control on the mcp-block scan's
+// BREADTH. The block is versioned and may grow members a running build predates, and a token
+// carrying claims minted for other consumers is ordinary — so the spelling rule must bind the
+// watched members alone. A member the build never reads is not one to refuse a token over,
+// ambiguously spelled or not, and a scan that refused every unrecognized name would make each
+// new claim in the block a breaking change for every deployed proxy.
+func TestJWT_UnwatchedMcpMemberStillValidates(t *testing.T) {
 	key := newTestKey(t, "k1")
 	srv := makeJWKSServer(t, key)
 	defer srv.Close()
@@ -5432,11 +5435,17 @@ func TestJWT_CapabilitiesVariantSpellingStillValidates(t *testing.T) {
 	exp := time.Now().Add(time.Hour)
 
 	token := signRawClaimsToken(t, key, "agent-1", exp, map[string]interface{}{
-		"mcp": map[string]interface{}{"v": mcpClaimVersion, "Capabilities": []string{"tool:read_file"}},
+		"mcp": map[string]interface{}{
+			"v": mcpClaimVersion,
+			// Unwatched, and deliberately both spellings: an ambiguity in a member this
+			// build never decodes stays none of its business.
+			"region": "eu-west-1",
+			"Region": "us-east-1",
+		},
 	})
 	ctx, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
 	if err != nil {
-		t.Fatalf("a non-null capabilities member must not be refused by the null probe: %v", err)
+		t.Fatalf("a member outside the mcp watch list must not refuse the token: %v", err)
 	}
 	if claims := JWTClaimsPtr(ctx); claims == nil || claims.HasCapabilities {
 		t.Fatalf("claims = %+v; want an identity-only token (HasCapabilities=false)", claims)
