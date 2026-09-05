@@ -367,6 +367,16 @@ type coercionVisit struct {
 	key  string
 }
 
+// isYAMLMergeKey reports whether k merges another mapping's pairs into the enclosing one.
+// It restates yaml.v3's own isMerge (value "<<" under a plain, "!" or "!!merge" tag) so this
+// walk and the decode that produces the enforced policy agree about what a merge is: a quoted
+// "<<" is a literal key there, and checking its pairs as merged ones would refuse a coerced
+// number under a key the loader's own key check is what reports.
+func isYAMLMergeKey(k *yaml.Node) bool {
+	return k.Kind == yaml.ScalarNode && k.Value == "<<" &&
+		(k.Tag == "" || k.Tag == "!" || k.Tag == "!!merge")
+}
+
 // rejectCoercedScalarsUnder is rejectCoercedValueScalars' walk, carrying the mapping key the
 // current node hangs off so a scoped numeric key is recognized only inside its own block.
 //
@@ -413,11 +423,7 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string, v
 			if err := rejectCoercedScalarsUnder(n.Content[i], isJSON, "", visited); err != nil {
 				return err
 			}
-			childKey := ""
-			if k := resolveYAMLAlias(n.Content[i]); k.Kind == yaml.ScalarNode {
-				childKey = k.Value
-			}
-			if err := rejectCoercedScalarsUnder(n.Content[i+1], isJSON, childKey, visited); err != nil {
+			if err := rejectCoercedScalarsUnder(n.Content[i+1], isJSON, childKeyFor(n.Content[i], enclosingKey), visited); err != nil {
 				return err
 			}
 		}
@@ -429,6 +435,34 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string, v
 		}
 	}
 	return nil
+}
+
+// childKeyFor is the enclosing key rejectCoercedScalarsUnder walks a mapping value under.
+//
+// A merged mapping's pairs belong to the mapping that merges them, so they carry that
+// mapping's own key: walked under "<<" they sat outside every scoped table, and
+// `conditions: [{type: blastRadius, <<: &s {max: 010}}]` loaded enforcing 8 where the inline
+// spelling is refused. The sequence form (`<<: [*a, *b]`) inherits it, that branch
+// propagating the enclosing key on.
+//
+// Every other key is canonicalized to "" unless it scopes a numeric field, because the key is
+// half of the visited set: keeping the whole vocabulary re-walks a shared anchor once per key
+// it is reachable under, which the merge inheritance turns from a fan-out into a chain — a
+// 15 KB document of merged anchors took 126 ms. Sound because the key is read for nothing
+// else: numericPolicyScalarKeyApplies indexes scopedNumericPolicyScalarKeys with it, and the
+// values:/enum: branch ignores it.
+func childKeyFor(keyNode *yaml.Node, enclosingKey string) string {
+	k := resolveYAMLAlias(keyNode)
+	if k == nil || k.Kind != yaml.ScalarNode {
+		return ""
+	}
+	if isYAMLMergeKey(k) {
+		return enclosingKey
+	}
+	if _, scoped := scopedNumericPolicyScalarKeys[k.Value]; !scoped {
+		return ""
+	}
+	return k.Value
 }
 
 // resolveYAMLAlias returns the node an alias points at (its anchored target), or n
