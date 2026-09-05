@@ -300,30 +300,69 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 	}
 }
 
-// maxCallsBucket derives the counter bucket for a maxCalls condition: casts the condition,
-// applies the skip-quota bypass, and validates the counter, session, and target. skip is true
-// under --audit observe mode (treat as satisfied); condErr is non-nil on any deny.
-func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (mc *capability.MaxCallsCondition, key string, skip bool, condErr *ConditionError) {
-	mc, condErr = castCondition[capability.MaxCallsCondition](cond)
-	if condErr != nil {
-		return nil, "", false, condErr
+// quotaBucketSpec is everything a counter-backed bucket derivation may vary. Deliberately no
+// denial CLASS: which guards run, in which order, and under which code is quotaBucketKey's, so
+// a spec cannot choose the answer the family had already drifted on.
+type quotaBucketSpec struct {
+	condType  string
+	namespace string
+	// subject and counterDetail complete the guard messages; the remediation differs per bound
+	// (wire a counter for the velocity budget vs. for the call quota), so a shared wording
+	// would send an operator to the wrong fix.
+	subject       string
+	counterDetail string
+}
+
+var (
+	maxCallsBucketSpec = quotaBucketSpec{
+		condType:  capability.ConditionTypeMaxCalls,
+		namespace: "maxcalls",
+		subject:   "maxCalls condition",
+	}
+	// Own namespace so a velocity budget and a maxCalls quota on the same target never share a
+	// bucket and corrupt each other's accounting.
+	blastRadiusBucketSpec = quotaBucketSpec{
+		condType:      capability.ConditionTypeBlastRadius,
+		namespace:     "blastradius",
+		subject:       "a cumulative blastRadius bound",
+		counterDetail: ", so a cumulative blast-radius bound cannot be enforced",
+	}
+)
+
+// quotaBucketKey is the guard sequence and key build every counter-backed bucket derivation
+// shares. skip is true under --audit observe mode (treat as satisfied).
+//
+// Shared rather than mirrored because the family had drifted here: blastRadius classified an
+// unwired counter ErrCodeConditionFailed, a POLICY code an observing posture DOWNGRADES, so an
+// --audit route forwarded the call with the cumulative budget neither checked nor counted. The
+// bound was never evaluated, so there is no verdict to downgrade.
+func (e *Engine) quotaBucketKey(ctx context.Context, req *capability.EnforceRequest, spec quotaBucketSpec) (key string, skip bool, condErr *ConditionError) {
+	if e.counter == nil {
+		return "", false, &ConditionError{
+			Code:          capability.ErrCodeEnforcementError,
+			ConditionType: spec.condType,
+			Message:       "call counter not configured" + spec.counterDetail,
+		}
 	}
 
-	if e.counter == nil {
-		return nil, "", false, &ConditionError{
+	// A caller-contract fault, not a missing field, so it takes nilRequestDenial's code rather
+	// than the session guard's: reporting "sessionId is required" would name a field the call
+	// never carried, and MISSING_CONTEXT is a POLICY class an observing route downgrades.
+	if req == nil {
+		return "", false, &ConditionError{
 			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: capability.ConditionTypeMaxCalls,
-			Message:       "call counter not configured",
+			ConditionType: spec.condType,
+			Message:       nilSeamRefusal(spec.condType, "a nil request"),
 		}
 	}
 
 	// A missing sessionID would merge quota across all anonymous callers (quota
 	// bypass / DoS). Deny rather than share a cross-session bucket.
 	if req.SessionID == "" {
-		return nil, "", false, &ConditionError{
+		return "", false, &ConditionError{
 			Code:          capability.ErrCodeMissingContext,
-			ConditionType: capability.ConditionTypeMaxCalls,
-			Message:       "sessionId is required for maxCalls condition",
+			ConditionType: spec.condType,
+			Message:       "sessionId is required for " + spec.subject,
 		}
 	}
 
@@ -338,10 +377,10 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 	// An empty bare name would key every such call into one bucket. Deny rather
 	// than quota-account an unidentifiable target.
 	if toolName == "" {
-		return nil, "", false, &ConditionError{
+		return "", false, &ConditionError{
 			Code:          capability.ErrCodeMissingContext,
-			ConditionType: capability.ConditionTypeMaxCalls,
-			Message:       "tool or resource name is required for maxCalls condition",
+			ConditionType: spec.condType,
+			Message:       "tool or resource name is required for " + spec.subject,
 		}
 	}
 
@@ -349,9 +388,23 @@ func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, 
 	// observe mode must not perform, but a nil counter, empty session, or unidentifiable
 	// target are misconfigurations observe mode should still surface, not hide as ALLOW.
 	if SkipQuota(ctx) {
-		return nil, "", true, nil
+		return "", true, nil
 	}
-	return mc, e.anchoredKey("maxcalls", req, targetType, toolName), false, nil
+	return e.anchoredKey(spec.namespace, req, targetType, toolName), false, nil
+}
+
+// maxCallsBucket derives the counter bucket for a maxCalls condition: casts the condition, then
+// applies the shared guard sequence and key build (see quotaBucketKey).
+func (e *Engine) maxCallsBucket(ctx context.Context, cond capability.Condition, req *capability.EnforceRequest) (mc *capability.MaxCallsCondition, key string, skip bool, condErr *ConditionError) {
+	mc, condErr = castCondition[capability.MaxCallsCondition](cond)
+	if condErr != nil {
+		return nil, "", false, condErr
+	}
+	key, skip, condErr = e.quotaBucketKey(ctx, req, maxCallsBucketSpec)
+	if condErr != nil || skip {
+		return nil, "", skip, condErr
+	}
+	return mc, key, false, nil
 }
 
 // maxCallsHandler is the built-in maxCalls condition handler. It commits a sliding-window

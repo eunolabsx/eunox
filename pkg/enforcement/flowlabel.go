@@ -224,7 +224,14 @@ func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceR
 // PeekSessionLabels is the exported form of peekSessionLabels, for the audit-mode antecedent
 // path to back-fill carried_labels onto a downgraded-and-forwarded deny that never went
 // through evaluateMatched's own peek.
+//
+// A nil engine or request is refused rather than dereferenced, for nilRequestDenial's reason.
+// The receiver too, because a ManifestPDP may legitimately hold none (as CeilingVerdictFor and
+// NonCommittingConditionVerdict already allow), and this seam runs on its forwarded-observe leg.
 func (e *Engine) PeekSessionLabels(ctx context.Context, req *capability.EnforceRequest) ([]string, error) {
+	if e == nil || req == nil {
+		return nil, errors.New(nilSeamRefusal("PeekSessionLabels", "a nil engine or request"))
+	}
 	return e.peekSessionLabels(ctx, req)
 }
 
@@ -247,6 +254,12 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 		// Mirrors peekSessionLabels; defense in depth since skipFlow implies no labelOutput
 		// to record anyway.
 		return nil, nil
+	}
+	// Below skipFlow, never above: this is the one leg that dereferences matched, and refusing
+	// higher up turned an antecedent-only commit on a flow-skipping engine — which never reads
+	// it — into a hard deny, the fail-shut inversion this seam must not cause.
+	if matched == nil {
+		return nil, errors.New(nilSeamRefusal("recordLabels", "a nil constraint"))
 	}
 	set := map[string]bool{}
 	for _, dir := range matched.Directives {
@@ -378,7 +391,15 @@ func (e *Engine) recordAntecedentIn(ctx context.Context, scope SourceCommitScope
 // path: when a downgraded audit-mode source's deny is forwarded, its flow labels and
 // sequenceBlock antecedent must still be recorded atomically and surfaced on the forwarded
 // record. scope names which of the two this caller wants (see SourceCommitScope).
+//
+// A nil engine or request is refused here, for PeekSessionLabels' reason; a nil matched is
+// refused by recordLabels, the only leg that reads it. Travels as a SourceCommitError like every
+// other fault on this path, so the caller's existing hard ENFORCEMENT_ERROR deny covers it with
+// no new branch.
 func (e *Engine) RecordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, scope SourceCommitScope, carriedLabels []string) ([]string, *SourceCommitError) {
+	if e == nil || req == nil {
+		return nil, &SourceCommitError{Err: errors.New(nilSeamRefusal("RecordSourceCall", "a nil engine or request")), Flow: scope.Flow}
+	}
 	return e.recordSourceCall(ctx, req, matched, scope, carriedLabels)
 }
 

@@ -344,7 +344,13 @@ func TestBlastRadiusVelocity_CumulativeAndMaxCallsCommitTogether(t *testing.T) {
 
 // TestBlastRadiusVelocity_FailsClosedWithoutACounter pins that a policy declaring a
 // cumulative bound with no counter backend wired denies rather than silently enforcing
-// nothing.
+// nothing — and, load-bearingly, denies as a FAULT.
+//
+// The code is the whole security property, not a label: this refusal used to carry the policy
+// code CONDITION_FAILED, which DenialInfo.Downgradable answers true for, so an observing
+// posture (an --audit route, or a per-constraint enforcement: audit) forwarded the call with
+// the cumulative budget neither checked nor counted. An unwired counter is the engine's own
+// state and the bound was never evaluated, so there is no verdict for any posture to downgrade.
 func TestBlastRadiusVelocity_FailsClosedWithoutACounter(t *testing.T) {
 	e := enforcement.New() // no WithCallCounter
 	caps := []capability.Constraint{refundConstraint("", "2000", 3600)}
@@ -352,6 +358,10 @@ func TestBlastRadiusVelocity_FailsClosedWithoutACounter(t *testing.T) {
 	resp := refund(t, e, caps, "10")
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	assert.Contains(t, resp.Denial.Message, "call counter not configured")
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code,
+		"an unwired counter is a fault, matching every sibling bucket derivation")
+	assert.False(t, resp.Denial.Downgradable(),
+		"no observing posture may forward this call: the cumulative budget was never checked")
 }
 
 // TestBlastRadiusVelocity_FailsClosedWithoutASession pins the bucket-key guard: with no

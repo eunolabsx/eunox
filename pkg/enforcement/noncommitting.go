@@ -41,6 +41,13 @@ func (e *Engine) NonCommittingConditionVerdict(ctx context.Context, cond capabil
 	if cond == nil || isTypedNil(cond) {
 		return nil, false
 	}
+	// Most pure handlers dereference req (Context.SourceIP, Arguments, SessionID), so dispatching
+	// one would panic where the rest of the package denies — see nilRequestDenial. ok=false is
+	// the caller's existing fail-closed signal; the cost is that it cannot distinguish this from
+	// an unusable handler, which the two share a diagnostic for.
+	if req == nil {
+		return nil, false
+	}
 	if e == nil {
 		return NonCommittingConditionVerdict(ctx, cond, req)
 	}

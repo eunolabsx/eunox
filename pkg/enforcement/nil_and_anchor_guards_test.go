@@ -154,3 +154,95 @@ func TestExportedSeams_NilArgumentsDenyRatherThanPanic(t *testing.T) {
 		})
 	}
 }
+
+// TestExportedStateSeams_NilArgumentsRefuseRatherThanPanic extends that same rule to the three
+// seams that answer with an error rather than an EnforceResponse. These are the ones a COMPOSING
+// layer reaches: the PDP's claim leg calls the first before the deciding PDP runs, and its
+// audit-mode antecedent path calls the other two on a forwarded observe deny.
+func TestExportedStateSeams_NilArgumentsRefuseRatherThanPanic(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	// Wired, so each seam reaches the dereference rather than short-circuiting on an absent
+	// subsystem — without a store PeekSessionLabels returns before it ever reads the request.
+	eng := anchoredEngine(callcounter.NewInMemory(), flowlabelstore.NewInMemory(), false)
+	var nilEng *enforcement.Engine
+
+	// The guard sits above the registry lookup, so the condition type cannot matter; ipRange is
+	// one whose handler would dereference req if it were dispatched.
+	t.Run("NonCommittingConditionVerdict with a nil request", func(t *testing.T) {
+		t.Parallel()
+		cond := capability.IPRangeCondition{CIDRs: []string{"10.0.0.0/8"}}
+		var ok bool
+		assert.NotPanics(t, func() { _, ok = eng.NonCommittingConditionVerdict(ctx, cond, nil) },
+			"a composing layer's nil request must not crash the decision point")
+		assert.False(t, ok, "ok=false is the caller's fail-closed signal; nothing may read as passed")
+
+		// The package-level entry point (a JWT-only or wiretap route, which holds no engine)
+		// takes the same guard.
+		assert.NotPanics(t, func() { _, ok = enforcement.NonCommittingConditionVerdict(ctx, cond, nil) })
+		assert.False(t, ok)
+	})
+
+	// The receiver as well as the argument: a ManifestPDP may legitimately hold no engine, and
+	// both of these run on its forwarded-observe leg.
+	t.Run("PeekSessionLabels", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name string
+			eng  *enforcement.Engine
+			req  *capability.EnforceRequest
+		}{
+			{"nil request", eng, nil},
+			{"nil engine", nilEng, req("s", "t")},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var err error
+				assert.NotPanics(t, func() { _, err = tc.eng.PeekSessionLabels(ctx, tc.req) })
+				// The caller turns any error into a hard ENFORCEMENT_ERROR deny, so reporting one
+				// is all this seam owes; a nil error would read as "no labels carried" and fail
+				// open on the sink that later checks them.
+				require.Error(t, err)
+			})
+		}
+	})
+
+	t.Run("RecordSourceCall", func(t *testing.T) {
+		t.Parallel()
+		matched := &sourceCaps("t", "confidential")[0]
+		scope := enforcement.SourceCommitScope{Flow: true, Antecedent: true}
+
+		for _, tc := range []struct {
+			name    string
+			eng     *enforcement.Engine
+			req     *capability.EnforceRequest
+			matched *capability.Constraint
+		}{
+			{"nil request", eng, nil, matched},
+			{"nil engine", nilEng, req("s", "t"), matched},
+			{"nil constraint", eng, req("s", "t"), nil},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var cerr *enforcement.SourceCommitError
+				var labels []string
+				assert.NotPanics(t, func() {
+					labels, cerr = tc.eng.RecordSourceCall(ctx, tc.req, tc.matched, scope, nil)
+				})
+				require.NotNil(t, cerr, "a commit that did not happen must not report success")
+				assert.Nil(t, labels, "nothing was written, so no labels may be stamped on the record")
+			})
+		}
+
+		// The bound on the constraint guard, and the reason it lives in recordLabels rather than
+		// at this seam: the PDP's no-match forwarded-state path passes nil deliberately (nothing
+		// was selected, and with no source labels there is no synthetic constraint to build), and
+		// the antecedent half never reads it. Refusing it here turned an observe route's
+		// antecedent record into a hard deny — the fail-shut inversion this seam must not cause.
+		t.Run("antecedent-only commit accepts a nil constraint", func(t *testing.T) {
+			labels, cerr := eng.RecordSourceCall(ctx, req("s", "t"), nil,
+				enforcement.SourceCommitScope{Antecedent: true}, nil)
+			require.Nil(t, cerr, "the antecedent half never reads the constraint")
+			assert.Nil(t, labels)
+		})
+	})
+}

@@ -111,15 +111,24 @@ func TestCompositeCounterKey_NulSeparatorWouldNotSuffice(t *testing.T) {
 	}
 }
 
-// TestCompositeCounterKey_PrefixPreserved confirms the disjoint "seq:" /
-// "maxcalls:" namespaces the callcounter backends rely on (redis.go) survive the
+// TestCompositeCounterKey_PrefixPreserved confirms the disjoint "seq:" / "maxcalls:" /
+// "blastradius:" namespaces the callcounter backends rely on (redis.go) survive the
 // length-prefixed encoding: each key still leads with its verbatim prefix token.
+//
+// blastradius is the one that shares a guard sequence with maxcalls (quotaBucketKey), so its
+// namespace is what keeps a velocity budget and a call quota on one target from draining each
+// other's accounting.
 func TestCompositeCounterKey_PrefixPreserved(t *testing.T) {
 	if got := seqKeyForTest("", "s", "tool", "t"); !strings.HasPrefix(got, "seq:") {
 		t.Errorf("sequenceHistoryKey = %q, want \"seq:\" prefix", got)
 	}
-	if got := capability.CompositeKey("maxcalls", "s", "tool", "t"); !strings.HasPrefix(got, "maxcalls:") {
-		t.Errorf("maxCalls key = %q, want \"maxcalls:\" prefix", got)
+	for _, spec := range []quotaBucketSpec{maxCallsBucketSpec, blastRadiusBucketSpec} {
+		if got := capability.CompositeKey(spec.namespace, "s", "tool", "t"); !strings.HasPrefix(got, spec.namespace+":") {
+			t.Errorf("%s key = %q, want %q prefix", spec.condType, got, spec.namespace+":")
+		}
+	}
+	if maxCallsBucketSpec.namespace == blastRadiusBucketSpec.namespace {
+		t.Error("a velocity budget and a maxCalls quota must not share a counter namespace")
 	}
 }
 

@@ -708,8 +708,15 @@ func recordFailureDenial(requestID, now string, auditOnly bool, obligations []ca
 func nilRequestDenial(seam string) capability.EnforceResponse {
 	return denyResponse("", "", false, nil, capability.DenialInfo{
 		Code:    capability.ErrCodeEnforcementError,
-		Message: seam + ": called with a nil request or constraint; refusing rather than evaluating an incomplete decision",
+		Message: nilSeamRefusal(seam, "a nil request or constraint"),
 	})
+}
+
+// nilSeamRefusal is the one wording every seam refusing a nil argument reports, so a support
+// tape can be grepped for all of them at once. what names the arguments THIS seam takes: naming
+// one it does not have sends an operator looking for a parameter that does not exist.
+func nilSeamRefusal(seam, what string) string {
+	return seam + ": called with " + what + "; refusing rather than evaluating an incomplete decision"
 }
 
 // denyResponse builds a deny EnforceResponse from the shared envelope, the single shape

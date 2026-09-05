@@ -82,64 +82,94 @@ func TestPeekSessionLabels_KnownLabelsStillOrdered(t *testing.T) {
 }
 
 // -----------------------------------------------------------------
-// maxCallsBucket: --audit must not hide misconfigurations
+// quotaBucketKey: one guard sequence for every counter-backed bucket
 // -----------------------------------------------------------------
 
-// Observe mode (--audit) exists to predict what enforcement would do. Only the counter
-// INCREMENT must be suppressed; a nil counter, an empty session, or an unidentifiable
-// target deny in enforce mode regardless of any quota, so honoring the skip before those
-// guards hid exactly the misconfigurations the audit run is meant to surface — the record
-// said ALLOW where enforce mode writes MISSING_CONTEXT.
-func TestMaxCallsBucket_SkipQuotaDoesNotBypassStructuralValidation(t *testing.T) {
-	cond := capability.MaxCallsCondition{Count: 5, WindowSeconds: 60}
+// The observe half is the original regression: --audit skips the COUNTER, not the guards in
+// front of it, so honoring the skip first hid exactly the misconfigurations an audit run exists
+// to surface — the record said ALLOW where enforce mode writes MISSING_CONTEXT.
+//
+// The class column is the second: blastRadius classified an unwired counter a POLICY code, which
+// an observing posture downgrades and FORWARDS with the budget neither checked nor counted,
+// while its siblings called it a fault. Asserted as a literal per row rather than derived from
+// the code under test, so it can actually fail.
+func TestQuotaBucketKey_GuardsAreIdenticalAcrossEverySpec(t *testing.T) {
+	specs := []quotaBucketSpec{maxCallsBucketSpec, blastRadiusBucketSpec}
 
 	cases := []struct {
-		name     string
-		engine   *Engine
-		req      *capability.EnforceRequest
-		wantCode string
-		wantMsg  string
+		name      string
+		engine    *Engine
+		req       *capability.EnforceRequest
+		wantCode  string
+		wantClass capability.DenialClass
+		wantMsg   string
 	}{
 		{
-			name:   "nil counter",
-			engine: New(),
-			req:    &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"},
-			// A fault, not a verdict: an unwired counter is the engine's own state, and the
-			// budget it was asked about was never evaluated.
-			wantCode: capability.ErrCodeEnforcementError,
-			wantMsg:  "call counter not configured",
+			// A fault, not a verdict: the counter is the engine's own state and the budget it
+			// was asked about was never evaluated, so no posture may forward past it.
+			name:      "nil counter",
+			engine:    New(),
+			req:       &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"},
+			wantCode:  capability.ErrCodeEnforcementError,
+			wantClass: capability.DenialClassFault,
+			wantMsg:   "call counter not configured",
 		},
 		{
-			name:     "empty session",
-			engine:   New(WithCallCounter(callcounter.NewInMemory())),
-			req:      &capability.EnforceRequest{SessionID: "", TargetName: "read_file"},
-			wantCode: capability.ErrCodeMissingContext,
-			wantMsg:  "sessionId is required",
+			// A caller-contract fault too, so it takes the same code rather than blaming a
+			// sessionId the call never carried.
+			name:      "nil request",
+			engine:    New(WithCallCounter(callcounter.NewInMemory())),
+			req:       nil,
+			wantCode:  capability.ErrCodeEnforcementError,
+			wantClass: capability.DenialClassFault,
+			wantMsg:   "called with a nil request",
 		},
 		{
-			name:     "empty target name",
-			engine:   New(WithCallCounter(callcounter.NewInMemory())),
-			req:      &capability.EnforceRequest{SessionID: "s", TargetName: ""},
-			wantCode: capability.ErrCodeMissingContext,
-			wantMsg:  "tool or resource name is required",
+			// DenialClassPolicy, recorded rather than asserted as safe: this refusal IS
+			// downgradable, so an observing route forwards a call whose bucket was never
+			// derived. It pre-dates the shared guard and is not this seam's to change — pinned
+			// so a future correction is a visible edit rather than a silent one.
+			name:      "empty session",
+			engine:    New(WithCallCounter(callcounter.NewInMemory())),
+			req:       &capability.EnforceRequest{SessionID: "", TargetName: "read_file"},
+			wantCode:  capability.ErrCodeMissingContext,
+			wantClass: capability.DenialClassPolicy,
+			wantMsg:   "sessionId is required",
+		},
+		{
+			name:      "empty target name",
+			engine:    New(WithCallCounter(callcounter.NewInMemory())),
+			req:       &capability.EnforceRequest{SessionID: "s", TargetName: ""},
+			wantCode:  capability.ErrCodeMissingContext,
+			wantClass: capability.DenialClassPolicy,
+			wantMsg:   "tool or resource name is required",
 		},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Enforce mode establishes the expected verdict...
-			_, _, skip, condErr := tc.engine.maxCallsBucket(context.Background(), cond, tc.req)
-			require.NotNil(t, condErr, "enforce mode must deny this misconfiguration")
-			require.False(t, skip)
-			assert.Equal(t, tc.wantCode, condErr.Code)
 
-			// ...and observe mode must report the SAME thing rather than skipping past it.
-			_, _, skip, condErr = tc.engine.maxCallsBucket(WithSkipQuota(context.Background()), cond, tc.req)
-			require.NotNil(t, condErr, "--audit must not hide a misconfiguration enforce mode denies")
-			assert.False(t, skip, "skip must not be reported for a request that fails structural validation")
-			assert.Equal(t, tc.wantCode, condErr.Code, "the observed code must match what enforce mode would record")
-			assert.True(t, strings.Contains(condErr.Message, tc.wantMsg),
-				"message = %q, want it to mention %q", condErr.Message, tc.wantMsg)
-		})
+	for _, spec := range specs {
+		for _, tc := range cases {
+			t.Run(spec.condType+"/"+tc.name, func(t *testing.T) {
+				for _, posture := range []struct {
+					name string
+					ctx  context.Context
+				}{
+					{"enforce", context.Background()},
+					{"observe", WithSkipQuota(context.Background())},
+				} {
+					key, skip, condErr := tc.engine.quotaBucketKey(posture.ctx, tc.req, spec)
+					require.NotNil(t, condErr, "%s must deny this misconfiguration", posture.name)
+					assert.False(t, skip, "%s: skip must not be reported for a failed structural guard", posture.name)
+					assert.Empty(t, key)
+					assert.Equal(t, tc.wantCode, condErr.Code,
+						"%s: the code must not depend on the condition or the posture", posture.name)
+					assert.Equal(t, tc.wantClass, capability.ClassifyDenialCode(condErr.Code),
+						"%s: whether this refusal is downgradable must not depend on the condition", posture.name)
+					assert.Equal(t, spec.condType, condErr.ConditionType)
+					assert.True(t, strings.Contains(condErr.Message, tc.wantMsg),
+						"%s: message = %q, want it to mention %q", posture.name, condErr.Message, tc.wantMsg)
+				}
+			})
+		}
 	}
 }
 
