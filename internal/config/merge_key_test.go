@@ -17,6 +17,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -282,87 +283,149 @@ capabilities:
 	}
 }
 
-// Precedence and shape, at the level the splice actually implements: the merging mapping's own
-// keys win over every source, and earlier sources win over later ones — matching what the decode
-// does with the same document, which is the whole point of doing this before it.
-func TestResolveMergeKeys_PrecedenceMatchesTheDecoder(t *testing.T) {
+// Precedence is the DECODER's, not a copy of its rules: the pre-decode read asks yaml.v3 which
+// scalar binds, so own-key-wins, last-`<<`-wins, alias resolution, the self-referential-anchor
+// check and the alias-expansion budget are all its. Asserted against the decoder as oracle
+// rather than against a hardcoded expectation, which is the only form that can catch a
+// divergence.
+func TestSchemaVersionRead_MatchesTheDecoder(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
-		name string
-		doc  string
-		want map[string]string
-	}{
-		{
-			name: "the mapping's own key wins over the merge",
-			doc:  "base: &b {a: from-base, b: from-base}\nmain:\n  <<: *b\n  a: own\n",
-			want: map[string]string{"a": "own", "b": "from-base"},
-		},
-		{
-			name: "an earlier source in a list wins over a later one",
-			doc:  "one: &x {a: first}\ntwo: &y {a: second, b: second}\nmain:\n  <<: [*x, *y]\n",
-			want: map[string]string{"a": "first", "b": "second"},
-		},
-		{
-			name: "a source that itself merges is flattened first",
-			doc:  "root: &r {a: root, b: root}\nmid: &m\n  <<: *r\n  b: mid\nmain:\n  <<: *m\n",
-			want: map[string]string{"a": "root", "b": "mid"},
-		},
+	docs := []string{
+		`schemaVersion: "0.1"`,
+		"<<: &v\n  schemaVersion: \"0.1\"",
+		"base: &b {schemaVersion: \"0.1\"}\n<<: *b\nschemaVersion: \"0.2\"",
+		"one: &x {schemaVersion: \"0.1\"}\ntwo: &y {schemaVersion: \"0.2\"}\n<<: [*x, *y]",
+		"root: &r {schemaVersion: \"0.1\"}\nmid: &m\n  <<: *r\n  schemaVersion: \"0.2\"\n<<: *m",
+		`other: 1`,
 	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	for _, doc := range docs {
+		t.Run(strings.ReplaceAll(doc, "\n", " / "), func(t *testing.T) {
 			var node yaml.Node
-			if err := yaml.Unmarshal([]byte(tc.doc), &node); err != nil {
+			if err := yaml.Unmarshal([]byte(doc+"\n"), &node); err != nil {
 				t.Fatalf("parse: %v", err)
 			}
-			resolveMergeKeys(&node)
-
-			// The decoder is the oracle: it resolves merges itself, so the flattened node must
-			// decode to exactly what the original document does.
-			var got map[string]map[string]string
-			if err := node.Decode(&got); err != nil {
-				t.Fatalf("decode flattened: %v", err)
+			// The oracle: what the decode that produces the enforced document binds.
+			var want struct {
+				SchemaVersion string `yaml:"schemaVersion"`
 			}
-			for k, want := range tc.want {
-				if got["main"][k] != want {
-					t.Errorf("main[%q] = %q, want %q (whole: %v)", k, got["main"][k], want, got["main"])
-				}
+			if err := node.Decode(&want); err != nil {
+				t.Fatalf("oracle decode: %v", err)
 			}
-			if _, ok := got["main"]["<<"]; ok {
-				t.Error("the merge key must be dropped, not carried forward as an ordinary key")
+			got, _ := schemaVersionFromNode(&node)
+			if got != want.SchemaVersion {
+				t.Errorf("schemaVersionFromNode = %q, decoder binds %q", got, want.SchemaVersion)
 			}
 		})
 	}
 }
 
-// A merge this pass cannot reproduce the decoder's precedence for is LEFT ALONE, so the decode
-// reports it rather than the pass guessing at a repair. The document must still be refused, and
-// must not hang: a self-referential anchor graph is the shape that recursed until the stack
-// overflowed, which is an uncatchable fatal error rather than a load failure.
-func TestResolveMergeKeys_UnresolvableAndCyclicDocumentsAreSafe(t *testing.T) {
+// The retag writes a FRESH node and never mutates the one it read, so a scalar reachable from
+// somewhere else keeps its own type.
+//
+// This is the failure forceSchemaVersionToString's doc describes: with `values: [*ver]` beside
+// an anchored numeric `schemaVersion`, retagging the anchor decodes that condition's value as a
+// Go string rather than a json.Number, and MatchAllowedValue matches a string entry only as a
+// glob against a string argument — so the capability silently denies every call it was written
+// to allow. It reproduced for the ANCHORED spelling before this change, merge or no merge.
+func TestForceSchemaVersion_NeverRetagsASharedScalar(t *testing.T) {
 	t.Parallel()
 
 	for _, doc := range []string{
-		"main:\n  <<: 5\n  a: b\n",           // not a mapping
-		"main:\n  <<: [&x {a: b}, 5]\n",      // a list with a non-mapping element
-		"main: &m\n  <<: *m\n  a: b\n",       // merges itself
-		"a: &a\n  <<: *b\nb: &b\n  <<: *a\n", // two anchors merging each other
+		"schemaVersion: &ver 0.1\nvalues: [*ver]\n",
+		"anchor: &ver 0.1\nschemaVersion: *ver\nvalues: [*ver]\n",
+		"<<: &d\n  schemaVersion: &ver 0.1\nvalues: [*ver]\n",
 	} {
-		var node yaml.Node
-		if err := yaml.Unmarshal([]byte(doc), &node); err != nil {
-			continue // a document yaml.v3 will not even parse needs nothing from this pass
+		t.Run(strings.ReplaceAll(doc, "\n", " / "), func(t *testing.T) {
+			var node yaml.Node
+			if err := yaml.Unmarshal([]byte(doc), &node); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			forceSchemaVersionToString(&node)
+
+			var out struct {
+				SchemaVersion string        `yaml:"schemaVersion"`
+				Values        []interface{} `yaml:"values"`
+			}
+			if err := node.Decode(&out); err != nil {
+				t.Fatalf("decode after retag: %v", err)
+			}
+			if out.SchemaVersion != "0.1" {
+				t.Errorf("schemaVersion = %q, want the verbatim text as a string", out.SchemaVersion)
+			}
+			if len(out.Values) != 1 {
+				t.Fatalf("values = %v", out.Values)
+			}
+			if _, isString := out.Values[0].(string); isString {
+				t.Errorf("values[0] decoded as a Go string; the retag rewrote a scalar it does not own, "+
+					"which silently narrows every allowedValues entry aliasing it (got %#v)", out.Values[0])
+			}
+		})
+	}
+}
+
+// The pre-decode read must never ACCEPT a document the decode refuses: the gate exists so a
+// future dialect is reported as one rather than as a typo, and a gate reading a document the
+// enforcement never sees is worse than no gate. Every row here is refused by yaml.v3, so the
+// read reports "no version" and the loader falls through to the decode's own diagnosis.
+func TestSchemaVersionRead_RefusesNothingTheDecoderRefuses(t *testing.T) {
+	t.Parallel()
+
+	for _, doc := range []string{
+		"main:\n  <<: &x {schemaVersion: \"0.1\"}\n  <<: &y {schemaVersion: \"0.2\"}\n", // duplicate merge key
+		"list: &l\n  - {a: 1}\nt:\n  <<: *l\n",                                          // alias to a sequence
+		"a: &A\n  b:\n    <<: *A\n",                                                     // self-referential anchor
+	} {
+		t.Run(strings.ReplaceAll(doc, "\n", " / "), func(t *testing.T) {
+			path := writeManifestFile(t, doc+"name: p\nversion: \"1.0.0\"\ncapabilities: []\n")
+			done := make(chan error, 1)
+			go func() {
+				_, err := LoadManifest(path)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Error("a document yaml.v3 refuses must not load; the pre-decode read must not resolve it")
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("LoadManifest did not terminate")
+			}
+		})
+	}
+}
+
+// The alias-expansion budget is yaml.v3's, so a chained-anchor bomb is still refused in
+// milliseconds rather than expanded. A pre-decode pass that flattened merges into literal pairs
+// defeated it structurally — the decode then counted no aliases at all — and turned a 151 KB
+// document into 38 s and 1.5 GB.
+func TestSchemaVersionRead_AliasBudgetStillApplies(t *testing.T) {
+	t.Parallel()
+
+	doc := "name: p\nversion: \"1.0.0\"\ncapabilities: []\na0: &a0 {k0: 0}\n"
+	for i := 1; i <= 2000; i++ {
+		doc += fmt.Sprintf("a%d: &a%d {<<: *a%d, k%d: %d}\n", i, i, i-1, i, i)
+	}
+	path := writeManifestFile(t, doc)
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := LoadManifest(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("an alias bomb must be refused")
 		}
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			resolveMergeKeys(&node)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("resolveMergeKeys did not terminate on %q", doc)
+		if !strings.Contains(err.Error(), "excessive aliasing") {
+			t.Errorf("want yaml.v3's own alias-budget refusal, got: %v", err)
 		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("refusal took %v; the budget is not bounding the expansion", elapsed)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("LoadManifest did not terminate on an alias bomb")
 	}
 }

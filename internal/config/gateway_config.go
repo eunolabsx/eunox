@@ -482,12 +482,16 @@ func errIfBinaryConfig(kind, path string, data []byte) error {
 	return nil
 }
 
-// gatewaySchemaVersionFromNode reads the top-level schemaVersion scalar's VERBATIM text off
-// the already-parsed document, plus whether it was written as a bare number (YAML auto-types
-// an unquoted 0.1 as !!float). Verbatim matters: "0.10" must not renormalize to "0.1".
+// gatewaySchemaVersionFromNode reads the effective schemaVersion scalar's VERBATIM text off the
+// already-parsed document, plus whether it was written as a bare number (YAML auto-types an
+// unquoted 0.1 as !!float). Verbatim matters: "0.10" must not renormalize to "0.1".
+//
+// "Effective" is the decoder's answer, not a literal-key scan (see effectiveSchemaVersionNode):
+// a config declaring its version through `<<:` was otherwise refused for not declaring one,
+// while the strict decode below — which resolves merges itself — would have accepted it.
 func gatewaySchemaVersionFromNode(root *yaml.Node) (version string, numeric bool) {
-	val := topLevelValueNode(root, "schemaVersion")
-	if val == nil || val.Kind != yaml.ScalarNode {
+	val, ok := effectiveSchemaVersionNode(root)
+	if !ok {
 		return "", false
 	}
 	return val.Value, val.Tag == "!!int" || val.Tag == "!!float"
@@ -566,11 +570,6 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	var version string
 	var numericVersion bool
 	if parsed {
-		// Before every walk over this node: they scan for a LITERAL key, and a `<<:`-merged
-		// schemaVersion has no slot of its own — so a config declaring one through a merge was
-		// refused for not declaring one at all, while the strict decode below (which resolves
-		// merges itself) would have accepted it. See resolveMergeKeys.
-		resolveMergeKeys(&root)
 		version, numericVersion = gatewaySchemaVersionFromNode(&root)
 		if err := validateGatewaySchemaVersion(version); err != nil {
 			return nil, fmt.Errorf("invalid gateway config %q: %w", path, err)
