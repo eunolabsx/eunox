@@ -694,3 +694,170 @@ func (h *declaringHostHarness) postToSession(t *testing.T, token, sessionID stri
 	_, _ = buf.ReadFrom(resp.Body)
 	return declaringResponse{status: resp.StatusCode, body: buf.String()}
 }
+
+// The SESSION-HEADER POST takes the same wait.
+//
+// A derived worker id is not confined to the path that derives it: a caller who computes it from
+// their own claims can present it in Mcp-Session-Id, and that spelling reached the same
+// mid-establishment worker through handleSessionPost with no wait at all — negotiation resolves
+// fine, since omission inherits the pinned revision. Driven through the real handler for
+// TheResolvePathWaitsForEstablishment's reason: a cell that exercises awaitEstablished alone
+// proves the primitive works while this caller could have stopped calling it.
+//
+// The message is a SWALLOWED notification so the cell measures the wait rather than a forward:
+// it runs the whole prologue and is answered 202 with no upstream involved.
+func TestFirstRequestCreation_TheSessionHeaderPathWaitsForEstablishment(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	route := newBareTestRoute()
+	sess := newTestSession(&httpSession{
+		id: "w1", route: route, done: make(chan struct{}), established: make(chan struct{}),
+	})
+	sess.initInProgress.Store(true)
+	proxy.mu.Lock()
+	proxy.sessions[sess.id] = sess
+	proxy.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, sess.id)
+	w := httptest.NewRecorder()
+	answered := make(chan struct{})
+	go func() {
+		defer close(answered)
+		proxy.handleSessionPost(w, req, route, sess.id,
+			mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized})
+	}()
+
+	select {
+	case <-answered:
+		t.Fatal("the POST was answered while the worker was still coming up; it ran against an upstream whose startup drift check had not passed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	proxy.finishEstablishing(sess)
+	select {
+	case <-answered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the POST never returned after establishment finished")
+	}
+	assert.Equal(t, http.StatusAccepted, w.Code, "body: %s", w.Body.String())
+}
+
+// So does the SSE GET, which is the one that gets served without asking for anything.
+//
+// newSession starts readUpstream BEFORE runDriftCheckOrTeardown, so the upstream is already
+// broadcasting by the time the drift check runs. A subscriber registered in that window receives
+// the not-yet-vetted upstream's notifications — the FM-5 rug-pull this proxy exists to catch,
+// delivered to a host as though it had been checked.
+func TestFirstRequestCreation_TheSSEGetPathWaitsForEstablishment(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	route := newBareTestRoute()
+	done := make(chan struct{})
+	sess := newTestSession(&httpSession{
+		id: "w1", route: route, done: done, established: make(chan struct{}),
+	})
+	sess.initInProgress.Store(true)
+	proxy.mu.Lock()
+	proxy.sessions[sess.id] = sess
+	proxy.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, sess.id)
+	w := httptest.NewRecorder()
+	streaming := make(chan struct{})
+	go func() {
+		defer close(streaming)
+		proxy.handleMCPGet(w, req, route)
+	}()
+
+	select {
+	case <-streaming:
+		t.Fatal("the SSE GET returned while the worker was still coming up")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// The assertion that names the harm: no stream is attached to the unvetted upstream's
+	// broadcast while it is unvetted.
+	assert.False(t, sess.hasSubscribers(),
+		"an SSE subscriber was registered on a worker whose startup drift check had not passed")
+
+	proxy.finishEstablishing(sess)
+	require.Eventually(t, sess.hasSubscribers, 2*time.Second, 5*time.Millisecond,
+		"the stream never opened after establishment finished")
+
+	close(done) // the upstream exits; the stream loop returns
+	select {
+	case <-streaming:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the SSE GET never returned after its session ended")
+	}
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// A worker torn down WHILE coming up is served by neither, and the POST keeps the kill contract.
+//
+// The wait's signal means "no longer coming up", never "came up" — a failed drift check ends
+// establishment by tearing the session down. Both entry points then hold an id that names nothing
+// servable, which is their existing unresolved-session answer rather than a new one: the POST's
+// renders KILL_SWITCH for an id the kill store still names (denyUnresolvedSession), so a worker
+// reaped by a kill mid-establishment does not come back as a bare 404 hiding why it vanished.
+func TestFirstRequestCreation_AWorkerTornDownWhileComingUpIsNotServed(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		post bool
+	}{{name: "session-header POST", post: true}, {name: "SSE GET"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			proxy := newTestHTTPProxy()
+			route := newBareTestRoute()
+			sess := newTestSession(&httpSession{
+				id: "w1", route: route, done: make(chan struct{}), established: make(chan struct{}),
+			})
+			sess.initInProgress.Store(true)
+			proxy.mu.Lock()
+			proxy.sessions[sess.id] = sess
+			proxy.mu.Unlock()
+
+			method := http.MethodGet
+			if tc.post {
+				method = http.MethodPost
+			}
+			req := httptest.NewRequest(method, "/mcp", http.NoBody)
+			req.Header.Set(SessionHeader, sess.id)
+			w := httptest.NewRecorder()
+			answered := make(chan struct{})
+			go func() {
+				defer close(answered)
+				if tc.post {
+					proxy.handleSessionPost(w, req, route, sess.id,
+						mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized})
+					return
+				}
+				proxy.handleMCPGet(w, req, route)
+			}()
+
+			select {
+			case <-answered:
+				t.Fatal("answered while the worker was still coming up")
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			// What a failed startup drift check does: tear the worker out, then end its
+			// establishing window.
+			proxy.mu.Lock()
+			delete(proxy.sessions, sess.id)
+			proxy.mu.Unlock()
+			proxy.finishEstablishing(sess)
+
+			select {
+			case <-answered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("never returned after establishment ended in teardown")
+			}
+			assert.Equal(t, http.StatusNotFound, w.Code,
+				"a worker torn down while coming up was served anyway; body: %s", w.Body.String())
+			assert.False(t, sess.hasSubscribers(), "a stream was attached to a torn-down worker")
+		})
+	}
+}

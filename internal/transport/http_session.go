@@ -1090,6 +1090,13 @@ func (s *httpSession) markEstablished() {
 // minted UUIDs no second request could name the id at all, which is why publishing early was safe
 // before and is not now.
 //
+// Every entry point that SERVES a host on an existing worker takes it, not just the one that
+// resolves a declaring peer's first request: a derived id reaches handleSessionPost through the
+// Mcp-Session-Id header and handleMCPGet through the same header on an SSE open, and both were
+// the identical unvetted-upstream exposure by a different spelling. Teardown paths deliberately
+// do not — a DELETE tears a worker down rather than being served by it, and making it wait would
+// hold a session the caller is entitled to end for the establishment budget.
+//
 // The re-check after waiting is the point: establishment can END in teardown (a failed drift
 // check tears the session down), so the signal means "no longer coming up", never "came up".
 func (p *HTTPProxy) awaitEstablished(ctx context.Context, sess *httpSession) bool {
