@@ -132,5 +132,16 @@ func (e *Engine) anchoredKey(prefix string, req *capability.EnforceRequest, tail
 // for sequenceBlock lookups. The target type is part of the key so a tool "export" and a
 // prompt "export" don't collide on one bucket.
 func (e *Engine) sequenceHistoryKey(req *capability.EnforceRequest, targetType, target string) string {
-	return e.anchoredKey("seq", req, targetType, target)
+	return e.anchoredKey(sequenceHistorySpec.namespace, req, targetType, target)
+}
+
+// anchorSubject names the identity a piece of state would be keyed on, for the guard that
+// refuses a request carrying none. Reported per KIND rather than always as "sessionId":
+// under WithTaskAnchoredState the key never reads SessionID at all, so naming it would send an
+// operator to set a field the enforced key does not consult.
+func anchorSubject(kind AnchorKind) string {
+	if kind == AnchorKindTask {
+		return "a task id (mcp.task_id)"
+	}
+	return "sessionId"
 }

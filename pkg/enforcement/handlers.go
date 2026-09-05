@@ -50,6 +50,13 @@ func ResolveArgument(args map[string]interface{}, ref string) (interface{}, bool
 // the caller must treat that as a deny — a shortened list would let a policy gating on
 // input.directives decide on incomplete information.
 func BuildRegoInput(ctx context.Context, req *capability.EnforceRequest) (map[string]interface{}, error) {
+	// This is the input builder handed to a third-party PolicyEvaluator, so a nil request is an
+	// embedder's contract break rather than something the engine produces. It refuses through
+	// the error return the doc above already binds to a deny, for nilRequestDenial's reason: a
+	// panic here is the fail-OPEN reading of "on any ambiguity, deny".
+	if req == nil {
+		return nil, errors.New(nilSeamRefusal("BuildRegoInput", "a nil request"))
+	}
 	args := req.Arguments
 	if args == nil {
 		args = map[string]interface{}{}
@@ -300,45 +307,55 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 	}
 }
 
-// quotaBucketSpec is everything a counter-backed bucket derivation may vary. Deliberately no
-// denial CLASS: which guards run, in which order, and under which code is quotaBucketKey's, so
-// a spec cannot choose the answer the family had already drifted on.
-type quotaBucketSpec struct {
-	condType  string
-	namespace string
-	// subject and counterDetail complete the guard messages; the remediation differs per bound
-	// (wire a counter for the velocity budget vs. for the call quota), so a shared wording
-	// would send an operator to the wrong fix.
+// counterKeySpec is everything a counter-backed KEY derivation may vary: which condition it
+// belongs to, the key namespace that keeps two bounds off one physical bucket, and the message
+// tails that complete the shared guards (the remediation differs per bound — wire a counter for
+// the velocity budget vs. for the call quota — so a shared wording would send an operator to
+// the wrong fix). Deliberately no denial CLASS: which guards run, in which order, and under
+// which code is counterSubjectGuards', so a spec cannot choose the answer the family had
+// already drifted on.
+type counterKeySpec struct {
+	condType      string
+	namespace     string
 	subject       string
 	counterDetail string
 }
 
 var (
-	maxCallsBucketSpec = quotaBucketSpec{
+	maxCallsBucketSpec = counterKeySpec{
 		condType:  capability.ConditionTypeMaxCalls,
 		namespace: "maxcalls",
 		subject:   "maxCalls condition",
 	}
 	// Own namespace so a velocity budget and a maxCalls quota on the same target never share a
 	// bucket and corrupt each other's accounting.
-	blastRadiusBucketSpec = quotaBucketSpec{
+	blastRadiusBucketSpec = counterKeySpec{
 		condType:      capability.ConditionTypeBlastRadius,
 		namespace:     "blastradius",
 		subject:       "a cumulative blastRadius bound",
 		counterDetail: ", so a cumulative blast-radius bound cannot be enforced",
 	}
+	// sequenceBlock derives a HISTORY key rather than a quota bucket, so it stops at
+	// counterSubjectGuards and never reaches quotaBucketKey's target guard or observe skip. Its
+	// namespace is the one sequenceHistoryKey builds on, read from here rather than respelled
+	// there so the guard and the key cannot disagree about which state they are about.
+	sequenceHistorySpec = counterKeySpec{
+		condType:  capability.ConditionTypeSequenceBlock,
+		namespace: "seq",
+		subject:   "sequenceBlock condition",
+	}
 )
 
-// quotaBucketKey is the guard sequence and key build every counter-backed bucket derivation
-// shares. skip is true under --audit observe mode (treat as satisfied).
+// counterSubjectGuards is the guard sequence every counter-backed key derivation shares: a
+// wired counter, a request to derive from, and an ANCHOR to key on.
 //
-// Shared rather than mirrored because the family had drifted here: blastRadius classified an
-// unwired counter ErrCodeConditionFailed, a POLICY code an observing posture DOWNGRADES, so an
-// --audit route forwarded the call with the cumulative budget neither checked nor counted. The
-// bound was never evaluated, so there is no verdict to downgrade.
-func (e *Engine) quotaBucketKey(ctx context.Context, req *capability.EnforceRequest, spec quotaBucketSpec) (key string, skip bool, condErr *ConditionError) {
+// Split out of quotaBucketKey because sequenceBlock kept a third hand-written copy of exactly
+// these — differing only in the two fields the spec already parameterizes, and missing the nil
+// request arm — which is the copy the next edit to the sequence would have left behind, the way
+// blastRadius was left behind before the two bucket derivations were shared.
+func (e *Engine) counterSubjectGuards(req *capability.EnforceRequest, spec counterKeySpec) *ConditionError {
 	if e.counter == nil {
-		return "", false, &ConditionError{
+		return &ConditionError{
 			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: spec.condType,
 			Message:       "call counter not configured" + spec.counterDetail,
@@ -346,27 +363,54 @@ func (e *Engine) quotaBucketKey(ctx context.Context, req *capability.EnforceRequ
 	}
 
 	// A caller-contract fault, not a missing field, so it takes nilRequestDenial's code rather
-	// than the session guard's: reporting "sessionId is required" would name a field the call
-	// never carried, and MISSING_CONTEXT is a POLICY class an observing route downgrades.
+	// than the subject guard's: reporting "sessionId is required" would name a field the call
+	// never carried.
 	if req == nil {
-		return "", false, &ConditionError{
+		return &ConditionError{
 			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: spec.condType,
 			Message:       nilSeamRefusal(spec.condType, "a nil request"),
 		}
 	}
 
-	// A missing sessionID would merge quota across all anonymous callers (quota
-	// bypass / DoS). Deny rather than share a cross-session bucket.
-	if req.SessionID == "" {
-		return "", false, &ConditionError{
+	// The ANCHOR's id, not req.SessionID: under WithTaskAnchoredState the key this state lands
+	// on never reads SessionID at all, so gating on it refused a task-anchored request whose
+	// bucket anchoredKey would have keyed perfectly well — the antecedent namespace, which
+	// already gates on the anchor (RecordSessionCall), and the quota namespace disagreed about
+	// whether one request had a subject. An empty one would merge state across all anonymous
+	// callers (quota bypass, or one session gating another). Deny rather than share a bucket.
+	anchor := e.resolveAnchor(req)
+	if anchor.ID == "" {
+		return &ConditionError{
 			Code:          capability.ErrCodeMissingContext,
 			ConditionType: spec.condType,
-			Message:       "sessionId is required for " + spec.subject,
+			// BlockOverride for anchorUnresolved's reason: MISSING_CONTEXT is a POLICY class an
+			// observing route FORWARDS, and this refusal is not a verdict about the caller — the
+			// bound was never evaluated, because there was no subject to evaluate it against.
+			// The narrow override rather than reclassifying MISSING_CONTEXT wholesale: the code
+			// is a genuine policy verdict everywhere it reports a missing ARGUMENT, and moving
+			// it there would break every SIEM rule keyed on it for a refusal that is one.
+			BlockOverride: true,
+			Message:       anchorSubject(anchor.Kind) + " is required for " + spec.subject,
 		}
 	}
+	return nil
+}
 
-	// Build a unique key from session + target type + bare name: the type must be in the
+// quotaBucketKey is counterSubjectGuards plus the target guard and key build every
+// counter-backed BUCKET derivation shares. skip is true under --audit observe mode (treat as
+// satisfied).
+//
+// Shared rather than mirrored because the family had drifted here: blastRadius classified an
+// unwired counter ErrCodeConditionFailed, a POLICY code an observing posture DOWNGRADES, so an
+// --audit route forwarded the call with the cumulative budget neither checked nor counted. The
+// bound was never evaluated, so there is no verdict to downgrade.
+func (e *Engine) quotaBucketKey(ctx context.Context, req *capability.EnforceRequest, spec counterKeySpec) (key string, skip bool, condErr *ConditionError) {
+	if condErr := e.counterSubjectGuards(req, spec); condErr != nil {
+		return "", false, condErr
+	}
+
+	// Build a unique key from the anchor + target type + bare name: the type must be in the
 	// key because req.TargetName is only the bare name (a tool and a prompt named "export"
 	// would otherwise drain one budget). sessionTargetKey derives the pair exactly as
 	// RecordSessionCall does, so both key the same bucket. windowSeconds is deliberately
@@ -380,6 +424,9 @@ func (e *Engine) quotaBucketKey(ctx context.Context, req *capability.EnforceRequ
 		return "", false, &ConditionError{
 			Code:          capability.ErrCodeMissingContext,
 			ConditionType: spec.condType,
+			// BlockOverride for the anchor guard's reason: an unidentifiable target is a bucket
+			// that was never derived, not a bound the caller failed.
+			BlockOverride: true,
 			Message:       "tool or resource name is required for " + spec.subject,
 		}
 	}
@@ -758,7 +805,24 @@ func (e *Engine) handleAllowedTables(_ context.Context, cond capability.Conditio
 
 	// Case-folded lookup structures: keyed by lowercased table so a "users" restriction
 	// still covers "USERS", with values in original case so denial details echo the manifest.
-	allowedTableSet, columnsByTable, columnSets := at.TableLookup()
+	// Manifest-loaded conditions are pre-compiled, so the hot path never re-folds the ACL. An
+	// uncompiled condition (built directly through the API) compiles a LOCAL copy — the engine
+	// must not cache state onto a condition it does not own — through the same Compile the
+	// loader runs, so the uncompiled path cannot drift from it and its refusals (a pair of
+	// 'columns' keys folding onto one table) fail closed here rather than being resolved
+	// silently. The shape its timeWindow and ipRange siblings already take.
+	allowedTableSet, columnsByTable, columnSets, compiled := at.TableLookup()
+	if !compiled {
+		local := *at
+		if err := local.Compile(); err != nil {
+			return &ConditionError{
+				Code:          capability.ErrCodeEnforcementError,
+				ConditionType: capability.ConditionTypeAllowedTables,
+				Message:       fmt.Sprintf("allowedTables condition could not be compiled: %v", err),
+			}
+		}
+		allowedTableSet, columnsByTable, columnSets, _ = local.TableLookup()
+	}
 
 	for _, access := range tables {
 		tableKey := strings.ToLower(access.Table)
@@ -909,12 +973,15 @@ func EvaluateAllowedValues(cond capability.Condition, req *capability.EnforceReq
 	}
 
 	// Unreachable from the engine, but this is an exported seam: a nil request must DENY
-	// rather than panic (fail-open-via-crash) or read as passed.
+	// rather than panic (fail-open-via-crash) or read as passed. ENFORCEMENT_ERROR, not the
+	// CONDITION_FAILED this used to pick: a caller-contract break is not a verdict the policy
+	// reached, and the policy code made an observing route FORWARD the call with the allowlist
+	// never evaluated. Same code and wording as every other nil-argument seam.
 	if req == nil {
 		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
+			Code:          capability.ErrCodeEnforcementError,
 			ConditionType: capability.ConditionTypeAllowedValues,
-			Message:       "allowedValues evaluated with no request to check against",
+			Message:       nilSeamRefusal("EvaluateAllowedValues", "a nil request"),
 		}
 	}
 
@@ -1236,22 +1303,11 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		}
 	}
 
-	if e.counter == nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: capability.ConditionTypeSequenceBlock,
-			Message:       "call counter not configured",
-		}
-	}
-
-	// A missing sessionID would merge history across anonymous callers, letting one
-	// session gate another. Deny rather than consult a shared bucket.
-	if req.SessionID == "" {
-		return &ConditionError{
-			Code:          capability.ErrCodeMissingContext,
-			ConditionType: capability.ConditionTypeSequenceBlock,
-			Message:       "sessionId is required for sequenceBlock condition",
-		}
+	// The counter/request/anchor sequence, shared with the quota bucket derivations rather
+	// than spelled a third time here — this copy was the one missing the nil-request arm, and
+	// gated on req.SessionID where the history key it guards is anchor-derived.
+	if condErr := e.counterSubjectGuards(req, sequenceHistorySpec); condErr != nil {
+		return condErr
 	}
 
 	// Resolve the blocked target's namespace as RecordSessionCall does, so reporting in

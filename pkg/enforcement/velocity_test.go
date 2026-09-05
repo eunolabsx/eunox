@@ -5,6 +5,7 @@ package enforcement_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -484,6 +485,36 @@ func TestBlastRadiusVelocity_BackendFaultDenies(t *testing.T) {
 	assert.Equal(t, capability.ConditionTypeBlastRadius, resp.Denial.ConditionType,
 		"the faulting bound must be identified structurally")
 	assert.Contains(t, resp.Denial.Message, "call counter error")
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
+	assert.False(t, resp.Denial.Downgradable())
+}
+
+// TestBlastRadiusVelocity_RetentionCeilingIsAFault pins the code docs/effect-contracts.md
+// names for the weighted retention ceiling.
+//
+// The ceiling arrives from the counter as an ERROR, and commitDeferredConditions reads err
+// before the refused-admission branch — so the refusal is ENFORCEMENT_ERROR, not the
+// CONDITION_FAILED the doc used to promise, and an operator's SIEM rule for a session hitting
+// the ceiling never fired. It is also the right code: nothing evaluated the bound, so no
+// observing route may forward past it.
+func TestBlastRadiusVelocity_RetentionCeilingIsAFault(t *testing.T) {
+	e := enforcement.New(enforcement.WithCallCounter(retentionCeilingCounter{}))
+	caps := []capability.Constraint{refundConstraint("", "2000", 3600)}
+
+	resp := refund(t, e, caps, "10")
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
+	assert.False(t, resp.Denial.Downgradable())
+	assert.Contains(t, resp.Denial.Message, "weighted entry limit")
+}
+
+// retentionCeilingCounter reproduces what both backends return at the weighted retention
+// ceiling: an error from the admission, never a refused admission.
+type retentionCeilingCounter struct{ *callcounter.InMemory }
+
+func (retentionCeilingCounter) AdmitAll(_ context.Context, _ []capability.QuotaBucket) (admitted bool, deniedIndex int, total float64, retryAfter time.Duration, err error) {
+	return false, 0, 0, 0, errors.New("callcounter: weighted entry limit reached (100000 entries in one window)")
 }
 
 // faultingWeightedCounter fails the admission path, so a test can isolate the
