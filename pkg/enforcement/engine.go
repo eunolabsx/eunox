@@ -7,6 +7,7 @@ package enforcement
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"slices"
@@ -558,6 +559,13 @@ func (e *Engine) policyUses(s capability.EngineSubsystem) bool {
 // reach: in audit (observe) mode a constraint with a failing condition returns a deny
 // without recording, yet the transport still forwards the request and the tool runs.
 func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceRequest) error {
+	// A nil engine or request is a caller-contract break, not "nothing to record": this
+	// function's own contract makes a nil return mean the marker WAS written, so short-circuiting
+	// on it let a composing caller forward the call and a later sequenceBlock Peek empty history
+	// — the fail-OPEN direction, and the one every other seam's nil guard exists to close.
+	if e == nil || req == nil {
+		return errors.New(nilSeamRefusal("RecordSessionCall", "a nil engine or request"))
+	}
 	// The ANCHOR's id, not req.SessionID: under WithTaskAnchoredState the key this write lands
 	// on never reads SessionID at all, so gating on it skipped the marker for a task-anchored
 	// request that carries no session — leaving an allowed antecedent invisible to a later
@@ -1472,6 +1480,12 @@ const resourceScoreWeight = 10
 // scan, sharing only the tiebreak (ConstraintScorer) and the match/specificity primitives.
 // Change the precedence rule there, not here.
 func (e *Engine) FindMatchingCapability(req *capability.EnforceRequest, capabilities []capability.Constraint) *capability.Constraint {
+	// No request, no match: the selection seam an embedder pairs with EvaluateConditions, which
+	// already denies a nil request rather than crashing. "Nothing matched" is this signature's
+	// own fail-closed answer — the caller denies on it — where the dereference below is not.
+	if req == nil {
+		return nil
+	}
 	reqType, bareToolName := resolveRequestTarget(req)
 	scorer := NewConstraintScorer()
 	for i := range capabilities {
@@ -1603,6 +1617,16 @@ var knownObligationTypes = map[string]bool{
 // return (returning it as a hard block) simply ignores the accompanying slice, so this
 // costs those callers nothing.
 func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, now string) ([]capability.Obligation, *capability.EnforceResponse) {
+	// A nil constraint has no directives to collect and nothing to say about a call, so it
+	// refuses through the response return the callers already treat as a hard block rather than
+	// dereferencing it — see nilRequestDenial.
+	if matched == nil {
+		resp := denyResponse(requestID, now, false, nil, capability.DenialInfo{
+			Code:    capability.ErrCodeEnforcementError,
+			Message: nilSeamRefusal("CollectObligations", "a nil constraint"),
+		})
+		return nil, &resp
+	}
 	var obligations []capability.Obligation
 	for _, dir := range matched.Directives {
 		if dir == nil {
