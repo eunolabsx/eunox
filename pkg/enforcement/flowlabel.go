@@ -90,16 +90,20 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	// state across anonymous callers). Runs before the threaded set is used so a nil threaded
 	// set can't be mistaken for "clean context".
 	if e.flowStore == nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: capability.ConditionTypeFlowLabel,
-			Message:       "flow-label store not configured; flow-label state is unavailable",
-		}
+		return conditionFault(capability.ConditionTypeFlowLabel, "flow-label store not configured; flow-label state is unavailable")
 	}
-	if req.SessionID == "" {
+	// The ANCHOR's id, not req.SessionID: flowKey is anchoredKey("flow", req), so gating on the
+	// session refused a task-anchored request whose flow bucket keys perfectly well — the same
+	// disagreement between a namespace's guard and its key that counterSubjectGuards closes for
+	// the quota and history namespaces.
+	if e.resolveAnchor(req).ID == "" {
 		return &ConditionError{
 			Code:          capability.ErrCodeMissingContext,
 			ConditionType: capability.ConditionTypeFlowLabel,
+			// BlockOverride for counterSubjectGuards' reason, and this is the namespace where the
+			// downgrade does the most damage: an observing route forwards the call with the SINK
+			// never evaluated, which is the check that stops tainted data reaching this target.
+			BlockOverride: true,
 			Message:       "sessionId is required for flowLabel condition",
 		}
 	}
@@ -111,11 +115,7 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 	if !threaded {
 		peeked, err := e.peekSessionLabels(ctx, req)
 		if err != nil {
-			return &ConditionError{
-				Code:          capability.ErrCodeEnforcementError,
-				ConditionType: capability.ConditionTypeFlowLabel,
-				Message:       fmt.Sprintf("flow-label state lookup failed: %v", err),
-			}
+			return conditionFault(capability.ConditionTypeFlowLabel, fmt.Sprintf("flow-label state lookup failed: %v", err))
 		}
 		present = peeked
 	}
@@ -194,7 +194,10 @@ func unionLabels(present, declared []string) []string {
 // about, and the subset check treats it as an opaque set member, so any build that can parse
 // it enforces it identically.
 func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceRequest) ([]string, error) {
-	if e.skipFlow || e.flowStore == nil || req.SessionID == "" {
+	// The anchor's id, not req.SessionID, for flowKey's reason: a task-anchored request with no
+	// session read as "no labels carried" for a task bucket that may hold them — a silent
+	// fail-OPEN at the sink, since the rule is "present and not in Allow => deny".
+	if e.skipFlow || e.flowStore == nil || e.resolveAnchor(req).ID == "" {
 		// skipFlow short-circuits here too, mirroring evaluateMatched's own gate, so the
 		// engine stays consistent even if a caller derives flow-relevance independently
 		// (e.g. the PDP audit path via ConstraintHasFlow alone).
@@ -284,7 +287,7 @@ func (e *Engine) recordLabels(ctx context.Context, req *capability.EnforceReques
 	if e.flowStore == nil {
 		return nil, fmt.Errorf("flow label store not configured; flow labels cannot be recorded")
 	}
-	if req.SessionID == "" {
+	if e.resolveAnchor(req).ID == "" {
 		return nil, fmt.Errorf("sessionId is required to record flow labels")
 	}
 	// Canonical order for labels_out; the store's Add commits the whole set atomically, so
@@ -430,7 +433,7 @@ func labelsAdded(out, carried []string) []string {
 // call leaves no flow taint. No-op for a nil store, empty session, or empty set; a Remove
 // fault is swallowed (the fail-closed residual — a stranded label over-blocks, never leaks).
 func (e *Engine) rollbackLabels(ctx context.Context, req *capability.EnforceRequest, added []string) {
-	if e.flowStore == nil || req.SessionID == "" || len(added) == 0 {
+	if e.flowStore == nil || e.resolveAnchor(req).ID == "" || len(added) == 0 {
 		return
 	}
 	if e.anchoredOnTask(req) {

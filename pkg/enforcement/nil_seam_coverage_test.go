@@ -89,9 +89,14 @@ var nilSeamTable = map[string]nilSeamDisposition{
 	"ConditionHandlerFunc.Handle":   seamCallerSupplied,
 }
 
-// TestNilSeams_EveryDeclaredSeamRefuses drives each seam the table says has its own guard, so
-// the declaration is a behavior and not a comment. The delegating and caller-supplied rows are
-// covered where their guard actually lives (see the table).
+// TestNilSeams_EveryDeclaredSeamRefuses drives the seams this batch newly guarded, so each
+// declaration is a behavior and not a comment.
+//
+// It is not the only driver, and does not claim to be: the seams guarded earlier are driven in
+// nil_and_anchor_guards_test.go (the two EnforceResponse/state tables) and, for
+// EvaluateAllowedValues, in internal/pdp's parity test. What makes the rule whole is the
+// completeness walk below, which derives the seam set from the sources — a driver in whichever
+// file an author opened is fine as long as no seam can be added without a declared disposition.
 func TestNilSeams_EveryDeclaredSeamRefuses(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

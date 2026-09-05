@@ -50,11 +50,7 @@ func (e *Engine) NonCommittingConditionVerdict(ctx context.Context, cond capabil
 	// cause. denyFromCondition copies Code verbatim, so the refusal stays a non-downgradable
 	// fault and no caller needs a new branch.
 	if req == nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: cond.ConditionType(),
-			Message:       nilSeamRefusal("NonCommittingConditionVerdict", "a nil request"),
-		}, true
+		return conditionFault(cond.ConditionType(), nilSeamRefusal("NonCommittingConditionVerdict", "a nil request")), true
 	}
 	if e == nil {
 		return NonCommittingConditionVerdict(ctx, cond, req)

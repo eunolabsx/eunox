@@ -59,13 +59,13 @@ func (e *Engine) handleEffectClass(ctx context.Context, cond capability.Conditio
 	// condition can carry either — surface both rather than silently admit. Faults, not
 	// verdicts: a condition that declares no evaluable set was never evaluated.
 	if len(ec.Allow) == 0 {
-		return effectFault(capability.ConditionTypeEffectClass,
+		return conditionFault(capability.ConditionTypeEffectClass,
 			"effectClass declares an empty 'allow' set, which admits no effect class")
 	}
 	allow := make(map[string]bool, len(ec.Allow))
 	for _, c := range ec.Allow {
 		if !capability.IsEffectClass(c) {
-			return effectFault(capability.ConditionTypeEffectClass, fmt.Sprintf(
+			return conditionFault(capability.ConditionTypeEffectClass, fmt.Sprintf(
 				"effectClass 'allow' contains unknown class %q; valid effect classes are %s",
 				c, strings.Join(capability.EffectClassVocabulary(), ", ")))
 		}
@@ -77,7 +77,7 @@ func (e *Engine) handleEffectClass(ctx context.Context, cond capability.Conditio
 		// Reachable through the exported NonCommittingConditionVerdict seam, whose composing
 		// caller never threads a resolved effect: a fault, so the claim leg's refusal is not
 		// downgraded to a forward on the strength of a condition nothing evaluated.
-		return effectFault(capability.ConditionTypeEffectClass,
+		return conditionFault(capability.ConditionTypeEffectClass,
 			"effect contract was not resolved for this call; effect state is unavailable")
 	}
 	if allow[eff.Class] {
@@ -108,22 +108,41 @@ type blastRadiusBounds struct {
 func parseBlastRadiusBounds(br *capability.BlastRadiusCondition) (blastRadiusBounds, *ConditionError) {
 	var bounds blastRadiusBounds
 	if br.Max == nil && !br.HasVelocity() {
-		return bounds, effectFault(capability.ConditionTypeBlastRadius,
+		return bounds, conditionFault(capability.ConditionTypeBlastRadius,
 			"blastRadius declares neither 'max' nor a complete 'maxTotal'/'windowSeconds' pair, so it bounds nothing")
 	}
 	if br.Max != nil {
 		limit, ok := capability.ParseBlastRadiusNumber(*br.Max)
 		if !ok {
-			return bounds, effectFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+			return bounds, conditionFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 				"blastRadius 'max' is not a number (%q)", br.Max.String()))
 		}
 		bounds.perCall = limit
 	}
+	// A HALF-written pair is its own fault, checked before HasVelocity's silence: a maxTotal with
+	// no windowSeconds (or the reverse) declares a cumulative budget that HasVelocity reports
+	// false for, so it was neither enforced nor committed while the per-call bound beside it
+	// passed — reading as "checked and fine" for exactly the programmatically built condition
+	// this function exists to refuse.
+	if (br.MaxTotal != nil) != (br.WindowSeconds > 0) {
+		return bounds, conditionFault(capability.ConditionTypeBlastRadius,
+			"blastRadius declares half of a cumulative bound ('maxTotal' without a positive 'windowSeconds', or the reverse); each half silently disables the other, so neither is enforced")
+	}
 	if br.HasVelocity() {
 		limit, ok := capability.ParseBlastRadiusNumber(*br.MaxTotal)
 		if !ok {
-			return bounds, effectFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+			return bounds, conditionFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
 				"blastRadius 'maxTotal' is not a number (%q)", br.MaxTotal.String()))
+		}
+		// REPRESENTABLE, not merely parseable: the counter accumulates in float64, and a bound
+		// past that range converts to +Inf, which no weighted total can ever exceed — the
+		// cumulative budget would admit every call. weightSummable is the same check on the
+		// magnitude side; the limit side had none.
+		limitF, _ := limit.Float64()
+		if !weightSummable(limitF) {
+			return bounds, conditionFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+				"blastRadius 'maxTotal' (%s) is outside the range a cumulative bound can sum, so no total could ever exceed it",
+				br.MaxTotal.String()))
 		}
 		bounds.cumulative = limit
 	}
@@ -164,7 +183,8 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 			"this call's blast radius could not be quantified, so it cannot be summed against the cumulative bound of %s per %ds%s",
 			br.MaxTotal.String(), br.WindowSeconds, unannotatedHint(eff)), velocityExtras(br))
 	}
-	// float64 on both sides, matching the counter contract's accumulator.
+	// float64 on both sides, matching the counter contract's accumulator. The limit's
+	// representability was established by parseBlastRadiusBounds.
 	weight, _ := eff.BlastRadius.Float64()
 	limitF, _ := limit.Float64()
 	if !weightSummable(weight) {
@@ -264,7 +284,7 @@ func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.C
 
 	eff, resolved := resolvedEffectFromContext(ctx)
 	if !resolved {
-		return DeferredCommit{}, false, effectFault(capability.ConditionTypeBlastRadius,
+		return DeferredCommit{}, false, conditionFault(capability.ConditionTypeBlastRadius,
 			"effect contract was not resolved for this call; blast radius is unavailable")
 	}
 
@@ -315,18 +335,6 @@ func effectDenial(eff *capability.ResolvedEffect, condType, message string, extr
 		ConditionType: condType,
 		Message:       message,
 		Details:       details,
-	}
-}
-
-// effectFault builds the effect layer's FAULT: a refusal produced because no verdict could be
-// reached. ENFORCEMENT_ERROR, whose class no observing route downgrades — there is no verdict
-// to stand in for the one that never ran. It carries no details, every site reaching it being
-// one with no resolved effect to describe.
-func effectFault(condType, message string) *ConditionError {
-	return &ConditionError{
-		Code:          capability.ErrCodeEnforcementError,
-		ConditionType: condType,
-		Message:       message,
 	}
 }
 

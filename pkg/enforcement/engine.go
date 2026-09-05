@@ -714,9 +714,17 @@ func recordFailureDenial(requestID, now string, auditOnly bool, obligations []ca
 // not a policy verdict an observing route may downgrade. It builds no request id of its own —
 // there is no request to identify.
 func nilRequestDenial(seam string) capability.EnforceResponse {
-	return denyResponse("", "", false, nil, capability.DenialInfo{
+	return nilSeamDenial(seam, "a nil request or constraint", "", "")
+}
+
+// nilSeamDenial is nilRequestDenial for a seam that HAS this decision's identity in hand, and
+// the one shape both build. Separate constructors let CollectObligations' refusal drift from
+// ValidateAction's on anything added to the envelope; requestID/now empty is the no-identity
+// case nilRequestDenial documents.
+func nilSeamDenial(seam, what, requestID, now string) capability.EnforceResponse {
+	return denyResponse(requestID, now, false, nil, capability.DenialInfo{
 		Code:    capability.ErrCodeEnforcementError,
-		Message: nilSeamRefusal(seam, "a nil request or constraint"),
+		Message: nilSeamRefusal(seam, what),
 	})
 }
 
@@ -725,6 +733,46 @@ func nilRequestDenial(seam string) capability.EnforceResponse {
 // one it does not have sends an operator looking for a parameter that does not exist.
 func nilSeamRefusal(seam, what string) string {
 	return seam + ": called with " + what + "; refusing rather than evaluating an incomplete decision"
+}
+
+// conditionFault builds the ConditionError for a refusal a condition path produced because it
+// could not reach a VERDICT: an unmodelled or uncastable condition, a declaration that bounds
+// nothing, one this build cannot compile, a backend that is unwired or answered
+// nonconformingly, a handler that broke its contract.
+//
+// ErrCodeEnforcementError, whose CLASS is what stops an observing route downgrading the refusal
+// to a forward — there is no verdict to stand in for the one that never ran. It is the single
+// minter package-wide (held there by a source guard), so "which class is this?" is answered at
+// one documented place rather than by whichever neighbour a new handler copied: the family had
+// already drifted, with blastRadius, timeWindow and ipRange calling an unevaluable condition a
+// policy verdict while their siblings called it a fault.
+//
+// A refusal that IS the policy's verdict does not come through here: it carries
+// ErrCodeConditionFailed (or a more specific policy code) and its own details.
+//
+// details is variadic so the detail-free majority reads as two arguments; at most one map is
+// honored, and a second would be a caller bug rather than a merge.
+func conditionFault(condType, message string, details ...map[string]interface{}) *ConditionError {
+	condErr := &ConditionError{
+		Code:          capability.ErrCodeEnforcementError,
+		ConditionType: condType,
+		Message:       message,
+	}
+	if len(details) > 0 {
+		condErr.Details = details[0]
+	}
+	return condErr
+}
+
+// Downgradable reports whether an observing route may forward the call this condition error
+// refuses. The ONE question every reader asks of a refusal — the class its code names, folded
+// with the producer's override — rather than either half alone, which is how a fault-shaped
+// refusal comes to be forwarded.
+func (e *ConditionError) Downgradable() bool {
+	if e == nil {
+		return false
+	}
+	return (&capability.DenialInfo{Code: e.Code, BlockOverride: e.BlockOverride}).Downgradable()
 }
 
 // denyResponse builds a deny EnforceResponse from the shared envelope, the single shape
@@ -1037,10 +1085,8 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, ec evalCtx, defer
 	// condErr above, but a custom CommittingConditionHandler need not, so guard here
 	// rather than panicking the enforcement goroutine.
 	if e.counter == nil {
-		return faults, ec.denyFromConditionError(&ConditionError{
-			Code:    capability.ErrCodeEnforcementError,
-			Message: "call counter not configured",
-		})
+		// No condition type: the batch-wide guard belongs to no single condition's verdict.
+		return faults, ec.denyFromConditionError(conditionFault("", "call counter not configured"))
 	}
 
 	admitted, deniedIndex, total, retryAfter, err := e.counter.AdmitAll(ctx, buckets)
@@ -1050,42 +1096,26 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, ec evalCtx, defer
 		// condition type, which is the ordinary case; a genuinely mixed batch leaves the
 		// field empty rather than naming an arbitrary one of the two, and Code+Message carry
 		// the fault either way.
-		return faults, ec.denyFromConditionError(&ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: attributableType(bucketTypes),
-			Message:       fmt.Sprintf("call counter error: %v", err),
-		})
+		return faults, ec.denyFromConditionError(conditionFault(attributableType(bucketTypes), fmt.Sprintf("call counter error: %v", err)))
 	}
 	if !admitted {
 		// deniedIndex comes from the CallCounter backend; validate it before using it as a
 		// slice index. A non-conforming backend could return an out-of-range value, which
 		// would panic the enforcement goroutine instead of failing closed.
 		if deniedIndex < 0 || deniedIndex >= len(denies) {
-			return faults, ec.denyFromConditionError(&ConditionError{
-				Code:          capability.ErrCodeEnforcementError,
-				ConditionType: attributableType(bucketTypes),
-				Message:       fmt.Sprintf("call counter returned out-of-range denied bucket index %d (have %d buckets)", deniedIndex, len(denies)),
-			})
+			return faults, ec.denyFromConditionError(conditionFault(attributableType(bucketTypes), fmt.Sprintf("call counter returned out-of-range denied bucket index %d (have %d buckets)", deniedIndex, len(denies))))
 		}
 		if denies[deniedIndex] == nil {
 			// A committing handler's PrepareCommit populated a bucket but left Deny nil — a
 			// handler bug. The bucket IS attributable here, unlike the batch-wide fault above.
-			return faults, ec.denyFromConditionError(&ConditionError{
-				Code:          capability.ErrCodeEnforcementError,
-				ConditionType: bucketTypes[deniedIndex],
-				Message:       fmt.Sprintf("committing condition handler for bucket index %d supplied a nil Deny callback", deniedIndex),
-			})
+			return faults, ec.denyFromConditionError(conditionFault(bucketTypes[deniedIndex], fmt.Sprintf("committing condition handler for bucket index %d supplied a nil Deny callback", deniedIndex)))
 		}
 		condErr := denies[deniedIndex](total, retryAfter)
 		if condErr == nil {
 			// A refused admission whose Deny callback returned nil would otherwise report the
 			// over-quota call as satisfied — a policy bypass — or, worse, panic
 			// denyFromConditionError's unconditional dereference of condErr.Code. Fail closed.
-			condErr = &ConditionError{
-				Code:          capability.ErrCodeEnforcementError,
-				ConditionType: bucketTypes[deniedIndex],
-				Message:       fmt.Sprintf("committing condition handler for bucket index %d's Deny callback returned nil for a refused admission", deniedIndex),
-			}
+			condErr = conditionFault(bucketTypes[deniedIndex], fmt.Sprintf("committing condition handler for bucket index %d's Deny callback returned nil for a refused admission", deniedIndex))
 		}
 		return faults, ec.denyFromConditionError(condErr)
 	}
@@ -1129,11 +1159,7 @@ func (ec evalCtx) denyFromConditionError(condErr *ConditionError) *capability.En
 // would have AUTHORIZED the skip. An enforce constraint on an enforce route reaches this
 // refusal too and blocks either way.
 func unauthorizedSkipError(condType string) *ConditionError {
-	return &ConditionError{
-		Code:          capability.ErrCodeEnforcementError,
-		ConditionType: condType,
-		Message:       fmt.Sprintf("committing condition %q reported a skip the request context did not authorize; skip must be derived solely from request context", condType),
-	}
+	return conditionFault(condType, fmt.Sprintf("committing condition %q reported a skip the request context did not authorize; skip must be derived solely from request context", condType))
 }
 
 // evalCondition runs a single PURE condition through the handler runPureConditions already
@@ -1621,10 +1647,7 @@ func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, n
 	// refuses through the response return the callers already treat as a hard block rather than
 	// dereferencing it — see nilRequestDenial.
 	if matched == nil {
-		resp := denyResponse(requestID, now, false, nil, capability.DenialInfo{
-			Code:    capability.ErrCodeEnforcementError,
-			Message: nilSeamRefusal("CollectObligations", "a nil constraint"),
-		})
+		resp := nilSeamDenial("CollectObligations", "a nil constraint", requestID, now)
 		return nil, &resp
 	}
 	var obligations []capability.Obligation

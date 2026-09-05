@@ -143,21 +143,37 @@ func TestCounterSubjectGuards_AreIdenticalAcrossEverySpec(t *testing.T) {
 				require.NotNil(t, condErr, "this misconfiguration must be refused")
 				assert.Equal(t, tc.wantCode, condErr.Code,
 					"the code must not depend on which counter-backed state this is")
-				assert.False(t, denialFor(condErr).Downgradable(),
+				assert.False(t, condErr.Downgradable(),
 					"no observing route may forward past a guard that found no subject to evaluate against")
 				assert.Equal(t, spec.condType, condErr.ConditionType)
 				assert.True(t, strings.Contains(condErr.Message, tc.wantMsg),
 					"message = %q, want it to mention %q", condErr.Message, tc.wantMsg)
+
+				// Through quotaBucketKey under BOTH postures, which is the half a ctx-less call
+				// cannot assert: --audit skips the COUNTER, not the guards in front of it, so a
+				// skip reported here would hide the misconfiguration as an ALLOW — the original
+				// regression, and one nothing pinned once the guards moved to their own seam.
+				for _, posture := range []struct {
+					name string
+					ctx  context.Context
+				}{
+					{"enforce", context.Background()},
+					{"observe", WithSkipQuota(context.Background())},
+				} {
+					if spec.condType == sequenceHistorySpec.condType {
+						continue // derives a history key; never reaches quotaBucketKey
+					}
+					key, skip, bucketErr := tc.engine.quotaBucketKey(posture.ctx, tc.req, spec)
+					require.NotNil(t, bucketErr, "%s must deny this misconfiguration", posture.name)
+					assert.False(t, skip,
+						"%s: a failed structural guard must never report a skip; observe mode would read it as satisfied", posture.name)
+					assert.Empty(t, key)
+					assert.Equal(t, tc.wantCode, bucketErr.Code, "%s", posture.name)
+					assert.False(t, bucketErr.Downgradable(), "%s", posture.name)
+				}
 			})
 		}
 	}
-}
-
-// denialFor asks the refusal the ONE question every layer asks of it, rather than reading the
-// class or the override alone — either half on its own is how a fault-shaped refusal comes to be
-// forwarded.
-func denialFor(condErr *ConditionError) *capability.DenialInfo {
-	return &capability.DenialInfo{Code: condErr.Code, BlockOverride: condErr.BlockOverride}
 }
 
 // quotaBucketKey's own two additions on top of the shared guards: the target-name guard (which
@@ -180,7 +196,7 @@ func TestQuotaBucketKey_TargetGuardAndSkipOrder(t *testing.T) {
 				assert.False(t, skip, "%s: skip must not be reported for a failed structural guard", posture.name)
 				assert.Empty(t, key)
 				assert.Equal(t, capability.ErrCodeMissingContext, condErr.Code)
-				assert.False(t, denialFor(condErr).Downgradable(),
+				assert.False(t, condErr.Downgradable(),
 					"%s: a bucket that was never derived has no verdict to forward in its place", posture.name)
 				assert.Contains(t, condErr.Message, "tool or resource name is required")
 			})

@@ -191,11 +191,10 @@ func (e *Engine) handleTimeWindow(_ context.Context, cond capability.Condition, 
 	// window, but a direct/programmatic caller can construct one, and silently allowing
 	// would fall open for a security rule.
 	if tw.NotBefore == "" && tw.NotAfter == "" {
-		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
-			ConditionType: capability.ConditionTypeTimeWindow,
-			Message:       "timeWindow condition declares neither notBefore nor notAfter; a window with no bounds restricts nothing",
-		}
+		// A fault, not a verdict, and the literal twin of blastRadius' "bounds nothing": a window
+		// declaring no bound was never evaluated, so an observing route has none to forward.
+		return conditionFault(capability.ConditionTypeTimeWindow,
+			"timeWindow condition declares neither notBefore nor notAfter; a window with no bounds restricts nothing")
 	}
 
 	now := e.clock.Now().UTC()
@@ -208,11 +207,9 @@ func (e *Engine) handleTimeWindow(_ context.Context, cond capability.Condition, 
 	if !compiled {
 		local := *tw
 		if err := local.Compile(); err != nil {
-			return &ConditionError{
-				Code:          capability.ErrCodeConditionFailed,
-				ConditionType: capability.ConditionTypeTimeWindow,
-				Message:       err.Error(),
-			}
+			// A condition this build cannot COMPILE was never evaluated, so its refusal is a
+			// fault — the class allowedTables' identical exit carries.
+			return conditionFault(capability.ConditionTypeTimeWindow, err.Error())
 		}
 		notBefore, notAfter, _ = local.Window()
 	}
@@ -282,11 +279,9 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 		// conditions; fail closed.
 		local := *ipr
 		if err := local.Compile(); err != nil {
-			return &ConditionError{
-				Code:          capability.ErrCodeConditionFailed,
-				ConditionType: capability.ConditionTypeIPRange,
-				Message:       fmt.Sprintf("invalid CIDR in condition: %v", err),
-			}
+			// As timeWindow's: nothing evaluated the range, so no posture forwards past it.
+			return conditionFault(capability.ConditionTypeIPRange,
+				fmt.Sprintf("invalid CIDR in condition: %v", err))
 		}
 		networks, _ = local.Networks()
 	}
@@ -355,22 +350,14 @@ var (
 // blastRadius was left behind before the two bucket derivations were shared.
 func (e *Engine) counterSubjectGuards(req *capability.EnforceRequest, spec counterKeySpec) *ConditionError {
 	if e.counter == nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: spec.condType,
-			Message:       "call counter not configured" + spec.counterDetail,
-		}
+		return conditionFault(spec.condType, "call counter not configured"+spec.counterDetail)
 	}
 
 	// A caller-contract fault, not a missing field, so it takes nilRequestDenial's code rather
 	// than the subject guard's: reporting "sessionId is required" would name a field the call
 	// never carried.
 	if req == nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: spec.condType,
-			Message:       nilSeamRefusal(spec.condType, "a nil request"),
-		}
+		return conditionFault(spec.condType, nilSeamRefusal(spec.condType, "a nil request"))
 	}
 
 	// The ANCHOR's id, not req.SessionID: under WithTaskAnchoredState the key this state lands
@@ -391,7 +378,11 @@ func (e *Engine) counterSubjectGuards(req *capability.EnforceRequest, spec count
 			// is a genuine policy verdict everywhere it reports a missing ARGUMENT, and moving
 			// it there would break every SIEM rule keyed on it for a refusal that is one.
 			BlockOverride: true,
-			Message:       anchorSubject(anchor.Kind) + " is required for " + spec.subject,
+			// Always "sessionId", and provably so: ResolveTaskVar reports a task only for a
+			// non-blank claim, so a task-kinded anchor always has an id and only the SESSION
+			// fallback can reach this guard. A task-anchored caller whose token carries no
+			// task_id is refused earlier, by anchorUnresolved, with the task-specific message.
+			Message: "sessionId is required for " + spec.subject,
 		}
 	}
 	return nil
@@ -815,11 +806,7 @@ func (e *Engine) handleAllowedTables(_ context.Context, cond capability.Conditio
 	if !compiled {
 		local := *at
 		if err := local.Compile(); err != nil {
-			return &ConditionError{
-				Code:          capability.ErrCodeEnforcementError,
-				ConditionType: capability.ConditionTypeAllowedTables,
-				Message:       fmt.Sprintf("allowedTables condition could not be compiled: %v", err),
-			}
+			return conditionFault(capability.ConditionTypeAllowedTables, fmt.Sprintf("allowedTables condition could not be compiled: %v", err))
 		}
 		allowedTableSet, columnsByTable, columnSets, _ = local.TableLookup()
 	}
@@ -978,11 +965,7 @@ func EvaluateAllowedValues(cond capability.Condition, req *capability.EnforceReq
 	// reached, and the policy code made an observing route FORWARD the call with the allowlist
 	// never evaluated. Same code and wording as every other nil-argument seam.
 	if req == nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: capability.ConditionTypeAllowedValues,
-			Message:       nilSeamRefusal("EvaluateAllowedValues", "a nil request"),
-		}
+		return conditionFault(capability.ConditionTypeAllowedValues, nilSeamRefusal("EvaluateAllowedValues", "a nil request"))
 	}
 
 	argValue, present := ResolveArgument(req.Arguments, av.Argument)
@@ -1271,11 +1254,9 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 	// A rule that can never fire is almost certainly an authoring mistake; deny rather
 	// than silently allow everything.
 	if len(sb.AfterTools) == 0 {
-		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
-			ConditionType: capability.ConditionTypeSequenceBlock,
-			Message:       "sequenceBlock condition requires a non-empty 'afterTools' list naming the tools whose prior use blocks this call",
-		}
+		// "A rule that can never fire" is the same shape as a bound that bounds nothing: a fault.
+		return conditionFault(capability.ConditionTypeSequenceBlock,
+			"sequenceBlock condition requires a non-empty 'afterTools' list naming the tools whose prior use blocks this call")
 	}
 
 	// Fail closed when an entry names no tool after its prefix is stripped and
@@ -1292,15 +1273,14 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		}
 	}
 	if len(emptyAfterTools) > 0 {
-		return &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
-			ConditionType: capability.ConditionTypeSequenceBlock,
-			Message:       fmt.Sprintf("sequenceBlock 'afterTools' contains entries that name no tool after the namespace prefix is stripped: %v", emptyAfterTools),
-			Details: map[string]interface{}{
+		// A fault for the sibling's reason: an entry naming no tool can match nothing, so the gate
+		// was never evaluated.
+		return conditionFault(capability.ConditionTypeSequenceBlock,
+			fmt.Sprintf("sequenceBlock 'afterTools' contains entries that name no tool after the namespace prefix is stripped: %v", emptyAfterTools),
+			map[string]interface{}{
 				"emptyAfterTools": emptyAfterTools,
 				"afterTools":      sb.AfterTools,
-			},
-		}
+			})
 	}
 
 	// The counter/request/anchor sequence, shared with the quota bucket derivations rather
@@ -1346,11 +1326,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 
 		count, err := e.counter.Peek(histCtx, key, sequenceHistoryWindowSec)
 		if err != nil {
-			return &ConditionError{
-				Code:          capability.ErrCodeEnforcementError,
-				ConditionType: capability.ConditionTypeSequenceBlock,
-				Message:       fmt.Sprintf("session history lookup failed: %v", err),
-			}
+			return conditionFault(capability.ConditionTypeSequenceBlock, fmt.Sprintf("session history lookup failed: %v", err))
 		}
 		if count > 0 {
 			// Re-arm the marker so retention measures inactivity, not age: without this a
@@ -1385,14 +1361,9 @@ func (e *Engine) handlePolicy(ctx context.Context, cond capability.Condition, re
 	// registry's: nothing evaluated the condition, so there is no verdict for an observing
 	// route to downgrade to.
 	if e.policyEvaluator == nil {
-		return &ConditionError{
-			Code:          capability.ErrCodeEnforcementError,
-			ConditionType: capability.ConditionTypePolicy,
-			Message:       "no policy evaluator configured; register one via WithPolicyEvaluator",
-			Details: map[string]interface{}{
-				"backend": pc.Backend,
-			},
-		}
+		return conditionFault(capability.ConditionTypePolicy,
+			"no policy evaluator configured; register one via WithPolicyEvaluator",
+			map[string]interface{}{"backend": pc.Backend})
 	}
 
 	return e.policyEvaluator.Evaluate(ctx, pc.Backend, pc.Config, pc.Input, req)
@@ -1407,14 +1378,9 @@ func (e *Engine) handleCustom(_ context.Context, cond capability.Condition, _ *c
 	// As handlePolicy's: an unwired extension point evaluated nothing, so the refusal is a
 	// fault rather than a verdict. Supply a handler via
 	// WithConditionHandler(capability.ConditionTypeCustom, handler).
-	return &ConditionError{
-		Code:          capability.ErrCodeEnforcementError,
-		ConditionType: capability.ConditionTypeCustom,
-		Message:       fmt.Sprintf("no handler registered for custom condition %q; register one via enforcement.WithConditionHandler", cc.Name),
-		Details: map[string]interface{}{
-			"name": cc.Name,
-		},
-	}
+	return conditionFault(capability.ConditionTypeCustom,
+		fmt.Sprintf("no handler registered for custom condition %q; register one via enforcement.WithConditionHandler", cc.Name),
+		map[string]interface{}{"name": cc.Name})
 }
 
 // parseTableArgument converts a raw tool argument value into a []TableAccess.
@@ -1539,11 +1505,9 @@ func castCondition[T capability.Condition](cond capability.Condition) (*T, *Cond
 	if !ok || t == nil {
 		var zero T
 		condType := zero.ConditionType()
-		return nil, &ConditionError{
-			Code:          capability.ErrCodeConditionFailed,
-			ConditionType: condType,
-			Message:       fmt.Sprintf("invalid %s condition type", condType),
-		}
+		// The funnel every condition handler calls first, so its class is the one a new handler
+		// inherits: a condition the registry could not cast to its own type evaluated nothing.
+		return nil, conditionFault(condType, fmt.Sprintf("invalid %s condition type", condType))
 	}
 	return t, nil
 }

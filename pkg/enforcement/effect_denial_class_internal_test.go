@@ -19,8 +19,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -135,51 +137,83 @@ func TestEffectRefusals_FaultsAreNotDowngradable(t *testing.T) {
 	}
 }
 
-// TestEffectFile_BuildsNoConditionErrorOutsideItsTwoConstructors is the half the signatures
-// cannot close. effectDenial takes the resolved effect, so a site above the resolution physically
-// cannot call it — but nothing stops one writing its own &ConditionError with whichever code it
-// picks, which is what every effect refusal did before the split. Requiring the two constructors
-// to be the only ones in this file keeps the class a two-way choice at a named constructor.
+// TestConditionFault_IsTheOnlyMinterOfTheFaultCode is the half the signatures cannot close.
 //
-// Scoped to ConditionError, not to the CODES: checkEffectCeiling legitimately names
-// ErrCodeConditionFailed in a capability.DenialInfo, a different shape with its own explicit
-// BlockOverride, and a rule broad enough to catch that would be one this file has to be exempted
-// from rather than held to.
-func TestEffectFile_BuildsNoConditionErrorOutsideItsTwoConstructors(t *testing.T) {
+// effectDenial takes the resolved effect, so a site above the resolution physically cannot call
+// it — but nothing stops any handler in the package writing ErrCodeEnforcementError into a
+// &ConditionError of its own, which is how blastRadius, timeWindow and ipRange came to call an
+// unevaluable condition a policy verdict while their siblings called it a fault. Requiring
+// conditionFault to be the single minter puts "which class is this?" at one documented place a
+// new handler lands on, package-wide rather than in the one file the split started in.
+//
+// RESIDUAL, stated rather than implied: this asserts that the fault code has one home, not that
+// every unevaluable site reaches it — no walk can tell whether a refusal reached a verdict. What
+// it buys is that the rule is discoverable and that a second spelling cannot ship silently.
+func TestConditionFault_IsTheOnlyMinterOfTheFaultCode(t *testing.T) {
 	t.Parallel()
 
 	dir, ok := callerDir()
-	require.True(t, ok, "runtime.Caller failed; cannot locate effect.go")
-	path := filepath.Join(dir, "effect.go")
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, nil, 0)
-	require.NoError(t, err)
+	require.True(t, ok, "runtime.Caller failed; cannot locate the package sources")
 
-	minters := map[string]bool{"effectDenial": true, "effectFault": true}
+	// One literal, in the constructor itself.
+	exempt := map[string]bool{"conditionFault": true}
 	found := 0
-	for _, decl := range file.Decls {
-		fn, isFunc := decl.(*ast.FuncDecl)
-		if !isFunc || fn.Body == nil {
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			lit, isLit := n.(*ast.CompositeLit)
-			if !isLit {
-				return true
+		fset := token.NewFileSet()
+		file, perr := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		require.NoError(t, perr)
+
+		for _, decl := range file.Decls {
+			fn, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fn.Body == nil {
+				continue
 			}
-			name, isIdent := lit.Type.(*ast.Ident)
-			if !isIdent || name.Name != "ConditionError" {
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				lit, isLit := n.(*ast.CompositeLit)
+				if !isLit {
+					return true
+				}
+				typeName, isIdent := lit.Type.(*ast.Ident)
+				if !isIdent || typeName.Name != "ConditionError" {
+					return true
+				}
+				if !namesFaultCode(lit) {
+					return true
+				}
+				found++
+				assert.True(t, exempt[fn.Name.Name],
+					"%s: %s builds a ConditionError carrying ErrCodeEnforcementError of its own; call conditionFault so the fault class has one home",
+					fset.Position(lit.Pos()), fn.Name.Name)
 				return true
-			}
-			found++
-			assert.True(t, minters[fn.Name.Name],
-				"%s: %s builds a ConditionError of its own; route it through effectDenial (a verdict the policy reached) or effectFault (one it could not), so the denial class is not a per-site literal",
-				fset.Position(lit.Pos()), fn.Name.Name)
-			return true
-		})
+			})
+		}
 	}
-	assert.Equal(t, len(minters), found,
-		"effect.go should build exactly one ConditionError per constructor; found %d, so this walk is asserting something other than what it says", found)
+	assert.Equal(t, len(exempt), found,
+		"expected exactly one fault-coded ConditionError literal in the package; found %d, so this walk is asserting something other than what it says", found)
+}
+
+// namesFaultCode reports whether a composite literal sets Code to ErrCodeEnforcementError.
+func namesFaultCode(lit *ast.CompositeLit) bool {
+	for _, elt := range lit.Elts {
+		kv, isKV := elt.(*ast.KeyValueExpr)
+		if !isKV {
+			continue
+		}
+		key, isIdent := kv.Key.(*ast.Ident)
+		if !isIdent || key.Name != "Code" {
+			continue
+		}
+		sel, isSel := kv.Value.(*ast.SelectorExpr)
+		return isSel && sel.Sel.Name == "ErrCodeEnforcementError"
+	}
+	return false
 }
 
 // callerDir locates this package's source directory, so the walk does not silently find nothing

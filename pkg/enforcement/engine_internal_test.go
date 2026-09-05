@@ -119,9 +119,14 @@ func TestCompositeCounterKey_NulSeparatorWouldNotSuffice(t *testing.T) {
 // namespace is what keeps a velocity budget and a call quota on one target from draining each
 // other's accounting.
 func TestCompositeCounterKey_PrefixPreserved(t *testing.T) {
-	seqPrefix := sequenceHistorySpec.namespace + ":"
-	if got := seqKeyForTest("", "s", "tool", "t"); !strings.HasPrefix(got, seqPrefix) {
-		t.Errorf("sequenceHistoryKey = %q, want %q prefix", got, seqPrefix)
+	// A LITERAL, not sequenceHistorySpec.namespace: derived from the code under test it is a
+	// tautology, and renaming the namespace silently moves every antecedent marker to a fresh
+	// empty keyspace — after which handleSequenceBlock Peeks nothing and every gate fails OPEN.
+	if got := seqKeyForTest("", "s", "tool", "t"); !strings.HasPrefix(got, "seq:") {
+		t.Errorf("sequenceHistoryKey = %q, want \"seq:\" prefix", got)
+	}
+	if sequenceHistorySpec.namespace != "seq" {
+		t.Errorf("sequenceHistorySpec.namespace = %q, want the on-disk %q", sequenceHistorySpec.namespace, "seq")
 	}
 	for _, spec := range []counterKeySpec{maxCallsBucketSpec, blastRadiusBucketSpec} {
 		if got := capability.CompositeKey(spec.namespace, "s", "tool", "t"); !strings.HasPrefix(got, spec.namespace+":") {

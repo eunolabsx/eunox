@@ -324,7 +324,7 @@ func TestEngine_IPRange_InvalidCIDR(t *testing.T) {
 		},
 	})
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeIPRange, resp.Denial.ConditionType)
 }
 
@@ -2670,7 +2670,7 @@ func TestEngine_TimeWindow_BothBoundsEmpty(t *testing.T) {
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ConditionTypeTimeWindow, resp.Denial.ConditionType)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 }
 
 func TestEngine_TimeWindow_InvalidNotAfter(t *testing.T) {
@@ -7411,7 +7411,7 @@ func TestSequenceBlock_EmptyAfterToolsFailsClosed(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 }
 
 func TestSequenceBlock_AllEntriesStripToEmptyFailsClosed(t *testing.T) {
@@ -7433,7 +7433,7 @@ func TestSequenceBlock_AllEntriesStripToEmptyFailsClosed(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, []string{"tool:", "resource:"}, resp.Denial.Details["emptyAfterTools"])
 }
 
@@ -7457,7 +7457,7 @@ func TestSequenceBlock_WhitespaceOnlyEntryFailsClosed(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, []string{"tool: ", "  "}, resp.Denial.Details["emptyAfterTools"])
 }
 
@@ -7500,7 +7500,7 @@ func TestSequenceBlock_OneEntryStripsToEmptyFailsClosed(t *testing.T) {
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ConditionTypeSequenceBlock, resp.Denial.ConditionType)
-	assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
 	assert.Equal(t, []string{"tool:"}, resp.Denial.Details["emptyAfterTools"])
 }
 
