@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -536,23 +537,32 @@ func TestFirstRequestCreation_AJoinerWaitsForEstablishment(t *testing.T) {
 	sess.initInProgress.Store(true)
 	require.NoError(t, h.proxy.registerSession(sess, h.proxy.currentReapGen()))
 
-	// While establishing, a joiner blocks rather than proceeding.
+	// While establishing, a joiner blocks rather than proceeding — and when its OWN wait ends it
+	// says so, which is a different answer from anything about the worker. Collapsing the two is
+	// what let the creating path fork an upstream for a request nobody was waiting on.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	assert.False(t, h.proxy.awaitEstablished(ctx, sess),
+	assert.Equal(t, waiterGone, h.proxy.awaitEstablished(ctx, sess),
 		"a joiner was released while the worker was still coming up")
 
 	// Once established it is joinable — and only because it is still registered.
 	h.proxy.finishEstablishing(sess)
-	assert.True(t, h.proxy.awaitEstablished(context.Background(), sess))
+	assert.Equal(t, workerServable, h.proxy.awaitEstablished(context.Background(), sess))
 
 	// A worker whose establishment ENDED IN TEARDOWN must not be joined: the signal means "no
 	// longer coming up", never "came up".
 	h.proxy.mu.Lock()
 	delete(h.proxy.sessions, sess.id)
 	h.proxy.mu.Unlock()
-	assert.False(t, h.proxy.awaitEstablished(context.Background(), sess),
+	assert.Equal(t, workerGone, h.proxy.awaitEstablished(context.Background(), sess),
 		"a joiner adopted a worker that was torn down while coming up")
+
+	// A dead context on a worker this never WAITED for is not the caller's answer: nothing
+	// blocked on it, so its context is not the primitive's business.
+	dead, cancelDead := context.WithCancel(context.Background())
+	cancelDead()
+	assert.Equal(t, workerGone, h.proxy.awaitEstablished(dead, sess),
+		"a departed caller was reported for a wait that never happened")
 }
 
 // And the resolve path actually WAITS — asserted by driving firstRequestSession, not the helper.
@@ -693,4 +703,365 @@ func (h *declaringHostHarness) postToSession(t *testing.T, token, sessionID stri
 	buf := new(bytes.Buffer)
 	_, _ = buf.ReadFrom(resp.Body)
 	return declaringResponse{status: resp.StatusCode, body: buf.String()}
+}
+
+// The SESSION-HEADER POST takes the same wait.
+//
+// A derived worker id is not confined to the path that derives it: a caller who computes it from
+// their own claims can present it in Mcp-Session-Id, and that spelling reached the same
+// mid-establishment worker through handleSessionPost with no wait at all — negotiation resolves
+// fine, since omission inherits the pinned revision. Driven through the real handler for
+// TheResolvePathWaitsForEstablishment's reason: a cell that exercises awaitEstablished alone
+// proves the primitive works while this caller could have stopped calling it.
+//
+// The message is a SWALLOWED notification so the cell measures the wait rather than a forward:
+// it runs the whole prologue and is answered 202 with no upstream involved.
+func TestFirstRequestCreation_TheSessionHeaderPathWaitsForEstablishment(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	route := newBareTestRoute()
+	sess := newTestSession(&httpSession{
+		id: "w1", route: route, done: make(chan struct{}), established: make(chan struct{}),
+	})
+	sess.initInProgress.Store(true)
+	proxy.mu.Lock()
+	proxy.sessions[sess.id] = sess
+	proxy.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, sess.id)
+	w := httptest.NewRecorder()
+	answered := make(chan struct{})
+	go func() {
+		defer close(answered)
+		proxy.handleSessionPost(w, req, route, sess.id,
+			mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized})
+	}()
+
+	select {
+	case <-answered:
+		t.Fatal("the POST was answered while the worker was still coming up; it ran against an upstream whose startup drift check had not passed")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	proxy.finishEstablishing(sess)
+	select {
+	case <-answered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the POST never returned after establishment finished")
+	}
+	assert.Equal(t, http.StatusAccepted, w.Code, "body: %s", w.Body.String())
+}
+
+// So does the SSE GET, which is the one that gets served without asking for anything.
+//
+// newSession starts readUpstream BEFORE runDriftCheckOrTeardown, so the upstream is already
+// broadcasting by the time the drift check runs. A subscriber registered in that window receives
+// the not-yet-vetted upstream's notifications — the FM-5 rug-pull this proxy exists to catch,
+// delivered to a host as though it had been checked.
+func TestFirstRequestCreation_TheSSEGetPathWaitsForEstablishment(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	route := newBareTestRoute()
+	done := make(chan struct{})
+	sess := newTestSession(&httpSession{
+		id: "w1", route: route, done: done, established: make(chan struct{}),
+	})
+	sess.initInProgress.Store(true)
+	proxy.mu.Lock()
+	proxy.sessions[sess.id] = sess
+	proxy.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, sess.id)
+	w := httptest.NewRecorder()
+	streaming := make(chan struct{})
+	go func() {
+		defer close(streaming)
+		proxy.handleMCPGet(w, req, route)
+	}()
+
+	select {
+	case <-streaming:
+		t.Fatal("the SSE GET returned while the worker was still coming up")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// The assertion that names the harm: no stream is attached to the unvetted upstream's
+	// broadcast while it is unvetted.
+	assert.False(t, sess.hasSubscribers(),
+		"an SSE subscriber was registered on a worker whose startup drift check had not passed")
+
+	proxy.finishEstablishing(sess)
+	require.Eventually(t, sess.hasSubscribers, 2*time.Second, 5*time.Millisecond,
+		"the stream never opened after establishment finished")
+
+	close(done) // the upstream exits; the stream loop returns
+	select {
+	case <-streaming:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the SSE GET never returned after its session ended")
+	}
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// A worker torn down WHILE coming up is served by neither leg.
+//
+// The wait's signal means "no longer coming up", never "came up" — a failed startup drift check
+// ends establishment by tearing the session down. Each leg then gives the answer it ALREADY gives
+// for a worker that is gone rather than a new one, which is what keeps an old-revision client's
+// handling of this race unchanged: the POST the retryable JSON-RPC error its teardown race
+// produces one gate further on, the GET resolveSessionForRoute's 404.
+func TestFirstRequestCreation_AWorkerTornDownWhileComingUpIsNotServed(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		msg        mcp.RPCMsg
+		wantStatus int
+		wantBody   string
+	}{{
+		name:       "session-header POST, request",
+		msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: capability.MethodToolsCall},
+		wantStatus: http.StatusOK, // a JSON-RPC error rides a 200; the code is the verdict
+		wantBody:   `"code":-32000`,
+	}, {
+		// A framing JSON-RPC forbids answering is acked bodyless, as every other drop on this
+		// leg is — never a denial body, and never the malformed {"jsonrpc":""} frame.
+		name:       "session-header POST, notification",
+		msg:        mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized},
+		wantStatus: http.StatusAccepted,
+	}, {
+		name:       "SSE GET",
+		wantStatus: http.StatusNotFound,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newTornDownWorkerHarness(t, nil)
+
+			w, answered := h.driveParked(t, tc.msg)
+			h.tearDownWhileComingUp()
+			awaitAnswer(t, answered)
+
+			assert.Equal(t, tc.wantStatus, w.Code,
+				"a worker torn down while coming up was served anyway; body: %s", w.Body.String())
+			if tc.wantBody != "" {
+				assert.Contains(t, w.Body.String(), tc.wantBody, "the answer must be retryable and correlatable to the caller's own request id")
+			}
+			if tc.msg.IsZero() {
+				assert.False(t, h.sess.hasSubscribers(), "a stream was attached to a torn-down worker")
+			}
+		})
+	}
+}
+
+// And a worker the kill store still names is answered KILL_SWITCH, on the tape, on BOTH legs.
+//
+// This is the half that decides where the failed-wait refusal lives. Reusing the unresolved-id
+// answer would have recorded the kill under an EMPTY signed session_id (that helper's subject is
+// claimedSession, since its id resolved nothing) — and on the declaring re-entry, which carries
+// no session header at all, under nothing. Routing the GET's failed wait to a bare status would
+// have dropped the leg's only kill record outright, since its own kill check sits below the wait.
+func TestFirstRequestCreation_AKilledWorkerTornDownWhileComingUpRecordsTheKill(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		msg        mcp.RPCMsg
+		wantStatus int
+	}{{
+		name:       "session-header POST",
+		msg:        mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: capability.MethodToolsCall},
+		wantStatus: http.StatusOK,
+	}, {
+		name:       "SSE GET",
+		wantStatus: http.StatusForbidden,
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ks := killswitch.NewInMemory()
+			h := newTornDownWorkerHarness(t, ks)
+
+			w, answered := h.driveParked(t, tc.msg)
+			require.NoError(t, ks.KillSession(context.Background(), h.sess.id))
+			h.tearDownWhileComingUp()
+			awaitAnswer(t, answered)
+
+			assert.Equal(t, tc.wantStatus, w.Code, "body: %s", w.Body.String())
+
+			var killRecords []map[string]interface{}
+			for _, rec := range h.tape(t) {
+				if rec["denial_code"] == capability.ErrCodeKillSwitch {
+					killRecords = append(killRecords, rec)
+				}
+			}
+			require.Len(t, killRecords, 1,
+				"a kill reaping a worker mid-establishment left no KILL_SWITCH record; the leg's own kill check sits below the wait")
+			// The subject is the whole point: this id RESOLVED a live registration and cleared
+			// both session gates, so it is fact. Left as a claim it lands in details only, and an
+			// operator cannot join this refusal to the traffic that preceded it.
+			assert.Equal(t, h.sess.id, killRecords[0]["session_id"],
+				"the kill was recorded against an unverified id for a worker this proxy established")
+		})
+	}
+}
+
+// An ABORTED request does not reach the session-creating path, however long its worker takes.
+//
+// The resolve path falls through to CREATE when the wait says the worker is not servable, and the
+// wait used to answer a departed caller with that same verdict. Reaching creation is the whole
+// harm: newSession forks the upstream before anything reads the context — exec.Command, not
+// CommandContext, and the noctx suppression is explicit — so a process was spawned and then
+// SIGKILLed a moment later when initUpstream failed on that same dead context. One fork-and-kill
+// per aborted request, and since the worker key is derived from the caller's own claims, an
+// authenticated caller knows exactly when this window is open; a client with an aggressive
+// timeout, or a load balancer dropping connections, does it by accident.
+//
+// Observed through the SESSION CAP rather than the spawned process, deliberately. A marker file
+// written by the child races its own SIGKILL — the kill lands microseconds after initUpstream
+// returns on the dead context, so the fork happens and the marker usually does not appear, which
+// is a test that fails to detect the bug it exists for. The cap is the deterministic signal that
+// the creating path was entered at all, which is the precondition for every fork it performs.
+func TestFirstRequestCreation_AnAbortedRequestDoesNotReachCreation(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	// One slot, already spent by the worker registered below — so a request that reaches the
+	// creating path trips the cap and says so, and one that never gets there is silent.
+	proxy.maxSessions = 1
+	route := &UpstreamRoute{
+		name: "up1", transport: "stdio",
+		// Would fail loudly if it were ever spawned; nothing here may spawn anything.
+		command: "/nonexistent/eunox-must-not-spawn-this",
+		pdp:     newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink:    &routeSink{},
+	}
+	// The gates BELOW the wait are the arm's own value, separately from the spawn guard further
+	// on: on a Redis-backed kill switch this lookup is a network round trip, and it answers on
+	// the caller's own dead context — which fails closed into a KILL_SWITCH_ERROR deny record
+	// for a session nobody killed and a client already gone.
+	var killChecks atomic.Int32
+	route.pdp = killGateHookPDP{PolicyDecisionPoint: route.pdp, onCheckKill: func() { killChecks.Add(1) }}
+	ctx, cancel := context.WithCancel(pdp.WithJWTClaims(
+		capability.WithProtocolRevision(context.Background(), capability.Revision20260728),
+		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1"}))
+	key, ok := firstRequestWorkerKey(route, ctx)
+	require.True(t, ok)
+
+	// A worker for this key, registered but still coming up: the window in which a joiner waits.
+	sess := newTestSession(&httpSession{id: key, route: route, done: make(chan struct{}), established: make(chan struct{})})
+	sess.initInProgress.Store(true)
+	require.NoError(t, proxy.registerSession(sess, proxy.currentReapGen()))
+
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,
+		Params: json.RawMessage(`{"name":"read_file"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	w := httptest.NewRecorder()
+	resolved := make(chan *httpSession, 1)
+	go func() {
+		resolved <- proxy.firstRequestSession(w, req.WithContext(ctx), route, capability.Revision20260728, msg)
+	}()
+
+	// The client gives up while its worker is still establishing.
+	cancel()
+	select {
+	case got := <-resolved:
+		assert.Nil(t, got, "a departed caller was handed a worker")
+	case <-time.After(5 * time.Second):
+		t.Fatal("firstRequestSession never returned after its caller went away")
+	}
+
+	// The assertion that names the harm: reaching creation is what forks, and the cap is what
+	// makes reaching it visible.
+	assert.Empty(t, w.Body.String(),
+		"a departed caller reached the session-creating path, which is where the upstream is forked")
+
+	// And the worker it was waiting on is untouched: the abort is the CALLER's fact, not the
+	// worker's, so it must not tear down or displace a session establishing perfectly well.
+	assert.Same(t, sess, proxy.getSession(key), "an aborted request disturbed the worker it was waiting on")
+	assert.Equal(t, 1, proxy.sessionCount())
+	assert.Zero(t, killChecks.Load(),
+		"a departed caller drove a kill-store lookup on its own dead context, which fails closed into a record for a session nobody killed")
+}
+
+// ── the torn-down-worker harness ────────────────────────────────────────────
+
+// tornDownWorkerHarness is the mid-establishment fixture the two tables above share: a worker
+// registered but still coming up, on a route whose sink is readable. ks may be nil for the cells
+// that arm no kill.
+type tornDownWorkerHarness struct {
+	proxy   *HTTPProxy
+	route   *UpstreamRoute
+	sess    *httpSession
+	sink    *audit.Sink
+	logPath string
+}
+
+func newTornDownWorkerHarness(t *testing.T, ks killswitch.Manager) *tornDownWorkerHarness {
+	t.Helper()
+	sink, logPath := newTempAuditSink(t)
+	h := &tornDownWorkerHarness{proxy: newTestHTTPProxy(), sink: sink, logPath: logPath}
+	h.route = &UpstreamRoute{name: "up1", pdp: pdp.AlwaysAllowPDP{}, sink: &routeSink{sink: sink, upstream: "up1"}}
+	if ks != nil {
+		h.route.pdp = newTestManifestPDPWithKS(ks)
+	}
+	h.sess = newTestSession(&httpSession{
+		id: "w1", route: h.route, done: make(chan struct{}), established: make(chan struct{}),
+	})
+	h.sess.initInProgress.Store(true)
+	h.proxy.mu.Lock()
+	h.proxy.sessions[h.sess.id] = h.sess
+	h.proxy.mu.Unlock()
+	return h
+}
+
+// driveParked launches the leg msg selects — a zero message is the SSE GET, which carries no
+// JSON-RPC envelope — and asserts it is still parked while the worker is coming up.
+func (h *tornDownWorkerHarness) driveParked(t *testing.T, msg mcp.RPCMsg) (w *httptest.ResponseRecorder, answered chan struct{}) {
+	t.Helper()
+	method := http.MethodGet
+	if !msg.IsZero() {
+		method = http.MethodPost
+	}
+	req := httptest.NewRequest(method, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, h.sess.id)
+	w, answered = httptest.NewRecorder(), make(chan struct{})
+	go func() {
+		defer close(answered)
+		if msg.IsZero() {
+			h.proxy.handleMCPGet(w, req, h.route)
+			return
+		}
+		h.proxy.handleSessionPost(w, req, h.route, h.sess.id, msg)
+	}()
+	select {
+	case <-answered:
+		t.Fatal("answered while the worker was still coming up")
+	case <-time.After(parkedWorkerSettle):
+	}
+	return w, answered
+}
+
+// tearDownWhileComingUp does what a failed startup drift check does: tear the worker out of the
+// registry, then end its establishing window.
+func (h *tornDownWorkerHarness) tearDownWhileComingUp() {
+	h.proxy.mu.Lock()
+	delete(h.proxy.sessions, h.sess.id)
+	h.proxy.mu.Unlock()
+	h.proxy.finishEstablishing(h.sess)
+}
+
+func (h *tornDownWorkerHarness) tape(t *testing.T) []map[string]interface{} {
+	t.Helper()
+	_ = h.sink.Close()
+	return readAuditRecords(t, h.logPath)
+}
+
+// parkedWorkerSettle is how long a cell watches a leg stay parked before releasing it. Long
+// enough that a leg which does not wait has certainly answered, short enough to pay per cell.
+const parkedWorkerSettle = 50 * time.Millisecond
+
+func awaitAnswer(t *testing.T, answered chan struct{}) {
+	t.Helper()
+	select {
+	case <-answered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("never returned after establishment ended in teardown")
+	}
 }

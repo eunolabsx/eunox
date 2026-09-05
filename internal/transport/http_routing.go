@@ -586,22 +586,15 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 	// record may name no policy target. See recordSessionGateDeny.
 	gateID, gateMethod := auditIdentity(msg)
 	if gate, denied := p.enforceSessionGates(r.Context(), route, sess, sessionID, gateID, gateMethod, legHTTPPost); denied {
-		if msg.IsRequest() {
-			writeJSONMsg(w, denialResult(msg.ID, gate.code, gate.conditionType, msg.Method, ""))
-		} else {
-			// Fire-and-forget (notification / response, including an id-less initialize
-			// notification carrying a victim's Mcp-Session-Id): ack the drop with a bodyless
-			// 202, matching the kill-switch notification path — the host cannot act on a body,
-			// and a JSON-RPC error body would omit the id (RPCMsg.ID is json:"id,omitempty")
-			// under an implicit 200, indistinguishable from success to a status-only client.
-			//
-			// A dropped RESPONSE unblocks its initiator only when the sender is this session's
-			// own owner: this gate refuses the SENDER, and answering on an unauthorized one's
-			// message would abort the real owner's pending reply. See
-			// unblockGateRefusedServerReply for both halves of that rule.
-			sess.unblockGateRefusedServerReply(r.Context(), msg)
-			w.WriteHeader(http.StatusAccepted)
-		}
+		answerSessionGateRefusal(r.Context(), w, sess, gate, msg)
+		return
+	}
+	// BELOW the session gates and ABOVE everything that reads this worker's negotiated state.
+	// Below, because the gates decide from this request's own claims and the ones captured at
+	// construction — neither of which establishment produces — so a caller who may not act on
+	// this session at all is refused at once rather than parking for the establishment budget.
+	// Above negotiation and dispatch, so the revocation lookup they take is FRESH past the wait.
+	if !p.awaitServableWorker(w, r, route, sess, msg, legHTTPPost) {
 		return
 	}
 	// Negotiate FIRST: every table below is revision-scoped, so resolving after the lookup
@@ -862,11 +855,7 @@ func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request
 	// here — recordKillDrop names the message itself through auditIdentity, which already
 	// labels a response "server-response"; the leg is what an operator tells the two drop
 	// SITES apart by, and it is the half a message cannot carry.
-	leg := legHTTPNotification
-	if msg.IsResponse() {
-		leg = legHTTPServerResponse
-	}
-	recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), msg, leg)
+	recordKillDrop(r.Context(), p.preSessionKillRecorder(route), deny, claimedSession(r), msg, killDropLeg(msg))
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -1000,6 +989,129 @@ func (p *HTTPProxy) enforceSessionGates(ctx context.Context, route *UpstreamRout
 	return gate, denied
 }
 
+// answerSessionGateRefusal renders a refused session gate on the POST leg, in the framing the
+// message allows.
+//
+// Fire-and-forget (a notification or response, including an id-less initialize notification
+// carrying a victim's Mcp-Session-Id): ack the drop with a bodyless 202, matching the kill-switch
+// notification path — the host cannot act on a body, and a JSON-RPC error body would omit the id
+// (RPCMsg.ID is json:"id,omitempty") under an implicit 200, indistinguishable from success to a
+// status-only client.
+//
+// A dropped RESPONSE unblocks its initiator only when the sender is this session's own owner:
+// this gate refuses the SENDER, and answering on an unauthorized one's message would abort the
+// real owner's pending reply. See unblockGateRefusedServerReply for both halves of that rule.
+func answerSessionGateRefusal(ctx context.Context, w http.ResponseWriter, sess *httpSession, gate sessionGate, msg mcp.RPCMsg) {
+	if msg.IsRequest() {
+		writeJSONMsg(w, denialResult(msg.ID, gate.code, gate.conditionType, msg.Method, ""))
+		return
+	}
+	sess.unblockGateRefusedServerReply(ctx, msg)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// awaitServableWorker holds a host-initiated action until the worker it names has stopped
+// COMING UP, and reports whether it may be served on. A false answer means the leg is finished
+// with this request: the caller has been answered, or — when the caller's own context ended —
+// there is nobody left to answer and nothing to say (see refuseUnestablishedWorker).
+//
+// The wait itself is awaitEstablished's; this adds the two things a SERVING leg owes around it,
+// so neither leg has to remember either. The refusal is shared so the legs cannot disagree about
+// what a worker that did not survive establishment costs a caller, or about what its id is on the
+// tape. And the write deadline is re-armed HERE when the wait actually blocked, covering both
+// outcomes because the time was spent either way: the entry window was armed before a wait that
+// spans the establishment budget — plus, on the teardown that makes it fail, that teardown's own
+// two sequential --shutdown-timeout bounds — so every exit below it was writing against a window
+// already spent, and the host got a reset instead of its answer. Skipped when nothing was waited
+// for, which is every request on an established worker: a syscall per request to re-arm a window
+// that has not moved.
+func (p *HTTPProxy) awaitServableWorker(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg, leg transportLeg) bool {
+	waited := sess.initInProgress.Load()
+	outcome := p.awaitEstablished(r.Context(), sess)
+	if waited && outcome != waiterGone {
+		rearmWriteDeadlineForTeardown(w, p.shutdownMs)
+	}
+	switch outcome {
+	case workerServable:
+		return true
+	case workerGone:
+		p.refuseUnestablishedWorker(r.Context(), w, route, sess, msg, leg)
+	case waiterGone:
+		// Answered nothing and recorded nothing: see establishmentOutcome.
+	}
+	return false
+}
+
+// refuseUnestablishedWorker answers a leg whose worker stopped coming up without staying
+// servable — a failed startup drift check tears it down, and a kill landing in the window
+// reclaims it at the establishment edge.
+//
+// NOT denyUnresolvedSession, whose subject is claimedSession(r) because its id resolved nothing:
+// here the id RESOLVED a live registration and cleared both session gates, so verifiedSession is
+// the honest subject, and stamping it is what lets an operator join this refusal to the traffic
+// that preceded it. That helper would also have named nothing at all on the declaring re-entry,
+// which carries no session header for a claim to be read out of.
+//
+// Reached only for workerGone. A waiter whose own context ended never arrives here at all — that
+// rule rides establishmentOutcome rather than being re-asked as a guard on this side, since a
+// second reading of "is the caller still there" is where the two answers drift apart.
+//
+// Each leg gives the answer it ALREADY gives for a worker that is gone, rather than a new one:
+// the POST the retryable JSON-RPC error its teardown race produces one gate further on, the GET
+// resolveSessionForRoute's 404 — which is also the re-initialize signal an old-revision host
+// reads, and inventing a retryable status there would have told it to keep dialling a UUID that
+// can never be registered again.
+//
+// No server-initiated request is unblocked here. This shares the kill drop's exception: the
+// worker is being torn down and its tracked ids go with it, so the answer is owed by that
+// teardown rather than by this refusal.
+func (p *HTTPProxy) refuseUnestablishedWorker(ctx context.Context, w http.ResponseWriter, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg, leg transportLeg) {
+	// An established session's kill record is unmetered, as its sibling arms are: this caller
+	// cleared the route binding and both session gates, so it is not the zero-session flood the
+	// pre-session bucket bounds.
+	rec := asRecorder(route.sink)
+	deny := route.pdp.CheckKill(ctx, sess.id)
+	if leg == legSSEGet {
+		if deny != nil {
+			recordKillDrop(ctx, rec, deny, verifiedSession(sess.id), msg, leg)
+			http.Error(w, "session terminated", http.StatusForbidden)
+			return
+		}
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	if !msg.IsRequest() {
+		// Fire-and-forget: acked bodyless, for the reason every other drop on this leg is —
+		// the host cannot act on a body it is not allowed to be sent. The leg recorded is the
+		// DROP-leg vocabulary's, never the session-gate constant this function was reached
+		// under: the drop leg is what an operator tells a dropped notification from a dropped
+		// server response by, and it is the half a message cannot carry.
+		if deny != nil {
+			recordKillDrop(ctx, rec, deny, verifiedSession(sess.id), msg, killDropLeg(msg))
+		}
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	if deny != nil {
+		writeJSONMsg(w, recordKillDenial(ctx, rec, deny, msg, verifiedSession(sess.id)))
+		return
+	}
+	// Word for word the answer the teardown race below gives: it is the same fact — the worker
+	// went away under a request that had already resolved it — and a JSON-RPC client dispatching
+	// on the envelope can correlate it to its own request id.
+	writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: session torn down; retry"))
+}
+
+// killDropLeg names the HTTP drop site for a fire-and-forget host message, in the vocabulary
+// recordKillDrop's records are read in. Shared by every arm that drops one, so the two sites
+// cannot label the same framing differently.
+func killDropLeg(msg mcp.RPCMsg) transportLeg {
+	if msg.IsResponse() {
+		return legHTTPServerResponse
+	}
+	return legHTTPNotification
+}
+
 // sessionGateRecorder resolves the metered recorder for a session-gate refusal.
 //
 // Bounded on the ROUTE's bucket, not the addressed session's: the session named here is the
@@ -1033,6 +1145,14 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 	// the security gates for whatever construction reached this point without a route.
 	if _, denied := p.enforceSessionGates(r.Context(), route, sess, sessionID, "", "", legSSEGet); denied {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	// readUpstream is started BEFORE the session-start drift check runs, so a subscriber
+	// registered mid-establishment receives the not-yet-vetted upstream's notifications — the
+	// FM-5 rug-pull this proxy exists to catch, delivered as though it had been checked. Below
+	// the gates and above the kill check for handleSessionPost's reasons; the refusal consults
+	// the kill store itself, so this placement costs the leg no kill record.
+	if !p.awaitServableWorker(w, r, route, sess, mcp.RPCMsg{}, legSSEGet) {
 		return
 	}
 	// Kill-switch check before serving: a killed (or globally emergency-stopped) session
@@ -1506,8 +1626,10 @@ func (s *httpSession) leg() hostLeg {
 // written: -32022 plus its record for a request, and for a notification a recorded drop with a
 // bodyless 202, since JSON-RPC forbids replying to one.
 //
-// This is the FIRST gate every host message passes — ahead of the kill check, deliberately;
-// see the gate order in dispatch.go for why, and for the one labelling exception it costs.
+// This is the first gate every DISPATCHED host message passes — ahead of the kill check,
+// deliberately; see the gate order in dispatch.go for why, for the labelling exception it costs,
+// and for the two session gates on the established-POST leg that precede it without dispatching
+// anything.
 //
 // Every arm that DISPATCHES a host message calls it — the established session, the
 // session-creating `initialize`, and the id-less one — because the two sessionless arms
