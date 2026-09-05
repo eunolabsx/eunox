@@ -1404,6 +1404,15 @@ list of exact strings or glob patterns (e.g. `/reports/*` matches
 > silently widen the allowlist. Quote it to mean the string, or write a value that
 > round-trips exactly.
 >
+> The same check covers the numeric policy fields themselves — `maxCalls`' `count` and
+> `windowSeconds`, `argumentSchema`'s bounds, and the effect layer's `max`, `maxTotal`,
+> `value` and `maxBlastRadius` — and it reads through YAML **anchors and merge keys**: a
+> bound reached as `*ref` or merged in with `<<:` is refused exactly as the inline spelling
+> is, so a shared block cannot carry a value into a policy that the same text written in
+> place would be refused for. The check is on the **text**, not on which value wins: a shared
+> block carrying `max: 010` is refused even where an inline `max: 8` overrides it, so quote or
+> canonicalize the shared block rather than relying on the override.
+>
 > Manifests load through one hardened path regardless of file extension: `.yaml`,
 > `.yml`, `.json`, and an extensionless file all get **duplicate-key rejection** and
 > **multi-document rejection**, so a duplicated security-critical key (e.g. two

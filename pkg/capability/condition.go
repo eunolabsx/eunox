@@ -259,10 +259,41 @@ type compiledTables struct {
 }
 
 // Compile builds the case-folded table and column lookup maps once at load, so the
-// hot path stops rebuilding them per request. It is idempotent and cannot fail; the
-// error return matches the other compiled conditions so the loader treats them alike.
+// hot path stops rebuilding them per request. It is idempotent, and refuses two 'columns'
+// keys that address the same table, the way every other case-variant ambiguity in this
+// codebase is refused rather than resolved (see validateEffectByArgument): one allowlist
+// would shadow the other, and picking a side means enforcing a column ACL its author never
+// wrote. The manifest loader refuses the same shape first, so this is the exit for a
+// condition built through the API.
 func (c *AllowedTablesCondition) Compile() error {
+	if err := checkColumnKeyCollision(c.Columns); err != nil {
+		return err
+	}
 	c.compiled = compileTables(c.Tables, c.Columns)
+	return nil
+}
+
+// checkColumnKeyCollision refuses two Columns keys that fold onto one table.
+//
+// The fold has to be the one the MATCHER applies or the certificate this issues is worthless:
+// compileTables and the handler both key on ToLower after TrimSpace, so this does too — NOT
+// canonicalCaseFold, which folds pairs ToLower leaves distinct.
+func checkColumnKeyCollision(columns map[string][]string) error {
+	seen := make(map[string]string, len(columns))
+	for table := range columns {
+		key := strings.ToLower(strings.TrimSpace(table))
+		prior, dup := seen[key]
+		if !dup {
+			seen[key] = table
+			continue
+		}
+		// Name the pair in a stable order: the map is ranged in Go's randomized order, and an
+		// error that names the same two keys differently per run cannot be diffed or tested.
+		if table < prior {
+			prior, table = table, prior
+		}
+		return fmt.Errorf("allowedTables 'columns' has case-colliding keys %+q and %+q, which address the same table (names are trimmed and lowercased, the same rule the matcher applies); one column allowlist would shadow the other, so merge them under a single key", prior, table)
+	}
 	return nil
 }
 
@@ -302,8 +333,17 @@ func compileTables(tables []string, columns map[string][]string) *compiledTables
 	}
 	out.columnsByTable = make(map[string][]string, len(columns))
 	out.columnSets = make(map[string]map[string]bool, len(columns))
+	// A fold collision is refused by Compile and by the manifest loader, so what is left here
+	// is a condition built through the API that never compiled. Resolve it to the smallest
+	// original key rather than to Go's randomized map order: an arbitrary column ACL is bad,
+	// one that differs per process is not even reportable.
+	winner := make(map[string]string, len(columns))
 	for table, cols := range columns {
 		key := strings.ToLower(strings.TrimSpace(table))
+		if prior, ok := winner[key]; ok && prior < table {
+			continue
+		}
+		winner[key] = table
 		out.columnsByTable[key] = cols
 		set := make(map[string]bool, len(cols))
 		for _, col := range cols {

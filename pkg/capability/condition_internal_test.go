@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -415,6 +416,42 @@ func TestAllowlistConditions_CompiledMatchesUncompiled(t *testing.T) {
 		for _, c := range []*AllowedTablesCondition{uncompiled, compiled} {
 			if _, byTable, _ := c.TableLookup(); byTable != nil {
 				t.Errorf("columnsByTable = %v, want nil when no restrictions are declared", byTable)
+			}
+		}
+	})
+
+	t.Run("allowedTables refuses a column-key fold collision", func(t *testing.T) {
+		// Two keys addressing one table are an ambiguous ACL, refused the way every other
+		// case-variant ambiguity here is rather than resolved: picking a side enforces a
+		// column allowlist the author never wrote, and the smaller key can be the wider one.
+		c := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}, Columns: map[string][]string{"Users": {"id", "ssn"}, "users": {"id"}}}
+		err := c.Compile()
+		if err == nil {
+			t.Fatal("a columns fold collision must be refused at Compile")
+		}
+		for _, want := range []string{"Users", "users", "same table"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error should name %q, got: %v", want, err)
+			}
+		}
+		// Stable across runs: the pair is ranged out of a map, so an unsorted message would
+		// name the two keys in a different order per process.
+		for i := 0; i < 32; i++ {
+			again := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}, Columns: c.Columns}
+			if got := again.Compile().Error(); got != err.Error() {
+				t.Fatalf("collision message is unstable:\n%s\n%s", err, got)
+			}
+		}
+		// A condition built through the API and never compiled still resolves to one ACL
+		// rather than to Go's randomized map order.
+		for i := 0; i < 64; i++ {
+			uncompiled := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}, Columns: c.Columns}
+			_, byTable, sets := uncompiled.TableLookup()
+			if got := byTable["users"]; len(got) != 2 || got[0] != "id" {
+				t.Fatalf("columnsByTable[users] = %v, want the smallest original key's list", got)
+			}
+			if !sets["users"]["ssn"] {
+				t.Fatalf("column set = %v, want the smallest original key's columns", sets["users"])
 			}
 		}
 	})

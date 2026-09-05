@@ -943,9 +943,6 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 			return fmt.Errorf("transport: stdio fronts exactly one upstream, got %d", len(cfg.Upstreams))
 		}
 	}
-	if err := validateHandshakelessPins(cfg); err != nil {
-		return err
-	}
 	for _, cidr := range cfg.Listen.TrustedProxyCIDRs {
 		ip, network, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -1026,7 +1023,11 @@ func (cfg *GatewayConfig) Validate(presentKeys []map[string]bool) error {
 			return err
 		}
 	}
-	return nil
+	// Last: a cross-field check reads values every upstream has already been validated for,
+	// so it cannot diagnose a typo as a pairing problem. Run early, it reported an
+	// unparseable `protocolVersion` — and an upstream missing its own `name` — as a
+	// host-transport mismatch advising `transport: stdio`, a remedy for neither.
+	return validateHandshakelessPins(cfg)
 }
 
 func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen map[string]bool, presentKey func(int, string) bool) error {
@@ -1130,6 +1131,9 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 //
 // stdio is not refused: a peer there may open a context at any revision by declaring it, so a
 // host and a pinned upstream on the same revision is a reachable matched pair.
+//
+// Runs after every upstream has been validated, so each pin is one this build speaks and this
+// check never has to describe a value validateProtocolVersion is about to reject.
 func validateHandshakelessPins(cfg *GatewayConfig) error {
 	if cfg.HostTransport() != HostTransportHTTP {
 		return nil
