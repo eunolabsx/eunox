@@ -309,7 +309,6 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	if rt.serializes() {
 		decideLock = func() (func(), bool) { return sess.beginDecisionTurnWithin(samplingTurnWait) }
 	}
-	// sess.broadcastServerRequest reports whether an SSE subscriber received the request;
 	// sess.claims is attached so per-agent kills are honored and records carry agent_id.
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:       asRecorder(rt.sink),
@@ -322,9 +321,7 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 		// tape from a pre-session refusal, the one case an absent field is supposed to mean.
 		// forwardServerRequest does the stamping; this supplies the fact.
 		revision: sess.hostRev,
-		forward: func(ctx context.Context, m mcp.RPCMsg) bool {
-			return sess.broadcastServerRequest(ctx, m)
-		},
+		forward:  sess.broadcastServerRequest,
 		// Through the seam, not a bare closure over the concrete writer: remote-upstream mode
 		// leaves upWriter nil, and every denial arm below answers the initiator AFTER its audit
 		// record — a nil-receiver panic there leaves a tape recording a denial the process died

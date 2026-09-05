@@ -196,7 +196,7 @@ func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 		sessionID: "sess",
 		pdp:       pdp.AlwaysAllowPDP{},
 		revision:  capability.Revision20260728,
-		forward:   func(context.Context, mcp.RPCMsg) bool { return true },
+		forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
 		// The leg's tape paired with its buckets, as both transports wire it: the boundary
 		// refusal's record resolves through this wiring, not through fp.rec.
 		unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, httpServerRequestLegs, io.Discard),

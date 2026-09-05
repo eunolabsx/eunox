@@ -806,7 +806,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSampling(t *testing.T) {
 		rec:              rec,
 		sessionID:        "s",
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
-		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
+		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
 		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
@@ -829,7 +829,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsSampling(t *testing.T) 
 		rec:              rec,
 		sessionID:        "s",
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
-		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
+		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
 		unblocker:        writingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
@@ -875,9 +875,9 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 		rec:       rec,
 		sessionID: "s",
 		pdp:       dp,
-		forward: func(context.Context, mcp.RPCMsg) bool {
+		forward: func(context.Context, mcp.RPCMsg) forwardOutcome {
 			t.Error("an enforced flowLabel deny must not forward to the host")
-			return false
+			return forwardUndelivered
 		},
 		unblocker: writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 	}
@@ -909,7 +909,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesNonSampling(t *testing.T
 		sessionID: "s",
 		// CheckKill returns nil; the strict gate is what fires
 		pdp:              pdp.AlwaysAllowPDP{},
-		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
+		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
 		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
@@ -933,7 +933,7 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsNonSampling(t *testing.
 		rec:              rec,
 		sessionID:        "s",
 		pdp:              pdp.AlwaysAllowPDP{},
-		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
+		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
 		unblocker:        writingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
@@ -959,11 +959,11 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
 		pdp: newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
-		forward: func(context.Context, mcp.RPCMsg) bool {
+		forward: func(context.Context, mcp.RPCMsg) forwardOutcome {
 			// Capture how many records existed at the moment of forwarding: the deny
 			// observation must already be among them.
 			forwardedBeforeRecords = len(rec.records)
-			return true
+			return forwardDelivered
 		},
 		unblocker: writingSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }),
 	}
@@ -1012,7 +1012,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsBeforeLogging(t *testing.T) {
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
 		// hard deny to an observe.
 		pdp:     newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
-		forward: func(context.Context, mcp.RPCMsg) bool { return true },
+		forward: func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
 		// The seam's diagnostic channel is left UNSET rather than pointed at io.Discard: this leg's
 		// notice resolves its destination at write time, which is what lets it reach the os.Stderr
 		// swapped in above. A channel naming a writer would answer the ordering question about the
@@ -1052,7 +1052,7 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSamplingObserveLeg(t *te
 		// No system:sampling opt-in → DecideSampling denies (a capability deny, not a
 		// kill-switch deny), so the request reaches the audit-mode observe leg.
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
-		forward:          func(context.Context, mcp.RPCMsg) bool { forwarded = true; return true },
+		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
 		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}

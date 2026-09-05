@@ -948,7 +948,10 @@ type serverRequestParams struct {
 	// message can resolve a revision, be recorded under it, and still not pin because the proxy
 	// discarded it. So it is resolved through resolveRevision rather than left absent.
 	revision capability.Revision
-	forward  func(context.Context, mcp.RPCMsg) bool
+	// forward hands msg to the host and reports what it DID with it, which is what
+	// recordForwardOutcome puts on the tape — see forwardOutcome for why that is three answers
+	// rather than "did a client get it".
+	forward func(context.Context, mcp.RPCMsg) forwardOutcome
 	// unblocker answers the blocked initiator and records an answer that did not land. A zero one
 	// (a params struct built by hand in a test) has no upstream sink, which every arm below
 	// reaches via answerInitiator so the case is REPORTED rather than nil-called — never a closure
@@ -1113,16 +1116,37 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 	return true
 }
 
-// recordForwardOutcome writes the audit record for a forwarded server-initiated request: an
-// allow when a client accepted it, or an ENFORCEMENT_ERROR deny when none could. Shared by all
-// three forwardServerRequest legs so the record shape cannot drift between them.
+// forwardOutcome is what a transport's forward did with a server-initiated request. Three answers
+// rather than a bool, because the two ways of not delivering are different FACTS and the tape has
+// to tell them apart: "no client would take it" is about the host, "I refused it" is about eunox,
+// and a bool collapsed them onto one record whose category declares the first while its commonest
+// producer was the second.
 //
-// On HTTP, "delivered" means buffered onto an SSE subscriber channel, not that the host's
-// socket received it — httpSession.failServerRequestDelivery appends a correction deny if
-// async delivery later fails. On stdio it means the frame was handed to the host writer; that
-// write is fire-and-forget, so a poisoned stdout is the one residual either transport carries
-// here (see StdioProxy.handleUpstreamRequest). Neither reports delivered for a request its
-// forward REFUSED, which is what keeps one refusal from also writing an allow.
+// The distinction is also what keeps admitServerRequestID's "exactly ONE record" a property of the
+// code rather than of the entry gate happening to run first: a forward that already recorded its
+// own refusal says so, and this leg adds nothing.
+type forwardOutcome int
+
+const (
+	// forwardDelivered: handed to the host. On HTTP that is buffered onto an SSE subscriber
+	// channel, not that the socket received it — httpSession.failServerRequestDelivery appends a
+	// correction deny if async delivery later fails. On stdio it is a whole frame written to the
+	// host writer without error.
+	forwardDelivered forwardOutcome = iota
+	// forwardUndelivered: nothing took it and the forward wrote no record of its own, so this leg
+	// writes the not-delivered deny. Reachable on both transports — no SSE subscriber accepted it,
+	// or the stdio host writer failed the frame.
+	forwardUndelivered
+	// forwardRefused: the forward refused the request, answered its initiator and wrote its OWN
+	// attributed record. This leg writes NOTHING for it — a second, site-less record for the same
+	// refusal is a duplicate an operator cannot attribute, and its category would misname the cause.
+	forwardRefused
+)
+
+// recordForwardOutcome writes the audit record for a forwarded server-initiated request: an
+// allow when a client accepted it, an ENFORCEMENT_ERROR deny when none could, and nothing at all
+// for a forward that already recorded its own refusal. Shared by all three forwardServerRequest
+// legs so the record shape cannot drift between them.
 //
 // dec supplies the record's flow fields; the non-sampling leg passes the zero decision. detail
 // carries the decision-side annotations, such as a repaired handler fault.
@@ -1139,9 +1163,14 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 // tamper-evident tape claiming a delivery that never happened.
 // identifier follows strictServerRequestAuditDenial's rule: the auditIdentity pair on the
 // non-sampling leg, the decision-backed method on the sampling one.
-func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, identifier, method string, delivered, auditOnly bool, dec capability.EnforceResponse, detail map[string]interface{}) {
+func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, identifier, method string, outcome forwardOutcome, auditOnly bool, dec capability.EnforceResponse, detail map[string]interface{}) {
+	// Above the strict-audit wrapper, not inside it: there is no record to warn about having
+	// possibly lost when this leg writes none.
+	if outcome == forwardRefused {
+		return
+	}
 	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, method, func() {
-		if !delivered {
+		if outcome == forwardUndelivered {
 			// Through the unblocker's own wiring — this leg's tape paired with its buckets — rather
 			// than fp.rec beside a bucket looked up separately, which is the two-copies-of-the-sink
 			// fault refusalLimits exists to prevent. Nil when the leg has no tape, or when the
@@ -1232,9 +1261,9 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		if fp.strictServerRequestAuditDenial(ctx, msg, identifier, method, capability.EnforceResponse{}) {
 			return
 		}
-		delivered := fp.forward(ctx, msg)
+		outcome := fp.forward(ctx, msg)
 		// Non-sampling methods are not policy-enforced, so there is no flow decision to record.
-		fp.recordForwardOutcome(ctx, identifier, method, delivered, fp.audit, capability.EnforceResponse{}, nil)
+		fp.recordForwardOutcome(ctx, identifier, method, outcome, fp.audit, capability.EnforceResponse{}, nil)
 		return
 	}
 
@@ -1253,10 +1282,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		if fp.strictServerRequestAuditDenial(ctx, msg, samplingMethod, samplingMethod, dec) {
 			return
 		}
-		delivered := fp.forward(ctx, msg)
+		outcome := fp.forward(ctx, msg)
 		// Carry the sampling decision's flow labels onto the tape, or the tape and state
 		// disagree for the sampling leg.
-		fp.recordForwardOutcome(ctx, samplingMethod, samplingMethod, delivered, fp.audit, dec, handlerFaultDetail(dec))
+		fp.recordForwardOutcome(ctx, samplingMethod, samplingMethod, outcome, fp.audit, dec, handlerFaultDetail(dec))
 		return
 	}
 
@@ -1298,11 +1327,11 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 			denial.Code,
 		)
 	}
-	delivered := fp.forward(ctx, msg)
+	outcome := fp.forward(ctx, msg)
 	// audit=true: the observe path. dec (the downgraded deny) still carries carried_labels, so
 	// the record shows the flow that was let through.
 	//
 	// No commit: a downgraded deny is still a deny, and untainting on one would drop a label
 	// for a call policy refused (the same rule enforcedForwardCore's DecisionAllow gate states).
-	fp.recordForwardOutcome(ctx, samplingMethod, samplingMethod, delivered, true, dec, handlerFaultDetail(dec))
+	fp.recordForwardOutcome(ctx, samplingMethod, samplingMethod, outcome, true, dec, handlerFaultDetail(dec))
 }

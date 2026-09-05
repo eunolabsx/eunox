@@ -423,9 +423,8 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	if opts.Port <= 0 {
 		opts.Port = 3000
 	}
-	// No Stderr default here either: errOut() resolves an unset writer, and the one line this
-	// constructor writes before the proxy exists takes the same resolver rather than a second
-	// copy of the fallback — see resolvedErrOut.
+	// No Stderr default: errOut() resolves an unset writer, and the one line below that writes
+	// before the proxy exists takes the same resolver. See resolvedErrOut.
 	var trustedProxyNets []*net.IPNet
 	for _, cidr := range opts.TrustedProxyCIDRs {
 		if _, ipNet, err := net.ParseCIDR(cidr); err == nil {

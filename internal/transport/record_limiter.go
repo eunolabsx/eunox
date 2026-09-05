@@ -174,10 +174,12 @@ const perBucketFloor = 1
 // both transports hand their own limiter to, so they live in neither transport's file.
 // catUntranslatableServerRequest reaches it the same way, through forwardServerRequest: a stdio
 // host pins 2026-07-28 like any other, and its subprocess upstream then has every server-initiated
-// request it issues refused at the boundary.
+// request it issues refused at the boundary. catUndeliveredForward arrives through that same core,
+// for a request the host writer failed the frame of — a whole-frame stdout failure poisons nothing
+// and so tears nothing down, which is what makes it repeatable at the upstream's own rate.
 var stdioRefusalCategories = []refusalCategory{
 	catRevision, catDisplaced, catUnroutableID, catServerRequestFailed, catRefusalUndeliverable,
-	catUntranslatableServerRequest,
+	catUntranslatableServerRequest, catUndeliveredForward,
 }
 
 // newRefusalRecordLimiter builds the proxy-wide table: a bucket for every metered category.
