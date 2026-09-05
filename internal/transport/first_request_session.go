@@ -171,8 +171,9 @@ func safeKeyComponent(s string) string {
 }
 
 // firstRequestSession resolves the worker a declaring peer's enforced request runs on, creating
-// it when this is the first request that reached it. It writes the refusal and returns nil when
-// the request may not have one.
+// it when this is the first request that reached it. It returns nil when the request may not have
+// one, having written the refusal — except for a caller whose own context ended, which is
+// answered nothing because there is nobody left to answer.
 //
 // msg must be a REQUEST — its caller drops every other framing before reaching here, since a
 // message that cannot be answered must not fork an upstream. The refusals below still route
@@ -202,11 +203,23 @@ func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, 
 	// without the wait a second request could be served on a worker whose FM-5 check has not
 	// compared the upstream's tools against the manifest and whose Tier-2 baseline is unset.
 	if sess := p.getSession(key); sess != nil && sess.route == route {
-		if p.awaitEstablished(ctx, sess) {
+		switch p.awaitEstablished(ctx, sess) {
+		case workerServable:
 			return sess
+		case waiterGone:
+			// The CALLER went away while its worker was coming up, which says nothing about that
+			// worker. Falling through here would CREATE one for a request nobody is waiting on:
+			// newSession forks the upstream before anything reads the context (exec.Command, not
+			// CommandContext), so the process is spawned and then SIGKILLed a moment later when
+			// initUpstream fails on the same dead context — one fork-and-kill per aborted
+			// request, and the key is derived from the caller's own claims, so an authenticated
+			// caller knows exactly when this window is open. Nothing is written either: there is
+			// no one left to answer.
+			return nil
+		case workerGone:
+			// Torn down while coming up (a failed drift check does that). Fall through and try
+			// to create one, exactly as if it had never been there.
 		}
-		// It was torn down while coming up (a failed drift check does that). Fall through and
-		// try to create one, exactly as if it had never been there.
 	}
 	if deny := route.pdp.CheckKill(ctx, key); deny != nil {
 		// verifiedSession, not claimedSession: the key is eunox's OWN derivation from claims a
@@ -232,6 +245,14 @@ func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, 
 // createFirstRequestSession spawns the upstream and registers the worker under key, or writes the
 // creation failure. A concurrent request that won the race is adopted rather than displaced.
 func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, key string, rev capability.Revision, startGen uint64) *httpSession {
+	// Spawning an upstream is the privileged side effect this whole path exists to gate, so a
+	// caller that is already gone gets none of it. Checked HERE rather than only where the wait
+	// reports waiterGone, because the wait is not the only way to arrive with a dead context: the
+	// gates above run a kill lookup that is a network round trip on a Redis-backed switch, and a
+	// client that hangs up across it would otherwise still fork and immediately kill a process.
+	if ctx.Err() != nil {
+		return nil
+	}
 	if !p.tryReserveSessionSlot() {
 		p.recordSessionCapDeny(ctx, r, route)
 		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
@@ -264,8 +285,14 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 		// A concurrent first request on the same identity already registered one. Adopt it:
 		// both requests are the same subject by construction, so the loser has nothing of its
 		// own to preserve, and its upstream is already torn down by the failed create.
-		if existing := p.getSession(key); existing != nil && existing.route == route && p.awaitEstablished(ctx, existing) {
-			return existing
+		if existing := p.getSession(key); existing != nil && existing.route == route {
+			switch p.awaitEstablished(ctx, existing) {
+			case workerServable:
+				return existing
+			case waiterGone:
+				return nil // nobody left to adopt it for, and nobody left to answer
+			case workerGone:
+			}
 		}
 		p.writeSessionCreateError(ctx, w, r, route, err)
 		return nil

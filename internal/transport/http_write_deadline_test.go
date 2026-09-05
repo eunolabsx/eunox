@@ -257,3 +257,123 @@ func TestWriteSessionCreateError_ReArmsForTheTeardownItMayHaveJustPaid(t *testin
 		})
 	}
 }
+
+// TestAwaitServableWorker_ReArmsForTheEstablishmentItJustWaitedOut is the joiner-side twin of
+// the cell above.
+//
+// A serving leg that waited for a worker to finish coming up has spent part of the window its
+// entry armed — and on the teardown that makes the wait FAIL, the establishment budget plus the
+// same two sequential shutdown budgets the creating path re-arms for, since `established` closes
+// only when the constructor returns and that is after its close. Both outcomes therefore write
+// against a window armed for neither, which is why the re-arm covers both rather than sitting on
+// the refusal alone: the success path's own exits (a swallowed notification's 202, a saturation
+// refusal, the SSE leg's kill 403) write with no re-arm of their own.
+func TestAwaitServableWorker_ReArmsForTheEstablishmentItJustWaitedOut(t *testing.T) {
+	t.Parallel()
+
+	const shutdownMs = 40_000
+	want := 2*msToDuration(shutdownMs) + writeSlack
+
+	post := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall}
+	notif := mcp.RPCMsg{JSONRPC: "2.0", Method: mcp.MethodNotificationsInitialized}
+
+	for _, tc := range []struct {
+		name     string
+		msg      mcp.RPCMsg
+		leg      transportLeg
+		survived bool
+	}{
+		{name: "POST request, worker torn down", msg: post, leg: legHTTPPost},
+		{name: "POST notification, worker torn down", msg: notif, leg: legHTTPPost},
+		{name: "SSE GET, worker torn down", leg: legSSEGet},
+		{name: "POST request, worker came up", msg: post, leg: legHTTPPost, survived: true},
+		{name: "SSE GET, worker came up", leg: legSSEGet, survived: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			proxy := &HTTPProxy{sessions: make(map[string]*httpSession), shutdownMs: shutdownMs, stderr: io.Discard}
+			route := &UpstreamRoute{name: "up1", pdp: pdp.AlwaysAllowPDP{}, sink: &routeSink{}}
+			// Establishment has ALREADY ended, so the cell measures the re-arm rather than a
+			// wall clock: what makes this leg a waiter is that it found the worker coming up.
+			established := make(chan struct{})
+			close(established)
+			sess := newTestSession(&httpSession{id: "w1", route: route, done: make(chan struct{}), established: established})
+			sess.initInProgress.Store(true)
+			if tc.survived {
+				proxy.mu.Lock()
+				proxy.sessions[sess.id] = sess
+				proxy.mu.Unlock()
+			}
+
+			w := newDeadlineRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+			start := time.Now()
+			if got := proxy.awaitServableWorker(w, req, route, sess, tc.msg, tc.leg); got != tc.survived {
+				t.Fatalf("servable = %v, want %v", got, tc.survived)
+			}
+
+			armed := w.armed()
+			if len(armed) != 1 {
+				t.Fatalf("armed %d write deadlines, want exactly the post-wait re-arm", len(armed))
+			}
+			if got := armed[0].Sub(start); got < want-2*time.Second {
+				t.Errorf("armed a %v window, want at least %v: this leg waited out an establishment that can end in a full session teardown", got, want)
+			}
+		})
+	}
+}
+
+// Nothing waited for is nothing to re-arm.
+//
+// The re-arm is a syscall, and every request on an established worker takes this path — a window
+// that has not moved must not be charged for one.
+func TestAwaitServableWorker_DoesNotReArmWhenItDidNotWait(t *testing.T) {
+	t.Parallel()
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), shutdownMs: 5000, stderr: io.Discard}
+	route := &UpstreamRoute{name: "up1", pdp: pdp.AlwaysAllowPDP{}, sink: &routeSink{}}
+	sess := newTestSession(&httpSession{id: "w1", route: route, done: make(chan struct{})})
+	proxy.mu.Lock()
+	proxy.sessions[sess.id] = sess
+	proxy.mu.Unlock()
+
+	w := newDeadlineRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	if !proxy.awaitServableWorker(w, req, route, sess, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall}, legHTTPPost) {
+		t.Fatal("an established worker was refused")
+	}
+	if armed := w.armed(); len(armed) != 0 {
+		t.Errorf("armed %d write deadlines for a leg that never waited", len(armed))
+	}
+}
+
+// A waiter whose OWN context ended is answered nothing, recorded nothing, and charged nothing.
+//
+// The wait's false verdict has two causes and only one of them is about the worker: a caller that
+// hung up may have been parked on a worker establishing perfectly well. Answering it would spend
+// a kill-store round trip and, under an active stop, sign a refusal against a live registration
+// on behalf of a client that is already gone.
+func TestAwaitServableWorker_SaysNothingToACallerThatIsAlreadyGone(t *testing.T) {
+	t.Parallel()
+	proxy := &HTTPProxy{sessions: make(map[string]*httpSession), shutdownMs: 5000, stderr: io.Discard}
+	route := &UpstreamRoute{name: "up1", pdp: pdp.AlwaysAllowPDP{}, sink: &routeSink{}}
+	sess := newTestSession(&httpSession{id: "w1", route: route, done: make(chan struct{}), established: make(chan struct{})})
+	sess.initInProgress.Store(true)
+	proxy.mu.Lock()
+	proxy.sessions[sess.id] = sess
+	proxy.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := newDeadlineRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody).WithContext(ctx)
+	if proxy.awaitServableWorker(w, req, route, sess,
+		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall}, legHTTPPost) {
+		t.Fatal("a departed caller was told its worker is servable")
+	}
+	if armed := w.armed(); len(armed) != 0 {
+		t.Errorf("armed %d write deadlines for a caller that is already gone", len(armed))
+	}
+	if body := w.Body.String(); body != "" {
+		t.Errorf("answered %q to a departed caller, about a worker that may be establishing fine", body)
+	}
+}
