@@ -127,6 +127,10 @@ func LoadManifest(path string) (*LocalManifest, error) {
 	if err := rejectExtraYAMLDocuments(dec, path, what); err != nil {
 		return nil, err
 	}
+	// Flatten YAML merge keys before anything reads the document as WRITTEN: every walk below
+	// scans a mapping for a LITERAL key, which a `<<:`-merged one does not have, while the
+	// decode that produces the enforced policy sees it perfectly well. See resolveMergeKeys.
+	resolveMergeKeys(&node)
 	// Gate on the declared grammar version FIRST, before any guard that INTERPRETS the
 	// content: the scalar-coercion guard below reads condition values under the 0.1 grammar,
 	// so a manifest declaring a future version would otherwise be reported as a scalar that
@@ -444,6 +448,12 @@ func rejectCoercedScalarsUnder(n *yaml.Node, isJSON bool, enclosingKey string, v
 // `conditions: [{type: blastRadius, <<: &s {max: 010}}]` loaded enforcing 8 where the inline
 // spelling is refused. The sequence form (`<<: [*a, *b]`) inherits it, that branch
 // propagating the enclosing key on.
+//
+// resolveMergeKeys normally splices those pairs in before this walk runs, so what is left for
+// this branch is the merge that pass deliberately does NOT flatten — one whose value or keys it
+// cannot reproduce the decoder's precedence for. That document is refused a few lines later, but
+// not by this guard, so the branch still has to check under the right key rather than under
+// none.
 //
 // Every other key is canonicalized to "" unless it scopes a numeric field, because the key is
 // half of the visited set: keeping the whole vocabulary re-walks a shared anchor once per key

@@ -566,6 +566,11 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	var version string
 	var numericVersion bool
 	if parsed {
+		// Before every walk over this node: they scan for a LITERAL key, and a `<<:`-merged
+		// schemaVersion has no slot of its own — so a config declaring one through a merge was
+		// refused for not declaring one at all, while the strict decode below (which resolves
+		// merges itself) would have accepted it. See resolveMergeKeys.
+		resolveMergeKeys(&root)
 		version, numericVersion = gatewaySchemaVersionFromNode(&root)
 		if err := validateGatewaySchemaVersion(version); err != nil {
 			return nil, fmt.Errorf("invalid gateway config %q: %w", path, err)
