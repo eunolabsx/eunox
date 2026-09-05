@@ -708,8 +708,15 @@ func recordFailureDenial(requestID, now string, auditOnly bool, obligations []ca
 func nilRequestDenial(seam string) capability.EnforceResponse {
 	return denyResponse("", "", false, nil, capability.DenialInfo{
 		Code:    capability.ErrCodeEnforcementError,
-		Message: seam + ": called with a nil request or constraint; refusing rather than evaluating an incomplete decision",
+		Message: nilRequestRefusal(seam),
 	})
+}
+
+// nilRequestRefusal is the wording every seam refusing a nil argument reports, whether it
+// answers with an EnforceResponse (nilRequestDenial) or an error (the exported state seams in
+// flowlabel.go). One string so a reader grepping a support tape finds every one of them.
+func nilRequestRefusal(seam string) string {
+	return seam + ": called with a nil request or constraint; refusing rather than evaluating an incomplete decision"
 }
 
 // denyResponse builds a deny EnforceResponse from the shared envelope, the single shape

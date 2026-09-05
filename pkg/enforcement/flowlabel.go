@@ -224,7 +224,14 @@ func (e *Engine) peekSessionLabels(ctx context.Context, req *capability.EnforceR
 // PeekSessionLabels is the exported form of peekSessionLabels, for the audit-mode antecedent
 // path to back-fill carried_labels onto a downgraded-and-forwarded deny that never went
 // through evaluateMatched's own peek.
+//
+// A nil request is refused rather than dereferenced, for nilRequestDenial's reason: the caller
+// turns any error here into a hard ENFORCEMENT_ERROR deny, where a panic would produce no
+// decision at all.
 func (e *Engine) PeekSessionLabels(ctx context.Context, req *capability.EnforceRequest) ([]string, error) {
+	if req == nil {
+		return nil, errors.New(nilRequestRefusal("PeekSessionLabels"))
+	}
 	return e.peekSessionLabels(ctx, req)
 }
 
@@ -378,7 +385,19 @@ func (e *Engine) recordAntecedentIn(ctx context.Context, scope SourceCommitScope
 // path: when a downgraded audit-mode source's deny is forwarded, its flow labels and
 // sequenceBlock antecedent must still be recorded atomically and surfaced on the forwarded
 // record. scope names which of the two this caller wants (see SourceCommitScope).
+//
+// A nil argument is refused rather than dereferenced, for nilRequestDenial's reason — but only
+// where this commit would actually READ it: matched is refused under scope.Flow alone, since
+// the antecedent-only commit never touches it and the PDP's no-match path legitimately passes
+// nil there (nothing was selected, and with no source labels there is no synthetic constraint
+// to build). Reported as a SourceCommitError like every other fault on this path, so the
+// caller's existing hard ENFORCEMENT_ERROR deny covers it with no new branch; Flow follows the
+// scope the caller asked for, as the anchorUnresolved backstop's does, since that is what picks
+// the message.
 func (e *Engine) RecordSourceCall(ctx context.Context, req *capability.EnforceRequest, matched *capability.Constraint, scope SourceCommitScope, carriedLabels []string) ([]string, *SourceCommitError) {
+	if req == nil || (scope.Flow && matched == nil) {
+		return nil, &SourceCommitError{Err: errors.New(nilRequestRefusal("RecordSourceCall")), Flow: scope.Flow}
+	}
 	return e.recordSourceCall(ctx, req, matched, scope, carriedLabels)
 }
 

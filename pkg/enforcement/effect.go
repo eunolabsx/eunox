@@ -198,43 +198,17 @@ func formatTotal(total float64) string {
 	return strconv.FormatFloat(total, 'f', -1, 64)
 }
 
-// blastRadiusBucket derives the counter bucket a cumulative bound sums into, under the same
-// fail-closed guards and keying as maxCallsBucket, so a session's velocity budget is per
-// (session, target type, target name).
+// blastRadiusBucket derives the counter bucket a cumulative bound sums into, so a session's
+// velocity budget is per (session, target type, target name).
 //
-// Own namespace ("blastradius:") so a velocity budget and a maxCalls quota on the same target
-// never share a bucket and corrupt each other's accounting.
+// Literally the same guards, order, denial classes and key build as maxCallsBucket rather than
+// a parallel copy of them: the two differ only in the spec they hand quotaBucketKey. The copy
+// this replaced had drifted at the guard that matters most — see quotaBucketKey.
 //
 // skip is true under observe mode, derived solely from context per the
 // CommittingConditionHandler contract.
 func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceRequest) (key string, skip bool, condErr *ConditionError) {
-	if e.counter == nil {
-		return "", false, effectDenial(capability.ConditionTypeBlastRadius,
-			"call counter not configured, so a cumulative blast-radius bound cannot be enforced", nil)
-	}
-	if req == nil || req.SessionID == "" {
-		// A missing session would merge every anonymous caller's magnitude into one budget —
-		// a bypass and a DoS at once.
-		return "", false, &ConditionError{
-			Code:          capability.ErrCodeMissingContext,
-			ConditionType: capability.ConditionTypeBlastRadius,
-			Message:       "sessionId is required for a cumulative blastRadius bound",
-		}
-	}
-	targetType, toolName := sessionTargetKey(req)
-	if toolName == "" {
-		return "", false, &ConditionError{
-			Code:          capability.ErrCodeMissingContext,
-			ConditionType: capability.ConditionTypeBlastRadius,
-			Message:       "tool or resource name is required for a cumulative blastRadius bound",
-		}
-	}
-	// After the structural guards, never before: observe mode must still surface a nil
-	// counter or an unidentifiable target as it would deny in enforce mode.
-	if SkipQuota(ctx) {
-		return "", true, nil
-	}
-	return e.anchoredKey("blastradius", req, targetType, toolName), false, nil
+	return e.quotaBucketKey(ctx, req, blastRadiusBucketSpec)
 }
 
 // blastRadiusHandler is the built-in blastRadius condition handler. A condition declaring a

@@ -160,3 +160,103 @@ func TestMaxCallsBucket_SkipQuotaStillSkipsAValidRequest(t *testing.T) {
 	assert.Nil(t, mc)
 	assert.Empty(t, key)
 }
+
+// -----------------------------------------------------------------
+// quotaBucketKey: one guard sequence for every counter-backed bucket
+// -----------------------------------------------------------------
+
+// The guards are shared rather than mirrored because the family had drifted: blastRadius
+// classified an unwired counter CONDITION_FAILED — DenialClassPolicy, which an observing
+// posture downgrades and FORWARDS — while maxCalls, sequenceBlock and the commit backstop all
+// classified it a fault. This runs the table against every spec, in both postures, so a bucket
+// added later cannot reintroduce the split: a misconfiguration must produce the same code
+// whatever the condition and whatever the posture.
+func TestQuotaBucketKey_GuardsAreIdenticalAcrossEverySpec(t *testing.T) {
+	specs := []quotaBucketSpec{maxCallsBucketSpec, blastRadiusBucketSpec}
+
+	cases := []struct {
+		name      string
+		engine    *Engine
+		req       *capability.EnforceRequest
+		wantCode  string
+		wantClass capability.DenialClass
+	}{
+		{
+			// A fault, not a verdict: the counter is the engine's own state, and the budget it
+			// was asked about was never evaluated. DenialClassFault is what stops an --audit
+			// route forwarding the call with the budget neither checked nor counted.
+			name:      "nil counter",
+			engine:    New(),
+			req:       &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"},
+			wantCode:  capability.ErrCodeEnforcementError,
+			wantClass: capability.DenialClassFault,
+		},
+		{
+			name:      "empty session",
+			engine:    New(WithCallCounter(callcounter.NewInMemory())),
+			req:       &capability.EnforceRequest{SessionID: "", TargetName: "read_file"},
+			wantCode:  capability.ErrCodeMissingContext,
+			wantClass: capability.ClassifyDenialCode(capability.ErrCodeMissingContext),
+		},
+		{
+			// Not reachable from the decision path, but maxCallsBucket dereferenced req here
+			// before the guard was shared; blastRadiusBucket already refused it.
+			name:      "nil request",
+			engine:    New(WithCallCounter(callcounter.NewInMemory())),
+			req:       nil,
+			wantCode:  capability.ErrCodeMissingContext,
+			wantClass: capability.ClassifyDenialCode(capability.ErrCodeMissingContext),
+		},
+		{
+			name:      "empty target name",
+			engine:    New(WithCallCounter(callcounter.NewInMemory())),
+			req:       &capability.EnforceRequest{SessionID: "s", TargetName: ""},
+			wantCode:  capability.ErrCodeMissingContext,
+			wantClass: capability.ClassifyDenialCode(capability.ErrCodeMissingContext),
+		},
+	}
+
+	for _, spec := range specs {
+		for _, tc := range cases {
+			t.Run(spec.condType+"/"+tc.name, func(t *testing.T) {
+				for _, posture := range []struct {
+					name string
+					ctx  context.Context
+				}{
+					{"enforce", context.Background()},
+					{"observe", WithSkipQuota(context.Background())},
+				} {
+					key, skip, condErr := tc.engine.quotaBucketKey(posture.ctx, tc.req, spec)
+					require.NotNil(t, condErr, "%s must deny this misconfiguration", posture.name)
+					assert.False(t, skip, "%s: skip must not be reported for a failed structural guard", posture.name)
+					assert.Empty(t, key)
+					assert.Equal(t, tc.wantCode, condErr.Code,
+						"%s: the code must not depend on the condition or the posture", posture.name)
+					assert.Equal(t, spec.condType, condErr.ConditionType)
+					assert.Equal(t, tc.wantClass, capability.ClassifyDenialCode(condErr.Code),
+						"%s: an observing posture must not be able to downgrade and forward this", posture.name)
+				}
+			})
+		}
+	}
+}
+
+// Each spec still keys its own namespace, so a velocity budget and a maxCalls quota on one
+// target cannot share a bucket and corrupt each other's accounting.
+func TestQuotaBucketKey_SpecsKeyDisjointNamespaces(t *testing.T) {
+	eng := New(WithCallCounter(callcounter.NewInMemory()))
+	req := &capability.EnforceRequest{
+		SessionID:  "s",
+		TargetName: "refund",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "refund"},
+	}
+
+	maxCallsKey, _, condErr := eng.quotaBucketKey(context.Background(), req, maxCallsBucketSpec)
+	require.Nil(t, condErr)
+	blastRadiusKey, _, condErr := eng.quotaBucketKey(context.Background(), req, blastRadiusBucketSpec)
+	require.Nil(t, condErr)
+
+	assert.NotEqual(t, maxCallsKey, blastRadiusKey)
+	assert.True(t, strings.HasPrefix(maxCallsKey, "maxcalls"), "key = %q", maxCallsKey)
+	assert.True(t, strings.HasPrefix(blastRadiusKey, "blastradius"), "key = %q", blastRadiusKey)
+}
