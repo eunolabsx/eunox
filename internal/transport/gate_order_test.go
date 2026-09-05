@@ -603,6 +603,11 @@ var dispositionPrologue = map[string]string{
 	// who has not cleared the binding. (recordSessionGateDeny needs no entry of its own: it
 	// WRITES that refusal's record rather than reaching a sink, so the walk sees its callers.)
 	"enforceSessionGates": "refuses a caller that may not act on this session at all, before anything reads the session's negotiated state (see its doc)",
+	// Its sibling on the same leg, and admissible for the same reason one gate further on: it
+	// answers a worker that did not survive coming up, so there is no established leg to hold a
+	// declaration against. Unlike enforceSessionGates it takes the revocation lookup ITSELF, so
+	// its record is KILL_SWITCH rather than the exception dispatch.go's order names.
+	"refuseUnestablishedWorker": "answers a worker torn down while establishing: nothing was ever negotiated against it, so the record carries no revision (see its doc)",
 	// An UPSTREAM-initiated message. Host-side negotiation governs host messages, and this is
 	// not one — the upstream leg's revision is pinned once per route at its own handshake.
 	"readUpstream": "drops an upstream-initiated notification on a revoked session; not a host message",

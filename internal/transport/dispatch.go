@@ -28,10 +28,14 @@
 //     bad-version probe is recorded as UNSUPPORTED_PROTOCOL_VERSION rather than KILL_SWITCH,
 //     on a message refused either way that contacts no upstream and mutates no state.
 //     Negotiation is also what stamps the revision onto the context every later gate records
-//     under, so a gate placed ahead of it would write a record naming no revision at all. ONE
-//     gate is deliberately ahead of it and therefore records no revision: HTTP's session-owner
-//     binding, which decides whether the caller may act on this session at all and so must not
-//     read the session's negotiated state first (see enforceSessionGates).
+//     under, so a gate placed ahead of it would write a record naming no revision at all. TWO
+//     gates are deliberately ahead of it and therefore record no revision, both for the same
+//     reason — neither may read the session's negotiated state, because neither has yet
+//     established that there is a session whose state this caller may read. HTTP's session-owner
+//     binding decides whether the caller may act on this session at all (enforceSessionGates);
+//     the establishment wait below it decides whether the worker survived coming up
+//     (awaitServableWorker), and its refusal takes the revocation lookup itself, so on that one
+//     arm a kill is recorded as KILL_SWITCH rather than deferring to the exception above.
 //  2. The SWALLOWED set (notification framing only): a method the proxy has already handled
 //     is neither an error nor an event, so it is dropped before anything that would record it.
 //     "Already handled" is a property of the LEG, not of the method: a pre-session arm has
