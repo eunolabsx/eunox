@@ -659,12 +659,12 @@ exact. This is the authoritative set.
 | `VALUE_NOT_PERMITTED` | `-32003` | An `allowedValues` condition: the argument value is outside the permitted set. |
 | `OPERATION_NOT_PERMITTED` | `-32003` | An `allowedOperations` condition: the operation is outside the permitted set. |
 | `RATE_LIMITED` | `-32003` | A `maxCalls` condition's count/window was exceeded. |
-| `MISSING_CONTEXT` | `-32003` | A condition's required argument is absent or empty (fail closed — the condition is never skipped). |
+| `MISSING_CONTEXT` | `-32003` | A condition's required argument is absent or empty (fail closed — the condition is never skipped). Also the code for the structural guards in front of a counter-backed bound: no subject to key state on (no `sessionId`, or under `taskAnchoredState` no `mcp.task_id`) and no identifiable target name. Those two are **not downgraded** on an observing route, unlike every other `MISSING_CONTEXT` — the bound was never evaluated, so there is no verdict to forward in its place. |
 | `INVALID_PARAMS` | `-32602` | `argumentSchema` structural validation failed (takes precedence over condition failures). |
 | `KILL_SWITCH` | `-32603`* | The session or agent has been killed via the kill switch. |
 | `KILL_SWITCH_ERROR` | `-32603`* | The kill-switch backend errored; the proxy fails closed rather than treat the error as "not blocked". |
 | `AUDIT_UNAVAILABLE` | `-32603` | Under `--require-audit=strict`, the audit trail has degraded (a record was dropped or a write failed); an otherwise-authorized call is denied rather than forwarded unaudited. |
-| `ENFORCEMENT_ERROR` | `-32603` | The engine could not reach a verdict: an unmodelled condition type, a condition with no usable handler, a quota/history/flow-label backend that failed or answered nonconformingly, or a registered handler that broke its contract. Distinct from `CONDITION_FAILED`, which is a verdict the policy *did* reach, and never downgraded to a forward on an observing route. |
+| `ENFORCEMENT_ERROR` | `-32603` | The engine could not reach a verdict: an unmodelled condition type, a condition with no usable handler, a quota/history/flow-label backend that failed or answered nonconformingly, a malformed effect condition (a `blastRadius` declaring neither bound, or a bound that is not a number), a condition reached with no resolved effect contract in scope, or a registered handler that broke its contract. Distinct from `CONDITION_FAILED`, which is a verdict the policy *did* reach, and never downgraded to a forward on an observing route. |
 
 `*` The kill-switch codes are infrastructure failures mapped to the internal-error
 class on the wire; the symbolic code in `error.data.code` disambiguates them from a
@@ -1412,6 +1412,14 @@ list of exact strings or glob patterns (e.g. `/reports/*` matches
 > place would be refused for. The check is on the **text**, not on which value wins: a shared
 > block carrying `max: 010` is refused even where an inline `max: 8` overrides it, so quote or
 > canonicalize the shared block rather than relying on the override.
+>
+> Merge keys are **flattened once**, right after the parse, into the mapping that merges them
+> with that mapping's own keys winning — exactly what the decoder does with the same document.
+> Every load-time check therefore sees a merged key as if it had been written in place,
+> including the ones that read the document as it was WRITTEN: a `schemaVersion` reached
+> through `<<:` is the declaration, and an unquoted one merged in gets the same friendly
+> unsupported-dialect message the inline spelling gets rather than a raw unmarshal error. A
+> merge whose value is not a mapping (or a list of them) is left for the decoder to refuse.
 >
 > Manifests load through one hardened path regardless of file extension: `.yaml`,
 > `.yml`, `.json`, and an extensionless file all get **duplicate-key rejection** and
@@ -2496,6 +2504,12 @@ conventional:
    a token without it on such a route is a misconfiguration the proxy cannot account for
    safely. eunox prints a startup notice if the option is on with no JWT validation
    configured at all, since it would then do nothing.
+
+On such a route the **subject** a `maxCalls`, cumulative `blastRadius` or `sequenceBlock`
+bound is keyed on is the anchor, not the session: a request carrying a validated `task_id` and
+no `sessionId` is keyed on the task and accounted normally. (It used to be refused for having no
+`sessionId` while the antecedent recorder, already anchor-gated, wrote for the same request — one
+request with a subject in one namespace and none in the other.)
 
 A task-anchored key carries the anchor kind as its own component, so a task named `x`
 and a session named `x` address different buckets, and a session-anchored key is

@@ -244,10 +244,14 @@ is catastrophic.
   counted quota, whose limit *is* its retention, a weighted one admits arbitrarily many
   sub-threshold magnitudes under a single bound — and every later admission re-sums the
   whole set, under the in-memory backend's lock or inside the Redis backend's script. At
-  the ceiling the call is **refused** with `CONDITION_FAILED` (the whole batch, never a
+  the ceiling the call is **refused** with `ENFORCEMENT_ERROR` (the whole batch, never a
   partial commit) rather than admitted-but-unrecorded, which would be unmetered spend;
   entries age out of the window on their own, so the refusal lasts as long as the burst
-  that caused it. Reaching it takes 100k calls to one target inside one window.
+  that caused it. Reaching it takes 100k calls to one target inside one window. The code is
+  the fault one, not `CONDITION_FAILED`: the retention limit arrives from the counter as an
+  error rather than as a refused admission, so nothing evaluated the bound and no observing
+  route may downgrade the refusal to a forward — a SIEM rule for this case must match
+  `ENFORCEMENT_ERROR`.
 - Under `--audit` the budget is **not** consumed, exactly as `maxCalls` quota is not:
   observing it accurately would spend the thing observation exists to leave alone.
 
