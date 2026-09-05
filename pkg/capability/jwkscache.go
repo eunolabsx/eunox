@@ -73,6 +73,7 @@ type JWKSCache struct {
 	// (see ForceRefreshForKID), so a flood of distinct unknown-kid tokens cannot amplify into
 	// one round-trip each. Separate from mu so a kid-miss lookup never contends with a
 	// fetch's write lock; RWMutex so the hot-path read runs concurrently across flood callers.
+	// Keyed by negKIDKey, never by the raw kid.
 	negMu   sync.RWMutex
 	negKIDs map[string]time.Time
 }
@@ -493,8 +494,9 @@ func sameKeyMultiset(before, after []jose.JSONWebKey) bool {
 // absorbs. The write lock is taken only on the expiry branch, re-checking after acquiring it
 // (RWMutex has no atomic upgrade) so a concurrent refresh is not clobbered.
 func (c *JWKSCache) kidRecentlyAbsent(kid string) bool {
+	k := negKIDKey(kid)
 	c.negMu.RLock()
-	at, ok := c.negKIDs[kid]
+	at, ok := c.negKIDs[k]
 	if !ok {
 		c.negMu.RUnlock()
 		return false
@@ -510,14 +512,14 @@ func (c *JWKSCache) kidRecentlyAbsent(kid string) bool {
 	// and Lock.
 	c.negMu.Lock()
 	defer c.negMu.Unlock()
-	at2, ok2 := c.negKIDs[kid]
+	at2, ok2 := c.negKIDs[k]
 	if !ok2 {
 		return false
 	}
 	if c.now().Sub(at2) < negativeKIDTTL {
 		return true
 	}
-	delete(c.negKIDs, kid)
+	delete(c.negKIDs, k)
 	return false
 }
 
@@ -526,6 +528,10 @@ func (c *JWKSCache) kidRecentlyAbsent(kid string) bool {
 // so a flood of distinct kids cannot grow the map without bound. The shared refresh
 // sentinel is exempt from the cap (see the cap check below).
 func (c *JWKSCache) markKIDAbsent(kid string) {
+	// Derive before locking, as kidRecentlyAbsent does: the kid is attacker-sized, and the
+	// RWMutex is documented as deliberately not serializing flood callers — a digest over a
+	// megabyte of JWS header held under the exclusive lock is that serialization.
+	k := negKIDKey(kid)
 	c.negMu.Lock()
 	defer c.negMu.Unlock()
 	now := c.now()
@@ -537,7 +543,7 @@ func (c *JWKSCache) markKIDAbsent(kid string) {
 	// Anchor the suppress window to the FIRST absent observation: overwriting on every
 	// presentation would slide the window forward indefinitely, letting a client that keeps
 	// presenting a stale kid pin it even after a JWKS update adds it back.
-	if _, ok := c.negKIDs[kid]; ok {
+	if _, ok := c.negKIDs[k]; ok {
 		return
 	}
 	// The shared sentinel must always be insertable: dropping it because a flood of distinct
@@ -546,8 +552,26 @@ func (c *JWKSCache) markKIDAbsent(kid string) {
 	if kid != sharedRefreshSentinel && len(c.negKIDs) >= negativeKIDMaxLen {
 		return
 	}
-	c.negKIDs[kid] = now
+	c.negKIDs[k] = now
 }
+
+// negKIDKey derives the negative cache's map key from a kid. A kid is attacker-chosen text
+// read out of an UNAUTHENTICATED token's JWS header, so keying by it verbatim let
+// negativeKIDMaxLen bound how MANY entries are retained for the TTL while nothing bounded how
+// big one is. Hashing rather than refusing an oversized kid keeps every kid cached, so no
+// length slips back onto the forced-refresh path.
+//
+// The sentinel's key is precomputed: it is consulted once or twice per rejected token on the
+// pre-auth path this cache exists to absorb, and it is a digest of a constant.
+func negKIDKey(kid string) string {
+	if kid == sharedRefreshSentinel {
+		return negKIDSentinelKey
+	}
+	return HashTokenKey(kid)
+}
+
+// negKIDSentinelKey is negKIDKey(sharedRefreshSentinel).
+var negKIDSentinelKey = HashTokenKey(sharedRefreshSentinel)
 
 // refresh fetches a fresh JWKS and stores it. When force is false it first double-checks the
 // TTL under the read lock; when true it always fetches. The store and log line run inside
