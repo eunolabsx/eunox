@@ -136,7 +136,7 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 			eff.BlastRadius.Text('f', -1), br.MaxTotal.String()), velocityDetails(eff, br))
 	}
 
-	key, skip, condErr := e.blastRadiusBucket(ctx, req)
+	key, skip, condErr := e.quotaBucketKey(ctx, req, blastRadiusBucketSpec)
 	if condErr != nil {
 		return DeferredCommit{}, false, condErr
 	}
@@ -196,19 +196,6 @@ func velocityDetails(eff *capability.ResolvedEffect, br *capability.BlastRadiusC
 // scientific notation, matching how the per-call bound renders a magnitude.
 func formatTotal(total float64) string {
 	return strconv.FormatFloat(total, 'f', -1, 64)
-}
-
-// blastRadiusBucket derives the counter bucket a cumulative bound sums into, so a session's
-// velocity budget is per (session, target type, target name).
-//
-// Literally the same guards, order, denial classes and key build as maxCallsBucket rather than
-// a parallel copy of them: the two differ only in the spec they hand quotaBucketKey. The copy
-// this replaced had drifted at the guard that matters most — see quotaBucketKey.
-//
-// skip is true under observe mode, derived solely from context per the
-// CommittingConditionHandler contract.
-func (e *Engine) blastRadiusBucket(ctx context.Context, req *capability.EnforceRequest) (key string, skip bool, condErr *ConditionError) {
-	return e.quotaBucketKey(ctx, req, blastRadiusBucketSpec)
 }
 
 // blastRadiusHandler is the built-in blastRadius condition handler. A condition declaring a

@@ -3978,12 +3978,17 @@ func TestMaxCalls_ValueType(t *testing.T) {
 	assert.Equal(t, capability.DecisionAllow, resp.Decision)
 }
 
-// TestMaxCalls_NoCounter covers the "call counter not configured" branch.
+// TestMaxCalls_NoCounter covers the "call counter not configured" branch, through the whole
+// decision rather than the shared bucket helper: the class is what decides whether an observing
+// posture forwards, and its blastRadius twin lives in velocity_test.go.
 func TestMaxCalls_NoCounter(t *testing.T) {
 	t.Parallel()
 	resp := runCondition(t, enforcement.New(), &capability.MaxCallsCondition{Count: 1, WindowSeconds: 60}, nil, "")
 	assert.Equal(t, capability.DecisionDeny, resp.Decision)
 	assert.Contains(t, resp.Denial.Message, "call counter not configured")
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
+	assert.False(t, resp.Denial.Downgradable(),
+		"the budget was never evaluated, so no observing posture may forward past it")
 }
 
 // TestIPRange_ErrorBranches exercises missing IP, malformed IP, malformed CIDR,

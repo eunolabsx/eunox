@@ -41,11 +41,10 @@ func (e *Engine) NonCommittingConditionVerdict(ctx context.Context, cond capabil
 	if cond == nil || isTypedNil(cond) {
 		return nil, false
 	}
-	// Every pure handler dereferences req (Context.SourceIP, Arguments, SessionID, Target), so
-	// this seam would panic where the rest of the package denies — the fail-OPEN reading, since
-	// a decision point that crashes produces no decision at all (see nilRequestDenial). ok=false
-	// is the caller's existing fail-closed signal, the same answer an unusable handler gets: a
-	// composing layer's bug must not become a hole inside the decision point.
+	// Most pure handlers dereference req (Context.SourceIP, Arguments, SessionID), so dispatching
+	// one would panic where the rest of the package denies — see nilRequestDenial. ok=false is
+	// the caller's existing fail-closed signal; the cost is that it cannot distinguish this from
+	// an unusable handler, which the two share a diagnostic for.
 	if req == nil {
 		return nil, false
 	}

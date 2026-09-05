@@ -300,18 +300,16 @@ func (e *Engine) handleIPRange(_ context.Context, cond capability.Condition, req
 	}
 }
 
-// quotaBucketSpec names the only things a counter-backed bucket derivation differs in: which
-// condition its refusals name, which key namespace the bucket lands in, and how each message's
-// tail reads. Everything else — which guards run, in which order, and under which denial CLASS
-// — is quotaBucketKey's, single-sourced.
+// quotaBucketSpec is everything a counter-backed bucket derivation may vary. Deliberately no
+// denial CLASS: which guards run, in which order, and under which code is quotaBucketKey's, so
+// a spec cannot choose the answer the family had already drifted on.
 type quotaBucketSpec struct {
 	condType  string
 	namespace string
-	// subject completes "sessionId is required for %s" and "tool or resource name is required
-	// for %s".
-	subject string
-	// counterDetail trails the shared nil-counter message where a site has more to say than
-	// "call counter not configured".
+	// subject and counterDetail complete the guard messages; the remediation differs per bound
+	// (wire a counter for the velocity budget vs. for the call quota), so a shared wording
+	// would send an operator to the wrong fix.
+	subject       string
 	counterDetail string
 }
 
@@ -331,17 +329,13 @@ var (
 	}
 )
 
-// quotaBucketKey applies the structural guards every counter-backed bucket derivation shares —
-// a wired counter, a keyable subject, an identifiable target — and then the observe-mode skip.
-// skip is true under --audit observe mode (treat as satisfied); condErr is non-nil on any deny.
+// quotaBucketKey is the guard sequence and key build every counter-backed bucket derivation
+// shares. skip is true under --audit observe mode (treat as satisfied).
 //
-// Shared rather than mirrored per condition because the family had already drifted at one of
-// its two seams: blastRadius classified an unwired counter ErrCodeConditionFailed, a POLICY
-// code an observing posture DOWNGRADES — so an --audit route forwarded the call with the
-// cumulative budget neither checked nor counted. An unwired counter is the engine's own state
-// and the bound it was asked about was never evaluated, so there is no verdict to downgrade:
-// ErrCodeEnforcementError at every seam, and one implementation is what makes that true of the
-// next bucket added rather than something each site has to remember.
+// Shared rather than mirrored because the family had drifted here: blastRadius classified an
+// unwired counter ErrCodeConditionFailed, a POLICY code an observing posture DOWNGRADES, so an
+// --audit route forwarded the call with the cumulative budget neither checked nor counted. The
+// bound was never evaluated, so there is no verdict to downgrade.
 func (e *Engine) quotaBucketKey(ctx context.Context, req *capability.EnforceRequest, spec quotaBucketSpec) (key string, skip bool, condErr *ConditionError) {
 	if e.counter == nil {
 		return "", false, &ConditionError{
@@ -351,9 +345,20 @@ func (e *Engine) quotaBucketKey(ctx context.Context, req *capability.EnforceRequ
 		}
 	}
 
+	// A caller-contract fault, not a missing field, so it takes nilRequestDenial's code rather
+	// than the session guard's: reporting "sessionId is required" would name a field the call
+	// never carried, and MISSING_CONTEXT is a POLICY class an observing route downgrades.
+	if req == nil {
+		return "", false, &ConditionError{
+			Code:          capability.ErrCodeEnforcementError,
+			ConditionType: spec.condType,
+			Message:       nilSeamRefusal(spec.condType, "a nil request"),
+		}
+	}
+
 	// A missing sessionID would merge quota across all anonymous callers (quota
 	// bypass / DoS). Deny rather than share a cross-session bucket.
-	if req == nil || req.SessionID == "" {
+	if req.SessionID == "" {
 		return "", false, &ConditionError{
 			Code:          capability.ErrCodeMissingContext,
 			ConditionType: spec.condType,
