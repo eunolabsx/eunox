@@ -167,3 +167,48 @@ upstreams:
 		t.Errorf("protocolVersion %q must be accepted over the stdio host transport: %v", newer, err)
 	}
 }
+
+// TestLoadGatewayConfig_InvalidPinReportsTheAcceptedSet: the handshakeless-pin check runs ahead
+// of the per-upstream validator and cast the unvalidated string, so a TYPO on an http-hosted
+// route was reported as a transport mismatch — advising `transport: stdio`, which fixes
+// nothing, and asserting that a revision this build has never heard of lacks `initialize`.
+func TestLoadGatewayConfig_InvalidPinReportsTheAcceptedSet(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []string{"banana", "2099-01-01", "0.1"} {
+		_, err := LoadGatewayConfig(writeConfig(t, fmt.Sprintf(`
+schemaVersion: "0.1"
+defaults:
+  enforcement: audit
+upstreams:
+  - name: mock
+    transport: stdio
+    command: echo
+    protocolVersion: %q
+`, bad)))
+		if err == nil {
+			t.Errorf("protocolVersion %q was accepted", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid protocolVersion") {
+			t.Errorf("protocolVersion %q should be reported as invalid with the accepted set, got: %v", bad, err)
+		}
+		if strings.Contains(err.Error(), HostTransportStdio) {
+			t.Errorf("protocolVersion %q must not be diagnosed as a host-transport mismatch, got: %v", bad, err)
+		}
+	}
+
+	// Same ordering rule for the rest of the per-upstream validation: an upstream missing its
+	// own name was reported as a transport mismatch on an upstream the error could not name.
+	_, err := LoadGatewayConfig(writeConfig(t, fmt.Sprintf(`
+schemaVersion: "0.1"
+defaults:
+  enforcement: audit
+upstreams:
+  - transport: stdio
+    command: echo
+    protocolVersion: %q
+`, capability.Revision20260728.String())))
+	if err == nil || !strings.Contains(err.Error(), "'name' is required") {
+		t.Errorf("an upstream missing 'name' should be reported as such, got: %v", err)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -251,13 +252,13 @@ func TestJWKSCache_kidRecentlyAbsent_ReinsertedFreshReturnsTrue(t *testing.T) {
 	}
 	cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: "http://example.invalid/jwks", Now: now})
 	cache.negMu.Lock()
-	cache.negKIDs[kid] = base
+	cache.negKIDs[negKIDKey(kid)] = base
 	cache.negMu.Unlock()
 
 	require.True(t, cache.kidRecentlyAbsent(kid),
 		"an entry re-stamped fresh between the read-unlock and write-lock must report recently-absent")
 	cache.negMu.RLock()
-	_, stillThere := cache.negKIDs[kid]
+	_, stillThere := cache.negKIDs[negKIDKey(kid)]
 	cache.negMu.RUnlock()
 	require.True(t, stillThere, "a re-stamped-fresh entry must NOT be pruned")
 }
@@ -272,13 +273,13 @@ func TestJWKSCache_kidRecentlyAbsent_ExpiredIsPruned(t *testing.T) {
 	clk := base
 	cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: "http://example.invalid/jwks", Now: func() time.Time { return clk }})
 	cache.negMu.Lock()
-	cache.negKIDs[kid] = base
+	cache.negKIDs[negKIDKey(kid)] = base
 	cache.negMu.Unlock()
 
 	clk = base.Add(negativeKIDTTL * 2)
 	require.False(t, cache.kidRecentlyAbsent(kid), "a genuinely-expired entry must report not-absent")
 	cache.negMu.RLock()
-	_, stillThere := cache.negKIDs[kid]
+	_, stillThere := cache.negKIDs[negKIDKey(kid)]
 	cache.negMu.RUnlock()
 	require.False(t, stillThere, "a genuinely-expired entry must be pruned by the write-lock branch")
 }
@@ -1259,4 +1260,25 @@ func mustKeyFetchHealth(t *testing.T, c *JWKSCache) KeyFetchHealth {
 	h, ok := c.KeyFetchHealth()
 	require.True(t, ok, "the cache was built with a breaker, so it must report one")
 	return h
+}
+
+// TestJWKSCache_NegativeKIDKeyIsFixedWidth: a kid is attacker-chosen text read out of an
+// UNAUTHENTICATED token's JWS header, so keying the negative cache by it verbatim bounded how
+// MANY entries are retained for the TTL (negativeKIDMaxLen) with nothing bounding how big one
+// is. Every kid is still cached — hashing rather than refusing an oversized one leaves no
+// length at which a flood slips back onto the forced-refresh path.
+func TestJWKSCache_NegativeKIDKeyIsFixedWidth(t *testing.T) {
+	t.Parallel()
+	base := time.Unix(1_000_000, 0)
+	cache := NewJWKSCache(JWKSCacheConfig{JWKSURL: "http://example.invalid/jwks", Now: func() time.Time { return base }})
+	huge := strings.Repeat("k", 64*1024)
+	cache.markKIDAbsent(huge)
+	require.True(t, cache.kidRecentlyAbsent(huge), "an oversized kid must still be negatively cached")
+
+	cache.negMu.RLock()
+	defer cache.negMu.RUnlock()
+	require.Len(t, cache.negKIDs, 1)
+	for k := range cache.negKIDs {
+		require.Len(t, k, 64, "the negative cache must key on the fixed-width digest")
+	}
 }
