@@ -655,7 +655,7 @@ exact. This is the authoritative set.
 | `NO_JWT_CLAIMS` | `-32001` | JWT mode is active but the request carried no validated token claims (an authentication miss, surfaced as a capability denial). |
 | `CAPABILITY_DENIED` | `-32002` | A matched entry's verdict is deny (e.g. the action is not granted for the target). |
 | `SAMPLING_DENIED` | `-32001` | A server-initiated `sampling/createMessage` is not permitted — no `system:sampling/createMessage` entry, or a JWT claim withholds it. Surfaced to the upstream initiator as `AUTHORIZATION_FAILED` (`-32001`); the symbolic `SAMPLING_DENIED` is what the audit log records. |
-| `CONDITION_FAILED` | `-32003` | A condition rejected the call for a structural reason (e.g. an `allowedOperations` entry missing its `argument`, or a malformed condition input). A refusal the engine produced because it could not *evaluate* the condition carries `ENFORCEMENT_ERROR` instead. |
+| `CONDITION_FAILED` | `-32003` | A verdict the policy reached: the condition was evaluated and this call does not pass it. Also the code for a condition that names no argument to check (an `allowedOperations` entry missing its `argument`, an `allowedValues` with an empty one) — the same shape as the entries below, kept here because the code is contractual for it. Every other refusal the engine produced because it could not *evaluate* the condition carries `ENFORCEMENT_ERROR` instead. |
 | `VALUE_NOT_PERMITTED` | `-32003` | An `allowedValues` condition: the argument value is outside the permitted set. |
 | `OPERATION_NOT_PERMITTED` | `-32003` | An `allowedOperations` condition: the operation is outside the permitted set. |
 | `RATE_LIMITED` | `-32003` | A `maxCalls` condition's count/window was exceeded. |
@@ -664,7 +664,7 @@ exact. This is the authoritative set.
 | `KILL_SWITCH` | `-32603`* | The session or agent has been killed via the kill switch. |
 | `KILL_SWITCH_ERROR` | `-32603`* | The kill-switch backend errored; the proxy fails closed rather than treat the error as "not blocked". |
 | `AUDIT_UNAVAILABLE` | `-32603` | Under `--require-audit=strict`, the audit trail has degraded (a record was dropped or a write failed); an otherwise-authorized call is denied rather than forwarded unaudited. |
-| `ENFORCEMENT_ERROR` | `-32603` | The engine could not reach a verdict: an unmodelled condition type, a condition with no usable handler, a quota/history/flow-label backend that failed or answered nonconformingly, a malformed effect condition (a `blastRadius` declaring neither bound, or a bound that is not a number), a condition reached with no resolved effect contract in scope, or a registered handler that broke its contract. Distinct from `CONDITION_FAILED`, which is a verdict the policy *did* reach, and never downgraded to a forward on an observing route. |
+| `ENFORCEMENT_ERROR` | `-32603` | The engine could not reach a verdict: an unmodelled condition type, a condition it could not cast to its own type, a condition with no usable handler, a quota/history/flow-label backend that failed or answered nonconformingly, a registered handler that broke its contract, or a condition whose own declaration cannot be evaluated — a `timeWindow` declaring neither bound or one that will not compile, an `ipRange` with an unparseable CIDR, an `allowedTables` whose `columns` keys fold onto one table, a `sequenceBlock` naming no antecedent, an `effectClass` with an empty or out-of-vocabulary `allow` set, a `blastRadius` declaring neither bound / a non-numeric bound / half a cumulative pair / a `maxTotal` the accumulator cannot represent, or either effect condition reached with no resolved contract in scope. Distinct from `CONDITION_FAILED`, which is a verdict the policy *did* reach, and never downgraded to a forward on an observing route. |
 
 `*` The kill-switch codes are infrastructure failures mapped to the internal-error
 class on the wire; the symbolic code in `error.data.code` disambiguates them from a
@@ -1413,13 +1413,13 @@ list of exact strings or glob patterns (e.g. `/reports/*` matches
 > block carrying `max: 010` is refused even where an inline `max: 8` overrides it, so quote or
 > canonicalize the shared block rather than relying on the override.
 >
-> Merge keys are **flattened once**, right after the parse, into the mapping that merges them
-> with that mapping's own keys winning — exactly what the decoder does with the same document.
-> Every load-time check therefore sees a merged key as if it had been written in place,
-> including the ones that read the document as it was WRITTEN: a `schemaVersion` reached
-> through `<<:` is the declaration, and an unquoted one merged in gets the same friendly
-> unsupported-dialect message the inline spelling gets rather than a raw unmarshal error. A
-> merge whose value is not a mapping (or a list of them) is left for the decoder to refuse.
+> The `schemaVersion` gates read the value the **decoder** binds, not a scan of the root mapping
+> for a literal key, so a version reached through `<<:` is the declaration: a merged one loads
+> exactly as the inline spelling does, and a merged *unquoted* one gets the same friendly
+> "must be quoted" message rather than a raw unmarshal error. Asking the decoder is what keeps
+> the gate and the enforced document in agreement — merge precedence, aliases, self-referential
+> anchors and the alias-expansion budget are all yaml.v3's. Every other load-time walk already
+> recursed through the whole document and was unaffected.
 >
 > Manifests load through one hardened path regardless of file extension: `.yaml`,
 > `.yml`, `.json`, and an extensionless file all get **duplicate-key rejection** and
