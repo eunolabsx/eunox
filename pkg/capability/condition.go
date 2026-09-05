@@ -297,9 +297,13 @@ func checkColumnKeyCollision(columns map[string][]string) error {
 	return nil
 }
 
-// TableLookup returns the case-folded lookup structures for matching. It prefers
-// what Compile cached and otherwise builds them on the spot, so a programmatically
-// built condition matches exactly what a loaded one matches.
+// TableLookup returns the case-folded lookup structures Compile cached, reporting whether the
+// condition was compiled at all. It reports rather than building on the spot, so the handler
+// can take the same shape its siblings do (Window, Networks): compile a LOCAL copy — the engine
+// must not cache state onto a condition it does not own — and turn a compile error into a
+// fail-closed denial. Building here silently swallowed that error, since this signature has no
+// channel for one, which left the uncompiled path with no fail-closed exit for the next
+// validation compileTables grows.
 //
 // allowedColumns is nil when the condition declares no column restrictions at all,
 // which the handler distinguishes from an empty restriction.
@@ -311,16 +315,16 @@ func checkColumnKeyCollision(columns map[string][]string) error {
 // no manifest change and no audit trace, and doing it from a request goroutine is an
 // unsynchronized write concurrent with every other request's reads — which crashes
 // the process with "concurrent map read and map write". Copy before mutating.
-func (c *AllowedTablesCondition) TableLookup() (allowedTables map[string]bool, allowedColumns map[string][]string, columnSets map[string]map[string]bool) {
-	t := c.compiled
-	if t == nil {
-		t = compileTables(c.Tables, c.Columns)
+func (c *AllowedTablesCondition) TableLookup() (allowedTables map[string]bool, allowedColumns map[string][]string, columnSets map[string]map[string]bool, ok bool) {
+	if c.compiled == nil {
+		return nil, nil, nil, false
 	}
-	return t.tables, t.columnsByTable, t.columnSets
+	return c.compiled.tables, c.compiled.columnsByTable, c.compiled.columnSets, true
 }
 
-// compileTables is the single source of the table/column normalization for both the
-// compiled and uncompiled paths.
+// compileTables is the single source of the table/column normalization, reached only through
+// Compile — by the loader for a manifest condition, and by the handler for a local copy of one
+// built through the API.
 func compileTables(tables []string, columns map[string][]string) *compiledTables {
 	out := &compiledTables{tables: make(map[string]bool, len(tables))}
 	for _, t := range tables {
@@ -333,17 +337,12 @@ func compileTables(tables []string, columns map[string][]string) *compiledTables
 	}
 	out.columnsByTable = make(map[string][]string, len(columns))
 	out.columnSets = make(map[string]map[string]bool, len(columns))
-	// A fold collision is refused by Compile and by the manifest loader, so what is left here
-	// is a condition built through the API that never compiled. Resolve it to the smallest
-	// original key rather than to Go's randomized map order: an arbitrary column ACL is bad,
-	// one that differs per process is not even reportable.
-	winner := make(map[string]string, len(columns))
+	// No fold tiebreak: Compile is the only way in and it refuses a collision first, so no two
+	// keys here can address one table. The tiebreak this replaced existed for the accessor's
+	// build-on-the-spot path, which resolved an ambiguity the loader refuses rather than failing
+	// closed on it; that path is gone (see TableLookup).
 	for table, cols := range columns {
 		key := strings.ToLower(strings.TrimSpace(table))
-		if prior, ok := winner[key]; ok && prior < table {
-			continue
-		}
-		winner[key] = table
 		out.columnsByTable[key] = cols
 		set := make(map[string]bool, len(cols))
 		for _, col := range cols {

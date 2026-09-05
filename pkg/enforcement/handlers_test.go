@@ -390,6 +390,44 @@ func TestHandleAllowedTables_WhitespaceEntryStillMatches(t *testing.T) {
 	assert.Equal(t, capability.ErrCodeConditionFailed, denyResp.Denial.Code)
 }
 
+// TestHandleAllowedTables_UncompiledCollisionFailsClosed pins the handler's own fail-closed exit
+// for a condition that never compiled.
+//
+// The accessor used to build the lookup maps on the spot, silently, having no channel for an
+// error — so a pair of 'columns' keys that Compile REFUSES as an ambiguous ACL was resolved here
+// instead and enforced. The handler now compiles a local copy (the shape its timeWindow and
+// ipRange siblings already take) and denies with a fault code: nothing evaluated the ACL, so
+// there is no verdict for an observing route to forward in its place.
+func TestHandleAllowedTables_UncompiledCollisionFailsClosed(t *testing.T) {
+	t.Parallel()
+	cond := &capability.AllowedTablesCondition{
+		Argument: "table",
+		Tables:   []string{"users"},
+		Columns:  map[string][]string{"Users": {"id", "ssn"}, "users": {"id"}},
+	}
+
+	resp := runCondition(t, enforcement.New(), cond, map[string]interface{}{"table": "users"}, "")
+	assert.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
+	assert.False(t, resp.Denial.Downgradable())
+	assert.Contains(t, resp.Denial.Message, "could not be compiled")
+}
+
+// An uncompiled but UNAMBIGUOUS condition still matches exactly what a loaded one matches: the
+// local compile is the same Compile the loader runs.
+func TestHandleAllowedTables_UncompiledStillMatches(t *testing.T) {
+	t.Parallel()
+	cond := &capability.AllowedTablesCondition{
+		Argument: "table",
+		Tables:   []string{"users"},
+		Columns:  map[string][]string{"Users": {"id"}},
+	}
+	resp := runCondition(t, enforcement.New(), cond,
+		map[string]interface{}{"table": map[string]interface{}{"table": "USERS", "columns": []interface{}{"ID"}}}, "")
+	assert.Equal(t, capability.DecisionAllow, resp.Decision)
+}
+
 // TestHandleRecipientDomain_WhitespaceEntryStillMatches verifies that a
 // recipientDomain entry carrying surrounding whitespace (e.g. "example.com ") is
 // trimmed before comparison, so a recipient at that domain is allowed and a
