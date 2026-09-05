@@ -1080,6 +1080,29 @@ func (s *httpSession) markEstablished() {
 	s.establishedOnce.Do(func() { close(s.established) })
 }
 
+// establishmentOutcome is what a wait for a worker to stop COMING UP resolved to.
+//
+// THREE-valued, because a wait that does not end in a servable worker ends for one of two
+// unrelated reasons and the callers answer them differently: workerGone is a fact about the
+// WORKER, waiterGone a fact about the CALLER. Collapsed into a bool they were indistinguishable,
+// and the one caller that responds to workerGone by CREATING read a caller that had hung up as a
+// worker that was gone — forking an upstream subprocess for a request nobody was waiting on and
+// SIGKILLing it a moment later, once per aborted request.
+type establishmentOutcome int
+
+const (
+	// workerServable: establishment ended and this worker is still the live registration under
+	// its id. The only outcome a host may be served on.
+	workerServable establishmentOutcome = iota
+	// workerGone: establishment ended in teardown (a failed drift check does that), or a
+	// successor took this id. The worker named is not servable and never will be.
+	workerGone
+	// waiterGone: the CALLER's context ended. It says nothing about the worker, which may be
+	// establishing perfectly well and about to serve everyone else — so it is never grounds to
+	// refuse, to record, or to create.
+	waiterGone
+)
+
 // awaitEstablished blocks until this worker has finished establishing, reporting whether it is
 // still a live registration afterwards.
 //
@@ -1098,15 +1121,20 @@ func (s *httpSession) markEstablished() {
 //
 // The re-check after waiting is the point: establishment can END in teardown (a failed drift
 // check tears the session down), so the signal means "no longer coming up", never "came up".
-func (p *HTTPProxy) awaitEstablished(ctx context.Context, sess *httpSession) bool {
+func (p *HTTPProxy) awaitEstablished(ctx context.Context, sess *httpSession) establishmentOutcome {
 	if sess.initInProgress.Load() {
 		select {
 		case <-sess.established:
 		case <-ctx.Done():
-			return false
+			return waiterGone
 		}
 	}
-	return p.getSession(sess.id) == sess
+	// Deliberately NOT reported for a caller whose context ended without this having waited: it
+	// never blocked on that caller, so its context is not this answer's business.
+	if p.getSession(sess.id) == sess {
+		return workerServable
+	}
+	return workerGone
 }
 
 // reclaimKilledSession tears down one session the kill switch names. Shared by the idle

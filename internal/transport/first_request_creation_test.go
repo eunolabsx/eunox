@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -536,23 +537,32 @@ func TestFirstRequestCreation_AJoinerWaitsForEstablishment(t *testing.T) {
 	sess.initInProgress.Store(true)
 	require.NoError(t, h.proxy.registerSession(sess, h.proxy.currentReapGen()))
 
-	// While establishing, a joiner blocks rather than proceeding.
+	// While establishing, a joiner blocks rather than proceeding — and when its OWN wait ends it
+	// says so, which is a different answer from anything about the worker. Collapsing the two is
+	// what let the creating path fork an upstream for a request nobody was waiting on.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	assert.False(t, h.proxy.awaitEstablished(ctx, sess),
+	assert.Equal(t, waiterGone, h.proxy.awaitEstablished(ctx, sess),
 		"a joiner was released while the worker was still coming up")
 
 	// Once established it is joinable — and only because it is still registered.
 	h.proxy.finishEstablishing(sess)
-	assert.True(t, h.proxy.awaitEstablished(context.Background(), sess))
+	assert.Equal(t, workerServable, h.proxy.awaitEstablished(context.Background(), sess))
 
 	// A worker whose establishment ENDED IN TEARDOWN must not be joined: the signal means "no
 	// longer coming up", never "came up".
 	h.proxy.mu.Lock()
 	delete(h.proxy.sessions, sess.id)
 	h.proxy.mu.Unlock()
-	assert.False(t, h.proxy.awaitEstablished(context.Background(), sess),
+	assert.Equal(t, workerGone, h.proxy.awaitEstablished(context.Background(), sess),
 		"a joiner adopted a worker that was torn down while coming up")
+
+	// A dead context on a worker this never WAITED for is not the caller's answer: nothing
+	// blocked on it, so its context is not the primitive's business.
+	dead, cancelDead := context.WithCancel(context.Background())
+	cancelDead()
+	assert.Equal(t, workerGone, h.proxy.awaitEstablished(dead, sess),
+		"a departed caller was reported for a wait that never happened")
 }
 
 // And the resolve path actually WAITS — asserted by driving firstRequestSession, not the helper.
@@ -891,6 +901,83 @@ func TestFirstRequestCreation_AKilledWorkerTornDownWhileComingUpRecordsTheKill(t
 				"the kill was recorded against an unverified id for a worker this proxy established")
 		})
 	}
+}
+
+// An ABORTED request does not reach the session-creating path, however long its worker takes.
+//
+// The resolve path falls through to CREATE when the wait says the worker is not servable, and the
+// wait used to answer a departed caller with that same verdict. Reaching creation is the whole
+// harm: newSession forks the upstream before anything reads the context — exec.Command, not
+// CommandContext, and the noctx suppression is explicit — so a process was spawned and then
+// SIGKILLed a moment later when initUpstream failed on that same dead context. One fork-and-kill
+// per aborted request, and since the worker key is derived from the caller's own claims, an
+// authenticated caller knows exactly when this window is open; a client with an aggressive
+// timeout, or a load balancer dropping connections, does it by accident.
+//
+// Observed through the SESSION CAP rather than the spawned process, deliberately. A marker file
+// written by the child races its own SIGKILL — the kill lands microseconds after initUpstream
+// returns on the dead context, so the fork happens and the marker usually does not appear, which
+// is a test that fails to detect the bug it exists for. The cap is the deterministic signal that
+// the creating path was entered at all, which is the precondition for every fork it performs.
+func TestFirstRequestCreation_AnAbortedRequestDoesNotReachCreation(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	// One slot, already spent by the worker registered below — so a request that reaches the
+	// creating path trips the cap and says so, and one that never gets there is silent.
+	proxy.maxSessions = 1
+	route := &UpstreamRoute{
+		name: "up1", transport: "stdio",
+		// Would fail loudly if it were ever spawned; nothing here may spawn anything.
+		command: "/nonexistent/eunox-must-not-spawn-this",
+		pdp:     newTestManifestPDP(capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink:    &routeSink{},
+	}
+	// The gates BELOW the wait are the arm's own value, separately from the spawn guard further
+	// on: on a Redis-backed kill switch this lookup is a network round trip, and it answers on
+	// the caller's own dead context — which fails closed into a KILL_SWITCH_ERROR deny record
+	// for a session nobody killed and a client already gone.
+	var killChecks atomic.Int32
+	route.pdp = killGateHookPDP{PolicyDecisionPoint: route.pdp, onCheckKill: func() { killChecks.Add(1) }}
+	ctx, cancel := context.WithCancel(pdp.WithJWTClaims(
+		capability.WithProtocolRevision(context.Background(), capability.Revision20260728),
+		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1"}))
+	key, ok := firstRequestWorkerKey(route, ctx)
+	require.True(t, ok)
+
+	// A worker for this key, registered but still coming up: the window in which a joiner waits.
+	sess := newTestSession(&httpSession{id: key, route: route, done: make(chan struct{}), established: make(chan struct{})})
+	sess.initInProgress.Store(true)
+	require.NoError(t, proxy.registerSession(sess, proxy.currentReapGen()))
+
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,
+		Params: json.RawMessage(`{"name":"read_file"}`)}
+	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+	w := httptest.NewRecorder()
+	resolved := make(chan *httpSession, 1)
+	go func() {
+		resolved <- proxy.firstRequestSession(w, req.WithContext(ctx), route, capability.Revision20260728, msg)
+	}()
+
+	// The client gives up while its worker is still establishing.
+	cancel()
+	select {
+	case got := <-resolved:
+		assert.Nil(t, got, "a departed caller was handed a worker")
+	case <-time.After(5 * time.Second):
+		t.Fatal("firstRequestSession never returned after its caller went away")
+	}
+
+	// The assertion that names the harm: reaching creation is what forks, and the cap is what
+	// makes reaching it visible.
+	assert.Empty(t, w.Body.String(),
+		"a departed caller reached the session-creating path, which is where the upstream is forked")
+
+	// And the worker it was waiting on is untouched: the abort is the CALLER's fact, not the
+	// worker's, so it must not tear down or displace a session establishing perfectly well.
+	assert.Same(t, sess, proxy.getSession(key), "an aborted request disturbed the worker it was waiting on")
+	assert.Equal(t, 1, proxy.sessionCount())
+	assert.Zero(t, killChecks.Load(),
+		"a departed caller drove a kill-store lookup on its own dead context, which fails closed into a record for a session nobody killed")
 }
 
 // ── the torn-down-worker harness ────────────────────────────────────────────

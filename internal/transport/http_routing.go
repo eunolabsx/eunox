@@ -1027,14 +1027,18 @@ func answerSessionGateRefusal(ctx context.Context, w http.ResponseWriter, sess *
 // that has not moved.
 func (p *HTTPProxy) awaitServableWorker(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg, leg transportLeg) bool {
 	waited := sess.initInProgress.Load()
-	servable := p.awaitEstablished(r.Context(), sess)
-	if waited && r.Context().Err() == nil {
+	outcome := p.awaitEstablished(r.Context(), sess)
+	if waited && outcome != waiterGone {
 		rearmWriteDeadlineForTeardown(w, p.shutdownMs)
 	}
-	if servable {
+	switch outcome {
+	case workerServable:
 		return true
+	case workerGone:
+		p.refuseUnestablishedWorker(r.Context(), w, route, sess, msg, leg)
+	case waiterGone:
+		// Answered nothing and recorded nothing: see establishmentOutcome.
 	}
-	p.refuseUnestablishedWorker(r.Context(), w, route, sess, msg, leg)
 	return false
 }
 
@@ -1048,11 +1052,9 @@ func (p *HTTPProxy) awaitServableWorker(w http.ResponseWriter, r *http.Request, 
 // that preceded it. That helper would also have named nothing at all on the declaring re-entry,
 // which carries no session header for a claim to be read out of.
 //
-// A waiter whose OWN context ended is answered nothing and records nothing: it may have been
-// parked on a worker that is establishing perfectly well, so the wait's false verdict says
-// something about the CALLER there, not about the worker — and answering would spend a
-// kill-store round trip and, under an active stop, sign a refusal against a live registration on
-// behalf of a client that is already gone.
+// Reached only for workerGone. A waiter whose own context ended never arrives here at all — that
+// rule rides establishmentOutcome rather than being re-asked as a guard on this side, since a
+// second reading of "is the caller still there" is where the two answers drift apart.
 //
 // Each leg gives the answer it ALREADY gives for a worker that is gone, rather than a new one:
 // the POST the retryable JSON-RPC error its teardown race produces one gate further on, the GET
@@ -1064,9 +1066,6 @@ func (p *HTTPProxy) awaitServableWorker(w http.ResponseWriter, r *http.Request, 
 // worker is being torn down and its tracked ids go with it, so the answer is owed by that
 // teardown rather than by this refusal.
 func (p *HTTPProxy) refuseUnestablishedWorker(ctx context.Context, w http.ResponseWriter, route *UpstreamRoute, sess *httpSession, msg mcp.RPCMsg, leg transportLeg) {
-	if ctx.Err() != nil {
-		return
-	}
 	// An established session's kill record is unmetered, as its sibling arms are: this caller
 	// cleared the route binding and both session gates, so it is not the zero-session flood the
 	// pre-session bucket bounds.
