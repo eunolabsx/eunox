@@ -364,6 +364,14 @@ func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.J
 // independent slice — so ForceRefreshForKID's copy would be pure allocation on a pre-auth
 // path a flood of unknown-kid tokens can drive at will.
 func (c *JWKSCache) forceRefreshForKIDLive(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
+	// The bound, at the head of the path that RETAINS and digests the value, so it holds for
+	// the exported ForceRefreshForKID too — a seam with no in-tree caller, and therefore the
+	// only one an out-of-tree consumer reaches without passing CandidateKIDs or
+	// VerifyWithKeyRotation. Without it, the invariant CheckKIDLength's doc states was true of
+	// two entry points rather than of the cache.
+	if err := CheckKIDLength(kid); err != nil {
+		return nil, err
+	}
 	if kid == "" {
 		// A kid-less lookup is not an unknown-kid lookup. The suppression block below is
 		// gated on kid != "", so routing it here would skip the rate-limit and let a flood

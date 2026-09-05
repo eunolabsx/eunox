@@ -36,6 +36,17 @@ func TestKIDBound_RefusedAtEverySeamThatReachesTheCache(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("ForceRefreshForKID", func(t *testing.T) {
+		t.Parallel()
+		// The seam with no in-tree caller, and therefore the only one an out-of-tree consumer
+		// reaches without passing the two above. A nil cache proves the refusal precedes every
+		// cache interaction.
+		var cache *capability.JWKSCache
+		_, err := cache.ForceRefreshForKID(context.Background(), long)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exceeding the limit")
+	})
+
 	t.Run("VerifyWithKeyRotation", func(t *testing.T) {
 		t.Parallel()
 		// A nil cache proves the refusal precedes every cache interaction: reaching one would
@@ -47,6 +58,17 @@ func TestKIDBound_RefusedAtEverySeamThatReachesTheCache(t *testing.T) {
 			})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "exceeding the limit")
+		// TERMINAL, so the multi-kid loop surfaces it rather than recording it as lastErr and
+		// trying the next candidate — which would verify the token against a silently narrowed
+		// key set, the outcome CandidateKIDs refuses the whole token to avoid.
+		_, multiErr := capability.VerifyWithKeyRotationMultiKID(context.Background(), nil,
+			[]string{long, "good"}, func(*jose.JSONWebKey, bool) (*struct{}, error) {
+				t.Fatal("no candidate may be verified once an over-long kid is in the list")
+				return nil, nil
+			})
+		require.Error(t, multiErr)
+		assert.Contains(t, multiErr.Error(), "exceeding the limit",
+			"the refusal must not be replaced by a later candidate's key-miss")
 	})
 }
 

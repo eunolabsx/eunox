@@ -83,8 +83,10 @@ const MaxKIDBytes = 256
 
 // CheckKIDLength refuses a kid past MaxKIDBytes. Exported because the bound belongs to what
 // RETAINS and hashes the value rather than to whichever entry point a caller came in through:
-// both CandidateKIDs and VerifyWithKeyRotation apply it, so an out-of-tree caller reaching the
-// second directly cannot route an unbounded kid into the cache.
+// every seam that routes a kid into the JWKS cache applies it — CandidateKIDs,
+// VerifyWithKeyRotation, and the cache's own ForceRefreshForKID — so an out-of-tree caller
+// reaching any of them cannot route an unbounded kid into the negative cache's digests or its
+// retention slot.
 func CheckKIDLength(kid string) error {
 	if len(kid) > MaxKIDBytes {
 		return fmt.Errorf("JWS 'kid' is %d bytes, exceeding the limit of %d; a JWKS key identifier is a short string, and a value this long can match no published key (fail closed)", len(kid), MaxKIDBytes)
@@ -192,8 +194,13 @@ func VerifyWithKeyRotation[T any](
 	// Ahead of every cache interaction: this is the seam that routes a kid into the negative
 	// cache's digest and the forced-refresh rate limit, so the bound is applied here as well as
 	// at CandidateKIDs rather than only at the entry point this build happens to use.
+	//
+	// Terminal, so VerifyWithKeyRotationMultiKID surfaces it rather than moving to the next
+	// candidate: a plain error becomes that loop's lastErr and the token verifies against a
+	// SILENTLY NARROWED key set — the exact outcome CandidateKIDs refuses the whole token to
+	// avoid, and this seam is the one a caller assembling its own kid list reaches.
 	if err := CheckKIDLength(kid); err != nil {
-		return nil, err
+		return nil, Terminal(err)
 	}
 	// getKeysLive, not GetKeys: the result is immediately narrowed through FindKeys below,
 	// which always allocates its own fresh slice — GetKeys' copyKeySet copy would be

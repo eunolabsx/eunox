@@ -235,8 +235,9 @@ type AllowedTablesCondition struct {
 	// compiled holds the case-folded lookup structures built by Compile at load time,
 	// so the hot path indexes ready maps instead of rebuilding the table set, the
 	// column-restriction index, AND a per-table column set on every enforced call.
-	// Unexported, so it never serializes; nil on an uncompiled condition, where
-	// Lookup builds them on the spot.
+	// Unexported, so it never serializes; nil on an uncompiled condition, which TableLookup
+	// REPORTS rather than building on the spot, so the handler can compile a local copy and
+	// fail closed on an error this field's accessor has no channel for.
 	compiled *compiledTables
 }
 
