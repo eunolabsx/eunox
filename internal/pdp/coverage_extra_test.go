@@ -1238,6 +1238,23 @@ func TestApplyRedactObligs_NonStringTextBody_FailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), "non-string 'text' body")
 }
 
+// A type=="text" item with NO text member fails closed too, and is diagnosed as the
+// absence it is: %T renders a missing member as <nil>, so the operator debugging a broken
+// upstream was told a wrongly-typed body exists on the one record they read it from. A
+// JSON null is a different fact -- the member is there and is not a string -- and keeps
+// the type-mismatch wording.
+func TestApplyRedactObligs_AbsentTextBody_FailsClosed(t *testing.T) {
+	t.Parallel()
+	_, err := ApplyRedactObligs([]byte(`{"content":[{"type":"text"}]}`), redactSSN)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no 'text' body")
+	assert.NotContains(t, err.Error(), "non-string")
+
+	_, nullErr := ApplyRedactObligs([]byte(`{"content":[{"type":"text","text":null}]}`), redactSSN)
+	require.Error(t, nullErr)
+	assert.Contains(t, nullErr.Error(), "non-string 'text' body")
+}
+
 // An unparseable response envelope fails closed.
 func TestApplyRedactObligs_UnparseableEnvelope_FailsClosed(t *testing.T) {
 	t.Parallel()

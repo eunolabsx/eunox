@@ -188,9 +188,16 @@ func redactContentItem(obj map[string]interface{}, spec redactSpec) (bool, error
 			return redactContentItemKeys(obj, spec, t, false)
 		}
 	}
-	text, ok := obj["text"].(string)
+	raw, present := obj["text"]
+	if !present {
+		// Reported apart from the type mismatch below: %T renders an ABSENT member as
+		// <nil>, so the operator debugging a broken upstream was told a body exists
+		// with the wrong type when the item carries none at all. Same deny either way.
+		return false, fmt.Errorf("redactFields: text content item has no 'text' body; cannot verify redaction (fail closed)")
+	}
+	text, ok := raw.(string)
 	if !ok {
-		return false, fmt.Errorf("redactFields: text content item has a non-string 'text' body (%T); cannot verify redaction (fail closed)", obj["text"])
+		return false, fmt.Errorf("redactFields: text content item has a non-string 'text' body (%T); cannot verify redaction (fail closed)", raw)
 	}
 	redacted, err := redactJSONText(text, spec)
 	if err != nil {

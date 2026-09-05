@@ -544,9 +544,10 @@ func TestResolvedEffectStringNamesTheUnquantifiedCase(t *testing.T) {
 
 // TestEffectArgumentReferencesHonorNestedPaths pins that the effect layer resolves an
 // `argument` reference through the SAME grammar every condition uses. A bare map index
-// made the documented "$." syntax resolve to ABSENT: the decision table never matched, a
-// permissive default applied to the exact call it was written to catch, and a blast radius
-// silently went unquantified — all while the manifest loaded clean.
+// made the documented "$." syntax resolve to ABSENT: the decision table never matched and a
+// blast radius silently went unquantified — all while the manifest loaded clean. (Back then
+// an absence also took the table's default; today it fails closed, so the same bug would
+// escalate every call rather than soften it. Either way the reference must resolve.)
 func TestEffectArgumentReferencesHonorNestedPaths(t *testing.T) {
 	table := &EffectContract{
 		Class: EffectReversible,
@@ -689,6 +690,93 @@ func TestBlastRadiusFailsClosedOnNaNAndInf(t *testing.T) {
 	}
 	if got := ResolveEffect(c, map[string]interface{}{"amount": 42.5}); !got.Quantified() {
 		t.Fatal("an ordinary float64 argument must still quantify")
+	}
+}
+
+// TestByArgumentUnestablishedValueDoesNotResolveThroughTheDefault pins the caller-controlled
+// absences on the effect surface that used to resolve permissively. `default` answers for a
+// VALUE the table does not cover; a call that established no value at all has nothing for it
+// to answer about, so an author's default — legitimately written softer than the base
+// contract — must not answer for it. Otherwise a caller sailed under effectClass, blastRadius
+// and the ceiling for a call whose operation was never known, and PICKED that outcome:
+// omitting the argument, sending it null, or sending it blank are all one keystroke apart.
+func TestByArgumentUnestablishedValueDoesNotResolveThroughTheDefault(t *testing.T) {
+	softDefault := func(argument string) *EffectContract {
+		return &EffectContract{
+			Class:              EffectCompensable,
+			Idempotent:         true,
+			CompensatingAction: "tool:restore",
+			BlastRadius:        &BlastRadiusSpec{Value: num("1"), Unit: "rows"},
+			ByArgument: &EffectByArgument{
+				Argument: argument,
+				Cases:    map[string]EffectCase{"transfer": {Class: EffectIrreversible}},
+				Default: &EffectCase{
+					Class:              EffectCompensable,
+					CompensatingAction: "tool:restore",
+					BlastRadius:        &BlastRadiusSpec{Value: num("1"), Unit: "rows"},
+				},
+			},
+		}
+	}
+
+	absent := []struct {
+		name     string
+		argument string
+		args     map[string]interface{}
+	}{
+		{"the keyed argument is not supplied", "op", map[string]interface{}{"amount": json.Number("5000")}},
+		{"no arguments at all", "op", map[string]interface{}{}},
+		// A nested reference that does not resolve is the same absence: the loader
+		// cannot tell an optional path from a required one.
+		{"a nested path that does not resolve", "$.body.op", map[string]interface{}{"body": map[string]interface{}{}}},
+		// Present but establishing nothing. These are the spellings that make the rule
+		// worth having: a caller who wants the softer row types four more characters
+		// than omitting the argument, so a rule that stops at map presence stops nothing.
+		{"an explicit null", "op", map[string]interface{}{"op": nil}},
+		{"an empty string", "op", map[string]interface{}{"op": ""}},
+		{"a whitespace-only string", "op", map[string]interface{}{"op": " \t "}},
+		// A composite renders through fmt as Go debug syntax ("map[a:1]"), which no
+		// author writes as a case key -- unusable rather than uncovered.
+		{"an object", "op", map[string]interface{}{"op": map[string]interface{}{"a": json.Number("1")}}},
+		{"an array", "op", map[string]interface{}{"op": []interface{}{"transfer"}}},
+	}
+	for _, c := range absent {
+		t.Run(c.name, func(t *testing.T) {
+			got := ResolveEffect(softDefault(c.argument), c.args)
+			if got.Class != EffectIrreversible {
+				t.Errorf("class = %q, want %q", got.Class, EffectIrreversible)
+			}
+			if got.Idempotent {
+				t.Error("an unestablished operation must not keep the base contract's idempotence claim")
+			}
+			if got.CompensatingAction != "" {
+				t.Errorf("compensatingAction = %q, want none", got.CompensatingAction)
+			}
+			if got.Quantified() {
+				t.Errorf("blastRadius must be unquantified, got %v", got.BlastRadius)
+			}
+		})
+	}
+
+	// The default still answers for a value the call DID supply: absence is the only
+	// thing this rule takes away from it.
+	for _, c := range []struct {
+		name  string
+		value interface{}
+	}{
+		{"a supplied uncovered string", "reindex"},
+		{"a supplied number", json.Number("3")},
+		{"a supplied bool", false},
+	} {
+		t.Run(c.name+" still falls to the default", func(t *testing.T) {
+			got := ResolveEffect(softDefault("op"), map[string]interface{}{"op": c.value})
+			if got.Class != EffectCompensable || got.CompensatingAction != "tool:restore" {
+				t.Fatalf("want the declared default's class, got %+v", got)
+			}
+			if !got.Quantified() || got.BlastRadius.Text('f', -1) != "1" || got.Unit != "rows" {
+				t.Fatalf("want the declared default's blast radius, got %+v", got)
+			}
+		})
 	}
 }
 
