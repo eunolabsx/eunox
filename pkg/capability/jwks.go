@@ -61,18 +61,57 @@ func (e *terminalError) Unwrap() error { return e.err }
 // VerifyWithKeyRotation verifier. See that function's verify contract.
 func Terminal(err error) error { return &terminalError{err: err} }
 
+// MaxKIDBytes bounds a `kid` this build will look a key up by.
+//
+// A kid is attacker-chosen text read out of an UNAUTHENTICATED token's JWS header, bounded by
+// nothing but the transport's header limit, and it drives the pre-auth negative-cache lookup
+// twice per rejected token — a digest over the whole value each time, since a new kid does not
+// short-circuit the sentinel check beside it. At 64 KB that was measurable CPU per token before
+// any signature was checked, proportional to bytes the caller chooses to send.
+//
+// The bound is what makes that cost constant, rather than the digest keying which only bounded
+// how much of it was RETAINED. A JWKS kid is a short identifier — a thumbprint, a UUID, a
+// base64url fingerprint; the widest in circulation are well under 64 bytes — so 256 is generous
+// by an order of magnitude while an over-long one can match no key an issuer publishes and is
+// refused before it reaches the forced-refresh path at all.
+//
+// RESIDUAL, stated rather than closed: an issuer that really does publish a kid past this bound
+// cannot be used, since nothing narrows the refusal to kids that miss the key set — checking the
+// set first is the lookup this bound exists to keep an unauthenticated caller out of. The
+// refusal names the length so an operator reading it can tell that case from a probe.
+const MaxKIDBytes = 256
+
+// CheckKIDLength refuses a kid past MaxKIDBytes. Exported because the bound belongs to what
+// RETAINS and hashes the value rather than to whichever entry point a caller came in through:
+// both CandidateKIDs and VerifyWithKeyRotation apply it, so an out-of-tree caller reaching the
+// second directly cannot route an unbounded kid into the cache.
+func CheckKIDLength(kid string) error {
+	if len(kid) > MaxKIDBytes {
+		return fmt.Errorf("JWS 'kid' is %d bytes, exceeding the limit of %d; a JWKS key identifier is a short string, and a value this long can match no published key (fail closed)", len(kid), MaxKIDBytes)
+	}
+	return nil
+}
+
 // CandidateKIDs returns the distinct kid values to verify against for a token's JWS headers,
 // in first-seen order. jwt.ParseSigned is compact-only, so a token carries one header today;
 // consulting all headers avoids a headers[0] foot-gun should a multi-signature JWS ever
 // reach this path. The "" (kid-less) entry is preserved (FindKeys expands it to "try every
 // key"), since the IdP-JWT caller enforces no kid-required policy. An empty header list is
-// an error.
+// an error, and so is a kid past MaxKIDBytes — refused here, at the boundary where the token's
+// own bytes are first read, so it costs one rejection rather than a walk of the key set and two
+// digests of the caller's choosing.
 func CandidateKIDs(headers []jose.Header) ([]string, error) {
 	seen := make(map[string]bool, len(headers))
 	kids := make([]string, 0, len(headers))
 	for _, h := range headers {
 		if seen[h.KeyID] {
 			continue
+		}
+		// The whole token, not just this header: jwt.ParseSigned is compact-only so there is one
+		// today, and dropping a header rather than the token would silently narrow which
+		// signatures a multi-signature JWS was checked against.
+		if err := CheckKIDLength(h.KeyID); err != nil {
+			return nil, err
 		}
 		seen[h.KeyID] = true
 		kids = append(kids, h.KeyID)
@@ -150,6 +189,12 @@ func VerifyWithKeyRotation[T any](
 	kid string,
 	verify func(key *jose.JSONWebKey, freshKeySet bool) (result *T, err error),
 ) (*T, error) {
+	// Ahead of every cache interaction: this is the seam that routes a kid into the negative
+	// cache's digest and the forced-refresh rate limit, so the bound is applied here as well as
+	// at CandidateKIDs rather than only at the entry point this build happens to use.
+	if err := CheckKIDLength(kid); err != nil {
+		return nil, err
+	}
 	// getKeysLive, not GetKeys: the result is immediately narrowed through FindKeys below,
 	// which always allocates its own fresh slice — GetKeys' copyKeySet copy would be
 	// transient garbage paid on every verification. See getKeysLive's doc.
