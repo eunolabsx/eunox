@@ -711,6 +711,62 @@ func TestServerRequestForward_UntrackableIDIsRefusedNotForwarded(t *testing.T) {
 	assert.False(t, sess.serverReqs.tracked(mcp.MsgKey(&over)))
 }
 
+// TestServerRequestForward_StdioReportsWhatItActuallyForwarded is the same refusal asked of the
+// RECORD rather than of the delivery, on the transport whose forward could not report one.
+//
+// recordForwardOutcome writes an ALLOW for a request the leg says it delivered and a not-delivered
+// deny otherwise, so what forward RETURNS is what the tape claims. stdio handed that leg a closure
+// that ran forwardServerRequestToHost and reported true unconditionally — including over its
+// refusing branch, which forwards nothing and writes its own unroutable-id drop. One refusal
+// therefore produced two contradicting entries: a deny saying the request was never routable, and
+// an allow saying the host received it. That is the shape admitServerRequestID's entry-gate
+// placement exists to prevent, and the comment above the closure covered only the poisoned-stdout
+// residual, not this branch.
+//
+// Reachable only by calling the handler directly, which its own doc invites, because the entry gate
+// pre-checks the same predicate — an agreement between two functions, not a property of either, and
+// the tape's honesty should not rest on one. Asserted through handleUpstreamRequest so it is the
+// WIRING under test: a closure reporting a constant passes every assertion made on the method alone.
+func TestServerRequestForward_StdioReportsWhatItActuallyForwarded(t *testing.T) {
+	t.Parallel()
+	sink, logPath := newTempAuditSink(t)
+	up := &mockUpstreamWriter{}
+	p, host := newStdioProxy(stdioServe{
+		sink:   sink,
+		upSink: mcp.NewMsgWriter(&writerAdapter{up}),
+	}, strings.NewReader(""))
+	over := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: &over, Method: "roots/list"}
+
+	assert.False(t, p.forwardServerRequestToHost(context.Background(), msg),
+		"a request the tracker will not retain is refused, not handed over — and the leg must be told so")
+	p.handleUpstreamRequest(revisionContext(handshakeRevision), msg)
+	require.NoError(t, sink.Close())
+
+	assert.Empty(t, host.messages, "the refusing branch forwards nothing; an answer to it could not be routed back")
+	records := readAuditRecords(t, logPath)
+	require.NotEmpty(t, records, "a refusal the proxy actively made reaches the tape")
+	for _, rec := range records {
+		assert.Equal(t, "deny", rec["decision"],
+			"one refusal may not also write an allow claiming the host received the request")
+	}
+	assert.NotNil(t, findAuditRecordByDetail(records, detailTransport, string(dropStdioUnroutableID)),
+		"and the drop naming the real cause must still be there")
+}
+
+// findAuditRecordByDetail returns the first record whose details carry key=value. Refusal records
+// are located this way when what identifies them is the site they name rather than a target or a
+// method — an unroutable id resolves neither.
+func findAuditRecordByDetail(records []map[string]interface{}, key, value string) map[string]interface{} {
+	for _, r := range records {
+		details, _ := r["details"].(map[string]interface{})
+		if got, _ := details[key].(string); got == value {
+			return r
+		}
+	}
+	return nil
+}
+
 // TestServerRequestRefusal_DestroyedAnswerRecordIsMetered bounds a record the UPSTREAM drives: an
 // upstream that closes its stdin and keeps emitting requests on stdout has every one of them
 // refused and every answer destroyed, at its own send rate, with no host and no tracking involved.

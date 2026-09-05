@@ -586,7 +586,7 @@ func TestRunInitHandshake_RepliesToServerInitiatedRequest(t *testing.T) {
 		t.Fatalf("runInitHandshake: %v", err)
 	}
 	if got := out.String(); !strings.Contains(got, `"srv-9"`) ||
-		!strings.Contains(got, "before initialize handshake completed") {
+		!strings.Contains(got, "during session startup; not yet routable") {
 		t.Errorf("handshake must reply a JSON-RPC error to the stray server-initiated request so the upstream unblocks; upWriter output was:\n%s", got)
 	}
 }
@@ -632,7 +632,7 @@ func TestFetchStdioTools_RepliesToServerInitiatedRequest(t *testing.T) {
 	}
 	// The probe must have replied a JSON-RPC error addressed to the stray request.
 	if got := out.String(); !strings.Contains(got, `"srv-1"`) ||
-		!strings.Contains(got, "before initialize handshake completed") {
+		!strings.Contains(got, "during session startup; not yet routable") {
 		t.Errorf("probe must reply a JSON-RPC error to the stray server-initiated request so the upstream unblocks; upWriter output was:\n%s", got)
 	}
 }

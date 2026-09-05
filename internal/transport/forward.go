@@ -1119,7 +1119,10 @@ func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context
 //
 // On HTTP, "delivered" means buffered onto an SSE subscriber channel, not that the host's
 // socket received it — httpSession.failServerRequestDelivery appends a correction deny if
-// async delivery later fails. On stdio, forward always reports delivered.
+// async delivery later fails. On stdio it means the frame was handed to the host writer; that
+// write is fire-and-forget, so a poisoned stdout is the one residual either transport carries
+// here (see StdioProxy.handleUpstreamRequest). Neither reports delivered for a request its
+// forward REFUSED, which is what keeps one refusal from also writing an allow.
 //
 // dec supplies the record's flow fields; the non-sampling leg passes the zero decision. detail
 // carries the decision-side annotations, such as a repaired handler fault.

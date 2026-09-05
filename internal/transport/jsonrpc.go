@@ -409,12 +409,18 @@ func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, i
 // received during a startup read loop, before the background reader exists to route it —
 // silently dropping a request would otherwise wedge the upstream until teardown. A no-op
 // for any non-request message.
+//
+// The message names the PHASE rather than the handshake, because the handshake is not what
+// every caller is inside: the session-start drift probe reads through here with initUpstream
+// already complete, and a 2026-07-28 leg has no handshake to be before at all (its opener is
+// server/discover) — so an upstream sampling during either was told something untrue about why
+// it was refused, on the one frame it gets to read.
 func RejectPreInitServerRequest(w mcp.MsgSink, msg mcp.RPCMsg) {
 	if !msg.IsRequest() {
 		return
 	}
 	_ = w.Write(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError,
-		"server-initiated request received before initialize handshake completed"))
+		"server-initiated request received during session startup; not yet routable"))
 }
 
 // awaitStartupReply reads upstream messages until the response matching wantID arrives.
