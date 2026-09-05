@@ -42,11 +42,15 @@ func (e *Engine) NonCommittingConditionVerdict(ctx context.Context, cond capabil
 		return nil, false
 	}
 	// Most pure handlers dereference req (Context.SourceIP, Arguments, SessionID), so dispatching
-	// one would panic where the rest of the package denies — see nilRequestDenial. ok=false is
-	// the caller's existing fail-closed signal; the cost is that it cannot distinguish this from
-	// an unusable handler, which the two share a diagnostic for.
+	// one would panic where the rest of the package denies — see nilRequestDenial.
+	//
+	// Reported as a VERDICT (ok=true) carrying the fault code rather than as ok=false: the
+	// consumer renders ok=false as "this handler commits state, or is not registered", every
+	// clause of which is false for a nil request, and a structured denial must not fabricate a
+	// cause. denyFromCondition copies Code verbatim, so the refusal stays a non-downgradable
+	// fault and no caller needs a new branch.
 	if req == nil {
-		return nil, false
+		return conditionFault(cond.ConditionType(), nilSeamRefusal("NonCommittingConditionVerdict", "a nil request")), true
 	}
 	if e == nil {
 		return NonCommittingConditionVerdict(ctx, cond, req)

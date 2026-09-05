@@ -173,15 +173,36 @@ func TestExportedStateSeams_NilArgumentsRefuseRatherThanPanic(t *testing.T) {
 	t.Run("NonCommittingConditionVerdict with a nil request", func(t *testing.T) {
 		t.Parallel()
 		cond := capability.IPRangeCondition{CIDRs: []string{"10.0.0.0/8"}}
-		var ok bool
-		assert.NotPanics(t, func() { _, ok = eng.NonCommittingConditionVerdict(ctx, cond, nil) },
-			"a composing layer's nil request must not crash the decision point")
-		assert.False(t, ok, "ok=false is the caller's fail-closed signal; nothing may read as passed")
-
-		// The package-level entry point (a JWT-only or wiretap route, which holds no engine)
-		// takes the same guard.
-		assert.NotPanics(t, func() { _, ok = enforcement.NonCommittingConditionVerdict(ctx, cond, nil) })
-		assert.False(t, ok)
+		// A VERDICT carrying the fault code rather than ok=false. Both are fail-closed, but the
+		// consumer renders ok=false as "this handler commits state, or is not registered", every
+		// clause of which is false here — a structured denial must not fabricate a cause.
+		for _, tc := range []struct {
+			name    string
+			verdict func() (*enforcement.ConditionError, bool)
+		}{
+			{"through an engine", func() (*enforcement.ConditionError, bool) {
+				return eng.NonCommittingConditionVerdict(ctx, cond, nil)
+			}},
+			// The package-level entry point (a JWT-only or wiretap route, which holds no engine)
+			// takes the same guard.
+			{"package level", func() (*enforcement.ConditionError, bool) {
+				return enforcement.NonCommittingConditionVerdict(ctx, cond, nil)
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var cerr *enforcement.ConditionError
+				var ok bool
+				assert.NotPanics(t, func() { cerr, ok = tc.verdict() },
+					"a composing layer's nil request must not crash the decision point")
+				assert.True(t, ok, "the seam reached a verdict about the argument; it is not an unusable handler")
+				require.NotNil(t, cerr, "nothing may read as passed")
+				assert.Equal(t, capability.ErrCodeEnforcementError, cerr.Code)
+				assert.False(t, (&capability.DenialInfo{Code: cerr.Code}).Downgradable(),
+					"a caller-contract break is not a verdict an observing route may forward")
+				assert.Equal(t, cond.ConditionType(), cerr.ConditionType)
+				assert.Contains(t, cerr.Message, "called with a nil request")
+			})
+		}
 	})
 
 	// The receiver as well as the argument: a ManifestPDP may legitimately hold no engine, and

@@ -89,66 +89,70 @@ func TestPeekSessionLabels_KnownLabelsStillOrdered(t *testing.T) {
 // front of it, so honoring the skip first hid exactly the misconfigurations an audit run exists
 // to surface — the record said ALLOW where enforce mode writes MISSING_CONTEXT.
 //
-// The class column is the second: blastRadius classified an unwired counter a POLICY code, which
-// an observing posture downgrades and FORWARDS with the budget neither checked nor counted,
-// while its siblings called it a fault. Asserted as a literal per row rather than derived from
-// the code under test, so it can actually fail.
-func TestQuotaBucketKey_GuardsAreIdenticalAcrossEverySpec(t *testing.T) {
-	specs := []quotaBucketSpec{maxCallsBucketSpec, blastRadiusBucketSpec}
+// The downgradable column is the second: blastRadius classified an unwired counter a POLICY
+// code, which an observing posture downgrades and FORWARDS with the budget neither checked nor
+// counted, while its siblings called it a fault. Asserted as a literal per row rather than
+// derived from the code under test, so it can actually fail — and asked as Downgradable()
+// rather than as the class alone, since the two structural guards keep the MISSING_CONTEXT code
+// an operator's SIEM rules are keyed on and block through the producer's override instead.
+func TestCounterSubjectGuards_AreIdenticalAcrossEverySpec(t *testing.T) {
+	specs := []counterKeySpec{maxCallsBucketSpec, blastRadiusBucketSpec, sequenceHistorySpec}
 
 	cases := []struct {
-		name      string
-		engine    *Engine
-		req       *capability.EnforceRequest
-		wantCode  string
-		wantClass capability.DenialClass
-		wantMsg   string
+		name     string
+		engine   *Engine
+		req      *capability.EnforceRequest
+		wantCode string
+		wantMsg  string
 	}{
 		{
 			// A fault, not a verdict: the counter is the engine's own state and the budget it
 			// was asked about was never evaluated, so no posture may forward past it.
-			name:      "nil counter",
-			engine:    New(),
-			req:       &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"},
-			wantCode:  capability.ErrCodeEnforcementError,
-			wantClass: capability.DenialClassFault,
-			wantMsg:   "call counter not configured",
+			name:     "nil counter",
+			engine:   New(),
+			req:      &capability.EnforceRequest{SessionID: "s", TargetName: "read_file"},
+			wantCode: capability.ErrCodeEnforcementError,
+			wantMsg:  "call counter not configured",
 		},
 		{
 			// A caller-contract fault too, so it takes the same code rather than blaming a
-			// sessionId the call never carried.
-			name:      "nil request",
-			engine:    New(WithCallCounter(callcounter.NewInMemory())),
-			req:       nil,
-			wantCode:  capability.ErrCodeEnforcementError,
-			wantClass: capability.DenialClassFault,
-			wantMsg:   "called with a nil request",
+			// sessionId the call never carried. sequenceBlock had no arm for this at all.
+			name:     "nil request",
+			engine:   New(WithCallCounter(callcounter.NewInMemory())),
+			req:      nil,
+			wantCode: capability.ErrCodeEnforcementError,
+			wantMsg:  "called with a nil request",
 		},
 		{
-			// DenialClassPolicy, recorded rather than asserted as safe: this refusal IS
-			// downgradable, so an observing route forwards a call whose bucket was never
-			// derived. It pre-dates the shared guard and is not this seam's to change — pinned
-			// so a future correction is a visible edit rather than a silent one.
-			name:      "empty session",
-			engine:    New(WithCallCounter(callcounter.NewInMemory())),
-			req:       &capability.EnforceRequest{SessionID: "", TargetName: "read_file"},
-			wantCode:  capability.ErrCodeMissingContext,
-			wantClass: capability.DenialClassPolicy,
-			wantMsg:   "sessionId is required",
-		},
-		{
-			name:      "empty target name",
-			engine:    New(WithCallCounter(callcounter.NewInMemory())),
-			req:       &capability.EnforceRequest{SessionID: "s", TargetName: ""},
-			wantCode:  capability.ErrCodeMissingContext,
-			wantClass: capability.DenialClassPolicy,
-			wantMsg:   "tool or resource name is required",
+			// Keeps MISSING_CONTEXT — an operator's rules are keyed on it, and the code is a
+			// genuine policy verdict everywhere else it is minted — and blocks anyway through
+			// the producer's override: no subject means the bound was never evaluated, so
+			// there is no verdict for an observing route to stand in for.
+			name:     "empty anchor",
+			engine:   New(WithCallCounter(callcounter.NewInMemory())),
+			req:      &capability.EnforceRequest{SessionID: "", TargetName: "read_file"},
+			wantCode: capability.ErrCodeMissingContext,
+			wantMsg:  "sessionId is required",
 		},
 	}
 
 	for _, spec := range specs {
 		for _, tc := range cases {
 			t.Run(spec.condType+"/"+tc.name, func(t *testing.T) {
+				condErr := tc.engine.counterSubjectGuards(tc.req, spec)
+				require.NotNil(t, condErr, "this misconfiguration must be refused")
+				assert.Equal(t, tc.wantCode, condErr.Code,
+					"the code must not depend on which counter-backed state this is")
+				assert.False(t, condErr.Downgradable(),
+					"no observing route may forward past a guard that found no subject to evaluate against")
+				assert.Equal(t, spec.condType, condErr.ConditionType)
+				assert.True(t, strings.Contains(condErr.Message, tc.wantMsg),
+					"message = %q, want it to mention %q", condErr.Message, tc.wantMsg)
+
+				// Through quotaBucketKey under BOTH postures, which is the half a ctx-less call
+				// cannot assert: --audit skips the COUNTER, not the guards in front of it, so a
+				// skip reported here would hide the misconfiguration as an ALLOW — the original
+				// regression, and one nothing pinned once the guards moved to their own seam.
 				for _, posture := range []struct {
 					name string
 					ctx  context.Context
@@ -156,21 +160,75 @@ func TestQuotaBucketKey_GuardsAreIdenticalAcrossEverySpec(t *testing.T) {
 					{"enforce", context.Background()},
 					{"observe", WithSkipQuota(context.Background())},
 				} {
-					key, skip, condErr := tc.engine.quotaBucketKey(posture.ctx, tc.req, spec)
-					require.NotNil(t, condErr, "%s must deny this misconfiguration", posture.name)
-					assert.False(t, skip, "%s: skip must not be reported for a failed structural guard", posture.name)
+					if spec.condType == sequenceHistorySpec.condType {
+						continue // derives a history key; never reaches quotaBucketKey
+					}
+					key, skip, bucketErr := tc.engine.quotaBucketKey(posture.ctx, tc.req, spec)
+					require.NotNil(t, bucketErr, "%s must deny this misconfiguration", posture.name)
+					assert.False(t, skip,
+						"%s: a failed structural guard must never report a skip; observe mode would read it as satisfied", posture.name)
 					assert.Empty(t, key)
-					assert.Equal(t, tc.wantCode, condErr.Code,
-						"%s: the code must not depend on the condition or the posture", posture.name)
-					assert.Equal(t, tc.wantClass, capability.ClassifyDenialCode(condErr.Code),
-						"%s: whether this refusal is downgradable must not depend on the condition", posture.name)
-					assert.Equal(t, spec.condType, condErr.ConditionType)
-					assert.True(t, strings.Contains(condErr.Message, tc.wantMsg),
-						"%s: message = %q, want it to mention %q", posture.name, condErr.Message, tc.wantMsg)
+					assert.Equal(t, tc.wantCode, bucketErr.Code, "%s", posture.name)
+					assert.False(t, bucketErr.Downgradable(), "%s", posture.name)
 				}
 			})
 		}
 	}
+}
+
+// quotaBucketKey's own two additions on top of the shared guards: the target-name guard (which
+// sequenceBlock does not take — it keys history on a target it resolves itself) and the observe
+// skip, which must sit BELOW every structural guard.
+func TestQuotaBucketKey_TargetGuardAndSkipOrder(t *testing.T) {
+	for _, spec := range []counterKeySpec{maxCallsBucketSpec, blastRadiusBucketSpec} {
+		for _, posture := range []struct {
+			name string
+			ctx  context.Context
+		}{
+			{"enforce", context.Background()},
+			{"observe", WithSkipQuota(context.Background())},
+		} {
+			t.Run(spec.condType+"/"+posture.name, func(t *testing.T) {
+				eng := New(WithCallCounter(callcounter.NewInMemory()))
+				req := &capability.EnforceRequest{SessionID: "s", TargetName: ""}
+				key, skip, condErr := eng.quotaBucketKey(posture.ctx, req, spec)
+				require.NotNil(t, condErr, "%s must deny an unidentifiable target", posture.name)
+				assert.False(t, skip, "%s: skip must not be reported for a failed structural guard", posture.name)
+				assert.Empty(t, key)
+				assert.Equal(t, capability.ErrCodeMissingContext, condErr.Code)
+				assert.False(t, condErr.Downgradable(),
+					"%s: a bucket that was never derived has no verdict to forward in its place", posture.name)
+				assert.Contains(t, condErr.Message, "tool or resource name is required")
+			})
+		}
+	}
+}
+
+// The anchor half of the guard: a task-anchored engine keys on the validated task id, so a
+// request carrying one and no session must reach the same bucket anchoredKey would build for
+// it — the namespace-disagreement C2 records, where the antecedent recorder wrote fine for a
+// request the quota guard refused for having no subject.
+func TestCounterSubjectGuards_TaskAnchoredRequestNeedsNoSession(t *testing.T) {
+	eng := New(WithCallCounter(callcounter.NewInMemory()), WithTaskAnchoredState())
+	req := &capability.EnforceRequest{
+		TargetName: "read_file",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_file"},
+		Claims:     map[string]interface{}{"task_id": "t-1"},
+	}
+	require.Nil(t, eng.counterSubjectGuards(req, maxCallsBucketSpec),
+		"a task-anchored request carrying a task id has a subject to key on")
+
+	key, skip, condErr := eng.quotaBucketKey(context.Background(), req, maxCallsBucketSpec)
+	require.Nil(t, condErr)
+	assert.False(t, skip)
+	assert.Equal(t, eng.anchoredKey(maxCallsBucketSpec.namespace, req, "tool", "read_file"), key,
+		"the guard and the key must agree about which subject the bucket belongs to")
+
+	// The same engine still refuses a request with neither, and names the subject the KEY would
+	// have used rather than always naming sessionId.
+	condErr = eng.counterSubjectGuards(&capability.EnforceRequest{TargetName: "read_file"}, maxCallsBucketSpec)
+	require.NotNil(t, condErr)
+	assert.Contains(t, condErr.Message, "sessionId is required")
 }
 
 // The skip itself is intact for a well-formed request: no quota is consumed under --audit.

@@ -364,6 +364,14 @@ func (c *JWKSCache) ForceRefreshForKID(ctx context.Context, kid string) (*jose.J
 // independent slice — so ForceRefreshForKID's copy would be pure allocation on a pre-auth
 // path a flood of unknown-kid tokens can drive at will.
 func (c *JWKSCache) forceRefreshForKIDLive(ctx context.Context, kid string) (*jose.JSONWebKeySet, error) {
+	// The bound, at the head of the path that RETAINS and digests the value, so it holds for
+	// the exported ForceRefreshForKID too — a seam with no in-tree caller, and therefore the
+	// only one an out-of-tree consumer reaches without passing CandidateKIDs or
+	// VerifyWithKeyRotation. Without it, the invariant CheckKIDLength's doc states was true of
+	// two entry points rather than of the cache.
+	if err := CheckKIDLength(kid); err != nil {
+		return nil, err
+	}
 	if kid == "" {
 		// A kid-less lookup is not an unknown-kid lookup. The suppression block below is
 		// gated on kid != "", so routing it here would skip the rate-limit and let a flood
@@ -558,8 +566,14 @@ func (c *JWKSCache) markKIDAbsent(kid string) {
 // negKIDKey derives the negative cache's map key from a kid. A kid is attacker-chosen text
 // read out of an UNAUTHENTICATED token's JWS header, so keying by it verbatim let
 // negativeKIDMaxLen bound how MANY entries are retained for the TTL while nothing bounded how
-// big one is. Hashing rather than refusing an oversized kid keeps every kid cached, so no
-// length slips back onto the forced-refresh path.
+// big one is. Hashing keeps every kid cached at a fixed key width, so no length slips back onto
+// the forced-refresh path.
+//
+// What bounds the digest's own COST is MaxKIDBytes, applied before a kid reaches this cache at
+// all: the hash is over a value the caller chooses, on the pre-auth path, twice per rejected
+// token. Keying short kids verbatim and hashing only long ones is NOT the alternative — a
+// 64-char lowercase-hex kid would then collide with a digest and reintroduce an
+// attacker-poisonable slot.
 //
 // The sentinel's key is precomputed: it is consulted once or twice per rejected token on the
 // pre-auth path this cache exists to absorb, and it is a digest of a constant.

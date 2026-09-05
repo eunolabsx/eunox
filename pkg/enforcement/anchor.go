@@ -132,5 +132,5 @@ func (e *Engine) anchoredKey(prefix string, req *capability.EnforceRequest, tail
 // for sequenceBlock lookups. The target type is part of the key so a tool "export" and a
 // prompt "export" don't collide on one bucket.
 func (e *Engine) sequenceHistoryKey(req *capability.EnforceRequest, targetType, target string) string {
-	return e.anchoredKey("seq", req, targetType, target)
+	return e.anchoredKey(sequenceHistorySpec.namespace, req, targetType, target)
 }

@@ -179,11 +179,17 @@ func TestAllowedValues_TaskVariableResolvesOnBothPaths(t *testing.T) {
 // The engine never evaluates a condition without a request, but this is a public function now,
 // and a nil request must deny rather than panic the request goroutine (fail-open-via-crash) or
 // read as a condition that passed.
+//
+// The FAULT code, shared with every other nil-argument seam: the allowlist was never evaluated,
+// so there is no verdict for an observing route to downgrade into a forward — which the
+// CONDITION_FAILED this used to carry invited.
 func TestEvaluateAllowedValues_NilRequestDenies(t *testing.T) {
 	cerr := enforcement.EvaluateAllowedValues(
 		capability.AllowedValuesCondition{Argument: "path", Values: []interface{}{"/tmp/*"}}, nil)
 	require.NotNil(t, cerr, "no request to check against is ambiguity; deny")
-	assert.Equal(t, capability.ErrCodeConditionFailed, cerr.Code)
+	assert.Equal(t, capability.ErrCodeEnforcementError, cerr.Code)
+	assert.False(t, (&capability.DenialInfo{Code: cerr.Code}).Downgradable())
+	assert.Contains(t, cerr.Message, "called with a nil request")
 }
 
 // TestAllowedOperations_JWTDenialsCarryTheEnginesDetails is the other half of the same defect,

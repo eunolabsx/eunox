@@ -195,23 +195,6 @@ func rejectCoercedScalarsForFormat(node *yaml.Node, isJSON bool, path string) er
 	return nil
 }
 
-// topLevelValueNode returns the value node of a top-level mapping key, unwrapping a
-// DocumentNode wrapper first. Shared by schemaVersionFromNode and forceSchemaVersionToString.
-//
-// The value is resolved through its ALIAS, for the same reason the coercion guard resolves
-// one: an `*ref` node carries no Value of its own, so both callers read it as absent. That
-// made an aliased schemaVersion falsely "required" in the gateway loader, and made the
-// manifest loader skip the pre-decode version gate entirely — producing exactly the coercion
-// misdiagnosis the gate's ordering exists to prevent, for a document that declares its
-// version perfectly well.
-func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
-	mapping, i := topLevelValueSlot(node, key)
-	if mapping == nil {
-		return nil
-	}
-	return resolveYAMLAlias(mapping.Content[i])
-}
-
 // topLevelValueSlot is topLevelValueNode's core, returning the mapping and the INDEX of key's
 // value rather than the value itself — the position, not the node.
 //
@@ -220,14 +203,8 @@ func topLevelValueNode(node *yaml.Node, key string) *yaml.Node {
 // key's value has to replace what sits in this slot rather than mutate what the slot points
 // at. A reader wants the resolved node and uses topLevelValueNode; a writer wants the slot.
 func topLevelValueSlot(node *yaml.Node, key string) (mapping *yaml.Node, valueIdx int) {
-	doc := resolveYAMLAlias(node)
+	doc := topLevelMapping(node)
 	if doc == nil {
-		return nil, -1
-	}
-	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
-		doc = resolveYAMLAlias(doc.Content[0])
-	}
-	if doc == nil || doc.Kind != yaml.MappingNode {
 		return nil, -1
 	}
 	for i := 0; i+1 < len(doc.Content); i += 2 {
@@ -239,63 +216,73 @@ func topLevelValueSlot(node *yaml.Node, key string) (mapping *yaml.Node, valueId
 	return nil, -1
 }
 
-// schemaVersionFromNode reads the top-level schemaVersion scalar's SOURCE TEXT off the parsed
-// document, reporting whether the key was present as a scalar. Reads Value, so it is
-// independent of the !!int/!!float retag forceSchemaVersionToString applies.
-func schemaVersionFromNode(node *yaml.Node) (string, bool) {
-	val := topLevelValueNode(node, "schemaVersion")
+// topLevelMapping unwraps a DocumentNode to the root mapping, or returns nil when the document
+// has none. Aliases are resolved on the way, for the reason the coercion guard resolves them:
+// an `*ref` node carries no Content of its own.
+func topLevelMapping(node *yaml.Node) *yaml.Node {
+	doc := resolveYAMLAlias(node)
+	if doc == nil {
+		return nil
+	}
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = resolveYAMLAlias(doc.Content[0])
+	}
+	if doc == nil || doc.Kind != yaml.MappingNode {
+		return nil
+	}
+	return doc
+}
+
+// effectiveSchemaVersionNode returns the scalar the DECODER will bind to the top-level
+// schemaVersion key, with its source text and tag intact.
+//
+// It asks yaml.v3 rather than scanning the root mapping for a literal key, because a literal
+// scan is blind to the one construct that gives a mapping a key its own source text never
+// spells: `<<:`. A merged declaration was therefore invisible to the pre-decode version gates
+// while being perfectly visible to the decode that produces the enforced policy — a gateway
+// config declaring its version through a merge was refused for not declaring one, and a
+// manifest declaring an unquoted one got the raw unmarshal error the retag below exists to
+// prevent.
+//
+// Asking the decoder, rather than reimplementing merge resolution over the node, is what makes
+// this agree with the enforced document by construction: precedence (own keys win, last `<<`
+// wins, a duplicate `<<` is refused), alias resolution, the self-referential-anchor check and
+// the alias-expansion budget are all yaml.v3's, and a copy of those rules would have to be
+// re-audited on every bump. `upstreamKeyPresence` already reads the document this way for the
+// same reason.
+//
+// ok is false when no scalar binds — absent, non-scalar, or a document the decode itself
+// rejects. The caller falls through, and the real decode a few lines on reports the cause.
+func effectiveSchemaVersionNode(node *yaml.Node) (*yaml.Node, bool) {
+	if node == nil {
+		return nil, false
+	}
+	var probe struct {
+		SchemaVersion yaml.Node `yaml:"schemaVersion"`
+	}
+	if err := node.Decode(&probe); err != nil {
+		return nil, false
+	}
+	// An ALIAS is assigned to a yaml.Node target verbatim — the decoder's node fast path runs
+	// before its alias arm — so `schemaVersion: *ver` arrives as the AliasNode and has to be
+	// followed here. Resolved rather than read as absent, which is what made an aliased version
+	// falsely "required" in the gateway loader and skipped the manifest loader's gate entirely.
+	val := resolveYAMLAlias(&probe.SchemaVersion)
 	if val == nil || val.Kind != yaml.ScalarNode {
+		return nil, false
+	}
+	return val, true
+}
+
+// schemaVersionFromNode reads the effective schemaVersion scalar's SOURCE TEXT, reporting
+// whether one binds. Reads Value, so it is independent of the !!int/!!float retag
+// forceSchemaVersionToString applies.
+func schemaVersionFromNode(node *yaml.Node) (string, bool) {
+	val, ok := effectiveSchemaVersionNode(node)
+	if !ok {
 		return "", false
 	}
 	return val.Value, true
-}
-
-// forceSchemaVersionToString retags an unquoted top-level `schemaVersion` scalar to !!str so
-// the natural `schemaVersion: 0.1` (auto-typed as a float by yaml.v3) decodes as the string
-// "0.1" instead of failing with an opaque "cannot unmarshal number into ... string" before
-// validateManifestSchemaVersion can emit its friendly message. The gateway-config loader
-// cannot do this (it decodes strictly from raw bytes for KnownFields) and instead rejects a
-// bare-number schemaVersion outright. Retagging keeps the verbatim text, so "0.10" stays
-// "0.10" rather than renormalizing to "0.1".
-//
-// An ALIASED `schemaVersion: *ver` is retagged by REPLACING this key's slot with a fresh string
-// scalar, never by retagging the anchor. An anchor is shared with every other reference to it,
-// so mutating it silently rewrites fields this function has no business touching — and one of
-// them changes POLICY, not just type.
-//
-// With `values: [&ver 0.2]` beside `schemaVersion: *ver`, retagging the anchor decoded that
-// condition's value as a Go string rather than the json.Number every other numeric spelling
-// yields. MatchAllowedValue matches a string entry ONLY as a glob and only against a string
-// argument, so the entry stopped matching the numeric argument it was written for: the
-// capability silently denied every call it was meant to allow, with no load-time signal.
-// Deny-side, but a policy change from a retag that had no business leaving this key.
-//
-// Copying also leaves the anchor's own tag intact for rejectCoercedScalarsForFormat, which runs
-// after this and would otherwise skip a node this function had already rewritten.
-func forceSchemaVersionToString(node *yaml.Node) {
-	mapping, i := topLevelValueSlot(node, "schemaVersion")
-	if mapping == nil {
-		return
-	}
-	slot := mapping.Content[i]
-	val := resolveYAMLAlias(slot)
-	if val == nil || val.Kind != yaml.ScalarNode || (val.Tag != "!!int" && val.Tag != "!!float") {
-		return
-	}
-	if slot == val {
-		// Written directly under this key, so nothing else can be looking at it.
-		val.Tag = "!!str"
-		return
-	}
-	// Position from the ALIAS, so a later error about this value points at the reference the
-	// author wrote rather than at the anchor's definition somewhere else in the file.
-	mapping.Content[i] = &yaml.Node{
-		Kind:   yaml.ScalarNode,
-		Tag:    "!!str",
-		Value:  val.Value,
-		Line:   slot.Line,
-		Column: slot.Column,
-	}
 }
 
 // forceTimestampsToStrings retags every !!timestamp scalar to !!str so the subsequent
@@ -311,6 +298,61 @@ func forceTimestampsToStrings(n *yaml.Node) {
 	for _, child := range n.Content {
 		forceTimestampsToStrings(child)
 	}
+}
+
+// forceSchemaVersionToString rewrites the top-level `schemaVersion` so the natural
+// `schemaVersion: 0.1` (auto-typed as a float by yaml.v3) decodes as the string "0.1" instead
+// of failing with an opaque "cannot unmarshal number into ... string" before
+// validateManifestSchemaVersion can emit its friendly message. The gateway-config loader cannot
+// do this (it decodes strictly from raw bytes for KnownFields) and instead rejects a
+// bare-number schemaVersion outright. The verbatim text is kept, so "0.10" stays "0.10" rather
+// than renormalizing to "0.1".
+//
+// It never mutates the node it read. It writes a FRESH !!str scalar into the root mapping —
+// replacing this key's slot when the root spells the key itself, appending the pair when the
+// binding came through a `<<:` merge (an own key beats a merged one at any position, which is
+// the decoder's own rule).
+//
+// Both halves matter because the scalar can be SHARED. An anchor is reachable from every
+// reference to it, so retagging one silently rewrites fields this function has no business
+// touching — and one of them changes POLICY, not just type: with `values: [*ver]` beside
+// `schemaVersion: &ver 0.2`, retagging the anchor decoded that condition's value as a Go string
+// rather than the json.Number every other numeric spelling yields. MatchAllowedValue matches a
+// string entry ONLY as a glob and only against a string argument, so the entry stopped matching
+// the numeric argument it was written for: the capability silently denied every call it was
+// meant to allow, with no load-time signal. Writing a fresh node is what closes that for the
+// anchored, aliased and merged spellings alike.
+//
+// Copying also leaves the original's tag intact for rejectCoercedScalarsForFormat, which runs
+// after this and would otherwise skip a node this function had already rewritten.
+func forceSchemaVersionToString(node *yaml.Node) {
+	val, ok := effectiveSchemaVersionNode(node)
+	if !ok || (val.Tag != "!!int" && val.Tag != "!!float") {
+		return
+	}
+	// Position from the node the author wrote, so a later error about this value points there
+	// rather than at a synthesized location.
+	replacement := &yaml.Node{
+		Kind:   yaml.ScalarNode,
+		Tag:    "!!str",
+		Value:  val.Value,
+		Line:   val.Line,
+		Column: val.Column,
+	}
+	if mapping, i := topLevelValueSlot(node, "schemaVersion"); mapping != nil {
+		mapping.Content[i] = replacement
+		return
+	}
+	root := topLevelMapping(node)
+	if root == nil {
+		return
+	}
+	// Appending rather than replacing: the binding came through a merge, which has no slot of
+	// its own here. A second literal `schemaVersion` would be a duplicate key the decoder
+	// refuses, and the slot branch above has already ruled one out.
+	root.Content = append(root.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "schemaVersion", Line: val.Line, Column: val.Column},
+		replacement)
 }
 
 // rejectCoercedValueScalars walks n and rejects any unquoted scalar in a condition "values:"

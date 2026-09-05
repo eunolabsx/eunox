@@ -386,37 +386,40 @@ func TestAllowlistConditions_CompiledMatchesUncompiled(t *testing.T) {
 		if err := compiled.Compile(); err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		for _, c := range []*AllowedTablesCondition{uncompiled, compiled} {
-			tables, byTable, sets := c.TableLookup()
-			if !tables["users"] || !tables["orders"] {
-				t.Errorf("table set = %v, want the trimmed lowercase names", tables)
-			}
-			if tables["Users"] {
-				t.Error("table set must be keyed on the folded name only")
-			}
-			// The restriction index is keyed on the folded table name but keeps the
-			// column list in original case, so denial details echo the manifest.
-			if got := byTable["users"]; len(got) != 2 || got[0] != " ID " {
-				t.Errorf("columnsByTable[users] = %v, want the original-case list", got)
-			}
-			if !sets["users"]["id"] || !sets["users"]["email"] {
-				t.Errorf("column set = %v, want the trimmed lowercase names", sets["users"])
-			}
+		// The accessor REPORTS compiled-ness rather than building on the spot, so its caller can
+		// compile a local copy and fail closed on an error this signature cannot carry.
+		if _, _, _, ok := uncompiled.TableLookup(); ok {
+			t.Error("an uncompiled condition must report itself uncompiled, not silently compile")
+		}
+		tables, byTable, sets, ok := compiled.TableLookup()
+		if !ok {
+			t.Fatal("a compiled condition must report itself compiled")
+		}
+		if !tables["users"] || !tables["orders"] {
+			t.Errorf("table set = %v, want the trimmed lowercase names", tables)
+		}
+		if tables["Users"] {
+			t.Error("table set must be keyed on the folded name only")
+		}
+		// The restriction index is keyed on the folded table name but keeps the
+		// column list in original case, so denial details echo the manifest.
+		if got := byTable["users"]; len(got) != 2 || got[0] != " ID " {
+			t.Errorf("columnsByTable[users] = %v, want the original-case list", got)
+		}
+		if !sets["users"]["id"] || !sets["users"]["email"] {
+			t.Errorf("column set = %v, want the trimmed lowercase names", sets["users"])
 		}
 	})
 
 	t.Run("allowedTables with no column restrictions", func(t *testing.T) {
 		// nil Columns must stay nil through both paths: "no restrictions declared" is a
 		// distinct state from "an empty restriction", and only the former skips the ACL.
-		uncompiled := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}}
 		compiled := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}}
 		if err := compiled.Compile(); err != nil {
 			t.Fatalf("Compile: %v", err)
 		}
-		for _, c := range []*AllowedTablesCondition{uncompiled, compiled} {
-			if _, byTable, _ := c.TableLookup(); byTable != nil {
-				t.Errorf("columnsByTable = %v, want nil when no restrictions are declared", byTable)
-			}
+		if _, byTable, _, _ := compiled.TableLookup(); byTable != nil {
+			t.Errorf("columnsByTable = %v, want nil when no restrictions are declared", byTable)
 		}
 	})
 
@@ -442,17 +445,12 @@ func TestAllowlistConditions_CompiledMatchesUncompiled(t *testing.T) {
 				t.Fatalf("collision message is unstable:\n%s\n%s", err, got)
 			}
 		}
-		// A condition built through the API and never compiled still resolves to one ACL
-		// rather than to Go's randomized map order.
-		for i := 0; i < 64; i++ {
-			uncompiled := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}, Columns: c.Columns}
-			_, byTable, sets := uncompiled.TableLookup()
-			if got := byTable["users"]; len(got) != 2 || got[0] != "id" {
-				t.Fatalf("columnsByTable[users] = %v, want the smallest original key's list", got)
-			}
-			if !sets["users"]["ssn"] {
-				t.Fatalf("column set = %v, want the smallest original key's columns", sets["users"])
-			}
+		// A condition built through the API and never compiled hands its caller no ACL at all,
+		// rather than one resolved out of the ambiguity Compile refuses. The handler's own
+		// fail-closed exit for that is pinned in pkg/enforcement.
+		uncompiled := &AllowedTablesCondition{Argument: "table", Tables: []string{"users"}, Columns: c.Columns}
+		if _, byTable, _, ok := uncompiled.TableLookup(); ok || byTable != nil {
+			t.Fatalf("an uncompiled condition must report itself uncompiled, got ok=%v byTable=%v", ok, byTable)
 		}
 	})
 

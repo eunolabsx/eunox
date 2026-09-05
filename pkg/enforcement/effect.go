@@ -6,7 +6,9 @@ package enforcement
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -54,86 +56,141 @@ func (e *Engine) handleEffectClass(ctx context.Context, cond capability.Conditio
 		return condErr
 	}
 	// The loader rejects an empty allow set and an unknown class, but a programmatically built
-	// condition can carry either — surface both rather than silently admit.
+	// condition can carry either — surface both rather than silently admit. Faults, not
+	// verdicts: a condition that declares no evaluable set was never evaluated.
 	if len(ec.Allow) == 0 {
-		return effectDenial(capability.ConditionTypeEffectClass,
-			"effectClass declares an empty 'allow' set, which admits no effect class", nil)
+		return conditionFault(capability.ConditionTypeEffectClass,
+			"effectClass declares an empty 'allow' set, which admits no effect class")
 	}
 	allow := make(map[string]bool, len(ec.Allow))
 	for _, c := range ec.Allow {
 		if !capability.IsEffectClass(c) {
-			return effectDenial(capability.ConditionTypeEffectClass, fmt.Sprintf(
+			return conditionFault(capability.ConditionTypeEffectClass, fmt.Sprintf(
 				"effectClass 'allow' contains unknown class %q; valid effect classes are %s",
-				c, strings.Join(capability.EffectClassVocabulary(), ", ")), nil)
+				c, strings.Join(capability.EffectClassVocabulary(), ", ")))
 		}
 		allow[c] = true
 	}
 
 	eff, ok := resolvedEffectFromContext(ctx)
 	if !ok {
-		return effectDenial(capability.ConditionTypeEffectClass,
-			"effect contract was not resolved for this call; effect state is unavailable", nil)
+		// Reachable through the exported NonCommittingConditionVerdict seam, whose composing
+		// caller never threads a resolved effect: a fault, so the claim leg's refusal is not
+		// downgraded to a forward on the strength of a condition nothing evaluated.
+		return conditionFault(capability.ConditionTypeEffectClass,
+			"effect contract was not resolved for this call; effect state is unavailable")
 	}
 	if allow[eff.Class] {
 		return nil
 	}
-	details := eff.AuditDetails()
-	details["allow_effect_classes"] = capability.SortedEffectClasses(ec.Allow)
-	return effectDenial(capability.ConditionTypeEffectClass, fmt.Sprintf(
+	details := map[string]interface{}{"allow_effect_classes": capability.SortedEffectClasses(ec.Allow)}
+	return effectDenial(eff, capability.ConditionTypeEffectClass, fmt.Sprintf(
 		"this call's effect class %q is not permitted at this target (permitted: %s)%s",
 		eff.Class, strings.Join(capability.SortedEffectClasses(ec.Allow), ", "), unannotatedHint(eff)), details)
 }
 
-// checkPerCallBlastRadius applies the per-call `max` bound. It commits nothing.
-func checkPerCallBlastRadius(br *capability.BlastRadiusCondition, eff *capability.ResolvedEffect) *ConditionError {
-	limit, ok := capability.ParseBlastRadiusNumber(*br.Max)
-	if !ok {
-		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
-			"blastRadius 'max' is not a number (%q)", br.Max.String()), nil)
+// blastRadiusBounds is a blastRadius condition's own declaration, parsed. Either field is nil
+// when the condition does not declare that bound; at least one is non-nil, since a condition
+// declaring neither is refused by parseBlastRadiusBounds.
+type blastRadiusBounds struct {
+	perCall    *big.Float
+	cumulative *big.Float
+}
+
+// parseBlastRadiusBounds validates a blastRadius condition's own declaration.
+//
+// Runs BEFORE the call's effect is resolved, which is what makes its refusals structurally
+// unable to take the verdict constructor: everything wrong here is wrong about the CONDITION,
+// so there is no resolved effect to hand effectDenial and the compiler says so. The loader
+// requires at least one bound and rejects a half-written pair or a non-numeric one; a
+// programmatically built condition may carry any of them, and none must read as "checked and
+// fine".
+func parseBlastRadiusBounds(br *capability.BlastRadiusCondition) (blastRadiusBounds, *ConditionError) {
+	var bounds blastRadiusBounds
+	if br.Max == nil && !br.HasVelocity() {
+		return bounds, conditionFault(capability.ConditionTypeBlastRadius,
+			"blastRadius declares neither 'max' nor a complete 'maxTotal'/'windowSeconds' pair, so it bounds nothing")
 	}
+	if br.Max != nil {
+		limit, ok := capability.ParseBlastRadiusNumber(*br.Max)
+		if !ok {
+			return bounds, conditionFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+				"blastRadius 'max' is not a number (%q)", br.Max.String()))
+		}
+		bounds.perCall = limit
+	}
+	// A HALF-written pair is its own fault, checked before HasVelocity's silence: a maxTotal with
+	// no windowSeconds (or the reverse) declares a cumulative budget that HasVelocity reports
+	// false for, so it was neither enforced nor committed while the per-call bound beside it
+	// passed — reading as "checked and fine" for exactly the programmatically built condition
+	// this function exists to refuse.
+	if (br.MaxTotal != nil) != (br.WindowSeconds > 0) {
+		return bounds, conditionFault(capability.ConditionTypeBlastRadius,
+			"blastRadius declares half of a cumulative bound ('maxTotal' without a positive 'windowSeconds', or the reverse); each half silently disables the other, so neither is enforced")
+	}
+	if br.HasVelocity() {
+		limit, ok := capability.ParseBlastRadiusNumber(*br.MaxTotal)
+		if !ok {
+			return bounds, conditionFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+				"blastRadius 'maxTotal' is not a number (%q)", br.MaxTotal.String()))
+		}
+		// REPRESENTABLE, not merely parseable: the counter accumulates in float64, and a bound
+		// past that range converts to +Inf, which no weighted total can ever exceed — the
+		// cumulative budget would admit every call. weightSummable is the same check on the
+		// magnitude side; the limit side had none.
+		limitF, _ := limit.Float64()
+		if !weightSummable(limitF) {
+			return bounds, conditionFault(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+				"blastRadius 'maxTotal' (%s) is outside the range a cumulative bound can sum, so no total could ever exceed it",
+				br.MaxTotal.String()))
+		}
+		bounds.cumulative = limit
+	}
+	return bounds, nil
+}
+
+// checkPerCallBlastRadius applies the per-call `max` bound against the already-parsed limit.
+// It commits nothing.
+func checkPerCallBlastRadius(br *capability.BlastRadiusCondition, limit *big.Float, eff *capability.ResolvedEffect) *ConditionError {
+	// The details map is built at each refusal rather than up front: the pass below is the hot
+	// path, and a map nothing reads is an allocation per allowed call.
 	if !eff.Quantified() {
-		details := eff.AuditDetails()
-		details["blast_radius_max"] = br.Max.String()
-		return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+		return effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius could not be quantified, so it cannot be shown to be within the bound of %s%s",
-			br.Max.String(), unannotatedHint(eff)), details)
+			br.Max.String(), unannotatedHint(eff)),
+			map[string]interface{}{"blast_radius_max": br.Max.String()})
 	}
 	if eff.BlastRadius.Cmp(limit) <= 0 {
 		return nil
 	}
-	details := eff.AuditDetails()
-	details["blast_radius_max"] = br.Max.String()
-	return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+	return effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 		"this call's blast radius %s exceeds the permitted maximum %s",
-		eff.BlastRadius.Text('f', -1), br.Max.String()), details)
+		eff.BlastRadius.Text('f', -1), br.Max.String()),
+		map[string]interface{}{"blast_radius_max": br.Max.String()})
 }
 
 // velocityBucket derives the weighted bucket a cumulative bound draws on, after the checks
 // that must fail closed first: an unquantified magnitude, one the accumulator can't
-// represent, and the structural session/target guards. Commits nothing — the engine admits
+// represent, and the structural anchor/target guards. Commits nothing — the engine admits
 // the bucket alongside every other quota condition in one atomic call, after the ceiling has
 // had its chance to refuse.
-func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusCondition, eff *capability.ResolvedEffect, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
-	limit, ok := capability.ParseBlastRadiusNumber(*br.MaxTotal)
-	if !ok {
-		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
-			"blastRadius 'maxTotal' is not a number (%q)", br.MaxTotal.String()), nil)
-	}
+func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusCondition, limit *big.Float, eff *capability.ResolvedEffect, req *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
 	if !eff.Quantified() {
 		// Same rule the per-call bound applies: an action whose size can't be established
 		// must not contribute 0 to a sum, or the unannotated call becomes the way to spend
 		// nothing.
-		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+		return DeferredCommit{}, false, effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius could not be quantified, so it cannot be summed against the cumulative bound of %s per %ds%s",
-			br.MaxTotal.String(), br.WindowSeconds, unannotatedHint(eff)), velocityDetails(eff, br))
+			br.MaxTotal.String(), br.WindowSeconds, unannotatedHint(eff)), velocityExtras(br))
 	}
-	// float64 on both sides, matching the counter contract's accumulator.
+	// float64 on both sides, matching the counter contract's accumulator. The limit's
+	// representability was established by parseBlastRadiusBounds.
 	weight, _ := eff.BlastRadius.Float64()
 	limitF, _ := limit.Float64()
 	if !weightSummable(weight) {
-		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+		return DeferredCommit{}, false, effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius %s is outside the range a cumulative bound can sum, so it cannot be shown to be within %s",
-			eff.BlastRadius.Text('f', -1), br.MaxTotal.String()), velocityDetails(eff, br))
+			eff.BlastRadius.Text('f', -1), br.MaxTotal.String()), velocityExtras(br))
 	}
 
 	key, skip, condErr := e.quotaBucketKey(ctx, req, blastRadiusBucketSpec)
@@ -154,13 +211,13 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 			Limit:     limitF,
 		},
 		Deny: func(total float64, retryAfter time.Duration) *ConditionError {
-			details := velocityDetails(eff, br)
+			details := velocityExtras(br)
 			details["blast_radius_total"] = total
 			// Shared helper every quota condition uses: rounds a fractional wait UP
 			// (truncating reported a 900ms wait as 0, telling the caller to retry into a
 			// guaranteed denial).
 			details["retry_after_seconds"] = retryAfterSeconds(retryAfter, br.WindowSeconds)
-			return effectDenial(capability.ConditionTypeBlastRadius, fmt.Sprintf(
+			return effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 				"this call's blast radius %s would take this session's cumulative total for the target past the permitted %s per %ds (already %s within the window)",
 				eff.BlastRadius.Text('f', -1), br.MaxTotal.String(), br.WindowSeconds, formatTotal(total)), details)
 		},
@@ -182,14 +239,15 @@ func weightSummable(weight float64) bool {
 	return weight >= 0 && weight <= capability.MaxWeightedTotal
 }
 
-// velocityDetails builds the structured details every cumulative-bound refusal carries. One
-// builder, because three hand-copied sites had let blast_radius_window_seconds drift out of
-// one of them, leaving a SIEM rule keyed on it blind to that class of denial.
-func velocityDetails(eff *capability.ResolvedEffect, br *capability.BlastRadiusCondition) map[string]interface{} {
-	details := eff.AuditDetails()
-	details["blast_radius_max_total"] = br.MaxTotal.String()
-	details["blast_radius_window_seconds"] = br.WindowSeconds
-	return details
+// velocityExtras builds the cumulative-bound fields every velocity refusal carries on top of
+// the resolved effect's own (which effectDenial supplies). One builder, because three
+// hand-copied sites had let blast_radius_window_seconds drift out of one of them, leaving a
+// SIEM rule keyed on it blind to that class of denial.
+func velocityExtras(br *capability.BlastRadiusCondition) map[string]interface{} {
+	return map[string]interface{}{
+		"blast_radius_max_total":      br.MaxTotal.String(),
+		"blast_radius_window_seconds": br.WindowSeconds,
+	}
 }
 
 // formatTotal renders a running weighted total for an operator-facing denial without
@@ -216,33 +274,33 @@ func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.C
 	if condErr != nil {
 		return DeferredCommit{}, false, condErr
 	}
-	if br.Max == nil && !br.HasVelocity() {
-		// The loader requires at least one bound and rejects a half-written pair; a
-		// programmatically built condition may carry neither — must not read as "checked and
-		// fine".
-		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius,
-			"blastRadius declares neither 'max' nor a complete 'maxTotal'/'windowSeconds' pair, so it bounds nothing", nil)
+	// The condition's own declaration first, before any effect is resolved: those refusals are
+	// faults about the policy text, and running them here is what keeps them off the verdict
+	// constructor (see parseBlastRadiusBounds).
+	bounds, condErr := parseBlastRadiusBounds(br)
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
 	}
 
 	eff, resolved := resolvedEffectFromContext(ctx)
 	if !resolved {
-		return DeferredCommit{}, false, effectDenial(capability.ConditionTypeBlastRadius,
-			"effect contract was not resolved for this call; blast radius is unavailable", nil)
+		return DeferredCommit{}, false, conditionFault(capability.ConditionTypeBlastRadius,
+			"effect contract was not resolved for this call; blast radius is unavailable")
 	}
 
 	// Per-call bound first, cumulative only after: a call over the per-call bound must be
 	// refused WITHOUT consuming the cumulative budget, or a burst of oversized attempts
 	// exhausts the window.
-	if br.Max != nil {
-		if condErr := checkPerCallBlastRadius(br, eff); condErr != nil {
+	if bounds.perCall != nil {
+		if condErr := checkPerCallBlastRadius(br, bounds.perCall, eff); condErr != nil {
 			return DeferredCommit{}, false, condErr
 		}
 	}
-	if !br.HasVelocity() {
+	if bounds.cumulative == nil {
 		// Bound checked, nothing to commit.
 		return DeferredCommit{}, false, nil
 	}
-	return h.e.velocityBucket(ctx, br, eff, req)
+	return h.e.velocityBucket(ctx, br, bounds.cumulative, eff, req)
 }
 
 // unannotatedHint appends the remediation that differs between "declared, and it does not
@@ -255,10 +313,23 @@ func unannotatedHint(eff *capability.ResolvedEffect) string {
 	return " — this target declares no effect contract, so it resolves to the fail-closed default (irreversible, unquantified); annotate it to buy it out of maximum friction"
 }
 
-// effectDenial builds a CONDITION_FAILED for the effect layer. details is stamped onto the
-// denial so the tape carries the structured consequence inputs (class, magnitude,
-// compensating action) rather than only the prose.
-func effectDenial(condType, message string, details map[string]interface{}) *ConditionError {
+// effectDenial builds the effect layer's policy VERDICT: the contract was resolved, the bound
+// was evaluated, and this call does not pass it. CONDITION_FAILED, so an observing route may
+// downgrade it to a forward — which is sound precisely because the bound WAS evaluated and
+// enforce mode's answer is known. details is stamped onto the denial so the tape carries the
+// structured consequence inputs (class, magnitude, compensating action) rather than only the
+// prose.
+//
+// Taking eff is what makes the split structural rather than a per-site choice: the one
+// constructor here used to hardcode CONDITION_FAILED for every effect refusal, including the
+// three that could reach no verdict at all — an unresolved contract, a condition bounding
+// nothing, a non-numeric bound — so an --audit route forwarded a call whose effect condition
+// nothing had evaluated. Every unevaluable site sits ABOVE the resolution and has no effect to
+// pass, so it cannot reach this constructor at all. eff also supplies the details every verdict
+// carries, extra adding only what is specific to the bound that refused.
+func effectDenial(eff *capability.ResolvedEffect, condType, message string, extra map[string]interface{}) *ConditionError {
+	details := eff.AuditDetails()
+	maps.Copy(details, extra)
 	return &ConditionError{
 		Code:          capability.ErrCodeConditionFailed,
 		ConditionType: condType,

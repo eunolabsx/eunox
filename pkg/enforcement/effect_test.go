@@ -44,40 +44,43 @@ func effectEngine(ceiling *capability.EffectCeiling) *enforcement.Engine {
 // malformed/unevaluable inputs that must fail closed rather than fall open.
 func TestEffectClassCondition(t *testing.T) {
 	cases := []struct {
-		name       string
-		contract   *capability.EffectContract
-		allow      []string
-		wantDecide capability.Decision
+		name     string
+		contract *capability.EffectContract
+		allow    []string
+		// wantCode is "" for an allow. A refusal names its own class: CONDITION_FAILED where the
+		// contract was resolved and the allow set decided against it, ENFORCEMENT_ERROR where the
+		// condition itself declared nothing evaluable — that one is not downgradable, so an
+		// observing route does not forward a call whose class gate never ran.
+		wantCode string
 	}{
 		{
-			name:       "a permitted class allows",
-			contract:   &capability.EffectContract{Class: capability.EffectReversible},
-			allow:      []string{capability.EffectReversible, capability.EffectCompensable},
-			wantDecide: capability.DecisionAllow,
+			name:     "a permitted class allows",
+			contract: &capability.EffectContract{Class: capability.EffectReversible},
+			allow:    []string{capability.EffectReversible, capability.EffectCompensable},
 		},
 		{
-			name:       "a class outside the allow set denies",
-			contract:   &capability.EffectContract{Class: capability.EffectIrreversible},
-			allow:      []string{capability.EffectReversible, capability.EffectCompensable},
-			wantDecide: capability.DecisionDeny,
+			name:     "a class outside the allow set denies",
+			contract: &capability.EffectContract{Class: capability.EffectIrreversible},
+			allow:    []string{capability.EffectReversible, capability.EffectCompensable},
+			wantCode: capability.ErrCodeConditionFailed,
 		},
 		{
-			name:       "an unannotated target denies — it resolves to irreversible",
-			contract:   nil,
-			allow:      []string{capability.EffectReversible},
-			wantDecide: capability.DecisionDeny,
+			name:     "an unannotated target denies — it resolves to irreversible",
+			contract: nil,
+			allow:    []string{capability.EffectReversible},
+			wantCode: capability.ErrCodeConditionFailed,
 		},
 		{
-			name:       "an empty allow set admits nothing",
-			contract:   &capability.EffectContract{Class: capability.EffectReversible},
-			allow:      nil,
-			wantDecide: capability.DecisionDeny,
+			name:     "an empty allow set admits nothing",
+			contract: &capability.EffectContract{Class: capability.EffectReversible},
+			allow:    nil,
+			wantCode: capability.ErrCodeEnforcementError,
 		},
 		{
-			name:       "an unknown class in the allow set denies rather than being ignored",
-			contract:   &capability.EffectContract{Class: capability.EffectReversible},
-			allow:      []string{"mostly-harmless"},
-			wantDecide: capability.DecisionDeny,
+			name:     "an unknown class in the allow set denies rather than being ignored",
+			contract: &capability.EffectContract{Class: capability.EffectReversible},
+			allow:    []string{"mostly-harmless"},
+			wantCode: capability.ErrCodeEnforcementError,
 		},
 	}
 
@@ -90,12 +93,16 @@ func TestEffectClassCondition(t *testing.T) {
 				Conditions: []capability.Condition{capability.EffectClassCondition{Allow: c.allow}},
 			}}
 			resp := effectEngine(nil).ValidateAction(context.Background(), effectReq("act", nil), caps)
-			assert.Equal(t, c.wantDecide, resp.Decision)
-			if c.wantDecide == capability.DecisionDeny {
-				require.NotNil(t, resp.Denial)
-				assert.Equal(t, capability.ConditionTypeEffectClass, resp.Denial.ConditionType)
-				assert.Equal(t, capability.ErrCodeConditionFailed, resp.Denial.Code)
+			if c.wantCode == "" {
+				assert.Equal(t, capability.DecisionAllow, resp.Decision)
+				return
 			}
+			assert.Equal(t, capability.DecisionDeny, resp.Decision)
+			require.NotNil(t, resp.Denial)
+			assert.Equal(t, capability.ConditionTypeEffectClass, resp.Denial.ConditionType)
+			assert.Equal(t, c.wantCode, resp.Denial.Code)
+			assert.Equal(t, c.wantCode == capability.ErrCodeConditionFailed, resp.Denial.Downgradable(),
+				"only a verdict the class gate actually reached may be downgraded to a forward")
 		})
 	}
 }
