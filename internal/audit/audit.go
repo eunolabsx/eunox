@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -650,7 +651,7 @@ func Open(logPath, keyPath string, rotateSizeBytes int64, retainRotated int, opt
 	var preSize int64 = -1
 	if info, statErr := os.Stat(logPath); statErr == nil {
 		preSize = info.Size()
-	} else if os.IsNotExist(statErr) {
+	} else if errors.Is(statErr, fs.ErrNotExist) {
 		preSize = 0
 	}
 

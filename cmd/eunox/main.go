@@ -655,8 +655,13 @@ func cmdProxy(args []string) (exitCode int) {
 	switch cfg.HostTransport() {
 	case config.HostTransportStdio:
 		serveErr = serveStdioHost(ctx, cfg, sink, counter, flowStore, ks, pf, onServeReady)
-	default: // config.HostTransportHTTP
+	case config.HostTransportHTTP:
 		serveErr = serveHTTPGateway(ctx, cfg, sink, counter, flowStore, ks, pf, onServeReady)
+	default:
+		// Unreachable — Validate constrains the value and validateTransportConditionalFlags
+		// refuses it again above — and named anyway, because a `default` serving HTTP is what
+		// made this fold run opposite to that validator's.
+		serveErr = errUnknownHostTransport(cfg.HostTransport())
 	}
 	if serveErr != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", serveErr)
@@ -1083,36 +1088,51 @@ func httpOnlyFlagsSetOnStdio(fs *flag.FlagSet) []string {
 // configured host transport — each would otherwise silently no-op, letting an operator
 // believe a security-relevant setting took effect. Runs from cmdProxy the moment the
 // transport is known, before the Redis dial and audit key/log creation.
+//
+// Both transports are named and anything else REFUSED: the `if HTTP {…} else {stdio rules}`
+// shape this replaced read every unknown value as stdio while cmdProxy's serve switch read it
+// as HTTP, so a third value would have been served as a gateway with stdio's rules checked
+// against it — every HTTP-only flag unexamined.
 func validateTransportConditionalFlags(hostTransport string, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
-	if hostTransport == config.HostTransportHTTP {
+	switch hostTransport {
+	case config.HostTransportHTTP:
 		// pf.sessionIDSet (not pf.sessionID, which is never empty — cmdProxy falls back to
 		// a fresh UUID) tracks whether the operator actually passed it.
 		if pf.sessionIDSet {
 			return fmt.Errorf("--session-id requires transport: stdio (a gateway mints its own Mcp-Session-Id per client session)")
 		}
 		return nil
+	case config.HostTransportStdio:
+		// JWT validation and OAuth metadata are HTTP-listener concerns; a stdio host
+		// has no socket on which to serve them.
+		if pf.jwksURI != "" {
+			return fmt.Errorf("--jwks-uri requires transport: http (a stdio host has no HTTP listener)")
+		}
+		if pf.oauthResource != "" {
+			return fmt.Errorf("--oauth-resource requires transport: http (a stdio host has no HTTP listener)")
+		}
+		// --oauth-authorization-server only feeds the RFC 9728 metadata document, which is
+		// served on the HTTP listener; on stdio it would be a silent no-op, so fail closed
+		// like its siblings above rather than ignore it.
+		if pf.oauthAuthzServer != "" {
+			return fmt.Errorf("--oauth-authorization-server requires transport: http (a stdio host has no HTTP listener)")
+		}
+		// Every other HTTP-only flag: httpOnlyFlagsSetOnStdio (precomputed into
+		// pf.httpOnlyFlagsSet) is the single source of truth, so a future HTTP-only flag is
+		// covered automatically.
+		if len(pf.httpOnlyFlagsSet) > 0 {
+			return fmt.Errorf("%s requires transport: http (a stdio host has no HTTP listener)", strings.Join(pf.httpOnlyFlagsSet, ", "))
+		}
+		return nil
+	default:
+		return errUnknownHostTransport(hostTransport)
 	}
-	// JWT validation and OAuth metadata are HTTP-listener concerns; a stdio host
-	// has no socket on which to serve them.
-	if pf.jwksURI != "" {
-		return fmt.Errorf("--jwks-uri requires transport: http (a stdio host has no HTTP listener)")
-	}
-	if pf.oauthResource != "" {
-		return fmt.Errorf("--oauth-resource requires transport: http (a stdio host has no HTTP listener)")
-	}
-	// --oauth-authorization-server only feeds the RFC 9728 metadata document, which is
-	// served on the HTTP listener; on stdio it would be a silent no-op, so fail closed
-	// like its siblings above rather than ignore it.
-	if pf.oauthAuthzServer != "" {
-		return fmt.Errorf("--oauth-authorization-server requires transport: http (a stdio host has no HTTP listener)")
-	}
-	// Every other HTTP-only flag: httpOnlyFlagsSetOnStdio (precomputed into
-	// pf.httpOnlyFlagsSet) is the single source of truth, so a future HTTP-only flag is
-	// covered automatically.
-	if len(pf.httpOnlyFlagsSet) > 0 {
-		return fmt.Errorf("%s requires transport: http (a stdio host has no HTTP listener)", strings.Join(pf.httpOnlyFlagsSet, ", "))
-	}
-	return nil
+}
+
+// errUnknownHostTransport is the ONE wording both refusals of an unrecognized host transport
+// carry, so the two sites cannot drift into describing the same condition differently.
+func errUnknownHostTransport(hostTransport string) error {
+	return fmt.Errorf("unknown host transport %q (expected %q or %q)", hostTransport, config.HostTransportStdio, config.HostTransportHTTP)
 }
 
 // validateProxyAuditPEPFlag rejects an unusable --audit-pep with the rest of the flag checks,

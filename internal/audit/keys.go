@@ -309,8 +309,9 @@ func auditKeySymlinkAllowed() bool {
 // follows symlinks. The guard is applied here, once, for all three readers rather than at
 // each call site.
 //
-// A genuinely absent file is returned as an os.IsNotExist error so LoadOrCreateKeys can
-// still mint a key; the caller distinguishes the two.
+// A genuinely absent file is returned as an fs.ErrNotExist error so LoadOrCreateKeys can
+// still mint a key; the caller distinguishes the two, and does so with errors.Is, so this
+// side must keep ENOENT reachable through Unwrap if it ever gains context.
 func readAuditKeyFile(keyPath string, tighten bool) ([]byte, error) {
 	allowSymlink := auditKeySymlinkAllowed()
 	flags := os.O_RDONLY
@@ -330,7 +331,7 @@ func readAuditKeyFile(keyPath string, tighten bool) ([]byte, error) {
 	flags |= config.OpenNonBlock
 	f, err := os.OpenFile(keyPath, flags, 0) //nolint:gosec // G304: path is user-configured audit key location (--audit-key-path or EUNOX_AUDIT_KEY_PATH)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, err // the caller decides whether absence is fatal or a create trigger
 		}
 		return nil, fmt.Errorf("reading audit key file %q: %w", keyPath, err)
