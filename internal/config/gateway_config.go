@@ -1073,8 +1073,9 @@ func (cfg *GatewayConfig) validateUpstreamEntry(i int, u *UpstreamConfig, seen m
 		if presentKey(i, "upstreamTlsSkipVerify") || u.UpstreamTLSSkipVerify {
 			return fmt.Errorf("upstream %q: 'upstreamTlsSkipVerify' is not allowed with stdio transport (HTTP-only)", u.Name)
 		}
-		// A stdio host speaks no HTTP, so there is no header to forward and an allowlist here
-		// would read as a granted passthrough that silently does nothing.
+		// A stdio upstream is a subprocess spoken to over pipes, so there is no upstream HTTP
+		// request for a forwarded header to ride on and an allowlist here would read as a
+		// granted passthrough that silently does nothing.
 		if presentKey(i, "forwardClientHeaders") || u.ForwardClientHeaders != nil {
 			return fmt.Errorf("upstream %q: 'forwardClientHeaders' is not allowed with stdio transport (HTTP-only)", u.Name)
 		}

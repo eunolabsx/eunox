@@ -2588,8 +2588,8 @@ capabilities: []
 
 func TestCmdInit_MissingUpstreamURL(t *testing.T) {
 	code := cmdInit(nil)
-	if code != initUsageExit {
-		t.Errorf("expected exit code %d (missing --upstream-url), got %d", initUsageExit, code)
+	if code != initFailExit {
+		t.Errorf("expected exit code %d (missing --upstream-url), got %d", initFailExit, code)
 	}
 }
 
@@ -2608,8 +2608,8 @@ func TestCmdInit_ConfigOutputWithoutOutput(t *testing.T) {
 	defer srv.Close()
 
 	code := cmdInit([]string{"--upstream-url", srv.URL, "--config-output", "/tmp/cfg.yaml"})
-	if code != initUsageExit {
-		t.Errorf("expected exit code %d (--config-output without --output), got %d", initUsageExit, code)
+	if code != initFailExit {
+		t.Errorf("expected exit code %d (--config-output without --output), got %d", initFailExit, code)
 	}
 }
 

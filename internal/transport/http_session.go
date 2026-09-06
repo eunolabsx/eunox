@@ -687,7 +687,11 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		case <-waited:
 		case <-time.After(msToDuration(p.shutdownMs)):
 			killUpstreamCmd(sess.upCmd)
-			<-waited
+			// Bounded like every other post-kill wait in this file: a descendant that escaped
+			// the process group holds the pipe open, cmd.Wait never returns, and this
+			// goroutine would never reach finishSessionCleanup — leaving the session
+			// registered, pinning its maxSessions slot and its state for the proxy's life.
+			waitBounded(waited, msToDuration(p.shutdownMs), "upstream output stream", p.errOut())
 		}
 		p.finishSessionCleanup(sess)
 	}()

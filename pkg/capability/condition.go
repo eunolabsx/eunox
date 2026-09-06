@@ -454,7 +454,9 @@ type AllowedValuesCondition struct {
 // before matching. An entry that strips to empty (e.g. "", "tool:", "  ") also
 // fails closed rather than being silently skipped, so a list whose every entry is
 // empty cannot pass unconditionally. Call history is keyed by session ID, so one
-// session's activity never gates another's.
+// session's activity never gates another's — unless the engine runs under
+// enforcement.WithTaskAnchoredState, where history follows the validated task id and
+// deliberately spans the sessions sharing it (the same caveat FlowLabelCondition carries).
 //
 // Example — block any external write once credentials have been read:
 //

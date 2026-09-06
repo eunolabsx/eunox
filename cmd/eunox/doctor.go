@@ -274,32 +274,13 @@ func cmdDoctor(args []string) int {
 	if outPath == "auto" {
 		outPath = fmt.Sprintf("eunox-doctor-%s.txt", time.Now().UTC().Format("20060102T150405Z"))
 	}
-	// The bundle always truncates (no --force gate here), so the symlink refusal is
-	// unconditional — otherwise a planted link's TARGET would be truncated and re-moded.
-	if err := refuseNonRegularOutput(outPath); err != nil {
-		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
-		return doctorUsageExit
-	}
-	// config.OpenNoFollow closes the Lstat->open race the refusal above cannot for a symlink;
-	// config.OpenNonBlock closes it for a FIFO, whose write-only open would otherwise block
-	// inside open(2) until a reader arrives, leaving no post-open check reachable at all.
-	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: --output is an operator-supplied destination
+	// The bundle always truncates (there is no --force gate here), so it takes the guarded
+	// open unconditionally — otherwise a planted link's TARGET would be truncated and
+	// re-moded. openGuardedOutput is the whole chain: the name refusal, the O_NOFOLLOW /
+	// O_NONBLOCK open that closes the race it cannot, the handle check, and the re-tighten.
+	f, err := openGuardedOutput(outPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox doctor: opening %q: %v\n", outPath, err)
-		return doctorUsageExit
-	}
-	// Asked through the HANDLE, ahead of the re-tighten, so a substituted object is refused
-	// rather than re-moded and written with a support bundle.
-	if err := config.RefuseNonRegularHandle(f, "output file", outPath); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)
-		_ = f.Close()
-		return doctorUsageExit
-	}
-	// Re-tighten on the open fd: O_CREATE applies 0600 only on creation, so a pre-existing
-	// looser-mode file would otherwise keep that mode.
-	if err := f.Chmod(0o600); err != nil {
-		fmt.Fprintf(os.Stderr, "eunox doctor: tightening mode of %q: %v\n", outPath, err)
-		_ = f.Close()
 		return doctorUsageExit
 	}
 	// Track write errors AND the close (which flushes) so a truncated bundle is reported

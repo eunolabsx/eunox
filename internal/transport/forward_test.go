@@ -199,6 +199,53 @@ func TestEnforcedForwardCore_RedactionFailureRecordsDeny(t *testing.T) {
 	assert.Equal(t, capability.ErrCodeEnforcementError, rec.records[0].code)
 }
 
+// TestEnforcedForwardCore_RedactionFailure_RecordsBeforeLogging pins the
+// record-before-act invariant on the redaction-failure exit: the ENFORCEMENT_ERROR
+// deny must be enqueued before the "SECURITY: redaction failed" stderr notice, so a
+// crash between the two can never leave a SIEM-visible alert with no corresponding
+// tamper-evident record — on the one exit below the decision an adversarial upstream
+// can drive at will, by answering a redactFields-guarded call with a body redaction
+// fails closed on. Regression for the same inversion dispatchUnmapped and the
+// sampling observe leg were fixed for.
+func TestEnforcedForwardCore_RedactionFailure_RecordsBeforeLogging(t *testing.T) {
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+
+	fp := forwardParams{
+		// forwardOrderRecorder's RecordDeny writes its sentinel to os.Stderr, and the
+		// notice channel is left UNSET so it resolves to the same swapped-in pipe at write
+		// time — a channel naming a writer would order the two against different streams.
+		rec:       forwardOrderRecorder{},
+		sessionID: "s",
+		callUpstream: func(_ context.Context, msg mcp.RPCMsg) (mcp.RPCMsg, error) {
+			// "content" present but not an array makes ApplyRedactObligs fail closed.
+			return mcp.RPCMsg{ID: msg.ID, Result: json.RawMessage(`{"content":"not-an-array"}`)}, nil
+		},
+	}
+	dec := capability.EnforceResponse{
+		Decision:    capability.DecisionAllow,
+		Obligations: []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"ssn"}}},
+	}
+	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", true, upstreamErrorDetail)
+	require.NotNil(t, resp.Error, "host must receive an internal error when redaction fails")
+
+	_ = w.Close()
+	os.Stderr = old
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	logged := buf.String()
+
+	recordIdx := strings.Index(logged, "RECORD_DENY_CALLED")
+	logIdx := strings.Index(logged, "SECURITY: redaction failed")
+	require.NotEqual(t, -1, recordIdx, "RecordDeny was not called; got: %q", logged)
+	require.NotEqual(t, -1, logIdx, "redaction-failure notice was not logged; got: %q", logged)
+	assert.Less(t, recordIdx, logIdx,
+		"RecordDeny must be called BEFORE the stderr security notice; got: %q", logged)
+}
+
 // TestAuditObligationNames pins the token shape recorded in the audit log's
 // obligations[] field: one "type:path" entry per matched redact path (so the tape
 // shows WHICH fields were masked), a bare "type" token for an obligation that

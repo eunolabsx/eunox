@@ -85,6 +85,35 @@ func TestWriteGeneratedFile_RefusesClobberAndTightens(t *testing.T) {
 	}
 }
 
+// TestCmdDoctor_NeverWritesThroughASymlink pins the SAME guarantee for the other caller of
+// openGuardedOutput. The two used to hold hand-mirrored copies of the guard chain, which is
+// the class of duplication that drifts silently — each step covers a race the next one
+// cannot, so a copy that loses one loses it with no symptom until a link is planted. Driving
+// both callers against a planted link is what keeps the extraction honest.
+func TestCmdDoctor_NeverWritesThroughASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "victim")
+	if err := os.WriteFile(target, []byte("victim contents"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(dir, "bundle.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	// The bundle always truncates — there is no --force gate — so the refusal is unconditional.
+	code := cmdDoctor([]string{"--output", link, "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
+	if code == 0 {
+		t.Error("writing the bundle to a symlinked destination must be refused")
+	}
+	if b, _ := os.ReadFile(target); string(b) != "victim contents" {
+		t.Fatalf("the symlink target was written through: %q", b)
+	}
+	if fi, err := os.Stat(target); err == nil && fi.Mode().Perm() != 0o600 {
+		t.Errorf("the symlink target was re-moded to %v", fi.Mode().Perm())
+	}
+}
+
 // TestWriteGeneratedFile_NeverWritesThroughASymlink pins the guarantee both halves of the
 // symlink guard exist for: a link planted at the destination must never have its TARGET
 // truncated (and then re-moded 0600 by the fd Chmod). The Lstat refusal names the path,

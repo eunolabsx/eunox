@@ -1992,28 +1992,64 @@ func refuseNonRegularOutput(path string) error {
 	return config.RefuseNonRegularPath(path, "output file")
 }
 
+// openGuardedOutput opens path for a TRUNCATING write at mode 0600, refusing anything that
+// is not a regular file at every point the answer can still change. It is the whole guard
+// sequence, in the one order that holds:
+//
+//  1. refuseNonRegularOutput on the NAME, which refuses a planted symlink or FIFO outright;
+//  2. config.OpenNoFollow, which closes the Lstat->open race the refusal above cannot for a
+//     symlink, and config.OpenNonBlock, which closes it for a FIFO — whose write-only open
+//     would otherwise block inside open(2) until a reader arrives, leaving no post-open check
+//     reachable at all;
+//  3. config.RefuseNonRegularHandle through the HANDLE, so the verdict describes what is
+//     about to be written rather than what the name resolved to before the open — the one
+//     question with no window after it;
+//  4. Chmod on the open fd, since O_CREATE applies the mode only on creation and a
+//     pre-existing looser-mode file would otherwise keep it. Ahead of the write so a
+//     regenerated credential-bearing file never lands loose, and after the handle check so a
+//     substituted object is refused rather than re-moded.
+//
+// One function rather than the two hand-mirrored copies it replaces (this one and doctor's
+// --output): each step exists for a race the next one cannot cover, so a copy that loses a
+// step loses it silently. The file is closed on every failure past the open, so a caller owns
+// the handle only on success.
+func openGuardedOutput(path string) (*os.File, error) {
+	if err := refuseNonRegularOutput(path); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: path is an operator-supplied output destination, and 0600 is the intended restrictive mode
+	if err != nil {
+		return nil, err
+	}
+	if rerr := config.RefuseNonRegularHandle(f, "output file", path); rerr != nil {
+		_ = f.Close()
+		return nil, rerr
+	}
+	if cerr := f.Chmod(0o600); cerr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("tightening mode of %q to 0600: %w", path, cerr)
+	}
+	return f, nil
+}
+
 // writeGeneratedFile writes content to path at mode 0600, refusing to clobber a
 // pre-existing file unless force is set. Closes two gaps in a plain os.WriteFile:
-// O_CREATE applies the mode only on creation (force re-tightens to 0600), and O_TRUNC
-// silently clobbers (without force, O_EXCL refuses instead).
+// O_CREATE applies the mode only on creation (force re-tightens to 0600, through
+// openGuardedOutput), and O_TRUNC silently clobbers (without force, O_EXCL refuses instead).
 func writeGeneratedFile(path, content string, force bool) (err error) {
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	var f *os.File
 	if force {
-		if err := refuseNonRegularOutput(path); err != nil {
-			return err
-		}
-		// config.OpenNoFollow closes the Lstat->open race the guard above cannot; O_EXCL
-		// already refuses a symlink for free, which is why only the force path needs it.
-		// OpenNonBlock is the FIFO half of that race: a symlink is refused by O_NOFOLLOW,
-		// but a FIFO swapped in after the Lstat is opened directly and a write-only open of
-		// a reader-less FIFO blocks inside open(2) forever, so no post-open check would run.
-		flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC | config.OpenNoFollow | config.OpenNonBlock
-	}
-	f, err := os.OpenFile(path, flags, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
-	if err != nil {
-		if !force && errors.Is(err, os.ErrExist) {
+		// The truncating open is the one that needs the guard chain: O_EXCL refuses a
+		// symlink for free and creates the file itself, so the non-force arm below has no
+		// pre-existing object to be substituted for.
+		f, err = openGuardedOutput(path)
+	} else {
+		f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: path is an operator-provided --output/--config-output location, and 0600 is the intended restrictive mode
+		if errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("%q already exists; refusing to overwrite it — pass --force to overwrite, or choose a different path", path)
 		}
+	}
+	if err != nil {
 		return err
 	}
 	// Surface the close (which flushes), or a delayed write error (e.g. NFS) would be
@@ -2023,20 +2059,6 @@ func writeGeneratedFile(path, content string, force bool) (err error) {
 			err = fmt.Errorf("closing %q: %w", path, cerr)
 		}
 	}()
-	if force {
-		// Asked through the HANDLE, so it describes what is about to be written rather than
-		// what the name resolved to before the open — the one question with no window after
-		// it. Ahead of the re-tighten, which would otherwise re-mode a substituted object.
-		if rerr := config.RefuseNonRegularHandle(f, "output file", path); rerr != nil {
-			return rerr
-		}
-		// Re-tighten BEFORE writing so a regenerated credential-bearing config never lands
-		// at a loose mode; on the open fd rather than os.Chmod(path), which would re-resolve
-		// and could follow a symlink.
-		if cerr := f.Chmod(0o600); cerr != nil {
-			return fmt.Errorf("tightening mode of %q to 0600: %w", path, cerr)
-		}
-	}
 	if _, werr := f.WriteString(content); werr != nil {
 		return fmt.Errorf("writing %q: %w", path, werr)
 	}
