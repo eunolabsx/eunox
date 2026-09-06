@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -1275,6 +1276,14 @@ func (s *Sink) enqueue(rec auditRecord) string {
 // returned as-is (immutable). marshalAndBoundDetails is the map-level entry point
 // driving this per-value recursion. []string slices are cloned unconditionally so
 // the bounded copy never aliases a caller slice.
+//
+// The arms below name the shapes a detail value USUALLY has; anything else goes to
+// boundUnmodelledValue, which decides by KIND rather than falling through to the
+// caller's own storage. That is what makes "fresh storage at every level" a property
+// of the function rather than of the six shapes it happens to enumerate: a
+// map[string]int64 (flushDropMarker's by_method_target), a json.RawMessage (a named
+// []byte, which `case []byte` does not match) or a struct holding a slice would
+// otherwise be queued as the caller's own value.
 func cloneAndBound(v interface{}) interface{} {
 	switch t := v.(type) {
 	case string:
@@ -1340,8 +1349,62 @@ func cloneAndBound(v interface{}) interface{} {
 		out := make([]byte, len(t))
 		copy(out, t)
 		return out
-	default:
+	// The scalars a detail map carries most often, ahead of the reflect-based decision
+	// below so the common values never pay for it.
+	case bool, int, int64, float64, nil:
 		return v
+	default:
+		return boundUnmodelledValue(v)
+	}
+}
+
+// boundUnmodelledValue clones and bounds a detail value whose shape cloneAndBound does not
+// model, deciding by KIND so the answer covers every type rather than a list of them.
+//
+// A value of scalar kind is stored by value in the interface, so returning it as-is shares
+// nothing; a named string type additionally takes the per-value cap here, which the
+// `case string` arm above cannot see. Anything else can reach storage the caller still owns
+// and may mutate or reuse, so it is marshaled into an owned json.RawMessage: the queued
+// record then aliases nothing whatever the value's shape, and the bound applies to the
+// marshaled length — the size the record actually pays — exactly as the []byte arm's does.
+// The emitted JSON is unchanged, since a json.RawMessage re-marshals to the bytes it holds.
+//
+// A value json.Marshal rejects is returned unchanged so the whole-map marshal in
+// marshalAndBoundDetails still fails on it and writes the not_serializable marker. Dropping
+// or substituting the field here would leave the rest of the record looking complete.
+func boundUnmodelledValue(v interface{}) interface{} {
+	rv := reflect.ValueOf(v)
+	switch k := rv.Kind(); {
+	case k == reflect.String:
+		if s := rv.String(); len(s) > auditDetailValueCap {
+			return overCapPlaceholder(len(s))
+		}
+		return v
+	case immutableDetailKind(k):
+		return v
+	}
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	if len(encoded) > auditDetailValueCap {
+		return overCapPlaceholder(len(encoded))
+	}
+	return json.RawMessage(encoded)
+}
+
+// immutableDetailKind reports whether a value of kind k is copied by the interface that
+// holds it, so handing it to the queue shares no storage with the caller. reflect.Invalid is
+// the untyped nil, which holds nothing at all.
+func immutableDetailKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Invalid, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return true
+	default:
+		return false
 	}
 }
 
