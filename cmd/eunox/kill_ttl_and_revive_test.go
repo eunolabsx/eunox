@@ -13,6 +13,9 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -836,4 +839,77 @@ func TestCmdKill_EveryNonExpiringTargetRejectsSessionTTLFlag(t *testing.T) {
 		code = cmdKill([]string{"--redis-addr", mr.Addr(), "--killswitch-session-ttl", "1h", "sess-1"})
 	})
 	require.Equal(t, 0, code, "a session kill writes a tombstone, so the lifetime flag applies")
+}
+
+// TestKillGatedFlags_AreDeclaredListsNotInlineCopies pins that `eunox kill` gates its
+// flags off declared lists rather than literals spelled at the rejection site. kill's two
+// hand-rolled loops named their flags inline, so a Redis flag added to redisGatedFlags for
+// the proxy was silently ungated here -- the drift the single-authoritative-list comment
+// on that var exists to prevent.
+func TestKillGatedFlags_AreDeclaredListsNotInlineCopies(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range killHTTPTransportFlags {
+		require.NotContains(t, redisGatedFlags, name,
+			"%s cannot be both HTTP-transport-only and Redis-gated", name)
+	}
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "kill.go", nil, 0)
+	require.NoError(t, err)
+	calls := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "rejectGatedFlags" {
+			return true
+		}
+		calls++
+		_, inline := call.Args[1].(*ast.CompositeLit)
+		require.False(t, inline,
+			"rejectGatedFlags at %s passes an inline list; name a declared one so a flag added to it is gated here too",
+			fset.Position(call.Pos()))
+		return true
+	})
+	require.GreaterOrEqual(t, calls, 2, "both of kill's gated-flag rejections must run through the shared helper")
+}
+
+// TestCmdKill_ExplicitDefaultValuedRedisFlagIsNotARejection: --redis-tls=false configures
+// nothing, so it is not the "set without --redis-addr" mistake the gate exists to catch.
+// kill's own loop used flagWasSet for every flag and refused it while the proxy's
+// value-detection accepted the same spelling -- two commands disagreeing about what
+// setting a flag means. Both now read explicitlyActiveFlags.
+func TestCmdKill_ExplicitDefaultValuedRedisFlagIsNotARejection(t *testing.T) {
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdKill([]string{"--redis-tls=false", "--port", "1", "sess-1"})
+	})
+	require.Equal(t, 1, code, "no proxy is listening on --port 1, so the HTTP attempt still fails")
+	require.NotContains(t, stderr, "requires --redis-addr",
+		"an explicit --redis-tls=false activates nothing and must not be rejected as a Redis flag")
+
+	stderr = captureStderr(t, func() {
+		code = cmdKill([]string{"--redis-tls", "--port", "1", "sess-1"})
+	})
+	require.Equal(t, 1, code)
+	require.Contains(t, stderr, "--redis-tls requires --redis-addr",
+		"an activated Redis flag without --redis-addr must still be refused")
+}
+
+// TestCmdKill_HTTPTransportFlagsRejectedUnderRedis: the flags addressing /control/kill are
+// silently dropped once the kill is written straight to Redis, so they are refused rather
+// than ignored -- and the refusal names every one the operator passed, not just the first.
+func TestCmdKill_HTTPTransportFlagsRejectedUnderRedis(t *testing.T) {
+	mr := miniredis.RunT(t)
+	var code int
+	stderr := captureStderr(t, func() {
+		code = cmdKill([]string{"--redis-addr", mr.Addr(), "--port", "3001", "--host", "localhost", "sess-1"})
+	})
+	require.Equal(t, 1, code)
+	require.Contains(t, stderr, "--port")
+	require.Contains(t, stderr, "--host")
+	require.Contains(t, stderr, "--redis-addr")
+	require.False(t, mr.Exists("killswitch:session:sess-1"), "a rejected flag combination must not still perform the kill")
 }

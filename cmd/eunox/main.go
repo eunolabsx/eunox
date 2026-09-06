@@ -1061,6 +1061,22 @@ func explicitlyActiveFlags(fs *flag.FlagSet, names []string) []string {
 	return out
 }
 
+// rejectGatedFlags returns an error naming every flag in names the operator activated, or
+// nil when none was. detail completes the sentence the joined names open, so a caller
+// states only WHY those flags cannot take effect here and never restates what "activated"
+// means: explicitlyActiveFlags is the one detection rule, so two commands gating the same
+// flag cannot disagree about whether an explicit --flag=<its own default> counts (kill's
+// hand-rolled loop refused --redis-tls=false, which configures nothing, while the proxy
+// accepted it). The "flag(s)" prefix is the helper's rather than each caller's: it is what
+// lets one singular-verb detail read correctly for a list of any length.
+func rejectGatedFlags(fs *flag.FlagSet, names []string, detail string) error {
+	active := explicitlyActiveFlags(fs, names)
+	if len(active) == 0 {
+		return nil
+	}
+	return fmt.Errorf("flag(s) %s %s", strings.Join(active, ", "), detail)
+}
+
 // httpOnlyProxyFlags is the single authoritative list of flag names that apply only to
 // transport: http; serveStdioHost's rejection guard reads it so a future HTTP-only flag is
 // covered automatically instead of silently no-oping on a stdio host.
@@ -1179,10 +1195,8 @@ func validateRedisFlagsRequireRedisAddr(fs *flag.FlagSet, redisAddr string) erro
 	if redisAddr != "" {
 		return nil
 	}
-	if active := explicitlyActiveFlags(fs, redisGatedFlags); len(active) > 0 {
-		return fmt.Errorf("flag(s) %s require --redis-addr: they configure the Redis-backed call counter / kill switch, which is only built when --redis-addr is set — without it the proxy uses in-memory state and these are silently ignored. Set --redis-addr to enable the Redis backend, or remove these flags", strings.Join(active, ", "))
-	}
-	return nil
+	return rejectGatedFlags(fs, redisGatedFlags,
+		"require --redis-addr: they configure the Redis-backed call counter / kill switch, which is only built when --redis-addr is set — without it the proxy uses in-memory state and these are silently ignored. Set --redis-addr to enable the Redis backend, or remove these flags")
 }
 
 // jwtLeewayOption bridges the --jwt-leeway flag to pdp.JWTPDPOptions.Leeway. The
