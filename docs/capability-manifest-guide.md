@@ -1262,9 +1262,13 @@ recipient.
 denied without being recorded, so the sliding window holds exactly the allowed
 calls and clears `windowSeconds` after the oldest of them — a client that keeps
 retrying while rate-limited does not extend its own lockout (and does not grow
-the counter's backing store). Each `RATE_LIMITED` denial carries a `retryAfter`
+the counter's backing store). Each `RATE_LIMITED` denial carries a `retry_after_seconds`
 hint in its details (whole seconds until a slot frees up) so a well-behaved
-caller can back off instead of hammering the limit.
+caller can back off instead of hammering the limit, beside `limit`, `current`
+and `window_seconds`. Those two time-valued keys are spelled the way the
+cumulative `blastRadius` denial spells its own, so a client backing off reads
+one name whichever quota refused it. They were previously `retryAfter` and
+`window`; a SIEM rule or client reading the camelCase names needs updating.
 
 A `maxCalls` slot is consumed only when the call is allowed by **every** other
 condition on the same constraint. The engine evaluates the pure predicates
@@ -1293,7 +1297,7 @@ A capability may carry **several** `maxCalls` conditions to layer rate limits of
 different lengths — e.g. 30/minute *and* 500/hour — and each is counted in its
 own sliding-window bucket (keyed in part by `windowSeconds`), so the two never
 interfere; both must pass. When several `maxCalls` conditions are present the
-`retryAfter` hint on a denial is the tight per-bucket estimate (time until the
+`retry_after_seconds` hint on a denial is the tight per-bucket estimate (time until the
 denying window's oldest over-limit call ages out), the same value a single
 `maxCalls` reports — not the whole `windowSeconds`. What is **rejected at load** is two `maxCalls`
 conditions on one capability that share the same `windowSeconds`: equal-length

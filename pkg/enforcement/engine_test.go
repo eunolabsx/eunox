@@ -736,11 +736,11 @@ func TestEngine_MaxCalls_DistinctWindowsCountIndependently(t *testing.T) {
 	assert.Equal(t, capability.ErrCodeRateLimited, resp.Denial.Code)
 	assert.Equal(t, capability.ConditionTypeMaxCalls, resp.Denial.ConditionType)
 	// The denial must report the short window's real count (10), not an inflated
-	// 20 — the audit count and retryAfter hint depend on it being accurate.
+	// 20 — the audit count and retry_after_seconds hint depend on it being accurate.
 	if assert.NotNil(t, resp.Denial.Details) {
 		assert.Equal(t, 10, resp.Denial.Details["limit"])
 		assert.Equal(t, int64(10), resp.Denial.Details["current"])
-		assert.Equal(t, 60, resp.Denial.Details["window"])
+		assert.Equal(t, 60, resp.Denial.Details["window_seconds"])
 	}
 }
 
@@ -794,7 +794,7 @@ func TestEngine_MaxCalls_LongWindowNotPrunedByShortWindow(t *testing.T) {
 	// The denial comes from the long window, reporting its own limit and length.
 	if assert.NotNil(t, resp.Denial.Details) {
 		assert.Equal(t, 5, resp.Denial.Details["limit"])
-		assert.Equal(t, 3600, resp.Denial.Details["window"])
+		assert.Equal(t, 3600, resp.Denial.Details["window_seconds"])
 	}
 }
 
@@ -3345,14 +3345,14 @@ func TestEngine_MaxCalls_DeniedCallsDoNotExtendLockout(t *testing.T) {
 		require.Equal(t, capability.DecisionAllow, resp.Decision)
 	}
 
-	// The next call is denied with a RATE_LIMITED code and a retryAfter hint.
+	// The next call is denied with a RATE_LIMITED code and a retry_after_seconds hint.
 	resp := engine.ValidateAction(ctx, &req, caps)
 	require.Equal(t, capability.DecisionDeny, resp.Decision)
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeRateLimited, resp.Denial.Code)
 	require.NotNil(t, resp.Denial.Details)
-	retryAfter, ok := resp.Denial.Details["retryAfter"].(int64)
-	require.True(t, ok, "denial must carry an integer-seconds retryAfter hint")
+	retryAfter, ok := resp.Denial.Details["retry_after_seconds"].(int64)
+	require.True(t, ok, "denial must carry an integer-seconds retry_after_seconds hint")
 	assert.Equal(t, int64(60), retryAfter, "oldest call expires one full window out")
 
 	// Keep retrying through the window; every call is denied and records nothing.
@@ -5745,11 +5745,11 @@ func TestEngine_MaxCalls_CheckOnlyDenialReportsTightRetryAfter(t *testing.T) {
 	require.NotNil(t, resp.Denial)
 	assert.Equal(t, capability.ErrCodeRateLimited, resp.Denial.Code)
 	require.NotNil(t, resp.Denial.Details)
-	retryAfter, ok := resp.Denial.Details["retryAfter"].(int64)
-	require.True(t, ok, "denial must carry an integer-seconds retryAfter hint")
+	retryAfter, ok := resp.Denial.Details["retry_after_seconds"].(int64)
+	require.True(t, ok, "denial must carry an integer-seconds retry_after_seconds hint")
 	assert.Equal(t, int64(10), retryAfter,
 		"check-only denial must report the tight estimate (oldest entry frees at T=3600), not the full window")
-	assert.Less(t, retryAfter, int64(3600), "retryAfter must be tighter than the full window")
+	assert.Less(t, retryAfter, int64(3600), "retry_after_seconds must be tighter than the full window")
 }
 
 // The read-only retry-after peek the check-only maxCalls pass uses is part

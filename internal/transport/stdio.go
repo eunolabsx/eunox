@@ -1483,7 +1483,6 @@ func (p *StdioProxy) refusalRecorders() refusalRecorders {
 // reservation, fwdHostWrites) are untouched by this path.
 func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
 	dispatchServerRequest(ctx, &p.serverPool, msg, serverRequestDispatch{
-		rec:       p.rec(),
 		sessionID: p.sessionID,
 		// Through the seam for the reason handleUpstreamRequest's is: the saturation path answers
 		// the initiator after recording, and a bare closure over a nil concrete writer panics there
@@ -1508,7 +1507,6 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
 	// No network client on this transport: no source IP to gate sampling on, no JWT identity.
 	forwardServerRequest(ctx, msg, serverRequestParams{
-		rec:       p.rec(),
 		audit:     p.audit,
 		sessionID: p.sessionID,
 		// The raw PIN, not a resolution of it: forwardServerRequest resolves the empty carrier

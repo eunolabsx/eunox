@@ -490,6 +490,13 @@ func (h maxCallsHandler) PrepareCommit(ctx context.Context, cond capability.Cond
 	}, false, nil
 }
 
+// detailRetryAfterSeconds is the details key EVERY quota denial reports its back-off hint under —
+// the maxCalls rate limit and the cumulative blastRadius bound alike. A constant beside the helper
+// that computes the value, because the two sites spelled one concept two ways (camelCase here,
+// snake_case in the effect layer) and a client backing off had to know which condition denied it
+// before it could read the hint.
+const detailRetryAfterSeconds = "retry_after_seconds"
+
 // retryAfterSeconds converts a backend retry-after estimate to whole seconds (rounded up),
 // falling back to the full window when unavailable. Shared by the commit and check-only
 // maxCalls denial paths.
@@ -509,16 +516,21 @@ func retryAfterSeconds(d time.Duration, windowSec int) int64 {
 
 // maxCallsRateLimited builds the RATE_LIMITED ConditionError shared by the commit
 // and check-only maxCalls denial paths, keeping the Details shape identical.
+//
+// The two time-valued keys are snake_case and name their UNIT, matching the effect layer's
+// cumulative blastRadius denial (velocityExtras). Both quota denials compute them with the same
+// helper, so the camelCase spelling this used to write meant a SIEM rule or a backing-off client
+// needed two names for one concept depending on which condition denied.
 func maxCallsRateLimited(mc *capability.MaxCallsCondition, current, retryAfterSec int64) *ConditionError {
 	return &ConditionError{
 		Code:          capability.ErrCodeRateLimited,
 		ConditionType: capability.ConditionTypeMaxCalls,
 		Message:       "call limit exceeded",
 		Details: map[string]interface{}{
-			"limit":      mc.Count,
-			"current":    current,
-			"window":     mc.WindowSeconds,
-			"retryAfter": retryAfterSec,
+			"limit":                 mc.Count,
+			"current":               current,
+			"window_seconds":        mc.WindowSeconds,
+			detailRetryAfterSeconds: retryAfterSec,
 		},
 	}
 }

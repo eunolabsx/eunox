@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -57,9 +58,13 @@ func (p *HTTPProxy) requireJSONContentType(w http.ResponseWriter, r *http.Reques
 	// primitive checkOrigin already closed for its twin. A suppressed burst is still
 	// visible, as the rollup count on the next admitted record.
 	if admitted && len(vals) > 1 {
+		// Through the joining bound rather than a whole join then a cut: the admission above
+		// bounds how OFTEN this line is written, never how much the peer put in the headers it
+		// reports. See boundedJoinedDetail.
+		reported, _ := boundedJoinedDetail(vals)
 		_, _ = fmt.Fprintf(p.errOut(),
 			"[eunox] SECURITY: rejected request carrying %d Content-Type headers (%q); exactly one is required (a reverse proxy that re-adds the header will trip this)\n",
-			len(vals), boundedRefusalDetail(strings.Join(vals, ", ")))
+			len(vals), reported)
 	}
 	http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 	return false
@@ -285,20 +290,20 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	// Record every value when several were sent so the smuggled header leaves a trace.
-	recordedOrigin := origin
-	if multiple {
-		recordedOrigin = strings.Join(vals, ", ")
-	}
-	// Bound it before it reaches the tape or stderr: an unauthenticated client can put
-	// ~1 MiB (Go's default MaxHeaderBytes) in an Origin header otherwise.
-	bounded := boundedRefusalDetail(recordedOrigin)
-	details := map[string]interface{}{"origin": bounded}
-	if bounded != recordedOrigin {
+	//
+	// Bounded as it is built, not after: an unauthenticated client can put ~1 MiB (Go's default
+	// MaxHeaderBytes) across these headers, this gate runs pre-auth at the peer's send rate, and
+	// everything here is built ABOVE the admission that may suppress the record it feeds.
+	//
+	// One value for the record and the stderr lines below, so the two can never disagree about
+	// what the peer sent.
+	recordedOrigin, verbatim := boundedJoinedDetail(vals)
+	details := map[string]interface{}{"origin": recordedOrigin}
+	if !verbatim {
 		// Flag it so a reader knows the field is not the header verbatim, mirroring
 		// claimed_session_id_truncated.
 		details["origin_truncated"] = true
 	}
-	recordedOrigin = bounded
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
 	// resolution — see recordPreSessionDeny. The stderr line is gated on the SAME admission
 	// verdict as the record, for the reason given on requireJSONContentType's stderr gate above.
@@ -353,10 +358,62 @@ func sanitizeClaimedID(s string, limit int) string {
 // few hundred bytes, but no legitimate value approaches 512.
 const maxRefusalDetailLen = 512
 
+// refusalDetailScanLen is how much of an attacker-chosen string can still affect what
+// boundedRefusalDetail keeps: the bound itself plus one rune, so a rune straddling the cut is
+// whole when the sanitize pass reaches it. Everything past it is discarded by the exact cut
+// anyway, and reading it costs a full UTF-8 walk over bytes the peer chose.
+const refusalDetailScanLen = maxRefusalDetailLen + utf8.UTFMax
+
 // boundedRefusalDetail sanitizes and cuts an attacker-controlled refusal detail to
 // maxRefusalDetailLen, using the same rune-safe, valid-UTF-8 treatment as sanitizeClaimedID.
+//
+// The cheap byte cut comes FIRST because the sanitize pass is a whole-input UTF-8 walk (and a
+// fresh string the size of the input when it rewrites anything), and every caller here is a
+// pre-session refusal running at an unauthenticated peer's send rate, above the admission that may
+// suppress the record it feeds — the pre-admission waste refuseUnroutable restructures away.
+//
+// It is NOT the cut sanitizeClaimedID warns against: that one walks BACK over continuation bytes
+// after cutting and can reach zero, stamping an empty field; this one cuts at a fixed offset and
+// leaves the walk-back to the sanitized string, where a run of attacker-chosen continuation bytes
+// still becomes a replacement character. The residual is that a value opening with a long run of
+// invalid bytes keeps fewer trailing characters than the whole-input walk would have — the field is
+// a bounded prefix of what the peer sent either way, and the caller flags it as not verbatim.
 func boundedRefusalDetail(s string) string {
+	if len(s) > refusalDetailScanLen {
+		s = s[:refusalDetailScanLen]
+	}
 	return sanitizeClaimedID(s, maxRefusalDetailLen)
+}
+
+// boundedJoinedDetail is boundedRefusalDetail over the repeated header values a refusal reports
+// together, reporting whether the result is the verbatim text of the WHOLE set — a join that had to
+// stop is not verbatim either, and a caller comparing only what survived it would report a dropped
+// value as untouched.
+//
+// The join stops at the bytes the bound can keep rather than joining and then cutting, for the
+// reason the cut above it comes first: joining allocates the sum of what the peer sent, per frame,
+// for a record the admission below may discard.
+func boundedJoinedDetail(vals []string) (detail string, verbatim bool) {
+	var b strings.Builder
+	whole := true
+	for i, v := range vals {
+		if b.Len() >= refusalDetailScanLen {
+			whole = false
+			break
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if len(v) > refusalDetailScanLen {
+			b.WriteString(v[:refusalDetailScanLen])
+			whole = false
+			break
+		}
+		b.WriteString(v)
+	}
+	joined := b.String()
+	detail = boundedRefusalDetail(joined)
+	return detail, whole && detail == joined
 }
 
 func addClaimedSessionID(details map[string]interface{}, r *http.Request) map[string]interface{} {

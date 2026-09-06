@@ -287,6 +287,17 @@ func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
 // caller needs no second vocabulary for the half of a refusal that is not a record.
 func (r refusalRecorders) notices() noticeWriter { return r.limits.notices }
 
+// unmetered is this leg's tape with no category admission applied — the recorder for the records
+// that are NOT refusals (an allow, a policy verdict, the strict-audit gate's own reading), and nil
+// when the leg has no tape.
+//
+// It exists so a leg that already holds this wiring needs no SECOND copy of the sink beside it: two
+// independently filled fields naming one tape is a wiring fault nothing catches, and a params
+// struct that fills one splits that leg's records across two tapes. Deliberately not spelled
+// forCategory(someCategory): these records are not refusals, and metering a policy verdict is what
+// the exemption declaration exists to forbid.
+func (r refusalRecorders) unmetered() auditRecorder { return r.rec }
+
 // admitRefusalRecord applies limiter's verdict for category to rec: nil when this record is
 // suppressed (the refusal itself still stands — only the tape write is bounded), rec when nothing
 // was elided since the last admitted one, and a rollup-stamping wrapper when something was.

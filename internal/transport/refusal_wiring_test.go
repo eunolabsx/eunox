@@ -526,6 +526,53 @@ func TestServerRequestLegs_AnswerThroughTheNilWriterSeam(t *testing.T) {
 	require.Positive(t, structs, "no struct declaration was found in any non-test file; the field guard would pass vacuously")
 }
 
+// TestServerRequestLegs_HoldNoSinkBesideTheirUnblocker is the same rule one field over, and the
+// structural half of it: a struct carrying a serverRequestUnblocker already holds this leg's TAPE
+// (report.recs), so a recorder field beside it is a SECOND, independently-wired copy of one thing.
+//
+// Nothing was wrong while both production constructors filled the two from the same route — which is
+// exactly the shape this package refuses elsewhere: a hand-built params struct that fills one splits
+// the leg's records across two tapes, silently, with every other guard still green. One of the two
+// copies also reached through s.route without a nil check, where the wiring it duplicated is
+// route-nil tolerant.
+//
+// Structural rather than a provenance walk, for the reason the nil-writer guard above is: there is
+// now no field to fill, and this fails the build for a struct that grows one back.
+func TestServerRequestLegs_HoldNoSinkBesideTheirUnblocker(t *testing.T) {
+	t.Parallel()
+	legs := 0
+	for _, src := range packageSources(t) {
+		for _, decl := range src.file.Decls {
+			ast.Inspect(decl, func(n ast.Node) bool {
+				st, isStruct := n.(*ast.StructType)
+				if !isStruct || st.Fields == nil || !hasFieldOfType(st, "serverRequestUnblocker") {
+					return true
+				}
+				legs++
+				for _, field := range st.Fields.List {
+					if ident, isIdent := field.Type.(*ast.Ident); !isIdent || ident.Name != "auditRecorder" {
+						continue
+					}
+					t.Errorf("%s:%d: this struct carries an %s beside its serverRequestUnblocker, which already holds the leg's tape; derive it (see serverRequestParams.recorder) rather than wiring a second copy that a hand-built literal can point at a different tape",
+						src.name, src.fset.Position(field.Pos()).Line, exprText(src.fset, field.Type))
+				}
+				return true
+			})
+		}
+	}
+	require.Positive(t, legs, "no struct carrying a serverRequestUnblocker was found in any non-test file; this guard would pass vacuously")
+}
+
+// hasFieldOfType reports whether st declares a field of the named package-local type.
+func hasFieldOfType(st *ast.StructType, name string) bool {
+	for _, field := range st.Fields.List {
+		if ident, isIdent := field.Type.(*ast.Ident); isIdent && ident.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // isMsgWriterFuncType reports whether e spells `func(mcp.RPCMsg) error`, the writer shape a leg must
 // take from an unblocker rather than hold itself.
 func isMsgWriterFuncType(e ast.Expr) bool {
@@ -574,7 +621,7 @@ func TestServerRequestLegs_NilWriterReportsRatherThanPanics(t *testing.T) {
 	// than nil-calls. errOut rides the unblocker, which is what writes the report.
 	sinkless := answeringSeam(nil, rec, httpServerRequestLegs, &errOut)
 	require.NotPanics(t, func() {
-		pool.dispatch(context.Background(), msg, serverRequestDispatch{rec: rec, sessionID: "s", unblocker: sinkless})
+		pool.dispatch(context.Background(), msg, serverRequestDispatch{sessionID: "s", unblocker: sinkless})
 	}, "the saturation refusal must report a missing upstream sink, not panic on a nil concrete writer")
 	assert.Contains(t, errOut.String(), "no upstream writer to answer it")
 
@@ -583,7 +630,7 @@ func TestServerRequestLegs_NilWriterReportsRatherThanPanics(t *testing.T) {
 	require.NotPanics(t, func() {
 		forwardServerRequest(revisionContext(handshakeRevision),
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: capability.MethodSamplingCreateMessage},
-			serverRequestParams{rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
+			serverRequestParams{sessionID: "s", pdp: pdp.DenyAllPDP{},
 				unblocker: answeringSeam(nil, rec, stdioServerRequestLegs, &errOut)})
 	}, "a denial that answers its initiator must report a missing upstream sink, not panic after writing its record")
 	assert.Contains(t, errOut.String(), "no upstream writer to answer it")
@@ -609,7 +656,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 		t.Parallel()
 		rec := &fwdRecorder{}
 		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
-			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
+			sessionID: "s", pdp: pdp.DenyAllPDP{},
 			unblocker: answeringSeam(broken, rec, stdioServerRequestLegs, io.Discard),
 		})
 		require.Len(t, rec.records, 2, "a destroyed answer is a second fact about the request, and the refusal's own record does not carry it")
@@ -627,7 +674,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 			})
 		}
 		pool.dispatch(context.Background(), samplingReq, serverRequestDispatch{
-			rec: rec, sessionID: "s",
+			sessionID: "s",
 			unblocker: answeringSeam(broken, rec, httpServerRequestLegs, io.Discard),
 		})
 		require.Len(t, rec.records, 2, "the saturation refusal has the same shape and the same gap")
@@ -641,7 +688,7 @@ func TestServerRequestRefusal_DestroyedAnswerReachesTheTape(t *testing.T) {
 		t.Parallel()
 		rec := &fwdRecorder{}
 		forwardServerRequest(revisionContext(handshakeRevision), samplingReq, serverRequestParams{
-			rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
+			sessionID: "s", pdp: pdp.DenyAllPDP{},
 			unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, stdioServerRequestLegs, io.Discard),
 		})
 		assert.Len(t, rec.records, 1, "a refusal the initiator received is one event, not two")
@@ -798,7 +845,7 @@ func TestServerRequestRefusal_DestroyedAnswerRecordIsMetered(t *testing.T) {
 	t.Parallel()
 	rec := &fwdRecorder{}
 	fp := serverRequestParams{
-		rec: rec, sessionID: "s", pdp: pdp.DenyAllPDP{},
+		sessionID: "s", pdp: pdp.DenyAllPDP{},
 		unblocker: answeringSeam(func(mcp.RPCMsg) error { return errors.New("write: broken pipe (test probe)") },
 			rec, stdioServerRequestLegs, io.Discard),
 	}
@@ -1013,9 +1060,9 @@ func TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota(t *testing.T) {
 		// Only reached if the gate admits; the decision below is what the gate exists to precede.
 		decided++
 		forwardServerRequest(revisionContext(handshakeRevision), msg, serverRequestParams{
-			rec: rec, sessionID: "s", pdp: pdp.AlwaysAllowPDP{},
+			sessionID: "s", pdp: pdp.AlwaysAllowPDP{},
 			forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardUndelivered },
-			unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
+			unblocker: recordingSeam(func(mcp.RPCMsg) error { return nil }, rec),
 		})
 	}
 

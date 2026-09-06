@@ -17,6 +17,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2270,6 +2271,98 @@ func TestOriginRejection_BoundsRecordedOrigin(t *testing.T) {
 		if !ok {
 			t.Errorf("record failed HMAC verification: %s", line)
 		}
+	}
+}
+
+// TestBoundedJoinedDetail_BoundsWhatItReadsAndReportsWhatItDropped covers the join half of the
+// same bound. checkOrigin builds its detail ABOVE the admission that may suppress the record, so a
+// suppressed refusal used to pay a whole-input UTF-8 walk plus a join of every header the peer
+// sent — the pre-admission waste refuseUnroutable restructures away, driven here at the peer's
+// send rate with no credential.
+//
+// The verbatim flag is the half a cheaper bound gets wrong: joining under a cap and then comparing
+// the result against what survived the cap reports a DROPPED header as untouched.
+func TestBoundedJoinedDetail_BoundsWhatItReadsAndReportsWhatItDropped(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		vals         []string
+		wantDetail   string
+		wantVerbatim bool
+	}{
+		{
+			name:         "single short value is verbatim",
+			vals:         []string{"https://evil.example.com"},
+			wantDetail:   "https://evil.example.com",
+			wantVerbatim: true,
+		},
+		{
+			name:         "several short values join whole",
+			vals:         []string{"http://localhost", "https://evil.example.com"},
+			wantDetail:   "http://localhost, https://evil.example.com",
+			wantVerbatim: true,
+		},
+		{
+			name:         "one oversized value is cut and flagged",
+			vals:         []string{strings.Repeat("a", 64*1024)},
+			wantDetail:   strings.Repeat("a", maxRefusalDetailLen),
+			wantVerbatim: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, verbatim := boundedJoinedDetail(tc.vals)
+			if got != tc.wantDetail {
+				t.Errorf("detail = %q, want %q", got, tc.wantDetail)
+			}
+			if verbatim != tc.wantVerbatim {
+				t.Errorf("verbatim = %v, want %v", verbatim, tc.wantVerbatim)
+			}
+		})
+	}
+
+	// The header set a bounded join must not report as verbatim: every value fits on its own, the
+	// join does not, and the values past the cut never reach the detail at all.
+	many := make([]string, 200)
+	for i := range many {
+		many[i] = "https://evil" + strconv.Itoa(i) + ".example.com"
+	}
+	got, verbatim := boundedJoinedDetail(many)
+	if verbatim {
+		t.Error("a join that stopped short of the header set must not be reported as the verbatim text")
+	}
+	if len(got) > maxRefusalDetailLen {
+		t.Errorf("detail is %d bytes, want at most %d", len(got), maxRefusalDetailLen)
+	}
+	if !strings.HasPrefix(got, "https://evil0.example.com, https://evil1.example.com") {
+		t.Errorf("detail = %q, want the leading values of the rejected set", got)
+	}
+}
+
+// TestOriginRefusalDetail_AllocatesUnderTheBoundNotTheHeader is the cost property itself, which no
+// assertion on the recorded VALUE can catch: both the bounded and the unbounded build produce the
+// same 512-byte field, and only the bytes touched getting there tell them apart.
+//
+// Measured rather than asserted structurally because the walk is inside strings.ToValidUTF8: an
+// edit that drops the cheap cut re-reads and re-allocates the whole ~1 MiB header per refused
+// frame, which shows up here as bytes-per-op in the megabytes.
+func TestOriginRefusalDetail_AllocatesUnderTheBoundNotTheHeader(t *testing.T) {
+	// Not parallel: allocation accounting is process-wide.
+	huge := []string{"https://evil.example.com/" + strings.Repeat("A", 1<<20)}
+	res := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = boundedJoinedDetail(huge)
+		}
+	})
+	// Two orders of magnitude under the input, and far above what the bounded build needs, so
+	// this fails on the regression rather than on allocator noise.
+	const maxBytesPerOp = 16 << 10
+	if got := res.AllocedBytesPerOp(); got > maxBytesPerOp {
+		t.Errorf("building the refusal detail for a %d-byte header allocated %d bytes/op, want at most %d: the bound is being applied after the scan, not before it",
+			len(huge[0]), got, maxBytesPerOp)
 	}
 }
 
@@ -4682,9 +4775,14 @@ func TestHTTPSessionClose_RemoteMode(t *testing.T) {
 // ── HTTPProxy.Serve ───────────────────────────────────────────────────────
 
 func TestHTTPProxy_Serve_CancelContext(t *testing.T) {
+	// A named port rather than 0: this test cancels a listener it must first know is UP, and the
+	// OS-chosen port left it with no address to ask. The fixed sleep that stood in for the
+	// question asserted a timing guess on a suite that otherwise polls with deadlines — slow
+	// under -race, it cancelled before the bind and passed on the wrong path.
+	port := freeTCPPort(t)
 	proxy := &HTTPProxy{
 		bind:       "127.0.0.1",
-		port:       0, // OS chooses a free port
+		port:       port,
 		shutdownMs: 50,
 		sessions:   make(map[string]*httpSession),
 	}
@@ -4693,8 +4791,7 @@ func TestHTTPProxy_Serve_CancelContext(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- proxy.Serve(ctx) }()
 
-	// Wait briefly for the server to start.
-	time.Sleep(30 * time.Millisecond)
+	waitForServer(t, fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
 	cancel()
 
 	select {

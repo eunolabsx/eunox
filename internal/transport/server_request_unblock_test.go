@@ -67,17 +67,20 @@ func answeringSeamWith(write func(mcp.RPCMsg) error, rec auditRecorder, legs ser
 	}
 }
 
-// writingSeam is answeringSeam for a test that only cares that the answer is WRITTEN — no drop
-// record is expected, so nothing resolves one (recordServerRequestDropped skips a nil recorder).
-func writingSeam(write func(mcp.RPCMsg) error) serverRequestUnblocker {
-	return answeringSeam(write, nil, serverRequestLegs{}, io.Discard)
+// recordingSeam is answeringSeam over the leg's TAPE and nothing else — no leg vocabulary, no
+// diagnostic destination. It is the shape most hand-assembled legs want, because the params structs
+// carry no recorder of their own: this wiring is where a server-initiated leg's sink comes from,
+// refusal and non-refusal records alike. A nil rec is the "no record is expected" case, a no-op at
+// every site.
+func recordingSeam(write func(mcp.RPCMsg) error, rec auditRecorder) serverRequestUnblocker {
+	return answeringSeam(write, rec, serverRequestLegs{}, io.Discard)
 }
 
-// unwrittenSeam is writingSeam with NO diagnostic writer named, so its lines resolve os.Stderr at
+// unwrittenSeam is recordingSeam with NO diagnostic writer named, so its lines resolve os.Stderr at
 // write time. For the one test that swaps os.Stderr for a pipe and asserts on what reaches it: a
 // channel naming io.Discard resolves before the swap and answers about the wrong pipe.
-func unwrittenSeam(write func(mcp.RPCMsg) error) serverRequestUnblocker {
-	return answeringSeam(write, nil, serverRequestLegs{}, nil)
+func unwrittenSeam(write func(mcp.RPCMsg) error, rec auditRecorder) serverRequestUnblocker {
+	return answeringSeam(write, rec, serverRequestLegs{}, nil)
 }
 
 // upstreamReplies decodes every JSON-RPC message a test's upstream sink received.

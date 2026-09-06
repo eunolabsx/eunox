@@ -232,7 +232,6 @@ func TestServerInitiatedLeg_NoRecordNamesAPolicyTarget(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			fp := serverRequestParams{
-				rec:       rec,
 				sessionID: "sess-1",
 				pdp:       pdp.AlwaysAllowPDP{},
 				forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
@@ -260,7 +259,7 @@ func TestServerInitiatedLeg_NoRecordNamesAPolicyTarget(t *testing.T) {
 		forwardServerRequest(revisionContext(handshakeRevision),
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: capability.MethodSamplingCreateMessage},
 			serverRequestParams{
-				rec: rec, sessionID: "sess-1", pdp: pdp.DenyAllPDP{},
+				sessionID: "sess-1", pdp: pdp.DenyAllPDP{},
 				unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, httpServerRequestLegs, io.Discard),
 			})
 		if len(rec.records) != 1 {
@@ -284,7 +283,7 @@ func TestServerInitiatedAllow_ReachesTheTapeWithNoTarget(t *testing.T) {
 	forwardServerRequest(revisionContext(handshakeRevision),
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall},
 		serverRequestParams{
-			rec: rec, sessionID: "sess-1", pdp: pdp.AlwaysAllowPDP{},
+			sessionID: "sess-1", pdp: pdp.AlwaysAllowPDP{},
 			forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
 			unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, httpServerRequestLegs, io.Discard),
 		})

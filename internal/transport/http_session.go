@@ -1395,7 +1395,6 @@ func (s *httpSession) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMs
 	// per-agent grouping the sampling leg's own refusals appear in, for one transport leg value.
 	ctx = s.withSessionClaims(ctx)
 	dispatchServerRequest(ctx, &s.serverPool, msg, serverRequestDispatch{
-		rec:       asRecorder(s.route.sink),
 		sessionID: s.id,
 		// Through the seam rather than a closure over the concrete writer: remote-upstream mode
 		// leaves upWriter nil, and (*mcp.MsgWriter).Write locks its mutex on a nil receiver — so

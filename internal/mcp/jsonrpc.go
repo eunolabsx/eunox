@@ -191,6 +191,14 @@ func MsgKey(id *json.RawMessage) string {
 // stringIDIsWellFormed reports whether raw — a JSON string id's quoted text — decodes
 // losslessly (valid UTF-8, properly paired surrogates), catching what json.Unmarshal
 // silently maps to U+FFFD.
+//
+// It takes raw as it arrived rather than as valid JSON: the caller happens to short-circuit on a
+// successful Unmarshal today, which is what guarantees four hex digits after every `\u`, but that
+// contract lived nowhere and a reordered condition or a second caller turns the first escape probe
+// below into an index past the buffer — a panic on the message-parsing path, where it tears down
+// the proxy. The surrogate probe already carries its own bound; this one now does too, and a
+// truncated escape fails CLOSED, which is the honest answer as well: an id ending `\u12` does not
+// decode losslessly.
 func stringIDIsWellFormed(raw []byte) bool {
 	if !utf8.Valid(raw) {
 		return false
@@ -200,6 +208,9 @@ func stringIDIsWellFormed(raw []byte) bool {
 			// Only \uXXXX warrants a further look: it's the one escape that can
 			// encode a surrogate half.
 			if i+1 < len(raw) && raw[i+1] == 'u' {
+				if i+6 > len(raw) {
+					return false // truncated \u escape: no four hex digits to read
+				}
 				hi, _ := strconv.ParseUint(string(raw[i+2:i+6]), 16, 32)
 				switch {
 				case hi >= 0xD800 && hi <= 0xDBFF:

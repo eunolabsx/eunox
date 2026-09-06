@@ -438,6 +438,41 @@ func TestMsgKey_NonconformingStringIDsDoNotCollide(t *testing.T) {
 	}
 }
 
+// TestStringIDIsWellFormed_TruncatedEscapeDoesNotPanic drives the scanner with the input its one
+// caller cannot currently hand it: a `\u` escape with fewer than four hex digits behind it.
+//
+// The caller short-circuits on a successful json.Unmarshal, and valid JSON always has the four
+// digits — so the escape probes were safe by a contract written nowhere, one reordered condition or
+// second caller away from indexing past the buffer. A panic here is not a bad key: it runs on the
+// message-parsing path, on the goroutine that reads frames, and it takes the proxy down.
+//
+// Asserted at the function rather than through MsgKey, since MsgKey is exactly the guard that keeps
+// these inputs from arriving.
+func TestStringIDIsWellFormed_TruncatedEscapeDoesNotPanic(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "truncated escape at end", raw: `"\u12`, want: false},
+		{name: "escape with nothing after it", raw: `"\u`, want: false},
+		{name: "one hex digit short", raw: `"\u123`, want: false},
+		// A high surrogate whose low half is cut short: the pair probe's own i+12 bound already
+		// covered this, and it must keep answering false rather than reading the truncated tail.
+		{name: "truncated low surrogate", raw: `"\ud800\udc`, want: false},
+		// The well-formed shapes must be unaffected by the new bound.
+		{name: "complete escape", raw: `"a"`, want: true},
+		{name: "paired surrogates", raw: `"😀"`, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stringIDIsWellFormed([]byte(tc.raw)); got != tc.want {
+				t.Errorf("stringIDIsWellFormed(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRPCMsg_UnmarshalJSON_Error verifies UnmarshalJSON surfaces the underlying
 // json error on malformed input rather than silently succeeding.
 func TestRPCMsg_UnmarshalJSON_Error(t *testing.T) {
