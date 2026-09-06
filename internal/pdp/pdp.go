@@ -1647,15 +1647,6 @@ func bareSpecificity(pattern, name string) int {
 	return enforcement.ResourceSpecificity(pattern, name)
 }
 
-// StripNamespacePrefix removes the leading "type:" prefix from a resource field,
-// returning the bare name/pattern (unchanged if no recognized prefix is present,
-// so bare wildcards like "*" pass through). Delegates to
-// enforcement.StripEnginePrefix so the proxy and engine recognize the same
-// namespace set and cannot diverge.
-func StripNamespacePrefix(s string) string {
-	return enforcement.StripEnginePrefix(s)
-}
-
 // containsAction reports whether actions contains act or the wildcard "*".
 func containsAction(actions []string, act string) bool {
 	for _, a := range actions {

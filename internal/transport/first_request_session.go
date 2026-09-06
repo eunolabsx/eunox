@@ -308,34 +308,13 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 	if ctx.Err() != nil {
 		return nil
 	}
-	if !p.tryReserveSessionSlot() {
-		p.recordSessionCapDeny(ctx, r, route)
-		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
-		return nil
-	}
-	// One owner, one release — success included. See handleSessionCreatingInitialize.
-	defer p.releaseSessionSlot()
-
-	startBudget := sessionStartTimeout
-	if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > startBudget {
-		startBudget = b
-	}
-	rearmWriteDeadlineFor(w, startBudget)
-	initCtx, cancel := context.WithTimeout(ctx, sessionStartTimeout)
-	defer cancel()
-
-	// Captured before creation: upstream-initiated sampling carries no request of its own and is
-	// evaluated against this address, and setting it after would race the reader goroutine.
-	clientIP := p.sourceIP(r)
-	var (
-		sess *httpSession
-		err  error
-	)
-	if route.transport == "http" {
-		sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen, firstRequestSeed(key, rev))
-	} else {
-		sess, err = p.newSession(initCtx, route, clientIP, startGen, firstRequestSeed(key, rev))
-	}
+	// The reservation, the start budget, and the spawn itself are establishSession's — the tail
+	// this arm shares with the session-creating initialize. The cap now comes back as
+	// errSessionLimit rather than being answered inside the tail, so it reaches the adoption
+	// branch below: a worker registered under this key while we were refused is served instead
+	// of 503'd, which costs no slot and no upstream, since it is the same subject either way.
+	seed := func() sessionSeed { return firstRequestSeed(key, rev) }
+	sess, err := p.establishSession(ctx, w, r, route, seed, startGen)
 	if err != nil {
 		// A concurrent first request on the same identity already registered one. Adopt it:
 		// both requests are the same subject by construction, so the loser has nothing of its

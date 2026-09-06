@@ -598,13 +598,9 @@ func targetLess(a, b *observedTarget) bool {
 // about the tape. `kill` is the one deliberate exception, documented in its own usage block.
 const suggestUsageExit = 2
 
-// cmdSuggest runs the `suggest` subcommand, returning the exit code (rather than calling
-// os.Exit) so tests can drive every branch.
-func cmdSuggest(args []string) int {
-	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, `Usage: eunox suggest [flags]
+// suggestUsage is the `suggest` subcommand's help text, a constant so the command body does not
+// carry a screen of prose inline.
+const suggestUsage = `Usage: eunox suggest [flags]
 
 Generate a draft capability manifest from the local audit log. Unlike 'init'
 (which scaffolds a deny-all from a live tool list), 'suggest' reads what the
@@ -627,10 +623,13 @@ Exit codes:
      code: the draft describes the tape, it does not judge it.
 
 Flags:
-`)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
+`
+
+// cmdSuggest runs the `suggest` subcommand, returning the exit code (rather than calling
+// os.Exit) so tests can drive every branch.
+func cmdSuggest(args []string) int {
+	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
+	setUsage(fs, args, suggestUsage)
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	name := fs.String("name", "suggested-manifest", "Value for the manifest name field.")

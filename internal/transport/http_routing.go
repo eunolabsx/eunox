@@ -270,6 +270,12 @@ func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.Response
 //  7. the drift check, inside establishment, which tears the session back down on a refusal;
 //  8. the response, answered directly rather than through dispatchInitialize's kill gate.
 //
+// Gates 5-7 are establishSession's, shared with the declaring peer's first request; 1-4 and the
+// response are this arm's. The declaring arm's own pre-tail gates are neither the same list nor
+// in this order — it is handed an already-resolved revision, and it requires a stable identity
+// and waits on an existing worker before the kill/audience/strict-audit trio — so this numbering
+// describes this arm alone.
+//
 // startGen is captured ahead of all of it — see the comment at its assignment.
 //
 // Returns nothing: every exit has already written its own response.
@@ -324,45 +330,10 @@ func (p *HTTPProxy) handleSessionCreatingInitialize(w http.ResponseWriter, r *ht
 		writeJSONMsg(w, denied)
 		return
 	}
-	// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held
-	// across establishment, so concurrent initializes can't all pass a registry-only
-	// check and each spawn an upstream before any registers. The defer below drops it.
-	if !p.tryReserveSessionSlot() {
-		// Recorded for the same reason as writeSessionCreateError's errSessionLimit leg:
-		// this is its cheap pre-spawn twin, and both go through the one route-stamped
-		// helper so the two ways to hit the same cap can't produce two record shapes.
-		p.recordSessionCapDeny(ctx, r, route)
-		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
-		return
-	}
-	// Released unconditionally — success included. One owner, one release: letting
-	// registerSession convert the reservation on success instead would double-free it on
-	// any failure AFTER registration (a drift refusal is one).
-	defer p.releaseSessionSlot()
-	// Establishment runs under sessionStartTimeout, independent of --upstream-timeout.
-	// Cover the larger of the two so the write deadline can't fire mid-handshake when
-	// --upstream-timeout is below sessionStartTimeout.
-	startBudget := sessionStartTimeout
-	if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > startBudget {
-		startBudget = b
-	}
-	rearmWriteDeadlineFor(w, startBudget)
-	initCtx, initCancel := context.WithTimeout(ctx, sessionStartTimeout)
-	defer initCancel()
-
-	var (
-		sess *httpSession
-		err  error
-	)
-	// Capture before session creation: upstream-initiated sampling carries no request
-	// of its own and is evaluated against this address. Setting it after creation would
-	// race the reader goroutine.
-	clientIP := p.sourceIP(r)
-	if route.transport == "http" {
-		sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen, handshakeSeed())
-	} else {
-		sess, err = p.newSession(initCtx, route, clientIP, startGen, handshakeSeed())
-	}
+	// The reservation, the start budget, and the spawn itself are establishSession's — the
+	// tail this arm shares with the declaring peer's first request. The cap refusal comes back
+	// as errSessionLimit and is answered by the same helper as its post-registration twin.
+	sess, err := p.establishSession(ctx, w, r, route, handshakeSeed, startGen)
 	if err != nil {
 		p.writeSessionCreateError(ctx, w, r, route, err)
 		return
@@ -371,7 +342,7 @@ func (p *HTTPProxy) handleSessionCreatingInitialize(w http.ResponseWriter, r *ht
 	// Re-arm before the success write too, so the entry arm's claim that the actual encode
 	// always arms a fresh window holds for this arm as well: establishment may have spent
 	// the whole start budget, leaving the window armed for it exhausted at encode time.
-	rearmWriteDeadlineFor(w, startBudget)
+	rearmWriteDeadlineFor(w, sessionStartBudget(p.upstreamTimeMs))
 	// Answered directly, not through dispatchInitialize's kill gate: the global-dimension
 	// CheckKill already ran above, and the session id minted here is brand new, so it
 	// can't yet be a per-session kill target.

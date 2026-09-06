@@ -3496,6 +3496,10 @@ func TestStripEnginePrefix(t *testing.T) {
 		{"mcp:read_file", "mcp:read_file"},   // unrecognized prefix unchanged
 		{"Tool:read_file", "Tool:read_file"}, // case mismatch unchanged
 		{"tool:", ""},                        // recognized prefix, empty name
+		// A recognized prefix, an embedded colon in the bare half, AND a glob — the target
+		// shape internal/drift feeds through this function (matchResource, resSpecificity,
+		// fm1Warnings), and the only row combining all three.
+		{"resource:file:///data/*", "file:///data/*"},
 	}
 	for _, tc := range cases {
 		if got := enforcement.StripEnginePrefix(tc.in); got != tc.want {

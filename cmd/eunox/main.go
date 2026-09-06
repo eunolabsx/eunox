@@ -114,27 +114,6 @@ func cmdVersion() {
 	fmt.Printf("eunox version %s\n", version)
 }
 
-// usageWriter returns os.Stdout when args explicitly requests help (--help, -help, or -h —
-// the same tokens the flag package itself special-cases into ErrHelp), os.Stderr otherwise,
-// so every subcommand's fs.Usage follows printUsage's own stated convention: help and bare
-// invocations are a successful query (stdout, exit 0), a parse error prints usage to stderr
-// alongside the failure. A "--" terminator ends the scan, matching parseFlagsAndPositionals'
-// own handling — nothing after it is a flag. This is a heuristic, not a full re-parse: a
-// flag value that happens to be the literal string "-h" (e.g. --audit-log -h) would be
-// misread as a help request, but none of this binary's flags take a value where that is a
-// plausible mistake to make.
-func usageWriter(args []string) io.Writer {
-	for _, a := range args {
-		if a == "--" {
-			return os.Stderr
-		}
-		if a == "--help" || a == "-help" || a == "-h" {
-			return os.Stdout
-		}
-	}
-	return os.Stderr
-}
-
 // printUsage writes the top-level usage text to w. Help and bare invocations
 // pass os.Stdout (a successful query, exit 0); callers that print usage as part
 // of an error pass os.Stderr.
@@ -360,9 +339,9 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 	return f
 }
 
-// printProxyUsage writes the `proxy` subcommand help text.
-func printProxyUsage(fs *flag.FlagSet, w io.Writer) {
-	_, _ = fmt.Fprint(w, `Usage:
+// proxyUsage is the `proxy` subcommand's help text. A constant rather than a function
+// body, mirroring auditVerifyUsage: it is a screen of prose, and setUsage renders it.
+const proxyUsage = `Usage:
   eunox proxy --config <eunox.yaml>
   eunox proxy --audit -- <command> [args...]
   eunox proxy --audit --upstream-url <url> [--upstream-auth-header "Name: Value"]
@@ -381,7 +360,7 @@ the upstream you point it at, in audit (observe) mode — every request eunox ca
 route is forwarded and its verdict recorded, and policy blocks nothing. Observe
 mode downgrades a policy VERDICT, so three refusals stand, none of which has one:
 the kill switch; a method eunox cannot dispatch under the MCP revision your host
-negotiated (UNROUTABLE_METHOD, whose record carries details.`+audit.UnroutableKey+` naming
+negotiated (UNROUTABLE_METHOD, whose record carries details.` + audit.UnroutableKey + ` naming
 which of the three ways it was unroutable); and a message whose revision cannot be established
 (UNSUPPORTED_PROTOCOL_VERSION). Point your MCP host (Claude Desktop, Cursor, …)
 at this command and inspect the audit tape with 'eunox stats' to see what an
@@ -402,10 +381,7 @@ Exit codes:
      parse" and 1 means "it parsed, and the proxy refused to start".
 
 Flags:
-`)
-	fs.SetOutput(w)
-	fs.PrintDefaults()
-}
+`
 
 // printWiretapBanners announces observe mode on stderr, and what it does NOT downgrade.
 //
@@ -469,7 +445,7 @@ func cmdProxy(args []string) (exitCode int) {
 	// ContinueOnError, like every sibling subcommand: ExitOnError would terminate the
 	// process inside Parse, reintroducing the untestable exit this function avoids.
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	fs.Usage = func() { printProxyUsage(fs, usageWriter(args)) }
+	setUsage(fs, args, proxyUsage)
 
 	f := registerProxyFlags(fs)
 

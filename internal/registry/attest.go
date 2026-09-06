@@ -144,7 +144,7 @@ func (s *Signature) Validate(contractID string) error {
 	if !validAttestStatements[s.Statement] {
 		return fmt.Errorf("contract %q: signature %q declares statement %q, not one of %s", contractID, s.KeyID, s.Statement, sortedKeys(validAttestStatements))
 	}
-	raw, err := base64.StdEncoding.DecodeString(s.Value)
+	raw, err := s.decoded()
 	if err != nil {
 		return fmt.Errorf("contract %q: signature %q is not valid base64: %w", contractID, s.KeyID, err)
 	}

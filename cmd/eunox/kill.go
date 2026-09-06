@@ -46,12 +46,10 @@ func killControlURL(host string, port int) string {
 	return fmt.Sprintf("http://%s/control/kill", net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
-// printKillUsage writes the kill subcommand's help. Split out of cmdKill because it is a screen
+// killUsage is the kill subcommand's help text. Split out of cmdKill because it is a screen
 // of prose in the middle of a control flow that reads as a sequence — parse, resolve a target,
 // pick a transport, execute — and the four kill dimensions made it long enough to bury that.
-func printKillUsage(fs *flag.FlagSet, args []string) {
-	w := usageWriter(args)
-	_, _ = fmt.Fprint(w, `Usage: eunox kill [flags] <session-id|all>
+const killUsage = `Usage: eunox kill [flags] <session-id|all>
        eunox kill [flags] --session <session-id>
        eunox kill [flags] --agent <agent-id>
        eunox kill [flags] --jti <token-id>
@@ -104,16 +102,13 @@ Exit codes:
      that treats one of them as success.
 
 Flags:
-`)
-	fs.SetOutput(w)
-	fs.PrintDefaults()
-}
+`
 
 // cmdKill runs the `kill` subcommand, returning the exit code (rather than calling
 // os.Exit) so tests can drive every branch.
 func cmdKill(args []string) int {
 	fs := flag.NewFlagSet("kill", flag.ContinueOnError)
-	fs.Usage = func() { printKillUsage(fs, args) }
+	setUsage(fs, args, killUsage)
 	port := fs.Int("port", 3000, "Port the HTTP proxy is listening on (HTTP transport).")
 	host := fs.String("host", "127.0.0.1", "Host the HTTP proxy is bound to (HTTP transport). Must be a loopback\nspelling (127.0.0.1, ::1, [::1], localhost): /control/kill accepts loopback\nsources only, so anything else is rejected before the control token is read\nrather than presented to whatever is listening there. Use --redis-addr to\nrevoke across a remote deployment.")
 	redisAddr := fs.String("redis-addr", "", "Redis address (host:port). When set, the kill is written to the shared\nRedis kill-switch state instead of an HTTP endpoint — the only way to\nrevoke a stdio proxy started with --redis-addr.")

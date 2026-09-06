@@ -1041,8 +1041,10 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
 	}
 	// Per-route audience pin, mirroring Decide/filterList: a no-op when
-	// routeAudience is unset (single-upstream, or stdio with no JWT).
-	if deny := p.CheckAudience(ctx); deny != nil {
+	// routeAudience is unset (single-upstream, or stdio with no JWT). Spelled with the
+	// claims already in hand rather than CheckAudience(ctx), which would re-fetch them
+	// from the context and carry a no-claims arm this method has already answered above.
+	if deny := p.audienceDenial(claims); deny != nil {
 		return *deny
 	}
 	// mcp.capabilities is an EXHAUSTIVE allowlist even when empty, but sampling was

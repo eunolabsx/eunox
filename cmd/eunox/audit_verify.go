@@ -209,12 +209,7 @@ Flags:
 // calling os.Exit) so tests can drive every branch.
 func cmdAuditVerify(args []string) int {
 	fs := flag.NewFlagSet("audit-verify", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, auditVerifyUsage)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
+	setUsage(fs, args, auditVerifyUsage)
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log and\naudit.keyPath are used as defaults for --audit-log and --audit-key-path.")
 	var logs, keys repeatedPath
 	fs.Var(&logs, "audit-log", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl). Repeatable:\neach occurrence names one enforcement point's tape, verified as its own\nchain with its own verdict.")

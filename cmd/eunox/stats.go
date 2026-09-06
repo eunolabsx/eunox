@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"maps"
 	"os"
@@ -28,13 +27,9 @@ import (
 // binary, or a script gating on it learns a rule with one silent exception.
 const statsUsageExit = 2
 
-// cmdStats runs the `stats` subcommand, returning the exit code (rather than calling
-// os.Exit) so tests can drive every branch.
-func cmdStats(args []string) int {
-	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, `Usage: eunox stats [flags]
+// statsUsage is the `stats` subcommand's help text, a constant so the command body does not
+// carry a screen of prose inline.
+const statsUsage = `Usage: eunox stats [flags]
 
 Print a denial count histogram from the local audit log. Denials are split
 into BLOCKED (enforce-mode — request was rejected) and OBSERVED (audit-mode
@@ -49,10 +44,13 @@ Exit codes:
      what the log already holds, so a busy histogram is not a failure.
 
 Flags:
-`)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
+`
+
+// cmdStats runs the `stats` subcommand, returning the exit code (rather than calling
+// os.Exit) so tests can drive every branch.
+func cmdStats(args []string) int {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	setUsage(fs, args, statsUsage)
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 
