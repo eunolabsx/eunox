@@ -4,7 +4,7 @@
 VERSION ?= 0.1.0
 GO ?= go
 GOFLAGS ?= -race
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.13.2
 GOVULNCHECK_VERSION ?= v1.4.0
 
 # Version stamped into `make build` binaries. Prefer git's tag/commit so a local

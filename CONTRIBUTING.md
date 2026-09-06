@@ -82,7 +82,7 @@ make coverage        # write coverage.out
 matching binary is on `PATH` — a different version already installed is ignored, not
 used, so a local run and a CI run cannot disagree.
 
-Full prerequisites (Go 1.26.6+, Docker) and the repository layout are in
+Full prerequisites (Go 1.27.0+, Docker) and the repository layout are in
 [`docs/repo-guide.md`](./docs/repo-guide.md).
 
 The end-to-end demo lives under [`demo/`](./demo/) — `make -C demo up` is the
