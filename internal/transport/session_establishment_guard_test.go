@@ -4,8 +4,9 @@
 package transport
 
 import (
-	"fmt"
 	"go/ast"
+	"maps"
+	"slices"
 	"testing"
 )
 
@@ -24,9 +25,8 @@ import (
 // reserving, or reserving twice are all spelled as one of these calls somewhere other than
 // establishSession, and none of them is visible to a test that drives requests.
 func TestSessionEstablishment_IsReachedThroughOneTail(t *testing.T) {
-	// The primitives whose ordering IS the sequence. recordSessionCapDeny is deliberately not
-	// here: writeSessionCreateError answers the post-spawn spelling of the same cap, so it has
-	// two legitimate callers by design.
+	t.Parallel()
+	// The primitives whose ordering IS the sequence.
 	const tail = "*HTTPProxy.establishSession"
 	primitives := map[string]string{
 		"tryReserveSessionSlot": "the pre-spawn reservation",
@@ -35,41 +35,43 @@ func TestSessionEstablishment_IsReachedThroughOneTail(t *testing.T) {
 		"newRemoteSession":      "the remote-upstream spawn",
 	}
 
-	var violations []string
-	seen := map[string]bool{}
+	// Recorded only for a call FROM the tail, so the vacuity check below also catches the tail
+	// silently losing one of them — a violation elsewhere must not stand in for that.
+	reachedFromTail := map[string]bool{}
 	for _, src := range packageSources(t) {
 		for _, decl := range src.file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
 				continue
 			}
-			caller := qualifiedFuncName(fn)
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				call, isCall := n.(*ast.CallExpr)
 				if !isCall {
 					return true
 				}
-				what, guarded := primitives[callName(call)]
+				name := callName(call)
+				what, guarded := primitives[name]
 				if !guarded {
 					return true
 				}
-				seen[callName(call)] = true
-				if caller != tail {
-					violations = append(violations, fmt.Sprintf(
-						"%s:%d: %s calls %s (%s) directly; it belongs to %s, the one tail both session-creating arms share",
-						src.name, src.fset.Position(call.Pos()).Line, caller, callName(call), what, tail))
+				// Resolved here rather than per declaration: the receiver render is the
+				// expensive part and all but a handful of this package's functions call none
+				// of these.
+				if caller := qualifiedFuncName(fn); caller != tail {
+					t.Errorf("%s:%d: %s calls %s (%s) directly; it belongs to %s, the one tail both session-creating arms share",
+						src.name, src.fset.Position(call.Pos()).Line, caller, name, what, tail)
+					return true
 				}
+				reachedFromTail[name] = true
 				return true
 			})
 		}
 	}
-	for _, v := range dedupeSorted(violations) {
-		t.Error(v)
-	}
-	// Fail OPEN otherwise: a rename that leaves every primitive uncalled would pass silently.
-	for name := range primitives {
-		if !seen[name] {
-			t.Errorf("%s is called nowhere in this package's non-test sources; the guard has stopped guarding it (renamed, or the tail was inlined)", name)
+	// Fail OPEN otherwise: a rename, or a tail that stopped reserving or spawning, would leave
+	// the guard passing over code it no longer guards.
+	for _, name := range slices.Sorted(maps.Keys(primitives)) {
+		if !reachedFromTail[name] {
+			t.Errorf("%s is not called by %s; the guard has stopped guarding it (renamed, or the tail no longer runs it)", name, tail)
 		}
 	}
 }

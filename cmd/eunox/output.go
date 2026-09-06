@@ -3,8 +3,10 @@
 
 // output.go holds the CLI's shared output plumbing: the stdout-vs-stderr rule every
 // subcommand's help follows, the one renderer that applies it, and the write helpers the
-// report-printing subcommands share. Neutral ground rather than one subcommand's file, since
-// every consumer of these is some OTHER subcommand.
+// report-printing subcommands share. Neutral ground rather than one subcommand's file: doctor,
+// contracts, stats and validate all print through the same pair, and every subcommand installs
+// its help through the same renderer, so hosting them in any one of those files makes that
+// file's name the answer to "where does this live".
 
 package main
 
@@ -44,15 +46,12 @@ func usageWriter(args []string) io.Writer {
 // The writer is resolved INSIDE the closure rather than at install time so it still reflects
 // the args scan when Usage fires, matching what the hand-rolled closures did.
 func setUsage(fs *flag.FlagSet, args []string, text string) {
-	fs.Usage = func() { writeUsage(fs, usageWriter(args), text) }
-}
-
-// writeUsage renders one subcommand's help to an explicit writer. setUsage is the entry point
-// for a real invocation; this one is for a caller that has already chosen the stream.
-func writeUsage(fs *flag.FlagSet, w io.Writer, text string) {
-	_, _ = fmt.Fprint(w, text)
-	fs.SetOutput(w)
-	fs.PrintDefaults()
+	fs.Usage = func() {
+		w := usageWriter(args)
+		_, _ = fmt.Fprint(w, text)
+		fs.SetOutput(w)
+		fs.PrintDefaults()
+	}
 }
 
 // wf and wln discard per-call write errors (not actionable for stdout); when the bundle goes

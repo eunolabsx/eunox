@@ -343,11 +343,9 @@ func sortedKeys[V any](m map[string]V) []string {
 // rather than 1, since init reports no findings and 1 would mean nothing here.
 const initUsageExit = 2
 
-// cmdInit runs the `init` subcommand, returning the exit code (rather than calling
-// os.Exit) so tests can drive every branch including the fail-closed error paths.
-func cmdInit(args []string) int {
-	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	setUsage(fs, args, `Usage:
+// initUsage is the `init` subcommand's help text, a constant so the command body does not
+// carry a screen of prose inline.
+const initUsage = `Usage:
   eunox init [--transport http] --upstream-url <url> [flags]
   eunox init   --transport stdio [flags] -- <command> [args...]
 
@@ -366,7 +364,13 @@ Exit codes:
   2  Usage error, or a failure reaching the upstream or writing a file.
 
 Flags:
-`)
+`
+
+// cmdInit runs the `init` subcommand, returning the exit code (rather than calling
+// os.Exit) so tests can drive every branch including the fail-closed error paths.
+func cmdInit(args []string) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	setUsage(fs, args, initUsage)
 
 	transportFlag := fs.String("transport", config.HostTransportHTTP, `Upstream transport to introspect: "http" or "stdio".`)
 	upstreamURL := fs.String("upstream-url", "", "Base URL of the MCP HTTP server (required with --transport http).")

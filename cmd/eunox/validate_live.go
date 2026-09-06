@@ -402,11 +402,9 @@ func capturedAfterTerminator(stdioCmd []string) string {
 	return fmt.Sprintf(" (note: everything after \"--\" was taken as a --live stdio upstream command, not as a manifest path: %q)", stdioCmd)
 }
 
-// cmdValidate runs the `validate` subcommand, returning the exit code (rather than
-// calling os.Exit) so tests can drive every branch including the fail-closed error paths.
-func cmdValidate(args []string) int {
-	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
-	setUsage(fs, args, `Usage:
+// validateUsage is the `validate` subcommand's help text, a constant so the command body does not
+// carry a screen of prose inline.
+const validateUsage = `Usage:
   eunox validate <manifest.yaml> [...] --live --upstream-url <url>
   eunox validate <manifest.yaml> [...] --live --transport stdio -- <cmd> [args...]
   eunox validate --config <eunox.yaml> [--live]
@@ -432,7 +430,13 @@ Exit codes:
 With --config the exit code is the maximum across all routes.
 
 Flags:
-`)
+`
+
+// cmdValidate runs the `validate` subcommand, returning the exit code (rather than
+// calling os.Exit) so tests can drive every branch including the fail-closed error paths.
+func cmdValidate(args []string) int {
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	setUsage(fs, args, validateUsage)
 
 	live := fs.Bool("live", false, "Connect to a running upstream and report drift against the live tool set.")
 	configPath := fs.String("config", "", "Path to an eunox config (YAML). Walks every route, validating each route's\nmanifest(s); with --live, each route's declared upstream is introspected.\nMutually exclusive with positional manifest files and --upstream-url.")

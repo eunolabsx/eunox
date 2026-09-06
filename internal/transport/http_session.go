@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/eunolabs/eunox/internal/audit"
+	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -482,58 +483,50 @@ func firstRequestSeed(key string, rev capability.Revision) sessionSeed {
 	return sessionSeed{id: key, hostRev: rev}
 }
 
-// sessionStartBudget is the write-deadline window one establishment may need: the larger of
-// sessionStartTimeout, which establishment actually runs under, and --upstream-timeout, which
-// it does not — cover both so the deadline can't fire mid-handshake when --upstream-timeout is
-// set below sessionStartTimeout. A pure function of a field fixed at construction, so the arm
-// that re-arms a second time before its response write cannot read a different budget than the
-// one establishment ran under.
-func (p *HTTPProxy) sessionStartBudget() time.Duration {
+// sessionStartBudget floors --upstream-timeout at sessionStartTimeout: establishment runs under
+// the latter independently of the former, so covering only the smaller one lets a deadline fire
+// mid-handshake. A free function rather than a method because buildUpstreamTransport needs the
+// same floor for its ResponseHeaderTimeout and has no proxy in hand — two spellings of one rule
+// drift apart the first time it changes, cutting the drift probe's header wait below the
+// establishment window it is meant to cover.
+func sessionStartBudget(upstreamTimeoutMs int) time.Duration {
 	budget := sessionStartTimeout
-	if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > budget {
+	if b := msToDuration(upstreamTimeoutMs); upstreamTimeoutMs > 0 && b > budget {
 		budget = b
 	}
 	return budget
 }
 
-// establishSession is the tail both session-creating arms share — handleSessionCreatingInitialize
-// and createFirstRequestSession. From the capacity reservation to the established session the two
-// ran the same security-ordered sequence, hand-mirrored and differing only in the seed: the
-// pre-spawn reservation and its one-owner release, the start budget and the write-deadline re-arm
-// covering it, the establishment context, the pre-creation clientIP capture, and the
-// remote/local transport switch. gate_order_test.go pins that order from three files away, so a
-// fix landing on one copy and not the other was the live risk.
+// establishSession is the tail both session-creating arms share — the session-creating
+// initialize and the declaring peer's first request. The two hand-mirrored this whole sequence,
+// differing only in the seed, while gate_order_test.go pins its order from another file: a fix
+// landing on one copy was invisible to every test that reads the other. Each arm keeps its own
+// gates ABOVE this tail, and disposes of the error below it, which is the one step where they
+// genuinely differ.
 //
-// The per-arm gates stay per-arm: everything ABOVE the reservation (revision negotiation, the kill
-// check, the audience pin, --require-audit=strict, and the declaring arm's identity requirement
-// and join-an-existing-worker wait) is each arm's own, as is what it does with the result.
-//
-// A nil session with a NIL error means the refusal is already written: the session cap, whose
-// answer is identical on both arms down to the record. A non-nil error is a creation failure the
-// CALLER disposes of, since that is the one step where the arms differ — the declaring arm adopts
-// a concurrent winner before it writes.
-func (p *HTTPProxy) establishSession(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, seed sessionSeed, startGen uint64) (*httpSession, error) {
+// newSeed is a thunk rather than a value so the initialize arm's UUID mint stays BELOW the
+// capacity reservation, which exists to be the cheap refusal: passing the seed by value made
+// every capped request draw crypto/rand entropy for an id it discards.
+func (p *HTTPProxy) establishSession(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, newSeed func() sessionSeed, startGen uint64) (*httpSession, error) {
 	// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held across
 	// establishment, so concurrent creations can't all pass a registry-only check and each spawn
 	// an upstream before any registers.
+	//
+	// Returned rather than answered here, so the cap has ONE answer: writeSessionCreateError's
+	// errSessionLimit leg, which both arms already route errors to, is this refusal's
+	// post-registration twin and the one route-stamped home for its record.
 	if !p.tryReserveSessionSlot() {
-		// Recorded for the same reason as writeSessionCreateError's errSessionLimit leg: this is
-		// its cheap pre-spawn twin, and both go through the one route-stamped helper so the two
-		// ways to hit the same cap can't produce two record shapes.
-		p.recordSessionCapDeny(ctx, r, route)
-		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
-		return nil, nil
+		return nil, errSessionLimit
 	}
 	// Released unconditionally — success included. One owner, one release: letting
 	// registerSession convert the reservation on success instead would double-free it on any
 	// failure AFTER registration (a drift refusal is one). It is released when ESTABLISHMENT
-	// ends rather than when the caller is done with the session, since registerSession has
-	// published it by then and the cap counts registered sessions too — holding the reservation
-	// across the caller's response write would count one session twice for as long as a slow
-	// client takes to read it.
+	// ends rather than when either caller is done, since registerSession has published the
+	// session by then and the cap counts registered sessions too — holding it across a caller's
+	// response write or adoption wait counts one session twice for that whole window.
 	defer p.releaseSessionSlot()
 
-	rearmWriteDeadlineFor(w, p.sessionStartBudget())
+	rearmWriteDeadlineFor(w, sessionStartBudget(p.upstreamTimeMs))
 	initCtx, cancel := context.WithTimeout(ctx, sessionStartTimeout)
 	defer cancel()
 
@@ -541,7 +534,8 @@ func (p *HTTPProxy) establishSession(ctx context.Context, w http.ResponseWriter,
 	// own and is evaluated against this address. Setting it after creation would race the reader
 	// goroutine.
 	clientIP := p.sourceIP(r)
-	if route.transport == "http" {
+	seed := newSeed()
+	if route.transport == config.HostTransportHTTP {
 		return p.newRemoteSession(initCtx, route, clientIP, startGen, seed)
 	}
 	return p.newSession(initCtx, route, clientIP, startGen, seed)
@@ -753,10 +747,11 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 	if p.maxSessions > 0 && len(p.sessions) >= p.maxSessions {
 		return errSessionLimit
 	}
-	// Deliberately does NOT touch p.establishing: the reservation has exactly one owner (the
-	// handler that took it), released exactly once when that handler returns. Converting it
-	// here double-freed it whenever establishment failed after registering, silently consuming
-	// a concurrent session's reservation and admitting more upstreams than the cap allows.
+	// Deliberately does NOT touch p.establishing: the reservation has exactly one owner
+	// (establishSession, which took it), released exactly once when establishment returns.
+	// Converting it here double-freed it whenever establishment failed after registering,
+	// silently consuming a concurrent session's reservation and admitting more upstreams than
+	// the cap allows.
 	now := time.Now().UnixNano()
 	sess.lastActive.Store(now)
 	// Seeds the hard idle ceiling from creation: the initialize POST counts as the first

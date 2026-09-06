@@ -309,9 +309,12 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 		return nil
 	}
 	// The reservation, the start budget, and the spawn itself are establishSession's — the tail
-	// this arm shares with the session-creating initialize. A nil session with no error is the
-	// session cap, already answered, and nil is what this function returns for that anyway.
-	sess, err := p.establishSession(ctx, w, r, route, firstRequestSeed(key, rev), startGen)
+	// this arm shares with the session-creating initialize. The cap now comes back as
+	// errSessionLimit rather than being answered inside the tail, so it reaches the adoption
+	// branch below: a worker registered under this key while we were refused is served instead
+	// of 503'd, which costs no slot and no upstream, since it is the same subject either way.
+	seed := func() sessionSeed { return firstRequestSeed(key, rev) }
+	sess, err := p.establishSession(ctx, w, r, route, seed, startGen)
 	if err != nil {
 		// A concurrent first request on the same identity already registered one. Adopt it:
 		// both requests are the same subject by construction, so the loser has nothing of its

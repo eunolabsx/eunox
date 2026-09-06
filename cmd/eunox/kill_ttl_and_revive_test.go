@@ -716,7 +716,7 @@ func TestSessionKillTTLHelp_DerivesTheDefaultFromTheConstant(t *testing.T) {
 
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	registerProxyFlags(fs)
-	proxyHelp := captureStderr(t, func() { writeUsage(fs, os.Stderr, proxyUsage) })
+	proxyHelp := captureStderr(t, func() { setUsage(fs, nil, proxyUsage); fs.Usage() })
 	require.Contains(t, proxyHelp, rendered)
 
 	// The day gloss is a claim about the constant, not decoration: it appears only when the

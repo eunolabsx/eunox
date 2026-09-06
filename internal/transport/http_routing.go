@@ -270,8 +270,11 @@ func (p *HTTPProxy) writeSessionCreateError(ctx context.Context, w http.Response
 //  7. the drift check, inside establishment, which tears the session back down on a refusal;
 //  8. the response, answered directly rather than through dispatchInitialize's kill gate.
 //
-// Gates 1-4 are this arm's own; 5-7 are establishSession's, shared verbatim with the declaring
-// peer's first request, which runs its own 1-4 above the same tail.
+// Gates 5-7 are establishSession's, shared with the declaring peer's first request; 1-4 and the
+// response are this arm's. The declaring arm's own pre-tail gates are neither the same list nor
+// in this order — it is handed an already-resolved revision, and it requires a stable identity
+// and waits on an existing worker before the kill/audience/strict-audit trio — so this numbering
+// describes this arm alone.
 //
 // startGen is captured ahead of all of it — see the comment at its assignment.
 //
@@ -328,20 +331,18 @@ func (p *HTTPProxy) handleSessionCreatingInitialize(w http.ResponseWriter, r *ht
 		return
 	}
 	// The reservation, the start budget, and the spawn itself are establishSession's — the
-	// tail this arm shares with the declaring peer's first request.
-	sess, err := p.establishSession(ctx, w, r, route, handshakeSeed(), startGen)
+	// tail this arm shares with the declaring peer's first request. The cap refusal comes back
+	// as errSessionLimit and is answered by the same helper as its post-registration twin.
+	sess, err := p.establishSession(ctx, w, r, route, handshakeSeed, startGen)
 	if err != nil {
 		p.writeSessionCreateError(ctx, w, r, route, err)
 		return
-	}
-	if sess == nil {
-		return // the session cap already answered
 	}
 	w.Header().Set(SessionHeader, sess.id)
 	// Re-arm before the success write too, so the entry arm's claim that the actual encode
 	// always arms a fresh window holds for this arm as well: establishment may have spent
 	// the whole start budget, leaving the window armed for it exhausted at encode time.
-	rearmWriteDeadlineFor(w, p.sessionStartBudget())
+	rearmWriteDeadlineFor(w, sessionStartBudget(p.upstreamTimeMs))
 	// Answered directly, not through dispatchInitialize's kill gate: the global-dimension
 	// CheckKill already ran above, and the session id minted here is brand new, so it
 	// can't yet be a per-session kill target.

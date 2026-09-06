@@ -169,11 +169,7 @@ func buildUpstreamTransport(tlsSkipVerify bool, upstreamTimeoutMs int) *http.Tra
 	// drift probe's header wait. Foreground calls stay bounded by their own deadline, so
 	// this is only a backstop; <= 0 leaves it unset.
 	if upstreamTimeoutMs > 0 {
-		rht := msToDuration(upstreamTimeoutMs)
-		if rht < sessionStartTimeout {
-			rht = sessionStartTimeout
-		}
-		transport.ResponseHeaderTimeout = rht
+		transport.ResponseHeaderTimeout = sessionStartBudget(upstreamTimeoutMs)
 	}
 	if tlsSkipVerify {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // G402: explicit dev flag; warning logged at startup

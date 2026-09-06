@@ -1629,7 +1629,7 @@ func TestPrintProxyUsage(t *testing.T) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	fs.String("config", "", "config path")
 
-	out := captureStderr(t, func() { writeUsage(fs, os.Stderr, proxyUsage) })
+	out := captureStderr(t, func() { setUsage(fs, nil, proxyUsage); fs.Usage() })
 	if !strings.Contains(out, "Usage:") {
 		t.Errorf("expected usage banner, got %q", out)
 	}
@@ -1650,7 +1650,7 @@ func TestPrintProxyUsage(t *testing.T) {
 // details at all.
 func TestPrintProxyUsage_WiretapClaimIsHonest(t *testing.T) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	out := captureStderr(t, func() { writeUsage(fs, os.Stderr, proxyUsage) })
+	out := captureStderr(t, func() { setUsage(fs, nil, proxyUsage); fs.Usage() })
 
 	if strings.Contains(out, "nothing is blocked") {
 		t.Errorf("the --audit help still claims nothing is blocked:\n%s", out)
@@ -1669,7 +1669,7 @@ func TestPrintProxyUsage_WiretapClaimIsHonest(t *testing.T) {
 // script had to derive it from the source.
 func TestPrintProxyUsage_DocumentsExitCodes(t *testing.T) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	out := captureStderr(t, func() { writeUsage(fs, os.Stderr, proxyUsage) })
+	out := captureStderr(t, func() { setUsage(fs, nil, proxyUsage); fs.Usage() })
 
 	if !strings.Contains(out, "Exit codes:") {
 		t.Fatalf("proxy usage must document its exit codes; got:\n%s", out)
@@ -3058,19 +3058,25 @@ func TestCmdSuggest_WriteFileError(t *testing.T) {
 // successful query, so — matching the top-level printUsage convention —
 // its usage text goes to stdout, not stderr; stderr must stay silent.
 func TestSubcommands_HelpReturnsZero(t *testing.T) {
+	// wantText is a phrase unique to THAT subcommand's help constant, and wantFlag one of its own
+	// flags. Together they pin the two halves setUsage renders: the right prose (the text is a
+	// parameter now, so passing a sibling's constant compiles) and the flag list behind it (which
+	// lands on the other stream if fs.SetOutput is ever skipped again).
 	cases := []struct {
-		name string
-		run  func([]string) int
+		name     string
+		run      func([]string) int
+		wantText string
+		wantFlag string
 	}{
-		{"proxy", cmdProxy},
-		{"validate", cmdValidate},
-		{"init", cmdInit},
-		{"suggest", cmdSuggest},
-		{"kill", cmdKill},
-		{"audit-verify", cmdAuditVerify},
-		{"stats", cmdStats},
-		{"doctor", cmdDoctor},
-		{"contracts", cmdContracts},
+		{"proxy", cmdProxy, "Start the MCP policy-enforcement proxy.", "-config"},
+		{"validate", cmdValidate, "Validate manifest file(s).", "-live"},
+		{"init", cmdInit, "eunox init", "-upstream-url"},
+		{"suggest", cmdSuggest, "eunox suggest", "-audit-log"},
+		{"kill", cmdKill, "Revoke one or all active sessions", "-session"},
+		{"audit-verify", cmdAuditVerify, "eunox audit-verify", "-audit-log"},
+		{"stats", cmdStats, "eunox stats", "-audit-log"},
+		{"doctor", cmdDoctor, "eunox doctor", "-output"},
+		{"contracts", cmdContracts, "eunox contracts", "-dir"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3084,8 +3090,10 @@ func TestSubcommands_HelpReturnsZero(t *testing.T) {
 			if code != 0 {
 				t.Errorf("%s --help: want exit code 0, got %d", tc.name, code)
 			}
-			if !strings.Contains(out, "Usage") {
-				t.Errorf("%s --help: expected usage text on stdout, got %q", tc.name, out)
+			for _, want := range []string{"Usage", tc.wantText, tc.wantFlag} {
+				if !strings.Contains(out, want) {
+					t.Errorf("%s --help: expected %q on stdout, got %q", tc.name, want, out)
+				}
 			}
 			if errOut != "" {
 				t.Errorf("%s --help: expected silent stderr, got %q", tc.name, errOut)

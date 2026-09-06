@@ -14,6 +14,10 @@ import (
 // hand-roll the four-line ritual, where omitting fs.SetOutput sent the prose to the chosen
 // stream and left PrintDefaults writing to the FlagSet's default (stderr) — one screen of help
 // split across two file descriptors, on the arm where it is read as a successful query.
+//
+// Driven through fs.Parse rather than by calling fs.Usage directly, so each row exercises the
+// path that actually reaches it: the flag package calls Usage for ErrHelp and, separately,
+// after writing its own diagnostic for an undefined flag.
 func TestSetUsage_ProseAndFlagListShareOneStream(t *testing.T) {
 	cases := []struct {
 		name string
@@ -32,38 +36,26 @@ func TestSetUsage_ProseAndFlagListShareOneStream(t *testing.T) {
 
 			var stdout string
 			stderr := captureStderr(t, func() {
-				stdout = captureStdout(t, fs.Usage)
+				stdout = captureStdout(t, func() { _ = fs.Parse(tc.args) })
 			})
 
-			got, quiet := stdout, stderr
+			got, other := stdout, stderr
 			if !tc.wantStdout {
-				got, quiet = stderr, stdout
+				got, other = stderr, stdout
 			}
 			for _, want := range []string{"PROSE-MARKER", "-marker-flag"} {
 				if !strings.Contains(got, want) {
 					t.Errorf("help is missing %q on the stream usageWriter picked:\n%s", want, got)
 				}
 			}
-			if quiet != "" {
-				t.Errorf("the other stream must stay silent, got %q", quiet)
+			// The flag package writes its own "not defined" diagnostic before calling Usage, and
+			// it goes to the FlagSet's default output — so the help itself is what must not be
+			// split, not that the other stream is empty.
+			for _, mustNotLeak := range []string{"PROSE-MARKER", "-marker-flag"} {
+				if strings.Contains(other, mustNotLeak) {
+					t.Errorf("help leaked %q onto the other stream, so one screen is split across two:\n%s", mustNotLeak, other)
+				}
 			}
 		})
-	}
-}
-
-// TestWriteUsage_HonorsAnExplicitWriter covers the entry point for a caller that has already
-// chosen its stream (the tests that render proxyUsage directly), which must not consult the
-// args scan setUsage applies.
-func TestWriteUsage_HonorsAnExplicitWriter(t *testing.T) {
-	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
-	fs.String("marker-flag", "", "a flag only PrintDefaults can render")
-
-	var out strings.Builder
-	writeUsage(fs, &out, "PROSE-MARKER\n")
-
-	for _, want := range []string{"PROSE-MARKER", "-marker-flag"} {
-		if !strings.Contains(out.String(), want) {
-			t.Errorf("writeUsage dropped %q from the explicit writer:\n%s", want, out.String())
-		}
 	}
 }
