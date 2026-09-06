@@ -342,33 +342,62 @@ func (s *Sink) swapToFreshBase(f *os.File, closeErrContext string) {
 	s.pruneRotated()
 }
 
-// openGuardedAppend opens logPath for append (creating it if absent), refusing a path
-// that exists but is NOT a regular file. os.OpenFile follows a symlink and would append
-// the tamper-evident tape straight through it; worse, a symlinked active log is silently
-// dropped from LogChainFiles' IsRegular() scan, so audit-verify would PASS without
-// reading a single live record. This mirrors the startup guard in openAndPrepareLog for
-// the two post-rotation reopen sites, where a symlink planted in the rename->reopen
-// window would otherwise be followed for the rest of the process. Lstat inspects the
-// path itself, not its target; a missing path is the ordinary post-rename case and
-// passes through to O_CREATE. On refusal the caller takes its existing reopen-failure
-// fallback (keep the renamed fd, retry later), the fail-closed direction.
+// openGuardedAppend opens logPath for append (creating it if absent) under all three of
+// the substitution guards, refusing a path that exists but is NOT a regular file.
+// os.OpenFile follows a symlink and would append the tamper-evident tape straight through
+// it; worse, a symlinked active log is silently dropped from LogChainFiles' IsRegular()
+// scan, so audit-verify would PASS without reading a single live record. This mirrors the
+// startup guard in openAndPrepareLog for the two post-rotation reopen sites, where an
+// object planted in the rename->reopen window would otherwise be opened for the rest of
+// the process. Lstat inspects the path itself, not its target; a missing path is the
+// ordinary post-rename case and passes through to O_CREATE. On refusal the caller takes
+// its existing reopen-failure fallback (keep the renamed fd, retry later), the
+// fail-closed direction.
 func openGuardedAppend(logPath string) (*os.File, error) {
 	if err := refuseNonRegular(logPath); err != nil {
 		return nil, err
 	}
-	// config.OpenNoFollow (O_NOFOLLOW on unix) closes the Lstat->open race the guard above
-	// cannot; the rename->reopen window is exactly where a planted symlink would land.
-	return os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|config.OpenNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	// Both remaining guards, neither of which O_NOFOLLOW subsumes: it closes only the
+	// SYMLINK half of the Lstat->open race, and the rename->reopen window is open to any
+	// planted object. config.OpenNonBlock makes an O_WRONLY open of a reader-less FIFO fail
+	// ENXIO rather than block INSIDE open(2) waiting for a reader — a block there wedges the
+	// drainer goroutine for the process's life: rotation never completes, the record queue
+	// fills and drops every subsequent record, and Close hangs on wg.Wait. ENXIO routes to
+	// the caller's keep-the-old-fd fallback, the fail-closed direction.
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	if err != nil {
+		return nil, err
+	}
+	// The handle check is what refuses whatever non-regular object survived the two above —
+	// a FIFO another process already holds open for reading opens fine, and the signed tape
+	// would be written into it while LogChainFiles' IsRegular() scan drops it from
+	// verification entirely: the same silent-PASS hazard as the symlink, one inode kind over.
+	if err := refuseNonRegularHandle(f, logPath); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // refuseNonRegular fails closed unless logPath is a regular file or genuinely absent. It
 // is the audit log's binding of the shared guard in internal/config, applied by the
 // startup open (openAndPrepareLog) and the two post-rotation reopen sites (via
 // openGuardedAppend) so a change to the check cannot leave one site weaker than the
-// other. See config.RefuseNonRegularPath for what the guard covers and the residual
-// Lstat->open window config.OpenNoFollow narrows here.
+// other. See config.RefuseNonRegularPath for what the guard covers; the residual Lstat->open
+// window is closed at both sites by config.OpenNoFollow (the symlink half) plus
+// config.OpenNonBlock and refuseNonRegularHandle (everything else that can be planted in it,
+// an absent path being the case this check passes by design).
 func refuseNonRegular(logPath string) error {
 	return config.RefuseNonRegularPath(logPath, "audit log path")
+}
+
+// refuseNonRegularHandle is the audit log's binding of the third guard, asked through the
+// already-open descriptor rather than the path — so it describes the object about to be
+// appended to rather than whatever the name resolved to a syscall ago, and no TOCTOU
+// window follows it. Shared by the startup open and the two post-rotation reopen sites for
+// refuseNonRegular's reason.
+func refuseNonRegularHandle(f *os.File, logPath string) error {
+	return config.RefuseNonRegularHandle(f, "audit log path", logPath)
 }
 
 // rotate is size-triggered rotation's entry point, called from writeRecord once the
@@ -810,15 +839,18 @@ func uniqueRotatedPathBounded(base string, maxSuffix int) (string, error) {
 	return "", fmt.Errorf("no free rotated name for %q after %d attempts", base, maxSuffix+1)
 }
 
-// ErrChainRotated reports that logPath's chain moved under a verification pass — a
-// rotation, or the retention prune that follows one, landed between the snapshot and the
-// re-check. The pass then covered an unknown set of files, so neither of its outcomes
-// means anything: callers report "re-run", never a verdict.
-var ErrChainRotated = errors.New("audit log rotated during verification")
+// ErrChainRotated reports that logPath's chain moved under a pass over it — a rotation, or
+// the retention prune that follows one, landed between the snapshot and the re-check. The
+// pass then covered an unknown set of files, so nothing it produced means anything:
+// callers report "re-run", never a verdict and never a report.
+var ErrChainRotated = errors.New("audit log rotated while it was being read")
 
 // ChainSnapshot pins the identity of logPath's chain at one instant — the discovered file
-// set AND the active base's directory entry — so a verification pass can prove afterwards
-// that nothing re-pointed the files under it.
+// set AND the active base's directory entry — so a pass over it can prove afterwards that
+// nothing re-pointed the files under it. Every reader of a LIVE chain needs that proof, not
+// only audit-verify: the reporting readers open the same files by name and lose the same
+// records to the same race, the difference being that their loss is silent (a draft
+// manifest or a histogram missing the newest records reads exactly like a quiet log).
 //
 // The single directory read scanLogDir documents makes the ENUMERATION atomic and nothing
 // more: VerifyLogFiles opens each path LAZILY by name, base last, so over a multi-GB
@@ -906,8 +938,11 @@ func sameChainBase(before, after os.FileInfo) bool {
 // prunes another, leaving the count identical — "3 files before and 3 now" would assert a
 // rotation while showing nothing that changed.
 func describeChainDelta(before, after []string) string {
-	gained := chainNamesMissingFrom(after, before)
-	lost := chainNamesMissingFrom(before, after)
+	// The two calls were transposed, which named every rotation backwards — the sibling a
+	// rotation had just published was reported as one the chain had LOST, i.e. as the
+	// retention prune it is the opposite of. Nothing covered the direction until now.
+	gained := chainNamesMissingFrom(before, after)
+	lost := chainNamesMissingFrom(after, before)
 	switch {
 	case len(gained) > 0 && len(lost) > 0:
 		return "the chain gained " + summarizeChainNames(gained) + " and lost " + summarizeChainNames(lost)

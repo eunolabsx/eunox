@@ -121,18 +121,48 @@ func parseAndResolveAuditLog(name string, fs *flag.FlagSet, args []string, confi
 	return logPath, 0, false
 }
 
-// openAuditChainOrExit runs openAuditChain and folds its error into the caller's own usageExit,
-// printing the (already fully-formatted) error verbatim. Shared by suggest and stats, the two
-// readers that both continue straight into a merged rotated-chain io.Reader; audit-verify does
-// not use this — it needs the discovered chain FILES themselves (audit.SnapshotLogChain), not a
-// merged reader, to verify per-file rather than stream one concatenated pass.
-func openAuditChainOrExit(name, logPath string, usageExit int) (r io.Reader, closeChain func(), exitCode int, done bool) {
-	r, closeChain, err := openAuditChain(name, logPath)
+// readAuditChainOrExit opens the merged rotated chain, hands it to consume, and BRACKETS
+// that read against a rotation landing inside it — folding every failure into the caller's
+// own usageExit and printing the (already fully-formatted) message verbatim. Shared by
+// suggest and stats, the two readers that consume one concatenated rotated-chain io.Reader;
+// audit-verify does not use this — it needs the discovered chain FILES themselves to verify
+// per-file rather than stream one pass, and brackets that pass itself.
+//
+// The read and the bracket are ONE call rather than a reader plus a check the caller
+// remembers to run: the check has to happen after the last record is consumed and before
+// anything is printed, and a caller that forgets it is back to the silent failure this
+// exists to close — the sequence would be re-hand-written per reader, which is how the two
+// commands came to share this race in the first place.
+func readAuditChainOrExit[T any](name, logPath string, usageExit int, consume func(io.Reader) (T, error)) (result T, exitCode int, done bool) {
+	r, snap, err := openAuditChain(name, logPath)
 	if err != nil {
 		fmt.Fprint(os.Stderr, err.Error())
-		return nil, nil, usageExit, true
+		return result, usageExit, true
 	}
-	return r, closeChain, 0, false
+	defer func() { _ = r.Close() }()
+
+	consumed, consumeErr := consume(r)
+	// Checked BEFORE the read error, the ordering verifyOneTape states and for its reason: a
+	// rotation produces read errors too. The chain is opened lazily by name, so a retention
+	// prune unlinks a sibling this reader has not reached yet and a rotation leaves the base
+	// absent for the length of its pre-reopen fsync — both surface as an open failure INSIDE
+	// consume, and reporting that verbatim sends the operator after a missing or misconfigured
+	// log. Reported as a failure rather than a caveat, and at the reader's usage code (2)
+	// rather than a findings code: an inconclusive read is not a finding about the tape.
+	//
+	// The wording stays cause-neutral because CheckUnchanged answers three ways — the chain
+	// moved, or the re-listing itself failed, or the base could not be stat'd — and only the
+	// first says a record was missed.
+	if err := snap.CheckUnchanged(); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox %s: %v; no report was produced — re-run "+
+			"(against a quiescent log, or a copy of the chain)\n", name, err)
+		return result, usageExit, true
+	}
+	if consumeErr != nil {
+		fmt.Fprintf(os.Stderr, "eunox %s: reading log: %v\n", name, consumeErr)
+		return result, usageExit, true
+	}
+	return consumed, 0, false
 }
 
 // auditVerifyUsageExit is audit-verify's exit code for a usage, config, key-resolution, or
