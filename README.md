@@ -683,12 +683,21 @@ session shapes MCP servers actually expose.
 | `eunox stats`                                                       | Print a denial histogram from the audit log                  |
 | `eunox contracts` | Verify a local effect-contract corpus (every declared digest recomputed from its own content) and print the `effect.ref` pin an author copies into a manifest. With `--trust-keys`, also verify each entry's signed vendor/reviewer attestations against a local trust store and report who attests to it and who disputes it. Offline — neither the registry nor any key is ever fetched. |
 | `eunox audit-verify [--audit-log <tape>]... [--task-id <id>]`      | Verify HMAC-SHA256 signatures in the audit log. `--audit-log` is repeatable — one per enforcement point's tape, each verified as its own chain with its own verdict — and `--task-id` prints the sequence they share for one task, attributed by `pep`. |
-| `eunox doctor [--config <eunox.yaml> [--live]]`                    | Print a redacted support bundle (binary identity, config, manifests, audit tail) for bug reports. Nothing is uploaded. `--live` adds a drift report per declared upstream and requires `--config`: without one there are no upstreams to introspect, so the invocation is rejected rather than producing a bundle with that section quietly skipped. |
+| `eunox doctor [--config <eunox.yaml> [--live]]`                    | Print a redacted support bundle (binary identity, config, manifests, audit tail) for bug reports. Nothing is uploaded. Sensitive field names are matched case-insensitively, since the configs this command uniquely renders are the ones the loader refused for misspelling a key. `--live` adds a drift report per declared upstream and requires `--config`: without one there are no upstreams to introspect, so the invocation is rejected rather than producing a bundle with that section quietly skipped. |
 | `eunox version`                                                     | Print the binary version and build metadata. |
 
 `eunox audit-verify` accepts `--request-id <id>` and `--since <RFC3339>` to
 scope which records it reports. The full HMAC chain is always verified regardless —
 these filters only narrow which records are counted and printed, not what is checked.
+
+Every per-record finding can occur once per *line* — a retired signing key, an empty key
+ring, a corrupt or non-JSONL file, pre-signing history, or the wrong `--audit-key-path`
+each puts a whole log into one state — so an unbounded run of any one of them would bury
+the others. Each kind is therefore printed individually up to a small cap, announced
+where the elision starts, and summarized once at the end with its true total, how many
+diagnostics were elided, and where its first and last occurrence sat. Every kind has its
+own budget, so a flood of one can never suppress another. Only the *printing* is
+bounded: the tallies, the verdict, and the exit code count every record.
 
 **Across enforcement points.** Each enforcement point signs its own chain over its own
 tape, so two of them are two chains, not one. Pass `--audit-log` once per tape and

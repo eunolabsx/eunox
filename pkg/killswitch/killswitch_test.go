@@ -130,6 +130,28 @@ func TestInMemory_SessionKillSwitch(t *testing.T) {
 	assert.False(t, blocked)
 }
 
+// TestInMemory_SessionKillNeverExpiresAtWriteTime pins what is testable about the residual
+// InMemory documents: no lifetime is applied when the kill is recorded, so the entry is not
+// written pre-expired.
+//
+// It cannot pin the absence of a future SWEEP, and does not claim to — InMemory exposes no
+// clock to advance (unlike the Redis backend), so any sweep with a realistic lifetime would
+// leave this green. That gap is the doc comment's job, not this test's.
+func TestInMemory_SessionKillNeverExpiresAtWriteTime(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	ctx := context.Background()
+
+	require.NoError(t, ks.KillSession(ctx, "sess-durable"))
+
+	st, err := ks.Status(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, st.KilledSessions, "sess-durable")
+
+	blocked, err := ks.ShouldBlock(ctx, killswitch.Subject{SessionID: "sess-durable"})
+	require.NoError(t, err)
+	assert.True(t, blocked, "an in-memory session kill must not lapse on its own")
+}
+
 func TestInMemory_Reset(t *testing.T) {
 	ks := killswitch.NewInMemory()
 	ctx := context.Background()
