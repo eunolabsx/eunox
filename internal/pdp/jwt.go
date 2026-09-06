@@ -531,6 +531,19 @@ func (e *jwtValidationError) Unwrap() error { return e.err }
 // exactly as err, so existing message-substring tests are unaffected.
 func jwtErr(code string, err error) error { return &jwtValidationError{code: code, err: err} }
 
+// maxRefusalDetailBytes bounds the IdP-controlled text a refusal message interpolates. The
+// refusal cache RETAINS these errors for its TTL, so an unbounded value is memory the token's
+// author chooses rather than a message anyone reads — the 401 carries no body and the audit
+// record carries the category alone. Sized well past any conforming issuer URL or capability
+// claim, so a legitimate value still reaches an operator debugging one intact. The same
+// argument MaxKIDBytes already makes for the other attacker-chosen string on this path.
+const maxRefusalDetailBytes = 512
+
+// boundedDetail is that bound, applied where a foreign value becomes part of a refusal
+// message, rather than at the cache: the value is interpolated by the site that knows it is
+// foreign, and a bound applied after the message is built has already paid for the copy.
+func boundedDetail(s string) string { return capability.BoundString(s, maxRefusalDetailBytes) }
+
 // ClassifyJWTError maps a ValidateToken error to a small, stable category code for
 // the JWT_INVALID audit record. It NEVER returns the raw error text, since the
 // underlying message can disclose claim values, algorithm, issuer, or key-rotation
@@ -751,6 +764,14 @@ func (p *JWTPDP) validateStandardClaims(stdClaims jwt.Claims, now time.Time) (in
 	if stdClaims.Expiry == nil {
 		return 0, capability.Terminal(jwtErr(jwtErrMissingClaims, fmt.Errorf("token has no exp claim; non-expiring tokens are rejected")))
 	}
+	// Every refusal from here down carries the exp, not just the success tail: the guard
+	// above has proved Expiry non-nil, and a caller capping a memoized refusal at the token's
+	// own lifetime needs it precisely for the refusals. Returning 0 for them left an issuer
+	// mismatch — refused AFTER ValidateWithLeeway proved the token live — memoized under the
+	// flat TTL, so its audit category outlived the token it described. An already-expired
+	// token simply fails the caller's own positive-remaining check and is not cached.
+	exp := stdClaims.Expiry.Time().Unix()
+
 	// acceptedAudiences widens validation to the UNION of every route's audience (the
 	// gateway's shared validator); the per-route wrapper narrows via routeAudience later.
 	//
@@ -759,7 +780,7 @@ func (p *JWTPDP) validateStandardClaims(stdClaims jwt.Claims, now time.Time) (in
 	// set-intersection match would admit a token whose own aud is the literal empty
 	// string instead of rejecting everything as the sentinel intends.
 	if !p.allowAnyAudience && len(p.acceptedAudiences) == 0 && p.audience == "" {
-		return 0, capability.Terminal(jwtErr(jwtErrInvalidAudience, fmt.Errorf("no audience is pinned (jwt-audience unset and jwt-allow-any-audience not set); all tokens are rejected regardless of aud")))
+		return exp, capability.Terminal(jwtErr(jwtErrInvalidAudience, fmt.Errorf("no audience is pinned (jwt-audience unset and jwt-allow-any-audience not set); all tokens are rejected regardless of aud")))
 	}
 	expected := jwt.Expected{Time: now}
 	if !p.allowAnyAudience {
@@ -770,14 +791,14 @@ func (p *JWTPDP) validateStandardClaims(stdClaims jwt.Claims, now time.Time) (in
 		}
 	}
 	if err := stdClaims.ValidateWithLeeway(expected, p.leeway); err != nil {
-		return 0, capability.Terminal(fmt.Errorf("token claims invalid: %w", err))
+		return exp, capability.Terminal(fmt.Errorf("token claims invalid: %w", err))
 	}
 	// Mirrors the audience check: enforced even when p.issuer is empty, so there is
 	// no pinned issuer to silently trust an arbitrary JWKS-sharing signer under.
 	if !p.allowAnyIssuer && (p.issuer == "" || stdClaims.Issuer != p.issuer) {
-		return 0, capability.Terminal(jwtErr(jwtErrInvalidIssuer, fmt.Errorf("token issuer %q does not match expected %q", stdClaims.Issuer, p.issuer)))
+		return exp, capability.Terminal(jwtErr(jwtErrInvalidIssuer, fmt.Errorf("token issuer %q does not match expected %q", boundedDetail(stdClaims.Issuer), p.issuer)))
 	}
-	return stdClaims.Expiry.Time().Unix(), nil
+	return exp, nil
 }
 
 // ValidateToken validates the Authorization: Bearer token in the request,
@@ -838,29 +859,35 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 	var tokenExpUnix int64
 	// signatureVerified records that some candidate key verified these bytes, which is what
 	// makes a refusal below memoizable — see memoizableRefusal. Reading it after the call is
-	// sound because a post-verification refusal is always Terminal, and VerifyWithKeyRotation
-	// surfaces a Terminal error immediately rather than replacing it with a later key's.
+	// sound because a post-verification refusal is always Terminal, and
+	// VerifyWithKeyRotationMultiKID surfaces a Terminal error immediately rather than
+	// replacing it with a later key's or a later kid's.
 	var signatureVerified bool
 	validated, err := capability.VerifyWithKeyRotationMultiKID[JWTClaims](ctx, p.cache, kids, func(key *jose.JSONWebKey, freshKeySet bool) (*JWTClaims, error) {
 		if !nowSampled || freshKeySet {
 			now = p.now()
 			nowSampled = true
 		}
-		var stdClaims jwt.Claims
-
-		// Step 1: verify the signature only, so a mismatch is reported as such and
-		// not conflated with a payload unmarshal failure. A plain (un-Terminal)
-		// error marks a retryable signature failure.
-		if err := tok.Claims(key, &stdClaims); err != nil {
+		// Step 1: verify the signature ALONE — no destination — so a mismatch is
+		// reported as such and not conflated with a payload unmarshal failure. A plain
+		// (un-Terminal) error marks a retryable signature failure. Passing &stdClaims
+		// here made go-jose unmarshal under the same call, so an IdP emitting a
+		// wrong-TYPED standard claim (a numeric `sub`, a string `exp`) produced a
+		// json error on a token whose signature had just verified: retried against
+		// every remaining key, one forced JWKS refresh, and recorded as `invalid`
+		// under a message naming a signature failure.
+		if err := tok.Claims(key); err != nil {
 			return nil, err
 		}
 		signatureVerified = true
 
 		// Step 2 (signature verified): the token bytes are key-independent, so a
 		// parse failure here is terminal — retrying other keys would report a later
-		// key's error over the real payload problem.
+		// key's error over the real payload problem. Both views come off the one
+		// verified payload.
+		var stdClaims jwt.Claims
 		var payload idpJWTPayload
-		if err := tok.UnsafeClaimsWithoutVerification(&payload); err != nil {
+		if err := tok.UnsafeClaimsWithoutVerification(&stdClaims, &payload); err != nil {
 			return nil, capability.Terminal(jwtErr(jwtErrMalformedToken, fmt.Errorf("jwt payload unmarshal: %w", err)))
 		}
 		rawClaims, mcpMembers, payloadErr := readTokenPayload(tokenStr)
@@ -868,10 +895,13 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, payloadErr
 		}
 		exp, stdErr := p.validateStandardClaims(stdClaims, now)
+		// Assigned before the error check, since a REFUSAL carrying an exp is exactly the
+		// case the cap exists for; validateStandardClaims reports 0 only where the token
+		// named no exp to cap with.
+		tokenExpUnix = exp
 		if stdErr != nil {
 			return nil, stdErr
 		}
-		tokenExpUnix = exp
 
 		// An absent mcp claim block is the most common IdP-template
 		// misconfiguration; give it an actionable message before the version check.
@@ -879,7 +909,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 			return nil, capability.Terminal(jwtErr(jwtErrMissingClaims, fmt.Errorf("jwt is missing the required mcp capability claim (expected mcp.v=%q); the token has no mcp claim block", mcpClaimVersion)))
 		}
 		if payload.MCP.Version != mcpClaimVersion {
-			return nil, capability.Terminal(jwtErr(jwtErrUnsupportedVersion, fmt.Errorf("unsupported mcp claim version %q (want %q)", payload.MCP.Version, mcpClaimVersion)))
+			return nil, capability.Terminal(jwtErr(jwtErrUnsupportedVersion, fmt.Errorf("unsupported mcp claim version %q (want %q)", boundedDetail(payload.MCP.Version), mcpClaimVersion)))
 		}
 
 		// A present `mcp.capabilities` of JSON null must be REJECTED, not treated as
@@ -911,7 +941,10 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		// silently ignoring it.
 		for _, claim := range capsList {
 			if _, _, _, err := parseV2Claim(claim); err != nil {
-				return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("JWT capability claim has invalid format: %w", err)))
+				// %s over the bounded text rather than %w: parseV2Claim interpolates the whole
+				// claim at a dozen sites, and this error is retained. Nothing unwraps it — the
+				// category travels on the jwtErr tag.
+				return nil, capability.Terminal(jwtErr(jwtErrInvalidCapabilities, fmt.Errorf("JWT capability claim has invalid format: %s", boundedDetail(err.Error()))))
 			}
 		}
 
@@ -950,11 +983,13 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 // memoizeRefusal stores a ValidateToken failure for replay, for the refusals memoizableRefusal
 // admits and no others.
 //
-// The entry is capped at the token's own exp whenever the standard-claim read got far enough
-// to produce one, so a refusal whose category WOULD become `expired` is never served past the
-// moment it does. A refusal reached before that read has no exp to cap with and falls back to
-// the flat TTL; the residual there is a category that names the payload fault rather than the
-// expiry that has since overtaken it — a stale label on a refusal, never a stale verdict.
+// The entry is capped at the token's own exp whenever the standard-claim read produced one —
+// which is every refusal reached at or after it, the issuer mismatch included, so a refusal
+// whose category WOULD become `expired` is never served past the moment it does. A refusal
+// reached BEFORE that read has no exp to cap with and falls back to the flat TTL, and needs no
+// cap: it consults no clock on the fresh path either, so its category is what a re-derivation
+// would produce for as long as the bytes are the same. What the flat TTL bounds there is the
+// KEY SET (see jwtRefusalCacheTTL), which no entry can cap against.
 func (p *JWTPDP) memoizeRefusal(cacheKey string, err error, signatureVerified bool, tokenExpUnix int64) {
 	if !memoizableRefusal(err, signatureVerified) {
 		return

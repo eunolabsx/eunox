@@ -33,7 +33,7 @@ import (
 // test, so the canonical member must be absent from the payload rather than supplied by the
 // builder. A map passed straight to Claims is merged key-for-key with no struct round trip,
 // so the payload bytes carry the spellings this file writes, verbatim.
-func signClaimsMapToken(t *testing.T, key testKey, raw map[string]interface{}) string {
+func signClaimsMapToken(t testing.TB, key testKey, raw map[string]interface{}) string {
 	t.Helper()
 	sig, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.ES256, Key: key.priv},

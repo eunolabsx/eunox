@@ -21,26 +21,39 @@ const (
 	jwtTokenCacheMaxSize = 4096
 )
 
-// Refusal-cache bounds. The TTL is the verified-token cache's, since both extend a verdict
-// past the moment it was reached and an operator reasoning about either wants ONE number —
-// but it is not what makes replaying a refusal correct: memoizableRefusal already admits only
-// verdicts no elapsed time can invert. What it bounds is how long the recorded CATEGORY may
-// lag a token that has meanwhile expired.
+// Refusal-cache bounds. Its own TTL rather than an alias of the verified-token cache's: that
+// one is pinned to the kill-switch propagation window because it extends TRUST, and tightening
+// it for revocation reasons must not silently shorten (or, below a second, silently disable)
+// a window that governs something else entirely.
 //
-// A SEPARATE, smaller instance rather than a share of the verified-token cache: entries here
-// are minted by whatever the IdP happens to be emitting, so sharing would let a stream of
-// distinct refusals evict every legitimate positive entry and turn the memoization into an
-// eviction lever against the path it exists to speed up.
+// What this one bounds is the KEY SET. Replaying the verdict is correct for any elapsed time —
+// memoizableRefusal admits nothing else — and an entry that carries the token's own exp is
+// already capped at it, so expiry is not the window either. But a key withdrawn from the JWKS
+// makes bytes that verified stop verifying, and a refusal memoized before that keeps naming
+// the payload fault where a fresh validation would now say invalid_signature. The verdict is a
+// deny throughout; what lags is the category a SIEM keys detection on, so the bound is set
+// where an operator responding to a key compromise would want it rather than at whatever the
+// memoization would save.
+//
+// The SIZE matches the verified-token cache deliberately. What stops a stream of distinct
+// refusals evicting every legitimate positive entry is that this is a separate INSTANCE, not
+// that it is smaller — and the scenario the memoization exists for (an IdP claim template
+// mis-spelling one member, so every token it mints is refused) has exactly the token
+// cardinality the positive cache is already sized for. A quarter of that size moved the
+// eviction cliff to a quarter of the fleet, and past it the cache is worse than none: every
+// request misses AND pays PayloadCache.Put's at-capacity sweep. The cliff is inherent to a
+// fixed bound; what matters is that both halves fall off it at the same population.
 const (
-	jwtRefusalCacheTTL     = jwtTokenCacheTTL
-	jwtRefusalCacheMaxSize = 1024
+	jwtRefusalCacheTTL     = 30 * time.Second
+	jwtRefusalCacheMaxSize = jwtTokenCacheMaxSize
 )
 
 // memoizableJWTRefusals declares, for EVERY ValidateToken failure category, whether a refusal
 // carrying it may be replayed from the refusal cache. A category with no row is not
 // memoizable (fail closed), and TestJWTRefusalMemoization_EveryCategoryDeclaresOne derives the
-// set from jwt.go's own constants so a category added without a row fails the build rather
-// than inheriting that default silently.
+// set from the package's own constants — every non-test file, since the constants and this
+// table already live in different ones — so a category added without a row fails the build
+// rather than inheriting that default silently.
 //
 // True means the verdict is a pure function of the token bytes and this validator's
 // construction-time configuration, so nothing that can change within the TTL can invert it.
@@ -99,35 +112,32 @@ func memoizableRefusal(err error, signatureVerified bool) bool {
 	return memoizableJWTRefusals[ClassifyJWTError(err)]
 }
 
-// newJWTTokenCache builds the verified-token cache for a JWTPDP validator, memoizing
-// verified claims by token hash so a repeat bearer token skips signature re-verification
-// and the two claim decodes ValidateToken performs on every request.
+// newJWTPayloadCache builds one of the validator's two token-hash-keyed caches.
 //
-// The clone is the IDENTITY function: JWTClaims is immutable and read-only by contract,
-// so entries are shared by pointer — a consumer that mutates returned claims would race
-// other sessions holding the same pointer within the TTL.
-func newJWTTokenCache(now func() time.Time) *capability.PayloadCache[*JWTClaims] {
-	return capability.NewPayloadCache(capability.PayloadCacheConfig[*JWTClaims]{
-		MaxEntryTTL: jwtTokenCacheTTL,
-		MaxSize:     jwtTokenCacheMaxSize,
+// The clone is the IDENTITY function for both: each payload is immutable once ValidateToken
+// has produced it, so entries are shared by pointer — a consumer that mutated one would race
+// the other sessions presenting the same token within the TTL. A ZERO payload (a nil
+// *JWTClaims, a nil error) reports the copy as failed, so it is neither stored nor served:
+// a hit that answered nothing would hand a caller a nil error beside an unpopulated context.
+func newJWTPayloadCache[T comparable](now func() time.Time, ttl time.Duration, maxSize int) *capability.PayloadCache[T] {
+	return capability.NewPayloadCache(capability.PayloadCacheConfig[T]{
+		MaxEntryTTL: ttl,
+		MaxSize:     maxSize,
 		Now:         now,
-		Clone:       func(c *JWTClaims) (*JWTClaims, bool) { return c, c != nil },
+		Clone:       func(v T) (T, bool) { var zero T; return v, v != zero },
 	})
 }
 
-// newJWTRefusalCache builds the negative half of the validator's memoization: the refusals
-// ValidateToken may replay verbatim (memoizableRefusal), keyed by the same token hash as the
-// verified-token cache but held in a SEPARATE instance so neither half can evict the other.
-//
-// The clone is the IDENTITY function for the verified-token cache's reason: the stored value
-// is the error ValidateToken already returned, immutable and shared by pointer across the
-// sessions that present the same token. A nil error reports the copy as failed, so a caller
-// that ever stored one re-validates rather than returning a nil error beside a nil context.
+// newJWTTokenCache builds the verified-token cache for a JWTPDP validator, memoizing
+// verified claims by token hash so a repeat bearer token skips signature re-verification
+// and the two claim decodes ValidateToken performs on every request.
+func newJWTTokenCache(now func() time.Time) *capability.PayloadCache[*JWTClaims] {
+	return newJWTPayloadCache[*JWTClaims](now, jwtTokenCacheTTL, jwtTokenCacheMaxSize)
+}
+
+// newJWTRefusalCache builds the negative half of that memoization: the refusals ValidateToken
+// may replay verbatim (memoizableRefusal), keyed by the same token hash but held in a SEPARATE
+// instance so neither half can evict the other.
 func newJWTRefusalCache(now func() time.Time) *capability.PayloadCache[error] {
-	return capability.NewPayloadCache(capability.PayloadCacheConfig[error]{
-		MaxEntryTTL: jwtRefusalCacheTTL,
-		MaxSize:     jwtRefusalCacheMaxSize,
-		Now:         now,
-		Clone:       func(e error) (error, bool) { return e, e != nil },
-	})
+	return newJWTPayloadCache[error](now, jwtRefusalCacheTTL, jwtRefusalCacheMaxSize)
 }

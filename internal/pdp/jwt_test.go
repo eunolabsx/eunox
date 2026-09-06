@@ -52,7 +52,7 @@ type testKey struct {
 	kid  string
 }
 
-func newTestKey(t *testing.T, kid string) testKey {
+func newTestKey(t testing.TB, kid string) testKey {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -62,7 +62,7 @@ func newTestKey(t *testing.T, kid string) testKey {
 }
 
 // makeJWKSServer returns a test JWKS HTTP server serving the public key.
-func makeJWKSServer(t *testing.T, keys ...testKey) *httptest.Server {
+func makeJWKSServer(t testing.TB, keys ...testKey) *httptest.Server {
 	t.Helper()
 	jwks := jose.JSONWebKeySet{}
 	for _, k := range keys {
@@ -5166,6 +5166,13 @@ func (c *advancingClock) Now() time.Time {
 func (c *advancingClock) set(t time.Time) {
 	c.mu.Lock()
 	c.now = t
+	c.mu.Unlock()
+}
+
+// advance moves the clock forward, for a test of what a cache entry outlives.
+func (c *advancingClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
 	c.mu.Unlock()
 }
 

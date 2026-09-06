@@ -12,17 +12,18 @@ import (
 	"github.com/eunolabs/eunox/pkg/capability"
 )
 
-// benchClaimWatch mirrors internal/pdp's watchedTopLevelClaims — the list every JWT payload is
-// scanned against on the validation path. Spelled out rather than imported because that list is
-// package-private to the consumer; what matters here is the SIZE of the fold map and the number
-// of members that hit it, both of which this reproduces.
+// benchClaimWatch is a watch list shaped like the one a JWT payload is scanned against: the
+// registered claims plus a proxy-owned block. Deliberately NOT described as a copy of any
+// consumer's list — that one is package-private and would drift from this silently — since
+// what the cost depends on is the SIZE of the fold map and the number of members that hit it,
+// not which names are in it.
 var benchClaimWatch = capability.NewClaimWatch("mcp", "sub", "iss", "aud", "jti", "exp", "nbf", "iat", "cnf")
 
 // BenchmarkClaimMembers isolates the claim-name scan: the pass a JWT payload takes on top of
-// its own decodes, twice per validation (the payload, then the `mcp` block). It is the guard
-// that makes the fold-space scan and the byte-exact decoders under it agree about which claims
-// a token carries, so it runs for every token — including the ones a negative-memoization hit
-// later spares the ECDSA verify.
+// its own decodes — once over the payload, and again over the `mcp` block when the token
+// carries one. It is the guard that makes the fold-space scan and the byte-exact decoders
+// under it agree about which claims a token carries, so it runs on every validation that
+// reaches the payload: a cache hit of either kind returns above it.
 //
 // Three shapes, splitting on what changes the work:
 //

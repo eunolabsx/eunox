@@ -5,21 +5,13 @@ package pdp
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/eunolabs/eunox/internal/mcp"
-
-	jose "github.com/go-jose/go-jose/v4"
-	josejwt "github.com/go-jose/go-jose/v4/jwt"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -71,34 +63,85 @@ func BenchmarkJWTPDP(b *testing.B) {
 	// benchValidate cycles headers minted by this arm's OWN fixture — the tokens carry that
 	// fixture's signature, so a shared header set would fail verification against another
 	// PDP's key set and measure the wrong refusal.
-	benchValidate := func(b *testing.B, mint func(benchJWTFixture) []string, cached bool) {
+	benchValidate := func(b *testing.B, arm benchValidateArm, cached bool) {
 		fx := benchJWTPDPContext(b, nil)
-		headers := mint(fx)
+		headers := arm.mint(fx)
 		if !cached {
 			fx.pdp.tokenCache, fx.pdp.refusalCache = nil, nil
 		}
 		baseCtx := context.Background()
-		// Warm the arm under test so a cached run measures hits from the first iteration
-		// rather than amortizing len(headers) cold validations across b.N.
-		for _, h := range headers {
-			_, _ = fx.pdp.ValidateToken(baseCtx, h)
+		if cached {
+			// Warm the arm so it measures hits from the first iteration rather than
+			// amortizing len(headers) cold validations across b.N — and assert the warm-up
+			// landed. Without that assertion an arm that stopped hitting its cache (a changed
+			// key derivation, a category dropped from the memoizable table, a -benchtime past
+			// the entry TTL) silently reports a full verification under a "Memoized" name,
+			// which is the mislabelling this whole split exists to correct.
+			for _, h := range headers {
+				_, err := fx.pdp.ValidateToken(baseCtx, h)
+				arm.check(b, err)
+			}
+			// At LEAST the warmed set: the fixture validates one token of its own on the way
+			// in, which lands in the positive cache too.
+			if n := arm.cache(fx).Len(); n < len(headers) {
+				b.Fatalf("%s: cache holds %d of %d warmed tokens; this arm would measure misses", arm.name, n, len(headers))
+			}
 		}
 		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_, _ = fx.pdp.ValidateToken(baseCtx, headers[i%len(headers)])
+			_, err := fx.pdp.ValidateToken(baseCtx, headers[i%len(headers)])
+			if err != nil != arm.refused {
+				b.Fatalf("%s: ValidateToken err = %v, refused = %v", arm.name, err, arm.refused)
+			}
 		}
 	}
 
-	for _, tc := range []struct {
-		name string
-		mint func(benchJWTFixture) []string
-	}{
-		{"ValidateToken", benchJWTFixture.validHeaders},
-		{"ValidateToken_Refused", benchJWTFixture.refusedHeaders},
+	for _, arm := range []benchValidateArm{
+		{
+			name:  "ValidateToken",
+			mint:  benchJWTFixture.validHeaders,
+			cache: func(fx benchJWTFixture) cacheLen { return fx.pdp.tokenCache },
+		},
+		{
+			name:    "ValidateToken_Refused",
+			mint:    benchJWTFixture.refusedHeaders,
+			cache:   func(fx benchJWTFixture) cacheLen { return fx.pdp.refusalCache },
+			refused: true,
+			want:    jwtErrNonCanonicalClaim,
+		},
 	} {
-		b.Run(tc.name+"_Memoized", func(b *testing.B) { benchValidate(b, tc.mint, true) })
-		b.Run(tc.name+"_Verified", func(b *testing.B) { benchValidate(b, tc.mint, false) })
+		b.Run(arm.name+"_Memoized", func(b *testing.B) { benchValidate(b, arm, true) })
+		b.Run(arm.name+"_Verified", func(b *testing.B) { benchValidate(b, arm, false) })
+	}
+}
+
+// cacheLen is the one thing benchValidate asks of either token cache, so the two concrete
+// PayloadCache instantiations can be named by one field.
+type cacheLen interface{ Len() int }
+
+// benchValidateArm is one side of the ValidateToken split: how its tokens are minted, which
+// cache is supposed to hold them, and what ValidateToken must answer for them.
+type benchValidateArm struct {
+	name    string
+	mint    func(benchJWTFixture) []string
+	cache   func(benchJWTFixture) cacheLen
+	refused bool
+	want    string
+}
+
+// check fails the benchmark unless err is the verdict this arm is written around — the guard
+// that keeps an arm from silently measuring the other path.
+func (a benchValidateArm) check(b *testing.B, err error) {
+	b.Helper()
+	if !a.refused {
+		if err != nil {
+			b.Fatalf("%s: ValidateToken: %v", a.name, err)
+		}
+		return
+	}
+	if got := ClassifyJWTError(err); got != a.want {
+		b.Fatalf("%s: category = %q, want %q (%v)", a.name, got, a.want, err)
 	}
 }
 
@@ -186,6 +229,8 @@ func benchToolCatalog(n int) []mcp.ToolEntry {
 // payload the validator refuses) under the same key rather than validating one token's bytes
 // forever.
 type benchJWTFixture struct {
+	// tb is held so a mint helper shared with the tests can report through the benchmark.
+	tb  testing.TB
 	pdp *JWTPDP
 	// ctx carries the claims of an already-validated token, for the Decide arms.
 	ctx context.Context
@@ -194,7 +239,7 @@ type benchJWTFixture struct {
 	sign func(claims map[string]interface{}) string
 }
 
-// validHeaders mints n distinct tokens the validator ACCEPTS. Distinct by `sub`, which is
+// validHeaders mints benchDistinctTokens tokens the validator ACCEPTS. Distinct by `sub`, which is
 // carried into the claims every arm below reads, so the tokens differ in payload bytes and
 // therefore in cache key.
 func (f benchJWTFixture) validHeaders() []string {
@@ -205,17 +250,14 @@ func (f benchJWTFixture) validHeaders() []string {
 	return out
 }
 
-// refusedHeaders mints n distinct tokens the validator REFUSES for a reason no elapsed time
+// refusedHeaders mints benchDistinctTokens tokens the validator REFUSES for a reason no elapsed time
 // can change: the `mcp` claim spelled a way no decoder on this path binds, which is refused
 // only after the signature has verified. The shape a claim template with one mis-cased entry
 // produces for every token an IdP mints.
 func (f benchJWTFixture) refusedHeaders() []string {
 	out := make([]string, benchDistinctTokens)
 	for i := range out {
-		claims := benchTokenClaims(fmt.Sprintf("bench-agent-%d", i))
-		delete(claims, "mcp")
-		claims["Mcp"] = map[string]interface{}{"v": mcpClaimVersion}
-		out[i] = f.sign(claims)
+		out[i] = f.sign(misspellMCPClaim(f.tb, benchTokenClaims(fmt.Sprintf("bench-agent-%d", i))))
 	}
 	return out
 }
@@ -240,26 +282,16 @@ func benchTokenClaims(sub string) map[string]interface{} {
 	}
 }
 
-// benchJWTPDPContext builds the fixture, warming its JWKS cache with one validated token. It
-// is a package-pdp copy of the same-named helper in internal/transport (which backs the
-// transport benchmark); the copies are independent because this one builds the claim block
-// with the package-private claim types, which the transport helper cannot reach.
+// benchJWTPDPContext builds the fixture, warming its JWKS cache with one validated token.
+//
+// It stays a package-pdp helper rather than merging with the same-named one in
+// internal/transport because the arms above reach what only this package can: mcpClaimVersion,
+// and the unexported cache fields a _Verified arm disarms.
 func benchJWTPDPContext(b *testing.B, inner PolicyDecisionPoint) benchJWTFixture {
 	b.Helper()
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		b.Fatalf("generate ECDSA key: %v", err)
-	}
-	const kid = "bench-k1"
-
-	jwksSet := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
-		{Key: priv.Public(), KeyID: kid, Use: "sig"},
-	}}
-	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(jwksSet)
-	}))
+	key := newTestKey(b, "bench-k1")
+	jwksSrv := makeJWKSServer(b, key)
 	b.Cleanup(jwksSrv.Close)
 
 	jwtPDP := NewJWTPDP(JWTPDPOptions{
@@ -270,22 +302,8 @@ func benchJWTPDPContext(b *testing.B, inner PolicyDecisionPoint) benchJWTFixture
 		CacheTTL:                 5 * time.Minute,
 		ExperimentalCapabilities: true,
 	})
-
-	sig, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.ES256, Key: priv},
-		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", kid),
-	)
-	if err != nil {
-		b.Fatalf("new signer: %v", err)
-	}
-	// A map handed straight to Claims is merged member-for-member with no struct round trip,
-	// so the payload carries the spellings benchTokenClaims writes, verbatim.
 	sign := func(claims map[string]interface{}) string {
-		token, serr := josejwt.Signed(sig).Claims(claims).Serialize()
-		if serr != nil {
-			b.Fatalf("sign bench token: %v", serr)
-		}
-		return "Bearer " + token
+		return "Bearer " + signClaimsMapToken(b, key, claims)
 	}
 
 	// Warm the JWKS cache and get a pre-populated context.
@@ -294,5 +312,5 @@ func benchJWTPDPContext(b *testing.B, inner PolicyDecisionPoint) benchJWTFixture
 		b.Fatalf("ValidateToken warmup: %v", err)
 	}
 
-	return benchJWTFixture{pdp: jwtPDP, ctx: ctx, sign: sign}
+	return benchJWTFixture{tb: b, pdp: jwtPDP, ctx: ctx, sign: sign}
 }
