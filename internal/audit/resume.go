@@ -827,15 +827,12 @@ func readLastAuditLine(path string) (string, error) {
 	// attacker-chosen bytes — or, for a planted FIFO, block forever inside open(2).
 	f, err := openDiscoveredAuditFile(path)
 	if err != nil {
-		// errors.Is, not os.IsNotExist: the latter does not unwrap, and this error reaches us
-		// through openDiscoveredAuditFile, which passes os.OpenFile's raw *fs.PathError along
-		// only by convention — its other caller (verify.go's lazy chain reader) wraps that
-		// same error with %w, which is the natural move here too. If it is ever made, the
-		// non-unwrapping test stops matching and a sibling pruned between the directory
-		// listing and this read reads as UNREADABLE rather than absent: the caller then fails
-		// closed on every startup that races retention, seeding past the on-disk maximum and
-		// stamping chain_resume_failed. keys.go's LoadOrCreateKeys and
-		// highestSeqAcrossChainCapped were converted for exactly this reason.
+		// errors.Is for this file's stated reason (see line ~552): openDiscoveredAuditFile
+		// passes ENOENT along raw only by convention, and the moment it gains a %w a sibling
+		// pruned between the directory listing and this read would read as UNREADABLE, failing
+		// the resume closed on every startup that races retention. It must stay reachable
+		// through Unwrap in the other direction too: a substitution REFUSAL that wrapped an
+		// ENOENT would read as absence here, which is the fail-open half.
 		if errors.Is(err, fs.ErrNotExist) {
 			// Absent file: the normal brand-new-install / freshly-rotated case, not an
 			// I/O error. Report empty so the caller resumes from genesis or a sibling.
@@ -862,7 +859,11 @@ func readLastAuditLine(path string) (string, error) {
 	start := tailWindowStart(size, auditScanBufferBytes)
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
-	if err != nil && err != io.EOF {
+	// errors.Is for the reason the open arm above carries: interpretAuditTail already reads
+	// this same value that way, and an == comparison that stopped matching a wrapped EOF would
+	// return the short read as a plain I/O error — skipping the call that distinguishes the
+	// file-shrink race from one.
+	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
 	return interpretAuditTail(buf, n, err, size, start)

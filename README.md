@@ -690,13 +690,14 @@ session shapes MCP servers actually expose.
 scope which records it reports. The full HMAC chain is always verified regardless —
 these filters only narrow which records are counted and printed, not what is checked.
 
-Three findings can occur once per *line* — an unsigned record, a malformed one, and a
-forged seq-0 decoy — so a pre-signing log, a corrupt or non-JSONL file, or a padded
-archive would otherwise print one diagnostic per line and bury the `CHAIN BREAK` the
-tool exists to surface. Each is printed individually up to a small cap and then
-summarized once at the end, naming its true total and how many diagnostics were
-elided. Only the *printing* is bounded: the tallies, the verdict, and the exit code
-count every record.
+Every per-record finding can occur once per *line* — a retired signing key, an empty key
+ring, a corrupt or non-JSONL file, pre-signing history, or the wrong `--audit-key-path`
+each puts a whole log into one state — so an unbounded run of any one of them would bury
+the others. Each kind is therefore printed individually up to a small cap, announced
+where the elision starts, and summarized once at the end with its true total, how many
+diagnostics were elided, and where its first and last occurrence sat. Every kind has its
+own budget, so a flood of one can never suppress another. Only the *printing* is
+bounded: the tallies, the verdict, and the exit code count every record.
 
 **Across enforcement points.** Each enforcement point signs its own chain over its own
 tape, so two of them are two chains, not one. Pass `--audit-log` once per tape and

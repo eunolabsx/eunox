@@ -2705,67 +2705,235 @@ func TestVerifyLogFiles_RefusesSymlinkedChainFile(t *testing.T) {
 	}
 }
 
-// TestVerifyLog_CapsMalformedDiagnostics pins the malformed arm to the same bound as its
-// unsigned sibling. A non-JSONL file passed as --audit-log (or a corrupt one) produces a
-// diagnostic per line, and an unbounded stream of them buries the CHAIN BREAK findings the
-// tool exists to surface. The Invalid tally must stay exact and the elided lines accounted
-// for in the closing summary.
-func TestVerifyLog_CapsMalformedDiagnostics(t *testing.T) {
-	t.Parallel()
-	const n = maxRecordDiagnostics + 25
+// signedChainFor builds a properly chained, signed log of n records and lets a case break
+// exactly one property of it. Shared by the cap table so each row states only the shape it
+// drives, rather than re-deriving how a valid chain is written.
+func signedChainFor(t *testing.T, key []byte, keyID string, n int, mut func(i int, rec *auditRecord)) []byte {
+	t.Helper()
 	var log bytes.Buffer
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&log, "this line %d is not JSON at all\n", i)
+	prev := auditGenesisPrev
+	for i := 1; i <= n; i++ {
+		rec := auditRecord{
+			Seq:       uint64(i), //nolint:gosec // G115: loop bound is a small positive test constant
+			Time:      "2026-06-15T10:00:00Z",
+			RequestID: fmt.Sprintf("r%d", i),
+			SessionID: "s",
+			Target:    "tool:exec",
+			Decision:  "allow",
+			PrevHMAC:  prev,
+			KeyID:     keyID,
+		}
+		if mut != nil {
+			mut(i, &rec)
+		}
+		line := signTestRecord(t, key, rec)
+		log.Write(line)
+		log.WriteByte('\n')
+		var signed auditRecord
+		if err := json.Unmarshal(line, &signed); err != nil {
+			t.Fatalf("unmarshal signed line: %v", err)
+		}
+		prev = signed.HMAC
 	}
-
-	var out strings.Builder
-	res, err := VerifyLog(&log, &Sink{}, VerifyOptions{Out: &out})
-	if err != nil {
-		t.Fatalf("VerifyLog: %v", err)
-	}
-	if res.Invalid != n {
-		t.Fatalf("Invalid = %d, want %d: capping the diagnostics must not change the tally", res.Invalid, n)
-	}
-	if res.OK() {
-		t.Error("a log of malformed lines must fail the verdict")
-	}
-
-	if perRecord := strings.Count(out.String(), "not valid JSON"); perRecord > maxRecordDiagnostics {
-		t.Errorf("printed %d per-record malformed diagnostics, want at most %d", perRecord, maxRecordDiagnostics)
-	}
-	if !strings.Contains(out.String(), fmt.Sprintf("%d malformed record(s) in total", n)) {
-		t.Errorf("expected a closing summary naming all %d malformed records, got:\n%s", n, out.String())
-	}
-	if !strings.Contains(out.String(), fmt.Sprintf("(%d diagnostics elided)", n-maxRecordDiagnostics)) {
-		t.Errorf("the summary must say how many diagnostics were suppressed, got:\n%s", out.String())
-	}
+	return log.Bytes()
 }
 
-// TestVerifyLog_CapsForgedDecoyDiagnostics pins the third capped arm. Padding an archive
-// with seq-0 decoys is free for anyone who can append to the log, so leaving this line
-// uncapped would keep the very flood the other two caps close: the real CHAIN BREAK scrolls
-// away under thousands of decoy lines.
-func TestVerifyLog_CapsForgedDecoyDiagnostics(t *testing.T) {
+// TestVerifyLog_CapsEveryPerRecordDiagnostic drives each capped kind to its flood shape and
+// pins the same four properties for all of them: the per-record lines are bounded, the
+// tally is untouched, the elision is announced inline, and the closing summary accounts for
+// what was elided AND where the kind's first and last occurrence sat.
+//
+// One table rather than a test per kind: three hand-copied versions had already drifted into
+// asserting different subsets, and the drift lands on whichever kind the copy forgot.
+func TestVerifyLog_CapsEveryPerRecordDiagnostic(t *testing.T) {
 	t.Parallel()
 	const n = maxRecordDiagnostics + 25
-	var log bytes.Buffer
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&log, `{"seq":0,"time":"2026-06-15T10:00:00Z","request_id":"r%d","decision":"allow","_hmac":"deadbeef"}`+"\n", i)
+	key := []byte("0123456789abcdef0123456789abcdef")
+	otherKey := []byte("ffffffffffffffffffffffffffffffff")
+
+	cases := []struct {
+		name string
+		kind diagnosticKind
+		// log and verifier are the flood this kind is reached by.
+		log      func(t *testing.T) []byte
+		verifier func(t *testing.T) *Sink
+		// perLine identifies one per-record diagnostic; tally reads the counter that must
+		// stay exact whatever the printing does.
+		perLine string
+		tally   func(VerifyResult) int
+		// seen/first override the occurrence count and first position when a shape cannot
+		// reach every record — the seq check is skipped for the first record, which has no
+		// predecessor to be contiguous with.
+		seen, first int
+	}{
+		{
+			name: "malformed",
+			kind: diagMalformed,
+			log: func(*testing.T) []byte {
+				var b bytes.Buffer
+				for i := 0; i < n; i++ {
+					fmt.Fprintf(&b, "this line %d is not JSON at all\n", i)
+				}
+				return b.Bytes()
+			},
+			perLine: "not valid JSON",
+			tally:   func(r VerifyResult) int { return r.Invalid },
+		},
+		{
+			name: "forged seq-0 decoy",
+			kind: diagDecoy,
+			log: func(*testing.T) []byte {
+				var b bytes.Buffer
+				for i := 0; i < n; i++ {
+					fmt.Fprintf(&b, `{"seq":0,"time":"2026-06-15T10:00:00Z","request_id":"r%d","decision":"allow","_hmac":"deadbeef"}`+"\n", i)
+				}
+				return b.Bytes()
+			},
+			perLine: "forged seq-0 decoy)",
+			tally:   func(r VerifyResult) int { return r.Invalid },
+		},
+		{
+			name: "unsigned",
+			kind: diagUnsigned,
+			log: func(*testing.T) []byte {
+				var b bytes.Buffer
+				for i := 0; i < n; i++ {
+					fmt.Fprintf(&b, `{"seq":%d,"time":"2026-06-15T10:00:00Z","request_id":"r%d","session_id":"s","target":"tool:exec","decision":"allow"}`+"\n", i+1, i)
+				}
+				return b.Bytes()
+			},
+			perLine: "carries no _hmac",
+			tally:   func(r VerifyResult) int { return r.Invalid },
+		},
+		{
+			// The most reachable flood of all: no attacker, no corruption, just a rotation
+			// that retired the key the historical records were signed with.
+			name:     "unknown key id",
+			kind:     diagUnknownKey,
+			log:      func(t *testing.T) []byte { return signedChainFor(t, key, "retired-key", n, nil) },
+			verifier: func(*testing.T) *Sink { return &Sink{verifyKeys: map[string][]byte{"current-key": key}} },
+			perLine:  "UNKNOWN_KEY_ID  seq=",
+			tally:    func(r VerifyResult) int { return r.UnknownKey },
+		},
+		{
+			name:     "unverifiable",
+			kind:     diagUnverifiable,
+			log:      func(t *testing.T) []byte { return signedChainFor(t, key, "", n, nil) },
+			verifier: func(*testing.T) *Sink { return &Sink{} },
+			perLine:  "UNVERIFIABLE  seq=",
+			tally:    func(r VerifyResult) int { return r.Unverifiable },
+		},
+		{
+			// Version skew or any whole-file re-serialization: every line decodes but none
+			// is in canonical on-disk form / carries a field this binary models.
+			name: "verification error",
+			kind: diagVerifyError,
+			log: func(*testing.T) []byte {
+				var b bytes.Buffer
+				for i := 0; i < n; i++ {
+					fmt.Fprintf(&b, `{"seq":%d,"time":"2026-06-15T10:00:00Z","request_id":"r%d","decision":"allow","@timestamp":"x","_hmac":"deadbeef"}`+"\n", i+1, i)
+				}
+				return b.Bytes()
+			},
+			perLine: "ERROR  seq ",
+			tally:   func(r VerifyResult) int { return r.Invalid },
+		},
+		{
+			// The wrong --audit-key-path: every record's HMAC fails under a key that IS in
+			// the ring. Also the most expensive line in the file to build.
+			name:     "hmac mismatch",
+			kind:     diagMismatch,
+			log:      func(t *testing.T) []byte { return signedChainFor(t, key, "k1", n, nil) },
+			verifier: func(*testing.T) *Sink { return &Sink{verifyKeys: map[string][]byte{"k1": otherKey}} },
+			perLine:  "INVALID  seq=",
+			tally:    func(r VerifyResult) int { return r.Invalid },
+		},
+		{
+			name: "unparseable time",
+			kind: diagMalformedTime,
+			log: func(t *testing.T) []byte {
+				return signedChainFor(t, key, "k1", n, func(_ int, rec *auditRecord) { rec.Time = "not-a-timestamp" })
+			},
+			verifier: func(*testing.T) *Sink { return &Sink{verifyKeys: map[string][]byte{"k1": key}} },
+			perLine:  "unparseable time field",
+			tally:    func(r VerifyResult) int { return r.Invalid },
+		},
+		{
+			// prev_hmac broken on every record, seqs left contiguous so this drives the
+			// chain check alone.
+			name: "chain break",
+			kind: diagChainBreak,
+			log: func(t *testing.T) []byte {
+				return signedChainFor(t, key, "k1", n, func(_ int, rec *auditRecord) { rec.PrevHMAC = "not-the-previous-hmac" })
+			},
+			verifier: func(*testing.T) *Sink { return &Sink{verifyKeys: map[string][]byte{"k1": key}} },
+			perLine:  "CHAIN BREAK at seq ",
+			tally:    func(r VerifyResult) int { return r.ChainBreaks },
+		},
+		{
+			// Chain links intact, seq stepping by two: the gap check alone.
+			name: "seq gap",
+			kind: diagSeqGap,
+			log: func(t *testing.T) []byte {
+				return signedChainFor(t, key, "k1", n, func(i int, rec *auditRecord) {
+					if i > 1 {
+						rec.Seq = uint64(i) * 2 //nolint:gosec // G115: loop bound is a small positive test constant
+					}
+				})
+			},
+			verifier: func(*testing.T) *Sink { return &Sink{verifyKeys: map[string][]byte{"k1": key}} },
+			perLine:  "SEQ GAP: record seq ",
+			tally:    func(r VerifyResult) int { return r.ChainBreaks },
+			seen:     n - 1,
+			first:    2,
+		},
 	}
 
-	var out strings.Builder
-	res, err := VerifyLog(&log, &Sink{}, VerifyOptions{Out: &out})
-	if err != nil {
-		t.Fatalf("VerifyLog: %v", err)
-	}
-	if res.Invalid != n {
-		t.Fatalf("Invalid = %d, want %d: capping the diagnostics must not change the tally", res.Invalid, n)
-	}
-	if perRecord := strings.Count(out.String(), "forged seq-0 decoy)"); perRecord > maxRecordDiagnostics {
-		t.Errorf("printed %d per-record decoy diagnostics, want at most %d", perRecord, maxRecordDiagnostics)
-	}
-	if !strings.Contains(out.String(), fmt.Sprintf("%d forged seq-0 decoy record(s) in total", n)) {
-		t.Errorf("expected a closing summary naming all %d decoys, got:\n%s", n, out.String())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			verifier := &Sink{}
+			if tc.verifier != nil {
+				verifier = tc.verifier(t)
+			}
+			wantSeen, wantFirst := n, 1
+			if tc.seen != 0 {
+				wantSeen, wantFirst = tc.seen, tc.first
+			}
+			var out strings.Builder
+			res, err := VerifyLog(bytes.NewReader(tc.log(t)), verifier, VerifyOptions{Out: &out})
+			if err != nil {
+				t.Fatalf("VerifyLog: %v", err)
+			}
+			got := out.String()
+
+			// The printing is bounded; the tally is not.
+			if printed := strings.Count(got, tc.perLine); printed > maxRecordDiagnostics {
+				t.Errorf("printed %d per-record lines, want at most %d:\n%s", printed, maxRecordDiagnostics, got)
+			}
+			if tallied := tc.tally(res); tallied < wantSeen {
+				t.Errorf("tally = %d, want at least %d: capping the printing must not change what is counted", tallied, wantSeen)
+			}
+			if res.OK() {
+				t.Error("a log in this state must fail the verdict")
+			}
+
+			d := cappedDiagnostics[tc.kind]
+			// The elision is announced where it happens and accounted for at the end, with
+			// the positions the elided per-record lines would have carried.
+			if !strings.Contains(got, "... further "+d.noun+" reported once at the end") {
+				t.Errorf("expected the inline elision notice for %q:\n%s", d.noun, got)
+			}
+			for _, want := range []string{
+				fmt.Sprintf("%d %s in total", wantSeen, d.noun),
+				fmt.Sprintf("(%d diagnostics elided; first at record %d, last at record %d)", wantSeen-maxRecordDiagnostics, wantFirst, n),
+				d.remedy,
+			} {
+				if !strings.Contains(got, want) {
+					t.Errorf("closing summary must contain %q:\n%s", want, got)
+				}
+			}
+		})
 	}
 }
 
@@ -2799,18 +2967,33 @@ func TestVerifyLog_CapsAreKeptPerKind(t *testing.T) {
 }
 
 // TestVerifyDiagnostics_EveryKindIsDeclared fails the build for a capped diagnostic added
-// without its noun and remedy: the summary is what accounts for the lines a cap elides, so a
-// half-written entry drops them silently — the exact failure the cap exists to avoid.
+// without its label, noun and remedy: the summary is what accounts for the lines a cap
+// elides, so a half-written entry drops them silently — the exact failure the cap exists to
+// avoid.
 func TestVerifyDiagnostics_EveryKindIsDeclared(t *testing.T) {
 	t.Parallel()
 	for kind := range cappedDiagnostics {
 		d := cappedDiagnostics[kind]
-		if d.noun == "" {
-			t.Errorf("cappedDiagnostics[%d]: noun must be declared", kind)
+		if d.label == "" || d.noun == "" || d.remedy == "" {
+			t.Errorf("cappedDiagnostics[%d] = %+v: label, noun and remedy must all be declared", kind, d)
 		}
-		if d.remedy == "" {
-			t.Errorf("cappedDiagnostics[%d]: remedy must be declared", kind)
-		}
+	}
+}
+
+// TestVerifyDiagnostics_UnclassifiedChargesTheFloor pins the zero value's direction: a site
+// that reaches the admission without naming its kind — or names one out of range — is
+// BOUNDED, not free, and cannot index outside the counter array.
+func TestVerifyDiagnostics_UnclassifiedChargesTheFloor(t *testing.T) {
+	t.Parallel()
+	v := &auditChainVerifier{opts: VerifyOptions{Out: io.Discard}}
+	for i := 0; i < maxRecordDiagnostics+5; i++ {
+		v.admitDiagnostic(numDiagnosticKinds + 7) // out of range: must resolve, not panic
+	}
+	if got := v.diags[diagUnclassified].seen; got != maxRecordDiagnostics+5 {
+		t.Fatalf("unclassified count = %d, want %d", got, maxRecordDiagnostics+5)
+	}
+	if v.admitDiagnostic(-1) {
+		t.Error("an unclassified diagnostic past the cap must be suppressed, not printed")
 	}
 }
 

@@ -130,12 +130,14 @@ func TestInMemory_SessionKillSwitch(t *testing.T) {
 	assert.False(t, blocked)
 }
 
-// TestInMemory_SessionKillIsDurable pins the residual InMemory documents: the session axis
-// declares `expires`, but that lifetime is the Redis backend's key TTL and this backend has
-// none — a killed session stays killed until a revive or Reset. Asserted rather than left to
-// the doc comment so a sweep added later has to change a test that says why the stop is
-// durable, instead of silently withdrawing a revocation on a lifetime nobody configured.
-func TestInMemory_SessionKillIsDurable(t *testing.T) {
+// TestInMemory_SessionKillNeverExpiresAtWriteTime pins what is testable about the residual
+// InMemory documents: no lifetime is applied when the kill is recorded, so the entry is not
+// written pre-expired.
+//
+// It cannot pin the absence of a future SWEEP, and does not claim to — InMemory exposes no
+// clock to advance (unlike the Redis backend), so any sweep with a realistic lifetime would
+// leave this green. That gap is the doc comment's job, not this test's.
+func TestInMemory_SessionKillNeverExpiresAtWriteTime(t *testing.T) {
 	ks := killswitch.NewInMemory()
 	ctx := context.Background()
 

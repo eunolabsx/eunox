@@ -11,23 +11,18 @@ import (
 
 // InMemory is an in-memory implementation of Manager for single-replica or dev use.
 //
-// # Tombstones are durable here, including the session axis
+// A kill here is DURABLE on every axis. The Redis backend expires a session tombstone against
+// a configured lifetime (WithSessionKillTTL); this backend has none and nothing sweeps its
+// sets, so an id stays killed until the matching Revive or Reset. Inventing a lifetime is
+// what a sweep would require, and an emergency stop that lapses on one nobody chose is a
+// revocation the operator never withdrew.
 //
-// The Redis backend expires a SESSION kill against a configured tombstone lifetime; this
-// backend has none. A killed id stays in its set until the matching Revive or Reset, and
-// nothing sweeps it.
-//
-// Deliberate, not an oversight. That lifetime is an option of the Redis backend
-// (WithSessionKillTTL, behind the Redis-gated --killswitch-session-ttl); there is no such
-// value here, so a sweep would have to invent one — and an emergency stop that lapses on a
-// lifetime nobody chose is a revocation the operator never withdrew. Non-expiry is the
-// fail-closed direction of the same trade.
-//
-// The residual is memory: one map entry per distinct killed id, freed only by a revive, a
-// Reset, or process exit. Growth is bounded by how many kills an operator issues, so a
-// long-lived single replica accumulates on the order of its revocations rather than its
-// traffic. A deployment that revokes at traffic rate wants the Redis backend, which is also
-// the one that can share the kill set across replicas.
+// The residual is unbounded growth, and its writer is NOT an operator typing: /control/kill
+// records any well-formed session id a control-token holder posts, live session or not, at
+// request rate. Left unbounded rather than capped because both answers to a full kill set —
+// refusing a kill, or evicting one — are worse than the growth, and picking between them
+// needs a design discussion this note does not settle. A deployment revoking at request rate
+// wants the Redis backend, whose tombstones expire and whose set is shared across replicas.
 type InMemory struct {
 	mu sync.RWMutex
 	// globalActive, killedAgents and killedSessions are nil-safe to READ (the zero value is a

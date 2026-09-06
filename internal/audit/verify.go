@@ -493,10 +493,10 @@ type auditChainVerifier struct {
 	havePrev bool
 	prevHMAC string
 	prevSeq  uint64
-	// diags counts each flood-shaped per-record diagnostic's occurrences, so each is capped
-	// against its OWN budget (see admitDiagnostic); the Invalid tally in res is unaffected by
-	// any of them and stays exact.
-	diags [numDiagnosticKinds]int
+	// diags counts each per-record diagnostic's occurrences, so each is capped against its
+	// OWN budget (see admitDiagnostic); the tallies in res are unaffected by any of them and
+	// stay exact.
+	diags [numDiagnosticKinds]diagnosticCap
 	// prevRecordInvalid is set by classify when the previous record's signature check
 	// REFUSED or FAILED it (the !ok / err cases: an HMAC mismatch under a held key, a
 	// strict-decode refusal, a non-canonical on-disk form) — i.e. nothing established
@@ -514,51 +514,121 @@ type auditChainVerifier struct {
 	prevRecordInvalid bool
 }
 
-// maxRecordDiagnostics bounds how many per-record lines a single verify pass prints for
-// ONE flood-shaped finding. Every kind in cappedDiagnostics can produce one line per input
-// line for a whole log — pre-signing history, a corrupt or non-JSONL file, an
-// attacker-padded archive — and an unbounded stream of them buries the CHAIN BREAK / INVALID
-// findings the tool exists to surface, the practical result being an operator who suppresses
-// the whole check. Sized to show enough to recognize the shape while leaving the output
-// readable; the exact count always survives in VerifyResult.Invalid and in the closing
-// summary line.
+// maxRecordDiagnostics bounds how many per-record lines a single verify pass prints for ONE
+// kind of finding. EVERY per-record diagnostic is one line per input line for a whole log in
+// some reachable state — a retired signing key, a keyless ring, a corrupt or non-JSONL file,
+// pre-signing history, an attacker-padded archive, a wrong --audit-key-path — and an
+// unbounded stream of any one of them buries the others, the practical result being an
+// operator who suppresses the whole check. Sized to show enough to recognize the shape while
+// leaving the output readable; every count stays exact in VerifyResult and in the closing
+// summary, which also names where the kind's first and last occurrence sit.
 const maxRecordDiagnostics = 10
 
-// diagnosticKind indexes the per-record diagnostics a verify pass caps.
+// diagnosticKind indexes the per-record diagnostics a verify pass caps, which is ALL of
+// them: an unbounded line is what the cap exists to prevent, so no site may be exempt.
 type diagnosticKind int
 
 const (
-	diagUnsigned diagnosticKind = iota
+	// diagUnclassified is the ZERO value, so a site that reaches the admission without
+	// naming its kind charges a floor bucket rather than printing free — undeclared is
+	// BOUNDED, the direction the transport's notice classes and refusal categories both
+	// take. An out-of-range kind resolves here too, so admitDiagnostic cannot index out of
+	// bounds and crash a pass over the corrupted log it was reached for.
+	diagUnclassified diagnosticKind = iota
 	diagMalformed
 	diagDecoy
+	diagUnsigned
+	diagUnknownKey
+	diagUnverifiable
+	diagVerifyError
+	diagMismatch
+	diagMalformedTime
+	diagChainBreak
+	diagSeqGap
 	numDiagnosticKinds
 )
 
-// cappedDiagnostic declares one capped diagnostic: the noun its elision notice and its
-// closing summary both name it by — one field, so the two lines cannot end up describing
-// different floods — and the sentence that summary closes with, which is what an operator
-// reading a log in this state has to act on.
+// cappedDiagnostic declares one capped diagnostic: the line prefix its per-record
+// diagnostics carry (so a summary greps alongside them), the noun both its elision notice
+// and its summary name it by — one field, so the two cannot end up describing different
+// floods — and the sentence that summary closes with, which is what an operator reading a
+// log in this state has to act on.
 type cappedDiagnostic struct {
+	label  string
 	noun   string
 	remedy string
 }
 
 // cappedDiagnostics is the declaration TestVerifyDiagnostics_EveryKindIsDeclared holds
-// complete, so a fourth capped diagnostic is one row rather than an entry that prints an
-// empty noun.
+// complete, so a new capped diagnostic is one row rather than an entry printing an empty
+// noun. TestVerifyDiagnostics_EveryOutputSiteIsAdmitted is the other half: it fails the
+// build for a per-record line that reaches opts.Out without an admission at all.
 var cappedDiagnostics = [numDiagnosticKinds]cappedDiagnostic{
-	diagUnsigned: {
-		noun:   "unsigned",
-		remedy: "none carries an _hmac, so none can be verified. Pre-signing history must be moved aside before upgrading; otherwise reconcile against your external sink.",
+	diagUnclassified: {
+		label:  "INVALID",
+		noun:   "unclassified diagnostic(s)",
+		remedy: "a diagnostic reached the output without declaring its kind; report this, and reconcile against your external sink.",
 	},
 	diagMalformed: {
-		noun:   "malformed",
+		label:  "INVALID",
+		noun:   "malformed record(s)",
 		remedy: "none decodes as a JSON record, so none can be verified. A log in this state is corrupt, truncated, or is not the JSONL audit log; reconcile against your external sink.",
 	},
 	diagDecoy: {
-		noun:   "forged seq-0 decoy",
+		label:  "INVALID",
+		noun:   "forged seq-0 decoy record(s)",
 		remedy: "a signed chain starts at seq 1, so none was written by this sink. Reconcile against your external sink.",
 	},
+	diagUnsigned: {
+		label:  "INVALID",
+		noun:   "unsigned record(s)",
+		remedy: "none carries an _hmac, so none can be verified. Pre-signing history must be moved aside before upgrading; otherwise reconcile against your external sink.",
+	},
+	diagUnknownKey: {
+		label:  "UNKNOWN_KEY_ID",
+		noun:   "record(s) naming a key absent from the ring",
+		remedy: "the expected state after a rotation that retired a signing key. Add the retired key to the ring to verify them.",
+	},
+	diagUnverifiable: {
+		label:  "UNVERIFIABLE",
+		noun:   "record(s) with no key to check",
+		remedy: "the ring held no key to try. Supply the signing key; until then nothing here is proven either way.",
+	},
+	diagVerifyError: {
+		label:  "ERROR",
+		noun:   "record(s) that could not be verified",
+		remedy: "each failed the shape or canonical-form check. Version skew and a whole-file re-serialization both produce this; reconcile against your external sink.",
+	},
+	diagMismatch: {
+		label:  "INVALID",
+		noun:   "record(s) whose HMAC did not match",
+		remedy: "each was signed by this ring's key and its content no longer matches that signature. Verify the key is the right one before concluding tampering, then reconcile against your external sink.",
+	},
+	diagMalformedTime: {
+		label:  "INVALID",
+		noun:   "record(s) with an unparseable time",
+		remedy: "the signed time field is required and must be RFC3339 Nano; format drift and tampering both produce this.",
+	},
+	diagChainBreak: {
+		label:  "CHAIN BREAK",
+		noun:   "chain break(s)",
+		remedy: "the tamper-evident links do not hold across these records. Verify the key is the right one, then reconcile against your external sink.",
+	},
+	diagSeqGap: {
+		label:  "SEQ GAP",
+		noun:   "seq gap(s)",
+		remedy: "the sequence is not contiguous across these records: one or more is missing, duplicated, or reordered.",
+	},
+}
+
+// diagnosticCap is one kind's occurrence count plus where its first and last occurrence sat
+// in the stream. The POSITIONS are what keeps a cap from destroying information the count
+// cannot carry: the per-record line is the only place an occurrence's position is printed
+// (VerifyResult holds none, and the join collector drops a record that did not decode), so
+// eliding one past the cap would otherwise make it unlocatable in the file.
+type diagnosticCap struct {
+	seen        int
+	first, last int
 }
 
 // recordDecode is what decodeAuditRecord's pass over a line yields for the two
@@ -812,111 +882,148 @@ func (v *auditChainVerifier) inJoinWindow(rec auditRecord) bool {
 	return v.opts.RequestID == "" || rec.RequestID == v.opts.RequestID
 }
 
+// checkGenesisAnchor reports a first record that claims seq 1 without the genesis sentinel.
+//
+// The first record of a fresh log (seq == 1) must carry that sentinel as prev_hmac
+// (writeRecord stamps it unconditionally). Verifying it closes a leading-truncation gap:
+// excising the true seq-1 record and rewriting the survivor to claim seq 1 would otherwise
+// pass, since updateChain's link check is skipped for the first record. A rotated log
+// legitimately starts at seq > 1, so this is provable only at seq == 1.
+//
+// There is no exemption for an empty prev_hmac: writeRecord emits either the resumed
+// predecessor's _hmac or the genesis sentinel, never "", so an empty one at seq 1 is always a
+// leading-truncation forgery. The pre-signing upgrade path that once produced a
+// legitimately-empty prev_hmac here is gone — an unsigned tail is no longer resumed onto, so
+// a chain restarted after one begins at genesis like any other fresh chain.
+func (v *auditChainVerifier) checkGenesisAnchor(rec auditRecord) {
+	if rec.Seq != 1 || rec.PrevHMAC == auditGenesisPrev {
+		return
+	}
+	v.res.ChainBreaks++
+	if !v.admitDiagnostic(diagChainBreak) {
+		return
+	}
+	if rec.PrevHMAC == "" {
+		_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq 1: prev_hmac is empty, expected genesis sentinel %q — the writer never emits an empty prev_hmac, so leading records were deleted and a replacement was forged\n", auditGenesisPrev)
+		return
+	}
+	_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq 1: prev_hmac is %q, expected genesis sentinel %q (a leading record was deleted or the origin was rewritten)\n", rec.PrevHMAC, auditGenesisPrev)
+}
+
 // updateChain checks a legitimate record's prev_hmac linkage and seq contiguity
 // against the chain anchor, reporting any break, then advances the anchor.
 func (v *auditChainVerifier) updateChain(rec auditRecord) {
 	if !v.havePrev {
 		v.res.FirstSeq = rec.Seq
-		// The first record of a fresh log (seq == 1) must carry the genesis sentinel
-		// as prev_hmac (writeRecord stamps it unconditionally). Verifying it closes a
-		// leading-truncation gap: excising the true seq-1 record and rewriting the
-		// survivor to claim seq 1 would otherwise pass, since the chain check below is
-		// skipped for the first record. A rotated log legitimately starts at seq > 1,
-		// so this is provable only at seq == 1.
-		//
-		// There is no exemption for an empty prev_hmac: writeRecord emits either the
-		// resumed predecessor's _hmac or the genesis sentinel, never "", so an empty one
-		// at seq 1 is always a leading-truncation forgery (delete the leading records,
-		// rewrite the survivor to claim seq 1). The pre-signing upgrade path that once
-		// produced a legitimately-empty prev_hmac here is gone — an unsigned tail is no
-		// longer resumed onto, so a chain restarted after one begins at genesis like any
-		// other fresh chain.
-		if rec.Seq == 1 && rec.PrevHMAC != auditGenesisPrev {
-			v.res.ChainBreaks++
-			if rec.PrevHMAC == "" {
-				_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq 1: prev_hmac is empty, expected genesis sentinel %q — the writer never emits an empty prev_hmac, so leading records were deleted and a replacement was forged\n", auditGenesisPrev)
-			} else {
-				_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq 1: prev_hmac is %q, expected genesis sentinel %q (a leading record was deleted or the origin was rewritten)\n", rec.PrevHMAC, auditGenesisPrev)
-			}
-		}
+		v.checkGenesisAnchor(rec)
 	} else {
-		// If the preceding record failed VerifyRecord (an HMAC mismatch, or — since
-		// this branch is reached on any non-nil error — a non-canonical-form
-		// rejection) its _hmac value in v.prevHMAC is untrustworthy: an attacker can
-		// set an arbitrary forged _hmac on the bad record and then stitch its
-		// successor by setting prev_hmac to that same value, making the link check
-		// pass for a tampered record. Fire a CHAIN BREAK before the link check to
-		// surface the untrustworthy anchor.
-		if v.prevRecordInvalid {
-			v.res.ChainBreaks++
-			_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq %d: the preceding record failed verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
-			v.prevRecordInvalid = false
-		}
-		if rec.PrevHMAC != v.prevHMAC {
-			v.res.ChainBreaks++
-			_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq %d: prev_hmac does not match the preceding record (a record was deleted, reordered, or inserted)\n", rec.Seq)
-		}
-		// Every record reaching updateChain is signed and carries a seq > 0 (processLine
-		// keeps unsigned records and seq-0 decoys out of the chain state), so the gap
-		// check needs no era or zero-seq guard: consecutive records must simply be
-		// contiguous.
-		if rec.Seq != v.prevSeq+1 {
-			v.res.ChainBreaks++
-			if rec.Seq > v.prevSeq+1 {
-				_, _ = fmt.Fprintf(v.opts.Out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
-			} else {
-				// A seq that goes backward or repeats is not a missing record — this
-				// package's own documented tamper/restart signature (a duplicated,
-				// reordered, or reissued seq), the same shape a chain-resume already
-				// guards against elsewhere. Naming it distinctly keeps a reader from
-				// searching for a deleted line that was never there.
-				_, _ = fmt.Fprintf(v.opts.Out, "SEQ GAP: record seq %d does not follow %d (seq did not increase — a duplicate, reordered, or restarted chain, not a missing record)\n", rec.Seq, v.prevSeq)
-			}
-		}
+		v.checkAnchorLink(rec)
+		v.checkSeqContiguity(rec)
 	}
 	v.havePrev = true
 	v.prevHMAC = rec.HMAC
 	v.prevSeq = rec.Seq
 }
 
-// reportSuppressedDiagnostics prints the one-line tail summary for every capped diagnostic
-// that elided lines (see maxRecordDiagnostics). Each names its own total so the elided lines
-// are accounted for rather than silently dropped — the same posture the pre-session record
-// limiter takes with suppressed_refusal_count — and repeats its remedy, since a log in any of
-// these states is one an operator has to act on rather than re-run.
+// checkAnchorLink reports a record that does not link onto the anchor before it.
 //
-// One loop over the declaration rather than a call per kind: the summary is what keeps a
-// capped diagnostic honest, and a kind whose summary a caller forgot would elide lines with
-// nothing accounting for them.
-func (v *auditChainVerifier) reportSuppressedDiagnostics() {
-	for kind, seen := range v.diags {
-		if seen <= maxRecordDiagnostics {
-			continue
+// If the preceding record failed VerifyRecord (an HMAC mismatch, or — since that branch is
+// reached on any non-nil error — a non-canonical-form rejection) its _hmac value in
+// v.prevHMAC is untrustworthy: an attacker can set an arbitrary forged _hmac on the bad
+// record and then stitch its successor by setting prev_hmac to that same value, making the
+// link check pass for a tampered record. That break fires BEFORE the link check, to surface
+// the untrustworthy anchor rather than the link that was made to fit it.
+func (v *auditChainVerifier) checkAnchorLink(rec auditRecord) {
+	if v.prevRecordInvalid {
+		v.res.ChainBreaks++
+		if v.admitDiagnostic(diagChainBreak) {
+			_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq %d: the preceding record failed verification; its _hmac is untrustworthy and cannot serve as a valid chain anchor\n", rec.Seq)
 		}
-		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  %d %s record(s) in total (%d diagnostics elided): %s\n",
-			seen, cappedDiagnostics[kind].noun, seen-maxRecordDiagnostics, cappedDiagnostics[kind].remedy)
+		v.prevRecordInvalid = false
+	}
+	if rec.PrevHMAC != v.prevHMAC {
+		v.res.ChainBreaks++
+		if v.admitDiagnostic(diagChainBreak) {
+			_, _ = fmt.Fprintf(v.opts.Out, "CHAIN BREAK at seq %d: prev_hmac does not match the preceding record (a record was deleted, reordered, or inserted)\n", rec.Seq)
+		}
 	}
 }
 
-// admitDiagnostic counts one occurrence of kind and reports whether the caller prints its
-// per-record line, emitting the one-line elision notice itself at the moment the cap is
-// passed. Each kind is counted against its OWN budget, for the reason the transport's
-// refusal limiter keeps a bucket per category: a whole pre-signing log would otherwise spend
-// the budget and reduce a handful of concurrent malformed lines — the finding an operator is
-// reading for — to a number on somebody else's summary.
+// checkSeqContiguity reports a break in the seq sequence. Every record reaching updateChain
+// is signed and carries a seq > 0 (processLine keeps unsigned records and seq-0 decoys out of
+// the chain state), so this needs no era or zero-seq guard: consecutive records must simply
+// be contiguous.
+//
+// Checked as its own break rather than an else of the link check: an interior deletion trips
+// BOTH, and reporting only the first hides how many records were removed.
+func (v *auditChainVerifier) checkSeqContiguity(rec auditRecord) {
+	if rec.Seq == v.prevSeq+1 {
+		return
+	}
+	v.res.ChainBreaks++
+	if !v.admitDiagnostic(diagSeqGap) {
+		return
+	}
+	if rec.Seq > v.prevSeq+1 {
+		_, _ = fmt.Fprintf(v.opts.Out, "SEQ GAP: record seq %d does not follow %d (a record is missing)\n", rec.Seq, v.prevSeq)
+		return
+	}
+	// A seq that goes backward or repeats is not a missing record — this package's own
+	// documented tamper/restart signature (a duplicated, reordered, or reissued seq), the same
+	// shape a chain-resume already guards against elsewhere. Naming it distinctly keeps a
+	// reader from searching for a deleted line that was never there.
+	_, _ = fmt.Fprintf(v.opts.Out, "SEQ GAP: record seq %d does not follow %d (seq did not increase — a duplicate, reordered, or restarted chain, not a missing record)\n", rec.Seq, v.prevSeq)
+}
+
+// reportSuppressedDiagnostics prints each capped kind's tail summary. It names the total and
+// the elided count so suppressed lines are accounted for rather than dropped — the posture
+// the pre-session record limiter takes with suppressed_refusal_count — and the positions,
+// which nothing else carries once a per-record line is elided.
+//
+// One loop over the declaration, not a call per kind: the summary is what keeps a cap honest,
+// so a kind whose summary a caller forgot would elide lines with nothing accounting for them.
+func (v *auditChainVerifier) reportSuppressedDiagnostics() {
+	for kind := range cappedDiagnostics {
+		c := &v.diags[kind]
+		if c.seen <= maxRecordDiagnostics {
+			continue
+		}
+		d := &cappedDiagnostics[kind]
+		_, _ = fmt.Fprintf(v.opts.Out, "%s  %d %s in total (%d diagnostics elided; first at record %d, last at record %d): %s\n",
+			d.label, c.seen, d.noun, c.seen-maxRecordDiagnostics, c.first, c.last, d.remedy)
+	}
+}
+
+// admitDiagnostic counts one occurrence of kind at the current record and reports whether
+// the caller prints its per-record line, emitting the one-line elision notice itself at the
+// moment the cap is passed. Each kind is counted against its OWN budget, for the reason the
+// transport's refusal limiter keeps a bucket per category: a whole pre-signing log would
+// otherwise spend the budget and reduce a handful of concurrent malformed lines — the
+// finding an operator is reading for — to a number on somebody else's summary. That per-kind
+// split is also why the chain checks may be capped at all: nothing else can spend their
+// budget, so a CHAIN BREAK is now unburiable rather than merely unbounded.
 //
 // The answer is taken BEFORE the site formats its diagnostic, which is the expensive part of
 // a line nobody sees: on the flood path this bound exists for, every suppressed line would
-// otherwise pay its formatting and its arguments. Counting and naming are one call, so a
-// kind's budget cannot be spent while another kind's noun is printed.
+// otherwise pay its formatting, its boxed arguments, and (on three sites) a SanitizeAuditField
+// walk per field. Counting and naming are one call, so a kind's budget cannot be spent while
+// another kind's noun is printed.
 func (v *auditChainVerifier) admitDiagnostic(kind diagnosticKind) bool {
-	v.diags[kind]++
+	if kind < 0 || kind >= numDiagnosticKinds {
+		kind = diagUnclassified
+	}
+	c := &v.diags[kind]
+	c.seen++
+	c.last = v.res.Total
+	if c.seen == 1 {
+		c.first = v.res.Total
+	}
 	switch {
-	case v.diags[kind] <= maxRecordDiagnostics:
+	case c.seen <= maxRecordDiagnostics:
 		return true
-	case v.diags[kind] == maxRecordDiagnostics+1:
-		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  ... further %s records reported once at the end rather than one line each\n",
-			cappedDiagnostics[kind].noun)
+	case c.seen == maxRecordDiagnostics+1:
+		_, _ = fmt.Fprintf(v.opts.Out, "%s  ... further %s reported once at the end rather than one line each\n",
+			cappedDiagnostics[kind].label, cappedDiagnostics[kind].noun)
 	}
 	return false
 }
@@ -930,8 +1037,14 @@ func (v *auditChainVerifier) admitDiagnostic(kind diagnosticKind) bool {
 // It deliberately counts nothing: the record is already tallied in its own bucket and the
 // verdict already fails (OK() treats both as unverified), so adding to Invalid here would
 // double-count one record. Diagnostic completeness only.
-func (v *auditChainVerifier) reportMalformedTime(rec auditRecord, malformed bool) {
-	if !malformed {
+//
+// printed is the caller's own admission result, which is what BOUNDS this line: it is a
+// rider on the diagnostic above it, meaningless without it, so it needs no budget of its own
+// and must never outlive the line it qualifies. The residual is that a malformed time on a
+// record whose parent line was elided goes unreported — it counts nothing either way, and
+// the parent kind's summary is what says records were elided.
+func (v *auditChainVerifier) reportMalformedTime(rec auditRecord, malformed, printed bool) {
+	if !malformed || !printed {
 		return
 	}
 	_, _ = fmt.Fprintf(v.opts.Out, "         also: seq=%d has an unparseable time field %q (already counted above)\n",
@@ -1072,8 +1185,14 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		// it distinctly so the INVALID tally stays a true tamper count; the verdict
 		// still fails (OK() treats UnknownKey as unverified). key_id is sanitized in
 		// case a future writer admits control chars.
-		_, _ = fmt.Fprintf(v.opts.Out, "UNKNOWN_KEY_ID  seq=%d key_id=%s — signed with a key absent from the verification ring; add that key to verify it (expected after a key rotation that retired the signing key)\n",
-			rec.Seq, SanitizeAuditField(rec.KeyID))
+		// CAPPED, and this is the flood most reachable with no attacker and no corruption:
+		// the state named at the end of this very message produces one line per record for
+		// the whole pre-rotation history.
+		printed := v.admitDiagnostic(diagUnknownKey)
+		if printed {
+			_, _ = fmt.Fprintf(v.opts.Out, "UNKNOWN_KEY_ID  seq=%d key_id=%s — signed with a key absent from the verification ring; add that key to verify it (expected after a key rotation that retired the signing key)\n",
+				rec.Seq, SanitizeAuditField(rec.KeyID))
+		}
 		v.res.UnknownKey++
 		verdict.status = StatusUnknownKey
 		// Do NOT mark the chain anchor untrustworthy here: a named-but-absent key_id is
@@ -1082,15 +1201,20 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		// prev_hmac still links correctly. Flagging a chain break would mislabel a benign
 		// rotation as tampering. Only a provable HMAC mismatch under a held key (the !ok /
 		// err cases below) invalidates the anchor.
-		v.reportMalformedTime(rec, malformedTime)
+		v.reportMalformedTime(rec, malformedTime, printed)
 	case errors.Is(err, errNoKeyTried):
 		// Nothing was checked: no key was available to try. The signing key is
 		// unidentifiable or absent, so this cannot be proven to be tampering rather than a
 		// retired/absent key (as a named-but-missing key_id can). Report distinctly and
 		// count it in its own bucket so the INVALID tally stays a true tamper count; the
 		// verdict still fails (OK() treats Unverifiable as unverified).
-		_, _ = fmt.Fprintf(v.opts.Out, "UNVERIFIABLE  seq=%d — no key was available to check this record's HMAC (an empty verification ring, or a keyless verifier); cannot verify it (supply the signing key, or this may be tampering)\n",
-			rec.Seq)
+		// CAPPED: an empty ring or a keyless verifier is a property of the RUN, not of a
+		// record, so every record in the log takes this arm.
+		printed := v.admitDiagnostic(diagUnverifiable)
+		if printed {
+			_, _ = fmt.Fprintf(v.opts.Out, "UNVERIFIABLE  seq=%d — no key was available to check this record's HMAC (an empty verification ring, or a keyless verifier); cannot verify it (supply the signing key, or this may be tampering)\n",
+				rec.Seq)
+		}
 		v.res.Unverifiable++
 		verdict.status = StatusUnverifiable
 		// Not provably tampering (see the message): this is indistinguishable from a
@@ -1098,28 +1222,43 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 		// fabricate a chain break on the successor. OK() already fails the verdict on any
 		// Unverifiable record; only a provable HMAC mismatch (the !ok / err cases below)
 		// invalidates the anchor.
-		v.reportMalformedTime(rec, malformedTime)
+		v.reportMalformedTime(rec, malformedTime, printed)
 	case err != nil:
 		// A verification error or HMAC mismatch is tampering: count it regardless of
 		// the filter.
-		_, _ = fmt.Fprintf(v.opts.Out, "ERROR  seq %d: %v\n", rec.Seq, err)
+		//
+		// CAPPED: a whole-file re-serialization (a SIEM export, a pretty-printer) or version
+		// skew makes every line non-canonical, and this arm ALSO latches prevRecordInvalid,
+		// so an uncapped one costs a CHAIN BREAK on the next record too.
+		if v.admitDiagnostic(diagVerifyError) {
+			_, _ = fmt.Fprintf(v.opts.Out, "ERROR  seq %d: %v\n", rec.Seq, err)
+		}
 		v.res.Invalid++
 		verdict.status = StatusInvalid
 		v.prevRecordInvalid = true
 	case !ok:
+		// CAPPED: the wrong --audit-key-path fails every record here, and this is the most
+		// expensive line in the file to build — three SanitizeAuditField walks over
+		// attacker-influenceable fields, none of them paid on the suppressed path.
+		//
 		// Sanitize the interpolated fields (target and session_id are
 		// attacker-influenceable and not control-char-sanitized at storage, so a
 		// literal newline could inject a spurious finding line).
-		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  seq=%d request_id=%s session_id=%s target=%s\n",
-			rec.Seq, SanitizeAuditField(rec.RequestID), SanitizeAuditField(rec.SessionID), SanitizeAuditField(rec.Target))
+		if v.admitDiagnostic(diagMismatch) {
+			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  seq=%d request_id=%s session_id=%s target=%s\n",
+				rec.Seq, SanitizeAuditField(rec.RequestID), SanitizeAuditField(rec.SessionID), SanitizeAuditField(rec.Target))
+		}
 		v.res.Invalid++
 		verdict.status = StatusInvalid
 		v.prevRecordInvalid = true
 	case malformedTime:
 		// HMAC-valid but the required, signed `time` field does not parse as RFC3339
 		// Nano: count it Invalid (not Skipped) and surface a diagnostic so format drift
-		// or tampering is visible rather than buried in the Skipped tally.
-		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  seq=%d: unparseable time field %q\n", rec.Seq, SanitizeAuditField(rec.Time))
+		// or tampering is visible rather than buried in the Skipped tally. Capped because
+		// format drift is a property of the writer, so it applies to every record it wrote.
+		if v.admitDiagnostic(diagMalformedTime) {
+			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  seq=%d: unparseable time field %q\n", rec.Seq, SanitizeAuditField(rec.Time))
+		}
 		v.res.Invalid++
 		verdict.status = StatusInvalid
 	case inReportWindow:

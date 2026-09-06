@@ -74,16 +74,15 @@ var urlConfigFields = map[string]func(string) string{
 	"allowedOrigins":            config.RedactURL,           // listen.allowedOrigins (sequence)
 }
 
-// The case-folded indexes the lookup actually reads. Derived from the declarations above so
-// the canonical spelling stays the documented one and the two cannot drift;
-// TestDoctorRedaction_FoldedIndexesAreComplete fails a pair of declared keys that fold
-// together, which would silently drop one.
+// The folded indexes the lookup actually reads, derived so the canonical spelling stays the
+// documented one. TestDoctorRedaction_FoldedIndexes fails a pair of declared keys that fold
+// together — WITHIN either table, where one would silently overwrite the other, and ACROSS
+// them, where redactedValueFor's precedence would drop the URL scrub.
 var (
 	redactedConfigFieldsFolded = foldConfigKeys(redactedConfigFields)
 	urlConfigFieldsFolded      = foldConfigKeys(urlConfigFields)
 )
 
-// foldConfigKeys re-keys a redaction table by foldConfigKey.
 func foldConfigKeys[V any](m map[string]V) map[string]V {
 	folded := make(map[string]V, len(m))
 	for k, v := range m {
@@ -93,21 +92,31 @@ func foldConfigKeys[V any](m map[string]V) map[string]V {
 }
 
 // foldConfigKey is the ONE normalization a raw on-disk key goes through before it is matched
-// against the redaction tables.
-func foldConfigKey(k string) string { return strings.ToLower(k) }
+// against the redaction tables: the module's shared case fold, then the separators an
+// operator's misspelling differs by.
+//
+// capability.FoldJSONKey rather than strings.ToLower, which that function's own doc rules out
+// as a fold (it leaves U+017F distinct from "s", and four of these key names contain one).
+// Dropping "_"/"-"/space on top is what reaches the rest of the class the case fold only
+// starts on: the typed loader binds keys exactly, so `auth_token`, `Auth-Token` and
+// `authToken ` are refused exactly as `AuthToken` was — and a config the loader refused is
+// precisely the one only this command ever renders. Over-folding is the safe direction here:
+// the cost is redacting a key that merely reads as one of these two names, and the schema has
+// no such key.
+func foldConfigKey(k string) string {
+	return configKeySeparators.Replace(capability.FoldJSONKey(k))
+}
 
-// redactedValueFor returns the scrubbed replacement for a config value under key, and
-// whether key names a sensitive field at all.
+var configKeySeparators = strings.NewReplacer("_", "", "-", "", " ", "")
+
+// redactedValueFor returns the scrubbed replacement for a config value under key, and whether
+// key names a sensitive field at all. One resolver rather than a lookup pair in each of
+// redactConfigValue's two map arms, so the string-keyed and interface-keyed walks cannot
+// disagree about which keys are sensitive.
 //
-// The match is case-INSENSITIVE, which is not a heuristic: it is the same two key names,
-// spelled the way an operator actually typed them. writeDoctorConfig raw-parses the file
-// precisely so a config the typed loader REFUSED still renders — and since that loader
-// rejects unknown keys case-sensitively, the configs only doctor handles are the misspelled
-// ones. `AuthToken:` was therefore the one spelling guaranteed to reach a bundle destined
-// for a public bug report, and the one spelling the allowlist missed.
-//
-// One resolver rather than a lookup pair in each of redactConfigValue's two map arms, so the
-// string-keyed and interface-keyed walks cannot disagree about which keys are sensitive.
+// What it does NOT reach is stated because the help text promises only this much: a secret
+// under a key that is not one of these six — `args` and `command` above all, which doctor
+// prints verbatim by design — is not covered by any spelling.
 func redactedValueFor(key string, val interface{}) (interface{}, bool) {
 	folded := foldConfigKey(key)
 	if redactedConfigFieldsFolded[folded] {
@@ -132,10 +141,17 @@ func redactURLValue(val interface{}, redact func(string) string) interface{} {
 			v[i] = redactURLValue(it, redact)
 		}
 		return v
+	case map[string]interface{}, map[interface{}]interface{}:
+		// A MAPPING under a URL key is a shape the schema does not have, so there is no key
+		// inside it this file knows anything about. Handing it back to the allowlist walk
+		// (which is what this arm used to do) meant every inner key matched nothing and the
+		// credentialed URL was re-emitted verbatim — while the sibling authToken arm answers
+		// the identical mis-shape with a placeholder. Replaced wholesale for the same reason
+		// redactString does it: the value cannot be scrubbed by a rule that fits it, and the
+		// bundle is written to be pasted into a public bug report.
+		return redactedNonString
 	default:
-		// A map or other nested shape: recurse so a credential under a known key is still
-		// scrubbed; a scalar number/bool has nothing to scrub.
-		redactConfigValue(val)
+		// A scalar number or bool: nothing to scrub.
 		return val
 	}
 }
@@ -461,12 +477,17 @@ func redactConfigValue(v interface{}) {
 	}
 }
 
+// redactedNonString is what a sensitive key holding a shape the schema does not have is
+// replaced by. One spelling, since both sensitive-key arms answer that mis-shape with it and
+// a bundle reader should not have to tell two placeholders apart.
+const redactedNonString = "<redacted non-string>"
+
 // redactString renders a present secret as "<redacted len=N>" and an empty value as "", so
 // an omitted secret reads differently from a present-but-redacted one.
 func redactString(v interface{}) string {
 	s, ok := v.(string)
 	if !ok {
-		return "<redacted non-string>"
+		return redactedNonString
 	}
 	if s == "" {
 		return ""
