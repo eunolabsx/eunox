@@ -13,10 +13,13 @@
 // in a package with no reason to know a keyless SCAN exists.
 //
 // What it answers is what a CONCRETE TYPE proves, which is why an unrecognized one is a value of
-// its own rather than a default. Each consumer then decides what to do about it: the counter
-// admits it (its own failure mode is a loud, fail-closed CROSSSLOT at the first multi-bucket
-// admission), and the kill switch refuses it, because a partial kill set served as complete is
-// fail-open and silent.
+// its own rather than a default. Both consumers refuse it, for the same reason in two shapes: a
+// keyless SCAN routed to one server of several loads a PARTIAL kill set and serves it as complete,
+// and a multi-key EVAL routed to one server of several splits a quota bucket's accounting and
+// enforces its limit at a multiple of the declared value. Neither announces itself — client-side
+// sharding raises no CROSSSLOT, the shards being standalone servers — so both are fail-open and
+// silent, and each package offers a declaring option for the consumer who knows what their
+// decorator wraps.
 package redisutil
 
 import (
@@ -63,8 +66,10 @@ const (
 	// TopologyUnknown is what an unrecognized concrete type establishes — a decorator, or a
 	// consumer's own Cmdable. NOTHING follows about the keyspace: it may live on one server or be
 	// spread over many, and the two are indistinguishable without proving it over the network.
-	// A consumer whose correctness depends on visiting every server must refuse this or be told
-	// the answer (see the topology-declaring options on pkg/killswitch's Redis).
+	// A consumer whose correctness depends on WHICH servers a command reaches — every one of them
+	// for a keyless SCAN, all of one command's keys at once for a multi-key EVAL — must refuse
+	// this or be told the answer (see the topology-declaring options on pkg/killswitch's and
+	// pkg/callcounter's Redis).
 	TopologyUnknown Topology = iota
 	// TopologySingleNode means the whole keyspace lives on one server, so a keyless command
 	// reaches all of it.

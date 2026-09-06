@@ -500,7 +500,14 @@ configured. Point all instances at one Redis (`--redis-addr`) to share both.
 Redis **Cluster is not supported**, and the proxy refuses to start against one
 rather than discovering it later: a capability carrying two quota bounds is
 admitted in a single multi-key script, whose keys can land on different shards.
-Use a single node, or Sentinel for failover.
+Use a single node, or Sentinel for failover. The same refusal covers *client-side*
+sharding (a `redis.Ring`), which is the more dangerous half: a cluster rejects the
+script outright, while a ring routes it by its first key and runs it whole on one
+standalone shard — so one quota bucket's spend splits across servers and its limit
+is enforced once per shard, with nothing to report it. A library consumer wiring
+these backends behind a metrics or tracing decorator, which no type check can see
+through, is refused too and declares the topology with
+`callcounter.WithSingleNodeKeyspace()` / `killswitch.WithSingleNodeKeyspace()`.
 
 > **The Redis kill switch fails closed during a Redis outage by default —
 > monitor Redis health.** The kill switch is checked on the request hot path from

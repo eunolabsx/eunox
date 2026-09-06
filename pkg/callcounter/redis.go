@@ -37,15 +37,37 @@ type Redis struct {
 	// maxWeightedEntries bounds live entries one weighted (key, window) may hold,
 	// mirroring InMemory. Defaults to MaxWeightedEntriesPerKey; lowered only by tests.
 	maxWeightedEntries int
+	// declared is the consumer's own answer to the topology question, for a client whose
+	// concrete type cannot answer it. Weighed against the classification in resolveTopology,
+	// never applied over it.
+	declared redisutil.Topology
 }
 
-// redisOption configures the Redis counter. Unexported: its only use (a custom clock) is
-// for deterministic tests, reached externally via WithRedisTimeFunc in export_test.go.
-type redisOption func(*Redis)
+// RedisOption configures the Redis counter.
+type RedisOption func(*Redis)
+
+// WithSingleNodeKeyspace declares that a client this package cannot classify keeps its WHOLE
+// keyspace on one server, so AdmitAll's multi-key EVAL reaches every key it names.
+//
+// The escape hatch for the ordinary decorator: a metrics or tracing wrapper around a plain
+// *redis.Client is invisible to a concrete-type match, and without this NewRedis refuses it with
+// ErrUnknownTopology. It FILLS an unknown topology and cannot override a known one — declared
+// beside a client whose own type shards, it is refused (ErrTopologyContradicted) rather than
+// honored, because honoring it would restore exactly the split accounting the refusal prevents.
+//
+// It is named as pkg/killswitch's identically-named option is, so a consumer wiring both backends
+// on one wrapped client answers the one topology question once, in one spelling. There is no
+// sharded counterpart here, unlike there: a keyless SCAN can fan out over shards where a multi-key
+// EVAL cannot, so declaring a sharded keyspace to this counter is declaring ErrClusterUnsupported.
+func WithSingleNodeKeyspace() RedisOption {
+	return func(r *Redis) {
+		r.declared = redisutil.TopologySingleNode
+	}
+}
 
 // withTimeFunc sets a custom time function so the same-tick collision regression
 // can be tested deterministically.
-func withTimeFunc(fn func() time.Time) redisOption {
+func withTimeFunc(fn func() time.Time) RedisOption {
 	return func(r *Redis) {
 		r.now = fn
 	}
@@ -53,7 +75,7 @@ func withTimeFunc(fn func() time.Time) redisOption {
 
 // withRedisMaxWeightedEntries lowers the per-key weighted retention ceiling, so a test
 // can reach it without writing MaxWeightedEntriesPerKey entries.
-func withRedisMaxWeightedEntries(n int) redisOption {
+func withRedisMaxWeightedEntries(n int) RedisOption {
 	return func(r *Redis) {
 		r.maxWeightedEntries = n
 	}
@@ -76,19 +98,56 @@ func (r *Redis) newMember(now time.Time) string {
 // ErrClusterUnsupported is returned by NewRedis for a client that spreads ONE keyspace across
 // several servers: a Redis Cluster, or a client-side Ring.
 //
-// AdmitAll is a single multi-key EVAL, and a batch's keys carry distinct window suffixes, so
-// they can hash to different slots and the script is refused with CROSSSLOT. That fails
-// closed — the engine maps the error to a deny, never an over-admission — which is precisely
-// why it must be refused at the seam: nothing is unsafe, so the wiring error stays invisible
+// AdmitAll is a single multi-key EVAL, and a batch's keys carry distinct window suffixes, so a
+// SERVER-side cluster hashes them to different slots and refuses the script with CROSSSLOT. That
+// fails closed — the engine maps the error to a deny, never an over-admission — which is precisely
+// why it must still be refused at the seam: nothing is unsafe, so the wiring error stays invisible
 // until the first policy carrying two quota buckets denies in production. Worse, unrelated
 // suffixes may collide into one slot by chance, so a deployment can look healthy across
 // several policies and then deny on the next one.
+//
+// CLIENT-side sharding is the worse half and has no such backstop. A *redis.Ring spreads one
+// keyspace over STANDALONE servers, none of which knows about hash slots: go-redis routes an EVAL
+// by its FIRST key, so the whole multi-key script runs on that one shard, successfully. A bucket
+// appearing in two batches under different first keys then accrues on two servers, each seeing
+// part of the spend, and its maxCalls or cumulative blastRadius bound is enforced at up to N times
+// its declared value — silently, on the decision path. Nothing at request time can announce that,
+// which is why an UNRECOGNIZED client is refused too (see ErrUnknownTopology) rather than admitted
+// on the strength of the CROSSSLOT above.
 //
 // Making it WORK instead would mean co-locating one anchor's buckets in a slot, which is a
 // physical key-layout change (a migration resetting live counters) on a key that is opaque by
 // construction: CompositeKey is injective but not parseable, so a hash tag cannot be recovered
 // from the logical key a bucket arrives with. Until that is worth doing, this is the posture.
 var ErrClusterUnsupported = errors.New("callcounter: Redis Cluster and Ring clients are not supported: a multi-bucket admission is one multi-key EVAL whose keys can hash to different slots (CROSSSLOT); wire a single-node or Sentinel-backed *redis.Client")
+
+// ErrUnknownTopology is returned by NewRedis for a client whose KEYSPACE TOPOLOGY cannot be
+// established: a concrete type redisutil does not recognize, which is a decorator (a metrics or
+// tracing wrapper) or a consumer's own Cmdable.
+//
+// Refused rather than assumed single-node, because assuming is fail-OPEN and silent: a wrapper
+// around a Ring is indistinguishable here from one around a single-node client, and the Ring case
+// splits a quota bucket's accounting across servers with no request-time signal at all — see
+// ErrClusterUnsupported for the routing that does it, and for why the CROSSSLOT backstop covers
+// only the server-side half.
+//
+// A consumer that knows what its wrapper wraps says so with WithSingleNodeKeyspace(), which is the
+// escape hatch this refusal is only tolerable with: it refuses a decorator around a perfectly
+// ordinary single-node client until its consumer says so, in exchange for never over-admitting a
+// quota silently.
+var ErrUnknownTopology = errors.New("callcounter: the Redis client's keyspace topology cannot be determined (a decorator, or a custom Cmdable); refusing, since a client-side-sharding wrapper splits one quota bucket's accounting across servers and enforces its limit at a multiple of the declared value. Pass the client itself, or declare the topology with callcounter.WithSingleNodeKeyspace()")
+
+// ErrTopologyContradicted is returned for a topology DECLARATION that disagrees with what the
+// client's own concrete type establishes — WithSingleNodeKeyspace() beside a *redis.Ring, say.
+//
+// Refused rather than obeyed, because obeying is the fail-open: a declaration exists to FILL what
+// a concrete-type match cannot answer, and letting one override an answer it CAN give would
+// re-admit the split accounting ErrUnknownTopology was added to stop, reached through the very
+// option that makes that refusal tolerable. Construction is refused either way here, a sharding
+// client being unusable regardless — but the DIAGNOSIS is not the same: a consumer who declared
+// single-node needs to be told their declaration disagrees with their client, not to be told to
+// wire the single-node client they believe they already wired.
+var ErrTopologyContradicted = errors.New("callcounter: the declared keyspace topology contradicts the Redis client's own type (drop the declaration, or pass the client the declaration describes)")
 
 // ServerInfoReader is the one command CheckServerNotClustered issues. A narrow parameter type
 // so a caller can drive the check with a canned reply, since standing up a cluster in a test
@@ -119,11 +178,13 @@ func CheckServerNotClustered(ctx context.Context, client ServerInfoReader) error
 }
 
 // NewRedis creates a Redis-backed call counter. It fails rather than returning a counter that
-// cannot admit: on a nil client (checked FIRST, so a typed-nil sharding handle reports the nil
-// rather than the topology), on a keyspace-sharding client (ErrClusterUnsupported), or when
-// crypto/rand cannot supply the per-instance entropy for ZADD member uniqueness — a silent
-// fallback there would risk reintroducing the cross-replica collision the entropy prevents.
-func NewRedis(client redis.Cmdable, opts ...redisOption) (*Redis, error) {
+// cannot admit, or one that admits WRONGLY: on a nil client (checked FIRST, so a typed-nil
+// sharding handle reports the nil rather than the topology), on a keyspace-sharding client
+// (ErrClusterUnsupported), on one whose topology cannot be settled at all (ErrUnknownTopology,
+// ErrTopologyContradicted), or when crypto/rand cannot supply the per-instance entropy for ZADD
+// member uniqueness — a silent fallback there would risk reintroducing the cross-replica
+// collision the entropy prevents.
+func NewRedis(client redis.Cmdable, opts ...RedisOption) (*Redis, error) {
 	// A nil client — including a typed nil inside a non-nil interface — is refused at the seam
 	// rather than at the first command: go-redis dereferences the receiver before it can build a
 	// reply, so every command panics instead of returning the error a counter's callers fail
@@ -132,28 +193,57 @@ func NewRedis(client redis.Cmdable, opts ...redisOption) (*Redis, error) {
 	if redisutil.IsNilClient(client) {
 		return nil, fmt.Errorf("callcounter: nil Redis client (got %T)", client)
 	}
-	// One classification, below both backends, so this refusal and pkg/killswitch's fan-out
-	// cannot disagree about a client shape. An UNRECOGNIZED type (a decorator, a consumer's own
-	// Cmdable) is admitted here, unlike in the kill switch: this counter's failure on a sharding
-	// client is a CROSSSLOT at the first multi-bucket admission, which fails closed and is mapped
-	// back to this same error, so the residual is loud rather than a silent over-admission.
-	if topology, _ := redisutil.ClassifyTopology(client); topology == redisutil.TopologySharded {
-		return nil, fmt.Errorf("%w (got %T)", ErrClusterUnsupported, client)
+	r := &Redis{
+		client:             client,
+		now:                time.Now,
+		maxWeightedEntries: MaxWeightedEntriesPerKey,
+	}
+	// Options run before the topology is settled: a declaration is one of the two inputs
+	// resolveTopology weighs, not an override applied after the fact.
+	for _, opt := range opts {
+		opt(r)
+	}
+	if err := r.resolveTopology(); err != nil {
+		return nil, err
 	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, fmt.Errorf("callcounter: crypto/rand unavailable: %w", err)
 	}
-	r := &Redis{
-		client:             client,
-		now:                time.Now,
-		instanceID:         hex.EncodeToString(b[:]),
-		maxWeightedEntries: MaxWeightedEntriesPerKey,
-	}
-	for _, opt := range opts {
-		opt(r)
-	}
+	r.instanceID = hex.EncodeToString(b[:])
 	return r, nil
+}
+
+// resolveTopology settles how the client spreads its keyspace, from what its concrete type
+// establishes and what the consumer declared, returning the refusal when the two cannot be settled
+// into one answer this counter can admit against.
+//
+// The classification is redisutil's, below both Redis backends, so this refusal and
+// pkg/killswitch's fan-out cannot disagree about a client shape. What each does with an
+// UNRECOGNIZED one is its own decision, and both now refuse: a keyless SCAN over a sharded
+// keyspace loads a partial kill set, and a multi-key EVAL over one splits a quota bucket's
+// accounting — neither announces itself at request time.
+//
+// A declaration FILLS an unknown topology and never OVERRIDES an established one; see
+// ErrTopologyContradicted for why that asymmetry is the whole point. Written as the general rule
+// rather than as the cases reachable today, so a second declaring option cannot slip past it.
+func (r *Redis) resolveTopology() error {
+	topology, _ := redisutil.ClassifyTopology(r.client)
+	switch {
+	case r.declared == redisutil.TopologyUnknown:
+		if topology == redisutil.TopologyUnknown {
+			return fmt.Errorf("%w (got %T)", ErrUnknownTopology, r.client)
+		}
+	case topology == redisutil.TopologyUnknown:
+		// The case the declaring option exists for: the type established nothing, the consumer knows.
+		topology = r.declared
+	case r.declared != topology:
+		return fmt.Errorf("%w: declared %s, but the client's own type is %s", ErrTopologyContradicted, r.declared, topology)
+	}
+	if topology == redisutil.TopologySharded {
+		return fmt.Errorf("%w (got %T)", ErrClusterUnsupported, r.client)
+	}
+	return nil
 }
 
 // IncrementAndGet atomically records a call via a MULTI/EXEC transaction, returning the

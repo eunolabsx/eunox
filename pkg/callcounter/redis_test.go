@@ -92,6 +92,158 @@ func TestNewRedis_AcceptsSingleNodeClient(t *testing.T) {
 	require.NotNil(t, counter)
 }
 
+// decoratedClient is the shape a metrics or tracing wrapper takes: a consumer's own type
+// forwarding to a real client. redisutil matches the CONCRETE type, so this is invisible to it
+// whatever it wraps — which is the whole reason an unrecognized client is its own answer.
+type decoratedClient struct {
+	redis.Cmdable
+}
+
+// TestNewRedis_RefusesAClientItCannotClassify pins the refusal that closes client-side sharding.
+//
+// The CROSSSLOT that makes a SERVER-side cluster announce itself does not exist here: a
+// *redis.Ring spreads one keyspace over standalone servers, go-redis routes an EVAL by its FIRST
+// key, and the whole multi-key script runs on that one shard successfully — so a bucket appearing
+// in batches with different first keys accrues on different servers and its declared limit is
+// enforced at a multiple of itself, silently, on the decision path. A wrapped Ring is
+// indistinguishable here from a wrapped single-node client, so both are refused and the consumer
+// says which they have.
+func TestNewRedis_RefusesAClientItCannotClassify(t *testing.T) {
+	mr := miniredis.RunT(t)
+	single := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = single.Close() })
+	ring := redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"}})
+	t.Cleanup(func() { _ = ring.Close() })
+
+	for _, tc := range []struct {
+		name  string
+		inner redis.Cmdable
+	}{
+		{"wrapping a single-node client", single},
+		{"wrapping a ring", ring},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			counter, err := callcounter.NewRedis(decoratedClient{Cmdable: tc.inner})
+			require.ErrorIs(t, err, callcounter.ErrUnknownTopology)
+			require.Nil(t, counter, "a refused construction must hand back nothing to admit against")
+			require.Contains(t, err.Error(), "got callcounter_test.decoratedClient",
+				"the operator reading a startup failure needs the concrete type that produced it")
+			require.NotErrorIs(t, err, callcounter.ErrClusterUnsupported,
+				"an unplaceable client is not a known-sharding one; the cluster sentinel would assert a topology this never established")
+		})
+	}
+}
+
+// TestNewRedis_AcceptsADeclaredSingleNodeKeyspace is the escape hatch the refusal above is only
+// tolerable with, asserted on ADMITTING rather than on constructing: a decorator around an
+// ordinary single-node client is a legitimate wiring, and refusing it forever would be trading
+// one fail-closed break for a working deployment.
+func TestNewRedis_AcceptsADeclaredSingleNodeKeyspace(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	counter, err := callcounter.NewRedis(decoratedClient{Cmdable: client}, callcounter.WithSingleNodeKeyspace())
+	require.NoError(t, err)
+	require.NotNil(t, counter)
+
+	admitted, _, _, _, err := counter.AdmitAll(context.Background(), []capability.QuotaBucket{
+		{Key: "declared-single-node", WindowSec: 60, Counted: true, Limit: 1},
+	})
+	require.NoError(t, err)
+	assert.True(t, admitted, "a declared single-node keyspace must be usable, not merely constructible")
+}
+
+// TestClientSideSharding_SplitsOneBucketsAccountingWithNoCrossSlot is the empirical premise the
+// unknown-topology refusal rests on, and the one ErrClusterUnsupported's CROSSSLOT rationale does
+// NOT cover: a *redis.Ring shards over STANDALONE servers, none of which knows about hash slots.
+// go-redis routes an EVAL by its first key, so the whole multi-key script runs on that one shard
+// and succeeds — and the same bucket, reached in another batch under a different first key,
+// accrues on the other server, each seeing part of the spend.
+//
+// The declaration here is deliberately FALSE. It is the only way to reach the shape now refused at
+// construction, and what it produces below is the reason for the refusal: a maxCalls limit of one
+// admitting twice, with no error, nothing on the tape, and no request-time signal that could ever
+// report it.
+func TestClientSideSharding_SplitsOneBucketsAccountingWithNoCrossSlot(t *testing.T) {
+	ctx := context.Background()
+	shardA, shardB := miniredis.RunT(t), miniredis.RunT(t)
+	ring := redis.NewRing(&redis.RingOptions{
+		Addrs:       map[string]string{"a": shardA.Addr(), "b": shardB.Addr()},
+		DialTimeout: 200 * time.Millisecond,
+	})
+	t.Cleanup(func() { _ = ring.Close() })
+
+	counter, err := callcounter.NewRedis(decoratedClient{Cmdable: ring}, callcounter.WithSingleNodeKeyspace())
+	require.NoError(t, err)
+
+	// Which server a key lands on is go-redis' consistent hashing, not this package's contract, so
+	// the pair is DISCOVERED: admit each candidate alone and see which shard gained the set.
+	var onA, onB string
+	for i := 0; i < 24 && (onA == "" || onB == ""); i++ {
+		key := "split-probe-" + strconv.Itoa(i)
+		admitted, _, _, _, probeErr := counter.AdmitAll(ctx, []capability.QuotaBucket{{Key: key, WindowSec: 60, Counted: true, Limit: 8}})
+		require.NoError(t, probeErr)
+		require.True(t, admitted)
+		if len(shardA.Keys()) > 0 && onA == "" {
+			onA = key
+		}
+		if len(shardB.Keys()) > 0 && onB == "" {
+			onB = key
+		}
+		shardA.FlushAll()
+		shardB.FlushAll()
+	}
+	require.NotEmpty(t, onA)
+	require.NotEmpty(t, onB, "the ring placed 24 keys on one shard; the pair this test needs was never found")
+
+	// Same two buckets, same limit of one call each, differing only in which is FIRST.
+	batch := func(first, second string) (bool, error) {
+		admitted, _, _, _, admitErr := counter.AdmitAll(ctx, []capability.QuotaBucket{
+			{Key: first, WindowSec: 60, Counted: true, Limit: 1},
+			{Key: second, WindowSec: 60, Counted: true, Limit: 1},
+		})
+		return admitted, admitErr
+	}
+
+	admitted, err := batch(onA, onB)
+	require.NoError(t, err, "client-side sharding raises no CROSSSLOT: the script runs whole on the first key's standalone shard")
+	require.True(t, admitted)
+
+	admitted, err = batch(onB, onA)
+	require.NoError(t, err)
+	assert.True(t, admitted,
+		"both buckets were spent by the first batch, so a single keyspace would have denied here; admitting is the split accounting the refusal exists to prevent")
+	assert.Len(t, shardA.Keys(), 2, "the first batch wrote both buckets to the shard its first key selected")
+	assert.Len(t, shardB.Keys(), 2,
+		"each batch wrote BOTH buckets to its own routed shard, so one bucket's limit is now enforced once per server")
+}
+
+// TestNewRedis_RefusesADeclarationContradictingTheClient pins the asymmetry: a declaration FILLS
+// an unknown topology and never OVERRIDES an established one.
+//
+// Honouring it is the fail-open, and it is reachable through the very option added to make the
+// unknown-topology refusal tolerable — a consumer who declares single-node beside a real Ring
+// would get back exactly the split accounting that refusal exists to prevent. The diagnosis is the
+// other half: ErrClusterUnsupported would tell them to wire the single-node client they believe
+// they already declared.
+func TestNewRedis_RefusesADeclarationContradictingTheClient(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		client redis.Cmdable
+	}{
+		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000", "127.0.0.1:7001"}})},
+		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"}})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			counter, err := callcounter.NewRedis(tc.client, callcounter.WithSingleNodeKeyspace())
+			require.ErrorIs(t, err, callcounter.ErrTopologyContradicted)
+			require.Nil(t, counter, "an obeyed declaration here is the fail-open the refusal exists to close")
+			require.Contains(t, err.Error(), "declared single-node, but the client's own type is sharded")
+		})
+	}
+}
+
 // fakeServerInfo answers INFO with a canned reply, so the clustered branch is reachable
 // without standing up a cluster.
 type fakeServerInfo struct {
