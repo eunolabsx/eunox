@@ -170,3 +170,56 @@ func TestVelocityDenialFieldsSignAndVerifyRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestRateLimitedDenialFieldsSignAndVerifyRoundTrip is the same check for the OTHER quota refusal,
+// whose two time-valued keys were renamed to the spelling above (retryAfter -> retry_after_seconds,
+// window -> window_seconds). A renamed key is a byte sequence no signed record has carried, and this
+// is where a numeric detail's signer/verifier disagreement shows up rather than in the map the
+// engine returns — which is all the enforcement-side tests can see.
+func TestRateLimitedDenialFieldsSignAndVerifyRoundTrip(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	keyPath := filepath.Join(dir, "audit.key")
+
+	sink, err := Open(logPath, keyPath, 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	details := map[string]interface{}{
+		"limit":               10,
+		"current":             int64(11),
+		"window_seconds":      3600,
+		"retry_after_seconds": int64(2718),
+	}
+	sink.RecordDeny(context.Background(), "sess", "export", capability.MethodToolsCall,
+		capability.ErrCodeRateLimited, capability.ConditionTypeMaxCalls, details, false)
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	lines := logLines(t, logPath)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 record, got %d", len(lines))
+	}
+	var sb strings.Builder
+	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifierFor(t, keyPath), VerifyOptions{Out: &sb})
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if !res.OK() {
+		t.Fatalf("a RATE_LIMITED denial must verify cleanly; output:\n%s\nresult: %+v", sb.String(), res)
+	}
+
+	var rec struct {
+		Details map[string]interface{} `json:"details"`
+	}
+	if err := json.Unmarshal(lines[0], &rec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"limit", "current", "window_seconds", "retry_after_seconds"} {
+		if _, present := rec.Details[key]; !present {
+			t.Fatalf("the signed record must carry %q; got details %v", key, rec.Details)
+		}
+	}
+}

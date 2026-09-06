@@ -550,10 +550,10 @@ func TestServerRequestLegs_HoldNoSinkBesideTheirUnblocker(t *testing.T) {
 				}
 				legs++
 				for _, field := range st.Fields.List {
-					if ident, isIdent := field.Type.(*ast.Ident); !isIdent || ident.Name != "auditRecorder" {
+					if !namesATape(field.Type) {
 						continue
 					}
-					t.Errorf("%s:%d: this struct carries an %s beside its serverRequestUnblocker, which already holds the leg's tape; derive it (see serverRequestParams.recorder) rather than wiring a second copy that a hand-built literal can point at a different tape",
+					t.Errorf("%s:%d: this struct carries a %s beside its serverRequestUnblocker, which already holds the leg's tape; derive it (see serverRequestUnblocker.recorder) rather than wiring a second copy that a hand-built literal can point at a different tape",
 						src.name, src.fset.Position(field.Pos()).Line, exprText(src.fset, field.Type))
 				}
 				return true
@@ -563,14 +563,45 @@ func TestServerRequestLegs_HoldNoSinkBesideTheirUnblocker(t *testing.T) {
 	require.Positive(t, legs, "no struct carrying a serverRequestUnblocker was found in any non-test file; this guard would pass vacuously")
 }
 
-// hasFieldOfType reports whether st declares a field of the named package-local type.
+// hasFieldOfType reports whether st declares a field of the named type, held by value or by
+// pointer — a leg that spells its wiring `*serverRequestUnblocker` is the same leg.
 func hasFieldOfType(st *ast.StructType, name string) bool {
 	for _, field := range st.Fields.List {
-		if ident, isIdent := field.Type.(*ast.Ident); isIdent && ident.Name == name {
+		if typeBaseName(field.Type) == name {
 			return true
 		}
 	}
 	return false
+}
+
+// tapeCarryingTypes are the spellings of "this leg's audit sink" a struct field can hold. The
+// interface ALONE is not the guard: the sink these legs carried was produced as a *routeSink, which
+// is both the natural regression and the more dangerous one — a concrete pointer assigned directly
+// is the typed-nil trap asRecorder exists for, so `if rec := ...; rec != nil` is always true and the
+// RecordDeny behind it is a nil-receiver call.
+var tapeCarryingTypes = map[string]bool{"auditRecorder": true, "routeSink": true, "Sink": true, "MsgSink": true}
+
+// namesATape reports whether a field type is one of those, through any number of pointers.
+func namesATape(e ast.Expr) bool { return tapeCarryingTypes[typeBaseName(e)] }
+
+// typeBaseName renders a field's type down to its bare name, unwrapping pointers and parentheses
+// and dropping a package qualifier, so a guard matching on names cannot be stepped around by a
+// spelling. Anything else (a func, a map, a literal struct) has no base name.
+func typeBaseName(e ast.Expr) string {
+	for {
+		switch t := e.(type) {
+		case *ast.StarExpr:
+			e = t.X
+		case *ast.ParenExpr:
+			e = t.X
+		case *ast.SelectorExpr:
+			return t.Sel.Name
+		case *ast.Ident:
+			return t.Name
+		default:
+			return ""
+		}
+	}
 }
 
 // isMsgWriterFuncType reports whether e spells `func(mcp.RPCMsg) error`, the writer shape a leg must

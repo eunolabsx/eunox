@@ -17,7 +17,6 @@ import (
 	"os"
 	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2274,95 +2273,116 @@ func TestOriginRejection_BoundsRecordedOrigin(t *testing.T) {
 	}
 }
 
-// TestBoundedJoinedDetail_BoundsWhatItReadsAndReportsWhatItDropped covers the join half of the
-// same bound. checkOrigin builds its detail ABOVE the admission that may suppress the record, so a
-// suppressed refusal used to pay a whole-input UTF-8 walk plus a join of every header the peer
-// sent — the pre-admission waste refuseUnroutable restructures away, driven here at the peer's
-// send rate with no credential.
+// TestOriginRejection_PaddingCannotEraseTheSmuggledOrigin is the regression for a cut applied on
+// the wrong side of the sanitize pass.
 //
-// The verbatim flag is the half a cheaper bound gets wrong: joining under a cap and then comparing
-// the result against what survived the cap reports a DROPPED header as untouched.
-func TestBoundedJoinedDetail_BoundsWhatItReadsAndReportsWhatItDropped(t *testing.T) {
-	t.Parallel()
+// capability.TruncateUTF8 collapses each RUN of invalid bytes to ONE replacement character, so
+// bounding the raw bytes before that pass rather than after it hands the peer an eraser: prefix the
+// header with padding the collapse would have folded to three bytes and the whole rest of the value
+// falls outside the bound. Go passes bytes >= 0x80 through to the handler verbatim, so the padding
+// costs nothing to send.
+//
+// The stakes are on checkOrigin's own comment — several Origin headers are joined into the record
+// "so the smuggled header leaves a trace". A version that records "�" for both of these is
+// bounded, flagged, and useless.
+func TestOriginRejection_PaddingCannotEraseTheSmuggledOrigin(t *testing.T) {
+	padding := strings.Repeat("\x80", 4*maxRefusalDetailLen)
 
 	cases := []struct {
-		name         string
-		vals         []string
-		wantDetail   string
-		wantVerbatim bool
+		name   string
+		origin []string
+		want   string
 	}{
 		{
-			name:         "single short value is verbatim",
-			vals:         []string{"https://evil.example.com"},
-			wantDetail:   "https://evil.example.com",
-			wantVerbatim: true,
+			name:   "padding ahead of the real origin",
+			origin: []string{padding + "https://evil.example.com/steal"},
+			want:   "https://evil.example.com/steal",
 		},
 		{
-			name:         "several short values join whole",
-			vals:         []string{"http://localhost", "https://evil.example.com"},
-			wantDetail:   "http://localhost, https://evil.example.com",
-			wantVerbatim: true,
-		},
-		{
-			name:         "one oversized value is cut and flagged",
-			vals:         []string{strings.Repeat("a", 64*1024)},
-			wantDetail:   strings.Repeat("a", maxRefusalDetailLen),
-			wantVerbatim: false,
+			name:   "padding in a smuggled pair",
+			origin: []string{padding, "https://evil.example.com"},
+			want:   "https://evil.example.com",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, verbatim := boundedJoinedDetail(tc.vals)
-			if got != tc.wantDetail {
-				t.Errorf("detail = %q, want %q", got, tc.wantDetail)
+			sink, logPath := newTempAuditSink(t)
+			proxy := newHTTPProxy(httpProxyOptions{Bind: "127.0.0.1", Sink: sink, Stderr: io.Discard})
+
+			req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+			for _, v := range tc.origin {
+				req.Header.Add("Origin", v)
 			}
-			if verbatim != tc.wantVerbatim {
-				t.Errorf("verbatim = %v, want %v", verbatim, tc.wantVerbatim)
+			if proxy.checkOrigin(httptest.NewRecorder(), req) {
+				t.Fatal("checkOrigin allowed a foreign Origin")
+			}
+			_ = sink.Close()
+
+			r := findAuditRecordByMethod(readAuditRecords(t, logPath), "", "deny")
+			if r == nil {
+				t.Fatal("no ORIGIN_REJECTED deny record written")
+			}
+			details, _ := r["details"].(map[string]interface{})
+			got, _ := details["origin"].(string)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("details.origin = %q, want it to still carry %q: padding the header must not erase what the peer actually sent", got, tc.want)
+			}
+			if len(got) > maxRefusalDetailLen {
+				t.Errorf("details.origin is %d bytes, want at most %d", len(got), maxRefusalDetailLen)
 			}
 		})
 	}
-
-	// The header set a bounded join must not report as verbatim: every value fits on its own, the
-	// join does not, and the values past the cut never reach the detail at all.
-	many := make([]string, 200)
-	for i := range many {
-		many[i] = "https://evil" + strconv.Itoa(i) + ".example.com"
-	}
-	got, verbatim := boundedJoinedDetail(many)
-	if verbatim {
-		t.Error("a join that stopped short of the header set must not be reported as the verbatim text")
-	}
-	if len(got) > maxRefusalDetailLen {
-		t.Errorf("detail is %d bytes, want at most %d", len(got), maxRefusalDetailLen)
-	}
-	if !strings.HasPrefix(got, "https://evil0.example.com, https://evil1.example.com") {
-		t.Errorf("detail = %q, want the leading values of the rejected set", got)
-	}
 }
 
-// TestOriginRefusalDetail_AllocatesUnderTheBoundNotTheHeader is the cost property itself, which no
-// assertion on the recorded VALUE can catch: both the bounded and the unbounded build produce the
-// same 512-byte field, and only the bytes touched getting there tell them apart.
+// discardResponseWriter is an http.ResponseWriter that keeps no body, so a measurement of a refusal
+// path is not dominated by the recorder's own buffer growth.
+type discardResponseWriter struct{ header http.Header }
+
+func (d discardResponseWriter) Header() http.Header       { return d.header }
+func (discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (discardResponseWriter) WriteHeader(_ int)           {}
+
+// TestOriginRefusal_SuppressedRefusalBuildsNothing is the cost property F4 is about: a refusal the
+// bucket suppressed must not build the join, the sanitize walk or the details map at all.
 //
-// Measured rather than asserted structurally because the walk is inside strings.ToValidUTF8: an
-// edit that drops the cheap cut re-reads and re-allocates the whole ~1 MiB header per refused
-// frame, which shows up here as bytes-per-op in the megabytes.
-func TestOriginRefusalDetail_AllocatesUnderTheBoundNotTheHeader(t *testing.T) {
+// checkOrigin is pre-auth and runs at the peer's send rate while its category admits a couple of
+// records a second, so on the flood path the bucket exists for, everything built above the gate is
+// thrown away. The header here is INVALID UTF-8 on purpose: that is the input on which the sanitize
+// pass actually rewrites, and therefore the only one whose cost an allocation assertion can see —
+// over valid bytes the same walk copies nothing and costs 700+ microseconds instead, which is what
+// made an earlier version of this test pass against the very shape it was written to reject.
+func TestOriginRefusal_SuppressedRefusalBuildsNothing(t *testing.T) {
 	// Not parallel: allocation accounting is process-wide.
-	huge := []string{"https://evil.example.com/" + strings.Repeat("A", 1<<20)}
+	sink, _ := newTempAuditSink(t)
+	defer func() { _ = sink.Close() }()
+	proxy := newHTTPProxy(httpProxyOptions{Bind: "127.0.0.1", Sink: sink, Stderr: io.Discard})
+
+	// TWO headers, which is what isolates the half this is about: checkOrigin skips originAllowed
+	// entirely for a smuggled pair (`!multiple && ...`), so nothing but the refusal's own detail
+	// build touches the value. The residual that leaves is real and is NOT this test's subject —
+	// originAllowed runs url.Parse over a single Origin of any size, above every gate, and costs
+	// more than the build measured here.
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Add("Origin", "https://evil.example.com/"+strings.Repeat("\x80", 1<<20))
+	req.Header.Add("Origin", "https://evil.example.com")
+	w := discardResponseWriter{header: http.Header{}}
+
+	// Drain the category's burst so every measured call takes the suppressed path.
+	for range perCategoryDenyBurstSize + 1 {
+		proxy.checkOrigin(w, req)
+	}
 	res := testing.Benchmark(func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _ = boundedJoinedDetail(huge)
+			proxy.checkOrigin(w, req)
 		}
 	})
-	// Two orders of magnitude under the input, and far above what the bounded build needs, so
-	// this fails on the regression rather than on allocator noise.
+	// Two orders of magnitude under the header, so this fails on the regression rather than on
+	// allocator noise: building the detail above the gate copies the whole ~1 MiB per frame.
 	const maxBytesPerOp = 16 << 10
 	if got := res.AllocedBytesPerOp(); got > maxBytesPerOp {
-		t.Errorf("building the refusal detail for a %d-byte header allocated %d bytes/op, want at most %d: the bound is being applied after the scan, not before it",
-			len(huge[0]), got, maxBytesPerOp)
+		t.Errorf("a suppressed Origin refusal allocated %d bytes/op for a %d-byte header, want at most %d: the record's details are being built above the admission that discards them",
+			got, len(req.Header.Get("Origin")), maxBytesPerOp)
 	}
 }
 
@@ -4787,7 +4807,11 @@ func TestHTTPProxy_Serve_CancelContext(t *testing.T) {
 		sessions:   make(map[string]*httpSession),
 	}
 
+	// defer, not just the cancel below: waitForServer ends in t.Fatalf, which skips the rest of
+	// this function — so a bind that lost the freeTCPPort race would leave Serve holding the port
+	// and its goroutine for the remainder of the binary.
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	errCh := make(chan error, 1)
 	go func() { errCh <- proxy.Serve(ctx) }()
 

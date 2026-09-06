@@ -287,15 +287,15 @@ func (r refusalRecorders) forCategory(category refusalCategory) auditRecorder {
 // caller needs no second vocabulary for the half of a refusal that is not a record.
 func (r refusalRecorders) notices() noticeWriter { return r.limits.notices }
 
-// unmetered is this leg's tape with no category admission applied — the recorder for the records
-// that are NOT refusals (an allow, a policy verdict, the strict-audit gate's own reading), and nil
-// when the leg has no tape.
+// unmetered is this leg's tape with no category admission applied, and nil when it has none. It
+// exists so a leg holding this wiring needs no second copy of the sink beside it.
 //
-// It exists so a leg that already holds this wiring needs no SECOND copy of the sink beside it: two
-// independently filled fields naming one tape is a wiring fault nothing catches, and a params
-// struct that fills one splits that leg's records across two tapes. Deliberately not spelled
-// forCategory(someCategory): these records are not refusals, and metering a policy verdict is what
-// the exemption declaration exists to forbid.
+// It is NOT a way to write a refusal off the books, and what goes through it is not "the records
+// that are not refusals": the server-initiated leg's kill deny, its AUDIT_UNAVAILABLE deny and the
+// pool's RESOURCE_EXHAUSTED all reach it, and all three are refusals bounded — deliberately, and
+// from before this accessor existed — by something other than a category bucket (an established
+// caller's kill record is unmetered by declaration, the saturation record by its own episode gate).
+// A NEW refusal takes forCategory, which is where the declaration is read.
 func (r refusalRecorders) unmetered() auditRecorder { return r.rec }
 
 // admitRefusalRecord applies limiter's verdict for category to rec: nil when this record is

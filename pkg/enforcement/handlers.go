@@ -494,7 +494,8 @@ func (h maxCallsHandler) PrepareCommit(ctx context.Context, cond capability.Cond
 // the maxCalls rate limit and the cumulative blastRadius bound alike. A constant beside the helper
 // that computes the value, because the two sites spelled one concept two ways (camelCase here,
 // snake_case in the effect layer) and a client backing off had to know which condition denied it
-// before it could read the hint.
+// before it could read the hint. It is the ONLY key the two denials share: everything else they
+// report describes a different quantity and is named for it.
 const detailRetryAfterSeconds = "retry_after_seconds"
 
 // retryAfterSeconds converts a backend retry-after estimate to whole seconds (rounded up),
@@ -517,10 +518,11 @@ func retryAfterSeconds(d time.Duration, windowSec int) int64 {
 // maxCallsRateLimited builds the RATE_LIMITED ConditionError shared by the commit
 // and check-only maxCalls denial paths, keeping the Details shape identical.
 //
-// The two time-valued keys are snake_case and name their UNIT, matching the effect layer's
-// cumulative blastRadius denial (velocityExtras). Both quota denials compute them with the same
-// helper, so the camelCase spelling this used to write meant a SIEM rule or a backing-off client
-// needed two names for one concept depending on which condition denied.
+// The keys are snake_case and name their UNIT, the effect layer's convention. What is actually
+// SHARED with the cumulative blastRadius denial is retry_after_seconds alone (both compute it with
+// the helper above, so the camelCase spelling this used to write meant a backing-off client needed
+// two names for one value); velocityExtras keeps its own prefixed spellings for the bound, the
+// total and the window, which describe a magnitude rather than a call count.
 func maxCallsRateLimited(mc *capability.MaxCallsCondition, current, retryAfterSec int64) *ConditionError {
 	return &ConditionError{
 		Code:          capability.ErrCodeRateLimited,

@@ -192,13 +192,15 @@ func MsgKey(id *json.RawMessage) string {
 // losslessly (valid UTF-8, properly paired surrogates), catching what json.Unmarshal
 // silently maps to U+FFFD.
 //
-// It takes raw as it arrived rather than as valid JSON: the caller happens to short-circuit on a
-// successful Unmarshal today, which is what guarantees four hex digits after every `\u`, but that
-// contract lived nowhere and a reordered condition or a second caller turns the first escape probe
-// below into an index past the buffer — a panic on the message-parsing path, where it tears down
-// the proxy. The surrogate probe already carries its own bound; this one now does too, and a
-// truncated escape fails CLOSED, which is the honest answer as well: an id ending `\u12` does not
-// decode losslessly.
+// It takes raw as it arrived rather than as valid JSON. The caller happens to short-circuit on a
+// successful Unmarshal today, which is what guarantees four hex digits after every `\u` — but that
+// contract lived nowhere, and every place this function LEANED on it failed in the fail-OPEN
+// direction: a truncated `\u` indexed past the buffer (a panic on the message-parsing goroutine,
+// which tears down the proxy), a truncated ordinary escape walked past the end and returned
+// well-formed, and a non-hex `\u` left ParseUint's error discarded, so `hi` was 0, matched neither
+// surrogate arm, and skipped six bytes — stepping over the backslash of a genuine lone surrogate
+// and reporting the id lossless. Every malformed escape now fails CLOSED, which is also the honest
+// answer: none of them decodes losslessly.
 func stringIDIsWellFormed(raw []byte) bool {
 	if !utf8.Valid(raw) {
 		return false
@@ -207,11 +209,20 @@ func stringIDIsWellFormed(raw []byte) bool {
 		if raw[i] == '\\' {
 			// Only \uXXXX warrants a further look: it's the one escape that can
 			// encode a surrogate half.
-			if i+1 < len(raw) && raw[i+1] == 'u' {
+			if i+1 >= len(raw) {
+				return false // a trailing backslash escapes nothing
+			}
+			if raw[i+1] == 'u' {
 				if i+6 > len(raw) {
 					return false // truncated \u escape: no four hex digits to read
 				}
-				hi, _ := strconv.ParseUint(string(raw[i+2:i+6]), 16, 32)
+				// The error is CHECKED, not discarded: ParseUint answers 0 for a non-hex escape,
+				// which matches neither surrogate arm, so the blind skip below stepped over the
+				// backslash of whatever followed — including a real lone surrogate.
+				hi, err := strconv.ParseUint(string(raw[i+2:i+6]), 16, 32)
+				if err != nil {
+					return false
+				}
 				switch {
 				case hi >= 0xD800 && hi <= 0xDBFF:
 					// High surrogate: valid only when immediately followed by a \u low

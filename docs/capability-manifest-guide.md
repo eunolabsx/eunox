@@ -1265,9 +1265,12 @@ retrying while rate-limited does not extend its own lockout (and does not grow
 the counter's backing store). Each `RATE_LIMITED` denial carries a `retry_after_seconds`
 hint in its details (whole seconds until a slot frees up) so a well-behaved
 caller can back off instead of hammering the limit, beside `limit`, `current`
-and `window_seconds`. Those two time-valued keys are spelled the way the
-cumulative `blastRadius` denial spells its own, so a client backing off reads
-one name whichever quota refused it. They were previously `retryAfter` and
+and `window_seconds`. `retry_after_seconds` is spelled identically on the
+cumulative `blastRadius` denial, so a client backing off reads one name
+whichever quota refused it; the other keys are deliberately not shared, since
+`blastRadius` bounds a magnitude rather than a call count and names its own
+(`blast_radius_max_total`, `blast_radius_total`,
+`blast_radius_window_seconds`). These two were previously `retryAfter` and
 `window`; a SIEM rule or client reading the camelCase names needs updating.
 
 A `maxCalls` slot is consumed only when the call is allowed by **every** other

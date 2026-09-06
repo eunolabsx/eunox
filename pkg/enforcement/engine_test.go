@@ -42,6 +42,7 @@ import (
 	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
+	"github.com/eunolabs/eunox/pkg/flowlabelstore"
 )
 
 // Both built-in counter backends must satisfy the full capability.CallCounter
@@ -7794,11 +7795,59 @@ func TestSequenceBlock_RecordFailureAuditModeIsAuditOnly(t *testing.T) {
 	assert.True(t, resp.AuditOnly, "recording failure under audit mode must be AuditOnly")
 }
 
+// addFailingFlowStore is a FlowLabelStore whose WRITE fails while its read succeeds, which is what
+// drives recordSourceCall's flow leg to fault after the peek has already passed.
+type addFailingFlowStore struct{ capability.FlowLabelStore }
+
+func (addFailingFlowStore) Add(_ context.Context, _ string, _ ...string) error {
+	return errors.New("flow store write failed (test probe)")
+}
+
+// TestCommitFailure_BothArmsCarryTheObligations pins the convention the two arms of one
+// recordSourceCall failure now share.
+//
+// They describe the SAME event — a call whose accumulated state could not be committed — and used
+// to disagree about what the response carried, each with its own rationale comment. Neither is
+// forwarded (both carry the FAULT code, which no observing route downgrades), so nothing is
+// redacted either way and the question is only what a caller inspecting the response sees; the
+// answer must not depend on which of the two namespaces faulted.
+//
+// The FLOW arm is the one that shipped untested. Its sibling, the sequenceBlock arm, is covered
+// below.
+func TestCommitFailure_BothArmsCarryTheObligations(t *testing.T) {
+	engine := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(addFailingFlowStore{FlowLabelStore: flowlabelstore.NewInMemory()}),
+	)
+	matched := &capability.Constraint{
+		Target:  "tool:get_secret",
+		Actions: []string{"call"},
+		Directives: []capability.Directive{
+			capability.LabelOutputDirective{Labels: []string{capability.FlowLabelConfidential}},
+			&capability.RedactFieldsDirective{Fields: []string{"$.result.secret_value"}},
+		},
+	}
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "get_secret"}
+
+	resp := engine.EvaluateConditions(context.Background(), req, matched)
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, capability.ConditionTypeFlowLabel, resp.Denial.ConditionType,
+		"a failed label write must be attributed to the flow layer, not to sequenceBlock")
+	assert.Equal(t, capability.ErrCodeEnforcementError, resp.Denial.Code)
+	assert.False(t, resp.Denial.Downgradable(),
+		"a state commit that did not happen is not a verdict an observing route may forward")
+	require.Len(t, resp.Obligations, 1,
+		"the flow arm must carry what would have applied, exactly as its sequenceBlock sibling does")
+	assert.Equal(t, capability.DirectiveTypeRedactFields, resp.Obligations[0].Type)
+}
+
 // TestSequenceBlock_RecordFailureAuditModePreservesObligations asserts that an
 // audit-mode recording-path failure preserves the obligations already collected
-// from the matched constraint (e.g. redactFields). Because the AuditOnly denial
-// is forwarded to upstream, dropping the obligations would leak fields the
-// manifest marked for redaction.
+// from the matched constraint (e.g. redactFields) — the sibling half of the
+// convention above. Nothing is forwarded (the FAULT code is not downgradable,
+// AuditOnly or not), so what this pins is that the response still states what
+// would have applied rather than that a redaction runs.
 func TestSequenceBlock_RecordFailureAuditModePreservesObligations(t *testing.T) {
 	engine := enforcement.New(enforcement.WithCallCounter(recordingErrorCounter{}))
 	matched := &capability.Constraint{

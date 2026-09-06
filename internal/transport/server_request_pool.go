@@ -95,8 +95,7 @@ type serverRequestDispatch struct {
 	// obligation, and a sixth thing this leg needs is then declared once instead of at both
 	// transports' literals, where a keyed literal zero-fills whichever is missed.
 	//
-	// The saturation record's own sink comes from it too (see recorder): a recorder field beside
-	// it would be a second, independently-filled copy of one leg's tape.
+	// The saturation record's own sink comes from it too. See serverRequestUnblocker.recorder.
 	unblocker serverRequestUnblocker
 	// handle is the server-initiated request's handler, run on its own goroutine.
 	handle func(context.Context, mcp.RPCMsg)
@@ -105,14 +104,6 @@ type serverRequestDispatch struct {
 	// so without this an established session's refusals recorded no revision at all — which on
 	// this tape means "written before one could be resolved".
 	revision capability.Revision
-}
-
-// recorder is this leg's tape for the saturation refusal, or nil when it has none. Derived from the
-// unblocker's own wiring rather than held beside it, exactly as serverRequestParams.recorder is: an
-// upstream that floods this leg is refused and answered through that wiring, and the record saying
-// so belongs on the same tape.
-func (d serverRequestDispatch) recorder() auditRecorder {
-	return d.unblocker.report.recs.unmetered()
 }
 
 // dispatchServerRequest is the ENTRY both transports take for one server-initiated request: refuse
@@ -155,7 +146,7 @@ func (p *serverRequestPool) dispatch(ctx context.Context, msg mcp.RPCMsg, d serv
 		// refusal is recorded as a new episode rather than folded into the last one.
 		p.saturation.clear()
 	default:
-		recordResourceExhausted(ctx, d.recorder(), &p.saturation, d.sessionID, msg.Method)
+		recordResourceExhausted(ctx, d.unblocker.recorder(), &p.saturation, d.sessionID, msg.Method)
 		// Record-before-act, so the answer below is the one that may be lost rather than the
 		// record. Through the shared seam because it runs AFTER that record: a nil concrete writer
 		// would panic here and leave a tape reporting a refusal the process died delivering — and
