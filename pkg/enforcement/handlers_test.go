@@ -169,6 +169,103 @@ func TestSequenceBlock_PlainAntecedentName_WritesSingleMarker(t *testing.T) {
 	assert.Equal(t, capability.DecisionAllow, resp.Decision, "a prompt-namespaced antecedent must not match a tool of the same bare name")
 }
 
+// TestSequenceBlock_BlockedTargetNamedWithARecognizedToken_ReportsTheRealName is the
+// regression for a signed-tape field naming a target that does not exist.
+//
+// The blocked-target resolution took req.Target.Name only as a FALLBACK for an empty prefix
+// split, inverting the rule every sibling applies (sessionTargetName/resolveRequestTarget prefer
+// Target.Name VERBATIM, precisely because a target whose own name begins with a recognized token
+// would otherwise have that token stripped). So a resource named "system:config" was denied and
+// recorded as blockedTool "resource:config" — a target no manifest names and no bucket is keyed
+// on — in the HMAC-signed audit detail and in the operator-facing message.
+//
+// The decision was never affected; the name on the record was.
+func TestSequenceBlock_BlockedTargetNamedWithARecognizedToken_ReportsTheRealName(t *testing.T) {
+	t.Parallel()
+	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	ctx := context.Background()
+
+	require.NoError(t, engine.RecordSessionCall(ctx, &capability.EnforceRequest{
+		SessionID:  "sess",
+		TargetName: "read_credentials",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
+	}))
+
+	// A resource whose NAME begins with the recognized "system" token. Both fields carry it,
+	// which is what every ManifestPDP entry point builds.
+	blockedReq := &capability.EnforceRequest{
+		SessionID:  "sess",
+		TargetName: "system:config",
+		Target:     &capability.EnforceRequestTarget{Type: "resource", Name: "system:config"},
+	}
+	blocked := &capability.Constraint{
+		Target:  "resource:system:config",
+		Actions: []string{"read"},
+		Conditions: []capability.Condition{
+			&capability.SequenceBlockCondition{AfterTools: []string{"read_credentials"}},
+		},
+	}
+	resp := engine.EvaluateConditions(ctx, blockedReq, blocked)
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	assert.Equal(t, "resource:system:config", resp.Denial.Details["blockedTool"],
+		"the signed detail must name the target that was blocked, not one with its leading token stripped")
+	assert.Contains(t, resp.Denial.Message, `"system:config"`,
+		"the operator-facing message must name the same target the detail does")
+}
+
+// And the property behind that name, stated without naming a literal: whatever blockedTool
+// reports must be the spelling that ADDRESSES the target's own history — an afterTools entry
+// copied verbatim off the record has to trip the gate. That is what makes a signed field name a
+// target that exists rather than a plausible-looking string, and it is what the inverted
+// resolution broke: "resource:config" addresses nothing.
+func TestSequenceBlock_ReportedBlockedNameIsTheNameTheHistoryIsKeyedOn(t *testing.T) {
+	t.Parallel()
+	engine := enforcement.New(enforcement.WithCallCounter(callcounter.NewInMemory()))
+	ctx := context.Background()
+
+	resource := func() *capability.EnforceRequest {
+		return &capability.EnforceRequest{
+			SessionID:  "sess",
+			TargetName: "system:config",
+			Target:     &capability.EnforceRequestTarget{Type: "resource", Name: "system:config"},
+		}
+	}
+	// Arm a block ON the resource to read the name it is reported under...
+	require.NoError(t, engine.RecordSessionCall(ctx, &capability.EnforceRequest{
+		SessionID:  "sess",
+		TargetName: "read_credentials",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_credentials"},
+	}))
+	resp := engine.EvaluateConditions(ctx, resource(), &capability.Constraint{
+		Target:  "resource:system:config",
+		Actions: []string{"read"},
+		Conditions: []capability.Condition{
+			&capability.SequenceBlockCondition{AfterTools: []string{"read_credentials"}},
+		},
+	})
+	require.Equal(t, capability.DecisionDeny, resp.Decision)
+	require.NotNil(t, resp.Denial)
+	reported, _ := resp.Denial.Details["blockedTool"].(string)
+	require.NotEmpty(t, reported)
+
+	// ...then record that same resource as an ANTECEDENT and address it with the reported name.
+	require.NoError(t, engine.RecordSessionCall(ctx, resource()))
+	resp = engine.EvaluateConditions(ctx, &capability.EnforceRequest{
+		SessionID:  "sess",
+		TargetName: "write_external",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "write_external"},
+	}, &capability.Constraint{
+		Target:  "tool:write_external",
+		Actions: []string{"call"},
+		Conditions: []capability.Condition{
+			&capability.SequenceBlockCondition{AfterTools: []string{reported}},
+		},
+	})
+	assert.Equal(t, capability.DecisionDeny, resp.Decision,
+		"an afterTools entry copied verbatim from blockedTool (%q) must address the same target's history", reported)
+}
+
 // extCaps builds a single tool:read_file capability gated by an allowedExtensions
 // condition on the "path" argument with the given allowlist.
 func extCaps(extensions []string) []capability.Constraint {

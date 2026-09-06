@@ -10,7 +10,6 @@
 package transport
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -187,23 +186,7 @@ var testHTTPClient = &http.Client{Timeout: 30 * time.Second}
 // rpcMsg body.  Optional sessionID is set as the Mcp-Session-Id header.
 func postMCP(t *testing.T, srv *httptest.Server, msg mcp.RPCMsg, sessionID string) *http.Response {
 	t.Helper()
-	data, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/mcp", bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if sessionID != "" {
-		req.Header.Set(SessionHeader, sessionID)
-	}
-	resp, err := testHTTPClient.Do(req)
-	if err != nil {
-		t.Fatalf("do request: %v", err)
-	}
-	return resp
+	return postMCPWithHeaders(t, srv, msg, sessionID, nil)
 }
 
 // decodeRPC decodes a JSON-RPC message from an HTTP response body.

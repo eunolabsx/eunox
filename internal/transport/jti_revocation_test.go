@@ -4,15 +4,22 @@
 package transport
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/killswitch"
 )
 
@@ -130,8 +137,8 @@ func TestRevocationReclaim_FollowsARotatedCredential(t *testing.T) {
 	require.NotNil(t, sess)
 	// Established on one credential...
 	sess.claims = &pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-first"}
-	// ...then a request arrives on a rotated one, same subject so the owner binding passes.
-	sess.noteRequestAnchor(&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-rotated"})
+	// ...then a message arrives on a rotated one, same subject so the owner binding passes.
+	sess.noteLiveTokenID(&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-rotated"})
 
 	// An unrelated credential still reclaims nothing.
 	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-unrelated"))
@@ -168,7 +175,7 @@ func TestRevocationReclaim_StillFollowsTheEstablishingCredential(t *testing.T) {
 	sess := proxy.getSession(sid)
 	require.NotNil(t, sess)
 	sess.claims = &pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-first"}
-	sess.noteRequestAnchor(&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-rotated"})
+	sess.noteLiveTokenID(&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-rotated"})
 
 	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-first"))
 	proxy.sweepKilledSessions()
@@ -184,7 +191,220 @@ func TestRevocationReclaim_AnUntokenedRequestDoesNotClearTheAssociation(t *testi
 	sess.noteLiveTokenID(nil)
 	sess.noteLiveTokenID(&pdp.JWTClaims{})
 
-	live := sess.liveTokenID.Load()
-	require.NotNil(t, live, "a request with no token must leave the last known credential in place")
-	assert.Equal(t, "jti-held", *live)
+	held := sess.liveTokenIDs.Load()
+	require.NotNil(t, held, "a request with no token must leave the known credentials in place")
+	assert.Equal(t, []string{"jti-held"}, *held)
+}
+
+// A rotation this proxy only ever sees on NON-ENFORCED traffic must still be reclaimable.
+//
+// The live-id association used to ride on the anchor-span latch, which is deliberately
+// enforced-only (it describes state a decision commits). So a client that rotated its bearer and
+// then spoke only */list, ping, a re-initialize or a notification recorded nothing: revoking the
+// token it was actually presenting denied every request — the data plane decides from each
+// request's own claims — while neither reclaim arm matched it, leaving the upstream subprocess,
+// the maxSessions slot and the SSE stream pinned until process exit under sessionIdleTimeoutMs: 0.
+// Driven end to end through the real POST path, since the gap was in WHERE the recording was
+// called from, which a direct call to the recorder cannot see.
+func TestRevocationReclaim_FollowsARotationSeenOnlyOnNonEnforcedTraffic(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           newTestManifestPDPWithKS(ks),
+		KS:            ks,
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	// Stands in for the JWT middleware: the jti a request names becomes its validated claims, so
+	// the credential reaches the leg the way a real one does.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if jti := r.Header.Get(testJTIHeader); jti != "" {
+			r = r.WithContext(pdp.WithJWTClaims(r.Context(),
+				&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: jti}))
+		}
+		proxy.handleMCP(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sid := initSession(t, srv)
+	sess := proxy.getSession(sid)
+	require.NotNil(t, sess)
+	// Established on one credential; same subject below, so the owner binding passes.
+	sess.claims = &pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-first"}
+
+	// The premise, asserted rather than assumed: tools/list is answered by the list-filter leg,
+	// not a Decide handler, so this POST commits no anchored state and takes no span latch.
+	listCtx := capability.WithProtocolRevision(context.Background(), capability.Revision20251125)
+	require.False(t, isEnforcedMethod(listCtx, capability.MethodToolsList),
+		"this test's whole point is a method the enforced-only predicate does not cover")
+
+	resp := postMCPWithHeaders(t, srv, mcp.RPCMsg{
+		JSONRPC: "2.0", ID: mcp.RawJSON(`2`), Method: capability.MethodToolsList,
+	}, sid, map[string]string{testJTIHeader: "jti-rotated"})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "tools/list on the rotated credential")
+	_ = resp.Body.Close()
+
+	// An unrelated revocation still reclaims nothing.
+	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-unrelated"))
+	proxy.sweepKilledSessions()
+	assert.Equal(t, 1, proxy.sessionCount(), "an unrelated revocation must not reclaim this session")
+
+	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-rotated"))
+	proxy.sweepKilledSessions()
+	waitForSessions(t, proxy, 0)
+}
+
+// A credential recorded by one leg must not be DROPPED by another presenting a different one.
+//
+// The association began as a single most-recent slot, which is last-writer-wins across legs that
+// have no ordering relationship. The SSE GET is the case that makes it bite: it writes once at
+// stream open and then holds for hours, so a stream carrying an older bearer than the session's
+// POSTs shadowed the credential every request was actually being decided against — and revoking
+// that one reclaimed nothing, which is the hole this whole mechanism exists to close.
+func TestRevocationReclaim_ALaterCredentialDoesNotDropAnEarlierOne(t *testing.T) {
+	t.Parallel()
+	sess := &httpSession{}
+	sess.noteLiveTokenID(&pdp.JWTClaims{TokenID: "jti-b"}) // a POST on the rotated bearer
+	sess.noteLiveTokenID(&pdp.JWTClaims{TokenID: "jti-a"}) // a stream re-opened on the older one
+
+	held := sess.liveTokenIDs.Load()
+	require.NotNil(t, held)
+	assert.Contains(t, *held, "jti-b", "the credential the session's requests run on was dropped by a later leg")
+	assert.Contains(t, *held, "jti-a")
+
+	// Re-presenting a credential already held writes nothing and duplicates nothing.
+	sess.noteLiveTokenID(&pdp.JWTClaims{TokenID: "jti-b"})
+	assert.Equal(t, []string{"jti-b", "jti-a"}, *sess.liveTokenIDs.Load())
+}
+
+// The set is bounded, and the bound discards OLDEST — the recent credentials are the ones a
+// revocation is likely to name, and the establishing one is matched separately from claims.
+func TestRevocationReclaim_TheCredentialSetIsBounded(t *testing.T) {
+	t.Parallel()
+	sess := &httpSession{}
+	for i := range maxLiveTokenIDs + 3 {
+		sess.noteLiveTokenID(&pdp.JWTClaims{TokenID: fmt.Sprintf("jti-%d", i)})
+	}
+	held := sess.liveTokenIDs.Load()
+	require.NotNil(t, held)
+	require.Len(t, *held, maxLiveTokenIDs, "an unbounded set is caller-driven growth")
+	assert.Equal(t, "jti-3", (*held)[0], "the bound must drop the oldest, not refuse the newest")
+	assert.Equal(t, fmt.Sprintf("jti-%d", maxLiveTokenIDs+2), (*held)[maxLiveTokenIDs-1])
+}
+
+// And every credential in the set is asked about, not just the newest: two streams under two
+// credentials of the same subject are both the session's, so revoking either must reclaim it.
+func TestRevocationReclaim_AsksAboutEveryHeldCredential(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	fake := newFakeUpstream()
+	upSrv := httptest.NewServer(http.StripPrefix("/mcp", fake))
+	t.Cleanup(upSrv.Close)
+	sink, _ := newTempAuditSink(t)
+	proxy := newHTTPProxy(httpProxyOptions{
+		UpstreamURL:   upSrv.URL,
+		PDP:           newTestManifestPDPWithKS(ks),
+		KS:            ks,
+		SessionIdleMs: 0,
+		Sink:          sink,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", proxy.handleMCP)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	sid := initSession(t, srv)
+	sess := proxy.getSession(sid)
+	require.NotNil(t, sess)
+	sess.claims = &pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-first"}
+	sess.noteLiveTokenID(&pdp.JWTClaims{TokenID: "jti-stream-a"})
+	sess.noteLiveTokenID(&pdp.JWTClaims{TokenID: "jti-stream-b"})
+
+	// Revoking the one that is NOT the most recent must still reclaim.
+	require.NoError(t, ks.RevokeJTI(context.Background(), "jti-stream-a"))
+	proxy.sweepKilledSessions()
+	waitForSessions(t, proxy, 0)
+}
+
+// testJTIHeader carries the jti the claims-injecting handler above turns into validated claims.
+const testJTIHeader = "X-Test-Jti"
+
+// postMCPWithHeaders is postMCP with extra host headers — here, the credential a request presents.
+// postMCP delegates to it rather than the two keeping separate request builders, so a change to
+// how a test frames an MCP POST lands once; it goes through testHTTPClient for the same reason,
+// whose timeout is the backstop that makes a wedged proxy fail THIS test rather than the package.
+func postMCPWithHeaders(t *testing.T, srv *httptest.Server, msg mcp.RPCMsg, sessionID string, headers map[string]string) *http.Response {
+	t.Helper()
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/mcp", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if sessionID != "" {
+		req.Header.Set(SessionHeader, sessionID)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := testHTTPClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	return resp
+}
+
+// The SSE GET leg records its credential too. It carries no JSON-RPC envelope, so it is not a
+// method the enforced-only predicate could ever have covered — and holding a stream open is
+// exactly how a client presents a rotated bearer while doing nothing else, while an SSE
+// subscriber is what spares the session from the idle reaper.
+func TestRevocationReclaim_TheSSEGetRecordsItsCredential(t *testing.T) {
+	t.Parallel()
+	proxy := newTestHTTPProxy()
+	route := newBareTestRoute()
+	done := make(chan struct{})
+	// Idempotent and deferred: a failed assertion below returns before the inline close, leaving
+	// the SSE handler goroutine parked on a session nothing tears down for the rest of the
+	// binary's life.
+	endSession := sync.OnceFunc(func() { close(done) })
+	defer endSession()
+	sess := newTestSession(&httpSession{
+		id: "w1", route: route, done: done, established: make(chan struct{}),
+	})
+	proxy.mu.Lock()
+	proxy.sessions[sess.id] = sess
+	proxy.mu.Unlock()
+	sess.markEstablished()
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Set(SessionHeader, sess.id)
+	req = req.WithContext(pdp.WithJWTClaims(req.Context(),
+		&pdp.JWTClaims{AgentID: "agent-1", Subject: "user@example.com", TokenID: "jti-rotated"}))
+	w := httptest.NewRecorder()
+	streaming := make(chan struct{})
+	go func() {
+		defer close(streaming)
+		proxy.handleMCPGet(w, req, route)
+	}()
+	require.Eventually(t, sess.hasSubscribers, 2*time.Second, 5*time.Millisecond,
+		"the SSE stream never opened")
+
+	held := sess.liveTokenIDs.Load()
+	require.NotNil(t, held, "the SSE GET presented a credential and recorded none")
+	assert.Contains(t, *held, "jti-rotated")
+
+	endSession()
+	select {
+	case <-streaming:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the SSE GET never returned after its session ended")
+	}
 }

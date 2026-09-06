@@ -15,6 +15,7 @@ import (
 	"math"
 	"net/http"
 	"os/exec"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,8 +99,8 @@ type httpSession struct {
 	// decisions (e.g. sampling/createMessage) have no host request in scope, so they're
 	// attributed to these claims instead.
 	claims *pdp.JWTClaims
-	// liveTokenID is the `jti` of the most recent token a request on this session presented,
-	// which is NOT necessarily the one in claims above.
+	// liveTokenIDs holds the `jti`s of tokens messages on this session have presented, which
+	// are NOT necessarily the one in claims above.
 	//
 	// claims is captured once, at initialize. A client may rotate its bearer mid-session — the
 	// owner binding compares `sub`, which survives rotation — and the reclaim sweep would then
@@ -108,10 +109,20 @@ type httpSession struct {
 	// reclaim nothing, pinning the upstream and the maxSessions slot until exit under
 	// sessionIdleTimeoutMs: 0, which is the configuration the on-delivery reclaim exists for.
 	//
-	// Stored per request rather than by refreshing claims: claims is the identity the
+	// A SET, not the single most-recent slot this started as: the legs that present a credential
+	// have no ordering relationship, so one slot is last-writer-wins across them and a write can
+	// DROP a credential the session is still running on — an SSE GET writes once at stream open
+	// and then holds for hours, so a stream on an older bearer shadowed the one every POST was
+	// decided against. Accumulating also matches two concurrent streams under two credentials.
+	//
+	// Bounded, and the bound DISCARDS OLDEST: an unbounded set is caller-driven growth, and the
+	// credentials worth keeping are the recent ones — the establishing credential is held
+	// separately in claims and matched on its own, so it is never what falls off.
+	//
+	// Stored per message rather than by refreshing claims: claims is the identity the
 	// server-initiated leg decides against and the owner binding compares, and re-pointing it
 	// mid-session would change both. This is only ever read by the reclaim predicate.
-	liveTokenID atomic.Pointer[string]
+	liveTokenIDs atomic.Pointer[[]string]
 
 	// clientIP is captured at initialize; it's what an ipRange condition on the sampling
 	// opt-in evaluates against, since server-initiated sampling has no host request in scope.
@@ -334,8 +345,10 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
 // cur is the request's own validated claims, the same input the engine's key builder resolves its
 // anchor from — so for a request that reaches dispatch, "the claims present at POST time" and
 // "the anchor the request resolved" are one answer, not two that could disagree.
+//
+// The reclaim association is not recorded here: it answers a different question on a wider
+// predicate, and folding it in tied it to this one. See noteLiveTokenID.
 func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
-	s.noteLiveTokenID(cur)
 	rt := s.route
 	if rt == nil || !rt.taskAnchored {
 		return
@@ -345,17 +358,51 @@ func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 	}
 }
 
-// noteLiveTokenID records the credential this request presented, for the reclaim predicate.
-// See liveTokenID for why the session's captured claims are not enough.
+// maxLiveTokenIDs bounds the credentials one session's reclaim set retains. Rotation is an
+// operator- or IdP-paced event and the concurrent-stream case needs a handful, so a small bound
+// covers every real client while keeping the set caller-bounded; the establishing credential is
+// matched separately from claims and is never what falls off.
+const maxLiveTokenIDs = 8
+
+// noteLiveTokenID records the credential this message presented, for the reclaim predicate.
+// See liveTokenIDs for why the session's captured claims are not enough, and why this accumulates
+// rather than replacing.
+//
+// Called for every host message this proxy admits on an established session, enforced or not: the
+// span latch is about state a DECISION writes, while this is about which credentials the session
+// has been used with, and every message presents one. See the threat model (§3.3) for what riding
+// on the enforced-only predicate left unreclaimable.
+//
+// Call sites sit BELOW the session gates, so a sender who may not act on this session cannot add a
+// credential to it. A DELETE is not one: it tears the session down itself.
 func (s *httpSession) noteLiveTokenID(cur *pdp.JWTClaims) {
 	if cur == nil || cur.TokenID == "" {
-		// An absent id is not recorded: leaving the previous one in place keeps the session
-		// reclaimable on the credential it was last KNOWN to hold, where clearing it would
-		// make a request with no token a way to shed the association.
+		// An absent id records nothing: the set is what the session is KNOWN to have held, and
+		// letting a token-less message touch it would make one a way to shed the association.
 		return
 	}
-	id := cur.TokenID
-	s.liveTokenID.Store(&id)
+	for {
+		held := s.liveTokenIDs.Load()
+		if held != nil && slices.Contains(*held, cur.TokenID) {
+			return // already associated; the common case, and it writes nothing at all
+		}
+		next := make([]string, 0, maxLiveTokenIDs)
+		if held != nil {
+			// Drop oldest first when at the bound.
+			if from := len(*held) + 1 - maxLiveTokenIDs; from > 0 {
+				next = append(next, (*held)[from:]...)
+			} else {
+				next = append(next, *held...)
+			}
+		}
+		next = append(next, cur.TokenID)
+		// CAS rather than Store: two legs write concurrently (a POST and an SSE GET open), and
+		// a plain store would drop the credential the loser had just added — the shape the set
+		// exists to prevent.
+		if s.liveTokenIDs.CompareAndSwap(held, &next) {
+			return
+		}
+	}
 }
 
 // spansAnchors reports whether this session has resolved a state anchor other than the one its
@@ -1061,15 +1108,23 @@ func (p *HTTPProxy) sessionKilled(s *httpSession) bool {
 	if killDenial(s.route.pdp.CheckKill(ctx, s.id)) {
 		return true
 	}
-	// Asked a second time for the credential the session is CURRENTLY presenting, when that
-	// differs from the one it was established with. See liveTokenID: a rotated bearer would
-	// otherwise leave the session denied on every request and reclaimed by nothing.
-	live := s.liveTokenID.Load()
-	if live == nil || s.claims != nil && *live == s.claims.TokenID {
+	// Asked again for each credential the session has been used with that differs from the one
+	// it was established with. See liveTokenIDs: a rotated bearer would otherwise leave the
+	// session denied on every request and reclaimed by nothing.
+	held := s.liveTokenIDs.Load()
+	if held == nil {
 		return false
 	}
-	rotated := *s.claimsWithTokenID(*live)
-	return killDenial(s.route.pdp.CheckKill(pdp.WithJWTClaims(context.Background(), &rotated), s.id))
+	for _, id := range *held {
+		if s.claims != nil && id == s.claims.TokenID {
+			continue // already asked above
+		}
+		rotated := *s.claimsWithTokenID(id)
+		if killDenial(s.route.pdp.CheckKill(pdp.WithJWTClaims(context.Background(), &rotated), s.id)) {
+			return true
+		}
+	}
+	return false
 }
 
 // claimsWithTokenID copies the session's captured claims with the token id replaced, so the

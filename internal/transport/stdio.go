@@ -200,6 +200,13 @@ type StdioProxy struct {
 	// waitHostForwardOrShutdown can skip the waiter goroutine when the barrier is already
 	// drained — the common case for a notification-heavy host.
 	fwdHostInFlight atomic.Int64
+	// hostHandlers counts dispatched host handlers that have not RETURNED, which is a
+	// different span from the barrier above: that one is released at the wire, so it reads
+	// zero while a handler is still processing the upstream's reply. Teardown needs the
+	// longer span — the list leg touches the Tier-2 baseline after callUpstream returns —
+	// so this is what awaitHostDecisionsDrained waits on. The stdio counterpart of
+	// httpSession.inFlight, which HTTP likewise holds for the whole handler.
+	hostHandlers atomic.Int64
 
 	// upstreamTornDown marks that teardown has begun forcing the upstream down, so the
 	// reader can tell an upstream fault from the consequence of this proxy's own shutdown.
@@ -544,15 +551,21 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 }
 
 // awaitHostDecisionsDrained blocks until no dispatched host request is still mid-decision, or
-// until timeout elapses, so teardown does not clear per-session flow state out from under a
-// sink still deciding (the stdio analogue of httpSession.awaitInFlightDrained). A no-op when
-// decideGate is nil, since ReleaseSession is itself a no-op then. Bounded and poll-based:
-// teardown must never hang on a wedged handler.
+// until timeout elapses, so teardown does not clear per-session state out from under a handler
+// still deciding (the stdio analogue of httpSession.awaitInFlightDrained). Bounded and
+// poll-based: teardown must never hang on a wedged handler.
+//
+// Runs for every session, not just a flow-serialized one, and waits on hostHandlers rather than
+// on the wire-order barrier. Two premises were wrong. ReleaseSession is not a no-op without a
+// decision gate: it also drops the Tier-2 interface baseline, which exists independently of
+// NeedsDecisionTurn. And fwdHostInFlight is released at the WIRE (see releaseHostForward), so it
+// reads zero while a handler is still processing the reply — where the list leg re-reads and
+// rewrites that baseline. Between them, teardown could clear the baseline under a live tools/list,
+// whose filter then re-baselines the surface it was supposed to diff against: a changed surface
+// neither hidden nor denied, the fail-open direction. On an already-drained counter this costs one
+// atomic load.
 func (p *StdioProxy) awaitHostDecisionsDrained(timeout time.Duration) {
-	if p.decideGate == nil {
-		return
-	}
-	awaitDrained(&p.fwdHostInFlight, timeout)
+	awaitDrained(&p.hostHandlers, timeout)
 }
 
 // awaitServerRequestsDrained blocks until every dispatched SERVER-initiated handler has
@@ -1093,8 +1106,10 @@ func (p *StdioProxy) serveHost(ctx context.Context) {
 				p.fwdHostWrites.Done()
 			})
 			wg.Add(1)
+			p.hostHandlers.Add(1)
 			go func(m mcp.RPCMsg, serialized bool, ticket decisionTicket) {
 				defer wg.Done()
+				defer p.hostHandlers.Add(-1)
 				defer func() { <-p.hostSem }()
 				defer release()
 				hctx := context.WithValue(ctx, fwdReleaseKey{}, release)
