@@ -498,10 +498,13 @@ func validateOpenerResultFields(method string, result mcp.InitResult, requireVer
 // characters through the same rule a peer's takes: it is a startup diagnostic, and an unbounded
 // one would put an upstream in control of the console.
 func checkNegotiatedRevision(opened capability.Revision, reported string) (notice string, err error) {
-	// An opener built with no explicit revision opened at the default, the same resolution
-	// every other empty carrier takes; judging on the strength of an empty string would name a
-	// revision no caller chose.
-	opened = resolveRevision(opened)
+	// Through UpstreamOpenRevision — the resolver that SELECTED the opener — rather than
+	// resolveRevision, which answers the host side's empty-carrier question. See
+	// upstreamAddressedRevision: the two agree only while DefaultRevision is the handshake
+	// revision, and the day the default advances this check would judge a conforming handshake
+	// reply against a revision the leg was never opened at. It also settles the unset and the
+	// unspeakable pin identically, which is what the opener already did with them.
+	opened = UpstreamOpenRevision(opened)
 	// Nothing stated is nothing to judge. Only a declaring leg reaches this with an empty
 	// string — the handshake opener's own result validation requires the member before this
 	// runs — and that revision negotiates no version, so silence there is conformance.

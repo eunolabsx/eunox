@@ -45,11 +45,13 @@ import (
 )
 
 // serverRequestLegs is ONE transport's drop-leg vocabulary for this seam: which site a record names
-// for each of the four ways a server-initiated request can be failed here.
+// for each way a server-initiated request can be failed here.
 //
-// One value per transport rather than four leg parameters threaded through the helpers: the four
-// dispositions are the same four on both transports, and a call site that carries only one of them
-// is how a displacement came to be recordable under the refusal leg.
+// One value per transport rather than a leg parameter per disposition threaded through the helpers:
+// the dispositions are the same on both transports, and a call site that carries only one of them
+// is how a displacement came to be recordable under the refusal leg. The field set is walked
+// reflectively by the guard that keeps each table naming its own transport, so a field added here
+// is covered by construction rather than by a reader remembering to extend a list.
 type serverRequestLegs struct {
 	// displaced: the bounded tracker made room, or an upstream reused an id.
 	displaced transportLeg
@@ -62,21 +64,32 @@ type serverRequestLegs struct {
 	// fact from refusal, carrying a different category (the host actually produced that work),
 	// which is why one leg field cannot serve both.
 	reply transportLeg
+	// undelivered: nothing on the host side would take the request at forward time. Not the
+	// tracker's doing and not a refusal of eunox's, so it is neither of the two above.
+	undelivered transportLeg
+	// untranslatable: the host's revision has no server-initiated requests at all, so the leg
+	// refuses every method on it. Its own site because its record shares a DENIAL CODE with the
+	// host-side revision refusal, leaving nothing else on the tape to tell the two apart.
+	untranslatable transportLeg
 }
 
 // The two transports' leg sets.
 var (
 	httpServerRequestLegs = serverRequestLegs{
-		displaced:    dropHTTPDisplaced,
-		unroutableID: dropHTTPUnroutableID,
-		refusal:      dropHTTPRefusalUndeliverable,
-		reply:        dropHTTPReplyUndeliverable,
+		displaced:      dropHTTPDisplaced,
+		unroutableID:   dropHTTPUnroutableID,
+		refusal:        dropHTTPRefusalUndeliverable,
+		reply:          dropHTTPReplyUndeliverable,
+		undelivered:    dropHTTPForwardUndelivered,
+		untranslatable: dropHTTPUntranslatableLeg,
 	}
 	stdioServerRequestLegs = serverRequestLegs{
-		displaced:    dropStdioDisplaced,
-		unroutableID: dropStdioUnroutableID,
-		refusal:      dropStdioRefusalUndeliverable,
-		reply:        dropStdioReplyUndeliverable,
+		displaced:      dropStdioDisplaced,
+		unroutableID:   dropStdioUnroutableID,
+		refusal:        dropStdioRefusalUndeliverable,
+		reply:          dropStdioReplyUndeliverable,
+		undelivered:    dropStdioForwardUndelivered,
+		untranslatable: dropStdioUntranslatableLeg,
 	}
 )
 
@@ -338,6 +351,21 @@ const (
 	// dropHTTPUndelivered: buffered onto a subscriber channel that never reached the host (the
 	// client disconnected, or the SSE write failed).
 	dropHTTPUndelivered transportLeg = "http-server-request-undelivered"
+	// dropHTTPForwardUndelivered / dropStdioForwardUndelivered: nothing took the request at
+	// FORWARD time — no SSE subscriber accepted it, or the stdio host writer failed the frame.
+	// Distinct from dropHTTPUndelivered above, which corrects a request already buffered and
+	// therefore already recorded as an allow: these two are the whole record for a request the
+	// host never had, and they are charged on their own category (catUndeliveredForward), which
+	// a shared leg value would make unrecoverable from a suppression rollup.
+	dropHTTPForwardUndelivered  transportLeg = "http-server-request-forward-undelivered"
+	dropStdioForwardUndelivered transportLeg = "stdio-server-request-forward-undelivered"
+	// dropHTTPUntranslatableLeg / dropStdioUntranslatableLeg: the host's revision replaced
+	// server-initiated requests with a client-driven exchange, so the leg refuses every method on
+	// it. Named on the record because its denial code is the same UNTRANSLATABLE_ACROSS_REVISIONS
+	// the HOST-side refusal writes, and telling those two apart is the whole reason this refusal
+	// has a bucket of its own.
+	dropHTTPUntranslatableLeg  transportLeg = "http-server-request-untranslatable"
+	dropStdioUntranslatableLeg transportLeg = "stdio-server-request-untranslatable"
 	// dropHTTPDisplaced / dropStdioDisplaced: the tracker made room, or an id collided. Distinct
 	// from undelivered because the request may well have reached the host — what failed is eunox's
 	// ability to route the answer back.
@@ -392,16 +420,10 @@ func recordServerRequestDropped(ctx context.Context, rec auditRecorder, subj kil
 	// would stamp a policy target onto the signed tape for a request the PDP never saw — and
 	// sampling/createMessage, the method most likely to be dropped on this leg, resolves one.
 	identifier, name := auditIdentity(mcp.RPCMsg{Method: method})
-	details := subj.auditDetails(nil)
-	// An UNSET leg names no site, and an empty member of a closed vocabulary is worse on a signed
-	// tape than an absent key: it matches no SIEM filter and reads like a record written before the
-	// vocabulary existed. Every production caller passes a constant; this is what keeps a future one
-	// that forgets from stamping a blank.
-	if drop != "" {
-		details = subj.auditDetails(map[string]interface{}{detailTransport: string(drop)})
-	}
+	// An UNSET leg names no site; transportLegDetail is where that rule lives, shared with the
+	// undelivered-forward record so the two spellings of "which site failed this" cannot disagree.
 	rec.RecordDeny(ctx, subj.auditSessionID(), identifier, name, capability.ErrCodeEnforcementError, "",
-		details, false)
+		subj.auditDetails(transportLegDetail(drop)), false)
 }
 
 // trackServerRequest records msg as an outstanding server-initiated request on this leg and

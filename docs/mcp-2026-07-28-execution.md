@@ -253,10 +253,17 @@ that session creation on first request is unimplemented rather than being told t
 its revision removed.
 
 **Session creation on the first enforced request has since landed too.** A 2026-07-28 host is now
-SERVED over HTTP with no `initialize` anywhere in the exchange. The worker is keyed on the
-resolved state anchor (`enforcement.ResolveStateAnchor`, route-namespaced) — the same subject
-stateful policy keys on, so the worker map and the accumulated state cannot disagree about a
-request, and a rotated credential lands on the same worker because `jti` stays revocation-only.
+SERVED over HTTP with no `initialize` anywhere in the exchange. The worker is keyed on the caller's
+stable identity resolved under the route's own state anchor (`enforcement.ResolveStateAnchor`,
+route-namespaced) — the same subject stateful policy keys on, so the worker map and the accumulated
+state cannot disagree about a request, and a rotated credential lands on the same worker because
+`jti` stays revocation-only. On the session arm the identity IS the anchor; on a task-anchored route
+the two are distinct and BOTH are in the key, so one identity working on two tasks gets two workers
+and two identities sharing a task get their own rather than colliding on one whose owner binding
+then refuses all but the first. Sharing an anchor is sharing state, which the engine keys on the
+anchor itself; it was never sharing the upstream and the captured claims a worker owns. The id is
+bounded as a WHOLE as well as per component, at the bound `/control/kill` applies to a session id —
+a worker whose own id exceeds it is one the targeted emergency stop cannot name.
 The kill gate, the audience pin and `--require-audit=strict` all run BEFORE the upstream is
 spawned, and a first request re-enters through the established-session arm rather than growing a
 creating path's own copy of the per-request gates.

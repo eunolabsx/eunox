@@ -313,7 +313,7 @@ func (c *gateCache) releaser(e *cachedGate) func() {
 
 // close releases every reference this cache holds and stops it admitting anything more.
 //
-// Called from releaseSessionState, on the one funnel every teardown passes through and
+// Called from releaseSessionObjectState, on the one funnel every teardown passes through and
 // AFTER the in-flight drains — the same placement and reasons as the pinned gate's own
 // drop: a session whose upstream exits on its own never reaches close(), and a reference
 // returned while a request is still taking turns on the gate would let the registry

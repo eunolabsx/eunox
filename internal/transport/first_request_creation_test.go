@@ -50,7 +50,7 @@ func TestFirstRequestCreation_ADeclaringHostIsServedWithNoHandshake(t *testing.T
 	// revision's business, pinned per route, and independent of what the host speaks.)
 	identity, ok := stableCallerIdentity(&pdp.JWTClaims{Subject: "agent-1", AgentID: "agent-1"})
 	require.True(t, ok)
-	sess := h.proxy.getSession(workerKey("", enforcement.ResolveStateAnchor(false, false, "", identity)))
+	sess := h.proxy.getSession(workerKey("", enforcement.ResolveStateAnchor(false, false, "", identity), identity))
 	require.NotNil(t, sess, "no worker was minted under the request's resolved state anchor")
 
 	// And the retired header is neither required nor returned.
@@ -101,7 +101,7 @@ func TestFirstRequestCreation_TheWorkerKeyIsTheStateAnchor(t *testing.T) {
 	require.True(t, ok)
 	identity, ok := stableCallerIdentity(base)
 	require.True(t, ok)
-	assert.Equal(t, workerKey("r1", enforcement.ResolveStateAnchor(false, false, "", identity)), key,
+	assert.Equal(t, workerKey("r1", enforcement.ResolveStateAnchor(false, false, "", identity), identity), key,
 		"the worker key must be the resolved state anchor, or the worker map and the policy state disagree about a request")
 	// Printable throughout: this string becomes the worker's id and is signed into the audit
 	// record's session_id, which is sanitized on the way — a control rune would be recorded as
@@ -251,6 +251,13 @@ func newDeclaringHostHarness(t *testing.T) *declaringHostHarness {
 // that assert on what a refusal RECORDED rather than on what it answered.
 func newDeclaringHostHarnessWithTape(t *testing.T) *declaringHostHarness {
 	t.Helper()
+	return newDeclaringHostHarnessAnchored(t, false)
+}
+
+// newDeclaringHostHarnessAnchored is the same harness on a TASK-anchored route, for the cells
+// about the arm whose anchor is not the caller.
+func newDeclaringHostHarnessAnchored(t *testing.T, taskAnchored bool) *declaringHostHarness {
+	t.Helper()
 	h := &declaringHostHarness{seen: map[string]mcp.RPCMsg{}, key: newTestKey(t, "k1")}
 
 	fake := newFakeUpstream()
@@ -276,18 +283,21 @@ func newDeclaringHostHarnessWithTape(t *testing.T) *declaringHostHarness {
 	t.Cleanup(upSrv.Close)
 
 	h.ks = killswitch.NewInMemory()
-	inner := newTestManifestPDPWithKS(h.ks, capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
+	// Route AND engine from the one flag, as BuildRoutes pairs them: a harness that anchored only
+	// the route would exercise a disagreement production cannot produce.
+	inner := newTestManifestPDPAnchored(h.ks, taskAnchored, capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
 	jwtPDP, cleanup := makeJWTPDPWithInner(t, h.key, inner)
 	t.Cleanup(cleanup)
 
 	sink, logPath := newTempAuditSink(t)
 	h.sink, h.logPath = sink, logPath
 	h.proxy = newHTTPProxy(httpProxyOptions{
-		UpstreamURL: upSrv.URL,
-		PDP:         jwtPDP,
-		JWTPDP:      jwtPDP,
-		KS:          h.ks,
-		Sink:        sink,
+		UpstreamURL:  upSrv.URL,
+		PDP:          jwtPDP,
+		JWTPDP:       jwtPDP,
+		KS:           h.ks,
+		Sink:         sink,
+		TaskAnchored: taskAnchored,
 	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", h.proxy.handleMCP)
@@ -337,6 +347,13 @@ func (h *declaringHostHarness) call(t *testing.T, agentID, method, params string
 	return h.callWithToken(t, h.tokenFor(t, agentID), method, params)
 }
 
+// callAs makes one declaring request bearing a token for a distinct subject working on taskID —
+// the shape a task-anchored route exists to serve.
+func (h *declaringHostHarness) callAs(t *testing.T, subject, taskID, method, params string) declaringResponse {
+	t.Helper()
+	return h.callWithToken(t, h.tokenForTask(t, subject, taskID), method, params)
+}
+
 func (h *declaringHostHarness) callWithToken(t *testing.T, token, method, params string) declaringResponse {
 	t.Helper()
 	declared := params[:len(params)-1] + `,"_meta":{"` + capability.MetaKeyProtocolVersion + `":"` + capability.Revision20260728.String() + `"}}`
@@ -371,6 +388,15 @@ func (h *declaringHostHarness) callWithToken(t *testing.T, token, method, params
 // tokenFor mints a bearer carrying the mcp.agent_id claim the worker key is derived from.
 func (h *declaringHostHarness) tokenFor(t *testing.T, agentID string) string {
 	t.Helper()
+	return h.tokenForTask(t, agentID, "")
+}
+
+// tokenForTask is tokenFor plus the validated mcp.task_id a task-anchored route resolves its
+// anchor from. Empty leaves the claim genuinely ABSENT (the field is omitempty), which is both the
+// ordinary session-anchored token and the input the engine's anchorUnresolved arm is about — a
+// present-but-empty claim would pass whatever that arm did.
+func (h *declaringHostHarness) tokenForTask(t *testing.T, agentID, taskID string) string {
+	t.Helper()
 	sig, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.ES256, Key: h.key.priv},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", h.key.kid),
@@ -379,7 +405,7 @@ func (h *declaringHostHarness) tokenFor(t *testing.T, agentID string) string {
 	now := time.Now()
 	token, err := jwt.Signed(sig).
 		Claims(jwt.Claims{Subject: agentID, IssuedAt: jwt.NewNumericDate(now), Expiry: jwt.NewNumericDate(now.Add(time.Hour))}).
-		Claims(idpJWTPayloadForTest{MCP: mcpClaimSetForTest{Version: mcpClaimVersionForTest, AgentID: agentID}}).
+		Claims(idpJWTPayloadForTest{MCP: mcpClaimSetForTest{Version: mcpClaimVersionForTest, AgentID: agentID, TaskID: taskID}}).
 		Serialize()
 	require.NoError(t, err)
 	return token
@@ -1064,4 +1090,123 @@ func awaitAnswer(t *testing.T, answered chan struct{}) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("never returned after establishment ended in teardown")
 	}
+}
+
+// Two identities sharing a validated task get two workers, and both are served.
+//
+// This is the shape task anchoring exists for — "two sessions sharing a task share a turn" — and
+// the worker key used to discard the identity on that arm: the anchor is the task ALONE, so the
+// first caller minted the worker and every request from the second resolved the same key and was
+// refused by ownerMismatch. Permanently, under sessionIdleTimeoutMs: 0, for entirely legitimate
+// traffic.
+//
+// Sharing an anchor was never sharing a worker. A worker owns an upstream and the claims captured
+// with it; the STATE two identities share on one task is keyed by the engine on the anchor itself,
+// which no key here can change.
+func TestFirstRequestCreation_TwoIdentitiesOnOneTaskAreNotLockedOut(t *testing.T) {
+	t.Parallel()
+	h := newDeclaringHostHarnessAnchored(t, true)
+
+	first := h.callAs(t, "alice", "task-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+	require.Equal(t, http.StatusOK, first.status, "body: %s", first.body)
+
+	second := h.callAs(t, "bob", "task-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+	assert.Equal(t, http.StatusOK, second.status, "body: %s", second.body)
+	assert.NotContains(t, second.body, capability.ErrCodeAuthorizationFailed,
+		"a second identity on a shared task was refused on the first identity's worker")
+	assert.Contains(t, second.body, `"result"`, "the second identity's call must be served")
+	assert.Equal(t, 2, h.proxy.sessionCount(), "two identities sharing a task must get their own workers")
+
+	// And the task still SEPARATES workers for one identity: the arm's own reason for keying on
+	// the anchor at all, which the identity must not have collapsed.
+	other := h.callAs(t, "alice", "task-2", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+	require.Equal(t, http.StatusOK, other.status, "body: %s", other.body)
+	assert.Equal(t, 3, h.proxy.sessionCount(), "one identity on two tasks must get two workers")
+
+	// Repeat traffic still JOINS rather than forking: the key is stable, not merely distinct.
+	again := h.callAs(t, "bob", "task-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+	require.Equal(t, http.StatusOK, again.status, "body: %s", again.body)
+	assert.Equal(t, 3, h.proxy.sessionCount(), "a repeat request minted a second worker for one identity and task")
+}
+
+// The task-anchored worker key carries BOTH dimensions, asserted on the key itself.
+//
+// The end-to-end cell above proves the lockout is gone; this one pins why, because the failure it
+// guards is silent in the other direction too: a key that dropped the TASK would hand one identity
+// spanning two tasks a single worker whose sampling leg then refuses for the session's life.
+func TestFirstRequestCreation_TheTaskAnchoredWorkerKeyCarriesTheIdentityToo(t *testing.T) {
+	t.Parallel()
+	route := &UpstreamRoute{name: "r1", taskAnchored: true}
+	keyFor := func(sub, task string) string {
+		ctx := pdp.WithJWTClaims(context.Background(),
+			&pdp.JWTClaims{Issuer: "https://idp", Subject: sub, AgentID: "agent-1", TaskID: task})
+		key, ok := firstRequestWorkerKey(route, ctx)
+		require.True(t, ok)
+		return key
+	}
+
+	alice, bob := keyFor("alice", "task-1"), keyFor("bob", "task-1")
+	assert.NotEqual(t, alice, bob,
+		"the worker key must be at least as fine as ownerMismatch, which compares (iss, sub)")
+	assert.NotEqual(t, alice, keyFor("alice", "task-2"), "the task must still separate one identity's workers")
+	assert.Equal(t, alice, keyFor("alice", "task-1"), "the key must be stable, or every request forks an upstream")
+
+	// Still printable and injective, which is the property workerKey owns: the id is signed into
+	// the audit record's session_id through SanitizeAuditField.
+	assert.Equal(t, alice, audit.SanitizeAuditField(alice))
+
+	// The SESSION arm is unchanged, byte for byte: its anchor already IS the identity, so there is
+	// nothing to append and the shipped default keeps the ids it had.
+	sessionOnly := &UpstreamRoute{name: "r1"}
+	ctx := pdp.WithJWTClaims(context.Background(),
+		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1", TaskID: "task-1"})
+	key, ok := firstRequestWorkerKey(sessionOnly, ctx)
+	require.True(t, ok)
+	identity, ok := stableCallerIdentity(pdp.JWTClaimsPtr(ctx))
+	require.True(t, ok)
+	assert.Equal(t, "r1:"+string(enforcement.AnchorKindSession)+":"+safeKeyComponent(identity), key)
+}
+
+// Separate workers still SHARE the task's accumulated state, which is the claim the split rests on.
+//
+// Giving two identities their own worker is only correct if it does not fragment what they share:
+// a worker owns an upstream and the claims captured with it, while quotas, flow labels and
+// antecedents accrue to the ANCHOR, which the engine resolves for itself from each request's
+// claims. If that were not so, the fix for the lockout would have bought availability by quietly
+// widening every budget on a task-anchored route.
+//
+// Driven through the PDP the route holds, anchored the way BuildRoutes anchors it, with the worker
+// keys asserted distinct in the same cell so the two facts are read together.
+func TestFirstRequestCreation_SeparateWorkersStillShareTheTaskBudget(t *testing.T) {
+	t.Parallel()
+	route := &UpstreamRoute{name: "r1", taskAnchored: true}
+	dp := newTestManifestPDPAnchored(killswitch.NewInMemory(), true, capability.Constraint{
+		Target:     "tool:read_file",
+		Actions:    []string{"call"},
+		Conditions: []capability.Condition{&capability.MaxCallsCondition{Count: 1, WindowSeconds: 60}},
+	})
+	claimsFor := func(sub, task string) *pdp.JWTClaims {
+		return &pdp.JWTClaims{Issuer: "https://idp", Subject: sub, AgentID: "agent-1", TaskID: task}
+	}
+	call := func(claims *pdp.JWTClaims) capability.EnforceResponse {
+		key, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), claims))
+		require.True(t, ok)
+		return dp.Decide(pdp.WithJWTClaims(context.Background(), claims), key,
+			pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"}, map[string]interface{}{}, "")
+	}
+
+	alice, bob := claimsFor("alice", "task-1"), claimsFor("bob", "task-1")
+	aliceKey, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), alice))
+	bobKey, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), bob))
+	require.NotEqual(t, aliceKey, bobKey, "the two identities must hold their own workers")
+
+	require.Equal(t, capability.DecisionAllow, call(alice).Decision, "the first call spends the task's one-call budget")
+	dec := call(bob)
+	assert.Equal(t, capability.DecisionDeny, dec.Decision,
+		"a second identity on the same task was served past a budget the task had already spent; the worker split fragmented the anchor's state")
+
+	// And a DIFFERENT task is a different budget, so the assertion above is about the anchor
+	// rather than about a globally exhausted counter.
+	assert.Equal(t, capability.DecisionAllow, call(claimsFor("carol", "task-2")).Decision,
+		"a distinct task must carry its own budget")
 }

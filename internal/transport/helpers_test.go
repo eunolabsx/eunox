@@ -21,6 +21,7 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -137,7 +138,7 @@ func makeJWKSServer(t *testing.T, keys ...testKey) *httptest.Server {
 type mcpClaimSetForTest struct {
 	Version      string    `json:"v"`
 	Capabilities *[]string `json:"capabilities,omitempty"` // nil ⟹ field absent
-	TaskID       string    `json:"task_id"`
+	TaskID       string    `json:"task_id,omitempty"`
 	AgentID      string    `json:"agent_id"`
 }
 
@@ -253,12 +254,35 @@ func newTestManifestPDP(caps ...capability.Constraint) *pdp.ManifestPDP {
 // kill-switch manager, for tests that pre-arm kills or share the manager
 // with a JWT wrapper.
 func newTestManifestPDPWithKS(ks killswitch.Manager, caps ...capability.Constraint) *pdp.ManifestPDP {
+	return newTestManifestPDPAnchored(ks, false, caps...)
+}
+
+// newTestManifestPDPAnchored is newTestManifestPDPWithKS with the engine anchored as a route is.
+//
+// Production derives BOTH from one value (BuildRoutes passes cfg.ResolvedTaskAnchoredState to
+// LoadUpstreamPDP and to the route), so a harness that anchors only the route runs a route/engine
+// disagreement production cannot produce — the very thing the worker key and the decision turn
+// resolve through one resolver to prevent.
+// The unanchored engine is built with NO options, byte-identical to what every other cell in this
+// package has always got: adding one for the anchored cells' sake would change what a quota
+// condition does in a hundred tests that never asked for a counter.
+func newTestManifestPDPAnchored(ks killswitch.Manager, taskAnchored bool, caps ...capability.Constraint) *pdp.ManifestPDP {
 	manifest := &config.LocalManifest{
 		Name:         "test-policy",
 		Version:      "1.0.0",
 		Capabilities: caps,
 	}
-	return pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(), ks)
+	var opts []enforcement.Option
+	if taskAnchored {
+		// The counter travels with the anchoring rather than being wired separately: anchored
+		// state is what a budget accrues to, and an engine with no counter hard-denies every
+		// quota condition, so the two would only ever be set together.
+		opts = []enforcement.Option{
+			enforcement.WithTaskAnchoredState(),
+			enforcement.WithCallCounter(callcounter.NewInMemory()),
+		}
+	}
+	return pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(opts...), ks)
 }
 
 // auditToolEntry is a tool entry in audit mode whose allowedValues condition
@@ -325,6 +349,10 @@ type httpProxyOptions struct {
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
 
+	// TaskAnchored mirrors the route's WithTaskAnchoredState setting: its decisions, its
+	// decision turn and its worker keys resolve on the validated mcp.task_id claim.
+	TaskAnchored bool
+
 	// Stderr, when set, captures this proxy's diagnostic lines instead of the real
 	// os.Stderr — the injectable-writer seam a test asserting on a startup/lifecycle line
 	// uses instead of swapping the process-global (see HTTPProxy.stderr).
@@ -358,6 +386,7 @@ func newHTTPProxy(opts httpProxyOptions) *HTTPProxy {
 		pdp:                     opts.PDP,
 		audit:                   opts.Audit,
 		driftCheck:              opts.DriftCheck,
+		taskAnchored:            opts.TaskAnchored,
 		sink:                    &routeSink{sink: opts.Sink},
 	}
 	return NewHTTPProxyGateway(HTTPGatewayOptions{
@@ -390,3 +419,16 @@ var errKillSwitchFailed = &ksTestError{"kill switch backend unavailable"}
 type ksTestError struct{ msg string }
 
 func (e *ksTestError) Error() string { return e.msg }
+
+// releaseSessionStateForTest tears a session's per-session state down the way a teardown does,
+// for a cell that holds a session directly and never went through the proxy's cleanup goroutine.
+//
+// It SKIPS the last-owner gate finishSessionCleanup applies, which is the whole reason it is a
+// test helper rather than a second production funnel: an unconditional id-keyed release is the
+// fail-open twin of an unconditional delete (a predecessor unparking after 2x shutdownMs would
+// un-quarantine a live successor's broken surface pin and empty its taint set), and a name that
+// reads like the production path is what the next caller would reach for.
+func releaseSessionStateForTest(sess *httpSession) {
+	releaseSessionObjectState(sess)
+	releaseSessionIDState(sess)
+}

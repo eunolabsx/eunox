@@ -136,3 +136,37 @@ func TestUndeliveredServerRequest_SuppressionDoesNotElideAnotherCategory(t *test
 	assert.Nil(t, refusalLimits{records: lim}.recorders(rec).forCategory(catUndeliveredForward),
 		"its own bucket must be the one that is empty after %d admitted writes", drained)
 }
+
+// TestUndeliveredServerRequest_RecordNamesItsSite: the not-delivered deny names the transport leg
+// it was written on, like every other drop record this leg produces.
+//
+// It was the one that did not. That matters precisely because the record is METERED: when the
+// bucket suppresses, the next admitted record carries the suppressed_refusal_scope rollup, and a
+// record naming no site leaves the category it rolls up unrecoverable — the misreading the scope
+// stamp exists to prevent. Per transport, because the fact differs: no SSE subscriber accepted it,
+// or the stdio host writer failed the frame.
+func TestUndeliveredServerRequest_RecordNamesItsSite(t *testing.T) {
+	t.Parallel()
+	for name, legs := range map[string]serverRequestLegs{
+		"http":  httpServerRequestLegs,
+		"stdio": stdioServerRequestLegs,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rec := &fwdRecorder{}
+			fp := undeliveredLeg(rec, newRefusalRecordLimiterFor([]refusalCategory{catUndeliveredForward}))
+			fp.unblocker.report.legs = legs
+			floodUndelivered(fp, 1)
+
+			require.Len(t, rec.records, 1)
+			assert.Equal(t, "deny", rec.records[0].decision)
+			assert.Equal(t, string(legs.undelivered), rec.records[0].details[detailTransport],
+				"the not-delivered deny must name its site, or a suppression rollup rides a record whose category cannot be recovered")
+		})
+	}
+
+	// Distinctness across the vocabulary is NOT re-asserted here: TestTransportLeg_IsOneClosedVocabulary
+	// derives that from the declared constants and TestServerRequestLegs_EachTableNamesItsOwnTransport
+	// walks each table's fields reflectively, so a hand-listed copy here would cover a subset and go
+	// stale at the next disposition.
+}

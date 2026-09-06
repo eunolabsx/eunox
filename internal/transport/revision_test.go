@@ -447,6 +447,34 @@ func TestCheckNegotiatedRevision(t *testing.T) {
 	}
 }
 
+// TestCheckNegotiatedRevision_ResolvesThroughTheOpenersResolver pins WHICH resolver settles an
+// unset leg revision here.
+//
+// upstreamAddressedRevision states the rule and its reason: an unset leg revision resolves through
+// UpstreamOpenRevision — the resolver that SELECTED the opener — not through resolveRevision, which
+// answers the host side's empty-carrier question and lands on capability.DefaultRevision. The two
+// agree only while the default IS the handshake revision, so this cell is written against the
+// resolver rather than against today's shared value: the day the default advances, an in-tree
+// caller's `ApplyUpstreamOpenerResult("")` would open with the handshake opener while this check
+// judged the reply against the new default, refusing a conforming handshake.
+func TestCheckNegotiatedRevision_ResolvesThroughTheOpenersResolver(t *testing.T) {
+	t.Parallel()
+	for _, pin := range []capability.Revision{"", "1999-01-01"} {
+		opened := UpstreamOpenRevision(pin)
+		if _, err := checkNegotiatedRevision(pin, opened.String()); err != nil {
+			t.Errorf("pin %q opened at %s; a reply naming that revision must not be refused: %v", pin, opened, err)
+		}
+		for _, other := range capability.PublishedRevisions() {
+			if other == opened {
+				continue
+			}
+			if _, err := checkNegotiatedRevision(pin, other.String()); err == nil {
+				t.Errorf("pin %q opened at %s; a reply naming %s must be refused", pin, opened, other)
+			}
+		}
+	}
+}
+
 // TestCheckNegotiatedRevision_BoundsTheReflectedVersion: the notice echoes an
 // upstream-controlled string to an operator's console, so it must be bounded and stripped of
 // anything a terminal would act on — the same rule the host-side -32022 refusal applies to a

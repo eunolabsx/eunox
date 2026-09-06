@@ -107,7 +107,7 @@ func TestGateCache_SpanningSessionStopsReenteringTheRegistry(t *testing.T) {
 	sess.beginDecisionTurn(taskCtx("task-1"))()
 	assert.Equal(t, 1, sess.decideCache.size(), "the pinned anchor never enters the cache")
 
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 	assert.Zero(t, rt.decideGates.size(), "teardown returns every reference, pinned and cached alike")
 	assert.Zero(t, sess.decideCache.size())
 }
@@ -122,7 +122,7 @@ func TestGateCache_CachedGateIsTheRegistrysGate(t *testing.T) {
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
 	a := spanningSession(t, rt, "sess-a", "task-1")
 	b := spanningSession(t, rt, "sess-b", "task-9")
-	t.Cleanup(func() { releaseSessionState(a); releaseSessionState(b) })
+	t.Cleanup(func() { releaseSessionStateForTest(a); releaseSessionStateForTest(b) })
 
 	// Both sessions span onto task-7, so both are served from their own caches.
 	ctx := taskCtx("task-7")
@@ -166,7 +166,7 @@ func TestGateCache_EvictionNeverDropsAGateInUse(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
 	sess := spanningSession(t, rt, "sess-a", "own")
-	t.Cleanup(func() { releaseSessionState(sess) })
+	t.Cleanup(func() { releaseSessionStateForTest(sess) })
 
 	victim := taskCtx("task-victim")
 	end := sess.beginDecisionTurn(victim) // held for the whole test: the entry has a user
@@ -230,7 +230,7 @@ func TestGateCache_CapBoundsWhatOneSessionPins(t *testing.T) {
 	// One session gate for the pin plus the capped cache, never one per anchor ever seen.
 	assert.Equal(t, maxCachedSessionGates+1, rt.decideGates.size())
 
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 	assert.Zero(t, rt.decideGates.size())
 }
 
@@ -241,8 +241,8 @@ func TestGateCache_CapBoundsWhatOneSessionPins(t *testing.T) {
 func TestGateCache_ReleasedOnEveryTeardownPath(t *testing.T) {
 	t.Parallel()
 	for name, teardown := range map[string]func(*httpSession){
-		"upstream exited on its own": func(s *httpSession) { releaseSessionState(s) },
-		"explicit close then reap":   func(s *httpSession) { s.close(0); releaseSessionState(s) },
+		"upstream exited on its own": func(s *httpSession) { releaseSessionStateForTest(s) },
+		"explicit close then reap":   func(s *httpSession) { s.close(0); releaseSessionStateForTest(s) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
@@ -259,7 +259,7 @@ func TestGateCache_ReleasedOnEveryTeardownPath(t *testing.T) {
 }
 
 // TestGateCache_TeardownRetiresAnEntryStillInUse is the teardown arm of the same hazard
-// eviction has. releaseSessionState drains in-flight requests first, but the drain is BOUNDED —
+// eviction has. releaseSessionObjectState drains in-flight requests first, but the drain is BOUNDED —
 // a handler wedged past the budget outlives it — so close() must not return a reference a
 // request is still queued on either. It retires such an entry instead, and the request that
 // leaves last is what returns it.
@@ -297,7 +297,7 @@ func TestGateCache_ShedsTheColdestEntry(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
 	sess := spanningSession(t, rt, "sess-a", "own")
-	t.Cleanup(func() { releaseSessionState(sess) })
+	t.Cleanup(func() { releaseSessionStateForTest(sess) })
 
 	// Fill the cache exactly, then keep using every entry EXCEPT task-1 — which leaves task-1
 	// the coldest by more than a full pass, and every other entry in rotation.
@@ -331,7 +331,7 @@ func TestGateCache_KeepsEntriesStillInRotation(t *testing.T) {
 	t.Parallel()
 	rt := &UpstreamRoute{decideGates: newAnchorGates(), taskAnchored: true, pdp: pdp.DenyAllPDP{}}
 	sess := spanningSession(t, rt, "sess-a", "own")
-	t.Cleanup(func() { releaseSessionState(sess) })
+	t.Cleanup(func() { releaseSessionStateForTest(sess) })
 
 	// One more live anchor than the cache can hold, cycled round-robin many times over.
 	cycle := append(fillTasks(), "task-overflow")
@@ -374,7 +374,7 @@ func TestGateCache_ClosedCacheStillServesTurns(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("the turn must advance once released")
 	}
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 	assert.Zero(t, rt.decideGates.size())
 }
 
@@ -403,7 +403,7 @@ func TestGateCache_ConcurrentMissesFileOneEntry(t *testing.T) {
 
 	assert.Equal(t, 1, sess.decideCache.size(), "one anchor, one entry, however many requests raced")
 	assert.Equal(t, 2, rt.decideGates.size(), "the pin plus one cached gate")
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 	assert.Zero(t, rt.decideGates.size(), "no surplus reference survives the race")
 }
 
@@ -441,7 +441,7 @@ func TestGateCache_AbandonedBoundedWaitReleasesItsUse(t *testing.T) {
 	assert.Nil(t, registryGate(rt.decideGates, spanned.Key()),
 		"an abandoned wait must return its use, so its entry can be shed and its gate reclaimed")
 
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 	assert.Zero(t, rt.decideGates.size())
 }
 
@@ -459,7 +459,7 @@ func TestGateCache_NonSerializedRouteCachesNothing(t *testing.T) {
 		end()
 	}
 	assert.Zero(t, sess.decideCache.size(), "nothing to cache without a registry to cache from")
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 }
 
 // TestGateCache_AcquireRejectsNilReceiverAndRegistry pins the two no-op guards directly: the

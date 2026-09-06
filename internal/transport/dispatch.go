@@ -1053,6 +1053,9 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 	if params.URI == "" {
 		return d.malformedDeny(ctx, msg, "resources/unsubscribe: uri must not be empty")
 	}
+	// The one Decide handler passing the raw ctx rather than d.decideCtx(ctx), and it is the
+	// absence of a reason rather than a missing one: decideCtx carries the observe-mode quota
+	// skip, and a cancel meters nothing to skip (that is what DecideResourceCancel means).
 	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.

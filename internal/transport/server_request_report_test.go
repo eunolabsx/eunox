@@ -199,11 +199,20 @@ func TestServerRequestLegs_EachTableNamesItsOwnTransport(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			// Fields walked REFLECTIVELY rather than hand-listed. The list is what left the fifth
+			// and sixth dispositions uncovered when they were added — every assertion below is
+			// exactly the one they needed — and a hand-written set fails silently in the direction
+			// this guard exists to catch.
+			v := reflect.ValueOf(tc.legs)
 			seen := map[transportLeg]bool{}
-			for field, leg := range map[string]transportLeg{
-				"displaced": tc.legs.displaced, "unroutableID": tc.legs.unroutableID,
-				"refusal": tc.legs.refusal, "reply": tc.legs.reply,
-			} {
+			for i := range v.NumField() {
+				field := v.Type().Field(i).Name
+				require.Equal(t, reflect.TypeOf(transportLeg("")), v.Type().Field(i).Type,
+					"%s.%s is not a transportLeg; this guard covers the leg vocabulary alone", tc.name, field)
+				// String(), not Interface(): the fields are unexported, which reflect lets a test
+				// READ but not box.
+				leg := transportLeg(v.Field(i).String())
+				assert.NotEmpty(t, leg, "%s.%s names no site; an empty member of a closed vocabulary matches no SIEM filter", tc.name, field)
 				assert.True(t, strings.HasPrefix(string(leg), tc.prefix),
 					"%s.%s is %q, which belongs to the other transport; a SIEM filter on this key would attribute the drop to the wrong leg", tc.name, field, leg)
 				assert.False(t, seen[leg], "%s.%s repeats %q; two dispositions sharing one leg value make them indistinguishable on the tape", tc.name, field, leg)

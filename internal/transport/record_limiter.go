@@ -32,9 +32,14 @@ const (
 	perCategoryDenyBurstSize  = 5
 )
 
-// refusalCategory is a distinct type (not a bare string) because a METERED category's value
-// doubles as both the rate-limit bucket key and the audit record's structured condition_type
-// field.
+// refusalCategory is a distinct type (not a bare string) because a category's value is the
+// rate-limit bucket key, and on the PRE-SESSION leg it doubles as the audit record's structured
+// condition_type field (recordRefusal writes it there). The server-request categories below do
+// not: those records leave condition_type empty and name their SITE in details.transport instead —
+// through recordServerRequestDropped for the tracker-side dispositions, and through the forward
+// leg's own record sites for the rest. So a value's spelling is load-bearing on the tape for part
+// of this set and only for the bucket for the rest, and what makes a suppression rollup readable
+// on the server-request half is the transport leg rather than this value.
 type refusalCategory string
 
 // The refusal categories. Every recordPreSessionDeny / recordSessionCapDeny call site
