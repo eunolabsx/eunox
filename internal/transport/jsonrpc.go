@@ -113,8 +113,9 @@ type serverReqTracker struct {
 	ids map[string]trackedServerRequest
 	// nextSeq stamps each tracked entry's arrival order, for the oldest-first eviction.
 	nextSeq uint64
-	// warned is the noticeOnce bound below, taken through the package's one latch primitive: only
-	// the first displacement is logged, so a sustained flood doesn't spam stderr.
+	// warned is the one-shot bound below, taken through the package's one latch primitive
+	// (noticeLatch): only the first displacement is logged, so a sustained flood doesn't spam
+	// stderr.
 	//
 	// It replaced an `evictions` tally compared against 1, and that tally is GONE rather than kept
 	// beside it: once the latch answered, nothing in production read the count — the per

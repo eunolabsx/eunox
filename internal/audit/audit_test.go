@@ -29,6 +29,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/eunolabs/eunox/pkg/capability"
 )
@@ -2264,6 +2265,85 @@ func TestBoundAuditDetails_Nested(t *testing.T) {
 	if arr[1].(string) == big {
 		t.Error("nested array string not truncated")
 	}
+}
+
+// TestBoundAuditDetails_UnmodelledContainerIsOwnedAndBounded: the arms of cloneAndBound name
+// the shapes a detail value usually has, and anything else used to be handed back as the
+// caller's own value -- so the "fresh storage at every level" contract held for six shapes
+// rather than for the function. flushDropMarker's map[string]int64 took that arm today (safe
+// only by inspection); a json.RawMessage is a named []byte, which `case []byte` does not
+// match, so it did too.
+func TestBoundAuditDetails_UnmodelledContainerIsOwnedAndBounded(t *testing.T) {
+	t.Parallel()
+
+	// A container the switch does not model, mutated after the clone: the queued copy must
+	// not follow it.
+	type ruleHits map[string]int
+	hits := ruleHits{"deny-writes": 3}
+	out, ok := cloneAndBound(map[string]interface{}{"hits": hits}).(map[string]interface{})
+	require.True(t, ok)
+	hits["deny-writes"] = 99
+	hits["allow-reads"] = 1
+	cloned, err := json.Marshal(out["hits"])
+	require.NoError(t, err)
+	require.JSONEq(t, `{"deny-writes":3}`, string(cloned), "the queued copy still aliased the caller's map")
+
+	// The emitted JSON is unchanged: an owned json.RawMessage re-marshals to the bytes it
+	// holds, so closing the aliasing gap did not change what lands on the tape.
+	verbatim, err := json.Marshal(map[string]interface{}{"hits": ruleHits{"deny-writes": 3}})
+	require.NoError(t, err)
+	whole, err := json.Marshal(out)
+	require.NoError(t, err)
+	require.JSONEq(t, string(verbatim), string(whole))
+
+	// Over the cap it is bounded per ELEMENT, like a modelled container: the oversized entry
+	// is replaced, its small siblings survive, and the field is still an object -- replacing
+	// the whole value would change its JSON type under a consumer that keys into it.
+	type ctx map[string]string
+	bounded, ok := cloneAndBound(map[string]interface{}{
+		"ctx": ctx{"big": strings.Repeat("x", auditDetailValueCap+1), "small": "keep-me"},
+	}).(map[string]interface{})
+	require.True(t, ok)
+	var got map[string]string
+	raw, err := json.Marshal(bounded["ctx"])
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &got), "an over-cap container must stay an object, got %s", raw)
+	require.Equal(t, "keep-me", got["small"], "a small sibling must survive the oversized entry")
+	require.True(t, IsOverCapValuePlaceholder(got["big"]), "placeholder = %q", got["big"])
+}
+
+// TestBoundAuditDetails_UnmodelledScalarKinds: a value of scalar kind is copied by the
+// interface holding it, so it is handed back as-is -- and a NAMED string type takes the
+// per-value cap here, which the `case string` arm cannot see. An unserializable value is
+// returned unchanged on purpose, so the whole-map marshal still fails on it and writes the
+// not_serializable marker rather than dropping one field from an otherwise complete record.
+func TestBoundAuditDetails_UnmodelledScalarKinds(t *testing.T) {
+	t.Parallel()
+
+	type denialCode string
+	type flag bool
+	out, ok := cloneAndBound(map[string]interface{}{
+		"code":  denialCode("CONDITION_FAILED"),
+		"flag":  flag(true),
+		"count": uint16(7),
+		"none":  nil,
+	}).(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, denialCode("CONDITION_FAILED"), out["code"])
+	require.Equal(t, flag(true), out["flag"])
+	require.Equal(t, uint16(7), out["count"])
+	require.Nil(t, out["none"])
+
+	over := cloneAndBound(map[string]interface{}{
+		"code": denialCode(strings.Repeat("x", auditDetailValueCap+1)),
+	}).(map[string]interface{})
+	placeholder, ok := over["code"].(string)
+	require.True(t, ok, "an over-cap named string must be replaced, got %T", over["code"])
+	require.True(t, IsOverCapValuePlaceholder(placeholder), "placeholder = %q", placeholder)
+
+	details := marshalAndBoundDetails(map[string]interface{}{"ch": make(chan int)})
+	require.Contains(t, string(details), auditTruncReasonNotSerializable,
+		"an unserializable value must still reach the whole-map marker")
 }
 
 // TestAuditRecord_OversizedArgumentStaysVerifiable is the end-to-end guard:

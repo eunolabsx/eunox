@@ -127,7 +127,8 @@ Usage:
   eunox validate     --config <eunox.yaml> [--live]
   eunox init         --upstream-url <url> [--output manifest.yaml] [--config-output eunox.yaml]
   eunox suggest      [--audit-log <path>] [--output manifest.yaml]
-  eunox kill         [--port N | --redis-addr H:P] <session-id|all>
+  eunox kill         [--port N] <session-id|all> | --session <id> | --jti <id>
+  eunox kill         --redis-addr H:P [--revive] <session-id|all> | --session/--agent/--jti <id>
   eunox audit-verify [flags]
   eunox stats        [flags]
   eunox contracts    [--dir <corpus-dir>] [--ref <contract-id>]
@@ -142,9 +143,11 @@ Subcommands:
   init            Generate a deny-all starter manifest (and, with --config-output, a runnable config) from a live upstream's tool list.
   suggest         Generate a draft manifest from the audit log — grounds entries (and allowedValues
                   conditions) in what the agent actually did. Run a wiretap (proxy --audit) first.
-  kill            Revoke one or all sessions on a running proxy — via the HTTP
-                  control endpoint, or with --redis-addr via the shared Redis
-                  kill switch (the only channel for a stdio proxy).
+  kill            Revoke a session, an agent identity (--agent), one issued bearer
+                  token (--jti) or the whole deployment ('all') on a running proxy —
+                  via the HTTP control endpoint, or with --redis-addr via the shared
+                  Redis kill switch (the only channel for a stdio proxy, and the only
+                  one that can --revive a revocation).
   audit-verify    Verify HMAC signatures in the local audit log.
   stats           Print a denial count histogram from the audit log.
   contracts       Verify a local effect-contract corpus (every declared digest recomputed
@@ -1044,8 +1047,9 @@ func gatedFlagsSetWithoutJWKS(fs *flag.FlagSet) []string {
 
 // explicitlyActiveFlags returns the "--"-prefixed names of every flag in names that the
 // operator activated: value detection for a zero-default flag, explicit-set for a
-// non-zero-default one (see flagDefaultIsZero). Shared by gatedFlagsSetWithoutJWKS and
-// httpOnlyFlagsSetOnStdio so the two detection halves cannot drift apart.
+// non-zero-default one (see flagDefaultIsZero). The one implementation of that rule, so no
+// guard reading it can drift on what "the operator set this" means; rejectPassedFlags below is
+// the deliberately stricter rule, for gates that protect something other than the flag.
 func explicitlyActiveFlags(fs *flag.FlagSet, names []string) []string {
 	var out []string
 	for _, name := range names {
@@ -1064,6 +1068,45 @@ func explicitlyActiveFlags(fs *flag.FlagSet, names []string) []string {
 		}
 	}
 	return out
+}
+
+// refuseActiveFlags builds the refusal naming active, or nil when it is empty. detail
+// completes the sentence the joined names open, so a caller states only WHY those flags
+// cannot take effect here. Shared by the two rejectors below so every gated refusal opens the
+// same way whichever detection rule the command needs, which is also why the "flag(s)" prefix
+// naming the class is here and not in each detail.
+func refuseActiveFlags(active []string, detail string) error {
+	if len(active) == 0 {
+		return nil
+	}
+	return fmt.Errorf("flag(s) %s %s", strings.Join(active, ", "), detail)
+}
+
+// rejectGatedFlags refuses the flags in names the operator ACTIVATED (explicitlyActiveFlags:
+// value detection for a zero-default flag, explicit-set for the rest). This is the rejector
+// for a gate whose hazard is that the flags are silently IGNORED — a flag explicitly set to
+// its own default configures nothing, so there is nothing being ignored and nothing to
+// refuse. Where the hazard is instead that the operator believes something else about the
+// run, use rejectPassedFlags.
+func rejectGatedFlags(fs *flag.FlagSet, names []string, detail string) error {
+	return refuseActiveFlags(explicitlyActiveFlags(fs, names), detail)
+}
+
+// rejectPassedFlags refuses every flag in names the operator PASSED, whatever value it
+// carries. The stricter rule, for a gate where the flag's presence is evidence of intent
+// about something other than the flag: `eunox kill --redis-tls=false` says "reach Redis,
+// without TLS", so with --redis-addr absent (an env var an incident script did not resolve)
+// value detection would let a deployment-wide kill go silently to loopback and exit 0. Which
+// spellings count is a property of what the gate protects, not of the flag's type, which is
+// why the two rules live side by side rather than one being reconciled into the other.
+func rejectPassedFlags(fs *flag.FlagSet, names []string, detail string) error {
+	var passed []string
+	for _, name := range names {
+		if fs.Lookup(name) != nil && flagWasSet(fs, name) {
+			passed = append(passed, "--"+name)
+		}
+	}
+	return refuseActiveFlags(passed, detail)
 }
 
 // httpOnlyProxyFlags is the single authoritative list of flag names that apply only to
@@ -1199,10 +1242,8 @@ func validateRedisFlagsRequireRedisAddr(fs *flag.FlagSet, redisAddr string) erro
 	if redisAddr != "" {
 		return nil
 	}
-	if active := explicitlyActiveFlags(fs, redisGatedFlags); len(active) > 0 {
-		return fmt.Errorf("flag(s) %s require --redis-addr: they configure the Redis-backed call counter / kill switch, which is only built when --redis-addr is set — without it the proxy uses in-memory state and these are silently ignored. Set --redis-addr to enable the Redis backend, or remove these flags", strings.Join(active, ", "))
-	}
-	return nil
+	return rejectGatedFlags(fs, redisGatedFlags,
+		"require --redis-addr: they configure the Redis-backed call counter / kill switch, which is only built when --redis-addr is set — without it the proxy uses in-memory state and these are silently ignored. Set --redis-addr to enable the Redis backend, or remove these flags")
 }
 
 // jwtLeewayOption bridges the --jwt-leeway flag to pdp.JWTPDPOptions.Leeway. The
