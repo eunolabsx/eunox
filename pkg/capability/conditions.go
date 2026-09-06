@@ -242,25 +242,18 @@ func unmarshalCondition(data []byte) (Condition, error) {
 	// recursive unknown-key check, but this decoder is also the exported seam
 	// (ConditionWrapper) a library consumer decodes through, and a security primitive must
 	// not depend on the caller remembering to re-validate.
-	//
-	// Checked by key MEMBERSHIP against the target's field set rather than by handing a
-	// discriminator-stripped copy to DisallowUnknownFields. Stripping means decoding to a
-	// map and re-marshaling, and that round-trip is not identity: it sorts keys and
-	// collapses duplicates, so which of two case-variant siblings won would change from
-	// JSON's last-wins to byte order — a parser differential introduced by the very check
-	// meant to tighten things. Matching is case-insensitive because that is how
-	// encoding/json binds, so this rejects exactly the keys the decode would have ignored,
-	// no more.
+	// What counts as unknown, and why two spellings of one field are refused rather than
+	// resolved, lives on rejectUnknownJSONFields.
 	// "type" is the envelope's discriminator, not a field of any condition struct.
 	if err := rejectUnknownJSONFields(data, target, fmt.Sprintf("condition %q", envelope.Type), "type"); err != nil {
 		return nil, err
 	}
 
-	// Decode the ORIGINAL bytes, so duplicate-key and case-variant binding stay exactly
-	// what encoding/json does everywhere else. UseNumber keeps numeric policy literals as
-	// json.Number rather than widening them to float64 (which rounds integers above 2^53,
-	// e.g. authorizing the neighbour of 9007199254740993). Request arguments are decoded
-	// the same way, and numericEqual compares the preserved json.Number values exactly.
+	// Decode the ORIGINAL bytes rather than anything the check above rebuilt, so binding stays
+	// exactly what encoding/json does everywhere else. UseNumber keeps numeric policy literals
+	// as json.Number rather than widening them to float64 (which rounds integers above 2^53,
+	// e.g. authorizing the neighbour of 9007199254740993). Request arguments are decoded the
+	// same way, and numericEqual compares the preserved json.Number values exactly.
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if err := dec.Decode(target); err != nil {
@@ -296,20 +289,38 @@ var jsonFieldNamesCache sync.Map // reflect.Type -> map[string]bool
 // through FoldJSONKey, the same fold encoding/json's own field binder uses (see its doc:
 // strings.ToLower under-folds runes like U+017F, which the binder itself does not), so this
 // rejects exactly the keys the decode would have ignored, no more.
+//
+// It also refuses two members that are the SAME field to the decoder, which membership alone
+// could not see: both fold to a known name, so both passed, and the decode that followed then
+// bound them last-wins. Through this seam
+// {"type":"recipientDomain","argument":"to","domains":["corp.com"],"Domains":["evil.com"]}
+// loaded clean and enforced evil.com while a reviewer read corp.com — the substitution
+// RefuseAmbiguousJSONKeys refuses one layer down, reaching the one surface it does not cover.
+// The members are enumerated with claimObjectMembers rather than unmarshaled into a map for
+// exactly that reason: a map is where the second spelling disappears.
+//
+// TOP LEVEL only, deliberately, which is what keeps it from being the whole-document walk:
+// a value here is consumed whole, so an extension point's opaque Config payload is the
+// embedder's own object to shape, and the fields this rule protects are the ones this
+// package's own decode binds.
 func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra ...string) error {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return fmt.Errorf("%s: %w", context, err)
+	members, err := claimObjectMembers(data, context)
+	if err != nil {
+		return err
 	}
 	known := jsonFieldNames(target)
-	for k := range fields {
-		if known[FoldJSONKey(k)] {
-			continue
+	seen := make(map[string]string, len(members))
+	for _, m := range members {
+		folded := FoldJSONKey(m.key)
+		if !known[folded] && !slices.ContainsFunc(allowExtra, func(e string) bool { return folded == FoldJSONKey(e) }) {
+			return fmt.Errorf("%s: unknown field %q", context, m.key)
 		}
-		if slices.ContainsFunc(allowExtra, func(e string) bool { return FoldJSONKey(k) == FoldJSONKey(e) }) {
-			continue
+		// Unknown first, so this reports on two members the decode would really have
+		// contended over — two spellings of an unrecognized name are already refused above.
+		if prior, dup := seen[folded]; dup {
+			return fmt.Errorf("%s: members %q and %q are the same field to a JSON decoder, which keeps the LAST of them — so which value takes effect depends on their order rather than on anything a reviewer reading the policy can see; declare it once", context, prior, m.key)
 		}
-		return fmt.Errorf("%s: unknown field %q", context, k)
+		seen[folded] = m.key
 	}
 	return nil
 }

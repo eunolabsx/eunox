@@ -375,9 +375,9 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 	}
 	if eff == nil {
 		// Every in-tree caller passes ResolveEffect's non-nil result, but this package makes
-		// every other exported accessor nil-safe on principle — an embedder calling this
-		// directly must not get fail-open-via-crash on the one accessor that isn't. An effect
-		// that cannot even be described must not be treated as small or reversible.
+		// every exported accessor on a resolved effect nil-safe on principle — an embedder
+		// calling one directly must not get fail-open-via-crash. An effect that cannot even be
+		// described must not be treated as small or reversible.
 		return true, []string{"effect_unresolved"}
 	}
 	// requireCompensation with no class bound to hang it on — OR a class bound of
@@ -416,12 +416,18 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 	return len(reasons) > 0, reasons
 }
 
-// exceedsNumber reports whether value is strictly greater than limit. An unparseable
-// limit reports true (fail closed: a bound that cannot be read bounds nothing, and
-// treating it as satisfied would silently disable the check). A nil value is handled by
-// the caller's Quantified test and never reaches here.
+// exceedsNumber reports whether value is strictly greater than limit. An unreadable limit
+// reports true (fail closed: a bound that cannot be read bounds nothing, and treating it as
+// satisfied would silently disable the check). A nil value is handled by the caller's
+// Quantified test and never reaches here.
+//
+// Unreadable now includes a limit outside NumericLiteralBounded, which this site used to
+// parse verbatim: the loader already refuses such a bound on an authored ceiling, so this
+// only closes the exported WithEffectCeiling seam that never passes through it — and reading
+// the two sides of one comparison through the SAME parse is what makes the comparison mean
+// anything.
 func exceedsNumber(value *big.Float, limit json.Number) bool {
-	lim, ok := new(big.Float).SetString(limit.String())
+	lim, ok := parseBoundedNumber(limit.String())
 	if !ok {
 		return true
 	}
@@ -555,11 +561,39 @@ func isASCIIDigit(c byte) bool { return c >= '0' && c <= '9' }
 // Rejecting it here resolves the call unquantified, which exceeds every bound and so
 // fails closed.
 func ParseBlastRadiusNumber(n json.Number) (*big.Float, bool) {
-	if !NumericLiteralBounded(n.String()) {
+	return parseBoundedNumber(n.String())
+}
+
+// parseBoundedNumber is the ONE parse behind every magnitude this layer compares — an
+// authored bound, a ceiling's bound, and a caller-supplied argument — so no two of them can
+// be read at different precisions and disagree about which is larger.
+//
+// It goes through big.Rat rather than straight to big.Float because SetString on a
+// zero-value big.Float takes precision 64 and ROUNDS there, which is exactly where the
+// exactness this arm exists for runs out: 2^64+1 rounded to 2^64, compared EQUAL to a 2^64
+// bound, and admitted — fail-open at the boundary, and at wei-scale magnitudes (10^20+1
+// against 10^20) too. big.Rat reads the literal with no precision at all, and SetRat then
+// sizes the mantissa from the value it is handed (the larger of the numerator and
+// denominator bit lengths, floor 64), so every INTEGER within NumericLiteralBounded is exact
+// while a small fraction is left at the precision it already had — which is what keeps its
+// Text('f', -1) rendering on the audit record as short as it is today.
+//
+// The residual is stated rather than closed: a value that is not a dyadic rational (0.1) has
+// no exact binary form at ANY precision, so it stays the nearest big.Float to it. Two
+// spellings of one such value still compare equal, because big.Rat normalizes to lowest
+// terms before SetRat sizes anything — "0.1" and "0.10" reach the identical float.
+func parseBoundedNumber(s string) (*big.Float, bool) {
+	// The bound first: it is what keeps the Rat below from materializing the ~1 MiB integer
+	// "1e1000000" names, and what keeps this to the decimal grammar a caller WROTE (big.Rat
+	// reads "a/b" quotients and hex-float exponents that no reviewer of a manifest would).
+	if !NumericLiteralBounded(s) {
 		return nil, false
 	}
-	f, ok := new(big.Float).SetString(n.String())
-	return f, ok
+	r, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return nil, false
+	}
+	return new(big.Float).SetRat(r), true
 }
 
 // ResolveEffect reduces a constraint's contract against one call's arguments. It is the
@@ -788,17 +822,13 @@ func (s *BlastRadiusSpec) resolveRaw(args map[string]interface{}) (*big.Float, b
 		// NOT fall through to counting characters — a free-form string has no magnitude,
 		// and inventing one would be exactly the inference this layer refuses to do.
 		//
-		// This is the one arm where the literal reaching SetString is BOTH caller-supplied
-		// and free of JSON's number grammar: the json.Number arm above cannot spell a
-		// binary exponent or a hex float, and this one can. NumericLiteralBounded is
-		// therefore load-bearing here in full — length, exponent, AND decimal-only — since
+		// This is the one arm whose literal is BOTH caller-supplied and free of JSON's
+		// number grammar: the json.Number arm above cannot spell a binary exponent or a hex
+		// float, and this one can. parseBoundedNumber's grammar check is therefore
+		// load-bearing here in full — length, exponent, AND decimal-only — since
 		// "1p100000000" is eleven bytes whose render would cost seconds and hundreds of
 		// megabytes on the per-session decision path.
-		t := strings.TrimSpace(v)
-		if !NumericLiteralBounded(t) {
-			return nil, false
-		}
-		return new(big.Float).SetString(t)
+		return parseBoundedNumber(strings.TrimSpace(v))
 	case []interface{}:
 		// A list argument (recipients, row ids) contributes its LENGTH: "how many things
 		// does this touch" is the quantity a recipient-count or row-count bound means.
@@ -808,8 +838,14 @@ func (s *BlastRadiusSpec) resolveRaw(args map[string]interface{}) (*big.Float, b
 	}
 }
 
-// String renders a resolved effect for an operator-facing message.
+// String renders a resolved effect for an operator-facing message. A nil effect renders as
+// unresolved rather than panicking, for Exceeds' reason and in its vocabulary: an embedder
+// reaches this with whatever ResolveEffect handed it, and a decision point that crashes
+// produces no decision at all.
 func (e *ResolvedEffect) String() string {
+	if e == nil {
+		return "unresolved"
+	}
 	parts := []string{"class=" + e.Class}
 	if e.Quantified() {
 		br := "blastRadius=" + e.BlastRadius.Text('f', -1)
@@ -833,6 +869,13 @@ func (e *ResolvedEffect) String() string {
 // denial detail carry. Sorted, scalar values only — never free-form prose in a structured
 // field.
 func (e *ResolvedEffect) AuditDetails() map[string]interface{} {
+	if e == nil {
+		// Still carrying the layer marker, and never nil: both callers copy their own fields
+		// into what this returns, so an empty map would move the panic one line down. Naming
+		// the state rather than omitting the fields, since an absent effect_class reads on the
+		// tape as a record that simply predates the effect layer.
+		return map[string]interface{}{"effect": true, "effect_unresolved": true}
+	}
 	d := map[string]interface{}{
 		// A stable discriminator saying THIS refusal came from the effect layer, so an
 		// operator (or a SIEM rule) can select every effect-layer record on one key

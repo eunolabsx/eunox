@@ -226,6 +226,20 @@ half of it. An action whose size cannot be established must not be treated as sm
 must not contribute 0 to a sum; treating unknown as zero is the fail-open the condition
 exists to prevent.
 
+The **per-call** comparison (`max`, and the ceiling's `maxBlastRadius`) is exact at any
+magnitude within that literal bound, not merely up to 2^53: both sides are read through one
+parse that sizes the value from the value itself, so `18446744073709551617` against a
+`18446744073709551616` bound exceeds it rather than rounding onto it. That matters where
+magnitudes really are that large — token amounts in wei, row counts on a bulk delete — and a
+comparison that rounds at the boundary fails *open*, admitting the one call that is over.
+Two spellings of one value stay one value (`0.1` and `0.10`, `250` and `2.5e2`). A bound the
+comparison cannot read at all — outside the decimal grammar, or past the length/exponent
+limits — is treated as unreadable and exceeds, fail closed.
+
+The **cumulative** bound is a different arithmetic and keeps its own rule: `maxTotal` sums in
+double precision to match the Redis backend's Lua, and is capped at 2^53 for that reason (see
+below).
+
 ### Cumulative velocity
 
 `max` bounds one call. `maxTotal` over `windowSeconds` bounds the **summed** magnitude of a

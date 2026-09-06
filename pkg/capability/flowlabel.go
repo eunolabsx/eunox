@@ -370,9 +370,9 @@ func (FlowLabelCondition) ConditionType() string { return ConditionTypeFlowLabel
 // MarshalJSON serializes FlowLabelCondition with its discriminator.
 func (c FlowLabelCondition) MarshalJSON() ([]byte, error) { return marshalCondition(c) }
 
-// LabelOutputDirective asserts — by policy, never by content inference — that the output
-// of an allowed call carries the named native flow Labels into the session's accumulated
-// set, where a later flowLabel condition checks them (the source half of the source->sink
+// LabelOutputDirective asserts — by policy, never by content inference — that the output of
+// an allowed call carries the named Labels into the session's accumulated set, where a later
+// flowLabel condition checks them (the source half of the source->sink
 // invariant). Unlike redactFields it does not mutate the response: its effect is a
 // per-session state write on allow, so it produces no response obligation and is valid on
 // any source target (tool: or resource:), not only tool: targets.

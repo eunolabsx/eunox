@@ -273,10 +273,35 @@ type Engine struct {
 // Option configures the Engine.
 type Option func(*Engine)
 
-// WithClock sets a custom clock for time-based condition evaluation.
+// wiredOrAbsent normalizes an injected subsystem to the ABSENT case when the caller handed
+// over no value at all: a plain nil, or a TYPED nil that survives `== nil` and would panic
+// the first method call that dereferences it (the shape isTypedNil already refuses for a
+// condition, a directive and a registered handler — those arrive per request or through a
+// map, while these four arrive through one funnel).
+//
+// Applied at the OPTION rather than at each read because an option is the only way these
+// fields are ever set: New zero-values the struct and applies them, and nothing else assigns.
+// The alternative was a typed-nil guard at every `== nil` read of them across three files,
+// where the next read added inherits the panic. Every absent case is already fail-closed
+// and says so at its own site — an ENFORCEMENT_ERROR fault deny, or the system clock — so
+// this hands the crash to the refusal the read site already promises rather than inventing a
+// verdict here.
+func wiredOrAbsent[T any](v T) T {
+	if capability.IsNilValue(v) {
+		var absent T
+		return absent
+	}
+	return v
+}
+
+// WithClock sets a custom clock for time-based condition evaluation. A clock holding no value
+// leaves the system clock in place: the field has no fail-closed absent case (every read is a
+// bare e.clock.Now()), so absent has to mean the default rather than nil.
 func WithClock(clock Clock) Option {
 	return func(e *Engine) {
-		e.clock = clock
+		if c := wiredOrAbsent(clock); c != nil {
+			e.clock = c
+		}
 	}
 }
 
@@ -290,7 +315,7 @@ func (e *Engine) Clock() Clock {
 // WithCallCounter sets the call counter backend for maxCalls evaluation.
 func WithCallCounter(counter capability.CallCounter) Option {
 	return func(e *Engine) {
-		e.counter = counter
+		e.counter = wiredOrAbsent(counter)
 	}
 }
 
@@ -300,7 +325,7 @@ func WithCallCounter(counter capability.CallCounter) Option {
 // control (see WithPolicyTokens); a flow constraint with no store wired fails closed.
 func WithFlowLabelStore(store capability.FlowLabelStore) Option {
 	return func(e *Engine) {
-		e.flowStore = store
+		e.flowStore = wiredOrAbsent(store)
 	}
 }
 
@@ -367,9 +392,13 @@ func WithEffectCeiling(ceiling *capability.EffectCeiling) Option {
 // When no evaluator is configured, any capability that contains a policy
 // condition is denied (fail-closed). Set this option to connect the engine to
 // an external policy decision point such as OPA or Cedar.
+//
+// An evaluator holding no value is the unconfigured case: this is the one option whose value
+// is also reached during New (policyConditionHandler asks it which subsystems it reads), so a
+// typed nil crashed the CONSTRUCTOR as well as the decision path.
 func WithPolicyEvaluator(pe PolicyEvaluator) Option {
 	return func(e *Engine) {
-		e.policyEvaluator = pe
+		e.policyEvaluator = wiredOrAbsent(pe)
 	}
 }
 

@@ -1106,12 +1106,6 @@ func validateLocalManifest(m *LocalManifest) error {
 				return err
 			}
 		}
-		// Reject two quota-consuming conditions addressing the same counter bucket before
-		// the per-condition pass, checked once per constraint rather than inside the
-		// per-condition loop (which sees one entry at a time).
-		if err := validateQuotaBucketsDistinct(i, c.Conditions); err != nil {
-			return err
-		}
 		for j, cond := range c.Conditions {
 			// A null conditions entry decodes to a nil Condition and would slip through this
 			// type switch, then panic the engine at request time on the nil interface — a
@@ -1137,6 +1131,17 @@ func validateLocalManifest(m *LocalManifest) error {
 			if err := validate(i, j, cond, scope); err != nil {
 				return err
 			}
+		}
+		// Two quota-consuming conditions addressing the same counter bucket, checked once per
+		// constraint rather than inside the loop above (which sees one entry at a time) — and
+		// BELOW it, for checkTokenGrammarVersion's ordering reason: this check dispatches on a
+		// condition's concrete TYPE, so it dereferences exactly what the loop's nil and
+		// typed-nil guards exist to refuse. Above them a programmatically built
+		// (*capability.MaxCallsCondition)(nil) — non-nil as an interface, so it matches the
+		// pointer arm — panicked the loader rather than failing it closed, through the exported
+		// MergeManifests seam.
+		if err := validateQuotaBucketsDistinct(i, c.Conditions); err != nil {
+			return err
 		}
 	}
 	// Single authoritative grammar-version gate, run after the per-capability loop (so
