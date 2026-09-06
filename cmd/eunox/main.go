@@ -127,7 +127,8 @@ Usage:
   eunox validate     --config <eunox.yaml> [--live]
   eunox init         --upstream-url <url> [--output manifest.yaml] [--config-output eunox.yaml]
   eunox suggest      [--audit-log <path>] [--output manifest.yaml]
-  eunox kill         [--port N | --redis-addr H:P] <session-id|all>
+  eunox kill         [--port N | --redis-addr H:P] [--revive] <session-id|all>
+  eunox kill         [--port N | --redis-addr H:P] [--revive] --session <id> | --agent <id> | --jti <id>
   eunox audit-verify [flags]
   eunox stats        [flags]
   eunox contracts    [--dir <corpus-dir>] [--ref <contract-id>]
@@ -142,9 +143,11 @@ Subcommands:
   init            Generate a deny-all starter manifest (and, with --config-output, a runnable config) from a live upstream's tool list.
   suggest         Generate a draft manifest from the audit log — grounds entries (and allowedValues
                   conditions) in what the agent actually did. Run a wiretap (proxy --audit) first.
-  kill            Revoke one or all sessions on a running proxy — via the HTTP
-                  control endpoint, or with --redis-addr via the shared Redis
-                  kill switch (the only channel for a stdio proxy).
+  kill            Revoke a session, an agent identity (--agent), one issued bearer
+                  token (--jti) or the whole deployment ('all') on a running proxy —
+                  via the HTTP control endpoint, or with --redis-addr via the shared
+                  Redis kill switch (the only channel for a stdio proxy, and the only
+                  one that can --revive a revocation).
   audit-verify    Verify HMAC signatures in the local audit log.
   stats           Print a denial count histogram from the audit log.
   contracts       Verify a local effect-contract corpus (every declared digest recomputed

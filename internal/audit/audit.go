@@ -993,9 +993,10 @@ func openDiscoveredAuditFile(path string) (*os.File, error) {
 // "sampling/createMessage"); target_type/target are derived from it with method.
 // method is the MCP method ("tools/call", …); pass "" only for pre-dispatch
 // records with no target (e.g. a JWT rejection). ctx carries validated JWT claims,
-// whose agent_id/task_id/user_id are stamped (§ 2.1). auditOnly marks an observed-but-not-
-// enforced allow (audit mode): the would-be verdict is logged with full arguments
-// and the call forwarded.
+// whose agent_id/task_id/user_id and token_id — the `jti` naming WHICH credential
+// authorized the call, which is what incident response revokes on — are stamped
+// (§ 2.1). auditOnly marks an observed-but-not-enforced allow (audit mode): the
+// would-be verdict is logged with full arguments and the call forwarded.
 func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	s.Record(ctx, RecordParams{
 		SessionID:     sessionID,

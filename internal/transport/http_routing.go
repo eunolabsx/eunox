@@ -1797,10 +1797,10 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	case p != nil:
 		rec = asRecorder(p.sink)
 	}
-	// sess is threaded even though this leg writes no stderr line today: the whole reason the
-	// accessor takes a nilable session is that a leg holding one must name it, and this one holds
-	// a live session on the established-POST path. A nil here would be a floorless channel waiting
-	// for the first diagnostic anyone adds to the -32022 refusal — which catRevision's own doc
-	// describes as the cheapest refusal an unauthenticated peer can drive.
+	// The notice channel rides along in refusalLimits even though this leg writes no stderr line
+	// today, so the first diagnostic anyone adds to the -32022 refusal is bounded rather than
+	// floorless — catRevision's own doc describes it as the cheapest refusal an unauthenticated
+	// peer can drive. Neither the session nor the route is a parameter of that resolution: the
+	// notice table is the proxy's one table, so neither selects a channel.
 	return p.routeRefusalLimits().recorders(rec).forCategory(catRevision)
 }
