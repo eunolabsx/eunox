@@ -962,7 +962,8 @@ func recordSessionGateDeny(ctx context.Context, rec auditRecorder, sessionID, id
 }
 
 // enforceSessionGates is the verdict-plus-record half used by the POST and SSE-GET
-// paths: runs sessionGateVerdict and, on denial, writes the record and returns the gate.
+// paths: runs sessionGateVerdict and, on denial, writes the record and returns the gate; on
+// admission it notes the credential the message presented for the revocation-reclaim sweep.
 // Kept separate from the check-only verdict so DELETE can run it under p.mu and render its
 // own 403 + record off the same predicate.
 //
@@ -974,8 +975,15 @@ func (p *HTTPProxy) enforceSessionGates(ctx context.Context, route *UpstreamRout
 	gate, denied := route.sessionGateVerdict(ctx, sess)
 	if denied {
 		recordSessionGateDeny(ctx, p.sessionGateRecorder(route), sessionID, identifier, method, leg, gate)
+		return gate, true
 	}
-	return gate, denied
+	// An ADMITTED message's credential joins the session's reclaim set here rather than at each
+	// leg, because this function's caller set IS the rule: it is what the POST and SSE-GET legs
+	// call and what handleMCPDelete deliberately does not (it runs the two verdict halves itself
+	// under p.mu), so "every admitted host message, below the gates, never a DELETE" holds by
+	// construction instead of by two call sites remembering it. See httpSession.noteLiveTokenID.
+	sess.noteLiveTokenID(pdp.JWTClaimsPtr(ctx))
+	return gate, false
 }
 
 // answerSessionGateRefusal renders a refused session gate on the POST leg, in the framing the

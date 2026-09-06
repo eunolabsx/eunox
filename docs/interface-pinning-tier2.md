@@ -94,7 +94,9 @@ Tier-2 closes the two gaps `descriptionHash` leaves:
 ## Scope: per session, not per process
 
 The baseline is keyed by **session**, and released on session teardown alongside the
-flow-label state. Two reasons:
+flow-label state — behind a bounded drain that spans the whole in-flight handler, so neither a call
+still being decided nor one still processing its upstream reply (where a `tools/list` re-reads and
+rewrites the baseline) can have it cleared underneath. Two reasons:
 
 - A tool's advertised surface changing *within* a session is anomalous — servers evolve
   across restarts, not mid-conversation — so a session-scoped pin has a low false-positive

@@ -10,6 +10,19 @@ import (
 )
 
 // InMemory is an in-memory implementation of Manager for single-replica or dev use.
+//
+// A kill here is DURABLE on every axis. The Redis backend expires a session tombstone against
+// a configured lifetime (WithSessionKillTTL); this backend has none and nothing sweeps its
+// sets, so an id stays killed until the matching Revive or Reset. Inventing a lifetime is
+// what a sweep would require, and an emergency stop that lapses on one nobody chose is a
+// revocation the operator never withdrew.
+//
+// The residual is unbounded growth, and its writer is NOT an operator typing: /control/kill
+// records any well-formed session id a control-token holder posts, live session or not, at
+// request rate. Left unbounded rather than capped because both answers to a full kill set —
+// refusing a kill, or evicting one — are worse than the growth, and picking between them
+// needs a design discussion this note does not settle. A deployment revoking at request rate
+// wants the Redis backend, whose tombstones expire and whose set is shared across replicas.
 type InMemory struct {
 	mu sync.RWMutex
 	// globalActive, killedAgents and killedSessions are nil-safe to READ (the zero value is a

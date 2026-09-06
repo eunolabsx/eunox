@@ -581,8 +581,9 @@ func (e *Engine) policyUses(s capability.EngineSubsystem) bool {
 // RecordSessionCall notes that an allowed call to req.TargetName occurred in this session,
 // so a later sequenceBlock condition on a different tool can detect it.
 //
-// A non-nil error means the counter write itself failed, and callers MUST treat that as a
-// fail-closed deny: a missing marker would let a later sequenceBlock Peek fail OPEN.
+// A non-nil error means the marker was NOT written — either the counter write failed, or this
+// engine cannot anchor the request as configured (see anchorUnresolved) — and callers MUST treat
+// either as a fail-closed deny: a missing marker would let a later sequenceBlock Peek fail OPEN.
 //
 // Recording is indiscriminate among the policy's targets (EvaluateConditions sees only the
 // matched constraint, so it cannot bound recording to known antecedents), so a write fault
@@ -602,13 +603,31 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 	if e == nil || req == nil {
 		return errors.New(nilSeamRefusal("RecordSessionCall", "a nil engine or request"))
 	}
+	// "Nothing to record" comes FIRST, and stays a nil no-op: with no sequenceBlock in the policy
+	// or no counter wired there is no antecedent namespace at all, so no write can split across
+	// two of them and there is nothing for the refusal below to protect. Refusing here instead
+	// would turn a documented no-op into a mandatory fail-closed deny for an embedder whose
+	// policy never records — after this call's quota slot is already committed.
+	if e.skipAntecedentRecording || e.counter == nil {
+		return nil
+	}
+	// The shape this engine cannot anchor as configured — task anchoring on, a token presented,
+	// no usable mcp.task_id — is REFUSED rather than written, mirroring recordSourceCall (the
+	// internal caller already refuses it there, so this is the backstop for the direct embedder
+	// use this seam is exported for). resolveAnchor falls back to the session for that shape, so
+	// guarding on the resolved id alone wrote the antecedent under the session key: exactly the
+	// split state anchorUnresolved exists to refuse, with a later Peek under the task key seeing
+	// none of it.
+	if e.anchorUnresolved(req) {
+		return errUnanchorableStateWrite
+	}
 	// The ANCHOR's id, not req.SessionID: under WithTaskAnchoredState the key this write lands
 	// on never reads SessionID at all, so gating on it skipped the marker for a task-anchored
 	// request that carries no session — leaving an allowed antecedent invisible to a later
 	// sequenceBlock Peek under the same task key, which is the fail-OPEN direction and the one
 	// this function's own contract calls out. Through resolveAnchor so the guard and the key
 	// cannot disagree about which subject the write belongs to.
-	if e.skipAntecedentRecording || e.counter == nil || e.resolveAnchor(req).ID == "" {
+	if e.resolveAnchor(req).ID == "" {
 		return nil
 	}
 	// Prefer the explicit target type set by every ManifestPDP entry point; the
@@ -670,8 +689,10 @@ func sessionTargetName(req *capability.EnforceRequest) string {
 // sessionTargetKey derives the (targetType, name) pair that identifies a target in both
 // the sequenceBlock-history and maxCalls counter buckets. RecordSessionCall and
 // maxCallsBucket both key through it so they land on the SAME bucket under the SAME
-// derivation. handleSequenceBlock deliberately does NOT use this: it keeps a display-name
-// fallback that reports "(unknown)" for an unnamed blocked target.
+// derivation, and handleSequenceBlock names its blocked target through it for the same
+// reason — a deny reporting a name no bucket was written under names a target that does not
+// exist. The "(unknown)" display fallback for an unnamed blocked target stays local to that
+// handler: it is a rendering choice, and a key must never be built from it.
 func sessionTargetKey(req *capability.EnforceRequest) (targetType, name string) {
 	targetType, _ = splitEnginePrefix(req.TargetName)
 	if req.Target != nil && req.Target.Type != "" {

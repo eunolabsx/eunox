@@ -2270,6 +2270,23 @@ func TestValidateTransportConditionalFlags_CleanFlagsAccepted(t *testing.T) {
 	}
 }
 
+// TestValidateTransportConditionalFlags_UnknownTransportRefused pins the third arm. Both
+// this validator and cmdProxy's serve switch used to fold an unrecognized transport into a
+// default — and in OPPOSITE directions: stdio's flag rules here, an HTTP gateway there. A
+// third transport value would then have been served as a gateway with every HTTP-only flag
+// unchecked, so neither site folds any more.
+func TestValidateTransportConditionalFlags_UnknownTransportRefused(t *testing.T) {
+	err := validateTransportConditionalFlags("quic", proxyFlags{})
+	if err == nil || !strings.Contains(err.Error(), "unknown host transport") {
+		t.Fatalf("want an unknown-transport refusal, got %v", err)
+	}
+	// An HTTP-only flag on an unknown transport must not be reported as accepted either:
+	// the refusal is the answer, whatever else was passed.
+	if err := validateTransportConditionalFlags("quic", proxyFlags{jwksURI: "https://idp.example.com/jwks.json"}); err == nil {
+		t.Fatal("an unknown transport must be refused regardless of which flags accompany it")
+	}
+}
+
 // TestServeStdioHost_HTTPOnlyFlagsRejected is a regression: before
 // httpOnlyFlagsSetOnStdio existed, --control-token-path, --session-idle-timeout,
 // --max-sessions, --unsafe-bind-all, and --trust-forwarded-for were silently
