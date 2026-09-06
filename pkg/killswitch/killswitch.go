@@ -181,9 +181,11 @@ type Manager interface {
 }
 
 // Revocation reports one kill a backend's local view just gained. Exactly one dimension is
-// set: Global for the emergency stop, otherwise the agent or session id. It carries no
-// "revive" counterpart on purpose — a revive restores traffic, which the next ShouldBlock
-// already reflects, and there is nothing for a consumer to reclaim or undo.
+// set: Global for the emergency stop, otherwise the agent id, the session id or the token id
+// (see killDimensions, which is what both backends build these from — a consumer switching on
+// a subset silently ignores the dimension it left out). It carries no "revive" counterpart on
+// purpose — a revive restores traffic, which the next ShouldBlock already reflects, and there
+// is nothing for a consumer to reclaim or undo.
 type Revocation struct {
 	// Global is set for the emergency stop, which blocks every agent and session.
 	Global bool

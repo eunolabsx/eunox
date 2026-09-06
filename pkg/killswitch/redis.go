@@ -1133,8 +1133,10 @@ func (r *Redis) publish(ctx context.Context, msg string) error {
 
 // recordRefreshErr stores err as the last refresh error and returns it, so the refresh's
 // failure paths share one stamp-and-return. Every scan-time caller is inside
-// serializedRefresh, which holds refreshMu for its whole body, so lastRefreshErr has a
-// single serialized writer.
+// serializedRefresh, which holds refreshMu for its whole body, so lastRefreshErr has a single
+// serialized writer there. refreshState's wiring-fault call is the one outside refreshMu, and
+// cannot race a scan: Start refuses to launch anything on a latched wiring fault, so no scan
+// ever runs on such an instance — and the value it stores is that same immutable fault.
 func (r *Redis) recordRefreshErr(err error) error {
 	r.mu.Lock()
 	r.lastRefreshErr = err

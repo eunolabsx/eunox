@@ -435,10 +435,11 @@ func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMs
 // the call as if the handler had conformed (see capability.EnforceResponse.HandlerFaults), so
 // the record is the only place the plugin bug is reported at all.
 //
-// Rendered into the plain map/slice shapes the audit layer's value bounder recurses into
-// rather than handed over as the typed slice: that bounder clones and caps what it recognizes
-// and passes anything else through untouched, so a typed value would ride the tape neither
-// bounded nor detached from the decision that produced it.
+// Rendered into the plain map/slice shapes the audit layer's value bounder RECURSES into
+// rather than handed over as the typed slice. A typed value is bounded and detached there too
+// (it is marshaled into storage the record owns), but as one opaque blob: the per-element
+// bound and the per-value placeholder, which are what keep one oversized fault from taking the
+// rest of the annotation with it, apply only to the shapes the walk descends into.
 func handlerFaultDetail(dec capability.EnforceResponse) map[string]interface{} {
 	if len(dec.HandlerFaults) == 0 {
 		return nil

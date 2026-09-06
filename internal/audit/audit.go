@@ -23,8 +23,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -993,9 +995,10 @@ func openDiscoveredAuditFile(path string) (*os.File, error) {
 // "sampling/createMessage"); target_type/target are derived from it with method.
 // method is the MCP method ("tools/call", …); pass "" only for pre-dispatch
 // records with no target (e.g. a JWT rejection). ctx carries validated JWT claims,
-// whose agent_id/task_id/user_id are stamped (§ 2.1). auditOnly marks an observed-but-not-
-// enforced allow (audit mode): the would-be verdict is logged with full arguments
-// and the call forwarded.
+// whose agent_id/task_id/user_id and token_id — the `jti` naming WHICH credential
+// authorized the call, which is what incident response revokes on — are stamped
+// (§ 2.1). auditOnly marks an observed-but-not-enforced allow (audit mode): the
+// would-be verdict is logged with full arguments and the call forwarded.
 func (s *Sink) RecordAllow(ctx context.Context, sessionID, identifier, method string, details map[string]interface{}, obligs []string, auditOnly bool, labelsOut, carriedLabels []string) {
 	s.Record(ctx, RecordParams{
 		SessionID:     sessionID,
@@ -1276,6 +1279,14 @@ func (s *Sink) enqueue(rec auditRecord) string {
 // returned as-is (immutable). marshalAndBoundDetails is the map-level entry point
 // driving this per-value recursion. []string slices are cloned unconditionally so
 // the bounded copy never aliases a caller slice.
+//
+// The arms below name the shapes a detail value USUALLY has; anything else goes to
+// boundUnmodelledValue, which decides by KIND rather than falling through to the
+// caller's own storage. That is what makes "fresh storage at every level" a property
+// of the function rather than of the shapes it happens to enumerate: a json.RawMessage
+// (a named []byte, which `case []byte` does not match) or a struct holding a slice
+// would otherwise be queued as the caller's own value. An arm below the recursing ones
+// is therefore a COST decision, never a correctness one.
 func cloneAndBound(v interface{}) interface{} {
 	switch t := v.(type) {
 	case string:
@@ -1341,9 +1352,74 @@ func cloneAndBound(v interface{}) interface{} {
 		out := make([]byte, len(t))
 		copy(out, t)
 		return out
+	case map[string]int64:
+		// The one unmodelled shape production writes (flushDropMarker's by_method_target),
+		// and the drainer writes it during a drop storm — when the sink is already behind.
+		// maps.Clone buys the same ownership for one allocation; measured, the fallback's
+		// marshal-and-re-walk is ~30% of that whole record's cost. Its values need no cap
+		// (an int64 renders in 20 bytes) and its size is bounded by auditDropBucketCap.
+		return maps.Clone(t)
 	default:
+		return boundUnmodelledValue(v)
+	}
+}
+
+// boundUnmodelledValue clones and bounds a detail value whose shape cloneAndBound does not
+// model, deciding by KIND so the answer covers every type rather than a list of them.
+//
+// A value of scalar kind is copied by the interface holding it, so returning it as-is shares
+// nothing; a named string type additionally takes the per-value cap here, which the
+// `case string` arm above cannot see. Anything else can reach storage the caller still owns
+// and may mutate or reuse, so it is marshaled into an owned json.RawMessage: the queued record
+// then aliases nothing whatever the value's shape, and the emitted JSON is unchanged, since a
+// json.RawMessage re-marshals to the bytes it holds.
+//
+// An over-cap value is re-entered through the modelled walk rather than replaced wholesale, so
+// a container is bounded per ELEMENT exactly as a modelled one is: replacing it whole drops
+// every small sibling of the one oversized entry, and drops the field's JSON TYPE with them —
+// for flushDropMarker's by_method_target that object is what a consumer keys into.
+//
+// The one value still handed back as the caller's own is one json.Marshal rejects, so that
+// marshalAndBoundDetails fails its whole-map marshal and writes the not_serializable marker;
+// substituting here would drop the field from a record that then looks complete. It is also
+// the one case where the no-aliasing property is the caller's rather than this function's —
+// that map is discarded, so nothing is queued.
+func boundUnmodelledValue(v interface{}) interface{} {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.String:
+		if s := rv.String(); len(s) > auditDetailValueCap {
+			return overCapPlaceholder(len(s))
+		}
+		return v
+	// SCALAR kinds only, which is narrower than "copied by the interface": an array or a
+	// struct is copied too, but copying one copies the slice and map HEADERS inside it and
+	// still aliases the caller's backing storage — adding either here reopens the hole this
+	// arm exists to close, invisibly (the emitted JSON is identical either way). Those go to
+	// the marshal below. reflect.Invalid is the untyped nil, which holds nothing at all.
+	case reflect.Invalid, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
 		return v
 	}
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	if len(encoded) <= auditDetailValueCap {
+		return json.RawMessage(encoded)
+	}
+	// UseNumber so the round trip re-marshals every number verbatim instead of through
+	// float64. The decode cannot fail on bytes json.Marshal just produced; the placeholder is
+	// the answer to a shape with no elements to bound rather than a case with a choice.
+	dec := json.NewDecoder(bytes.NewReader(encoded))
+	dec.UseNumber()
+	var decoded interface{}
+	if err := dec.Decode(&decoded); err != nil {
+		return overCapPlaceholder(len(encoded))
+	}
+	return cloneAndBound(decoded)
 }
 
 // overCapPlaceholder is the structured stand-in cloneAndBound substitutes for any

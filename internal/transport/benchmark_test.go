@@ -946,10 +946,13 @@ func BenchmarkStdioProxy(b *testing.B) {
 	})
 }
 
-// BenchmarkAuditRecord measures the synchronous cost of audit.Sink.Record, which
-// must stay non-blocking: it does only struct initialization and a channel send,
-// with all marshalling/HMAC/disk-I/O happening in the drainer goroutine. The
-// benchmark writes to a temp log so the drainer makes real progress.
+// BenchmarkAuditRecord measures the synchronous cost of audit.Sink.Record, which must stay
+// non-blocking: struct initialization, the details clone-and-bound, and a channel send, with
+// HMAC signing and disk I/O in the drainer goroutine. The bounding is deliberately on THIS
+// side (the queue must not retain an un-truncated or aliased payload), so it is part of what
+// this benchmark has to cover — hence the unmodelled-container case below, which is the arm
+// that reaches reflection. The benchmark writes to a temp log so the drainer makes real
+// progress.
 func BenchmarkAuditRecord(b *testing.B) {
 	dir := b.TempDir()
 
@@ -981,6 +984,21 @@ func BenchmarkAuditRecord(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			sink.RecordAllow(context.Background(), "sess-bench", "read_file", "tools/call", details, []string{"redactFields"}, false, nil, nil)
+		}
+	})
+
+	// A detail value outside the shapes the bounder models — what an embedder's condition
+	// handler or external PolicyEvaluator returns. It takes the reflect arm, so a change
+	// there is visible here rather than hiding behind the string-and-map case above.
+	b.Run("Allow_WithUnmodelledDetail", func(b *testing.B) {
+		details := map[string]interface{}{"path": "/reports/q3.pdf", "ctx": struct {
+			Rule  string `json:"rule"`
+			Score int    `json:"score"`
+		}{Rule: "deny-writes", Score: 3}}
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sink.RecordAllow(context.Background(), "sess-bench", "read_file", "tools/call", details, nil, false, nil, nil)
 		}
 	})
 }

@@ -569,12 +569,6 @@ func redactJSONValue(val interface{}, paths []string) bool {
 	}
 }
 
-// mcpReservedRootKeys are the MCP result-envelope keys that carry protocol STRUCTURE
-// rather than tool data. The envelope-root redaction pass masks a named key wholesale
-// with the string sentinel, which is right for an unmodeled sibling but wrong for
-// these: `isError` is a bool and `contents`/`messages` are arrays, so replacing one
-// with "[redacted]" yields a result a spec-conformant host cannot decode at all.
-// content/structuredContent additionally get their own shape-specific passes.
 // mcpContentItemKeys are the keys ApplyRedactObligs reads EXACTLY off a `content` item:
 // obj["type"] selects the per-type treatment, and obj["text"] is the body it then walks.
 //
@@ -625,6 +619,12 @@ func contentItemReservedKeys(t string) map[string]struct{} {
 	}
 }
 
+// mcpReservedRootKeys are the MCP result-envelope keys that carry protocol STRUCTURE
+// rather than tool data. The envelope-root redaction pass masks a named key wholesale
+// with the string sentinel, which is right for an unmodeled sibling but wrong for
+// these: `isError` is a bool and `contents`/`messages` are arrays, so replacing one
+// with "[redacted]" yields a result a spec-conformant host cannot decode at all.
+// content/structuredContent additionally get their own shape-specific passes.
 var mcpReservedRootKeys = map[string]struct{}{
 	"content":           {},
 	"structuredContent": {},

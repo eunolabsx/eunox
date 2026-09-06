@@ -164,11 +164,16 @@ func cmdKill(args []string) int {
 			ttlFlagSet:     flagWasSet(fs, "killswitch-session-ttl"),
 		})
 	}
-	for _, name := range []string{"redis-password", "redis-tls", "killswitch-session-ttl"} {
-		if flagWasSet(fs, name) {
-			fmt.Fprintf(os.Stderr, "eunox kill: --%s requires --redis-addr; without it the kill silently uses the HTTP control endpoint instead of Redis\n", name)
-			return 1
-		}
+	// redisGatedFlags is the proxy's list, not a copy: a name this FlagSet does not carry is
+	// skipped, so a Redis flag added there is gated here the moment kill grows it, and the two
+	// commands cannot disagree about which flags the Redis backend owns. The DETECTION differs
+	// on purpose (rejectPassedFlags, not the proxy's rejectGatedFlags): here the flag's
+	// presence is evidence the operator meant to reach Redis, so --redis-tls=false must refuse
+	// rather than send a deployment-wide kill to loopback.
+	if err := rejectPassedFlags(fs, redisGatedFlags,
+		"requires --redis-addr; without it the kill silently uses the HTTP control endpoint instead of Redis"); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
+		return 1
 	}
 	// The HTTP /control/kill endpoint is deliberately a one-way emergency stop: a same-host
 	// process holding the control token could otherwise lift the very revocation it issued.
@@ -180,17 +185,27 @@ func cmdKill(args []string) int {
 	return killViaControlEndpoint(*host, *port, *controlToken, *controlTokenPath, target)
 }
 
+// killHTTPTransportFlags is the single authoritative list of `eunox kill` flags that only
+// address the HTTP /control/kill endpoint. runRedisKillTransport is the one guard that
+// reads it, so a future HTTP-transport flag is rejected under --redis-addr instead of
+// silently doing nothing.
+var killHTTPTransportFlags = []string{
+	"port",
+	"host",
+	"control-token",
+	"control-token-path",
+}
+
 // runRedisKillTransport handles the --redis-addr branch of `eunox kill`: rejects flag
 // combinations that would be silently dropped on this transport, then performs the write.
 // Split out of cmdKill so the growing rejection rules are one block to review.
 func runRedisKillTransport(fs *flag.FlagSet, req redisKillRequest) int {
-	for _, name := range []string{"port", "host", "control-token", "control-token-path"} {
-		// flagWasSet reports only flags actually passed, distinguishing an explicit
-		// --port=3000 from the unset default.
-		if flagWasSet(fs, name) {
-			fmt.Fprintf(os.Stderr, "eunox kill: --%s is an HTTP-transport flag and has no effect with --redis-addr set; remove --%s or drop --redis-addr\n", name, name)
-			return 1
-		}
+	// Strict detection, as above: --control-token "" is an operator who expected a token to be
+	// there, not one declaring the empty default.
+	if err := rejectPassedFlags(fs, killHTTPTransportFlags,
+		"has no effect with --redis-addr set: the Redis write replaces the HTTP /control/kill request entirely; remove them or drop --redis-addr"); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
+		return 1
 	}
 	// A tombstone lifetime is meaningless where no tombstone is written: --revive deletes
 	// rather than creates one, "all" carries no per-session expiry, and an agent kill is

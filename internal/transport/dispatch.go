@@ -139,8 +139,8 @@ type methodHandler func(context.Context, dispatchParams, mcp.RPCMsg) mcp.RPCMsg
 type notificationDisposition int
 
 const (
-	// notifyUnmapped drops and records the notification (denyUnmappedHostNotification), the
-	// notification-framed analogue of dispatchUnmapped's default.
+	// notifyUnmapped drops and records the notification through refuseUnroutable, the same
+	// producer dispatchUnmapped's default reaches (see hostNotificationGate.admit).
 	notifyUnmapped notificationDisposition = iota
 	// notifyForward forwards the notification to the upstream verbatim.
 	notifyForward
