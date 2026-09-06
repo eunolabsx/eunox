@@ -3493,15 +3493,18 @@ func (p *ManifestPDP) RecordObservedToolHashes(ctx context.Context, result json.
 // The ENTRIES are examined once — toolEntryVerdict hands this walk's scan and decode to the
 // filter — but the ENVELOPE is tokenized more than once on the enforce path: here
 // (decodeListEntries, then toolsKeyAmbiguous) and again in the caller's filterListResult
-// (decodeOrderedObject). That is a deliberate trade rather than a pass the verdicts left
-// behind, because the two reads answer different questions: toolsKeyAmbiguous asks whether
-// the TOOLS key is ambiguous, while decodeOrderedObject reports a fold collision between ANY
-// pair of top-level keys. Deriving the first from the second would drop two passes at the
-// cost of sticky-poisoning every pin — permanently, for the session — over an envelope whose
-// tools array is perfectly readable and whose colliding keys were unrelated siblings. Both
-// directions are fail-closed and emit the same catalog, so the whole cost lands on what an
-// operator has to explain; revisiting the trade means giving that widened poison its own
-// test row, not swapping the reads.
+// (decodeOrderedObject). What may NOT be done about that is the cheap version: reading
+// decodeOrderedObject's ERROR as this gate's answer poisons every pin, permanently for the
+// session, over an envelope whose tools array is perfectly readable and whose colliding keys
+// were unrelated siblings — that error reports a fold collision between ANY pair of top-level
+// keys, where this gate asks only about the TOOLS key.
+//
+// TODO: one tokenization, without that widening. decodeOrderedObject already builds the
+// per-key fold map both questions are asked of, so returning the collision FACTS rather than
+// a bare error would let the pin ask about "tools" and the filter about any key, off one
+// pass. It is not a drive-by: the arming pass runs to completion before filtering starts, so
+// the shared decode has to be threaded from the caller, and the pin's blast radius needs its
+// own test row proving it did not move.
 func (p *ManifestPDP) armPinsFromToolsList(sessionID string, result json.RawMessage, completeListing bool) (entryCount int, verdicts []toolEntryVerdict) {
 	pinned := p.hasPinnedTools()
 	// Tier-2 arms off the same pass, so the two pins read one decode of one response and

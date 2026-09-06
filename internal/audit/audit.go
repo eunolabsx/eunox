@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1281,10 +1282,10 @@ func (s *Sink) enqueue(rec auditRecord) string {
 // The arms below name the shapes a detail value USUALLY has; anything else goes to
 // boundUnmodelledValue, which decides by KIND rather than falling through to the
 // caller's own storage. That is what makes "fresh storage at every level" a property
-// of the function rather than of the six shapes it happens to enumerate: a
-// map[string]int64 (flushDropMarker's by_method_target), a json.RawMessage (a named
-// []byte, which `case []byte` does not match) or a struct holding a slice would
-// otherwise be queued as the caller's own value.
+// of the function rather than of the shapes it happens to enumerate: a json.RawMessage
+// (a named []byte, which `case []byte` does not match) or a struct holding a slice
+// would otherwise be queued as the caller's own value. An arm below the recursing ones
+// is therefore a COST decision, never a correctness one.
 func cloneAndBound(v interface{}) interface{} {
 	switch t := v.(type) {
 	case string:
@@ -1350,10 +1351,13 @@ func cloneAndBound(v interface{}) interface{} {
 		out := make([]byte, len(t))
 		copy(out, t)
 		return out
-	// The scalars a detail map carries most often, ahead of the reflect-based decision
-	// below so the common values never pay for it.
-	case bool, int, int64, float64, nil:
-		return v
+	case map[string]int64:
+		// The one unmodelled shape production writes (flushDropMarker's by_method_target),
+		// and the drainer writes it during a drop storm — when the sink is already behind.
+		// maps.Clone buys the same ownership for one allocation; measured, the fallback's
+		// marshal-and-re-walk is ~30% of that whole record's cost. Its values need no cap
+		// (an int64 renders in 20 bytes) and its size is bounded by auditDropBucketCap.
+		return maps.Clone(t)
 	default:
 		return boundUnmodelledValue(v)
 	}
@@ -1362,51 +1366,59 @@ func cloneAndBound(v interface{}) interface{} {
 // boundUnmodelledValue clones and bounds a detail value whose shape cloneAndBound does not
 // model, deciding by KIND so the answer covers every type rather than a list of them.
 //
-// A value of scalar kind is stored by value in the interface, so returning it as-is shares
+// A value of scalar kind is copied by the interface holding it, so returning it as-is shares
 // nothing; a named string type additionally takes the per-value cap here, which the
 // `case string` arm above cannot see. Anything else can reach storage the caller still owns
-// and may mutate or reuse, so it is marshaled into an owned json.RawMessage: the queued
-// record then aliases nothing whatever the value's shape, and the bound applies to the
-// marshaled length — the size the record actually pays — exactly as the []byte arm's does.
-// The emitted JSON is unchanged, since a json.RawMessage re-marshals to the bytes it holds.
+// and may mutate or reuse, so it is marshaled into an owned json.RawMessage: the queued record
+// then aliases nothing whatever the value's shape, and the emitted JSON is unchanged, since a
+// json.RawMessage re-marshals to the bytes it holds.
 //
-// A value json.Marshal rejects is returned unchanged so the whole-map marshal in
-// marshalAndBoundDetails still fails on it and writes the not_serializable marker. Dropping
-// or substituting the field here would leave the rest of the record looking complete.
+// An over-cap value is re-entered through the modelled walk rather than replaced wholesale, so
+// a container is bounded per ELEMENT exactly as a modelled one is: replacing it whole drops
+// every small sibling of the one oversized entry, and drops the field's JSON TYPE with them —
+// for flushDropMarker's by_method_target that object is what a consumer keys into.
+//
+// The one value still handed back as the caller's own is one json.Marshal rejects, so that
+// marshalAndBoundDetails fails its whole-map marshal and writes the not_serializable marker;
+// substituting here would drop the field from a record that then looks complete. It is also
+// the one case where the no-aliasing property is the caller's rather than this function's —
+// that map is discarded, so nothing is queued.
 func boundUnmodelledValue(v interface{}) interface{} {
 	rv := reflect.ValueOf(v)
-	switch k := rv.Kind(); {
-	case k == reflect.String:
+	switch rv.Kind() {
+	case reflect.String:
 		if s := rv.String(); len(s) > auditDetailValueCap {
 			return overCapPlaceholder(len(s))
 		}
 		return v
-	case immutableDetailKind(k):
+	// SCALAR kinds only, which is narrower than "copied by the interface": an array or a
+	// struct is copied too, but copying one copies the slice and map HEADERS inside it and
+	// still aliases the caller's backing storage — adding either here reopens the hole this
+	// arm exists to close, invisibly (the emitted JSON is identical either way). Those go to
+	// the marshal below. reflect.Invalid is the untyped nil, which holds nothing at all.
+	case reflect.Invalid, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
 		return v
 	}
 	encoded, err := json.Marshal(v)
 	if err != nil {
 		return v
 	}
-	if len(encoded) > auditDetailValueCap {
+	if len(encoded) <= auditDetailValueCap {
+		return json.RawMessage(encoded)
+	}
+	// UseNumber so the round trip re-marshals every number verbatim instead of through
+	// float64. The decode cannot fail on bytes json.Marshal just produced; the placeholder is
+	// the answer to a shape with no elements to bound rather than a case with a choice.
+	dec := json.NewDecoder(bytes.NewReader(encoded))
+	dec.UseNumber()
+	var decoded interface{}
+	if err := dec.Decode(&decoded); err != nil {
 		return overCapPlaceholder(len(encoded))
 	}
-	return json.RawMessage(encoded)
-}
-
-// immutableDetailKind reports whether a value of kind k is copied by the interface that
-// holds it, so handing it to the queue shares no storage with the caller. reflect.Invalid is
-// the untyped nil, which holds nothing at all.
-func immutableDetailKind(k reflect.Kind) bool {
-	switch k {
-	case reflect.Invalid, reflect.Bool,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
-		return true
-	default:
-		return false
-	}
+	return cloneAndBound(decoded)
 }
 
 // overCapPlaceholder is the structured stand-in cloneAndBound substitutes for any

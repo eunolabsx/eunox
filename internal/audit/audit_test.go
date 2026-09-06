@@ -2267,45 +2267,49 @@ func TestBoundAuditDetails_Nested(t *testing.T) {
 	}
 }
 
-// TestBoundAuditDetails_UnmodelledContainerIsOwnedAndBounded: the arms of cloneAndBound
-// name the shapes a detail value usually has, and anything else used to be handed back as
-// the caller's own value -- so the "fresh storage at every level" contract held for six
-// shapes rather than for the function. flushDropMarker's map[string]int64 took that arm
-// today (safe only by inspection); a json.RawMessage is a named []byte, which `case []byte`
-// does not match, so it did too.
+// TestBoundAuditDetails_UnmodelledContainerIsOwnedAndBounded: the arms of cloneAndBound name
+// the shapes a detail value usually has, and anything else used to be handed back as the
+// caller's own value -- so the "fresh storage at every level" contract held for six shapes
+// rather than for the function. flushDropMarker's map[string]int64 took that arm today (safe
+// only by inspection); a json.RawMessage is a named []byte, which `case []byte` does not
+// match, so it did too.
 func TestBoundAuditDetails_UnmodelledContainerIsOwnedAndBounded(t *testing.T) {
 	t.Parallel()
 
 	// A container the switch does not model, mutated after the clone: the queued copy must
 	// not follow it.
-	buckets := map[string]int64{"tools/call|read_file": 3}
-	out, ok := cloneAndBound(map[string]interface{}{"by_method_target": buckets}).(map[string]interface{})
+	type ruleHits map[string]int
+	hits := ruleHits{"deny-writes": 3}
+	out, ok := cloneAndBound(map[string]interface{}{"hits": hits}).(map[string]interface{})
 	require.True(t, ok)
-	buckets["tools/call|read_file"] = 99
-	buckets["tools/call|write_file"] = 1
-	cloned, err := json.Marshal(out["by_method_target"])
+	hits["deny-writes"] = 99
+	hits["allow-reads"] = 1
+	cloned, err := json.Marshal(out["hits"])
 	require.NoError(t, err)
-	require.JSONEq(t, `{"tools/call|read_file":3}`, string(cloned),
-		"the queued copy still aliased the caller's map")
+	require.JSONEq(t, `{"deny-writes":3}`, string(cloned), "the queued copy still aliased the caller's map")
 
 	// The emitted JSON is unchanged: an owned json.RawMessage re-marshals to the bytes it
 	// holds, so closing the aliasing gap did not change what lands on the tape.
-	verbatim, err := json.Marshal(map[string]interface{}{"by_method_target": map[string]int64{"tools/call|read_file": 3}})
+	verbatim, err := json.Marshal(map[string]interface{}{"hits": ruleHits{"deny-writes": 3}})
 	require.NoError(t, err)
 	whole, err := json.Marshal(out)
 	require.NoError(t, err)
 	require.JSONEq(t, string(verbatim), string(whole))
 
-	// And it takes the per-value cap, on the marshaled length the record actually pays.
-	big := make(map[string]int64, 64)
-	for i := 0; len(big)*24 < auditDetailValueCap+1024; i++ {
-		big[fmt.Sprintf("k%0*d", 20, i)] = int64(i)
-	}
-	bounded, ok := cloneAndBound(map[string]interface{}{"big": big}).(map[string]interface{})
+	// Over the cap it is bounded per ELEMENT, like a modelled container: the oversized entry
+	// is replaced, its small siblings survive, and the field is still an object -- replacing
+	// the whole value would change its JSON type under a consumer that keys into it.
+	type ctx map[string]string
+	bounded, ok := cloneAndBound(map[string]interface{}{
+		"ctx": ctx{"big": strings.Repeat("x", auditDetailValueCap+1), "small": "keep-me"},
+	}).(map[string]interface{})
 	require.True(t, ok)
-	placeholder, ok := bounded["big"].(string)
-	require.True(t, ok, "an over-cap container must be replaced by the placeholder, got %T", bounded["big"])
-	require.True(t, IsOverCapValuePlaceholder(placeholder), "placeholder = %q", placeholder)
+	var got map[string]string
+	raw, err := json.Marshal(bounded["ctx"])
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &got), "an over-cap container must stay an object, got %s", raw)
+	require.Equal(t, "keep-me", got["small"], "a small sibling must survive the oversized entry")
+	require.True(t, IsOverCapValuePlaceholder(got["big"]), "placeholder = %q", got["big"])
 }
 
 // TestBoundAuditDetails_UnmodelledScalarKinds: a value of scalar kind is copied by the

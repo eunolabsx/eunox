@@ -1797,10 +1797,8 @@ func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder 
 	case p != nil:
 		rec = asRecorder(p.sink)
 	}
-	// The notice channel rides along in refusalLimits even though this leg writes no stderr line
-	// today, so the first diagnostic anyone adds to the -32022 refusal is bounded rather than
-	// floorless — catRevision's own doc describes it as the cheapest refusal an unauthenticated
-	// peer can drive. Neither the session nor the route is a parameter of that resolution: the
-	// notice table is the proxy's one table, so neither selects a channel.
+	// The route selects the SINK above (it stamps the route name and policy version); the
+	// BUDGET below is the proxy's, since routeRefusalLimits takes neither a route nor a session
+	// — one notice table and one category table serve every leg.
 	return p.routeRefusalLimits().recorders(rec).forCategory(catRevision)
 }

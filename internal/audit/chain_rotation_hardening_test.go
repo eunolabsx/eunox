@@ -366,12 +366,14 @@ func TestInterpretAuditTail_RefusesAnUnboundedLeadingRecord(t *testing.T) {
 	}
 }
 
-// TestWhitespaceOnlyWindow_BothTailReadersRefuseIdentically pins the fail-closed answer
-// both tail readers owe a scan window that trimmed away entirely without starting at file
-// offset 0. The two exist so the startup path and the read-only path cannot drift on what
-// "the last record" means, and this check plus its wording were spelled out at both; the
-// test drives the readers rather than the helper so a site that stops calling it fails
-// here rather than passing on the helper's own behavior.
+// TestWhitespaceOnlyWindow_BothTailReadersRefuseIdentically adds the one property the pair in
+// verify_test.go does not carry: that the two readers refuse the same window with the same
+// words. TestReadLastAuditLine_WhitespaceFillsWholeWindowFailsClosed and
+// TestTruncatePartialTail_WhitespaceFillsWholeWindowFailsClosed already pin that each fails
+// closed; the readers exist so the startup path and the read-only path cannot drift on what
+// "the last record" means, and the check plus its wording were spelled out at both, so
+// agreement is what the shared refusal buys. It drives the readers rather than the helper, so
+// a site that stops calling it fails here instead of passing on the helper's own behavior.
 func TestWhitespaceOnlyWindow_BothTailReadersRefuseIdentically(t *testing.T) {
 	const start = 64
 	window := []byte("   \n\t\n")
@@ -403,10 +405,6 @@ func TestWhitespaceOnlyWindow_BothTailReadersRefuseIdentically(t *testing.T) {
 	if readErr.Error() != windowErr.Error() {
 		t.Errorf("the two readers refuse the same window differently:\n  read-only: %v\n  startup:   %v", readErr, windowErr)
 	}
-	if !strings.Contains(readErr.Error(), "entire window is whitespace") {
-		t.Errorf("refusal = %v, want it to name the window it refused", readErr)
-	}
-
 	// A window that DOES begin at file offset 0 is authoritative: an all-whitespace log is
 	// genuinely empty, and ("", nil) is the answer both readers must keep giving for it.
 	if line, err := interpretAuditTail(window, len(window), nil, int64(len(window)), 0); line != "" || err != nil {

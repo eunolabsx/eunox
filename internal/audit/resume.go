@@ -450,6 +450,12 @@ func tailLineFromWindow(f *os.File, window []byte, start, size, winSize int64) (
 		return "", fmt.Errorf("%w: read: %v", errAuditTailProbe, err)
 	}
 	line, _ = lastCompleteLineFromTail(buf[:n])
+	// Unreachable today — the re-read window is a superset of one already proven non-blank —
+	// but held structurally rather than argued: this is the third place that could answer
+	// ("", nil) for a non-empty log, the one answer the whole path exists to refuse.
+	if err := refuseWhitespaceOnlyWindow(line, n, reStart); err != nil {
+		return "", err
+	}
 	return line, nil
 }
 

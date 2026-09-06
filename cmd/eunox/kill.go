@@ -164,11 +164,13 @@ func cmdKill(args []string) int {
 			ttlFlagSet:     flagWasSet(fs, "killswitch-session-ttl"),
 		})
 	}
-	// redisGatedFlags is the proxy's list, not a copy: kill defines a subset of it
-	// (explicitlyActiveFlags skips a name this FlagSet does not carry), so a Redis flag
-	// added there is gated here the moment kill grows it, and the two commands cannot
-	// disagree about which flags the Redis backend owns.
-	if err := rejectGatedFlags(fs, redisGatedFlags,
+	// redisGatedFlags is the proxy's list, not a copy: a name this FlagSet does not carry is
+	// skipped, so a Redis flag added there is gated here the moment kill grows it, and the two
+	// commands cannot disagree about which flags the Redis backend owns. The DETECTION differs
+	// on purpose (rejectPassedFlags, not the proxy's rejectGatedFlags): here the flag's
+	// presence is evidence the operator meant to reach Redis, so --redis-tls=false must refuse
+	// rather than send a deployment-wide kill to loopback.
+	if err := rejectPassedFlags(fs, redisGatedFlags,
 		"requires --redis-addr; without it the kill silently uses the HTTP control endpoint instead of Redis"); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
 		return 1
@@ -198,7 +200,9 @@ var killHTTPTransportFlags = []string{
 // combinations that would be silently dropped on this transport, then performs the write.
 // Split out of cmdKill so the growing rejection rules are one block to review.
 func runRedisKillTransport(fs *flag.FlagSet, req redisKillRequest) int {
-	if err := rejectGatedFlags(fs, killHTTPTransportFlags,
+	// Strict detection, as above: --control-token "" is an operator who expected a token to be
+	// there, not one declaring the empty default.
+	if err := rejectPassedFlags(fs, killHTTPTransportFlags,
 		"has no effect with --redis-addr set: the Redis write replaces the HTTP /control/kill request entirely; remove them or drop --redis-addr"); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox kill: %v\n", err)
 		return 1
