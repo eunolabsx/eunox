@@ -560,13 +560,6 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		answerSessionGateRefusal(r.Context(), w, sess, gate, msg)
 		return
 	}
-	// Record the credential THIS message presented for the revocation-reclaim sweep, on every
-	// admitted host message rather than only the enforced ones — a rotated bearer that only ever
-	// appears on */list, ping, a re-initialize or a notification is still the credential the
-	// session is running on. Below the gates so an unauthorized sender cannot overwrite the
-	// association; the span latch further down stays enforced-only, since that one is about state
-	// a decision commits. See httpSession.noteLiveTokenID.
-	sess.noteLiveTokenID(pdp.JWTClaimsPtr(r.Context()))
 	// BELOW the session gates and ABOVE everything that reads this worker's negotiated state.
 	// Below, because the gates decide from this request's own claims and the ones captured at
 	// construction — neither of which establishment produces — so a caller who may not act on
@@ -969,7 +962,8 @@ func recordSessionGateDeny(ctx context.Context, rec auditRecorder, sessionID, id
 }
 
 // enforceSessionGates is the verdict-plus-record half used by the POST and SSE-GET
-// paths: runs sessionGateVerdict and, on denial, writes the record and returns the gate.
+// paths: runs sessionGateVerdict and, on denial, writes the record and returns the gate; on
+// admission it notes the credential the message presented for the revocation-reclaim sweep.
 // Kept separate from the check-only verdict so DELETE can run it under p.mu and render its
 // own 403 + record off the same predicate.
 //
@@ -981,8 +975,15 @@ func (p *HTTPProxy) enforceSessionGates(ctx context.Context, route *UpstreamRout
 	gate, denied := route.sessionGateVerdict(ctx, sess)
 	if denied {
 		recordSessionGateDeny(ctx, p.sessionGateRecorder(route), sessionID, identifier, method, leg, gate)
+		return gate, true
 	}
-	return gate, denied
+	// An ADMITTED message's credential joins the session's reclaim set here rather than at each
+	// leg, because this function's caller set IS the rule: it is what the POST and SSE-GET legs
+	// call and what handleMCPDelete deliberately does not (it runs the two verdict halves itself
+	// under p.mu), so "every admitted host message, below the gates, never a DELETE" holds by
+	// construction instead of by two call sites remembering it. See httpSession.noteLiveTokenID.
+	sess.noteLiveTokenID(pdp.JWTClaimsPtr(ctx))
+	return gate, false
 }
 
 // answerSessionGateRefusal renders a refused session gate on the POST leg, in the framing the
@@ -1143,11 +1144,6 @@ func (p *HTTPProxy) handleMCPGet(w http.ResponseWriter, r *http.Request, route *
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	// The POST leg's reclaim association, on the leg with no JSON-RPC envelope at all: holding the
-	// stream open is how a client presents a rotated credential when it is doing nothing else, and
-	// an SSE subscriber is exactly what spares the session from the idle reaper. See
-	// httpSession.noteLiveTokenID.
-	sess.noteLiveTokenID(pdp.JWTClaimsPtr(r.Context()))
 	// readUpstream is started BEFORE the session-start drift check runs, so a subscriber
 	// registered mid-establishment receives the not-yet-vetted upstream's notifications — the
 	// FM-5 rug-pull this proxy exists to catch, delivered as though it had been checked. Below

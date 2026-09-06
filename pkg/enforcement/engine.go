@@ -603,6 +603,14 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 	if e == nil || req == nil {
 		return errors.New(nilSeamRefusal("RecordSessionCall", "a nil engine or request"))
 	}
+	// "Nothing to record" comes FIRST, and stays a nil no-op: with no sequenceBlock in the policy
+	// or no counter wired there is no antecedent namespace at all, so no write can split across
+	// two of them and there is nothing for the refusal below to protect. Refusing here instead
+	// would turn a documented no-op into a mandatory fail-closed deny for an embedder whose
+	// policy never records — after this call's quota slot is already committed.
+	if e.skipAntecedentRecording || e.counter == nil {
+		return nil
+	}
 	// The shape this engine cannot anchor as configured — task anchoring on, a token presented,
 	// no usable mcp.task_id — is REFUSED rather than written, mirroring recordSourceCall (the
 	// internal caller already refuses it there, so this is the backstop for the direct embedder
@@ -619,7 +627,7 @@ func (e *Engine) RecordSessionCall(ctx context.Context, req *capability.EnforceR
 	// sequenceBlock Peek under the same task key, which is the fail-OPEN direction and the one
 	// this function's own contract calls out. Through resolveAnchor so the guard and the key
 	// cannot disagree about which subject the write belongs to.
-	if e.skipAntecedentRecording || e.counter == nil || e.resolveAnchor(req).ID == "" {
+	if e.resolveAnchor(req).ID == "" {
 		return nil
 	}
 	// Prefer the explicit target type set by every ManifestPDP entry point; the

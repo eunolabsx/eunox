@@ -317,41 +317,85 @@ func findByID(msgs []mcp.RPCMsg, id string) *mcp.RPCMsg {
 	return nil
 }
 
-// TestAwaitHostDecisionsDrained_BlocksUntilInFlightZero pins the stdio teardown drain that
-// gates ReleaseSession: on the signal/upstream-exit
-// paths serveHost returns WITHOUT waiting for its handler goroutines, so Start must not clear
-// per-session flow state while a sink handler is still mid-decision. The drain blocks on
-// fwdHostInFlight and returns once it reaches zero.
-func TestAwaitHostDecisionsDrained_BlocksUntilInFlightZero(t *testing.T) {
+// TestAwaitHostDecisionsDrained pins the stdio teardown drain that gates ReleaseSession: on the
+// signal/upstream-exit paths serveHost returns WITHOUT waiting for its handler goroutines, so
+// Start must not release per-session state — the flow taint a sink is still reading, and the
+// Tier-2 interface baseline, which exists whether or not the policy needs a decision turn — while
+// a handler is still running.
+//
+// Both gate values are driven because the drain reads NEITHER: it once short-circuited on a nil
+// decideGate, on the premise that ReleaseSession is then a no-op, which the baseline falsifies.
+// The two rows are the regression guard for that short-circuit not coming back.
+func TestAwaitHostDecisionsDrained(t *testing.T) {
 	t.Parallel()
-	p := &StdioProxy{decideGate: newDecisionSerializer()}
-	p.fwdHostInFlight.Store(1) // a handler dispatched but still mid-decision
+	for _, tc := range []struct {
+		name string
+		gate *decisionSerializer
+	}{
+		{"flow-serialized session", newDecisionSerializer()},
+		{"no decision gate", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := &StdioProxy{decideGate: tc.gate}
+			p.hostHandlers.Store(1) // a handler dispatched but not yet returned
 
-	done := make(chan struct{})
-	go func() { p.awaitHostDecisionsDrained(2 * time.Second); close(done) }()
+			done := make(chan struct{})
+			// The drain's own budget is far longer than the window each assertion allows, so
+			// neither can be satisfied by the timeout instead of by the counter.
+			go func() { p.awaitHostDecisionsDrained(30 * time.Second); close(done) }()
 
-	// It must NOT return while a decision is in flight.
-	select {
-	case <-done:
-		t.Fatal("drain returned while a host decision was still in flight")
-	case <-time.After(50 * time.Millisecond):
-	}
+			select {
+			case <-done:
+				t.Fatal("drain returned while a host handler was still running; teardown would release its state under it")
+			case <-time.After(50 * time.Millisecond):
+			}
 
-	// Once the handler settles, the drain returns promptly.
-	p.fwdHostInFlight.Store(0)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("drain did not return after in-flight reached zero")
+			p.hostHandlers.Store(0)
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("drain did not return after the handler count reached zero")
+			}
+		})
 	}
 }
 
-// TestAwaitHostDecisionsDrained_BoundedByTimeout: a wedged handler (fwdHostInFlight never
-// falls) must not hang teardown — the drain returns after its bounded timeout.
+// TestAwaitHostDecisionsDrained_WaitsPastTheWire is the counter's own regression: the drain must
+// span the handler, not the forward.
+//
+// It first waited on fwdHostInFlight, the notification wire-ordering barrier, which callUpstream
+// releases the instant a request reaches the wire (releaseHostForward) — so it read zero while the
+// handler was still processing the reply. That is exactly where the list leg re-reads and rewrites
+// the Tier-2 baseline, so teardown could clear the baseline under a live tools/list, whose filter
+// then re-baselines the surface it was meant to diff against.
+func TestAwaitHostDecisionsDrained_WaitsPastTheWire(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{}
+	p.hostHandlers.Store(1)
+	p.fwdHostInFlight.Store(0) // already forwarded: the barrier has been released
+
+	done := make(chan struct{})
+	go func() { p.awaitHostDecisionsDrained(30 * time.Second); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("drain returned for a handler that had reached the wire but not returned; the response leg still touches the Tier-2 baseline")
+	case <-time.After(50 * time.Millisecond):
+	}
+	p.hostHandlers.Store(0)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not return after the handler returned")
+	}
+}
+
+// TestAwaitHostDecisionsDrained_BoundedByTimeout: a wedged handler (the count never falls) must
+// not hang teardown — the drain returns after its bounded timeout.
 func TestAwaitHostDecisionsDrained_BoundedByTimeout(t *testing.T) {
 	t.Parallel()
 	p := &StdioProxy{decideGate: newDecisionSerializer()}
-	p.fwdHostInFlight.Store(1) // never drains
+	p.hostHandlers.Store(1) // never drains
 
 	start := time.Now()
 	p.awaitHostDecisionsDrained(80 * time.Millisecond)
@@ -364,34 +408,10 @@ func TestAwaitHostDecisionsDrained_BoundedByTimeout(t *testing.T) {
 	}
 }
 
-// TestAwaitHostDecisionsDrained_RunsWithoutADecideGate: the drain must NOT short-circuit for a
-// non-flow session. It once did, on the premise that ReleaseSession is a no-op without a decision
-// gate — untrue, because ReleaseSession also drops the Tier-2 interface baseline, which exists
-// independently of NeedsDecisionTurn. Skipping the drain let step 8 clear that baseline under an
-// in-flight enforced handler, whose surface-pin check then saw no baseline at all (fail-open).
-func TestAwaitHostDecisionsDrained_RunsWithoutADecideGate(t *testing.T) {
-	t.Parallel()
-	p := &StdioProxy{decideGate: nil}
-	p.fwdHostInFlight.Store(1) // a handler mid-decision, with no gate held
-
-	done := make(chan struct{})
-	go func() { p.awaitHostDecisionsDrained(2 * time.Second); close(done) }()
-	select {
-	case <-done:
-		t.Fatal("drain returned while a host decision was in flight; a gateless session's baseline is cleared under it")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	p.fwdHostInFlight.Store(0)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("drain did not return after in-flight reached zero")
-	}
-}
-
-// TestAwaitHostDecisionsDrained_NoWaitWhenAlreadyDrained: the cost of dropping that
-// short-circuit is one atomic load — a settled counter must not add teardown latency.
+// TestAwaitHostDecisionsDrained_NoWaitWhenAlreadyDrained: the cost of dropping the nil-gate
+// short-circuit is one atomic load — a settled counter must not add teardown latency. The budget
+// is 10s against a 1s allowance, so a drain that slept even one poll interval per call would still
+// pass; what this pins is that it does not WAIT, not that it is instantaneous.
 func TestAwaitHostDecisionsDrained_NoWaitWhenAlreadyDrained(t *testing.T) {
 	t.Parallel()
 	p := &StdioProxy{decideGate: nil}
