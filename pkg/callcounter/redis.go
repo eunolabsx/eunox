@@ -62,9 +62,10 @@ type RedisOption func(*Redis)
 //
 //   - Declared over a wrapper that actually fronts a Ring, it reproduces the split accounting in
 //     full — silently, with no CROSSSLOT and nothing on the audit tape. Declare it only for a
-//     wrapper you know fronts one server; there is no way to say "sharded" here, because a
-//     multi-key EVAL cannot run over shards at all (unlike the kill switch's keyless SCAN, whose
-//     WithShardFanOut has somewhere to go).
+//     wrapper you know fronts one server, and run CheckKeyspaceCoLocated at startup to CHECK that
+//     rather than assert it: this constructor performs no I/O, so it cannot. There is no way to
+//     say "sharded" here, because a multi-key EVAL cannot run over shards at all (unlike the kill
+//     switch's keyless SCAN, whose WithShardFanOut has somewhere to go).
 //   - Declared over a wrapper holding a NIL client, it constructs: IsNilClient answers for a
 //     client that IS nil, not for a wrapper around one, and this is the only remaining way past
 //     that guard. The first admission then panics inside go-redis rather than failing closed.
@@ -129,10 +130,14 @@ func (r *Redis) newMember(now time.Time) string {
 // which is why an UNRECOGNIZED client is refused too (see ErrUnknownTopology) rather than admitted
 // on the strength of the CROSSSLOT above.
 //
-// Making it WORK instead would mean co-locating one anchor's buckets in a slot, which is a
-// physical key-layout change (a migration resetting live counters) on a key that is opaque by
-// construction: CompositeKey is injective but not parseable, so a hash tag cannot be recovered
-// from the logical key a bucket arrives with. Until that is worth doing, this is the posture.
+// Making it WORK instead would mean co-locating one anchor's buckets in a slot, which IS available
+// and is not being done for one honest reason: it resets every live counter. Nothing needs to
+// recover a hash tag from the opaque key a bucket arrives with — pkg/enforcement's anchoredKey
+// splices the anchor in where the key is BUILT, so a `{...}` tag is emittable one layer up, and
+// go-redis applies hashtag.Key on a client-side Ring as well as a Cluster, so one tag would fix
+// both sharding shapes and retire this refusal outright. What it costs is a physical key-layout
+// change across two packages plus a migration that drops every in-flight window on the floor.
+// Until that is worth doing, this is the posture.
 var ErrClusterUnsupported = errors.New("callcounter: Redis Cluster and Ring clients are not supported: a multi-bucket admission is one multi-key EVAL whose keys can hash to different slots (CROSSSLOT); wire a single-node or Sentinel-backed *redis.Client")
 
 // ErrUnknownTopology is returned by NewRedis for a client whose KEYSPACE TOPOLOGY cannot be
@@ -150,8 +155,10 @@ var ErrClusterUnsupported = errors.New("callcounter: Redis Cluster and Ring clie
 // A consumer whose wrapper fronts ONE server says so with WithSingleNodeKeyspace(), which is the
 // escape hatch this refusal is only tolerable with: it refuses a wrapper around a perfectly
 // ordinary single-node client until its consumer says so, in exchange for never over-admitting a
-// quota silently. The declaration is BELIEVED, not checked — see that option for the residual.
-var ErrUnknownTopology = errors.New("callcounter: the Redis client's keyspace topology cannot be determined (a custom Cmdable, or a wrapper forwarding to one); refusing, since a client-side-sharding wrapper splits one quota bucket's accounting across servers and enforces its limit at a multiple of the declared value. Pass the client itself; or, ONLY if the wrapper fronts a single server, declare that with callcounter.WithSingleNodeKeyspace(). A wrapper fronting a Cluster or a Ring has no supported declaration here and must not be declared single-node — this counter cannot admit against a sharded keyspace at all")
+// quota silently. NewRedis performs no I/O, so that declaration is BELIEVED rather than checked —
+// CheckKeyspaceCoLocated is the startup probe that checks it, and a consumer reaching for the
+// escape hatch should run it.
+var ErrUnknownTopology = errors.New("callcounter: the Redis client's keyspace topology cannot be determined (a custom Cmdable, or a wrapper forwarding to one); refusing, since a client-side-sharding wrapper splits one quota bucket's accounting across servers and enforces its limit at a multiple of the declared value. Pass the client itself; or, ONLY if the wrapper fronts a single server, declare that with callcounter.WithSingleNodeKeyspace() and verify it at startup with callcounter.CheckKeyspaceCoLocated. A wrapper fronting a Cluster or a Ring has no supported declaration here and must not be declared single-node — this counter cannot admit against a sharded keyspace at all")
 
 // ErrTopologyContradicted is returned for a topology DECLARATION that disagrees with what the
 // client's own concrete type establishes — WithSingleNodeKeyspace() beside a *redis.Ring, say.
@@ -192,6 +199,114 @@ func CheckServerNotClustered(ctx context.Context, client ServerInfoReader) error
 	}
 	return fmt.Errorf("%w (the server at the configured address reports cluster_enabled:1)", ErrClusterUnsupported)
 }
+
+// KeyspaceProbeClient is the command set CheckKeyspaceCoLocated issues. A narrow parameter type,
+// as ServerInfoReader is: a consumer's own wrapper satisfies it by forwarding, which is the point —
+// the probe asks the CLIENT what it does, where the construction refusal can only read its type.
+type KeyspaceProbeClient interface {
+	redis.Scripter
+	Exists(ctx context.Context, keys ...string) *redis.IntCmd
+	Del(ctx context.Context, keys ...string) *redis.IntCmd
+}
+
+// keyspaceProbeKeys is how many keys one probe writes in a single EVAL. A client-side-sharding
+// client is caught unless every probe key hashes to one shard, which for k shards is k^(1-n) — at
+// 16 keys and two shards, ~3e-5, and lower for a wider ring. Not free (one EVAL plus n EXISTS and
+// n DEL), but this is a startup check a consumer runs once.
+const keyspaceProbeKeys = 16
+
+// probeScript writes every key it is handed, so a client that routes the whole script by its first
+// key writes them all to one server. Values are irrelevant; only WHERE they land is.
+var probeScript = redis.NewScript(`
+for i = 1, #KEYS do
+  redis.call('SET', KEYS[i], '1', 'EX', tonumber(ARGV[1]))
+end
+return 1
+`)
+
+// CheckKeyspaceCoLocated verifies that a multi-key script actually reaches every key it names —
+// the property AdmitAll depends on and WithSingleNodeKeyspace only ASSERTS.
+//
+// A declaration is believed, not checked, so a consumer who declares single-node over a wrapper
+// that in fact fronts a Ring gets exactly the split accounting the refusal exists to prevent, with
+// no CROSSSLOT and nothing on the tape. This is how they check it. Run it once at startup against
+// the same client passed to NewRedis, as CheckServerNotClustered is run.
+//
+// It writes keyspaceProbeKeys short-lived keys in ONE script and then reads each back
+// INDIVIDUALLY, so each read routes on its own key. On one keyspace every key is found. On a
+// client that shards — client-side, where no CROSSSLOT is ever raised, or through a proxy fronting
+// a sharded backend, which INFO reports as a plain server — the script ran wholly on the first
+// key's shard and the keys that hash elsewhere are missing.
+//
+// INCONCLUSIVE IS SAFE, as it is for CheckServerNotClustered: a client that cannot run the script
+// or answer EXISTS (an emulator, an ACL, a proxy that refuses EVAL) reports nothing rather than
+// refusing to start against every Redis-protocol server. What it reports positively is a MISS, and
+// a miss is re-probed once with fresh keys before it is believed — a shard placement repeats for
+// new keys where an eviction under memory pressure does not, which is the one way a single
+// keyspace can lose a key between the write and the read.
+//
+// Cleanup is per-key DEL (always slot-safe) and best-effort; every key carries a TTL regardless.
+func CheckKeyspaceCoLocated(ctx context.Context, client KeyspaceProbeClient) error {
+	missing, err := probeKeyspace(ctx, client)
+	if err != nil || missing == 0 {
+		// A probe that could not run says nothing: see INCONCLUSIVE IS SAFE above.
+		return nil //nolint:nilerr // an unrunnable probe is inconclusive, not a refusal
+	}
+	// Fresh keys: a sharded keyspace misses again, an evicted key does not.
+	if missing, err = probeKeyspace(ctx, client); err != nil || missing == 0 {
+		return nil //nolint:nilerr // same
+	}
+	return fmt.Errorf("%w (a script writing %d keys at once left %d of them unreachable to a per-key read, so this client does not keep one keyspace on one server)",
+		ErrClusterUnsupported, keyspaceProbeKeys, missing)
+}
+
+// probeKeyspace runs one round of the probe, returning how many of its keys a per-key read could
+// not find. An error means the round could not be run at all, which its caller reads as
+// inconclusive rather than as a verdict.
+func probeKeyspace(ctx context.Context, client KeyspaceProbeClient) (int, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, fmt.Errorf("callcounter: crypto/rand unavailable: %w", err)
+	}
+	// Random per round so two instances probing at once cannot read each other's keys, and so the
+	// second round genuinely re-hashes rather than repeating the first round's placement.
+	prefix := "callcounter:keyspace-probe:" + hex.EncodeToString(b[:]) + ":"
+	keys := make([]string, keyspaceProbeKeys)
+	for i := range keys {
+		keys[i] = prefix + strconv.Itoa(i)
+	}
+	// Cleanup is per-key: a multi-key DEL is refused CROSSSLOT on a cluster, which would turn
+	// tidying up into an error on the one topology the probe most needs to survive.
+	defer func() {
+		for _, k := range keys {
+			_ = client.Del(ctx, k).Err()
+		}
+	}()
+
+	if err := probeScript.Run(ctx, client, keys, keyspaceProbeTTLSec).Err(); err != nil {
+		// A CROSSSLOT here is a SERVER-side cluster answering the question directly, which is a
+		// verdict rather than an inconclusive round.
+		if isCrossSlot(err) {
+			return len(keys), nil
+		}
+		return 0, fmt.Errorf("callcounter: keyspace probe could not run: %w", err)
+	}
+	missing := 0
+	for _, k := range keys {
+		found, err := client.Exists(ctx, k).Result()
+		if err != nil {
+			return 0, fmt.Errorf("callcounter: keyspace probe could not read back: %w", err)
+		}
+		if found == 0 {
+			missing++
+		}
+	}
+	return missing, nil
+}
+
+// keyspaceProbeTTLSec bounds how long a probe key outlives its round, so an interrupted probe
+// leaves nothing behind. Generous relative to the read-back that follows immediately.
+const keyspaceProbeTTLSec = 60
 
 // NewRedis creates a Redis-backed call counter. It fails rather than returning a counter that
 // cannot admit, or one that admits WRONGLY: on a nil client (checked FIRST, so a typed-nil
@@ -245,33 +360,35 @@ func NewRedis(client redis.Cmdable, opts ...RedisOption) (*Redis, error) {
 // answer this counter can admit against. See ErrUnknownTopology and ErrTopologyContradicted for
 // what each refusal is for.
 //
-// A declaration FILLS an unknown topology and never OVERRIDES an established one, and it fills
-// nothing for a NIL client: a nil one classifies unknown, so without that arm a declaration
-// settles a handle that has no keyspace at all and every command on it panics inside go-redis.
-// NewRedis refuses nil first, but ordering at one call site is not the property — the kill switch
-// takes nilness as resolveTopology's own first case for this reason, and a resolver that is only
-// correct when called in the right place is one a second construction path gets wrong.
-//
-// Written as the general rule rather than as the cases reachable today, so a second declaring
-// option cannot slip past it.
+// The fills-never-overrides rule itself is redisutil.Reconcile's, shared with pkg/killswitch so
+// the two backends cannot drift on it; what stays here is the part that is this counter's alone —
+// nilness first, and a settled SHARDED keyspace refused rather than used.
 func (r *Redis) resolveTopology() error {
-	topology, _ := redisutil.ClassifyTopology(r.client)
-	switch {
-	case redisutil.IsNilClient(r.client):
+	// Nilness first, and asked here rather than left to NewRedis's own guard: a nil client
+	// classifies UNKNOWN, which is exactly the value a declaration fills, so without this arm a
+	// declared nil handle settles as single-node and every command on it panics inside go-redis.
+	// A resolver that is only correct when its caller checked first is one a second construction
+	// path gets wrong.
+	if redisutil.IsNilClient(r.client) {
 		return fmt.Errorf("callcounter: nil Redis client (got %T)", r.client)
-	case r.declared == redisutil.TopologyUnknown:
-		if topology == redisutil.TopologyUnknown {
-			return fmt.Errorf("%w (got %T)", ErrUnknownTopology, r.client)
-		}
-	case topology == redisutil.TopologyUnknown:
-		// The case the declaring option exists for: the type established nothing, the consumer knows.
-		topology = r.declared
-	case r.declared != topology:
+	}
+	classified, _ := redisutil.ClassifyTopology(r.client)
+	// No fan-out on either side: this counter runs no keyless command, so a sharded keyspace is
+	// refused rather than iterated and an iterator would be a field nothing could use.
+	resolved, outcome := redisutil.Reconcile(
+		redisutil.Resolution{Topology: classified},
+		redisutil.Resolution{Topology: r.declared},
+	)
+	switch outcome {
+	case redisutil.ReconcileUndetermined:
+		return fmt.Errorf("%w (got %T)", ErrUnknownTopology, r.client)
+	case redisutil.ReconcileContradicted:
 		// The concrete type, as its siblings carry it: the remedy is "pass the client the
 		// declaration describes", and a Ring and a ClusterClient need different ones.
-		return fmt.Errorf("%w: declared %s, but the client's own type is %s (got %T)", ErrTopologyContradicted, r.declared, topology, r.client)
+		return fmt.Errorf("%w: declared %s, but the client's own type is %s (got %T)", ErrTopologyContradicted, r.declared, classified, r.client)
+	case redisutil.ReconcileSettled:
 	}
-	if topology == redisutil.TopologySharded {
+	if resolved.Topology == redisutil.TopologySharded {
 		return fmt.Errorf("%w (got %T)", ErrClusterUnsupported, r.client)
 	}
 	return nil

@@ -513,9 +513,14 @@ client. A consumer passing a client whose concrete type says nothing (their own
 metrics hooks do not change the type and are unaffected) is refused too, and
 declares the topology with `callcounter.WithSingleNodeKeyspace()` /
 `killswitch.WithSingleNodeKeyspace()` — **only if the wrapper really fronts one
-server.** The declaration is believed, not verified: declared over a wrapper that
-fronts a ring it reproduces both fail-opens in full, split quota accounting and a
-partial kill set served as complete. A wrapper fronting a ring has no supported
+server.** Neither constructor performs I/O, so the declaration is believed rather
+than verified: declared over a wrapper that fronts a ring it reproduces both
+fail-opens in full, split quota accounting and a partial kill set served as
+complete. `callcounter.CheckKeyspaceCoLocated(ctx, client)` is the startup probe
+that checks it — it writes several keys in one script and reads each back
+individually, so a client that routes the script to one shard is caught — and a
+consumer using the escape hatch should run it beside
+`callcounter.CheckServerNotClustered`. A wrapper fronting a ring has no supported
 declaration for the counter at all; the kill switch takes
 `killswitch.WithShardFanOut(killswitch.RingFanOut(ring))`.
 

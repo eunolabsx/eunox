@@ -246,3 +246,85 @@ func isNilValue(v any) bool {
 		return false
 	}
 }
+
+// Resolution pairs a topology with the per-server iterator that belongs to it: the two are one
+// answer, and holding them apart is how a client one site calls sharding while another has no
+// iterator for it becomes representable.
+type Resolution struct {
+	// Topology is what was established, or TopologyUnknown when nothing was.
+	Topology Topology
+	// FanOut is the per-server iterator a keyless command needs, non-nil only for a sharding
+	// topology whose holder has one. A consumer with no keyless command leaves it nil.
+	FanOut ShardFanOut
+}
+
+// Reconciliation is what Reconcile could make of a classification and a declaration.
+//
+// An OUTCOME rather than an error, because the rule is shared between consumers and the
+// DIAGNOSIS is not: the counter has to say a sharded keyspace has no declaration at all, the kill
+// switch has to name its two options, and folding those into one sentinel here would make the
+// wording of one backend's refusal the other's to maintain.
+type Reconciliation int
+
+const (
+	// ReconcileSettled means the two inputs agreed, or exactly one of them answered.
+	ReconcileSettled Reconciliation = iota
+	// ReconcileUndetermined means neither answered: the type established nothing and the consumer
+	// declared nothing. A consumer whose correctness depends on which servers a command reaches
+	// must refuse this.
+	ReconcileUndetermined
+	// ReconcileContradicted means both answered and disagreed. Refuse rather than pick: obeying
+	// the declaration is the fail-open, and obeying the classification silently discards a
+	// consumer's stated intent.
+	ReconcileContradicted
+)
+
+// String renders an outcome for an error or a log line.
+func (r Reconciliation) String() string {
+	switch r {
+	case ReconcileSettled:
+		return "settled"
+	case ReconcileUndetermined:
+		return "undetermined"
+	case ReconcileContradicted:
+		return "contradicted"
+	default:
+		return "unknown"
+	}
+}
+
+// Reconcile settles a client's keyspace topology from what ClassifyTopology established and what
+// the consumer declared, returning the resolved pair and what it could make of the two.
+//
+// ONE implementation, in the package that exists so more than one backend does not answer the
+// go-redis topology question separately. The two copies this replaced were the same switch in the
+// same order down to a shared format string, and had already diverged on what each told an
+// operator — which is the shape ClassifyTopology's own doc records as how the predicate and the
+// iterator drifted before it.
+//
+// The rule is that a declaration FILLS an unknown topology and never OVERRIDES an established one.
+// The asymmetry is the whole point: applied unconditionally, a single-node declaration beside a
+// real cluster client throws away a working fan-out and puts the consumer back to reaching one
+// server of several — reachable through the very option added to prevent that. An agreeing
+// declaration is redundant rather than a conflict, and keeps the CLASSIFIED side's iterator, the
+// declared one having nothing the type did not already supply.
+//
+// Nilness is deliberately not asked here: it is a question about the CLIENT, which IsNilClient
+// answers, and a nil client has no keyspace for either input to describe. Each consumer refuses it
+// above this call, in the shape its own constructor allows.
+func Reconcile(classified, declared Resolution) (Resolution, Reconciliation) {
+	switch {
+	case declared.Topology == TopologyUnknown:
+		if classified.Topology == TopologyUnknown {
+			return Resolution{}, ReconcileUndetermined
+		}
+		return classified, ReconcileSettled
+	case classified.Topology == TopologyUnknown:
+		// The case the declaring options exist for: the type established nothing, the consumer knows.
+		return declared, ReconcileSettled
+	case declared.Topology != classified.Topology:
+		return Resolution{}, ReconcileContradicted
+	default:
+		return classified, ReconcileSettled
+	}
+}
