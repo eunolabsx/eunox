@@ -6232,6 +6232,11 @@ func TestJWTPDP_FilterList_NonEnforcingInnerSkipsSideEffectPass(t *testing.T) {
 // Rejecting the KEY is what closes it at the root. Widening the "the '?' belongs to the URI"
 // rule past http(s) looks like the same fix and is not: it leaves the key unexamined and
 // silently reverses every conditioned non-http claim that already worked.
+//
+// "op" is refused on those two types for the same reason one step in: naming no argument, it
+// scans the synthesized map, which holds the target name alone — so it judges the target's
+// spelling rather than an operation (see TestJWTPDP_OpOnTargetOnlyClaim_RefusedAtValidation
+// for the grant that shape accidentally issued).
 func TestParseV2Claim_InertConditionKeyRejected(t *testing.T) {
 	for _, tc := range []struct {
 		name, claim string
@@ -6242,8 +6247,12 @@ func TestParseV2Claim_InertConditionKeyRejected(t *testing.T) {
 		{name: "prompt key a get never carries", claim: "prompt:summarize?lang=en", wantErr: true},
 		{name: "resource uri is the one key in scope", claim: "resource:s3://reports/*?uri=s3://reports/q3.pdf"},
 		{name: "prompt name is the one key in scope", claim: "prompt:summarize?name=summarize"},
-		{name: "op scans whatever arguments exist", claim: "resource:db://x?op=select"},
+		// op= names no argument, so it scans what the decision carries — here the target
+		// name alone. Its verdict is about that spelling, never about an operation.
+		{name: "resource op scans only the uri it was handed", claim: "resource:db://x?op=select", wantErr: true},
+		{name: "prompt op scans only the name it was handed", claim: "prompt:summarize?op=select", wantErr: true},
 		{name: "a tool carries real arguments, so any key may match", claim: "tool:read_db?table=sales"},
+		{name: "a tool carries real arguments, so op has something to scan", claim: "tool:query_db?op=SELECT"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, _, err := parseV2Claim(tc.claim)
@@ -6254,6 +6263,80 @@ func TestParseV2Claim_InertConditionKeyRejected(t *testing.T) {
 				t.Fatalf("parseV2Claim(%q): %v", tc.claim, err)
 			}
 		})
+	}
+}
+
+// TestJWTPDP_OpOnTargetOnlyClaim_RefusedAtValidation pins the whole-token refusal for an
+// `op=` claim on a resource or prompt, which is where the shape stops being merely inert.
+// The scan runs over the synthesized {"uri"|"name": target} map, so the verdict tracks the
+// TARGET's spelling: a prompt whose name is spelled like a granted verb satisfied
+// `prompt:*?op=SELECT` and was ALLOWED — a grant no operator wrote — while the same claim on
+// an ordinary name denied MISSING_CONTEXT on every call. Both are refused at the token
+// boundary now, so neither reaches a decision.
+//
+// The category is asserted, not just the error: the refusal's operator contract is the stable
+// `invalid_capabilities` a SIEM rule keys on, and every claim here has other refusal paths
+// (pattern validation, the SQL-verb gate) that would keep a bare err != nil green after this
+// rule was gone. The untouched tool: case is TestJWTPDP_OpCondition_SQLVerb_StillWorks.
+func TestJWTPDP_OpOnTargetOnlyClaim_RefusedAtValidation(t *testing.T) {
+	t.Parallel()
+	key := newTestKey(t, "k1")
+	pdp, cleanup := makeJWTPDPWithInner(t, key, nil)
+	defer cleanup()
+
+	for _, tc := range []struct{ name, claim string }{
+		{"prompt name spelled as the granted verb", "prompt:select?op=SELECT"},   // the accidental grant
+		{"case-folded and multi-word too", "prompt:Select rows?op=SELECT"},       // OperationVerb folds and takes the first token
+		{"ordinary resource name", "resource:db://reports/*?op=SELECT"},          // the inert one
+		{"non-SQL op is refused here too", "resource:db://reports/*?op=publish"}, // the SQL-verb gate never runs
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := makeJWTToken(t, key, []string{tc.claim})
+			_, err := pdp.ValidateToken(context.Background(), "Bearer "+token)
+			if err == nil {
+				t.Fatalf("ValidateToken accepted %q; a target-only decision has no operation to scan for", tc.claim)
+			}
+			if got := ClassifyJWTError(err); got != "invalid_capabilities" {
+				t.Errorf("error_type = %q, want invalid_capabilities (the category the tape and a SIEM rule key on); err=%v", got, err)
+			}
+			// Pins WHICH rule refused: every claim here has other refusal paths (pattern
+			// validation, the SQL-verb gate) that would keep a bare err != nil green.
+			if !strings.Contains(err.Error(), "op= names no argument") {
+				t.Errorf("refused for the wrong reason; want the op= rule, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestJWTPDP_OpOnTargetOnlyClaim_RequestTimeBackstop is the twin of the refusal above, for a
+// JWTClaims built directly — the path parsedCapHeads documents (tests, callers bypassing
+// ValidateToken), which re-derives conditions through parseCondSuffix and so never re-applies
+// the validator's rules. Without the backstop this leg still ALLOWED the accidental grant,
+// which is the shape, not the seam, that makes it worth guarding: the file keeps the sibling
+// `c.Argument != ""` guard on the same reasoning.
+func TestJWTPDP_OpOnTargetOnlyClaim_RequestTimeBackstop(t *testing.T) {
+	t.Parallel()
+	key := newTestKey(t, "k1")
+	pdp, cleanup := makeJWTPDPWithInner(t, key, nil)
+	defer cleanup()
+
+	ctx := WithJWTClaims(context.Background(), &JWTClaims{
+		Subject:         "user-1",
+		Capabilities:    []string{"prompt:select?op=SELECT"},
+		HasCapabilities: true,
+	})
+	resp := pdp.DecidePromptGet(ctx, "sess", "select", "")
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny: an argument-less op= scan over a synthesized {\"name\"} map judges the target's spelling, not an operation", resp.Decision)
+	}
+	if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+		t.Fatalf("denial = %+v, want ENFORCEMENT_ERROR: nothing evaluated the restriction, so an observing route must not forward it", resp.Denial)
+	}
+	if got, _ := resp.Denial.Details["reason"].(string); got != "op_scan_without_arguments" {
+		t.Errorf("reason = %q, want op_scan_without_arguments — the deny must come from this backstop, not an unrelated refusal", got)
+	}
+	if resp.Denial.Downgradable() {
+		t.Errorf("refusal must not be downgradable: an --audit route would otherwise forward the call; got %+v", resp.Denial)
 	}
 }
 

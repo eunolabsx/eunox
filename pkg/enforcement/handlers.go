@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"net"
 	"path"
@@ -34,10 +35,10 @@ func ResolveArgument(args map[string]interface{}, ref string) (interface{}, bool
 // EnforceRequest. The returned map contains:
 //
 //	{
-//	  "arguments":  req.Arguments,              // always {} — never null
+//	  "arguments":  {...},                      // copy of req.Arguments; always {} — never null
 //	  "target":     {"type": ..., "name": ...}, // when req.Target != nil
-//	  "claims":     {...},                       // always {} — never null
-//	  "directives": [...],                       // always [] — never null
+//	  "claims":     {...},                      // copy of req.Claims; always {} — never null
+//	  "directives": [...],                      // always [] — never null
 //	  "context": {
 //	    "session_id": req.SessionID,
 //	    "source_ip":  req.Context.SourceIP,
@@ -57,18 +58,25 @@ func BuildRegoInput(ctx context.Context, req *capability.EnforceRequest) (map[st
 	if req == nil {
 		return nil, errors.New(nilSeamRefusal("BuildRegoInput", "a nil request"))
 	}
-	args := req.Arguments
-	if args == nil {
-		args = map[string]interface{}{}
-	}
-
-	// req.Claims is a memoized map shared read-only across every request on the token.
-	// Hand the PolicyEvaluator (pluggable third-party OPA/Cedar code) a shallow copy so
-	// a writer into input.claims cannot corrupt the shared map or race concurrent readers.
-	claims := map[string]interface{}{}
-	for k, v := range req.Claims {
-		claims[k] = v
-	}
+	// Both maps go into the document as SHALLOW copies, so a write into input.claims or
+	// input.arguments changes only this document. The hazards differ and both are real:
+	// req.Claims is memoized and shared read-only across every request on the token, so a
+	// write there corrupts the shared map and races concurrent readers; req.Arguments is
+	// per-request, but it outlives the decision — the pure conditions ordered AFTER `policy`
+	// resolve their argument from it, CeilingVerdictFor re-resolves the effect from it on the
+	// harden path, and the transport builds the tools/call audit record's argument details
+	// from that same map after Decide returns, so a write there reaches a signed record.
+	// Copying one and not the other was the asymmetry, not a decision.
+	//
+	// An accident guard, not an isolation boundary, and the residual is wider than this
+	// function: nested objects stay shared (for claims that leaves the cross-request race one
+	// level down, on any object-valued IdP claim), Evaluate is handed `req` itself, and its
+	// `config`/`input` arguments are manifest-owned values shared for the process's life.
+	// What this closes is the likely mistake — writing into the document it was handed.
+	args := make(map[string]interface{}, len(req.Arguments))
+	maps.Copy(args, req.Arguments)
+	claims := make(map[string]interface{}, len(req.Claims))
+	maps.Copy(claims, req.Claims)
 
 	// Prefer directives threaded via ctx (mutating req would race concurrent readers)
 	// over req.Directives, still honored for a direct caller.
