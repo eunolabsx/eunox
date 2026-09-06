@@ -409,12 +409,19 @@ func buildInitializeResponse(id *json.RawMessage, caps map[string]interface{}, i
 // received during a startup read loop, before the background reader exists to route it —
 // silently dropping a request would otherwise wedge the upstream until teardown. A no-op
 // for any non-request message.
+//
+// The message names what is true of every caller — a bounded read loop with no routing behind it —
+// rather than the handshake, which only two of the four are inside. It used to say "before
+// initialize handshake completed", which was wrong for the session-start drift probe (initUpstream
+// is already complete), for a 2026-07-28 leg (no handshake exists; its opener is server/discover)
+// and for the CLI's live introspection (no session, and none coming). It is the one frame the
+// upstream gets to read, so it should not send it looking for a phase it is not in.
 func RejectPreInitServerRequest(w mcp.MsgSink, msg mcp.RPCMsg) {
 	if !msg.IsRequest() {
 		return
 	}
 	_ = w.Write(mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError,
-		"server-initiated request received before initialize handshake completed"))
+		"server-initiated request cannot be routed: no message loop is running for this connection"))
 }
 
 // awaitStartupReply reads upstream messages until the response matching wantID arrives.

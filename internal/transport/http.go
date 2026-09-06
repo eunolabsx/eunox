@@ -423,9 +423,8 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 	if opts.Port <= 0 {
 		opts.Port = 3000
 	}
-	if opts.Stderr == nil {
-		opts.Stderr = os.Stderr
-	}
+	// No Stderr default: errOut() resolves an unset writer, and the one line below that writes
+	// before the proxy exists takes the same resolver. See resolvedErrOut.
 	var trustedProxyNets []*net.IPNet
 	for _, cidr := range opts.TrustedProxyCIDRs {
 		if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
@@ -434,7 +433,7 @@ func NewHTTPProxyGateway(opts HTTPGatewayOptions) *HTTPProxy {
 			// GatewayConfig.Validate rejects a malformed entry before the CLI reaches here, but
 			// this is an exported constructor a caller could invoke directly, so warn rather
 			// than silently trust fewer peers than configured.
-			_, _ = fmt.Fprintf(opts.Stderr, "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
+			_, _ = fmt.Fprintf(resolvedErrOut(opts.Stderr), "[eunox] WARNING: listen.trustedProxyCIDRs entry %q is not a valid CIDR and will never be trusted: %v\n", cidr, err)
 		}
 	}
 	p := &HTTPProxy{

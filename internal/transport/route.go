@@ -281,15 +281,13 @@ func BuildRoutes(cfg *config.GatewayConfig, sink *audit.Sink, counter capability
 	// The same refusal the proxy constructors make, at the seam that reaches these by parameter (see
 	// requireUsable). The first three are the subsystems the ENGINE guards with `x == nil` so an
 	// unwired backend denies rather than panics — a guard a typed nil walks straight past, on the
-	// decision path, per request. w is here for the reason HTTPGatewayOptions.Stderr is: the `if w
-	// == nil` normalization on the next line is the same interface comparison, one seam over.
+	// decision path, per request. w is here for the reason HTTPGatewayOptions.Stderr is: the
+	// nil-writer normalization on the next line is the same interface comparison, one seam over.
 	requireUsable("BuildRoutes counter", counter)
 	requireUsable("BuildRoutes flowStore", flowStore)
 	requireUsable("BuildRoutes ks", ks)
 	requireUsable("BuildRoutes w", w)
-	if w == nil {
-		w = os.Stderr
-	}
+	w = resolvedErrOut(w)
 	routes := make(map[string]*UpstreamRoute, len(cfg.Upstreams))
 	anyPoliced := false
 	for i := range cfg.Upstreams {

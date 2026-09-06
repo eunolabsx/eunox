@@ -1706,25 +1706,29 @@ func (s *httpSession) broadcast(msg mcp.RPCMsg) {
 }
 
 // broadcastServerRequest tracks a server-initiated request's ID and delivers it to one SSE
-// subscriber, reporting whether the host can service it (the host's response is later routed
-// back by handleMCPPost). Such a request blocks the upstream until answered, so with no
-// subscriber able to receive it, fail closed: untrack the ID and reply an error so the upstream
-// unblocks, rather than let it hang until teardown.
+// subscriber, reporting what it did with it (the host's response is later routed back by
+// handleMCPPost). Such a request blocks the upstream until answered, so with no subscriber able to
+// receive it, fail closed: untrack the ID and reply an error so the upstream unblocks, rather than
+// let it hang until teardown.
 // The refusal wiring is resolved from the SESSION (see refusalRecorders) rather than carried in by
 // the caller: every category charged below is driven by this session's upstream, and which table
 // bounds them is the session's wiring to answer.
-func (s *httpSession) broadcastServerRequest(ctx context.Context, msg mcp.RPCMsg) bool {
+//
+// The two ways of not delivering are DIFFERENT answers: a refusal here already wrote its own
+// attributed record, while an unserviceable request wrote none and is the not-delivered deny's
+// actual subject. See forwardOutcome.
+func (s *httpSession) broadcastServerRequest(ctx context.Context, msg mcp.RPCMsg) forwardOutcome {
 	u := s.unblocker()
 	// See forwardServerRequestToHost: an id the tracker will not retain must be REFUSED here, never
 	// delivered untracked to a host whose answer nothing could route back.
 	if !admitAndTrackServerRequest(ctx, u, msg) {
-		return false
+		return forwardRefused
 	}
 	if s.deliverToOne(msg) {
-		return true
+		return forwardDelivered
 	}
 	u.unblock(ctx, msg.ID, "no client stream available to service server-initiated request")
-	return false
+	return forwardUndelivered
 }
 
 // deliverToOne delivers a message to exactly one active SSE subscriber, reporting whether one

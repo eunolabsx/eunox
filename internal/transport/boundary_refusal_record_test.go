@@ -207,7 +207,7 @@ func TestServerInitiatedLeg_NoRecordNamesAPolicyTarget(t *testing.T) {
 		{
 			name: "no client accepted it",
 			leg: func(fp *serverRequestParams, _ *fwdRecorder) {
-				fp.forward = func(context.Context, mcp.RPCMsg) bool { return false }
+				fp.forward = func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardUndelivered }
 			},
 		},
 		{
@@ -235,7 +235,7 @@ func TestServerInitiatedLeg_NoRecordNamesAPolicyTarget(t *testing.T) {
 				rec:       rec,
 				sessionID: "sess-1",
 				pdp:       pdp.AlwaysAllowPDP{},
-				forward:   func(context.Context, mcp.RPCMsg) bool { return true },
+				forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
 				unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, httpServerRequestLegs, io.Discard),
 			}
 			tc.leg(&fp, rec)
@@ -285,7 +285,7 @@ func TestServerInitiatedAllow_ReachesTheTapeWithNoTarget(t *testing.T) {
 		mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall},
 		serverRequestParams{
 			rec: rec, sessionID: "sess-1", pdp: pdp.AlwaysAllowPDP{},
-			forward:   func(context.Context, mcp.RPCMsg) bool { return true },
+			forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
 			unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, httpServerRequestLegs, io.Discard),
 		})
 	_ = sink.Close()
