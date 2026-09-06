@@ -224,9 +224,15 @@ to the decoder are now refused there as well, naming both spellings. The rule st
 at the object's own members: an extension point's `config` payload is consumed
 whole and stays the embedder's to shape.
 
-Loading through `eunox` was never exposed to this: the manifest loader reads YAML
-and matches keys case-sensitively, so a case variant was already an unknown key
-with a "did you mean" suggestion.
+Loading through `eunox` was **not** immune. The loader's own recursive key walk
+selects a condition's field set by looking its `type` up byte-exactly, so a
+condition spelled `Type:` matched nothing, was treated as an unknown type, and had
+its per-type key check skipped entirely — after which a fold-equivalent sibling of
+a real field decided the policy last-wins, from a file that loaded clean. That
+lookup now folds the way the decoder does, so the loader keeps reporting the path
+and the "did you mean" (`capabilities[0].conditions[0]: unknown field "Domains"
+(did you mean "domains"?)`), and a second binding spelling of `type` is reported
+rather than resolved.
 
 Loading through `eunox` reports **unknown keys** exactly as before: the manifest
 loader's own walk covers these same structs and still runs first, so a typo keeps

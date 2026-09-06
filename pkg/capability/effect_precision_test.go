@@ -5,6 +5,9 @@ package capability
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/big"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -50,10 +53,9 @@ func TestBlastRadiusComparisonIsExactPastSixtyFourMantissaBits(t *testing.T) {
 	}
 }
 
-// Two spellings of one value must still compare equal: big.Rat normalizes to lowest terms
-// before SetRat sizes the mantissa, so the precision a literal is read at is a property of
-// its VALUE and not of how many characters the author typed. Without that, deriving precision
-// per-literal would report a longer spelling of the same number as strictly greater.
+// Two spellings of one value must compare equal: the width a literal is read at is fixed, so
+// it cannot be a property of how many characters the author typed. A per-literal width does
+// exactly that, and reports a longer spelling of one number as strictly greater than itself.
 func TestBlastRadiusEqualValuesCompareEqualHoweverSpelled(t *testing.T) {
 	for _, pair := range [][2]string{
 		{"0.1", "0.10"},
@@ -72,16 +74,93 @@ func TestBlastRadiusEqualValuesCompareEqualHoweverSpelled(t *testing.T) {
 	}
 }
 
-// A small fraction keeps the precision — and so the short rendering — it had before, which is
-// what keeps the audit record's blast_radius field readable.
-func TestBlastRadiusFractionsRenderShort(t *testing.T) {
-	for _, s := range []string{"0.1", "19.99", "1.5"} {
+// Parse width serves the comparison; the RENDER is bounded separately, so the audit record's
+// blast_radius field stays the number the author wrote rather than the ~1200 digits a
+// non-dyadic value has at the comparison width.
+func TestBlastRadiusRenderIsBoundedAndFaithful(t *testing.T) {
+	for _, s := range []string{"0.1", "19.99", "1.5", "250", "18446744073709551617"} {
 		v, ok := ParseBlastRadiusNumber(json.Number(s))
 		if !ok {
 			t.Fatalf("ParseBlastRadiusNumber(%q) refused a bounded decimal literal", s)
 		}
-		if got := v.Text('f', -1); got != s {
-			t.Fatalf("%q rendered as %q; a fraction must not gain digits from the exact parse", s, got)
+		if got := BlastRadiusText(v); got != s {
+			t.Fatalf("%q rendered as %q", s, got)
+		}
+	}
+
+	// A caller-supplied argument is the input the bound exists for: it must not render to
+	// thousands of digits on every refusal, synchronously, inside the decision.
+	worst := "0." + strings.Repeat("9", MaxNumericLiteralLen-8) + "e-1024"
+	v, ok := ParseBlastRadiusNumber(json.Number(worst))
+	if !ok {
+		t.Fatalf("%.12s... is inside NumericLiteralBounded", worst)
+	}
+	if got := len(BlastRadiusText(v)); got > 2*MaxNumericLiteralLen {
+		t.Fatalf("the worst in-grammar literal rendered %d chars", got)
+	}
+
+	// A caller that decoded without UseNumber lost the literal; its magnitude still renders as
+	// the number it wrote, not as the 55-digit exact value of the float64 behind it.
+	spec := &BlastRadiusSpec{Argument: "amount"}
+	f, ok := spec.resolve(map[string]interface{}{"amount": 0.1})
+	if !ok {
+		t.Fatal("a float64 argument is a magnitude")
+	}
+	if got := BlastRadiusText(f); got != "0.1" {
+		t.Fatalf("float64 0.1 rendered as %q", got)
+	}
+}
+
+// The property a bound actually depends on, over the range where the old parse was wrong and
+// where a per-literal width made it wrong differently: if a value is over its bound exactly,
+// the comparison must say so. Sweeping adjacent decimals is what finds this — the committed
+// cases before it were all integers, which is the arm that is exact by construction.
+func TestBlastRadiusComparisonAgreesWithExactArithmetic(t *testing.T) {
+	rnd := rand.New(rand.NewSource(20260906))
+	for i := 0; i < 20000; i++ {
+		whole := rnd.Int63n(1 << 62)
+		frac := rnd.Intn(9)
+		lower := fmt.Sprintf("%d.%d", whole, frac)
+		upper := fmt.Sprintf("%d.%d", whole, frac+1)
+
+		v, okv := ParseBlastRadiusNumber(json.Number(upper))
+		l, okl := ParseBlastRadiusNumber(json.Number(lower))
+		if !okv || !okl {
+			t.Fatalf("%q and %q are bounded decimal literals", upper, lower)
+		}
+		ev, _ := new(big.Rat).SetString(upper)
+		el, _ := new(big.Rat).SetString(lower)
+
+		// Both directions: the fail-OPEN (over its bound, reported as within) and the
+		// fail-CLOSED regression a per-literal width introduced (within, reported as over).
+		if got, want := v.Cmp(l) > 0, ev.Cmp(el) > 0; got != want {
+			t.Fatalf("%s vs %s: comparison says exceeds=%v, exact arithmetic says %v", upper, lower, got, want)
+		}
+		if got, want := l.Cmp(v) > 0, el.Cmp(ev) > 0; got != want {
+			t.Fatalf("%s vs %s: comparison says exceeds=%v, exact arithmetic says %v", lower, upper, got, want)
+		}
+	}
+}
+
+// The shapes the sweep above generalizes, kept by name because each was a verified wrong
+// verdict: the first two under the bound and reported over it, the rest over and reported
+// within.
+func TestBlastRadiusComparisonNamedRegressions(t *testing.T) {
+	for _, tc := range []struct {
+		value, limit string
+		exceeds      bool
+	}{
+		{"1.1", "1.100000000000000000001", false},
+		{"0.1", "0.100000000000000000021", false},
+		{"100000000000000000000.3", "100000000000000000000.2", true},
+		{"0.30000000000000000000000000000000000000001", "0.3", true},
+		{"1376241083072480382061353.56", "1376241083072480382061353.55", true},
+	} {
+		v, _ := ParseBlastRadiusNumber(json.Number(tc.value))
+		ceiling := &EffectCeiling{MaxBlastRadius: num(tc.limit)}
+		eff := &ResolvedEffect{Class: EffectReversible, BlastRadius: v, Annotated: true}
+		if exceeds, _ := ceiling.Exceeds(eff); exceeds != tc.exceeds {
+			t.Errorf("%s against %s: exceeds=%v, want %v", tc.value, tc.limit, exceeds, tc.exceeds)
 		}
 	}
 }
@@ -146,7 +225,7 @@ func TestReceiptBlastRadiusComparisonIsExact(t *testing.T) {
 	if claimed.Cmp(declared) <= 0 {
 		t.Fatal("a receipt claiming one more than the decision's magnitude must compare greater")
 	}
-	// And the sizing rule itself: an integer is carried at whatever precision it needs.
+	// And the sizing rule itself: an integer is carried at whatever width it needs, exactly.
 	if got := claimed.Prec(); got < 65 {
 		t.Fatalf("a 65-bit integer was carried at %d bits of precision", got)
 	}
@@ -174,5 +253,33 @@ func TestResolvedEffectAccessorsAreNilSafe(t *testing.T) {
 	if d["effect_unresolved"] != true {
 		t.Fatal("the record must name the unresolved state rather than omitting the effect fields")
 	}
-	d["ceiling_exceeded"] = []string{"effect_unresolved"} // the write both callers perform
+}
+
+// A bound this comparison cannot read refuses every quantified call for the process's
+// lifetime, so it must not report the ACTION as too large — that sends an operator to tune
+// the call rather than to the one literal that is wrong. Reachable only through
+// WithEffectCeiling, which takes a ceiling directly and never passes through the loader.
+func TestEffectCeiling_UnreadableBoundNamesItselfRatherThanTheAction(t *testing.T) {
+	v, _ := ParseBlastRadiusNumber(json.Number("5"))
+	eff := &ResolvedEffect{Class: EffectReversible, BlastRadius: v, Annotated: true}
+	for _, limit := range []string{
+		"Inf", "+Inf", // the natural spellings of "no magnitude bound"
+		"1e2000",                         // over the exponent bound
+		"0x10", "1_000", "1p10", "0b101", // outside the decimal grammar
+		strings.Repeat("9", MaxNumericLiteralLen+1), // over the length bound
+	} {
+		ceiling := &EffectCeiling{MaxBlastRadius: num(limit)}
+		exceeds, reasons := ceiling.Exceeds(eff)
+		if !exceeds {
+			t.Fatalf("a bound this comparison cannot read (%.12s) must fail closed", limit)
+		}
+		if len(reasons) != 1 || reasons[0] != "blast_radius_bound_unreadable" {
+			t.Fatalf("%.12s: reasons = %v, want [blast_radius_bound_unreadable]", limit, reasons)
+		}
+	}
+	// A readable bound still reports the action, so the new reason did not swallow the old one.
+	over := &EffectCeiling{MaxBlastRadius: num("1")}
+	if _, reasons := over.Exceeds(eff); len(reasons) != 1 || reasons[0] != "blast_radius" {
+		t.Fatalf("reasons = %v, want [blast_radius]", reasons)
+	}
 }

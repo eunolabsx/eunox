@@ -102,6 +102,13 @@ func NewInMemory(opts ...InMemoryOption) *InMemory {
 	for _, opt := range opts {
 		opt(m)
 	}
+	// A clock holding no value leaves the default in place: every read is a bare m.now(), so
+	// there is no fail-closed absent case to route a nil to — it would panic the first
+	// admission instead of denying it, which is the fail-OPEN reading of a decision point.
+	// flowlabelstore.NewInMemory has always done this; the two sibling options disagreed.
+	if m.now == nil {
+		m.now = time.Now
+	}
 	return m
 }
 

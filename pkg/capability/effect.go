@@ -401,6 +401,12 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 			// Unquantified is over ANY finite bound: an action whose size cannot be
 			// established must not be treated as small.
 			reasons = append(reasons, "blast_radius_unknown")
+		case !boundReadable(*c.MaxBlastRadius):
+			// Named apart from blast_radius for the reason ceiling_misconfigured is named apart
+			// from effect_class one leg up: an unreadable bound refuses every quantified call
+			// for the process's lifetime, and a record saying the ACTION was too large sends an
+			// operator to tune the call rather than to the one literal that is wrong.
+			reasons = append(reasons, "blast_radius_bound_unreadable")
 		case exceedsNumber(eff.BlastRadius, *c.MaxBlastRadius):
 			reasons = append(reasons, "blast_radius")
 		}
@@ -426,6 +432,14 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 // only closes the exported WithEffectCeiling seam that never passes through it — and reading
 // the two sides of one comparison through the SAME parse is what makes the comparison mean
 // anything.
+// boundReadable reports whether limit is a bound this comparison can read at all, which is
+// the question exceedsNumber folds into its fail-closed true and a caller reporting a reason
+// has to ask separately.
+func boundReadable(limit json.Number) bool {
+	_, ok := parseBoundedNumber(limit.String())
+	return ok
+}
+
 func exceedsNumber(value *big.Float, limit json.Number) bool {
 	lim, ok := parseBoundedNumber(limit.String())
 	if !ok {
@@ -564,37 +578,89 @@ func ParseBlastRadiusNumber(n json.Number) (*big.Float, bool) {
 	return parseBoundedNumber(n.String())
 }
 
+// magnitudeFractionPrec is the ONE mantissa width every non-integer magnitude is read at,
+// and magnitudeDisplayPrec the width one is RENDERED at.
+//
+// A common parse width is the whole point, not a tuning knob: rounding to nearest is
+// monotone, so two values rounded by the SAME rule keep their order, while two rounded by
+// DIFFERENT rules can invert — which is what a per-value width (big.Float.SetRat's own
+// sizing) does, reporting a magnitude under its bound as over it.
+//
+// 4096 bits is derived from the literal grammar rather than picked: two distinct decimals
+// within MaxNumericLiteralLen bytes differ by at least ~10^-1022 relatively, about 2^-3395,
+// so at this width no two of them round together and the comparison is exact for every
+// literal a policy or a caller can spell. Display is a different question with a different
+// answer — see magnitudeText.
+const (
+	magnitudeFractionPrec = 4 * MaxNumericLiteralLen
+	magnitudeDisplayPrec  = 64
+)
+
 // parseBoundedNumber is the ONE parse behind every magnitude this layer compares — an
-// authored bound, a ceiling's bound, and a caller-supplied argument — so no two of them can
-// be read at different precisions and disagree about which is larger.
+// authored bound, a ceiling's bound, and a caller-supplied argument — so no two of them are
+// read by different rules and disagree about which is larger.
 //
-// It goes through big.Rat rather than straight to big.Float because SetString on a
-// zero-value big.Float takes precision 64 and ROUNDS there, which is exactly where the
-// exactness this arm exists for runs out: 2^64+1 rounded to 2^64, compared EQUAL to a 2^64
-// bound, and admitted — fail-open at the boundary, and at wei-scale magnitudes (10^20+1
-// against 10^20) too. big.Rat reads the literal with no precision at all, and SetRat then
-// sizes the mantissa from the value it is handed (the larger of the numerator and
-// denominator bit lengths, floor 64), so every INTEGER within NumericLiteralBounded is exact
-// while a small fraction is left at the precision it already had — which is what keeps its
-// Text('f', -1) rendering on the audit record as short as it is today.
+// big.Float.SetString on a zero value takes precision 64 and ROUNDS there, which is exactly
+// where the exactness this arm exists for ran out: 2^64+1 rounded onto a 2^64 bound, compared
+// EQUAL, and admitted — fail-open at the boundary, and at the wei-scale magnitudes (10^20+1
+// against 10^20) a token-transfer tool really carries. An INTEGER is therefore read through
+// big.Int, which rounds nothing at all; anything else through big.Rat at one fixed width.
 //
-// The residual is stated rather than closed: a value that is not a dyadic rational (0.1) has
-// no exact binary form at ANY precision, so it stays the nearest big.Float to it. Two
-// spellings of one such value still compare equal, because big.Rat normalizes to lowest
-// terms before SetRat sizes anything — "0.1" and "0.10" reach the identical float.
+// The residual is stated rather than hidden: a value that is not a dyadic rational (0.1) has
+// no exact binary form at ANY precision, so it is the nearest big.Float at that width. What
+// the common width buys is that this can no longer change an ORDER — the property a bound
+// depends on — only collapse two values closer together than the grammar can express.
 func parseBoundedNumber(s string) (*big.Float, bool) {
-	// The bound first: it is what keeps the Rat below from materializing the ~1 MiB integer
+	// The bound first: it is what keeps the parse below from materializing the ~1 MiB integer
 	// "1e1000000" names, and what keeps this to the decimal grammar a caller WROTE (big.Rat
 	// reads "a/b" quotients and hex-float exponents that no reviewer of a manifest would).
 	if !NumericLiteralBounded(s) {
 		return nil, false
 	}
+	// A plain integer literal — every authored bound, every row or recipient count — read with
+	// no rounding and no rational, which also keeps the common case at the two allocations the
+	// rounding parse it replaced cost. Base 10 refuses the underscore and 0x forms big.Int
+	// accepts under base 0, matching the grammar checked above.
+	if i, ok := new(big.Int).SetString(s, 10); ok {
+		return new(big.Float).SetInt(i), true
+	}
 	r, ok := new(big.Rat).SetString(s)
 	if !ok {
 		return nil, false
 	}
-	return new(big.Float).SetRat(r), true
+	if r.IsInt() {
+		// An integer spelled with an exponent or a trailing ".0" is still an integer.
+		return new(big.Float).SetInt(r.Num()), true
+	}
+	return new(big.Float).SetPrec(magnitudeFractionPrec).SetRat(r), true
 }
+
+// magnitudeText renders a magnitude for an operator message and the audit record.
+//
+// NOT Text('f', -1) on the parsed value: parse width serves the COMPARISON, and printing a
+// non-dyadic value at 4096 bits emits ~1200 digits nobody wrote — on a field an operator
+// reads and, for a caller-supplied argument, at request rate. An integer is exact (its
+// decimal length is bounded by the grammar and it is the number an operator reconciles
+// against); anything else is rendered at the width the value actually needs, capped at what
+// the shortest-form printer resolved before this layer parsed exactly at all.
+func magnitudeText(f *big.Float) string {
+	if f == nil {
+		return ""
+	}
+	prec := f.MinPrec()
+	if !f.IsInt() && prec > magnitudeDisplayPrec {
+		prec = magnitudeDisplayPrec
+	}
+	if prec == 0 { // zero needs no mantissa; SetPrec(0) would discard the value
+		prec = magnitudeDisplayPrec
+	}
+	return new(big.Float).SetPrec(prec).Set(f).Text('f', -1)
+}
+
+// BlastRadiusText renders a resolved magnitude the way this package's own messages and audit
+// details do, so a consumer building its own message does not re-derive the bound on how much
+// of a caller-supplied literal reaches an operator's terminal.
+func BlastRadiusText(f *big.Float) string { return magnitudeText(f) }
 
 // ResolveEffect reduces a constraint's contract against one call's arguments. It is the
 // single resolution path, so the effectClass condition, the blastRadius condition, the
@@ -848,7 +914,7 @@ func (e *ResolvedEffect) String() string {
 	}
 	parts := []string{"class=" + e.Class}
 	if e.Quantified() {
-		br := "blastRadius=" + e.BlastRadius.Text('f', -1)
+		br := "blastRadius=" + magnitudeText(e.BlastRadius)
 		if e.Unit != "" {
 			br += " " + e.Unit
 		}
@@ -887,7 +953,7 @@ func (e *ResolvedEffect) AuditDetails() map[string]interface{} {
 		"annotated":    e.Annotated,
 	}
 	if e.Quantified() {
-		d["blast_radius"] = e.BlastRadius.Text('f', -1)
+		d["blast_radius"] = magnitudeText(e.BlastRadius)
 		if e.Unit != "" {
 			d["blast_radius_unit"] = e.Unit
 		}

@@ -40,7 +40,7 @@ func TestFoldDuplicateMembersAreRefusedAtTheExportedSeams(t *testing.T) {
 		"exact duplicate": {
 			decode: func(b []byte) error { _, err := unmarshalCondition(b); return err },
 			data:   `{"type":"timeWindow","notBefore":"09:00","notBefore":"00:00"}`,
-			want:   []string{`"notBefore"`},
+			want:   []string{`"notBefore"`, "declared twice"},
 		},
 		"directive field": {
 			decode: func(b []byte) error { _, err := unmarshalDirective(b); return err },
@@ -72,19 +72,42 @@ func TestFoldDuplicateMembersAreRefusedAtTheExportedSeams(t *testing.T) {
 					t.Fatalf("the refusal must name %s, got: %v", want, err)
 				}
 			}
-			if !strings.Contains(err.Error(), "same field to a JSON decoder") {
-				t.Fatalf("the refusal must say what the ambiguity IS, got: %v", err)
+			if !strings.Contains(err.Error(), "declare it once") {
+				t.Fatalf("the refusal must say what the ambiguity IS and how to fix it, got: %v", err)
 			}
 		})
 	}
 }
 
-// Two spellings of an UNRECOGNIZED name are already refused as unknown, so the ambiguity
-// refusal only ever reports on members the decode would really have contended over.
-func TestFoldDuplicateOfAnUnknownNameIsReportedAsUnknown(t *testing.T) {
+// The ambiguity scan runs before the field set is known — it has to, since the discriminator
+// that selects that set is itself one of the members it protects — so an ambiguous name is
+// refused as ambiguous whether or not it is one this build binds. A LONE unknown name still
+// reports as unknown, which is the message an author with a typo needs.
+func TestFoldDuplicateRefusalIsIndependentOfWhetherTheNameIsKnown(t *testing.T) {
 	_, err := unmarshalCondition([]byte(`{"type":"timeWindow","notBefore":"09:00","bogus":1,"Bogus":2}`))
-	if err == nil || !strings.Contains(err.Error(), "unknown field") {
+	if err == nil || !strings.Contains(err.Error(), "declare it once") {
+		t.Fatalf("expected the ambiguity refusal, got: %v", err)
+	}
+	_, err = unmarshalCondition([]byte(`{"type":"timeWindow","notBefore":"09:00","bogus":1}`))
+	if err == nil || !strings.Contains(err.Error(), `unknown field "bogus"`) {
 		t.Fatalf("expected the unknown-field refusal, got: %v", err)
+	}
+}
+
+// A fold-variant discriminator is refused as the ambiguity it is, rather than steering
+// newCondition and reporting a condition type the author never wrote.
+func TestFoldDuplicateDiscriminatorIsRefusedBeforeItSteers(t *testing.T) {
+	for _, data := range []string{
+		`{"type":"maxCalls","Type":"bogus","count":5,"windowSeconds":60}`,
+		`{"type":"maxCalls","Type":"redactFields","count":5,"windowSeconds":60}`,
+	} {
+		_, err := unmarshalCondition([]byte(data))
+		if err == nil || !strings.Contains(err.Error(), "declare it once") {
+			t.Fatalf("expected the ambiguity refusal, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "unknown condition type") || strings.Contains(err.Error(), "must be placed in") {
+			t.Fatalf("the refusal names a type the author never wrote: %v", err)
+		}
 	}
 }
 
@@ -122,5 +145,30 @@ func TestFoldDuplicateScanLeavesMalformedInputToTheDecoder(t *testing.T) {
 		if _, err := unmarshalCondition([]byte(data)); err == nil {
 			t.Fatalf("%q must not decode as a condition", data)
 		}
+	}
+}
+
+// encoding/json calls an Unmarshaler for a null too, and the convention is that null is a
+// no-op. The map decode the member scan replaced gave that for free; without the guard a
+// `capabilities: [null]` manifest regressed from the loader's own "'target' must not be
+// empty", which names the index, to a shape error naming no position at all.
+func TestConstraintNullIsANoOp(t *testing.T) {
+	var one Constraint
+	if err := json.Unmarshal([]byte("null"), &one); err != nil {
+		t.Fatalf("null must be a no-op: %v", err)
+	}
+	if one.Target != "" {
+		t.Fatalf("null must leave the value untouched, got %+v", one)
+	}
+	var many []Constraint
+	if err := json.Unmarshal([]byte("[null]"), &many); err != nil {
+		t.Fatalf("a null array element must decode: %v", err)
+	}
+	if len(many) != 1 || many[0].Target != "" {
+		t.Fatalf("decoded %+v", many)
+	}
+	// It is still the ONLY non-object accepted; the gate stays in force for the rest.
+	if err := json.Unmarshal([]byte(`[7]`), &many); err == nil {
+		t.Fatal("a non-object constraint must be refused")
 	}
 }

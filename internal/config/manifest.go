@@ -2031,7 +2031,7 @@ func checkManifestKeys(data []byte) error {
 				if !ok {
 					continue
 				}
-				ct, _ := condObj["type"].(string)
+				ct := discriminatorOf(condObj)
 				allowed, known := conditionKeysFor(ct)
 				if !known {
 					continue // unknown type is already rejected by the typed decode
@@ -2047,7 +2047,7 @@ func checkManifestKeys(data []byte) error {
 				if !ok {
 					continue
 				}
-				dt, _ := dirObj["type"].(string)
+				dt := discriminatorOf(dirObj)
 				allowed, known := directiveKeysFor(dt)
 				if !known {
 					continue
@@ -2240,6 +2240,37 @@ func checkArgumentSchemaKeywords(path string, raw interface{}) error {
 		}
 	}
 	return nil
+}
+
+// discriminatorOf reads the `type` a decoder would BIND on this object, which is not what a
+// byte-exact map lookup answers: encoding/json matches member names case-insensitively, so a
+// `Type:` spelling bound the type perfectly well while `obj["type"]` came back empty — and an
+// empty type is unknown, so the per-type key walk below it was SKIPPED for that whole
+// condition. Its unknown-key check then never ran, and a fold-equivalent sibling of a real
+// field decided the policy last-wins with nothing naming the path a reviewer could look at.
+// pkg/capability now refuses the ambiguity itself; this is what restores the loader's own
+// diagnostic — and what keeps the next check hung off checkObjectKeys from inheriting the
+// silent skip.
+//
+// A second binding spelling is reported rather than resolved, for the same reason the decoder
+// seam refuses it: which one wins is a property of member order, not of the file.
+func discriminatorOf(obj map[string]interface{}) string {
+	var found string
+	var seen bool
+	for k, v := range obj {
+		if !strings.EqualFold(k, "type") {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			return ""
+		}
+		if seen && s != found {
+			return ""
+		}
+		found, seen = s, true
+	}
+	return found
 }
 
 // checkObjectKeys reports the first key in obj that is not in allowed, in deterministic

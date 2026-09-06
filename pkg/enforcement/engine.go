@@ -309,6 +309,13 @@ func WithClock(clock Clock) Option {
 // the engine (the ManifestPDP hand-built deny paths) can stamp DecidedAt from the
 // same source — a frozen test clock is then honored on every deny path.
 func (e *Engine) Clock() Clock {
+	// A nil engine answers the system clock, for the reason ConditionHandlerOverridden and
+	// NonCommittingConditionVerdict state on themselves: an embedder legitimately holds an
+	// unwired *Engine, and this accessor's own use is stamping DecidedAt on a hand-built deny,
+	// so panicking here would crash the deny path it exists to serve.
+	if e == nil || e.clock == nil {
+		return systemClock{}
+	}
 	return e.clock
 }
 

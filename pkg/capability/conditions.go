@@ -211,6 +211,12 @@ func marshalCondition(condition Condition) ([]byte, error) {
 }
 
 func unmarshalCondition(data []byte) (Condition, error) {
+	// Above the envelope decode, not below it: this decode resolves the discriminator
+	// last-wins, so a `"Type"` beside a `"type"` would steer newCondition and report an
+	// unknown condition type the author never wrote. See objectFieldNames.
+	if _, err := objectFieldNames(data, "condition"); err != nil {
+		return nil, err
+	}
 	var envelope conditionEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return nil, err
@@ -304,25 +310,59 @@ var jsonFieldNamesCache sync.Map // reflect.Type -> map[string]bool
 // embedder's own object to shape, and the fields this rule protects are the ones this
 // package's own decode binds.
 func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra ...string) error {
-	members, err := claimObjectMembers(data, context)
+	names, err := objectFieldNames(data, context)
 	if err != nil {
 		return err
 	}
 	known := jsonFieldNames(target)
-	seen := make(map[string]string, len(members))
-	for _, m := range members {
-		folded := FoldJSONKey(m.key)
-		if !known[folded] && !slices.ContainsFunc(allowExtra, func(e string) bool { return folded == FoldJSONKey(e) }) {
-			return fmt.Errorf("%s: unknown field %q", context, m.key)
+	for _, name := range names {
+		folded := FoldJSONKey(name)
+		if known[folded] || slices.ContainsFunc(allowExtra, func(e string) bool { return folded == FoldJSONKey(e) }) {
+			continue
 		}
-		// Unknown first, so this reports on two members the decode would really have
-		// contended over — two spellings of an unrecognized name are already refused above.
-		if prior, dup := seen[folded]; dup {
-			return fmt.Errorf("%s: members %q and %q are the same field to a JSON decoder, which keeps the LAST of them — so which value takes effect depends on their order rather than on anything a reviewer reading the policy can see; declare it once", context, prior, m.key)
-		}
-		seen[folded] = m.key
+		return fmt.Errorf("%s: unknown field %q", context, name)
 	}
 	return nil
+}
+
+// objectFieldNames returns data's top-level member names in source order, having refused two
+// that are the same field to a JSON decoder.
+//
+// The ambiguity refusal is SEPARABLE from the unknown-key check because it has to run
+// earlier: a caller that resolves a discriminator out of these bytes has already let the
+// decode pick between `"type"` and `"Type"` by the time it knows which field set to check
+// against, and would report an unknown TYPE the author never wrote instead of the ambiguity.
+func objectFieldNames(data []byte, context string) ([]string, error) {
+	members, err := claimObjectMembers(data, context)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(members))
+	// Linear over the folds already in hand rather than a map: these objects carry a handful
+	// of members, and this runs per request on the attribution block.
+	for _, m := range members {
+		folded := FoldJSONKey(m.key)
+		for _, prior := range names {
+			if FoldJSONKey(prior) != folded {
+				continue
+			}
+			if prior == m.key {
+				return nil, foldDuplicateError(context, fmt.Sprintf("member %q is declared twice", m.key))
+			}
+			return nil, foldDuplicateError(context, fmt.Sprintf("members %q and %q are the same field to a JSON decoder", prior, m.key))
+		}
+		names = append(names, m.key)
+	}
+	return names, nil
+}
+
+// foldDuplicateError reports a member named more than once, carrying the same sentinel type
+// RefuseAmbiguousJSONKeys uses so a caller classifying the two seams' refusals sees one kind.
+// The consequence sentence is shared; only what was found differs, since an exact repeat and
+// a case variant are the same hazard reached two ways and a message naming one string twice
+// reads as a bug in the checker.
+func foldDuplicateError(context, found string) error {
+	return &ambiguityRefusal{msg: fmt.Sprintf("%s: %s; the decoder keeps the LAST of them, so which value takes effect depends on their order rather than on anything a reviewer reading the policy can see — declare it once", context, found)}
 }
 
 // jsonFieldNames returns the fold-canonicalized JSON field names encoding/json would bind
