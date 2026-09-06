@@ -172,6 +172,13 @@ type JWTPDP struct {
 	// ValidateToken (the shared validator) — route wrappers call Decide and leave
 	// their cache empty. Kill switch, route audience, and policy are still per-call.
 	tokenCache *capability.PayloadCache[*JWTClaims]
+	// refusalCache is the same memoization for the REFUSALS a later request carrying the
+	// same bytes must reach again (memoizableRefusal), so an IdP emitting one mis-minted
+	// claim costs one verification per TTL rather than one per request. Written and read
+	// only by ValidateToken on the shared validator, which is what makes an audience or
+	// issuer refusal cacheable at all: the per-route narrowing happens later in Decide, and
+	// a route wrapper's cache stays nil.
+	refusalCache *capability.PayloadCache[error]
 }
 
 // JWTPDPOptions configures a JWTPDP.
@@ -274,12 +281,14 @@ func NewJWTPDP(opts JWTPDPOptions) *JWTPDP {
 		cacheConfig.Now = opts.Clock.Now
 	}
 	p := newJWTPDP(opts, capability.NewJWKSCache(cacheConfig))
-	// Only a shared VALIDATOR gets a token cache: it is written solely by
+	// Only a shared VALIDATOR gets the two token caches: both are written solely by
 	// ValidateToken, and a per-route wrapper (NewJWTPDPWithCache) only intersects
-	// already-validated claims, so its cache would stay empty for the process
-	// lifetime — PayloadCache's Get/Put are nil-receiver safe, so leaving it nil
-	// there is simply the miss path.
+	// already-validated claims, so its caches would stay empty for the process
+	// lifetime — PayloadCache's Get/Put are nil-receiver safe, so leaving them nil
+	// there is simply the miss path, and for the refusal cache it is also the
+	// enforcement of memoizableJWTRefusals' route-scope constraint.
 	p.tokenCache = newJWTTokenCache(p.now)
+	p.refusalCache = newJWTRefusalCache(p.now)
 	return p
 }
 
@@ -790,6 +799,14 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 	if cached, ok := p.tokenCache.Get(cacheKey); ok {
 		return WithJWTClaims(ctx, cached), nil
 	}
+	// The same fast path for the refusals no elapsed time can turn into an allow
+	// (memoizableRefusal). Without it a token the IdP mis-mints — one watched claim spelled
+	// the wrong way is enough — re-runs ParseSigned, the ECDSA verify and both payload
+	// decodes on EVERY request for the life of the misconfiguration, where the same token
+	// validating successfully costs one verification per TTL.
+	if refusal, ok := p.refusalCache.Get(cacheKey); ok {
+		return ctx, refusal
+	}
 
 	tok, err := jwt.ParseSigned(tokenStr, capability.JWKSAlgorithms())
 	if err != nil {
@@ -819,6 +836,11 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 	// tokenExpUnix caps the cache entry's TTL at the token's remaining lifetime, so
 	// a structurally expired token is never served from cache.
 	var tokenExpUnix int64
+	// signatureVerified records that some candidate key verified these bytes, which is what
+	// makes a refusal below memoizable — see memoizableRefusal. Reading it after the call is
+	// sound because a post-verification refusal is always Terminal, and VerifyWithKeyRotation
+	// surfaces a Terminal error immediately rather than replacing it with a later key's.
+	var signatureVerified bool
 	validated, err := capability.VerifyWithKeyRotationMultiKID[JWTClaims](ctx, p.cache, kids, func(key *jose.JSONWebKey, freshKeySet bool) (*JWTClaims, error) {
 		if !nowSampled || freshKeySet {
 			now = p.now()
@@ -832,6 +854,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		if err := tok.Claims(key, &stdClaims); err != nil {
 			return nil, err
 		}
+		signatureVerified = true
 
 		// Step 2 (signature verified): the token bytes are key-independent, so a
 		// parse failure here is terminal — retrying other keys would report a later
@@ -914,6 +937,7 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 		return newValidatedClaims(capsList, capabilitiesPresent, payload, stdClaims, rawClaims), nil
 	})
 	if err != nil {
+		p.memoizeRefusal(cacheKey, err, signatureVerified, tokenExpUnix)
 		return ctx, err
 	}
 	// TTL is capped at the token's remaining lifetime inside Put. Consumers must
@@ -921,6 +945,25 @@ func (p *JWTPDP) ValidateToken(ctx context.Context, authHeader string) (context.
 	// concurrent sessions.
 	p.tokenCache.Put(cacheKey, validated, tokenExpUnix)
 	return WithJWTClaims(ctx, validated), nil
+}
+
+// memoizeRefusal stores a ValidateToken failure for replay, for the refusals memoizableRefusal
+// admits and no others.
+//
+// The entry is capped at the token's own exp whenever the standard-claim read got far enough
+// to produce one, so a refusal whose category WOULD become `expired` is never served past the
+// moment it does. A refusal reached before that read has no exp to cap with and falls back to
+// the flat TTL; the residual there is a category that names the payload fault rather than the
+// expiry that has since overtaken it — a stale label on a refusal, never a stale verdict.
+func (p *JWTPDP) memoizeRefusal(cacheKey string, err error, signatureVerified bool, tokenExpUnix int64) {
+	if !memoizableRefusal(err, signatureVerified) {
+		return
+	}
+	exp := tokenExpUnix
+	if exp <= 0 {
+		exp = p.now().Add(jwtRefusalCacheTTL).Unix()
+	}
+	p.refusalCache.Put(cacheKey, err, exp)
 }
 
 // CheckKill consults the kill switch, returning non-nil when the session is killed

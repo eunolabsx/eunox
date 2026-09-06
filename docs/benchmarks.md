@@ -45,10 +45,22 @@ The table below shows the mean of 3 × 3s runs on the reference machine.
 | ManifestPDP / Decide_Deny_FailsArgumentSchema | 194 ns | 5 | < 1 ms | ✅ |
 | JWTPDP / Decide_CachedClaims_Allow | 229 ns | 9 | < 1 ms | ✅ |
 | JWTPDP / Decide_CachedClaims_Deny | 352 ns | 8 | < 1 ms | ✅ |
-| JWTPDP / ValidateToken_CachedJWKS | 45 400 ns | 182 | — ¹ | — |
+| JWTPDP / ValidateToken_Memoized | — ¹ | — ¹ | — | — |
+| JWTPDP / ValidateToken_Verified | — ¹ | — ¹ | — | — |
+| JWTPDP / ValidateToken_Refused_Memoized | — ¹ | — ¹ | — | — |
+| JWTPDP / ValidateToken_Refused_Verified | — ¹ | — ¹ | — | — |
 
-¹ `ValidateToken_CachedJWKS` is ECDSA P-256 signature verification (no JWKS network fetch;
-cache is warm). This is called once per session, not on every tool call.
+¹ These four replace a single `ValidateToken_CachedJWKS` row whose figure was recorded as an
+ECDSA P-256 signature verification and was in fact a verified-token cache HIT: the benchmark
+reused one token, so every iteration after the first skipped the crypto entirely. The split
+measures the same call on either side of each cache — `_Memoized` is the hit, `_Verified` runs
+with the caches disarmed and pays the full `ParseSigned` + ECDSA verify + payload decodes; the
+`Refused_` pair is the same split for a token the validator refuses for a reason no elapsed
+time can change. `ValidateToken` runs on **every** request through the HTTP transport, not once
+per session. No numbers are carried over: the old figure measured a different thing, and one
+cut on another machine is what a reader mistakes for a baseline. Run `./scripts/bench.sh` and
+read each `_Verified` row against its `_Memoized` sibling — the gap is roughly two orders of
+magnitude in both ns/op and allocs/op, which is the whole reason both caches exist.
 
 ### 2. Full HTTP round-trip — stateless mode (no audit)
 
@@ -83,9 +95,10 @@ in-memory key set.
 | HTTPProxy_JWTPDP / Allow_JWTAndManifest | 92 194 ns | 31 900 | **60.3 µs** | < 3 ms | ✅ |
 | HTTPProxy_JWTPDP / Deny_AbsentFromJWT | 51 902 ns | — | < 52 µs ² | < 3 ms | ✅ |
 
-The ~59 µs JWT overhead is dominated by ECDSA P-256 signature verification
-(~45 µs, see `ValidateToken_CachedJWKS` above). No further optimization is
-needed to meet the 3 ms target.
+The ~59 µs JWT overhead is dominated by ECDSA P-256 signature verification (see
+`ValidateToken_Verified` above). It is the cost of a token the validator has not seen within
+the cache TTL; a repeat of the same token, and a token refused for a reason that cannot change,
+are both served from cache instead. No further optimization is needed to meet the 3 ms target.
 
 ### 4. Redis kill-switch overhead
 
@@ -143,6 +156,7 @@ derivation and the atomic admission cost on an in-memory counter.
 | ValidateAction / PureConditions (n=1,4,8) | Per-condition dispatch; allocs must not grow with n |
 | ValidateAction / PureAndCommitting | The second pass: deferral + `AdmitAll` |
 | AnchoredKey (session, task) | The key builder on every quota bucket and history lookup |
+| ClaimMembers (Clean, Unwatched, Variant, Decode) | The JWT claim-name scan every token pays twice, against a plain decode of the same bytes |
 
 No numbers are recorded here on purpose: unlike the tables above, these have no target to
 meet, and a figure copied from one machine into a document is the thing a reader mistakes for
