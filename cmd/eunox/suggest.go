@@ -648,17 +648,11 @@ Flags:
 		fmt.Fprintf(os.Stderr, "eunox suggest: --force requires --output (there is no file to overwrite when the draft goes to stdout)\n")
 		return suggestUsageExit
 	}
-	r, closeChain, code, done := openAuditChainOrExit("suggest", logPath, suggestUsageExit)
+	resolvedMaxValues := resolveMaxValues(*maxValues)
+	suggestions, code, done := readAuditChainOrExit("suggest", logPath, suggestUsageExit,
+		func(r io.Reader) (suggestionSet, error) { return computeSuggestions(r, resolvedMaxValues) })
 	if done {
 		return code
-	}
-	defer closeChain()
-
-	resolvedMaxValues := resolveMaxValues(*maxValues)
-	suggestions, err := computeSuggestions(r, resolvedMaxValues)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox suggest: reading log: %v\n", err)
-		return suggestUsageExit
 	}
 	manifest := renderSuggestedManifest(suggestions, *name, resolvedMaxValues)
 

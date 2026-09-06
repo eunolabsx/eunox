@@ -2775,7 +2775,7 @@ func TestOpenAuditChain_DiscoveryError(t *testing.T) {
 	}
 	logPath := filepath.Join(blocker, "audit.jsonl")
 
-	_, _, err := openAuditChain("stats", logPath)
+	_, _, _, err := openAuditChain("stats", logPath)
 	if err == nil {
 		t.Fatal("expected an error when the log directory is a regular file")
 	}

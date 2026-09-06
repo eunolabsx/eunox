@@ -542,12 +542,28 @@ func openAndPrepareLog(logPath string, preSize int64, lockFile *os.File) (f *os.
 	// refuseNonRegular check above cannot. A symlink surviving to here fails the open
 	// with ELOOP, which is neither ErrPermission nor ErrNotExist, so it falls straight
 	// into the fail-closed return below rather than the write-only fallback.
-	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR|config.OpenNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+	//
+	// config.OpenNonBlock covers what O_NOFOLLOW does not: the Lstat->open window is open
+	// to any planted object, and the two arms below fail differently on a FIFO. The O_RDWR
+	// arm does not block, so without a check the signed tape is written into the pipe with
+	// writeFailures staying 0 — --require-audit=strict never trips — while LogChainFiles'
+	// IsRegular() scan drops the diverted "log" from verification, the same silent-PASS
+	// hazard as the symlink. The O_WRONLY fallback arm blocks INSIDE open(2) until a reader
+	// appears, wedging startup before the drainer exists; with O_NONBLOCK it fails ENXIO and
+	// takes the fail-closed return below.
+	f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_RDWR|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	if errors.Is(err, os.ErrPermission) {
 		readable = false
-		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|config.OpenNoFollow, 0o600) //nolint:gosec // G304: path is user-configured audit log location
+		f, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: path is user-configured audit log location
 	}
 	if err != nil {
+		_ = releaseAuditLock(lockFile)
+		return nil, 0, 0, tailResume{}, fmt.Errorf("opening audit log %q: %w", logPath, err)
+	}
+	// Ask through the HANDLE, the guard with no window after it — and ahead of the tighten
+	// below, which would otherwise fchmod whatever object was substituted for the log.
+	if err := refuseNonRegularHandle(f, logPath); err != nil {
+		_ = f.Close()
 		_ = releaseAuditLock(lockFile)
 		return nil, 0, 0, tailResume{}, fmt.Errorf("opening audit log %q: %w", logPath, err)
 	}

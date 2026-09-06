@@ -60,16 +60,9 @@ Flags:
 	if done {
 		return code
 	}
-	r, closeChain, code, done := openAuditChainOrExit("stats", logPath, statsUsageExit)
+	summary, code, done := readAuditChainOrExit("stats", logPath, statsUsageExit, computeAuditStats)
 	if done {
 		return code
-	}
-	defer closeChain()
-
-	summary, err := computeAuditStats(r)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox stats: reading log: %v\n", err)
-		return statsUsageExit
 	}
 	printAuditStats(os.Stdout, summary)
 	return 0

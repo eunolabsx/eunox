@@ -2024,22 +2024,30 @@ func auditLogMissingHint(cmdName, logPath string) string {
 
 // openAuditChain opens the FULL audit chain — every rotated sibling plus the active base —
 // for a read-only reporting command, returning one concatenated reader (oldest record
-// first) and a closer. audit.OpenLogChain opens one file at a time, so the fd count stays
-// bounded even under keep-all retention. On error the returned message is the full text to
-// print to stderr verbatim; the caller prints it and exits with its own usage code (2 for
-// both callers, via openAuditChainOrExit) — a log this command cannot read is a
-// configuration failure, not a finding, so it must not collide with a findings code.
-func openAuditChain(cmdName, logPath string) (reader io.Reader, closeAll func(), err error) {
-	files, ferr := audit.LogChainFiles(logPath)
+// first), a closer, and the snapshot the read must be bracketed against. audit.OpenLogChain
+// opens one file at a time, so the fd count stays bounded even under keep-all retention. On
+// error the returned message is the full text to print to stderr verbatim; the caller prints
+// it and exits with its own usage code (2 for both callers, via readAuditChainOrExit) — a
+// log this command cannot read is a configuration failure, not a finding, so it must not
+// collide with a findings code.
+//
+// Snapshot rather than a bare audit.LogChainFiles for the reason audit-verify already takes
+// one: these commands read a log a proxy is still writing, the files are opened LAZILY by
+// name, and a rotation landing in between renames the base — holding the newest up-to-
+// maxBytes of records — to a sibling this listing never saw, leaving the lazy open to read
+// the fresh, nearly-empty file in its place. The snapshot is what lets the caller find that
+// out afterwards; without it the loss is silent, and silence here reads as a quiet log.
+func openAuditChain(cmdName, logPath string) (reader io.Reader, closeAll func(), snap *audit.ChainSnapshot, err error) {
+	snap, ferr := audit.SnapshotLogChain(logPath)
 	if ferr != nil {
 		// Pre-formatted via Sprintf, not Errorf, so the deliberate trailing newline
 		// doesn't trip the "error strings must not end in punctuation" checks.
 		msg := fmt.Sprintf("eunox %s: discovering rotated audit logs: %v\n", cmdName, ferr)
-		return nil, nil, fmt.Errorf("%s", msg)
+		return nil, nil, nil, fmt.Errorf("%s", msg)
 	}
-	if len(files) == 0 {
-		return nil, nil, fmt.Errorf("%s", auditLogMissingHint(cmdName, logPath))
+	if len(snap.Files) == 0 {
+		return nil, nil, nil, fmt.Errorf("%s", auditLogMissingHint(cmdName, logPath))
 	}
-	rc := audit.OpenLogChain(files)
-	return rc, func() { _ = rc.Close() }, nil
+	rc := audit.OpenLogChain(snap.Files)
+	return rc, func() { _ = rc.Close() }, snap, nil
 }
