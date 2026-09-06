@@ -326,11 +326,11 @@ func TestSessionGate_HeldOnceForTheSessionsLife(t *testing.T) {
 	assert.Same(t, held, viaRegistry)
 	drop()
 
-	// And it is released by the TEARDOWN FUNNEL, not by a hand call: releaseSessionState is
-	// the one path that runs on every teardown reason, and driving it is what makes this
-	// assertion about the release production performs. See
+	// And it is released by the TEARDOWN FUNNEL, not by a hand call: releaseSessionObjectState
+	// is the half of it that runs on every teardown reason whatever the id's ownership, and
+	// driving it is what makes this assertion about the release production performs. See
 	// TestSessionGate_ReleasedOnEveryTeardownPath.
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 	assert.Zero(t, rt.decideGates.size())
 }
 
@@ -340,8 +340,8 @@ func TestSessionGate_HeldOnceForTheSessionsLife(t *testing.T) {
 // A session-lifetime hold is only bounded if something always releases it, and close() is NOT
 // that something: a local upstream that exits on its own (crash, clean exit, an unreadable
 // frame) has its session reaped by the cleanup goroutine, which deletes the registry entry and
-// calls releaseSessionState WITHOUT ever calling close() — the path releaseSessionState's own
-// doc exists to cover. Releasing the gate anywhere else retained one per such session for the
+// releases its state WITHOUT ever calling close() — the path finishSessionCleanup's own doc
+// exists to cover. Releasing the gate anywhere else retained one per such session for the
 // proxy's life, which is exactly the accumulation the registry refcounts to prevent, and a
 // test that called dropDecideGate directly could not see it.
 func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
@@ -349,10 +349,10 @@ func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
 	for name, teardown := range map[string]func(*httpSession){
 		// The natural-upstream-exit path: what the cleanup goroutine runs after <-sess.done,
 		// with no close() anywhere in it.
-		"upstream exited on its own": func(s *httpSession) { releaseSessionState(s) },
+		"upstream exited on its own": func(s *httpSession) { releaseSessionStateForTest(s) },
 		// An explicit teardown (idle reap, DELETE, kill, shutdown) closes first and is reaped
 		// by the same goroutine afterwards.
-		"explicit close then reap": func(s *httpSession) { s.close(0); releaseSessionState(s) },
+		"explicit close then reap": func(s *httpSession) { s.close(0); releaseSessionStateForTest(s) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			rt := &UpstreamRoute{decideGates: newAnchorGates(), pdp: pdp.DenyAllPDP{}}
@@ -367,7 +367,7 @@ func TestSessionGate_ReleasedOnEveryTeardownPath(t *testing.T) {
 }
 
 // TestSessionGate_TimedOutDrainHandsOffTheDropRatherThanForcingIt: a handler still
-// holding the session's pinned turn when releaseSessionState's bounded drain gives up must not
+// holding the session's pinned turn when releaseSessionObjectState's bounded drain gives up must not
 // have its gate deleted out from under it. Forcing the drop at that point would let the
 // registry reap the entry and hand the next caller on the same anchor a FRESH gate with an
 // empty turn channel — two gates for one anchor, unserialized until the wedged handler returns.
@@ -386,14 +386,14 @@ func TestSessionGate_TimedOutDrainHandsOffTheDropRatherThanForcingIt(t *testing.
 
 	done := make(chan struct{})
 	go func() {
-		releaseSessionState(sess)
+		releaseSessionStateForTest(sess)
 		close(done)
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("releaseSessionState must return once its bounded budget elapses, not block on the wedged handler")
+		t.Fatal("the release must return once its bounded budget elapses, not block on the wedged handler")
 	}
 
 	assert.Same(t, held, registryGate(rt.decideGates, key),
@@ -444,8 +444,8 @@ func TestSessionGate_TaskAnchoredRouteResolvesPerRequest(t *testing.T) {
 	assert.Equal(t, 3, rt.decideGates.size(),
 		"three live gates: each session's own, plus the ONE both sessions resolved for task-42 — "+
 			"which each now holds through its span cache rather than re-minting per call")
-	releaseSessionState(a)
-	releaseSessionState(b)
+	releaseSessionStateForTest(a)
+	releaseSessionStateForTest(b)
 	assert.Zero(t, rt.decideGates.size())
 }
 
@@ -511,8 +511,8 @@ func TestSessionGate_CacheFollowsTheResolvedAnchor(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("the turn must advance once released")
 	}
-	releaseSessionState(sess)
-	releaseSessionState(sibling)
+	releaseSessionStateForTest(sess)
+	releaseSessionStateForTest(sibling)
 	assert.Zero(t, rt.decideGates.size(),
 		"both sessions spanned onto task-99 and each cached its gate, so both teardowns are what empties the registry")
 }

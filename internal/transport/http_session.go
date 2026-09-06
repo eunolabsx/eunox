@@ -714,7 +714,7 @@ func (p *HTTPProxy) registerSession(sess *httpSession, startGen uint64) error {
 }
 
 // holdDecisionGate resolves this session's anchor once and pins the registry gate for it, for
-// the session's life; the reference is released by releaseSessionState. It's a cache, not a
+// the session's life; the reference is released by releaseSessionObjectState. It's a cache, not a
 // decision the anchor can't change: each request resolves its own anchor and compares (gateFor).
 // No-op on a non-serialized route (no registry to hold).
 func (s *httpSession) holdDecisionGate() {
@@ -1430,11 +1430,11 @@ func (s *httpSession) errOut() io.Writer {
 	return s.proxy.errOut()
 }
 
-// noticeWriter is this session's diagnostic channel: the proxy's writer, bounded by this session's
-// ROUTE table rather than the proxy-wide aggregate, so one tenant's flood cannot silence another's
-// lines — and under it this session's own reserved floor, so a SIBLING session's dead upstream
-// cannot elide this one's first line of a class. Nil-safe throughout for a bare-struct-literal
-// session.
+// noticeWriter is this session's diagnostic channel, which is the PROXY's: one writer and one
+// class table, with no session or route tier under it. The per-route tables and per-session floors
+// this used to describe were removed (see the proxy's own accessor and record_limiter.go's package
+// comment), so the residual is real and stated rather than hidden — one session's dead upstream can
+// spend a class budget its siblings share. Nil-safe throughout for a bare-struct-literal session.
 func (s *httpSession) noticeWriter() noticeWriter {
 	return s.proxy.noticeWriter()
 }
@@ -1550,26 +1550,17 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 	}
 }
 
-// inFlightDrainPoll is how often releaseSessionState re-checks the in-flight counter
+// inFlightDrainPoll is how often releaseSessionObjectState re-checks the in-flight counter
 // while waiting for enforced decisions to drain before it releases flow state.
 const inFlightDrainPoll = 2 * time.Millisecond
-
-// releaseSessionState releases a torn-down session's per-session enforcement state (its
-// accumulated flow-label set) via the route's PDP, so a reused session id starts clean. Called
-// from the cleanup goroutine after <-sess.done on EVERY teardown path, including the natural
-// upstream exit that close() alone does not cover.
-//
-// Waits for in-flight enforced decisions first (bounded by the shutdown budget), so a Clear
-// can't empty the session's taint between a source's committed Add and a sink still deciding on
-// the same session — the fail-open a teardown racing live decisions would otherwise open.
-func releaseSessionState(sess *httpSession) {
-	releaseSessionObjectState(sess)
-	releaseSessionIDState(sess)
-}
 
 // releaseSessionObjectState reclaims what the session OBJECT holds — the in-flight drains, its
 // decision-gate references, its gate cache. Always owed on teardown, however many sessions have
 // carried this session's id, which is why it is split from the id-keyed half below.
+//
+// Waits for in-flight enforced decisions first (bounded by the shutdown budget), so a teardown
+// cannot drop a gate or clear a cache under a request still deciding against it — the fail-open a
+// teardown racing live decisions would otherwise open.
 func releaseSessionObjectState(sess *httpSession) {
 	if sess.route == nil {
 		return
@@ -1617,7 +1608,7 @@ func releaseSessionIDState(sess *httpSession) {
 	sess.route.pdp.ReleaseSession(ctx, sess.id)
 }
 
-// awaitAndDropDecideGate is releaseSessionState's fallback when its bounded drain gave up with
+// awaitAndDropDecideGate is releaseSessionObjectState's fallback when its bounded drain gave up with
 // a handler still holding the session's pinned decision gate. It polls past the budget — the
 // same counters awaitInFlightDrained and serverPool.drain already watch, so this is not a
 // second notion of "idle" — and drops the gate the instant both read zero, closing the window

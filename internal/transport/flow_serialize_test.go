@@ -949,7 +949,7 @@ func TestReleaseSessionState_DrainsServerInitiatedHandlers(t *testing.T) {
 		})
 	<-running
 
-	releaseSessionState(sess)
+	releaseSessionStateForTest(sess)
 	select {
 	case <-finished:
 	default:

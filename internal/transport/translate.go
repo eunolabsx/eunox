@@ -507,7 +507,7 @@ func refuseServerRequestAcrossRevisions(method string, hostRev capability.Revisi
 }
 
 // translateNotificationForLeg adapts a host notification for an upstream leg addressed at a
-// different revision, reporting false when it must be dropped instead.
+// different revision, or returns the error the leg drops it with.
 //
 // Notifications need this for the same reason requests do — a declaring upstream requires the
 // per-request declaration on every message a client sends it, not only on the ones carrying an
@@ -517,21 +517,22 @@ func refuseServerRequestAcrossRevisions(method string, hostRev capability.Revisi
 // forwardNotification). Wrapping the call seam therefore covered every enforced request and
 // none of these.
 //
-// A drop rather than a refusal, because JSON-RPC forbids answering a notification and the
-// boundary already ADMITTED this one at negotiation: reaching a translation failure here means
-// the params are malformed in a way the gate could not see, which is the same disposition every
-// other unforwardable notification takes.
+// The disposition is re-asked here rather than trusted from checkUpstreamHonorable, for the
+// reason withCrossRevisionTranslation re-asks it: that gate runs at negotiation, and this is the
+// seam a notification's bytes actually cross. Unreachable today — a non-translating notification
+// is already refused there — and one map lookup on the mismatched-pair path, which is what an
+// outbound seam that would otherwise SILENTLY ship an uncarryable message is worth.
+//
+// The CAUSE travels with the drop rather than being flattened to "no": this is the one
+// unforwardable-notification disposition whose reason is eunox's own boundary rather than the
+// peer's message, so the leg dropping it is the only place that can say which notification was
+// lost and why. A drop rather than a refusal because JSON-RPC forbids answering a notification.
 func translateNotificationForLeg(msg mcp.RPCMsg, hostRev, legRev capability.Revision) (mcp.RPCMsg, error) {
 	if hostRev == upstreamAddressedRevision(legRev) {
 		return msg, nil
 	}
-	translated, err := translateRequest(msg, hostRev, legRev)
-	if err != nil {
-		// The CAUSE travels with the drop rather than being flattened to "no": this is the one
-		// unforwardable-notification disposition whose reason is eunox's own translation layer
-		// rather than the peer's message, so the leg dropping it is the only place that can say
-		// which notification was lost and why.
-		return mcp.RPCMsg{}, err
+	if decl := boundaryDisposition(msg); !decl.translates {
+		return mcp.RPCMsg{}, refuseAcrossRevisions(msg.Method, hostRev, legRev, decl.why)
 	}
-	return translated, nil
+	return translateRequest(msg, hostRev, legRev)
 }

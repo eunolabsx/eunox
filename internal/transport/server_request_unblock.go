@@ -62,6 +62,9 @@ type serverRequestLegs struct {
 	// fact from refusal, carrying a different category (the host actually produced that work),
 	// which is why one leg field cannot serve both.
 	reply transportLeg
+	// undelivered: nothing on the host side would take the request at forward time. Not the
+	// tracker's doing and not a refusal of eunox's, so it is neither of the two above.
+	undelivered transportLeg
 }
 
 // The two transports' leg sets.
@@ -71,12 +74,14 @@ var (
 		unroutableID: dropHTTPUnroutableID,
 		refusal:      dropHTTPRefusalUndeliverable,
 		reply:        dropHTTPReplyUndeliverable,
+		undelivered:  dropHTTPForwardUndelivered,
 	}
 	stdioServerRequestLegs = serverRequestLegs{
 		displaced:    dropStdioDisplaced,
 		unroutableID: dropStdioUnroutableID,
 		refusal:      dropStdioRefusalUndeliverable,
 		reply:        dropStdioReplyUndeliverable,
+		undelivered:  dropStdioForwardUndelivered,
 	}
 )
 
@@ -338,6 +343,14 @@ const (
 	// dropHTTPUndelivered: buffered onto a subscriber channel that never reached the host (the
 	// client disconnected, or the SSE write failed).
 	dropHTTPUndelivered transportLeg = "http-server-request-undelivered"
+	// dropHTTPForwardUndelivered / dropStdioForwardUndelivered: nothing took the request at
+	// FORWARD time — no SSE subscriber accepted it, or the stdio host writer failed the frame.
+	// Distinct from dropHTTPUndelivered above, which corrects a request already buffered and
+	// therefore already recorded as an allow: these two are the whole record for a request the
+	// host never had, and they are charged on their own category (catUndeliveredForward), which
+	// a shared leg value would make unrecoverable from a suppression rollup.
+	dropHTTPForwardUndelivered  transportLeg = "http-server-request-forward-undelivered"
+	dropStdioForwardUndelivered transportLeg = "stdio-server-request-forward-undelivered"
 	// dropHTTPDisplaced / dropStdioDisplaced: the tracker made room, or an id collided. Distinct
 	// from undelivered because the request may well have reached the host — what failed is eunox's
 	// ability to route the answer back.
@@ -392,16 +405,10 @@ func recordServerRequestDropped(ctx context.Context, rec auditRecorder, subj kil
 	// would stamp a policy target onto the signed tape for a request the PDP never saw — and
 	// sampling/createMessage, the method most likely to be dropped on this leg, resolves one.
 	identifier, name := auditIdentity(mcp.RPCMsg{Method: method})
-	details := subj.auditDetails(nil)
-	// An UNSET leg names no site, and an empty member of a closed vocabulary is worse on a signed
-	// tape than an absent key: it matches no SIEM filter and reads like a record written before the
-	// vocabulary existed. Every production caller passes a constant; this is what keeps a future one
-	// that forgets from stamping a blank.
-	if drop != "" {
-		details = subj.auditDetails(map[string]interface{}{detailTransport: string(drop)})
-	}
+	// An UNSET leg names no site; transportLegDetail is where that rule lives, shared with the
+	// undelivered-forward record so the two spellings of "which site failed this" cannot disagree.
 	rec.RecordDeny(ctx, subj.auditSessionID(), identifier, name, capability.ErrCodeEnforcementError, "",
-		details, false)
+		subj.auditDetails(transportLegDetail(drop)), false)
 }
 
 // trackServerRequest records msg as an outstanding server-initiated request on this leg and

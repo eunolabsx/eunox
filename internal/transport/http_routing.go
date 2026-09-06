@@ -767,8 +767,9 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// awaitAndDropDecideGate) counts only requests that already incremented inFlight —
 			// a straggler the drain missed would otherwise take its turn on a gate the registry
 			// no longer owns, or decide against flow state ReleaseSession already cleared. Every
-			// teardown path deletes from p.sessions before releaseSessionState, so a straggler
-			// whose Add(1) the drain missed observes the deletion here and fails closed instead.
+			// teardown path deletes from p.sessions before finishSessionCleanup releases that
+			// state, so a straggler whose Add(1) the drain missed observes the deletion here
+			// and fails closed instead.
 			writeJSONMsg(w, mcp.ErrorResponse(msg.ID, jsonRPCCodeServerBusy, "eunox: session torn down; retry"))
 			return
 		}
@@ -841,7 +842,17 @@ var (
 // site's, which comes from an established session). Stamping it into the signed session_id
 // field would let anyone forge kill records against an arbitrary session id; claimedSession(r)
 // keeps session_id empty and preserves it only as details.claimed_session_id.
+//
+// It is also the only CheckKill argument bounded by nothing but Go's ~1 MiB header cap, which is
+// why an over-length one short-circuits: the value flows into the kill store's key, so without
+// this an unauthenticated POST on an open bind mints a ~1 MiB Redis key per request. Refusing
+// loses no kill — an id this long names no session this proxy ever minted — and it is the rule
+// /control/kill already applies to the body form of the same value (maxClaimedSessionIDLen).
 func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sessionID string, msg mcp.RPCMsg) {
+	if len(sessionID) > maxClaimedSessionIDLen {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
 	deny := route.pdp.CheckKill(r.Context(), sessionID)
 	if deny == nil {
 		http.Error(w, "session not found", http.StatusNotFound)

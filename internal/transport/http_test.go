@@ -6891,3 +6891,51 @@ func TestHTTPForwardNotification_LocalModeWriteErrorIsReported(t *testing.T) {
 		t.Errorf("a dropped notification must not be silent; stderr = %q", got)
 	}
 }
+
+// TestDenyUnresolvedSession_OverLengthSessionIDNeverReachesTheKillStore: an over-length
+// Mcp-Session-Id is answered with the plain 404 BEFORE the kill lookup runs.
+//
+// denyUnresolvedSession is the one CheckKill call site whose subject is the raw client header —
+// bounded by nothing but Go's ~1 MiB header cap — and it flows into the kill store's key, so an
+// unauthenticated POST on an open bind would mint a ~1 MiB Redis key per request. /control/kill
+// already refuses the body form of the same value for exactly this reason (maxClaimedSessionIDLen).
+//
+// Driven under an ACTIVE GLOBAL KILL, which is what makes the assertion about ordering rather than
+// about the answer: with the kill active, any id that reaches the lookup denies with KILL_SWITCH,
+// so a 404 here can only mean the length gate ran first. Nothing is served either way — an
+// over-length id names no session this proxy ever minted.
+func TestDenyUnresolvedSession_OverLengthSessionIDNeverReachesTheKillStore(t *testing.T) {
+	t.Parallel()
+	ks := killswitch.NewInMemory()
+	if err := ks.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
+	}
+	route := &UpstreamRoute{
+		name: "up1",
+		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		sink: &routeSink{},
+	}
+	proxy := newTestHTTPProxy()
+	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call"}
+
+	post := func(sessionID string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
+		req.Header.Set(SessionHeader, sessionID)
+		proxy.handleSessionPost(w, req, route, sessionID, msg)
+		return w
+	}
+
+	// The bound holds, so an ordinary unknown id still gets the kill contract's deny.
+	if w := post("short-and-unknown"); w.Code == http.StatusNotFound {
+		t.Fatal("a normal unknown id under a global kill must still deny with KILL_SWITCH, or this cell proves nothing")
+	}
+
+	w := post(strings.Repeat("A", maxClaimedSessionIDLen+1))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("an over-length session id must be refused before it becomes a kill-store key; got %d (%s)", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), capability.ErrCodeKillSwitch) {
+		t.Error("the kill lookup ran on an unbounded, client-supplied id")
+	}
+}

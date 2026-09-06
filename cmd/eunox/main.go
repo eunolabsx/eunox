@@ -407,6 +407,19 @@ Flags:
 	fs.PrintDefaults()
 }
 
+// printWiretapBanners announces observe mode on stderr, and what it does NOT downgrade.
+//
+// Printed by cmdProxy after the last fail-closed flag guard rather than by resolveProxyConfig,
+// which runs before them: `eunox proxy --audit --jwt-issuer x -- cmd` announced the mode twice and
+// then died on the JWKS guard, and in a supervisor log a banner reads as a proxy that came up.
+// Same parse-before-side-effects principle the guards themselves are ordered by.
+func printWiretapBanners(w io.Writer) {
+	_, _ = fmt.Fprintf(w, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
+	// Named rather than left to be discovered on the tape: observe mode downgrades POLICY
+	// verdicts, and a message eunox cannot route has no verdict to downgrade.
+	_, _ = fmt.Fprintf(w, "[eunox] WIRETAP MODE: policy blocks nothing, but three refusals stand — the kill switch, a method absent from the revision your host negotiated (UNROUTABLE_METHOD, marked details.%s), and a revision that cannot be established (UNSUPPORTED_PROTOCOL_VERSION).\n", audit.UnroutableKey)
+}
+
 // resolveProxyConfig determines cmdProxy's GatewayConfig from the audit/config mode switch:
 // --audit builds a zero-config wiretap upstream, --config loads the gateway config, and
 // neither is a usage error. Extracted from cmdProxy to keep the latter's own branch count
@@ -420,10 +433,6 @@ func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConf
 		if err != nil {
 			return nil, err
 		}
-		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
-		// Named rather than left to be discovered on the tape: observe mode downgrades POLICY
-		// verdicts, and a message eunox cannot route has no verdict to downgrade.
-		fmt.Fprintf(os.Stderr, "[eunox] WIRETAP MODE: policy blocks nothing, but three refusals stand — the kill switch, a method absent from the revision your host negotiated (UNROUTABLE_METHOD, marked details.%s), and a revision that cannot be established (UNSUPPORTED_PROTOCOL_VERSION).\n", audit.UnroutableKey)
 		return cfg, nil
 	case *f.configPath != "":
 		// The upstream command comes from the config in this mode; a trailing
@@ -575,6 +584,12 @@ func cmdProxy(args []string) (exitCode int) {
 	if err := validateRedisFlagsRequireRedisAddr(fs, *f.redisAddr); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
+	}
+
+	// Past the last guard that can still refuse to start, and before the first side effect. See
+	// printWiretapBanners.
+	if *f.audit {
+		printWiretapBanners(os.Stderr)
 	}
 
 	// Build call counter and kill-switch manager, shared across routes and the

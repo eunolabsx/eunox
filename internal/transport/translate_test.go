@@ -475,6 +475,35 @@ func TestTranslateNotificationForLeg(t *testing.T) {
 			t.Error("a notification whose params could not be translated was admitted for forwarding")
 		}
 	})
+
+	// The disposition is re-asked HERE, at the seam the bytes cross, not trusted from the
+	// negotiation-time refusal.
+	//
+	// Unreachable on the shipped path — checkUpstreamHonorable refuses a non-translating
+	// notification when the leg is negotiated — which is exactly why it is worth pinning: this is
+	// the outbound seam where a missed refusal ships an uncarryable message SILENTLY, with the far
+	// peer's error naming eunox's own bug as the upstream's. The request seam re-asks for the same
+	// reason (withCrossRevisionTranslation), and a gate that ran only at negotiation is, in this
+	// package's own words, one refactor away from being bypassed.
+	t.Run("a non-translating notification is refused at the seam", func(t *testing.T) {
+		t.Parallel()
+		notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsRootsListChanged}
+		if decl := boundaryDisposition(notif); decl.translates {
+			t.Fatalf("%s is declared translatable; this cell needs a method that is not", notif.Method)
+		}
+		got, err := translateNotificationForLeg(notif, capability.Revision20251125, capability.Revision20260728)
+		if err == nil {
+			t.Fatalf("a notification the boundary refuses was admitted for forwarding as %+v", got)
+		}
+		if !errors.Is(err, errUntranslatableAcrossRevisions) {
+			t.Errorf("error = %v, want the boundary's own refusal so the leg can say what was lost and why", err)
+		}
+		// And a matched pair still forwards it: the refusal is about crossing, not about the
+		// method.
+		if _, err := translateNotificationForLeg(notif, capability.Revision20251125, capability.Revision20251125); err != nil {
+			t.Errorf("a matched pair must forward it untouched: %v", err)
+		}
+	})
 }
 
 func TestRefuseServerRequestAcrossRevisions(t *testing.T) {

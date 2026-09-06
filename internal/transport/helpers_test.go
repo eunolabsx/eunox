@@ -325,6 +325,10 @@ type httpProxyOptions struct {
 	// DriftCheck is the injected drift hook; nil = no drift checking.
 	DriftCheck drift.CheckFunc
 
+	// TaskAnchored mirrors the route's WithTaskAnchoredState setting: its decisions, its
+	// decision turn and its worker keys resolve on the validated mcp.task_id claim.
+	TaskAnchored bool
+
 	// Stderr, when set, captures this proxy's diagnostic lines instead of the real
 	// os.Stderr — the injectable-writer seam a test asserting on a startup/lifecycle line
 	// uses instead of swapping the process-global (see HTTPProxy.stderr).
@@ -358,6 +362,7 @@ func newHTTPProxy(opts httpProxyOptions) *HTTPProxy {
 		pdp:                     opts.PDP,
 		audit:                   opts.Audit,
 		driftCheck:              opts.DriftCheck,
+		taskAnchored:            opts.TaskAnchored,
 		sink:                    &routeSink{sink: opts.Sink},
 	}
 	return NewHTTPProxyGateway(HTTPGatewayOptions{
@@ -390,3 +395,16 @@ var errKillSwitchFailed = &ksTestError{"kill switch backend unavailable"}
 type ksTestError struct{ msg string }
 
 func (e *ksTestError) Error() string { return e.msg }
+
+// releaseSessionStateForTest tears a session's per-session state down the way a teardown does,
+// for a cell that holds a session directly and never went through the proxy's cleanup goroutine.
+//
+// It SKIPS the last-owner gate finishSessionCleanup applies, which is the whole reason it is a
+// test helper rather than a second production funnel: an unconditional id-keyed release is the
+// fail-open twin of an unconditional delete (a predecessor unparking after 2x shutdownMs would
+// un-quarantine a live successor's broken surface pin and empty its taint set), and a name that
+// reads like the production path is what the next caller would reach for.
+func releaseSessionStateForTest(sess *httpSession) {
+	releaseSessionObjectState(sess)
+	releaseSessionIDState(sess)
+}

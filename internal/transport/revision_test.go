@@ -424,6 +424,13 @@ func TestCheckNegotiatedRevision(t *testing.T) {
 			name: "a declaring leg's contradicting reply is refused", opened: capability.Revision20260728,
 			reported: "2025-11-25", wantErr: "opened at",
 		},
+		{
+			// An UNSPEAKABLE pin selected the handshake opener (UpstreamOpenRevision), so the
+			// handshake's own answer is the conforming one. Judging it verbatim — the host-side
+			// empty-carrier resolver's answer — refused a leg that did exactly what it was told.
+			name: "an unspeakable pin is judged against the opener it selected", opened: capability.Revision("1999-01-01"),
+			reported: "2025-11-25",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -444,6 +451,34 @@ func TestCheckNegotiatedRevision(t *testing.T) {
 				t.Errorf("notice = %q, want it to mention %q", notice, tc.wantNotice)
 			}
 		})
+	}
+}
+
+// TestCheckNegotiatedRevision_ResolvesThroughTheOpenersResolver pins WHICH resolver settles an
+// unset leg revision here.
+//
+// upstreamAddressedRevision states the rule and its reason: an unset leg revision resolves through
+// UpstreamOpenRevision — the resolver that SELECTED the opener — not through resolveRevision, which
+// answers the host side's empty-carrier question and lands on capability.DefaultRevision. The two
+// agree only while the default IS the handshake revision, so this cell is written against the
+// resolver rather than against today's shared value: the day the default advances, an in-tree
+// caller's `ApplyUpstreamOpenerResult("")` would open with the handshake opener while this check
+// judged the reply against the new default, refusing a conforming handshake.
+func TestCheckNegotiatedRevision_ResolvesThroughTheOpenersResolver(t *testing.T) {
+	t.Parallel()
+	for _, pin := range []capability.Revision{"", "1999-01-01"} {
+		opened := UpstreamOpenRevision(pin)
+		if _, err := checkNegotiatedRevision(pin, opened.String()); err != nil {
+			t.Errorf("pin %q opened at %s; a reply naming that revision must not be refused: %v", pin, opened, err)
+		}
+		for _, other := range capability.PublishedRevisions() {
+			if other == opened {
+				continue
+			}
+			if _, err := checkNegotiatedRevision(pin, other.String()); err == nil {
+				t.Errorf("pin %q opened at %s; a reply naming %s must be refused", pin, opened, other)
+			}
+		}
 	}
 }
 

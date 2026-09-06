@@ -32,9 +32,12 @@ const (
 	perCategoryDenyBurstSize  = 5
 )
 
-// refusalCategory is a distinct type (not a bare string) because a METERED category's value
-// doubles as both the rate-limit bucket key and the audit record's structured condition_type
-// field.
+// refusalCategory is a distinct type (not a bare string) because a category's value is the
+// rate-limit bucket key, and on the PRE-SESSION leg it doubles as the audit record's structured
+// condition_type field (recordRefusal writes it there). The server-request categories below do
+// not: their records go through recordServerRequestDropped, which leaves condition_type empty and
+// names the site in details.transport instead — so a value's spelling is load-bearing on the tape
+// for some of this set and only for the bucket for the rest.
 type refusalCategory string
 
 // The refusal categories. Every recordPreSessionDeny / recordSessionCapDeny call site

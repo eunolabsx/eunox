@@ -20,12 +20,15 @@
 // worker, fork a new upstream, and accumulate its policy state in a bucket nothing else ever
 // reaches — quotas that never bind, `sequenceBlock` antecedents that never correlate.
 //
-// So the key is the RESOLVED STATE ANCHOR — the same subject stateful policy keys on, through
-// the same `enforcement.ResolveStateAnchor` the engine's own key builder uses, so the worker map
-// and the accumulated state cannot come to disagree about a request. The stable caller identity
-// (`agent_id`) is what fills the anchor's session slot, per the ADR's scope-key/revocation-key
-// split: `jti` is the finest REVOCABLE unit and would fragment cross-request state under token
-// rotation, so it stays revocation-only.
+// So the key is the STABLE CALLER IDENTITY, resolved under the route's own STATE ANCHOR — the
+// same subject stateful policy keys on, through the same `enforcement.ResolveStateAnchor` the
+// engine's own key builder uses, so the worker map and the accumulated state cannot come to
+// disagree about which subject a request belongs to. On the default session arm the identity IS
+// the anchor; the task arm adds the task beside it, one worker per (identity, task), because the
+// anchor alone is coarser than the owner binding every request on that worker must clear — see
+// stableCallerIdentity and workerKey. Per the ADR's scope-key/revocation-key split, `jti` is the
+// finest REVOCABLE unit and would fragment cross-request state under token rotation, so it stays
+// revocation-only.
 //
 // The key is namespaced by ROUTE because `p.sessions` is one flat map across a gateway's
 // upstreams and `handleSessionPost` answers 409 on a route mismatch. A UUID could never collide;
@@ -60,9 +63,18 @@ import (
 // firstRequestWorkerKey names the worker a declaring peer's request maps to, and reports whether
 // the caller presented the identity one can be keyed on.
 //
-// Resolved through the route's own anchor resolver, so a task-anchored route keys its workers on
-// the task exactly as it keys the decision turn and the engine keys its state — one resolution,
-// three consumers, no chance of two of them disagreeing about which subject a request belongs to.
+// The ANCHOR is resolved through the route's own resolver, so a task-anchored route separates its
+// workers by task exactly as it keys the decision turn and the engine keys its state — one
+// resolution, three consumers, no chance of two of them disagreeing about which subject a request
+// belongs to.
+//
+// The IDENTITY rides alongside it rather than being folded into it, because the anchor is not
+// always as fine as the gates every request on the worker must clear: the task arm resolves the
+// validated `task_id` ALONE, and two identities sharing one — the shape task anchoring exists for
+// ("two sessions sharing a task share a turn") — would otherwise resolve one key, letting the
+// first mint a worker whose ownerMismatch then refuses every request from the second for that
+// worker's whole life. Sharing an anchor is sharing STATE, which the engine keys on the anchor
+// itself; it was never sharing the upstream and the captured claims a worker owns.
 func firstRequestWorkerKey(route *UpstreamRoute, ctx context.Context) (string, bool) {
 	claims := pdp.JWTClaimsPtr(ctx)
 	identity, ok := stableCallerIdentity(claims)
@@ -73,7 +85,7 @@ func firstRequestWorkerKey(route *UpstreamRoute, ctx context.Context) (string, b
 	if anchor.ID == "" {
 		return "", false
 	}
-	return workerKey(route.name, anchor), true
+	return workerKey(route.name, anchor, identity), true
 }
 
 // stableCallerIdentity is the correlator a worker and its policy state are keyed on.
@@ -84,7 +96,8 @@ func firstRequestWorkerKey(route *UpstreamRoute, ctx context.Context) (string, b
 // worker was created with. A key coarser than that binding hands the first caller a worker every
 // OTHER caller sharing its agent id is then permanently refused on — an `AUTHORIZATION_FAILED`
 // per attempt, forever, for traffic that is entirely legitimate. So the key is at least as fine
-// as every per-session gate applied to it, which is the invariant to preserve if a gate is added.
+// as every per-session gate applied to it, which is the invariant to preserve if a gate is added
+// — and it is workerKey that HOLDS it, by carrying this tuple on an arm whose anchor does not.
 //
 // `jti` is deliberately absent. Revocation wants the finest revocable thing and cross-request
 // policy wants the most stable correlator; under short-lived rotating credentials a jti-keyed
@@ -106,7 +119,7 @@ func stableCallerIdentity(claims *pdp.JWTClaims) (string, bool) {
 		safeKeyComponent(claims.AgentID), true
 }
 
-// workerKey renders a route and an anchor as one map key.
+// workerKey renders a route, an anchor and the caller identity as one map key.
 //
 // NOT enforcement.StateAnchor.Key(), which separates with NUL. This string becomes the worker's
 // id, and a worker's id is both PRINTED to an operator's console and signed into the audit
@@ -120,10 +133,20 @@ func stableCallerIdentity(claims *pdp.JWTClaims) (string, bool) {
 // point every worker id is built is what makes "a worker id is printable and injective" a property
 // of the type rather than of remembering which arm produced it.
 //
+// The identity is APPENDED for an anchor that is not the identity itself, which today is the task
+// arm: the anchor alone is coarser than the owner binding every request on the worker must clear,
+// and the two shapes cannot collide because the kind component already separates them. The session
+// arm's anchor IS the identity (firstRequestWorkerKey resolves it as the session id), so appending
+// it there would double a component and change nothing.
+//
 // Unambiguous without escaping the other components: a route name matches `^[a-zA-Z0-9_-]+$` and
 // the anchor kind is a closed vocabulary, so neither can carry the `:` they are joined on.
-func workerKey(routeName string, anchor enforcement.StateAnchor) string {
-	return routeName + ":" + string(anchor.Kind) + ":" + safeKeyComponent(anchor.ID)
+func workerKey(routeName string, anchor enforcement.StateAnchor, identity string) string {
+	key := routeName + ":" + string(anchor.Kind) + ":" + safeKeyComponent(anchor.ID)
+	if anchor.Kind == enforcement.AnchorKindSession {
+		return key
+	}
+	return key + ":" + safeKeyComponent(identity)
 }
 
 // maxKeyComponentBytes bounds one caller-supplied component of a worker key.

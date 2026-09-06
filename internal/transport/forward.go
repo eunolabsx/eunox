@@ -174,6 +174,20 @@ type transportLeg string
 // this key, which cannot find a second producer spelling the literal itself.
 const detailTransport = "transport"
 
+// transportLegDetail renders a leg as the details fragment a record naming its site carries, or nil
+// for an UNSET one.
+//
+// An empty member of a closed vocabulary is worse on a signed tape than an absent key: it matches no
+// SIEM filter and reads like a record written before the vocabulary existed. Every production caller
+// passes a constant; this is what keeps a future one that forgets from stamping a blank, on whichever
+// of the record sites it reaches.
+func transportLegDetail(leg transportLeg) map[string]interface{} {
+	if leg == "" {
+		return nil
+	}
+	return map[string]interface{}{detailTransport: string(leg)}
+}
+
 // The kill-drop legs (recordKillDrop).
 const (
 	legHTTPNotification          transportLeg = "http-notification"
@@ -1176,7 +1190,12 @@ func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, identifi
 			// fault refusalLimits exists to prevent. Nil when the leg has no tape, or when the
 			// bucket suppressed this record.
 			if rec := fp.unblocker.report.recs.forCategory(catUndeliveredForward); rec != nil {
-				rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeEnforcementError, "", detail, false)
+				// Named for recordServerRequestDropped's reason, from the same leg vocabulary: this
+				// is the one drop record on the leg that used to name no site, so when the bucket
+				// suppressed one, the suppressed_refusal_scope rollup rode a record whose category
+				// could not be recovered — the misreading that stamp exists to prevent.
+				rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeEnforcementError, "",
+					mergeAuditDetails(detail, transportLegDetail(fp.unblocker.report.legs.undelivered)), false)
 			}
 			return
 		}
