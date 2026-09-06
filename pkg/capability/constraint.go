@@ -572,6 +572,14 @@ func (c *Constraint) UnmarshalJSON(data []byte) error {
 	// author sees a manifest that loaded clean. The binary's own loader runs a recursive
 	// unknown-key check, but this decoder is an exported seam a library consumer reaches
 	// without it.
+	// encoding/json calls an Unmarshaler for a null too, and the convention is that null is a
+	// no-op — which the map decode this gate replaced gave for free and the object scan does
+	// not. Both wrappers in this package short-circuit it the same way, and it is what keeps a
+	// `capabilities: [null]` manifest reaching the loader's own "'target' must not be empty"
+	// with its index rather than a shape error naming no position.
+	if string(data) == "null" {
+		return nil
+	}
 	if err := rejectUnknownJSONFields(data, constraintJSON{}, "constraint"); err != nil {
 		return err
 	}

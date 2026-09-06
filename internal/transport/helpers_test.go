@@ -263,15 +263,24 @@ func newTestManifestPDPWithKS(ks killswitch.Manager, caps ...capability.Constrai
 // LoadUpstreamPDP and to the route), so a harness that anchors only the route runs a route/engine
 // disagreement production cannot produce — the very thing the worker key and the decision turn
 // resolve through one resolver to prevent.
+// The unanchored engine is built with NO options, byte-identical to what every other cell in this
+// package has always got: adding one for the anchored cells' sake would change what a quota
+// condition does in a hundred tests that never asked for a counter.
 func newTestManifestPDPAnchored(ks killswitch.Manager, taskAnchored bool, caps ...capability.Constraint) *pdp.ManifestPDP {
 	manifest := &config.LocalManifest{
 		Name:         "test-policy",
 		Version:      "1.0.0",
 		Capabilities: caps,
 	}
-	opts := []enforcement.Option{enforcement.WithCallCounter(callcounter.NewInMemory())}
+	var opts []enforcement.Option
 	if taskAnchored {
-		opts = append(opts, enforcement.WithTaskAnchoredState())
+		// The counter travels with the anchoring rather than being wired separately: anchored
+		// state is what a budget accrues to, and an engine with no counter hard-denies every
+		// quota condition, so the two would only ever be set together.
+		opts = []enforcement.Option{
+			enforcement.WithTaskAnchoredState(),
+			enforcement.WithCallCounter(callcounter.NewInMemory()),
+		}
 	}
 	return pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(opts...), ks)
 }

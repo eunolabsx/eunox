@@ -182,6 +182,10 @@ func (h policyConditionHandler) Handle(ctx context.Context, cond capability.Cond
 // UsesEngineSubsystems implements [SubsystemDependent] by asking the evaluator that will
 // actually run, read once after every option is applied so it is the one this engine was
 // built with.
+//
+// No typed-nil test beside the assertion, unlike registeredHandler.dependsOn one seam over:
+// the evaluator arrives through WithPolicyEvaluator, which normalizes a value-less one to the
+// unconfigured case, while a handler's own registration keeps whatever the caller registered.
 func (h policyConditionHandler) UsesEngineSubsystems() []capability.EngineSubsystem {
 	if d, ok := h.e.policyEvaluator.(SubsystemDependent); ok {
 		return d.UsesEngineSubsystems()

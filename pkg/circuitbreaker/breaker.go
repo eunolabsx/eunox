@@ -164,6 +164,12 @@ func New(cfg Config, opts ...Option) *Breaker {
 	for _, opt := range opts {
 		opt(b)
 	}
+	// A clock holding no value leaves the default in place, matching how New already replaces
+	// a non-positive Config field rather than failing: b.now() is read only once a failure has
+	// been recorded, so a nil would panic inside the outage this breaker exists to survive.
+	if b.now == nil {
+		b.now = time.Now
+	}
 	return b
 }
 
