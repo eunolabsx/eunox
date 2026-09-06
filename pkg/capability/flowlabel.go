@@ -201,10 +201,25 @@ func ValidateFlowLabel(label string) error {
 // across one or two taxonomies) and low enough to keep the decision in the tens of
 // microseconds.
 //
-// It bounds the EXTERNAL surfaces only. A manifest's own labelOutput/flowLabel lists are
-// operator-authored config, bounded like the rest of the manifest by maxManifestFileBytes,
-// and the accumulated store set is bounded by what those lists can write.
+// It bounds the EXTERNAL surfaces only; the operator-authored lists carry their own count
+// bound (MaxAuthoredFlowLabels), for a different reason.
 const MaxExternalFlowLabels = 64
+
+// MaxAuthoredFlowLabels bounds how many labels ONE manifest-authored list may carry — a
+// labelOutput directive's `labels`, a flowLabel condition's `allow`.
+//
+// Not a DoS bound: these lists are operator-authored config, so a bad one is an authoring
+// mistake rather than a lever a caller pulls. It bounds what those lists can WRITE, which is
+// what the audit record's labels_out/carried_labels fields are made of — the manifest file
+// cap (32 MiB) admits tens of thousands of distinct labels on one directive,
+// and a record over the audit reader's scan window is not merely large: the verify/stats pass
+// aborts on it with no per-record finding, and as a tail it takes the window-clipped resume
+// path on every restart. Sixty-four mirrors MaxExternalFlowLabels because a policy declaring
+// dozens of classes on one target is already past anything real.
+//
+// It does NOT bound the session-wide union of everything an anchor accrues, which is why the
+// record's own byte backstop exists beside it rather than instead of it.
+const MaxAuthoredFlowLabels = 64
 
 // checkExternalFlowLabels validates one externally-supplied label list: bounded in COUNT,
 // every entry usable on one of the two axes. The single checker for every such boundary, so

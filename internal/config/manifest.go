@@ -1849,14 +1849,24 @@ func requireSourceDirectiveTarget(i int, target string, targetType capability.Ta
 
 // validateFlowLabelSet checks one authored label list against BOTH axes: a native class
 // from the closed vocabulary, or an imported "namespace:value" whose namespace the manifest
-// declared. It is the single label check the three flow tokens share, so a label legal in a
-// labelOutput cannot be illegal in the flowLabel that reads it back.
+// declared, and bounds the list's COUNT. It is the single label check the three flow tokens
+// share, so a label legal in a labelOutput cannot be illegal in the flowLabel that reads it
+// back — and so a flow token added later cannot pick up the per-label rule while missing the
+// count bound, which is the pairing capability.checkExternalFlowLabels makes on its own side.
 //
 // The declared-namespace half is what makes this the load-time closure the imported axis
 // otherwise lacks: eunox cannot know the taxonomy's values, but it does know which
 // taxonomies this policy said it speaks, so "purvew:confidential" fails here instead of
 // becoming a label that taints where nothing admits it and reads as a mysterious denial.
 func validateFlowLabelSet(where string, labels []string, declared map[string]bool) error {
+	// Counted before the per-entry walk: what the bound is FOR is the size of what these
+	// lists write (the audit record's label fields, the accumulated store set), and a
+	// 32,000-entry list that also happens to be well-formed should not be walked entry by
+	// entry to say so. See capability.MaxAuthoredFlowLabels.
+	if len(labels) > capability.MaxAuthoredFlowLabels {
+		return fmt.Errorf("%s: declares %d flow labels, more than the maximum of %d (a policy naming dozens of classes on one target is past anything a real taxonomy carries, and these lists are what the audit record's labels_out/carried_labels are made of)",
+			where, len(labels), capability.MaxAuthoredFlowLabels)
+	}
 	for _, l := range labels {
 		if err := capability.ValidateFlowLabel(l); err != nil {
 			return fmt.Errorf("%s: %w", where, err)

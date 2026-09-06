@@ -31,9 +31,11 @@ const (
 	// It says nothing about the record's CHAIN links: a break is a property of two
 	// adjacent records on one tape, reported by that tape's own verdict.
 	StatusVerified RecordStatus = "verified"
-	// StatusInvalid means the record was provably not what its signature covers (an
-	// HMAC mismatch under a held key, a forged seq-0 decoy, or an unparseable signed
-	// `time`).
+	// StatusInvalid means the signature check refused or failed the record: an HMAC
+	// mismatch under a held key, a strict-decode refusal, a non-canonical on-disk form,
+	// a forged seq-0 decoy, or an unparseable signed `time`. The first is the only one
+	// that ran a key comparison; the rest reject the line before or instead of one, and
+	// none of them is a record the writer emitted.
 	StatusInvalid RecordStatus = "invalid"
 	// StatusUnknownKey means the record names a key_id absent from the ring — the
 	// routine post-rotation state, not tampering, but unverified either way.

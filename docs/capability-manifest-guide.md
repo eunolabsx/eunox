@@ -2319,6 +2319,17 @@ A label on either axis is **asserted by policy, never inferred from content**.
 eunox reads no payload to decide one, so there is no classifier and no model
 anywhere on this path. A label belonging to neither axis is a load error.
 
+**Each authored list carries at most 64 labels** — a `labelOutput`'s `labels`, a
+`flowLabel`'s `allow` — and more is a load error. A target carrying dozens of
+classes is already past anything a real taxonomy needs, and these lists are what
+the audit record's `labels_out` / `carried_labels` fields are made of: without a
+count bound the manifest's own 32 MiB file cap admits tens of thousands of
+distinct labels on one directive, enough to push a record past the audit reader's
+line window and make the tape unverifiable. The record itself is bounded
+independently ([threat model §6.1](./threat-model-mcp.md)), since the accumulated
+set an anchor carries is a union across every directive it has hit and no
+per-list cap bounds that.
+
 > **A label is only as trustworthy as its source.** Today an imported label is
 > asserted by the policy author, the same way a native one is. Deriving it from a
 > field the *server* returned would make the flow control only as strong as that

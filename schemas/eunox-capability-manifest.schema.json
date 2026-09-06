@@ -422,8 +422,9 @@
               "const": "flowLabel"
             },
             "allow": {
-              "description": "The source classes this sink tolerates. An EMPTY list is valid and is the strictest sink: it admits only an unlabeled, clean-context flow.",
+              "description": "The source classes this sink tolerates. An EMPTY list is valid and is the strictest sink: it admits only an unlabeled, clean-context flow. Bounded at 64 entries, like every authored flow-label list.",
               "type": "array",
+              "maxItems": 64,
               "items": {
                 "$ref": "#/$defs/flowLabel"
               }
@@ -562,8 +563,10 @@
               "const": "labelOutput"
             },
             "labels": {
+              "description": "The classes this call's output carries. Bounded at 64 entries: these lists are what the audit record's labels_out/carried_labels are made of, so an unbounded one can put a record past the audit reader's scan window.",
               "type": "array",
               "minItems": 1,
+              "maxItems": 64,
               "items": {
                 "$ref": "#/$defs/flowLabel"
               }
