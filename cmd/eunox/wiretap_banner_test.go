@@ -37,10 +37,14 @@ func TestCmdProxy_WiretapBannerFollowsTheFlagGuards(t *testing.T) {
 		"a proxy that failed a startup guard announced the mode it never entered")
 }
 
-// And the banners themselves still say both halves: what observe mode downgrades, and what it does
-// not. The second line is the one an operator reads to learn that a kill, an unroutable method and
-// an unestablishable revision still refuse — none of which is a policy verdict to downgrade.
-func TestPrintWiretapBanners_NamesWhatStillRefuses(t *testing.T) {
+// The banners still say both halves: what observe mode downgrades, and that some refusals stand.
+//
+// Deliberately NOT an assertion that the second line's list is COMPLETE, which it is not: at least
+// --require-audit=strict (which defaults to strict and is not exclusive with --audit), the -32020
+// routing-header refusal, and the RESOURCE_EXHAUSTED cap refusals also stand in observe mode. That
+// is the banner's own copy to correct, not this cell's to pin — but a cell asserting the list as
+// closed would make correcting it look like a regression.
+func TestPrintWiretapBanners_NamesTheRefusalsItLists(t *testing.T) {
 	t.Parallel()
 	var out strings.Builder
 	printWiretapBanners(&out)

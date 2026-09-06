@@ -534,5 +534,13 @@ func translateNotificationForLeg(msg mcp.RPCMsg, hostRev, legRev capability.Revi
 	if decl := boundaryDisposition(msg); !decl.translates {
 		return mcp.RPCMsg{}, refuseAcrossRevisions(msg.Method, hostRev, legRev, decl.why)
 	}
-	return translateRequest(msg, hostRev, legRev)
+	translated, err := translateRequest(msg, hostRev, legRev)
+	if err != nil {
+		// Wrapped as the request seam wraps it, so this function's two failure kinds answer
+		// errors.Is alike: the branch above carries the sentinel through refuseAcrossRevisions,
+		// and a caller that ever classifies drops by it must not get a different answer for the
+		// same underlying failure depending on which framing produced it.
+		return mcp.RPCMsg{}, fmt.Errorf("%w: %w", errUntranslatableAcrossRevisions, err)
+	}
+	return translated, nil
 }
