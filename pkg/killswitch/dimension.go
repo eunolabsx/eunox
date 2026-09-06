@@ -50,6 +50,8 @@ type killDimension struct {
 	// expires marks a dimension whose tombstones carry the session TTL. Only sessions do: an
 	// agent kill and a token revocation are durable revocations of a long-lived identity, and
 	// a revocation that quietly expires is one an operator did not withdraw.
+	// Read by the REDIS backend alone (setBlock, through ttl below), which is where a
+	// configured lifetime exists; InMemory documents what it does instead.
 	expires bool
 	// cache and memCache return the live set for this dimension on each backend. Two
 	// accessors rather than one over an interface: both are called under the holder's own

@@ -199,6 +199,122 @@ func TestRedactConfigValue_ScrubsMisconfiguredURLShapes(t *testing.T) {
 	}
 }
 
+// TestRedactConfigValue_ScrubsMisspelledKeys covers the spellings the allowlist used to
+// miss. writeDoctorConfig raw-parses on-disk YAML so a config the typed loader REFUSED still
+// renders — and that loader binds keys exactly, so a misspelled `AuthToken:` or `auth_token:`
+// is precisely the shape only doctor ever prints. Matching exactly meant the one config
+// guaranteed to reach a bundle was the one whose secret went into it verbatim.
+func TestRedactConfigValue_ScrubsMisspelledKeys(t *testing.T) {
+	root := map[string]interface{}{
+		"listen": map[string]interface{}{
+			"AuthToken":       "upper-camel-secret",
+			"authtoken":       "all-lower-secret",
+			"auth_token":      "snake-case-secret",
+			"Auth-Token":      "kebab-case-secret",
+			"OAUTHRESOURCE":   "https://rsuser:shouty-url-secret@rs.example.com/mcp",
+			"allowed_origins": []interface{}{"https://o:separator-origin-secret@o.example.com"},
+		},
+		"upstreams": []interface{}{
+			map[string]interface{}{
+				"UpstreamAuthHeader":   "Authorization: Bearer sk_live_CASEVARIANT",
+				"upstream_auth_header": "Authorization: Bearer sk_live_SNAKE",
+				"UPSTREAMURL":          "https://user:shouty-upstream-secret@mcp.example.com/x",
+			},
+		},
+	}
+	redactConfigValue(root)
+	dump := mustJSON(t, root)
+
+	for _, secret := range []string{
+		"upper-camel-secret",
+		"all-lower-secret",
+		"snake-case-secret",
+		"kebab-case-secret",
+		"shouty-url-secret",
+		"separator-origin-secret",
+		"sk_live_CASEVARIANT",
+		"sk_live_SNAKE",
+		"shouty-upstream-secret",
+	} {
+		if strings.Contains(dump, secret) {
+			t.Errorf("redactConfigValue: secret %q leaked from a misspelled key:\n%s", secret, dump)
+		}
+	}
+	// The non-string-keyed arm reads the same resolver, so it must fold identically.
+	nonString := map[interface{}]interface{}{
+		8080:         "sentinel-int-key",
+		"Auth_Token": "non-string-map-secret",
+	}
+	redactConfigValue(nonString)
+	out, err := yaml.Marshal(nonString)
+	if err != nil {
+		t.Fatalf("yaml.Marshal: %v", err)
+	}
+	if strings.Contains(string(out), "non-string-map-secret") {
+		t.Errorf("a misspelled key must be scrubbed in the non-string-keyed arm too:\n%s", out)
+	}
+}
+
+// TestRedactConfigValue_ScrubsMappingUnderASensitiveKey pins the two sensitive-key arms to
+// the SAME polarity for a shape the schema does not have. A mapping under a URL key used to
+// be handed back to the allowlist walk, which knows none of its inner keys, so the
+// credentialed URL was re-emitted verbatim — while the identical mis-shape under authToken
+// was replaced with a placeholder. Both are mis-shapes the typed loader refuses, i.e.
+// exactly the configs only doctor renders.
+func TestRedactConfigValue_ScrubsMappingUnderASensitiveKey(t *testing.T) {
+	root := map[string]interface{}{
+		"listen": map[string]interface{}{
+			"oauthResource":  map[string]interface{}{"primary": "https://u:map-url-secret@rs.example.com/mcp?token=map-query-secret"},
+			"allowedOrigins": []interface{}{map[string]interface{}{"a": "https://u:list-map-secret@o.example.com/"}},
+			"authToken":      map[string]interface{}{"x": "map-under-authtoken"},
+		},
+		"upstreams": []interface{}{
+			map[string]interface{}{"upstreamUrl": map[string]interface{}{"inner": "https://u:map-upstream-secret@up.example.com/"}},
+		},
+	}
+	redactConfigValue(root)
+	dump := mustJSON(t, root)
+
+	for _, secret := range []string{
+		"map-url-secret",
+		"map-query-secret",
+		"list-map-secret",
+		"map-under-authtoken",
+		"map-upstream-secret",
+	} {
+		if strings.Contains(dump, secret) {
+			t.Errorf("redactConfigValue: secret %q leaked from a mapping under a sensitive key:\n%s", secret, dump)
+		}
+	}
+}
+
+// TestDoctorRedaction_FoldedIndexes pins the derivation in both directions: two declared keys
+// that fold together collapse into one index entry, silently dropping the other — WITHIN a
+// table, where one scrubber overwrites the other by map-iteration order, and ACROSS the two,
+// where redactedValueFor's precedence would drop the URL scrub with nothing failing.
+func TestDoctorRedaction_FoldedIndexes(t *testing.T) {
+	if got, want := len(redactedConfigFieldsFolded), len(redactedConfigFields); got != want {
+		t.Errorf("redactedConfigFieldsFolded has %d entries, want %d: two declared keys fold together", got, want)
+	}
+	if got, want := len(urlConfigFieldsFolded), len(urlConfigFields); got != want {
+		t.Errorf("urlConfigFieldsFolded has %d entries, want %d: two declared keys fold together", got, want)
+	}
+	for k := range redactedConfigFields {
+		folded := foldConfigKey(k)
+		if !redactedConfigFieldsFolded[folded] {
+			t.Errorf("declared key %q is missing from the folded index", k)
+		}
+		if urlConfigFieldsFolded[folded] != nil {
+			t.Errorf("declared key %q folds into urlConfigFields: the URL scrub would never run", k)
+		}
+	}
+	for k := range urlConfigFields {
+		if urlConfigFieldsFolded[foldConfigKey(k)] == nil {
+			t.Errorf("declared key %q is missing from the folded index", k)
+		}
+	}
+}
+
 func TestRedactConfigValue_EmptyAndMissingValues(t *testing.T) {
 	// An empty authToken (operator omitted it) must read differently from a
 	// present-but-redacted one — otherwise a bug report "authToken was set" is
