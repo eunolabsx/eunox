@@ -397,7 +397,7 @@ func refuseNonRegular(logPath string) error {
 // window follows it. Shared by the startup open and the two post-rotation reopen sites for
 // refuseNonRegular's reason.
 func refuseNonRegularHandle(f *os.File, logPath string) error {
-	return config.RefuseNonRegularHandle(f, "audit log", logPath)
+	return config.RefuseNonRegularHandle(f, "audit log path", logPath)
 }
 
 // rotate is size-triggered rotation's entry point, called from writeRecord once the
@@ -938,11 +938,9 @@ func sameChainBase(before, after os.FileInfo) bool {
 // prunes another, leaving the count identical — "3 files before and 3 now" would assert a
 // rotation while showing nothing that changed.
 func describeChainDelta(before, after []string) string {
-	// chainNamesMissingFrom(have, want) reports the entries of WANT that HAVE lacks, so the
-	// listing being searched comes first: a gained name is one the before-listing lacks. The
-	// two calls were transposed, which named every rotation backwards — the sibling a
+	// The two calls were transposed, which named every rotation backwards — the sibling a
 	// rotation had just published was reported as one the chain had LOST, i.e. as the
-	// retention prune it is the opposite of.
+	// retention prune it is the opposite of. Nothing covered the direction until now.
 	gained := chainNamesMissingFrom(before, after)
 	lost := chainNamesMissingFrom(after, before)
 	switch {

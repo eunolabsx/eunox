@@ -974,13 +974,9 @@ func openDiscoveredAuditFile(path string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, statErr := f.Stat()
-	if statErr != nil || !info.Mode().IsRegular() {
+	if err := refuseNonRegularHandle(f, path); err != nil {
 		_ = f.Close()
-		if statErr == nil {
-			statErr = fmt.Errorf("not a regular file (mode %v)", info.Mode())
-		}
-		return nil, statErr
+		return nil, err
 	}
 	return f, nil
 }

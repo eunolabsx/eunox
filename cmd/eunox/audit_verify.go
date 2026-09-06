@@ -134,26 +134,32 @@ func parseAndResolveAuditLog(name string, fs *flag.FlagSet, args []string, confi
 // exists to close — the sequence would be re-hand-written per reader, which is how the two
 // commands came to share this race in the first place.
 func readAuditChainOrExit[T any](name, logPath string, usageExit int, consume func(io.Reader) (T, error)) (result T, exitCode int, done bool) {
-	r, closeChain, snap, err := openAuditChain(name, logPath)
+	r, snap, err := openAuditChain(name, logPath)
 	if err != nil {
 		fmt.Fprint(os.Stderr, err.Error())
 		return result, usageExit, true
 	}
-	defer closeChain()
+	defer func() { _ = r.Close() }()
 
-	consumed, err := consume(r)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox %s: reading log: %v\n", name, err)
+	consumed, consumeErr := consume(r)
+	// Checked BEFORE the read error, the ordering verifyOneTape states and for its reason: a
+	// rotation produces read errors too. The chain is opened lazily by name, so a retention
+	// prune unlinks a sibling this reader has not reached yet and a rotation leaves the base
+	// absent for the length of its pre-reopen fsync — both surface as an open failure INSIDE
+	// consume, and reporting that verbatim sends the operator after a missing or misconfigured
+	// log. Reported as a failure rather than a caveat, and at the reader's usage code (2)
+	// rather than a findings code: an inconclusive read is not a finding about the tape.
+	//
+	// The wording stays cause-neutral because CheckUnchanged answers three ways — the chain
+	// moved, or the re-listing itself failed, or the base could not be stat'd — and only the
+	// first says a record was missed.
+	if err := snap.CheckUnchanged(); err != nil {
+		fmt.Fprintf(os.Stderr, "eunox %s: %v; no report was produced — re-run "+
+			"(against a quiescent log, or a copy of the chain)\n", name, err)
 		return result, usageExit, true
 	}
-	// Checked before anything is reported, and reported as a failure rather than a caveat:
-	// what a raced read produces is a report over an unknown part of the chain, and the part
-	// it loses is the NEWEST — the records a draft manifest or a denial histogram is read
-	// for. "Re-run" is the only honest answer, and it exits with the reader's usage code
-	// (2), never a findings code: an inconclusive read is not a finding about the tape.
-	if err := snap.CheckUnchanged(); err != nil {
-		fmt.Fprintf(os.Stderr, "eunox %s: %v; the read covered an unknown part of the chain and the newest "+
-			"records may be missing — re-run (against a quiescent log, or a copy of the chain)\n", name, err)
+	if consumeErr != nil {
+		fmt.Fprintf(os.Stderr, "eunox %s: reading log: %v\n", name, consumeErr)
 		return result, usageExit, true
 	}
 	return consumed, 0, false

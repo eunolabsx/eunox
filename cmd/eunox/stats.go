@@ -44,9 +44,9 @@ exactly what would be blocked if enforcement were enabled.
 
 Exit codes:
   0  The histogram was printed (including for a log with no denials).
-  2  Usage error, or a config or audit-log-read failure. There is no findings
-     code: stats reports what the log already holds, so a busy histogram is
-     not a failure.
+  2  Usage error, a config or audit-log-read failure, or a read a rotation
+     raced (inconclusive - re-run). There is no findings code: stats reports
+     what the log already holds, so a busy histogram is not a failure.
 
 Flags:
 `)

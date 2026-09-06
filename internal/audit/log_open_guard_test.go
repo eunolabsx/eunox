@@ -5,126 +5,221 @@ package audit
 
 import (
 	"go/ast"
+	"go/build"
 	"go/parser"
-	"go/printer"
 	"go/token"
-	"os"
-	"path/filepath"
+	"go/types"
 	"slices"
 	"strings"
 	"testing"
 )
 
-// activeLogOpenFuncs names the two functions that produce the ACTIVE tape's write handle.
-// Scoped to these two rather than to every open in the package because the rule below is
-// about a path an attacker who can write the log DIRECTORY chooses the contents of: the
-// whole-file readers already carry all three guards (openDiscoveredAuditFile), while the
-// key file and the sidecar lock are their own threat models and their own findings.
-var activeLogOpenFuncs = []string{"openAndPrepareLog", "openGuardedAppend"}
+// guardedAuditOpens names every function in this package that opens a path an attacker who
+// can write the audit DIRECTORY chooses the contents of. All five answer to one rule, so
+// they are listed rather than filtered: a name here that no longer exists fails the walk
+// below, which is the failure mode a filter would hide.
+var guardedAuditOpens = []string{
+	"openAndPrepareLog",       // the active tape, at startup
+	"openGuardedAppend",       // the active tape, at both post-rotation reopens
+	"openDiscoveredAuditFile", // any chain file found by a directory scan
+	"readAuditKeyFile",        // the HMAC key, whose redirection is unrecoverable
+	"openAuditLockFile",       // the sidecar lock, whose payload is its exclusivity
+}
 
-// TestActiveLogOpens_CarryAllThreeSubstitutionGuards is the deterministic half of the FIFO
-// hardening: openDiscoveredAuditFile states the package's rule — OpenNoFollow, OpenNonBlock
-// and an fstat through the HANDLE are individually load-bearing and none subsumes another —
-// and these two sites had only the first. A source guard rather than a behavioral test
-// because the behavioral one (TestActiveLogOpen_FIFOPlantedInTheCreateWindow) has to RACE
-// the Lstat->open window to reach the code it covers, so a dropped flag can survive a run
-// that never lands in it, and because an open added to either function later inherits the
-// rule here rather than the next reviewer's memory.
-func TestActiveLogOpens_CarryAllThreeSubstitutionGuards(t *testing.T) {
+// handleGuards are the two spellings of the third guard. Both are the same function —
+// refuseNonRegularHandle is the log's subject-binding shim over config.RefuseNonRegularHandle
+// — and a site is free to call either, but not to hand-roll a third fstat: that is how the
+// package came to answer one question three ways with three different refusal messages.
+var handleGuards = []string{"refuseNonRegularHandle", "config.RefuseNonRegularHandle"}
+
+// usesTheHandle names the calls whose safety DEPENDS on the check having already run: the
+// fchmod pair (which would re-mode whatever object was substituted) and the whole-file read.
+// The guard requires the check to precede them, since a check that runs after the damage is
+// a check in name only.
+var usesTheHandle = []string{"tightenLogMode", "tightenKeyFileMode", "io.ReadAll"}
+
+// TestGuardedAuditOpens_CarryAllThreeSubstitutionGuards is the deterministic half of the
+// FIFO hardening: openDiscoveredAuditFile states the package's rule — OpenNoFollow,
+// OpenNonBlock and an fstat through the HANDLE are individually load-bearing and none
+// subsumes another — and three of these five sites had only the first. A source guard
+// rather than a behavioral test because the behavioral ones have to RACE the Lstat->open
+// window to reach the code they cover, so a dropped flag can survive a run that never
+// lands in it, and because an open added to any of these functions later inherits the rule
+// here rather than the next reviewer's memory.
+//
+// It is deliberately per-function rather than "no bare os.OpenFile in the package": the
+// rule is about paths an attacker influences, and a guard that also refused a legitimate
+// unguarded open would be argued with rather than obeyed.
+func TestGuardedAuditOpens_CarryAllThreeSubstitutionGuards(t *testing.T) {
 	t.Parallel()
-	fset := token.NewFileSet()
 	found := map[string]bool{}
-
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("listing package sources: %v", err)
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		file, perr := parser.ParseFile(fset, filepath.Join(".", name), nil, 0)
-		if perr != nil {
-			t.Fatalf("parsing %s: %v", name, perr)
-		}
-		for _, decl := range file.Decls {
+	for _, src := range buildableSources(t) {
+		for _, decl := range src.file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || !slices.Contains(activeLogOpenFuncs, fn.Name.Name) {
+			if !ok || fn.Body == nil || !slices.Contains(guardedAuditOpens, fn.Name.Name) {
 				continue
 			}
 			found[fn.Name.Name] = true
-			checkGuardedOpen(t, fset, fn)
+			checkGuardedOpen(t, src.fset, fn)
 		}
 	}
 
-	// An enumeration that matched nothing would pass this guard vacuously, which is the one
-	// way a source guard fails silently: a rename is exactly what leaves it walking nothing.
-	for _, name := range activeLogOpenFuncs {
+	// An enumeration that matched nothing would pass vacuously, which is the one way a
+	// source guard fails silently: a rename is exactly what leaves it walking nothing.
+	for _, name := range guardedAuditOpens {
 		if !found[name] {
-			t.Fatalf("%s is not among this package's sources; the guard is walking nothing", name)
+			t.Fatalf("%s is not among this package's buildable sources; the guard is walking nothing", name)
 		}
 	}
 }
 
 // checkGuardedOpen holds one function to all three guards: both flags on every os.OpenFile
-// it performs, and the handle check somewhere in its body. The handle check is asserted by
-// CALL rather than by position because it legitimately sits after a permission-fallback arm
-// at one site and immediately after the open at the other.
+// it performs, and a handle check that is ACTED ON and runs before anything else touches
+// the descriptor.
 func checkGuardedOpen(t *testing.T, fset *token.FileSet, fn *ast.FuncDecl) {
 	t.Helper()
 	opens := 0
-	handleChecked := false
+	checkedAt := token.NoPos
+	usedAt := token.NoPos
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		switch callee(call) {
-		case "os.OpenFile":
+		name := types.ExprString(call.Fun)
+		switch {
+		case name == "os.OpenFile":
 			opens++
 			if len(call.Args) < 2 {
 				t.Fatalf("%s: os.OpenFile with no flag argument at %s", fn.Name.Name, fset.Position(call.Pos()))
 			}
-			flags := render(fset, call.Args[1])
-			for _, guard := range []string{"config.OpenNoFollow", "config.OpenNonBlock"} {
-				if !strings.Contains(flags, guard) {
-					t.Errorf("%s: the open at %s does not OR in %s (flags: %s) — a path an attacker can plant in the Lstat->open window must not be followed (OpenNoFollow) and must not be able to BLOCK the open (OpenNonBlock)",
-						fn.Name.Name, fset.Position(call.Pos()), guard, flags)
-				}
+			checkOpenFlags(t, fset, fn, call)
+		case slices.Contains(handleGuards, name):
+			if !checkedAt.IsValid() {
+				checkedAt = call.Pos()
 			}
-		case "refuseNonRegularHandle":
-			handleChecked = true
+		case slices.Contains(usesTheHandle, name):
+			if !usedAt.IsValid() {
+				usedAt = call.Pos()
+			}
 		}
 		return true
 	})
+
 	if opens == 0 {
-		t.Errorf("%s performs no os.OpenFile; the flag guard above is vacuous for it", fn.Name.Name)
+		t.Errorf("%s performs no os.OpenFile; the flag guard is vacuous for it", fn.Name.Name)
 	}
-	if !handleChecked {
-		t.Errorf("%s never calls refuseNonRegularHandle: the two flags make the open safe to ATTEMPT, and only the fstat through the handle refuses whatever non-regular object was substituted (a FIFO another process holds open for reading opens fine under both flags)", fn.Name.Name)
+	if !checkedAt.IsValid() {
+		t.Errorf("%s never checks its handle: the two flags make the open safe to ATTEMPT, and only the fstat through the descriptor refuses whatever non-regular object was substituted (a FIFO another process holds open opens fine under both flags)", fn.Name.Name)
+		return
+	}
+	// A check whose error is discarded, or whose failure falls through, is not a check.
+	if !guardIsActedOn(fn) {
+		t.Errorf("%s calls the handle guard but does not return on its error: the refusal has to stop the function, not be recorded and stepped over", fn.Name.Name)
+	}
+	if usedAt.IsValid() && usedAt < checkedAt {
+		t.Errorf("%s touches the handle at %s before checking it at %s: an fchmod or read that runs first has already acted on whatever object was substituted in the Lstat->open window",
+			fn.Name.Name, fset.Position(usedAt), fset.Position(checkedAt))
 	}
 }
 
-// callee renders a call's function as "pkg.Name" or "Name", the spelling the switch above
-// matches on.
-func callee(call *ast.CallExpr) string {
-	switch fun := call.Fun.(type) {
-	case *ast.Ident:
-		return fun.Name
-	case *ast.SelectorExpr:
-		if pkg, ok := fun.X.(*ast.Ident); ok {
-			return pkg.Name + "." + fun.Sel.Name
+// checkOpenFlags requires both flags on one open. The flag argument is usually a literal
+// OR-expression, but the key file BUILDS it in a variable across an opt-out branch, so an
+// identifier is resolved by joining every assignment to it in the function — the flag has
+// to be applied on some path, which is as much as a syntactic walk can honestly say.
+func checkOpenFlags(t *testing.T, fset *token.FileSet, fn *ast.FuncDecl, call *ast.CallExpr) {
+	t.Helper()
+	flags := types.ExprString(call.Args[1])
+	if ident, ok := call.Args[1].(*ast.Ident); ok {
+		flags = strings.Join(assignmentsTo(fn, ident.Name), " ")
+	}
+	for _, guard := range []string{"config.OpenNoFollow", "config.OpenNonBlock"} {
+		if !strings.Contains(flags, guard) {
+			t.Errorf("%s: the open at %s does not OR in %s (flags: %s) — a path an attacker can plant in the Lstat->open window must not be followed (OpenNoFollow) and must not be able to BLOCK the open (OpenNonBlock), which would wedge the caller where no post-open check can run",
+				fn.Name.Name, fset.Position(call.Pos()), guard, flags)
 		}
-		return fun.Sel.Name
 	}
-	return ""
 }
 
-func render(fset *token.FileSet, node ast.Node) string {
-	var sb strings.Builder
-	if err := printer.Fprint(&sb, fset, node); err != nil {
-		return ""
+// assignmentsTo renders every value assigned to name inside fn, so a flag set built up over
+// several statements can be inspected as one string.
+func assignmentsTo(fn *ast.FuncDecl, name string) []string {
+	var values []string
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, lhs := range assign.Lhs {
+			if ident, ok := lhs.(*ast.Ident); ok && ident.Name == name && i < len(assign.Rhs) {
+				values = append(values, types.ExprString(assign.Rhs[i]))
+			}
+		}
+		return true
+	})
+	return values
+}
+
+// guardIsActedOn reports whether some handle-guard call appears as the condition (or its
+// init) of an if whose body returns — the shape every site uses, and the one that makes the
+// refusal binding rather than advisory.
+func guardIsActedOn(fn *ast.FuncDecl) bool {
+	acted := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		stmt, ok := n.(*ast.IfStmt)
+		if !ok || acted {
+			return true
+		}
+		calls := false
+		ast.Inspect(stmt, func(inner ast.Node) bool {
+			if call, ok := inner.(*ast.CallExpr); ok && slices.Contains(handleGuards, types.ExprString(call.Fun)) {
+				calls = true
+			}
+			return true
+		})
+		if !calls {
+			return true
+		}
+		ast.Inspect(stmt.Body, func(inner ast.Node) bool {
+			if _, ok := inner.(*ast.ReturnStmt); ok {
+				acted = true
+			}
+			return true
+		})
+		return true
+	})
+	return acted
+}
+
+type packageSource struct {
+	fset *token.FileSet
+	file *ast.File
+}
+
+// buildableSources parses the package's non-test sources that this GOOS/GOARCH actually
+// COMPILES. go/parser ignores build constraints, and this package carries six build-tagged
+// files: without the filter a per-platform variant of a guarded open would be held to the
+// rule on platforms that never build it (a false failure), and — worse — a name found only
+// in an excluded file would satisfy the enumeration check while the compiled implementation
+// went unread.
+func buildableSources(t *testing.T) []packageSource {
+	t.Helper()
+	ctx := build.Default
+	pkg, err := ctx.ImportDir(".", 0)
+	if err != nil {
+		t.Fatalf("resolving this package's buildable files: %v", err)
 	}
-	return sb.String()
+	fset := token.NewFileSet()
+	var sources []packageSource
+	for _, name := range pkg.GoFiles {
+		file, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parsing %s: %v", name, perr)
+		}
+		sources = append(sources, packageSource{fset: fset, file: file})
+	}
+	if len(sources) == 0 {
+		t.Fatal("no buildable package sources found; every source guard here would pass vacuously")
+	}
+	return sources
 }

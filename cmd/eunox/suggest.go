@@ -622,8 +622,9 @@ tighten every entry, then 'eunox validate' it before enforcing.
 
 Exit codes:
   0  Draft manifest generated (to stdout or --output).
-  2  Usage, config, or audit-log-read error, or a failure writing --output. There
-     is no findings code: the draft describes the tape, it does not judge it.
+  2  Usage, config, or audit-log-read error, a read a rotation raced
+     (inconclusive - re-run), or a failure writing --output. There is no findings
+     code: the draft describes the tape, it does not judge it.
 
 Flags:
 `)
