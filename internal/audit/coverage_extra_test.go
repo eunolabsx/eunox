@@ -701,8 +701,8 @@ func TestJSONEncodedStringLen(t *testing.T) {
 	}
 }
 
-// TestTruncatedObligations_Bounds covers truncatedStringList directly, on the
-// obligations kind,
+// TestTruncatedObligations_Bounds covers boundedList.truncate directly, on the
+// obligations list,
 // including the shrink loop (kept entries that, with the sentinel, exceed the cap
 // must be dropped one at a time until the result fits) and the lone-sentinel
 // path (a huge "total" with no kept entries still returns the smallest marker).
@@ -712,7 +712,7 @@ func TestTruncatedObligations_Bounds(t *testing.T) {
 	// A normal truncation that already fits: kept prefix plus the
 	// "obligations_truncated:N" sentinel, within the cap, no shrinking needed.
 	kept := []string{"a", "b", "c"}
-	out := truncatedStringList(kept, 10, auditObligationsTotalCap, "obligations")
+	out := obligationsList.truncate(kept, 10)
 	if len(out) != len(kept)+1 {
 		t.Fatalf("got %d entries, want kept(%d)+sentinel", len(out), len(kept))
 	}
@@ -721,7 +721,7 @@ func TestTruncatedObligations_Bounds(t *testing.T) {
 	}
 
 	// Shrink loop: a kept slice that on its own already exceeds the cap forces
-	// truncatedStringList to drop trailing entries until the re-marshaled result
+	// truncate to drop trailing entries until the re-marshaled result
 	// (kept prefix + sentinel) fits within auditObligationsTotalCap. Build entries
 	// summing well past 64 KiB so several must be dropped.
 	const entry = 4096
@@ -729,7 +729,7 @@ func TestTruncatedObligations_Bounds(t *testing.T) {
 	for i := range bigKept {
 		bigKept[i] = strings.Repeat("z", entry)
 	}
-	shrunk := truncatedStringList(bigKept, len(bigKept), auditObligationsTotalCap, "obligations")
+	shrunk := obligationsList.truncate(bigKept, len(bigKept))
 	encoded, err := json.Marshal(shrunk)
 	if err != nil {
 		t.Fatalf("marshal shrunk: %v", err)
@@ -746,7 +746,7 @@ func TestTruncatedObligations_Bounds(t *testing.T) {
 
 	// Empty kept with a huge total: the lone sentinel is the smallest marker and is
 	// returned regardless.
-	loneOut := truncatedStringList(nil, 1<<30, auditObligationsTotalCap, "obligations")
+	loneOut := obligationsList.truncate(nil, 1<<30)
 	if len(loneOut) != 1 || !strings.HasPrefix(loneOut[0], "obligations_truncated:") {
 		t.Fatalf("lone-sentinel path = %v, want a single obligations_truncated marker", loneOut)
 	}

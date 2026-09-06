@@ -2321,14 +2321,20 @@ anywhere on this path. A label belonging to neither axis is a load error.
 
 **Each authored list carries at most 64 labels** — a `labelOutput`'s `labels`, a
 `flowLabel`'s `allow` — and more is a load error. A target carrying dozens of
-classes is already past anything a real taxonomy needs, and these lists are what
-the audit record's `labels_out` / `carried_labels` fields are made of: without a
-count bound the manifest's own 32 MiB file cap admits tens of thousands of
-distinct labels on one directive, enough to push a record past the audit reader's
-line window and make the tape unverifiable. The record itself is bounded
-independently ([threat model §6.1](./threat-model-mcp.md)), since the accumulated
-set an anchor carries is a union across every directive it has hit and no
-per-list cap bounds that.
+classes is already past anything a real taxonomy needs. What the bound buys
+differs per token: a `labelOutput`'s list is what the audit record's `labels_out`
+/ `carried_labels` fields are built from, and without a count bound the manifest's
+own 32 MiB file cap admits tens of thousands of distinct labels on one directive;
+a `flowLabel`'s `allow` reaches neither field — it is the sink's subset set,
+rebuilt and walked once per decision, so there the bound is on per-call work.
+
+It bounds one *list*, and neither record field is one list: `labels_out` unions
+every `labelOutput` on the matched constraint (and, where selection is
+principal-blind, across every capability naming the target), and `carried_labels`
+unions everything the anchor has accrued. Both fields therefore carry their own
+byte bound in the audit sink ([threat model §6.1](./threat-model-mcp.md)),
+truncating to a kept prefix plus a `labels_truncated:N` marker — so a policy whose
+every list sits at the cap still produces a readable tape.
 
 > **A label is only as trustworthy as its source.** Today an imported label is
 > asserted by the policy author, the same way a native one is. Deriving it from a

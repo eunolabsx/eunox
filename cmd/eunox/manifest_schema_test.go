@@ -586,3 +586,37 @@ func TestComputeAuditStats_HandlerFaultIsCountedAndCalledOut(t *testing.T) {
 		t.Errorf("a healthy run must raise no handler-fault line:\n%s", cleanOut.String())
 	}
 }
+
+// TestManifestSchema_AuthoredFlowLabelCountBound pins the published maxItems on both
+// flow-label lists against the loader's own constant, for TestManifestSchema_SchemaVersionEnum's
+// reason: a literal here would let the two disagree with both sides frozen and the test
+// green, handing an author a schema-valid manifest the proxy refuses at startup (or the
+// reverse — an editor flagging a policy eunox loads happily), with nothing to say which
+// is authoritative.
+func TestManifestSchema_AuthoredFlowLabelCountBound(t *testing.T) {
+	t.Parallel()
+	doc := loadManifestSchema(t)
+
+	for _, tc := range []struct {
+		node string
+		list string
+	}{
+		{"condition", "allow"},
+		{"directive", "labels"},
+	} {
+		branches := schemaOneOfByConst(t, schemaObjectAt(t, doc, "$defs", tc.node))
+		branch, ok := branches[map[string]string{"allow": capability.ConditionTypeFlowLabel, "labels": capability.DirectiveTypeLabelOutput}[tc.list]]
+		if !ok {
+			t.Fatalf("schema declares no %s branch for the flow token carrying %q", tc.node, tc.list)
+		}
+		list := schemaObjectAt(t, branch, "properties", tc.list)
+		got, ok := list["maxItems"].(float64)
+		if !ok {
+			t.Fatalf("%s.%s declares no maxItems; the loader bounds it at %d", tc.node, tc.list, capability.MaxAuthoredFlowLabels)
+		}
+		if int(got) != capability.MaxAuthoredFlowLabels {
+			t.Errorf("%s.%s maxItems = %d, want capability.MaxAuthoredFlowLabels (%d)",
+				tc.node, tc.list, int(got), capability.MaxAuthoredFlowLabels)
+		}
+	}
+}

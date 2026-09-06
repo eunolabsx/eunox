@@ -498,14 +498,18 @@ type auditChainVerifier struct {
 	unsignedSeen int
 	// prevRecordInvalid is set by classify when the previous record's signature check
 	// REFUSED or FAILED it (the !ok / err cases: an HMAC mismatch under a held key, a
-	// strict-decode refusal, a non-canonical on-disk form) — i.e. the line is not one the
-	// writer emitted, whether or not a key comparison ever ran. updateChain stores rec.HMAC
-	// before classify runs, so such a record's stored HMAC is written into
-	// v.prevHMAC; prevRecordInvalid lets the NEXT record's updateChain call detect
-	// that the anchor is untrustworthy and emit a CHAIN BREAK before the usual
-	// prev_hmac link check. It is deliberately NOT set for UnknownKey/Unverifiable
+	// strict-decode refusal, a non-canonical on-disk form) — i.e. nothing established
+	// that its stored _hmac covers its content, whether or not a key comparison ever ran.
+	// updateChain stores rec.HMAC before classify runs, so such a record's stored HMAC is
+	// written into v.prevHMAC; prevRecordInvalid lets the NEXT record's updateChain call
+	// detect that the anchor is untrustworthy and emit a CHAIN BREAK before the usual
+	// prev_hmac link check. Only the mismatch PROVES tampering; the two decode refusals
+	// also cover version skew, so the break they raise says the anchor is uncertified,
+	// not that it was rewritten. It is deliberately NOT set for UnknownKey/Unverifiable
 	// records, whose _hmac is intact (a retired/absent key, not tampering) and still
-	// chains correctly — flagging those would mislabel a routine rotation as tampering.
+	// chains correctly — flagging those would mislabel a routine rotation as tampering —
+	// nor for a record whose HMAC VERIFIED and whose signed `time` did not parse, which
+	// is an authentic record and a sound anchor.
 	prevRecordInvalid bool
 }
 

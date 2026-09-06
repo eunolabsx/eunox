@@ -209,16 +209,20 @@ const MaxExternalFlowLabels = 64
 // labelOutput directive's `labels`, a flowLabel condition's `allow`.
 //
 // Not a DoS bound: these lists are operator-authored config, so a bad one is an authoring
-// mistake rather than a lever a caller pulls. It bounds what those lists can WRITE, which is
-// what the audit record's labels_out/carried_labels fields are made of — the manifest file
-// cap (32 MiB) admits tens of thousands of distinct labels on one directive,
-// and a record over the audit reader's scan window is not merely large: the verify/stats pass
-// aborts on it with no per-record finding, and as a tail it takes the window-clipped resume
-// path on every restart. Sixty-four mirrors MaxExternalFlowLabels because a policy declaring
-// dozens of classes on one target is already past anything real.
+// mistake rather than a lever a caller pulls. What it buys differs per token, which is why
+// the load error states the bound rather than one consequence. A labelOutput's list is what
+// the audit record's labels_out/carried_labels are built from, and the manifest file cap
+// (32 MiB) admits tens of thousands of distinct labels on one directive. A flowLabel's
+// `allow` reaches neither field — it is the sink's subset set, rebuilt and walked once per
+// decision, so the bound there is on per-call work.
 //
-// It does NOT bound the session-wide union of everything an anchor accrues, which is why the
-// record's own byte backstop exists beside it rather than instead of it.
+// It bounds ONE LIST, and NEITHER record field is one list: labels_out unions every
+// labelOutput on the matched constraint (and, on the principal-blind legs, across every
+// capability naming the target), and carried_labels unions everything the anchor has
+// accrued. A manifest whose every list sits exactly at this cap can still produce either
+// field arbitrarily large, which is why the record carries its own byte backstop beside
+// this rather than because of it. Sixty-four mirrors MaxExternalFlowLabels because a
+// policy declaring dozens of classes on one target is already past anything real.
 const MaxAuthoredFlowLabels = 64
 
 // checkExternalFlowLabels validates one externally-supplied label list: bounded in COUNT,
