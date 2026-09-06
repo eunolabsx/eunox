@@ -168,9 +168,11 @@ type EffectByArgument struct {
 	// coarse first-verb rule allowedOperations uses, with the same documented limit that
 	// it is not a SQL parser.
 	Cases map[string]EffectCase `json:"cases"`
-	// Default applies when no case matches. Absent means the fail-closed default
-	// (irreversible, unquantified) rather than the base contract: a table that does not
-	// cover a value has not said the value is safe.
+	// Default applies when the call supplies a value the cases do not cover. Absent means
+	// the fail-closed default (irreversible, unquantified) rather than the base contract:
+	// a table that does not cover a value has not said the value is safe. A call that
+	// establishes no value at all — the argument omitted, null or blank — resolves
+	// fail-closed whether or not a default is declared; see match.
 	Default *EffectCase `json:"default,omitempty"`
 }
 
@@ -580,9 +582,9 @@ func ResolveEffect(contract *EffectContract, args map[string]interface{}) *Resol
 	}
 	spec := contract.BlastRadius
 
-	// The argument-parameterized table overlays the base contract. A table that matches
-	// nothing and declares no default resolves to the fail-closed default rather than to
-	// the base contract: a table that does not cover a value has not said it is safe.
+	// The argument-parameterized table overlays the base contract. A table that resolves
+	// no case resolves to the fail-closed default rather than to the base contract: a
+	// table that does not cover a value has not said it is safe.
 	if tbl := contract.ByArgument; tbl != nil {
 		matched, found := tbl.match(args)
 		switch {
@@ -600,7 +602,8 @@ func ResolveEffect(contract *EffectContract, args map[string]interface{}) *Resol
 				spec = matched.BlastRadius
 			}
 		default:
-			// No case matched and no default row: the fail-closed reading. Every
+			// No case resolved — no default row, or no key for one to answer about
+			// (see match) — so this is the fail-closed reading. Every
 			// assertion the base contract made about this call is void, INCLUDING
 			// idempotence — a table that does not cover a value has not said the value is
 			// safe to repeat any more than it has said it is reversible. Leaving
@@ -639,22 +642,25 @@ func ResolveEffect(contract *EffectContract, args map[string]interface{}) *Resol
 	return eff
 }
 
-// match finds the case for the call's argument value. found is false when the argument is
-// absent or unusable and no default is declared.
+// match finds the case for the call's argument value. found is false whenever the call
+// established no key to match on — however the table declares its default — and otherwise
+// when no case matches and no default is declared.
 func (t *EffectByArgument) match(args map[string]interface{}) (EffectCase, bool) {
 	// ResolveArgument, not a bare map index: the `argument` reference obeys the same
 	// "$." nested-path grammar every argument-matching condition obeys. A bare index
-	// made a documented reference like "$.filters.query" resolve to ABSENT, so the
-	// table never matched and a permissive default silently applied to the exact call
-	// the table was written to catch.
+	// made a documented reference like "$.filters.query" resolve to ABSENT.
 	raw, ok := ResolveArgument(args, t.Argument)
-	if !ok {
-		if t.Default != nil {
-			return *t.Default, true
-		}
+	key, keyed := argumentMatchKey(raw)
+	if !ok || !keyed {
+		// `default` answers for a VALUE the cases do not list; a call that established
+		// none has nothing for it to answer about. A default an author may legitimately
+		// write softer than the base (`default: {class: reversible}`, a small fixed
+		// blastRadius) otherwise carried a call whose operation was never determined
+		// past effectClass, blastRadius and the ceiling — and the caller picks: omit the
+		// argument, or send it null or blank. Same three spellings handleAllowedOperations
+		// refuses, since it is the same question about the same value.
 		return EffectCase{}, false
 	}
-	key := argumentMatchKey(raw)
 	if c, hit := t.lookup(key); hit {
 		return c, true
 	}
@@ -705,22 +711,31 @@ func (t *EffectByArgument) lookup(key string) (EffectCase, bool) {
 }
 
 // argumentMatchKey renders an argument value as the string the decision table matches on.
-// Numbers keep their literal form (json.Number is preserved through decoding), booleans
-// render as true/false, and anything else renders through fmt so a table can key on it
-// without the resolver having to model every JSON shape.
-func argumentMatchKey(raw interface{}) string {
+// Numbers keep their literal form (json.Number is preserved through decoding) and booleans
+// render as true/false.
+//
+// ok is false for a value no case key can name: JSON null, a blank string, and a composite
+// (an object or array, whose fmt rendering is Go debug syntax — "map[a:1]" — that no author
+// writes as a case key and that two equal JSON documents need not even share). Those are
+// unusable, not uncovered, so they take match's fail-closed arm rather than the default row.
+func argumentMatchKey(raw interface{}) (string, bool) {
 	switch v := raw.(type) {
 	case string:
-		return strings.TrimSpace(v)
+		key := strings.TrimSpace(v)
+		return key, key != ""
 	case json.Number:
-		return v.String()
+		return v.String(), true
 	case bool:
 		if v {
-			return "true"
+			return "true", true
 		}
-		return "false"
+		return "false", true
+	case float32, float64, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		// A caller that decoded without UseNumber, or a library embedder passing Go
+		// numbers: still a scalar the author can key on, unlike the default arm.
+		return fmt.Sprintf("%v", v), true
 	default:
-		return fmt.Sprintf("%v", raw)
+		return "", false
 	}
 }
 

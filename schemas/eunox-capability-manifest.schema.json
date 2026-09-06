@@ -673,7 +673,7 @@
             },
             "default": {
               "$ref": "#/$defs/effectCase",
-              "description": "Applies when no case matches. ABSENT means the fail-closed default (irreversible, unquantified), not the base contract: a table that does not cover a value has not said the value is safe."
+              "description": "Applies when the call supplies a value the cases do not cover. ABSENT means the fail-closed default (irreversible, unquantified), not the base contract: a table that does not cover a value has not said the value is safe. A call that establishes no value at all \u2014 the argument omitted, an unresolvable path, null, blank, or a composite no case key can name \u2014 resolves fail-closed whether or not a default is declared."
             }
           }
         },

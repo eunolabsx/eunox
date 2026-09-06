@@ -168,7 +168,7 @@ inference:
 A table, not an expression, because a table is **reviewable and pinnable** and an
 expression must be executed to be understood — the property the registry depends on.
 
-Two behaviors worth knowing:
+A few behaviors worth knowing:
 
 - The first whitespace-delimited token is matched too, so `DROP` matches
   `DROP TABLE users` — and, because it splits on *any* whitespace, a multi-line or
@@ -190,6 +190,24 @@ Two behaviors worth knowing:
 - An **uncovered** value falls to `default`, and an **absent** `default` means the
   fail-closed reading (irreversible, unquantified) — *not* the base contract. A table that
   does not mention a value has not said the value is safe.
+- **A value the call never established is not an uncovered value**: it resolves fail-closed
+  **whether or not a `default` is declared**. `default` says what an operation the table
+  does not list resolves to, and such a call named no operation at all — so a `default` an
+  author legitimately writes softer than the base contract (`default: {class: reversible}`,
+  a small fixed `blastRadius`) must not answer for it. The same reading `blastRadius` gives
+  a missing magnitude: an action whose size or operation cannot be established must not be
+  treated as small or safe. Five spellings count as establishing nothing, because the caller
+  picks between them freely and they are one keystroke apart: the argument **omitted**, an
+  `$.` path that does not **resolve**, an explicit **`null`**, a **blank** string, and an
+  **object or array** (whose rendering is Go debug syntax no case key can name — unusable
+  rather than uncovered). A supplied scalar the `cases` do not list is a real value and
+  still falls to `default`.
+- Keep that in mind when keying a table on an **optional** parameter, or on one a caller can
+  pass under an alias the contract does not key on. If the target's effect is only defined
+  when the argument is present, make it required at the policy level: a condition on the
+  same argument denies a call that omits it with `MISSING_CONTEXT` — `allowedOperations`
+  for the free-form statement shape above, `allowedValues` where the value set is
+  enumerable.
 
 ## The two conditions
 

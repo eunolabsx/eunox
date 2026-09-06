@@ -1074,9 +1074,11 @@ func numericEqual(a, b any) bool {
 	if aInt && bInt {
 		return ia == ib
 	}
-	// Exactly one operand is a representable int64: they are by definition distinct
-	// integers and must not be collapsed onto a shared float64, which would round
-	// them equal.
+	// Exactly one side is an int64-representable integer, so the pair cannot be equal:
+	// an integer inside that range and one outside it are different numbers, and a
+	// non-integer is not an integer at all. Answered HERE rather than left to the tail
+	// because exactRat has no int64 arm, so the out-of-range pair (math.MaxInt64 against
+	// 9223372036854775808) would reach the float64 compare and round together.
 	if aInt != bInt {
 		return false
 	}
