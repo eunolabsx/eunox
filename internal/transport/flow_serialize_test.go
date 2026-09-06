@@ -364,20 +364,44 @@ func TestAwaitHostDecisionsDrained_BoundedByTimeout(t *testing.T) {
 	}
 }
 
-// TestAwaitHostDecisionsDrained_NoopWhenNoDecideGate: a non-flow session (decideGate nil)
-// has no flow state to protect and ReleaseSession is itself a no-op, so the drain must
-// short-circuit rather than add teardown latency waiting on unrelated in-flight handlers.
-func TestAwaitHostDecisionsDrained_NoopWhenNoDecideGate(t *testing.T) {
+// TestAwaitHostDecisionsDrained_RunsWithoutADecideGate: the drain must NOT short-circuit for a
+// non-flow session. It once did, on the premise that ReleaseSession is a no-op without a decision
+// gate — untrue, because ReleaseSession also drops the Tier-2 interface baseline, which exists
+// independently of NeedsDecisionTurn. Skipping the drain let step 8 clear that baseline under an
+// in-flight enforced handler, whose surface-pin check then saw no baseline at all (fail-open).
+func TestAwaitHostDecisionsDrained_RunsWithoutADecideGate(t *testing.T) {
 	t.Parallel()
 	p := &StdioProxy{decideGate: nil}
-	p.fwdHostInFlight.Store(5) // would block to the timeout if not short-circuited
+	p.fwdHostInFlight.Store(1) // a handler mid-decision, with no gate held
+
+	done := make(chan struct{})
+	go func() { p.awaitHostDecisionsDrained(2 * time.Second); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("drain returned while a host decision was in flight; a gateless session's baseline is cleared under it")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	p.fwdHostInFlight.Store(0)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not return after in-flight reached zero")
+	}
+}
+
+// TestAwaitHostDecisionsDrained_NoWaitWhenAlreadyDrained: the cost of dropping that
+// short-circuit is one atomic load — a settled counter must not add teardown latency.
+func TestAwaitHostDecisionsDrained_NoWaitWhenAlreadyDrained(t *testing.T) {
+	t.Parallel()
+	p := &StdioProxy{decideGate: nil}
 
 	done := make(chan struct{})
 	go func() { p.awaitHostDecisionsDrained(10 * time.Second); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(1 * time.Second):
-		t.Fatal("drain must be a no-op for a non-flow session (decideGate nil)")
+	case <-time.After(time.Second):
+		t.Fatal("drain must return immediately when nothing is in flight")
 	}
 }
 

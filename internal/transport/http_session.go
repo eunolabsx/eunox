@@ -334,8 +334,11 @@ func (s *httpSession) ownerMismatch(cur *pdp.JWTClaims) (string, bool) {
 // cur is the request's own validated claims, the same input the engine's key builder resolves its
 // anchor from — so for a request that reaches dispatch, "the claims present at POST time" and
 // "the anchor the request resolved" are one answer, not two that could disagree.
+//
+// It records no live token id: that association answers a different question (which credentials
+// has this session been used with, for the reclaim sweep) on a WIDER predicate, and folding it in
+// here tied it to this one. See noteLiveTokenID.
 func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
-	s.noteLiveTokenID(cur)
 	rt := s.route
 	if rt == nil || !rt.taskAnchored {
 		return
@@ -345,8 +348,23 @@ func (s *httpSession) noteRequestAnchor(cur *pdp.JWTClaims) {
 	}
 }
 
-// noteLiveTokenID records the credential this request presented, for the reclaim predicate.
+// noteLiveTokenID records the credential this message presented, for the reclaim predicate.
 // See liveTokenID for why the session's captured claims are not enough.
+//
+// Called for EVERY host message this proxy admits on an established session — enforced or not —
+// rather than only for the ones that commit anchored state. The two are different questions: the
+// span latch is about state a DECISION writes, while this is about which credentials the session
+// has been used with, and every message presents one. Riding on the enforced-only predicate left a
+// client that rotates its bearer and then presents the new one on non-enforced traffic alone
+// (*/list, ping, re-initialize, a notification, an SSE GET) with no live id recorded: revoking the
+// token actually in use denied every request — the data plane decides from each request's own
+// claims — while neither reclaim arm matched, pinning the upstream subprocess, the maxSessions
+// slot and the SSE stream until process exit under sessionIdleTimeoutMs: 0, which is the
+// configuration the on-delivery reclaim exists for.
+//
+// Every call site sits BELOW the session gates, so a sender who may not act on this session at all
+// cannot overwrite the association. A DELETE is deliberately not one of them: it tears the session
+// down itself, so there is nothing left to reclaim.
 func (s *httpSession) noteLiveTokenID(cur *pdp.JWTClaims) {
 	if cur == nil || cur.TokenID == "" {
 		// An absent id is not recorded: leaving the previous one in place keeps the session

@@ -544,14 +544,17 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 }
 
 // awaitHostDecisionsDrained blocks until no dispatched host request is still mid-decision, or
-// until timeout elapses, so teardown does not clear per-session flow state out from under a
-// sink still deciding (the stdio analogue of httpSession.awaitInFlightDrained). A no-op when
-// decideGate is nil, since ReleaseSession is itself a no-op then. Bounded and poll-based:
-// teardown must never hang on a wedged handler.
+// until timeout elapses, so teardown does not clear per-session state out from under a handler
+// still deciding (the stdio analogue of httpSession.awaitInFlightDrained). Bounded and
+// poll-based: teardown must never hang on a wedged handler.
+//
+// Runs for every session, not just a flow-serialized one. The decideGate == nil short-circuit
+// this replaced rested on ReleaseSession being a no-op without a gate, which it is not: it also
+// drops the Tier-2 interface baseline, which exists independently of NeedsDecisionTurn, so on
+// the signal/upstream-exit paths an in-flight enforced handler could have the baseline cleared
+// mid-decision and see an unpinned surface — the fail-open direction. On an already-drained
+// counter the drain costs one atomic load.
 func (p *StdioProxy) awaitHostDecisionsDrained(timeout time.Duration) {
-	if p.decideGate == nil {
-		return
-	}
 	awaitDrained(&p.fwdHostInFlight, timeout)
 }
 

@@ -1318,17 +1318,15 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		return condErr
 	}
 
-	// Resolve the blocked target's namespace as RecordSessionCall does, so reporting in
-	// namespace:name form disambiguates same-named targets in the audit log.
-	blockedType, blockedName := splitEnginePrefix(req.TargetName)
-	if req.Target != nil {
-		if req.Target.Type != "" {
-			blockedType = req.Target.Type
-		}
-		if blockedName == "" && req.Target.Name != "" {
-			blockedName = strings.TrimSpace(req.Target.Name)
-		}
-	}
+	// Through the SAME derivation RecordSessionCall keys its history marker on, so the name this
+	// deny reports is a target that exists — reporting in namespace:name form only disambiguates
+	// same-named targets if the name is the one the bucket was written under. The copy this
+	// replaced consulted Target.Name only as a FALLBACK for an empty prefix split, inverting the
+	// rule every sibling applies (Target.Name is preferred VERBATIM, because a target whose own
+	// name begins with a recognized token would otherwise have that token stripped): a resource
+	// named "system:config" was recorded on the signed tape as "resource:config", a target no
+	// manifest names.
+	blockedType, blockedName := sessionTargetKey(req)
 	blockedTarget := blockedType + ":" + blockedName
 	// Report "(unknown)" rather than the misleading "tool:" sentinel when no name is
 	// present, so a SIEM rule parsing blockedTool as namespace:name gets no empty name.
