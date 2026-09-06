@@ -48,13 +48,13 @@ type CheckFunc func(rawToolsListResult json.RawMessage, serverVersion string, pr
 // matchResource reports whether the resource pattern (its namespace prefix stripped) matches
 // the bare target name, delegating to enforcement.MatchesResource.
 func matchResource(pattern, name string) bool {
-	return enforcement.MatchesResource(pdp.StripNamespacePrefix(pattern), name)
+	return enforcement.MatchesResource(enforcement.StripEnginePrefix(pattern), name)
 }
 
 // resSpecificity scores how specific a resource pattern is against name, via
 // enforcement.ResourceSpecificity — the same algorithm the engine uses.
 func resSpecificity(pattern, name string) int {
-	return enforcement.ResourceSpecificity(pdp.StripNamespacePrefix(pattern), name)
+	return enforcement.ResourceSpecificity(enforcement.StripEnginePrefix(pattern), name)
 }
 
 // UpstreamTool describes one tool returned by the upstream tools/list response.
@@ -354,7 +354,7 @@ func liveAndExpectedToolCounts(manifest *config.LocalManifest, tools []UpstreamT
 // pair, or nil. A glob match is a potential silent over-permission; inspecting EVERY covering
 // entry surfaces both of two equal-specificity globs, each reachable for some caller.
 func fm1Warnings(tool UpstreamTool, c *capability.Constraint) []Warning {
-	if !capability.ContainsGlobMeta(pdp.StripNamespacePrefix(c.Target)) {
+	if !capability.ContainsGlobMeta(enforcement.StripEnginePrefix(c.Target)) {
 		return nil
 	}
 	return []Warning{{Kind: Fm1, Tool: tool.Name, Resource: c.Target}}

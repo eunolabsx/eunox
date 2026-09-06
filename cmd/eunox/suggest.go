@@ -602,9 +602,7 @@ const suggestUsageExit = 2
 // os.Exit) so tests can drive every branch.
 func cmdSuggest(args []string) int {
 	fs := flag.NewFlagSet("suggest", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, `Usage: eunox suggest [flags]
+	setUsage(fs, args, `Usage: eunox suggest [flags]
 
 Generate a draft capability manifest from the local audit log. Unlike 'init'
 (which scaffolds a deny-all from a live tool list), 'suggest' reads what the
@@ -627,9 +625,6 @@ Exit codes:
 
 Flags:
 `)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	name := fs.String("name", "suggested-manifest", "Value for the manifest name field.")

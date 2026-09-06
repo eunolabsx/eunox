@@ -482,6 +482,71 @@ func firstRequestSeed(key string, rev capability.Revision) sessionSeed {
 	return sessionSeed{id: key, hostRev: rev}
 }
 
+// sessionStartBudget is the write-deadline window one establishment may need: the larger of
+// sessionStartTimeout, which establishment actually runs under, and --upstream-timeout, which
+// it does not — cover both so the deadline can't fire mid-handshake when --upstream-timeout is
+// set below sessionStartTimeout. A pure function of a field fixed at construction, so the arm
+// that re-arms a second time before its response write cannot read a different budget than the
+// one establishment ran under.
+func (p *HTTPProxy) sessionStartBudget() time.Duration {
+	budget := sessionStartTimeout
+	if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > budget {
+		budget = b
+	}
+	return budget
+}
+
+// establishSession is the tail both session-creating arms share — handleSessionCreatingInitialize
+// and createFirstRequestSession. From the capacity reservation to the established session the two
+// ran the same security-ordered sequence, hand-mirrored and differing only in the seed: the
+// pre-spawn reservation and its one-owner release, the start budget and the write-deadline re-arm
+// covering it, the establishment context, the pre-creation clientIP capture, and the
+// remote/local transport switch. gate_order_test.go pins that order from three files away, so a
+// fix landing on one copy and not the other was the live risk.
+//
+// The per-arm gates stay per-arm: everything ABOVE the reservation (revision negotiation, the kill
+// check, the audience pin, --require-audit=strict, and the declaring arm's identity requirement
+// and join-an-existing-worker wait) is each arm's own, as is what it does with the result.
+//
+// A nil session with a NIL error means the refusal is already written: the session cap, whose
+// answer is identical on both arms down to the record. A non-nil error is a creation failure the
+// CALLER disposes of, since that is the one step where the arms differ — the declaring arm adopts
+// a concurrent winner before it writes.
+func (p *HTTPProxy) establishSession(ctx context.Context, w http.ResponseWriter, r *http.Request, route *UpstreamRoute, seed sessionSeed, startGen uint64) (*httpSession, error) {
+	// Pre-spawn capacity RESERVATION, not just a check: the slot is taken now and held across
+	// establishment, so concurrent creations can't all pass a registry-only check and each spawn
+	// an upstream before any registers.
+	if !p.tryReserveSessionSlot() {
+		// Recorded for the same reason as writeSessionCreateError's errSessionLimit leg: this is
+		// its cheap pre-spawn twin, and both go through the one route-stamped helper so the two
+		// ways to hit the same cap can't produce two record shapes.
+		p.recordSessionCapDeny(ctx, r, route)
+		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
+		return nil, nil
+	}
+	// Released unconditionally — success included. One owner, one release: letting
+	// registerSession convert the reservation on success instead would double-free it on any
+	// failure AFTER registration (a drift refusal is one). It is released when ESTABLISHMENT
+	// ends rather than when the caller is done with the session, since registerSession has
+	// published it by then and the cap counts registered sessions too — holding the reservation
+	// across the caller's response write would count one session twice for as long as a slow
+	// client takes to read it.
+	defer p.releaseSessionSlot()
+
+	rearmWriteDeadlineFor(w, p.sessionStartBudget())
+	initCtx, cancel := context.WithTimeout(ctx, sessionStartTimeout)
+	defer cancel()
+
+	// Captured before session creation: upstream-initiated sampling carries no request of its
+	// own and is evaluated against this address. Setting it after creation would race the reader
+	// goroutine.
+	clientIP := p.sourceIP(r)
+	if route.transport == "http" {
+		return p.newRemoteSession(initCtx, route, clientIP, startGen, seed)
+	}
+	return p.newSession(initCtx, route, clientIP, startGen, seed)
+}
+
 func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, clientIP string, startGen uint64, seed sessionSeed) (*httpSession, error) {
 	// Built before registerSession publishes the session, so a concurrent close() never races
 	// the write of sessCancel. Descends from Background, not the request ctx which ends when

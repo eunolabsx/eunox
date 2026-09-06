@@ -34,18 +34,6 @@ const (
 	doctorSep              = "────────────────────────────────────────────────────────────"
 )
 
-// wf and wln discard per-call write errors (not actionable for stdout); when the bundle goes
-// to --output FILE, w is an *errTrackingWriter so a short write is still caught there.
-func wf(w io.Writer, format string, args ...interface{}) { _, _ = fmt.Fprintf(w, format, args...) }
-func wln(w io.Writer, args ...interface{})               { _, _ = fmt.Fprintln(w, args...) }
-
-// writers binds w into the (wf, wln) pair so a function emitting one stream declares
-// `wf, wln := writers(out)` once instead of re-deriving the closures at each site.
-func writers(w io.Writer) (writef func(string, ...interface{}), writeln func(...interface{})) {
-	return func(format string, args ...interface{}) { wf(w, format, args...) },
-		func(args ...interface{}) { wln(w, args...) }
-}
-
 // errTrackingWriter records the first write error, so a short write to --output FILE (e.g.
 // ENOSPC mid-bundle) is reported instead of silently producing a partial bundle that
 // "Wrote support bundle" (exit 0) would otherwise vouch for.
@@ -144,9 +132,7 @@ const doctorUsageExit = 2
 // os.Exit) so tests can drive every branch in-process.
 func cmdDoctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, `Usage:
+	setUsage(fs, args, `Usage:
   eunox doctor [flags]
 
 Print a user-initiated support bundle: binary identity, redacted transport
@@ -163,9 +149,6 @@ before sharing.
 
 Flags:
 `)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
 
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the bundle includes the\nredacted config, manifest validation per route, and (with --live) drift.")
 	auditLog := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")

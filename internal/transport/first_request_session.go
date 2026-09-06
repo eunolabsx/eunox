@@ -308,34 +308,10 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 	if ctx.Err() != nil {
 		return nil
 	}
-	if !p.tryReserveSessionSlot() {
-		p.recordSessionCapDeny(ctx, r, route)
-		http.Error(w, "session limit reached", http.StatusServiceUnavailable)
-		return nil
-	}
-	// One owner, one release — success included. See handleSessionCreatingInitialize.
-	defer p.releaseSessionSlot()
-
-	startBudget := sessionStartTimeout
-	if b := msToDuration(p.upstreamTimeMs); p.upstreamTimeMs > 0 && b > startBudget {
-		startBudget = b
-	}
-	rearmWriteDeadlineFor(w, startBudget)
-	initCtx, cancel := context.WithTimeout(ctx, sessionStartTimeout)
-	defer cancel()
-
-	// Captured before creation: upstream-initiated sampling carries no request of its own and is
-	// evaluated against this address, and setting it after would race the reader goroutine.
-	clientIP := p.sourceIP(r)
-	var (
-		sess *httpSession
-		err  error
-	)
-	if route.transport == "http" {
-		sess, err = p.newRemoteSession(initCtx, route, clientIP, startGen, firstRequestSeed(key, rev))
-	} else {
-		sess, err = p.newSession(initCtx, route, clientIP, startGen, firstRequestSeed(key, rev))
-	}
+	// The reservation, the start budget, and the spawn itself are establishSession's — the tail
+	// this arm shares with the session-creating initialize. A nil session with no error is the
+	// session cap, already answered, and nil is what this function returns for that anyway.
+	sess, err := p.establishSession(ctx, w, r, route, firstRequestSeed(key, rev), startGen)
 	if err != nil {
 		// A concurrent first request on the same identity already registered one. Adopt it:
 		// both requests are the same subject by construction, so the loser has nothing of its

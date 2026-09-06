@@ -2155,34 +2155,6 @@ func TestAlwaysAllowPDP_InjectedClock(t *testing.T) {
 	}
 }
 
-// TestStripNamespacePrefix_Behavior pins StripNamespacePrefix: it strips a known
-// "<type>:" namespace prefix (tool:/resource:/prompt:/system:) from a target and
-// leaves a string with no known prefix unchanged. Relocated here from the
-// manifest tests when the config/manifest layer split into internal/config — the
-// helper itself lives in this package.
-func TestStripNamespacePrefix_Behavior(t *testing.T) {
-	cases := []struct {
-		input string
-		want  string
-	}{
-		{"tool:read_file", "read_file"},
-		{"resource:file:///data/*", "file:///data/*"},
-		{"prompt:code_review", "code_review"},
-		{"system:sampling/createMessage", "sampling/createMessage"},
-		{"tool:*", "*"},
-		// Non-prefixed strings remain unchanged.
-		{"*", "*"},
-		{"read_file", "read_file"},
-		{"unknown:foo", "unknown:foo"},
-	}
-	for _, tc := range cases {
-		got := StripNamespacePrefix(tc.input)
-		if got != tc.want {
-			t.Errorf("StripNamespacePrefix(%q) = %q, want %q", tc.input, got, tc.want)
-		}
-	}
-}
-
 // TestDenyResponseStampsCorrelationFields asserts every PDP deny response carries
 // a non-empty RequestID and DecidedAt, the same audit-correlation fields the
 // allow path stamps. A blank request_id/decided_at on a deny breaks join-by-

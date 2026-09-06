@@ -32,9 +32,7 @@ const statsUsageExit = 2
 // os.Exit) so tests can drive every branch.
 func cmdStats(args []string) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, `Usage: eunox stats [flags]
+	setUsage(fs, args, `Usage: eunox stats [flags]
 
 Print a denial count histogram from the local audit log. Denials are split
 into BLOCKED (enforce-mode — request was rejected) and OBSERVED (audit-mode
@@ -50,9 +48,6 @@ Exit codes:
 
 Flags:
 `)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
 	configPath := fs.String("config", "", "Path to the eunox config (YAML). When set, the configured audit.log is\nused as the default for --audit-log.")
 	auditLogPath := fs.String("audit-log", "", "Path to the audit JSONL log (default: ~/.eunox/audit.jsonl).")
 

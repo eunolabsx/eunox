@@ -3495,6 +3495,10 @@ func TestStripEnginePrefix(t *testing.T) {
 		{"mcp:read_file", "mcp:read_file"},   // unrecognized prefix unchanged
 		{"Tool:read_file", "Tool:read_file"}, // case mismatch unchanged
 		{"tool:", ""},                        // recognized prefix, empty name
+		// Bare wildcards pass through unchanged, so a glob target keeps matching after
+		// the strip — the property internal/drift's pattern matching relies on.
+		{"tool:*", "*"},
+		{"*", "*"},
 	}
 	for _, tc := range cases {
 		if got := enforcement.StripEnginePrefix(tc.in); got != tc.want {

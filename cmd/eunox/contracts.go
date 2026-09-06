@@ -35,10 +35,9 @@ func reportUnreadableCorpusDir(resolved, requested string, statErr error) {
 	}
 }
 
-// printContractsUsage writes the `contracts` subcommand help text. Its own top-level function,
-// mirroring printProxyUsage, so cmdContracts' body doesn't carry the usage text inline.
-func printContractsUsage(fs *flag.FlagSet, w io.Writer) {
-	_, _ = fmt.Fprint(w, `Usage:
+// contractsUsage is the `contracts` subcommand's help text, a constant so cmdContracts'
+// body does not carry a screen of prose inline.
+const contractsUsage = `Usage:
   eunox contracts [--dir <corpus-dir>] [--trust-keys <file>]
   eunox contracts [--dir <corpus-dir>] --ref <contract-id>
   eunox contracts [--dir <corpus-dir>] --attest-payload <contract-id> [--role <role>] [--statement <statement>]
@@ -72,16 +71,13 @@ Exit codes:
      signature that does not verify, or an unknown contract id.
 
 Flags:
-`)
-	fs.SetOutput(w)
-	fs.PrintDefaults()
-}
+`
 
 // cmdContracts runs the `contracts` subcommand, returning the exit code (rather than
 // calling os.Exit) so tests can drive every branch including the failure paths.
 func cmdContracts(args []string) int {
 	fs := flag.NewFlagSet("contracts", flag.ContinueOnError)
-	fs.Usage = func() { printContractsUsage(fs, usageWriter(args)) }
+	setUsage(fs, args, contractsUsage)
 
 	dir := fs.String("dir", defaultContractsDir, "Directory holding the corpus entries (*.json).")
 	ref := fs.String("ref", "", "Print the effect.ref pin for this contract id and exit.")

@@ -1623,13 +1623,13 @@ func TestRunStdioHandshake_NotificationWriteError(t *testing.T) {
 	}
 }
 
-// ───────────────────────── printProxyUsage ──────────────────────────────────
+// ───────────────────────── proxy usage text ─────────────────────────────────
 
 func TestPrintProxyUsage(t *testing.T) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	fs.String("config", "", "config path")
 
-	out := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
+	out := captureStderr(t, func() { writeUsage(fs, os.Stderr, proxyUsage) })
 	if !strings.Contains(out, "Usage:") {
 		t.Errorf("expected usage banner, got %q", out)
 	}
@@ -1650,7 +1650,7 @@ func TestPrintProxyUsage(t *testing.T) {
 // details at all.
 func TestPrintProxyUsage_WiretapClaimIsHonest(t *testing.T) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	out := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
+	out := captureStderr(t, func() { writeUsage(fs, os.Stderr, proxyUsage) })
 
 	if strings.Contains(out, "nothing is blocked") {
 		t.Errorf("the --audit help still claims nothing is blocked:\n%s", out)
@@ -1669,7 +1669,7 @@ func TestPrintProxyUsage_WiretapClaimIsHonest(t *testing.T) {
 // script had to derive it from the source.
 func TestPrintProxyUsage_DocumentsExitCodes(t *testing.T) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	out := captureStderr(t, func() { printProxyUsage(fs, os.Stderr) })
+	out := captureStderr(t, func() { writeUsage(fs, os.Stderr, proxyUsage) })
 
 	if !strings.Contains(out, "Exit codes:") {
 		t.Fatalf("proxy usage must document its exit codes; got:\n%s", out)

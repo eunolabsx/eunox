@@ -406,9 +406,7 @@ func capturedAfterTerminator(stdioCmd []string) string {
 // calling os.Exit) so tests can drive every branch including the fail-closed error paths.
 func cmdValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
-	fs.Usage = func() {
-		w := usageWriter(args)
-		_, _ = fmt.Fprint(w, `Usage:
+	setUsage(fs, args, `Usage:
   eunox validate <manifest.yaml> [...] --live --upstream-url <url>
   eunox validate <manifest.yaml> [...] --live --transport stdio -- <cmd> [args...]
   eunox validate --config <eunox.yaml> [--live]
@@ -435,9 +433,6 @@ With --config the exit code is the maximum across all routes.
 
 Flags:
 `)
-		fs.SetOutput(w)
-		fs.PrintDefaults()
-	}
 
 	live := fs.Bool("live", false, "Connect to a running upstream and report drift against the live tool set.")
 	configPath := fs.String("config", "", "Path to an eunox config (YAML). Walks every route, validating each route's\nmanifest(s); with --live, each route's declared upstream is introspected.\nMutually exclusive with positional manifest files and --upstream-url.")
