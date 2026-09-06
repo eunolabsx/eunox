@@ -756,7 +756,9 @@ func buildCallCounterAndKillSwitch(redisAddr, redisPassword string, redisTLS, ki
 			return upstreamBackends{}, err
 		}
 		fmt.Fprintf(os.Stderr, "[eunox] Redis backend enabled (%s). State persists across restarts.\n", redisAddr)
-		// Refuses a keyspace-sharding client (see callcounter.ErrClusterUnsupported). Close
+		// Refuses a keyspace-sharding client, and one whose topology it cannot place at all (see
+		// callcounter.ErrClusterUnsupported, ErrUnknownTopology) — neither is reachable while
+		// buildRedisClient returns a bare *goredis.Client, which classifies single-node. Close
 		// the pool first, as the ping failure above does: this returns before anything else
 		// takes ownership of it.
 		counter, err = callcounter.NewRedis(rdb)

@@ -158,8 +158,11 @@ else
 	# go directive, so a release of it requiring a newer Go than we build with would
 	# switch the whole invocation -- and govulncheck reports stdlib advisories against
 	# the toolchain it loaded packages with, so the scan would describe a Go that does
-	# not ship. Build the tool under GOTOOLCHAIN=auto (it must be allowed its own
-	# requirement), then run the SCAN pinned.
+	# not ship. So the tool is built under "$PINNED_TOOLCHAIN+auto" -- the module's
+	# toolchain as a FLOOR, upgraded if x/vuln itself requires newer -- then the SCAN is
+	# run pinned. A bare `auto` gives the tool its own requirement and nothing more, so a
+	# tool built with an older Go than the module cannot LOAD it at all ("package requires
+	# newer Go version"), which is a scan that did not happen rather than a clean one.
 	#
 	# Ask the go command which toolchain that is rather than parsing go.mod. The `go`
 	# directive is a LANGUAGE version, not a toolchain name: `go 1.27` is a legal
@@ -180,7 +183,7 @@ else
 	esac
 
 	echo "govulncheck $VERSION, analyzing against $PINNED_TOOLCHAIN" >&2
-	GOBIN="$work/bin" GOTOOLCHAIN=auto \
+	GOBIN="$work/bin" GOTOOLCHAIN="$PINNED_TOOLCHAIN+auto" \
 		go install "golang.org/x/vuln/cmd/govulncheck@$VERSION"
 
 	# govulncheck exits 3 when it finds vulnerabilities; that is data here, not a

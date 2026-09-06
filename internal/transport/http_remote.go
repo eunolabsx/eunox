@@ -132,6 +132,12 @@ func BoundConsoleDetail(s string) string {
 	return capability.SanitizeControlRunes(capability.BoundString(strings.TrimSpace(s), maxConsoleDetailBytes))
 }
 
+// maxUpstreamIdleConnsPerHost caps the idle connections a route's shared transport keeps warm
+// for reuse. Named rather than inlined because it is also the bound on what a session-churn leak
+// test may legitimately observe still resident: those connections are pooled by design, and how
+// many of them a given Go release keeps warm is the runtime's business, not a leak.
+const maxUpstreamIdleConnsPerHost = 32
+
 // buildUpstreamTransport builds the *http.Transport for a remote upstream. When
 // tlsSkipVerify is true it accepts any TLS certificate (development only; callers warn).
 // upstreamTimeoutMs is the resolved per-call timeout; pass <= 0 when disabled.
@@ -155,7 +161,7 @@ func buildUpstreamTransport(tlsSkipVerify bool, upstreamTimeoutMs int) *http.Tra
 	// All of a route's sessions target the same host, so raise the per-host idle-conn cap
 	// above the stdlib default of 2 for more reuse under concurrency (still bounded and
 	// reaped by IdleConnTimeout).
-	transport.MaxIdleConnsPerHost = 32
+	transport.MaxIdleConnsPerHost = maxUpstreamIdleConnsPerHost
 	// ResponseHeaderTimeout is a transport property, so it applies to every request
 	// (foreground calls AND the session-start drift probe) on top of any per-call context
 	// deadline. Floor it at sessionStartTimeout: a hardcoded value would undercut a larger
