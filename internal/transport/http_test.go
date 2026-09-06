@@ -1811,30 +1811,43 @@ func TestHTTPProxy_RemoteSessions_NoLeak(t *testing.T) {
 		ShutdownMs:  2000,
 	})
 
-	for i := 0; i < 3; i++ {
-		sid := leakInitSession(t, proxy)
-		leakDeleteSession(t, proxy, sid)
+	const cycles = 25
+	churn := func() {
+		for i := 0; i < cycles; i++ {
+			sid := leakInitSession(t, proxy)
+			leakDeleteSession(t, proxy, sid)
+		}
+		if n := proxy.liveSessionCount(); n != 0 {
+			t.Fatalf("session map leak: %d live sessions after %d init/delete cycles", n, cycles)
+		}
 	}
+
 	settleGoroutines()
 	base := runtime.NumGoroutine()
 
-	const cycles = 25
-	for i := 0; i < cycles; i++ {
-		sid := leakInitSession(t, proxy)
-		leakDeleteSession(t, proxy, sid)
+	// TWO equal batches, compared against each other rather than one batch against a fixed
+	// tolerance. A route's sessions SHARE one *http.Transport (sharedUpstreamTransport), closed
+	// only at proxy shutdown, so what stays resident after churn is that pool's warm connections
+	// — two goroutines per connection, kept on purpose and reaped by IdleConnTimeout. How many a
+	// given Go release keeps warm is the runtime's business: Go 1.26 settled at two connections
+	// and 1.27 at three, which a fixed tolerance of four read as a leak.
+	//
+	// What must NOT happen is accumulation with churn, which is what a per-session pool never
+	// released would produce. The pool is saturated by the first batch, so a second identical
+	// batch adds nothing — while a leak proportional to sessions adds as much again.
+	churn()
+	first := waitForGoroutineCount(base + 2*maxUpstreamIdleConnsPerHost)
+	if first > base+2*maxUpstreamIdleConnsPerHost {
+		t.Fatalf("connection pool unbounded: baseline %d, after %d remote sessions %d (the shared transport may keep at most %d idle conns, two goroutines each)",
+			base, cycles, first, maxUpstreamIdleConnsPerHost)
 	}
 
-	if n := proxy.liveSessionCount(); n != 0 {
-		t.Fatalf("session map leak: %d live sessions after %d init/delete cycles", n, cycles)
-	}
-
-	// Each remote session owns its connection pool, released on close() via
-	// CloseIdleConnections — so the per-session upstream-connection goroutines
-	// must not accumulate across churn.
-	const tolerance = 4
-	if got := waitForGoroutineCount(base + tolerance); got > base+tolerance {
-		t.Fatalf("goroutine/connection leak: baseline %d, after %d remote sessions %d (tolerance %d)",
-			base, cycles, got, tolerance)
+	// Slack for scheduler noise only: the expected growth here is zero.
+	const churnTolerance = 4
+	churn()
+	if second := waitForGoroutineCount(first + churnTolerance); second > first+churnTolerance {
+		t.Fatalf("goroutine/connection leak: %d after %d sessions, %d after %d (tolerance %d) — the residue grows with churn, so it is not a bounded pool",
+			first, cycles, second, 2*cycles, churnTolerance)
 	}
 }
 

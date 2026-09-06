@@ -8,7 +8,7 @@
 #   docker build -f deploy/docker/Dockerfile.mcp -t eunolabs/eunox:latest .
 
 # ── Build stage ──────────────────────────────────────────────────────────────
-# Pinned to the same patch release as go.mod and CI (go 1.26.6) so the released
+# Pinned to the same patch release as go.mod and CI (go 1.27.0) so the released
 # image is built with the exact toolchain the binary was tested against.
 FROM golang:1.27.0-alpine AS builder
 

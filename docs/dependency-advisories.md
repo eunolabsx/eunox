@@ -83,7 +83,9 @@ this register only when the advisory no longer applies to the tree at all.
 
 **Current state: the scan reports nothing.** As of the run that landed this file,
 `govulncheck ./...` against `go1.26.6` returns 0 in all three buckets — no called
-finding, no toolchain finding, nothing at `required` or `imported` level. The entries
+finding, no toolchain finding, nothing at `required` or `imported` level. The pin has
+since moved to `go1.27.0`; that scan is CI's to run, and this register has not been
+re-derived against it. The entries
 below are therefore a record of advisories that were *reachable in the module graph* and
 what was concluded about each, not a list of things the scan is currently printing.
 

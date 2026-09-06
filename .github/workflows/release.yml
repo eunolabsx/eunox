@@ -65,7 +65,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.6"
+          go-version: "1.27.0"
           cache-dependency-path: go.sum
 
       - name: Verify module
@@ -111,7 +111,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.6"
+          go-version: "1.27.0"
           cache-dependency-path: go.sum
 
       # Cosign signs the aggregate checksums.txt with a Sigstore keyless
