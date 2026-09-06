@@ -192,13 +192,12 @@ func TestGateOrder_ServerInitiatedLegInheritsTheRevisionStamp(t *testing.T) {
 	sink, logPath := newTempAuditSink(t)
 	rec := asRecorder(&routeSink{sink: sink, upstream: "up1"})
 	fp := serverRequestParams{
-		rec:       rec,
 		sessionID: "sess",
 		pdp:       pdp.AlwaysAllowPDP{},
 		revision:  capability.Revision20260728,
 		forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
-		// The leg's tape paired with its buckets, as both transports wire it: the boundary
-		// refusal's record resolves through this wiring, not through fp.rec.
+		// The leg's tape paired with its buckets, as both transports wire it: every record this
+		// leg writes, the boundary refusal's included, resolves through this one wiring.
 		unblocker: answeringSeam(func(mcp.RPCMsg) error { return nil }, rec, httpServerRequestLegs, io.Discard),
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"}, fp)

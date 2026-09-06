@@ -2273,6 +2273,119 @@ func TestOriginRejection_BoundsRecordedOrigin(t *testing.T) {
 	}
 }
 
+// TestOriginRejection_PaddingCannotEraseTheSmuggledOrigin is the regression for a cut applied on
+// the wrong side of the sanitize pass.
+//
+// capability.TruncateUTF8 collapses each RUN of invalid bytes to ONE replacement character, so
+// bounding the raw bytes before that pass rather than after it hands the peer an eraser: prefix the
+// header with padding the collapse would have folded to three bytes and the whole rest of the value
+// falls outside the bound. Go passes bytes >= 0x80 through to the handler verbatim, so the padding
+// costs nothing to send.
+//
+// The stakes are on checkOrigin's own comment — several Origin headers are joined into the record
+// "so the smuggled header leaves a trace". A version that records "�" for both of these is
+// bounded, flagged, and useless.
+func TestOriginRejection_PaddingCannotEraseTheSmuggledOrigin(t *testing.T) {
+	padding := strings.Repeat("\x80", 4*maxRefusalDetailLen)
+
+	cases := []struct {
+		name   string
+		origin []string
+		want   string
+	}{
+		{
+			name:   "padding ahead of the real origin",
+			origin: []string{padding + "https://evil.example.com/steal"},
+			want:   "https://evil.example.com/steal",
+		},
+		{
+			name:   "padding in a smuggled pair",
+			origin: []string{padding, "https://evil.example.com"},
+			want:   "https://evil.example.com",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink, logPath := newTempAuditSink(t)
+			proxy := newHTTPProxy(httpProxyOptions{Bind: "127.0.0.1", Sink: sink, Stderr: io.Discard})
+
+			req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+			for _, v := range tc.origin {
+				req.Header.Add("Origin", v)
+			}
+			if proxy.checkOrigin(httptest.NewRecorder(), req) {
+				t.Fatal("checkOrigin allowed a foreign Origin")
+			}
+			_ = sink.Close()
+
+			r := findAuditRecordByMethod(readAuditRecords(t, logPath), "", "deny")
+			if r == nil {
+				t.Fatal("no ORIGIN_REJECTED deny record written")
+			}
+			details, _ := r["details"].(map[string]interface{})
+			got, _ := details["origin"].(string)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("details.origin = %q, want it to still carry %q: padding the header must not erase what the peer actually sent", got, tc.want)
+			}
+			if len(got) > maxRefusalDetailLen {
+				t.Errorf("details.origin is %d bytes, want at most %d", len(got), maxRefusalDetailLen)
+			}
+		})
+	}
+}
+
+// discardResponseWriter is an http.ResponseWriter that keeps no body, so a measurement of a refusal
+// path is not dominated by the recorder's own buffer growth.
+type discardResponseWriter struct{ header http.Header }
+
+func (d discardResponseWriter) Header() http.Header       { return d.header }
+func (discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (discardResponseWriter) WriteHeader(_ int)           {}
+
+// TestOriginRefusal_SuppressedRefusalBuildsNothing is the cost property F4 is about: a refusal the
+// bucket suppressed must not build the join, the sanitize walk or the details map at all.
+//
+// checkOrigin is pre-auth and runs at the peer's send rate while its category admits a couple of
+// records a second, so on the flood path the bucket exists for, everything built above the gate is
+// thrown away. The header here is INVALID UTF-8 on purpose: that is the input on which the sanitize
+// pass actually rewrites, and therefore the only one whose cost an allocation assertion can see —
+// over valid bytes the same walk copies nothing and costs 700+ microseconds instead, which is what
+// made an earlier version of this test pass against the very shape it was written to reject.
+func TestOriginRefusal_SuppressedRefusalBuildsNothing(t *testing.T) {
+	// Not parallel: allocation accounting is process-wide.
+	sink, _ := newTempAuditSink(t)
+	defer func() { _ = sink.Close() }()
+	proxy := newHTTPProxy(httpProxyOptions{Bind: "127.0.0.1", Sink: sink, Stderr: io.Discard})
+
+	// TWO headers, which is what isolates the half this is about: checkOrigin skips originAllowed
+	// entirely for a smuggled pair (`!multiple && ...`), so nothing but the refusal's own detail
+	// build touches the value. The residual that leaves is real and is NOT this test's subject —
+	// originAllowed runs url.Parse over a single Origin of any size, above every gate, and costs
+	// more than the build measured here.
+	req := httptest.NewRequest(http.MethodGet, "/mcp", http.NoBody)
+	req.Header.Add("Origin", "https://evil.example.com/"+strings.Repeat("\x80", 1<<20))
+	req.Header.Add("Origin", "https://evil.example.com")
+	w := discardResponseWriter{header: http.Header{}}
+
+	// Drain the category's burst so every measured call takes the suppressed path.
+	for range perCategoryDenyBurstSize + 1 {
+		proxy.checkOrigin(w, req)
+	}
+	res := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			proxy.checkOrigin(w, req)
+		}
+	})
+	// Two orders of magnitude under the header, so this fails on the regression rather than on
+	// allocator noise: building the detail above the gate copies the whole ~1 MiB per frame.
+	const maxBytesPerOp = 16 << 10
+	if got := res.AllocedBytesPerOp(); got > maxBytesPerOp {
+		t.Errorf("a suppressed Origin refusal allocated %d bytes/op for a %d-byte header, want at most %d: the record's details are being built above the admission that discards them",
+			got, len(req.Header.Get("Origin")), maxBytesPerOp)
+	}
+}
+
 // TestLoopbackRejection_BoundsRecordedPath is the same bound on the other
 // client-controlled string a refusal records.
 func TestLoopbackRejection_BoundsRecordedPath(t *testing.T) {
@@ -4682,19 +4795,27 @@ func TestHTTPSessionClose_RemoteMode(t *testing.T) {
 // ── HTTPProxy.Serve ───────────────────────────────────────────────────────
 
 func TestHTTPProxy_Serve_CancelContext(t *testing.T) {
+	// A named port rather than 0: this test cancels a listener it must first know is UP, and the
+	// OS-chosen port left it with no address to ask. The fixed sleep that stood in for the
+	// question asserted a timing guess on a suite that otherwise polls with deadlines — slow
+	// under -race, it cancelled before the bind and passed on the wrong path.
+	port := freeTCPPort(t)
 	proxy := &HTTPProxy{
 		bind:       "127.0.0.1",
-		port:       0, // OS chooses a free port
+		port:       port,
 		shutdownMs: 50,
 		sessions:   make(map[string]*httpSession),
 	}
 
+	// defer, not just the cancel below: waitForServer ends in t.Fatalf, which skips the rest of
+	// this function — so a bind that lost the freeTCPPort race would leave Serve holding the port
+	// and its goroutine for the remainder of the binary.
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	errCh := make(chan error, 1)
 	go func() { errCh <- proxy.Serve(ctx) }()
 
-	// Wait briefly for the server to start.
-	time.Sleep(30 * time.Millisecond)
+	waitForServer(t, fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
 	cancel()
 
 	select {

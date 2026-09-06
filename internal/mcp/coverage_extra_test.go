@@ -438,6 +438,59 @@ func TestMsgKey_NonconformingStringIDsDoNotCollide(t *testing.T) {
 	}
 }
 
+// TestStringIDIsWellFormed_MalformedEscapesFailClosed drives the scanner with the inputs its one
+// caller cannot currently hand it: escapes valid JSON cannot contain.
+//
+// The caller short-circuits on a successful json.Unmarshal, so every assumption those inputs break
+// held by a contract written nowhere — and each broke the FAIL-OPEN way: an index past the buffer
+// (a panic on the goroutine that reads frames, which takes the proxy down), or a malformed id
+// reported lossless, which is the cross-correlation this function exists to prevent.
+//
+// Asserted at the function rather than through MsgKey, since MsgKey is exactly the guard that keeps
+// these inputs from arriving.
+func TestStringIDIsWellFormed_MalformedEscapesFailClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "truncated escape at end", raw: `"\u12`, want: false},
+		{name: "escape with nothing after it", raw: `"\u`, want: false},
+		{name: "one hex digit short", raw: `"\u123`, want: false},
+		// A high surrogate whose low half is cut short: the pair probe's own i+12 bound already
+		// covered this, and it must keep answering false rather than reading the truncated tail.
+		{name: "truncated low surrogate", raw: `"\ud800\udc`, want: false},
+		// A trailing backslash escapes nothing. It walked PAST the end of the buffer and returned
+		// well-formed — the same truncated-escape class as the rows above, answered the other way.
+		{name: "lone trailing backslash", raw: `"abc\`, want: false},
+		// Non-hex digits behind a \u. ParseUint's discarded error made hi 0, which matches neither
+		// surrogate arm, so the scan skipped six bytes and called the id lossless.
+		{name: "non-hex escape", raw: `"\uZZZZ"`, want: false},
+		{name: "partly-hex escape", raw: `"\u12X4"`, want: false},
+		{name: "signed escape", raw: `"\u+123"`, want: false},
+		// The case that discarded error actually cost: the six-byte skip stepped over the
+		// backslash of a genuine lone high surrogate, so the one thing this function exists to
+		// catch went unreported.
+		{name: "malformed escape hiding a lone surrogate", raw: `"\ud80\ud800"`, want: false},
+		// The well-formed shapes must be unaffected by the new bounds. The escaped PAIR is the one
+		// positive case for the arm the guards sit above: nothing in this package asserted that a
+		// well-formed surrogate pair is accepted, so an off-by-six in its skip would have been
+		// invisible while sending every escaped astral id down the raw-bytes fallback.
+		{name: "hex escape", raw: `"\u0061"`, want: true},
+		{name: "uppercase hex escape", raw: `"\u00E9"`, want: true},
+		{name: "escaped surrogate pair", raw: `"\ud83d\ude00"`, want: true},
+		{name: "literal astral rune", raw: "\"\U0001F600\"", want: true},
+		{name: "ordinary escapes", raw: `"a\"b\\c\/d\ne"`, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stringIDIsWellFormed([]byte(tc.raw)); got != tc.want {
+				t.Errorf("stringIDIsWellFormed(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRPCMsg_UnmarshalJSON_Error verifies UnmarshalJSON surfaces the underlying
 // json error on malformed input rather than silently succeeding.
 func TestRPCMsg_UnmarshalJSON_Error(t *testing.T) {

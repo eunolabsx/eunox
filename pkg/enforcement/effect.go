@@ -216,7 +216,7 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 			// Shared helper every quota condition uses: rounds a fractional wait UP
 			// (truncating reported a 900ms wait as 0, telling the caller to retry into a
 			// guaranteed denial).
-			details["retry_after_seconds"] = retryAfterSeconds(retryAfter, br.WindowSeconds)
+			details[detailRetryAfterSeconds] = retryAfterSeconds(retryAfter, br.WindowSeconds)
 			return effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 				"this call's blast radius %s would take this session's cumulative total for the target past the permitted %s per %ds (already %s within the window)",
 				capability.BlastRadiusText(eff.BlastRadius), br.MaxTotal.String(), br.WindowSeconds, formatTotal(total)), details)

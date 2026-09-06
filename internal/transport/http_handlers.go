@@ -311,7 +311,6 @@ func (p *HTTPProxy) handleHTTPUpstreamRequest(ctx context.Context, sess *httpSes
 	}
 	// sess.claims is attached so per-agent kills are honored and records carry agent_id.
 	forwardServerRequest(ctx, msg, serverRequestParams{
-		rec:       asRecorder(rt.sink),
 		audit:     rt.audit,
 		sessionID: sess.id,
 		sourceIP:  sess.clientIP,

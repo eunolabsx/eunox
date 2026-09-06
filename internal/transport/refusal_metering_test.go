@@ -41,8 +41,12 @@ var meteringCallSites = map[string]struct {
 	// nothing is left for the marker to mark.
 	readsDeclaration bool
 }{
-	"admitRefusalRecord":   {categoryArg: 2, implementsMetered: true},
-	"recordRefusal":        {categoryArg: 4, implementsMetered: true},
+	"admitRefusalRecord": {categoryArg: 2, implementsMetered: true},
+	"recordRefusal":      {categoryArg: 4, implementsMetered: true},
+	// admitRefusalWrite is the admission recordRefusal itself delegates to, and the spelling a
+	// caller takes when its details cost something to build — it charges the bucket before handing
+	// back the write, so a suppressed refusal builds nothing.
+	"admitRefusalWrite":    {categoryArg: 3, implementsMetered: true},
 	"recordPreSessionDeny": {categoryArg: 2, implementsMetered: true},
 	"forCategory":          {categoryArg: 0, readsDeclaration: true},
 	// The server-initiated leg's drop records resolve through dropReport.recordDrop, which threads

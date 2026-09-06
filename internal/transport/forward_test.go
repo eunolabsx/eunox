@@ -803,11 +803,10 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSampling(t *testing.T) {
 	forwarded := false
 	var upstreamReply mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:              rec,
 		sessionID:        "s",
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
 		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
-		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
+		unblocker:        recordingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }, rec),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
@@ -826,11 +825,10 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsSampling(t *testing.T) 
 	rec := &fwdRecorder{} // healthy
 	forwarded := false
 	fp := serverRequestParams{
-		rec:              rec,
 		sessionID:        "s",
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "system:sampling/createMessage", Actions: []string{"allow"}}),
 		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
-		unblocker:        writingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }),
+		unblocker:        recordingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }, rec),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
@@ -872,14 +870,13 @@ func TestForwardServerRequest_SamplingFlowLabelDenyRecordsDetails(t *testing.T) 
 	rec := &fwdRecorder{}
 	var upstreamReply mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:       rec,
 		sessionID: "s",
 		pdp:       dp,
 		forward: func(context.Context, mcp.RPCMsg) forwardOutcome {
 			t.Error("an enforced flowLabel deny must not forward to the host")
 			return forwardUndelivered
 		},
-		unblocker: writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
+		unblocker: recordingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }, rec),
 	}
 	forwardServerRequest(ctx, mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
 
@@ -905,12 +902,11 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesNonSampling(t *testing.T
 	forwarded := false
 	var upstreamReply mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:       rec,
 		sessionID: "s",
 		// CheckKill returns nil; the strict gate is what fires
 		pdp:              pdp.AlwaysAllowPDP{},
 		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
-		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
+		unblocker:        recordingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }, rec),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "roots/list"}, fp)
@@ -930,11 +926,10 @@ func TestForwardServerRequest_StrictAudit_HealthyForwardsNonSampling(t *testing.
 	rec := &fwdRecorder{} // healthy
 	forwarded := false
 	fp := serverRequestParams{
-		rec:              rec,
 		sessionID:        "s",
 		pdp:              pdp.AlwaysAllowPDP{},
 		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
-		unblocker:        writingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }),
+		unblocker:        recordingSeam(func(mcp.RPCMsg) error { t.Error("a healthy gate must not write an error to the upstream"); return nil }, rec),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "roots/list"}, fp)
@@ -953,7 +948,6 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 	rec := &fwdRecorder{} // healthy
 	forwardedBeforeRecords := -1
 	fp := serverRequestParams{
-		rec:       rec,
 		audit:     true, // route-level audit mode → observe-and-forward a would-be deny
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
@@ -965,7 +959,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsDenyBeforeForward(t *testing.T) 
 			forwardedBeforeRecords = len(rec.records)
 			return forwardDelivered
 		},
-		unblocker: writingSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }),
+		unblocker: recordingSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }, rec),
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
 
@@ -1006,7 +1000,6 @@ func TestForwardServerRequest_ObserveLeg_RecordsBeforeLogging(t *testing.T) {
 	os.Stderr = w
 
 	fp := serverRequestParams{
-		rec:       forwardOrderRecorder{},
 		audit:     true, // route-level audit mode → observe-and-forward a would-be deny
 		sessionID: "s",
 		// An empty manifest denies sampling/createMessage; audit mode downgrades the
@@ -1017,7 +1010,7 @@ func TestForwardServerRequest_ObserveLeg_RecordsBeforeLogging(t *testing.T) {
 		// notice resolves its destination at write time, which is what lets it reach the os.Stderr
 		// swapped in above. A channel naming a writer would answer the ordering question about the
 		// wrong pipe.
-		unblocker: unwrittenSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }),
+		unblocker: unwrittenSeam(func(mcp.RPCMsg) error { t.Error("observe leg must not write an error to the upstream"); return nil }, forwardOrderRecorder{}),
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`7`), Method: "sampling/createMessage"}, fp)
 
@@ -1046,14 +1039,13 @@ func TestForwardServerRequest_StrictAudit_DegradedDeniesSamplingObserveLeg(t *te
 	forwarded := false
 	var upstreamReply mcp.RPCMsg
 	fp := serverRequestParams{
-		rec:       rec,
 		sessionID: "s",
 		audit:     true, // route audit mode → a would-be-deny is observed-and-forwarded
 		// No system:sampling opt-in → DecideSampling denies (a capability deny, not a
 		// kill-switch deny), so the request reaches the audit-mode observe leg.
 		pdp:              newTestManifestPDP(capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}}),
 		forward:          func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded = true; return forwardDelivered },
-		unblocker:        writingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }),
+		unblocker:        recordingSeam(func(m mcp.RPCMsg) error { upstreamReply = m; return nil }, rec),
 		strictAuditState: strictAuditState{requireAuditStrict: true},
 	}
 	forwardServerRequest(context.Background(), mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`9`), Method: "sampling/createMessage"}, fp)

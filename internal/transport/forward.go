@@ -944,7 +944,6 @@ func auditedUpstreamErrorCode(ctx context.Context, upResp mcp.RPCMsg) int {
 // response back to the upstream initiator; claims carries the session's JWT identity (HTTP only).
 // The rest mirror forwardParams.
 type serverRequestParams struct {
-	rec       auditRecorder
 	audit     bool
 	sessionID string
 	sourceIP  string
@@ -977,6 +976,9 @@ type serverRequestParams struct {
 	// — the writer AND its bound — which is why there is no errOut beside it: the two used to be
 	// independent fields feeding one line, so a leg that wired one and not the other wrote
 	// unbounded with the call-site walk still green.
+	//
+	// It carries this leg's TAPE too, which is why there is no recorder field either. See
+	// serverRequestUnblocker.recorder.
 	unblocker serverRequestUnblocker
 	// decideLock serializes the sampling decision against host-path decisions on the same
 	// anchor when the policy is flow-relevant, since this path runs on the upstream-reader
@@ -1117,13 +1119,14 @@ func samplingFlowDenial(message, reason string) capability.EnforceResponse {
 // auditIdentity pair (no policy evaluated, so an upstream-chosen target-resolving method must
 // not stamp a fabricated target), the sampling leg its decision-backed method.
 func (fp serverRequestParams) strictServerRequestAuditDenial(ctx context.Context, msg mcp.RPCMsg, identifier, method string, dec capability.EnforceResponse) bool {
-	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
+	rec := fp.unblocker.recorder()
+	tripped, reason, detail := auditGateTripped(rec, fp.requireAuditStrict)
 	if !tripped {
 		return false
 	}
 	// Record BEFORE replying to the upstream (record-before-act), matching the other legs, so
 	// a crash between the two can't leave the upstream answered with no matching record.
-	fp.rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeAuditUnavailable, "",
+	rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeAuditUnavailable, "",
 		mergeAuditDetails(detail, handlerFaultDetail(dec)), false)
 	fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, capability.JSONRPCCodeEnforcementError, capability.ErrCodeAuditUnavailable), answerStrictAuditRefusal, method)
 	warnStrictAuditOnce(fp.errOutOrStderr(), fp.strictAuditWarned, reason)
@@ -1183,26 +1186,26 @@ func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, identifi
 	if outcome == forwardRefused {
 		return
 	}
-	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, method, func() {
+	rec := fp.unblocker.recorder()
+	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, rec, method, method, func() {
 		if outcome == forwardUndelivered {
-			// Through the unblocker's own wiring — this leg's tape paired with its buckets — rather
-			// than fp.rec beside a bucket looked up separately, which is the two-copies-of-the-sink
-			// fault refusalLimits exists to prevent. Nil when the leg has no tape, or when the
-			// bucket suppressed this record.
-			if rec := fp.unblocker.report.recs.forCategory(catUndeliveredForward); rec != nil {
+			// metered, not the rec above: this arm is a REFUSAL, so it resolves against
+			// catUndeliveredForward's own declaration rather than writing straight to the tape.
+			// Nil when the leg has no tape, or when the bucket suppressed this record.
+			if metered := fp.unblocker.report.recs.forCategory(catUndeliveredForward); metered != nil {
 				// Named for recordServerRequestDropped's reason, from the same leg vocabulary: this
 				// record used to name no site, so when the bucket suppressed one, the
 				// suppressed_refusal_scope rollup rode a record whose category could not be
 				// recovered — the misreading that stamp exists to prevent.
-				rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeEnforcementError, "",
+				metered.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeEnforcementError, "",
 					mergeAuditDetails(detail, transportLegDetail(fp.unblocker.report.legs.undelivered)), false)
 			}
 			return
 		}
-		if fp.rec == nil {
+		if rec == nil {
 			return
 		}
-		fp.rec.RecordAllow(ctx, fp.sessionID, identifier, method, detail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
+		rec.RecordAllow(ctx, fp.sessionID, identifier, method, detail, nil, auditOnly, dec.LabelsOut, dec.CarriedLabels)
 	})
 }
 
@@ -1275,8 +1278,8 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	if msg.Method != samplingMethod {
 		if deny := fp.pdp.CheckKill(ctx, fp.sessionID); deny != nil {
 			denial := normalizeDenial(deny.Denial)
-			if fp.rec != nil {
-				fp.rec.RecordDeny(ctx, fp.sessionID, identifier, method, denial.Code, denial.ConditionType, nil, false)
+			if rec := fp.unblocker.recorder(); rec != nil {
+				rec.RecordDeny(ctx, fp.sessionID, identifier, method, denial.Code, denial.ConditionType, nil, false)
 			}
 			fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerRevokedServerRequest, method)
 			return
@@ -1323,10 +1326,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// as both JSON-RPC code and message — derived via denialToJSONRPCCode rather than a
 		// literal, and sending denial.Code as the message so an upstream sees the actual
 		// reason instead of a hardcoded "AUTHORIZATION_FAILED".
-		if fp.rec != nil {
+		if rec := fp.unblocker.recorder(); rec != nil {
 			// Pass denial.Details: a flowLabel deny on system:sampling names the blocked
 			// provenance class there, which dropping details would leave absent from the tape.
-			fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
+			rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 				mergeAuditDetails(denial.Details, handlerFaultDetail(dec)), false)
 		}
 		fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID, denialToJSONRPCCode(denial.Code), denial.Code), answerPolicyRefusal, samplingMethod)
@@ -1340,10 +1343,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	}
 	// Record-before-act: recorded before both the stderr notice and the forward, so a crash
 	// between them can't leave a SIEM alert with no corresponding audit record.
-	if fp.rec != nil {
+	if rec := fp.unblocker.recorder(); rec != nil {
 		// Carry denial.Details here too: the would-be flowLabel deny's blocked label must
 		// reach the tape.
-		fp.rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
+		rec.RecordDeny(ctx, fp.sessionID, samplingMethod, samplingMethod, denial.Code, denial.ConditionType,
 			mergeAuditDetails(denial.Details, handlerFaultDetail(dec)), true)
 	}
 	if line, ok := fp.unblocker.notices.admitNotice(siteSamplingDowngrade); ok {
