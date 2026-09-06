@@ -143,9 +143,11 @@ func newStdioProxy(cfg stdioServe, hostReader io.Reader) (*StdioProxy, *mockHost
 		byUpstreamID: make(map[string]chan upstreamResult),
 		hostToUp:     make(map[string]*json.RawMessage),
 		upstreamDone: make(chan struct{}),
-		// Wired as the constructor wires it: without it the revision refusal records unbounded,
-		// which is a state NewStdioProxy does not produce.
-		refusalLimiter: newRefusalRecordLimiter(),
+		// Wired as the constructor wires it — the SUBSET table, not the proxy-wide one: without a
+		// limiter at all the revision refusal records unbounded, and with every category's bucket
+		// a stdio refusal is metered on a table production never builds, which is precisely how a
+		// category stdio charges but does not declare stays invisible to every test here.
+		refusalLimiter: newRefusalRecordLimiterFor(stdioRefusalCategories),
 	}
 	if cfg.setup != nil {
 		cfg.setup(p)

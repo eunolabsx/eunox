@@ -44,7 +44,7 @@ func untranslatableLeg(u serverRequestUnblocker, rec auditRecorder) serverReques
 		sessionID: "s",
 		pdp:       pdp.AlwaysAllowPDP{},
 		revision:  capability.Revision20260728,
-		forward:   func(context.Context, mcp.RPCMsg) bool { return true },
+		forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardDelivered },
 		unblocker: u,
 	}
 }
@@ -161,7 +161,7 @@ func TestUntranslatableServerRequest_RefusesBeforeTheMethodSplit(t *testing.T) {
 			rec := &fwdRecorder{}
 			var forwarded int
 			fp := untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, newRefusalRecordLimiter()), rec)
-			fp.forward = func(context.Context, mcp.RPCMsg) bool { forwarded++; return true }
+			fp.forward = func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded++; return forwardDelivered }
 
 			forwardServerRequest(revisionContext(capability.Revision20260728),
 				mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: method}, fp)
@@ -179,7 +179,7 @@ func TestUntranslatableServerRequest_RefusesBeforeTheMethodSplit(t *testing.T) {
 		var forwarded int
 		fp := untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, newRefusalRecordLimiter()), rec)
 		fp.revision = handshakeRevision
-		fp.forward = func(context.Context, mcp.RPCMsg) bool { forwarded++; return true }
+		fp.forward = func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded++; return forwardDelivered }
 
 		forwardServerRequest(revisionContext(handshakeRevision),
 			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "roots/list"}, fp)

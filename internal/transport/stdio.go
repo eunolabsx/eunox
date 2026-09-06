@@ -347,9 +347,7 @@ func NewStdioProxy(opts StdioProxyOptions) *StdioProxy {
 	if opts.ShutdownMs <= 0 {
 		opts.ShutdownMs = 5000
 	}
-	if opts.Stderr == nil {
-		opts.Stderr = os.Stderr
-	}
+	// No Stderr default: every read resolves through errOut(). See resolvedErrOut.
 	p := &StdioProxy{
 		command:               opts.Command,
 		args:                  opts.Args,
@@ -1435,20 +1433,38 @@ func (p *StdioProxy) buildInitResponse(msg mcp.RPCMsg) mcp.RPCMsg {
 }
 
 // forwardServerRequestToHost tracks msg's ID and forwards the server-initiated request to the
-// host. The host's response (same ID) is later routed back to the upstream by serveHost, and a
-// request this one displaces from the bounded tracker is answered and recorded rather than left to
-// hang — see trackServerRequest. A request whose id the tracker will not retain never reaches here:
-// admitServerRequestID refuses it at this leg's entry.
-func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) {
+// host, reporting what it did with it. The host's response (same ID) is later routed back to the
+// upstream by serveHost, and a request this one displaces from the bounded tracker is answered and
+// recorded rather than left to hang — see trackServerRequest. A request whose id the tracker will
+// not retain does not reach here on the shipped path: admitServerRequestID refuses it at this
+// leg's entry.
+//
+// It is serverRequestParams.forward itself rather than a body a closure answers over: a caller that
+// reported "delivered" across the refusing branch below put a contradicting ALLOW on the signed
+// tape beside that branch's own refusal record.
+func (p *StdioProxy) forwardServerRequestToHost(ctx context.Context, msg mcp.RPCMsg) forwardOutcome {
+	u := p.unblocker()
 	// The tracker refuses an id it will not retain, and that refusal must not degrade into a
 	// SILENT untracked forward: the host would answer, the routing arm would drop the answer as
 	// untracked, and the upstream would block with nothing on the tape. Asked here rather than
 	// inferred from track's return, which cannot distinguish "displaced nothing" from "tracked
 	// nothing". Normally the leg's entry gate has already refused it and this admits for free.
-	if !admitAndTrackServerRequest(ctx, p.unblocker(), msg) {
-		return
+	if !admitAndTrackServerRequest(ctx, u, msg) {
+		return forwardRefused
 	}
-	_ = p.hostWriter.Write(msg)
+	// The write's error is REPORTED, not discarded. Two of its failures are neither fire-and-forget
+	// nor covered by the poison teardown, and both return having written nothing: a writer already
+	// poisoned by an earlier frame refuses this one for as long as that teardown takes, and a
+	// whole-frame failure (ENOSPC on a redirected stdout, EIO on a detached tty) never poisons at
+	// all, since NewMsgWriter(os.Stdout) arms no deadline and only a PARTIAL write latches. Reported
+	// delivered, each wrote an allow claiming the host had a request that never left the process.
+	if err := p.hostWriter.Write(msg); err != nil {
+		// The initiator is answered on the upstream's own sink, which a broken stdout says nothing
+		// about — the leg's rule, and what HTTP's counterpart already does when no stream takes it.
+		u.unblock(ctx, msg.ID, "host stream unavailable: "+err.Error())
+		return forwardUndelivered
+	}
+	return forwardDelivered
 }
 
 // refusalRecorders is this proxy's wiring for a refusal record's recorder. stdio meters only the
@@ -1485,14 +1501,12 @@ func (p *StdioProxy) dispatchUpstreamRequest(ctx context.Context, msg mcp.RPCMsg
 // requests are forwarded to the host.
 //
 // It is called on a per-request goroutine (dispatchUpstreamRequest), never on the read loop.
-// Tests call it directly and synchronously, which is the same body without the dispatch.
+// Tests call it directly and synchronously. That is this body without the POOL, not without the
+// dispatch: dispatchServerRequest also runs the id-admission gate, so a direct call is the one way
+// to reach the forward's own refusing branch — which is what makes that branch testable, and why
+// what it reports may not rest on the gate having run.
 func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) {
 	// No network client on this transport: no source IP to gate sampling on, no JWT identity.
-	//
-	// forward always reports true — an honest inaccuracy, not a guarantee: host writes are
-	// fire-and-forget, so a poisoned stdout discards the request while the audit record still
-	// says delivered=true. The writer's poison hook (armed in Start) bounds the window: the
-	// FIRST desync tears the upstream down, so at most frames already in flight are misrecorded.
 	forwardServerRequest(ctx, msg, serverRequestParams{
 		rec:       p.rec(),
 		audit:     p.audit,
@@ -1502,7 +1516,7 @@ func (p *StdioProxy) handleUpstreamRequest(ctx context.Context, msg mcp.RPCMsg) 
 		// pinned one (a message the proxy discarded) records the surface it is routed by rather
 		// than claiming nothing was ever negotiated. This supplies the fact; that leg stamps it.
 		revision: p.hostRevision(),
-		forward:  func(ctx context.Context, m mcp.RPCMsg) bool { p.forwardServerRequestToHost(ctx, m); return true },
+		forward:  p.forwardServerRequestToHost,
 		// Through the seam, not a bare closure over the concrete writer: a nil *mcp.MsgWriter locks
 		// its mutex on a nil receiver, so the four denial arms below would panic where the seam
 		// reports — after their audit record. See writeToInitiator.

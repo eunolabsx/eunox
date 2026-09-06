@@ -14,6 +14,7 @@ package transport
 import (
 	"go/ast"
 	"go/token"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"testing"
@@ -195,12 +196,48 @@ func TestRefusalMetering_StdioLimiterHasABucketPerDeclaredCategory(t *testing.T)
 		assert.NotEqual(t, lim.fallback, lim.bucket(cat),
 			"stdio charges %q but its limiter builds no bucket for it", cat)
 	}
-	// The two categories that reach stdio through a SHARED helper rather than its own file, which
-	// is why the filename-scoped predecessor of this test could not see them.
-	assert.Contains(t, stdioRefusalCategories, catDisplaced,
-		"trackServerRequest charges catDisplaced with whichever limiter its caller passes, and stdio passes its own")
-	assert.Contains(t, stdioRefusalCategories, catUntranslatableServerRequest,
-		"forwardServerRequest refuses at the translation boundary on either transport, and a stdio host pins a declaring revision like any other")
+	// Every category the SHARED server-initiated core charges, DERIVED rather than hand-listed.
+	// That core runs on both transports with whichever limiter its caller passed, so a category
+	// added to it is one stdio charges — and the hand-written list this replaced named the two that
+	// had already been missed while the next one, catUndeliveredForward, went unnoticed until it
+	// became reachable. A subset table's whole safety argument is that the subset is complete.
+	for cat := range sharedServerRequestCategories(t) {
+		if _, exempt := exemptRefusals[cat]; exempt {
+			// An exempt category never reaches a bucket (admitRefusal returns before resolving
+			// one), so there is nothing for a subset table to be missing.
+			continue
+		}
+		assert.Contains(t, stdioRefusalCategories, cat,
+			"the shared server-initiated core charges %q with whichever limiter its caller passed, and stdio passes its own — undeclared, it falls to the floor bucket", cat)
+	}
+}
+
+// sharedServerRequestCategories reads the categories named at metering call sites in the
+// transport-agnostic server-initiated files. Those files are the seam both transports reach
+// through, so what they charge is what BOTH must declare.
+func sharedServerRequestCategories(t *testing.T) map[refusalCategory]bool {
+	t.Helper()
+	shared := map[string]bool{"forward.go": true, "server_request_unblock.go": true}
+	out := map[refusalCategory]bool{}
+	for _, src := range packageSources(t) {
+		if !shared[filepath.Base(src.name)] {
+			continue
+		}
+		ast.Inspect(src.file, func(n ast.Node) bool {
+			call, isCall := n.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			for _, arg := range call.Args {
+				if cat, ok := categoryConstant(t, arg); ok {
+					out[cat] = true
+				}
+			}
+			return true
+		})
+	}
+	require.NotEmpty(t, out, "no category named in the shared server-initiated files; this guard would pass vacuously")
+	return out
 }
 
 // TestRefusalMetering_SizedLimiterKeepsTheAggregateShare pins that building buckets for a SUBSET

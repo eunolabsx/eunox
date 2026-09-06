@@ -48,7 +48,7 @@ func undeliveredLeg(rec auditRecorder, lim *categoryRecordLimiter) serverRequest
 		pdp:       pdp.AlwaysAllowPDP{},
 		// The HTTP shape this bounds: broadcastServerRequest reporting that no subscriber took the
 		// request.
-		forward:   func(context.Context, mcp.RPCMsg) bool { return false },
+		forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardUndelivered },
 		unblocker: u,
 	}
 }

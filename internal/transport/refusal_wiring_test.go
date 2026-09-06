@@ -706,9 +706,89 @@ func TestServerRequestForward_UntrackableIDIsRefusedNotForwarded(t *testing.T) {
 	ok := sess.broadcastServerRequest(context.Background(), msg)
 	delivered = len(sub)
 
-	assert.False(t, ok, "a request whose reply could never be routed must not be reported as delivered")
+	assert.Equal(t, forwardRefused, ok,
+		"a request whose reply could never be routed is REFUSED, not merely undelivered: this leg wrote its own record, and reporting it as undelivered files a second one naming a host that was never asked")
 	assert.Zero(t, delivered, "and must not reach the host at all: its answer would be dropped as untracked")
 	assert.False(t, sess.serverReqs.tracked(mcp.MsgKey(&over)))
+}
+
+// TestServerRequestForward_StdioRecordsWhatItActuallyDid is the stdio leg's forward asked about the
+// TAPE: what it reports is what recordForwardOutcome writes, so each of its three answers must
+// produce exactly the records that answer earns.
+//
+// stdio used to hand that leg a closure reporting delivered unconditionally, so the refusing branch
+// — which forwards nothing and writes its own attributed drop — also filed an ALLOW saying the host
+// had the request. Reporting it merely "undelivered" is not the fix either: that files a second,
+// site-less deny for one refusal, under a category whose declaration names a host that was never
+// asked. Driven through handleUpstreamRequest rather than the method, because the WIRING is the
+// subject: a closure answering a constant passes any assertion made on the method alone.
+func TestServerRequestForward_StdioRecordsWhatItActuallyDid(t *testing.T) {
+	t.Parallel()
+	over := json.RawMessage(`"` + strings.Repeat("x", maxTrackedServerReqIDBytes) + `"`)
+
+	t.Run("refused writes one attributed record and no allow", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		p, host := newStdioProxy(stdioServe{setup: recordingTo(rec)}, strings.NewReader(""))
+
+		p.handleUpstreamRequest(revisionContext(handshakeRevision),
+			mcp.RPCMsg{JSONRPC: "2.0", ID: &over, Method: "roots/list"})
+
+		assert.Empty(t, host.messages, "the refusing branch forwards nothing; an answer to it could not be routed back")
+		require.Len(t, rec.records, 1,
+			"one refusal, one record: the forward already wrote its own, so the leg above must not file a second")
+		assert.Equal(t, "deny", rec.records[0].decision,
+			"a refusal may not also write an allow claiming the host received the request")
+		assert.Equal(t, string(dropStdioUnroutableID), rec.records[0].details[detailTransport],
+			"and the one record must be the attributed one — a bare ENFORCEMENT_ERROR names no site to join on")
+	})
+
+	// The other two answers, on an id the tracker retains. A failing host writer is the one
+	// not-delivered case stdio can actually reach: it is NOT fire-and-forget (Write returns the
+	// error) and NOT bounded by the poison teardown, which only a PARTIAL write latches.
+	t.Run("a failed host write is undelivered, not allowed", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		var upstream []mcp.RPCMsg
+		p, _ := newStdioProxy(stdioServe{
+			upSink: sinkFunc(func(m mcp.RPCMsg) error { upstream = append(upstream, m); return nil }),
+			setup:  recordingTo(rec),
+		}, strings.NewReader(""))
+		p.hostWriter = mcp.NewMsgWriter(&failingWriter{})
+
+		p.handleUpstreamRequest(revisionContext(handshakeRevision),
+			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`4`), Method: "roots/list"})
+
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, "deny", rec.records[0].decision,
+			"a frame the host writer refused never reached the host; recording an allow for it is the lie this leg exists to prevent")
+		assert.Equal(t, capability.ErrCodeEnforcementError, rec.records[0].code)
+		require.Len(t, upstream, 1, "and the initiator is answered on the upstream's own sink, which a broken stdout says nothing about")
+		assert.NotNil(t, upstream[0].Error)
+	})
+
+	t.Run("a written frame is delivered", func(t *testing.T) {
+		t.Parallel()
+		rec := &fwdRecorder{}
+		p, host := newStdioProxy(stdioServe{setup: recordingTo(rec)}, strings.NewReader(""))
+
+		p.handleUpstreamRequest(revisionContext(handshakeRevision),
+			mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`5`), Method: "roots/list"})
+
+		require.Len(t, host.messages, 1, "the control: an ordinary forward still reaches the host")
+		require.Len(t, rec.records, 1)
+		assert.Equal(t, "allow", rec.records[0].decision)
+	})
+}
+
+// recordingTo injects rec as the proxy's audit recorder, so a test asserting on record SHAPE needs
+// no on-disk sink (StdioProxy.rec() returns nil without one, and reading a real tape back costs a
+// key-file create plus three fsyncs per case).
+func recordingTo(rec auditRecorder) func(*StdioProxy) {
+	return func(p *StdioProxy) {
+		p.recOnce.Do(func() {})
+		p.recCached = rec
+	}
 }
 
 // TestServerRequestRefusal_DestroyedAnswerRecordIsMetered bounds a record the UPSTREAM drives: an
@@ -934,7 +1014,7 @@ func TestServerRequestAdmission_RefusalCostsOneRecordAndNoQuota(t *testing.T) {
 		decided++
 		forwardServerRequest(revisionContext(handshakeRevision), msg, serverRequestParams{
 			rec: rec, sessionID: "s", pdp: pdp.AlwaysAllowPDP{},
-			forward:   func(context.Context, mcp.RPCMsg) bool { return false },
+			forward:   func(context.Context, mcp.RPCMsg) forwardOutcome { return forwardUndelivered },
 			unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
 		})
 	}
