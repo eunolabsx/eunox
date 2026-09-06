@@ -77,6 +77,52 @@ func TestRecordSessionCall_WritesUnderTheAnchorNotTheSession(t *testing.T) {
 	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, otherTask, caps).Decision)
 }
 
+// TestRecordSessionCall_RefusesTheShapeAnchorUnresolvedExistsToRefuse is the regression for the
+// one seam that still wrote the split state.
+//
+// Under WithTaskAnchoredState an authenticated request whose token carries no mcp.task_id is
+// hard-denied on the evaluate path and refused by recordSourceCall — resolveAnchor falls back to
+// the SESSION for that shape, and writing there splits the caller's state across two buckets. The
+// exported RecordSessionCall, documented for direct embedder use, guarded only on the resolved id
+// being non-empty, which that fallback always satisfies: it wrote the antecedent under the session
+// key, invisible to every read on the task key.
+func TestRecordSessionCall_RefusesTheShapeAnchorUnresolvedExistsToRefuse(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	eng := enforcement.New(
+		enforcement.WithCallCounter(callcounter.NewInMemory()),
+		enforcement.WithFlowLabelStore(flowlabelstore.NewInMemory()),
+		enforcement.WithTaskAnchoredState(),
+	)
+	caps := []capability.Constraint{
+		{Target: "tool:read_secrets", Actions: []string{"call"}},
+		{
+			Target:     "tool:send_email",
+			Actions:    []string{"call"},
+			Conditions: []capability.Condition{capability.SequenceBlockCondition{AfterTools: []string{"read_secrets"}}},
+		},
+	}
+
+	// Authenticated (a token was presented) but carrying no task id: unanchorable here.
+	err := eng.RecordSessionCall(ctx, &capability.EnforceRequest{
+		SessionID:  "s1",
+		TargetName: "read_secrets",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "read_secrets"},
+		Claims:     map[string]interface{}{"sub": "user@example.com"},
+	})
+	require.Error(t, err, "an unanchorable write must be refused, and this seam's contract makes a nil return mean the marker WAS written")
+
+	// And nothing landed under the session key: a TOKENLESS request on the same session is the
+	// one shape that still resolves there, so it is what would see a split write.
+	assert.Equal(t, capability.DecisionAllow, eng.ValidateAction(ctx, &capability.EnforceRequest{
+		SessionID:  "s1",
+		TargetName: "send_email",
+		Target:     &capability.EnforceRequestTarget{Type: "tool", Name: "send_email"},
+	}, caps).Decision,
+		"the refused write must leave no antecedent under the session key it declined to use")
+}
+
 // TestRecordSessionCall_StillSkipsWithNoAnchorAtAll pins the other side: gating on the anchor
 // must not turn "nothing to key on" into a write under an EMPTY key, which would pool every
 // anonymous caller's antecedents into one bucket and gate unrelated sessions on each other.

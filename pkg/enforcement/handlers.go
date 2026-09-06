@@ -1318,24 +1318,6 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 		return condErr
 	}
 
-	// Resolve the blocked target's namespace as RecordSessionCall does, so reporting in
-	// namespace:name form disambiguates same-named targets in the audit log.
-	blockedType, blockedName := splitEnginePrefix(req.TargetName)
-	if req.Target != nil {
-		if req.Target.Type != "" {
-			blockedType = req.Target.Type
-		}
-		if blockedName == "" && req.Target.Name != "" {
-			blockedName = strings.TrimSpace(req.Target.Name)
-		}
-	}
-	blockedTarget := blockedType + ":" + blockedName
-	// Report "(unknown)" rather than the misleading "tool:" sentinel when no name is
-	// present, so a SIEM rule parsing blockedTool as namespace:name gets no empty name.
-	blockedDetail := blockedTarget
-	if blockedName == "" {
-		blockedDetail = "(unknown)"
-	}
 	// Detached from the REQUEST's cancellation: net/http cancels ctx the instant the client
 	// disconnects, and a backend honoring it (Redis; not in-memory) would then hand the
 	// gate's own I/O to the party the gate constrains — a client that probes and drops the
@@ -1357,6 +1339,25 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 			return conditionFault(capability.ConditionTypeSequenceBlock, fmt.Sprintf("session history lookup failed: %v", err))
 		}
 		if count > 0 {
+			// Named here rather than above the loop: the derivation allocates, and every
+			// ALLOWED call gated by this condition — the common outcome, since the antecedent
+			// usually has not run — reached the end of the loop without ever reading it.
+			//
+			// Through the SAME derivation RecordSessionCall keys its history marker on, so the
+			// name reported is one that addresses this target's history. The copy this replaced
+			// consulted Target.Name only as a FALLBACK for an empty prefix split, inverting the
+			// rule every sibling applies (Target.Name is preferred VERBATIM, or a target whose
+			// own name begins with a recognized token has that token stripped): a resource named
+			// "system:config" was recorded on the signed tape as "resource:config".
+			blockedType, blockedName := sessionTargetKey(req)
+			// "(unknown)" rather than the misleading "tool:" sentinel when no name is present,
+			// so a SIEM rule parsing blockedTool as namespace:name gets no empty name — applied
+			// to the MESSAGE too, since one record whose two halves disagree about the target is
+			// the thing this fallback exists to prevent.
+			blockedDetail, blockedShown := blockedType+":"+blockedName, blockedName
+			if blockedName == "" {
+				blockedDetail, blockedShown = "(unknown)", "(unknown)"
+			}
 			// Re-arm the marker so retention measures inactivity, not age: without this a
 			// still-live session probing the blocked target has its gate expire on pure wall
 			// clock (fail-open). Best-effort (errors ignored): this path has ALREADY decided
@@ -1366,7 +1367,7 @@ func (e *Engine) handleSequenceBlock(ctx context.Context, cond capability.Condit
 			return &ConditionError{
 				Code:          capability.ErrCodeConditionFailed,
 				ConditionType: capability.ConditionTypeSequenceBlock,
-				Message:       fmt.Sprintf("%s %q was already called in this session; %s %q is blocked after it", priorType, priorTool, blockedType, blockedName),
+				Message:       fmt.Sprintf("%s %q was already called in this session; %s %q is blocked after it", priorType, priorTool, blockedType, blockedShown),
 				Details: map[string]interface{}{
 					"afterTool":   priorTarget,
 					"blockedTool": blockedDetail,
