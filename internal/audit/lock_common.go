@@ -40,9 +40,19 @@ func openAuditLockFile(lockPath string) (*os.File, error) {
 	// config.OpenNoFollow is 0 on platforms with no O_NOFOLLOW equivalent, so this one
 	// expression is correct on every GOOS and the portable Lstat above carries the guard
 	// alone where the flag does not exist.
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|config.OpenNoFollow, 0o600) //nolint:gosec // G304: derived from the user-configured audit log path
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: derived from the user-configured audit log path
 	if err != nil {
 		return nil, fmt.Errorf("opening audit lock file %q: %w", lockPath, err)
+	}
+	// The lock's payload is its EXCLUSIVITY, and flock applies to whatever the open
+	// resolved to: a FIFO planted in the Lstat->open window would send a second instance's
+	// lock to a different object, leaving both instances appending to the log and forking
+	// the HMAC chain. O_RDWR happens not to block on a FIFO on Linux, so the handle check
+	// rather than the flag is what refuses it here — which is exactly why the rule is all
+	// three guards and not whichever two the platform makes visible.
+	if err := config.RefuseNonRegularHandle(lf, "audit lock file", lockPath); err != nil {
+		_ = lf.Close()
+		return nil, err
 	}
 	return lf, nil
 }

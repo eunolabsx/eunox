@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -208,4 +209,25 @@ func TestChainSnapshot_BaseAppearingOrVanishingIsReported(t *testing.T) {
 			t.Fatalf("a base that vanished during the pass must report ErrChainRotated; got %v", err)
 		}
 	})
+}
+
+// TestDescribeChainDelta_NamesTheDirection pins which way the delta reads. The two halves
+// are computed by one helper called twice with its arguments swapped, so a transposition
+// compiles, passes every rotation test (the pass is still refused, with a message) and is
+// visible only to the operator reading it — who is told a rotation PRUNED the sibling it
+// just published, and looks for a retention fault that never happened.
+func TestDescribeChainDelta_NamesTheDirection(t *testing.T) {
+	t.Parallel()
+	base := "/logs/audit.jsonl"
+	sibling := base + ".00000000000000000001.20260101T000000.000000000Z"
+
+	// A rotation: the base is renamed to a sibling and a fresh base takes its name, so the
+	// listing GAINS a name.
+	if got := describeChainDelta([]string{base}, []string{sibling, base}); !strings.Contains(got, "gained "+strconv.Quote("audit.jsonl.00000000000000000001.20260101T000000.000000000Z")) {
+		t.Errorf("a rotation that published a sibling reads as %q, want it named as gained", got)
+	}
+	// A retention prune: the oldest sibling is unlinked, so the listing LOSES a name.
+	if got := describeChainDelta([]string{sibling, base}, []string{base}); !strings.Contains(got, "lost "+strconv.Quote("audit.jsonl.00000000000000000001.20260101T000000.000000000Z")) {
+		t.Errorf("a prune that unlinked a sibling reads as %q, want it named as lost", got)
+	}
 }
