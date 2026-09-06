@@ -43,7 +43,6 @@ func undeliveredLeg(rec auditRecorder, lim *categoryRecordLimiter) serverRequest
 		},
 	}
 	return serverRequestParams{
-		rec:       rec,
 		sessionID: "s",
 		pdp:       pdp.AlwaysAllowPDP{},
 		// The HTTP shape this bounds: broadcastServerRequest reporting that no subscriber took the

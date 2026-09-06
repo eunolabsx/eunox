@@ -1372,10 +1372,12 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 		// policy could not already have.
 		SourceCommitScope{Flow: flowRelevant, Antecedent: true}, carriedLabels)
 	if cerr != nil {
+		// Both arms stamp the obligations, per recordFailureDenial's stated purpose: neither
+		// refusal is forwarded (both carry a FAULT code), so nothing is redacted either way, and a
+		// caller inspecting the response sees what would have applied. The two used to disagree —
+		// two records describing one commit failure, one carrying them and one not.
 		if cerr.Flow {
-			// No obligations: it refuses with a FAULT code, which no observing route downgrades
-			// to a forward, so there is no response to redact.
-			return labelRecordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), nil)
+			return labelRecordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), obligations)
 		}
 		return recordFailureDenial(ec.requestID, ec.now, ec.auditOnly(), obligations)
 	}

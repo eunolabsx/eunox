@@ -550,15 +550,32 @@ func writeDoctorAudit(w io.Writer, logPath, keyPath string, tail int) {
 	}
 	// Cover the FULL rotated set, not just the active base file — otherwise totals and tail
 	// silently omit every rotated segment once the log has rotated at least once.
-	chainFiles, err := audit.LogChainFiles(resolvedLog)
+	//
+	// Snapshot rather than a bare listing, for the reason the reporting readers take one:
+	// the chain files are opened LAZILY by name (twice here — the totals pass and the tail
+	// pass), so a rotation landing in between reads a fresh, nearly-empty base in place of
+	// the sibling holding the newest records, and can leave the two passes describing
+	// different chains. doctor is a diagnostic bundle rather than a command whose output is
+	// acted on directly, so it CAVEATS rather than exiting — every other failure here is a
+	// printed line too — but it must not present a raced total as a fact, least of all in
+	// the artifact attached to a ticket that says the tape looks empty.
+	snap, err := audit.SnapshotLogChain(resolvedLog)
 	if err != nil {
 		wf(w, "  log file:  %v\n", err)
 		return
 	}
+	chainFiles := snap.Files
 	if len(chainFiles) == 0 {
 		wf(w, "  log file:  %v\n", os.ErrNotExist)
 		return
 	}
+	// Deferred so it covers every exit below, including the two that return early: a caveat
+	// printed on only some paths is the silence it exists to replace.
+	defer func() {
+		if cerr := snap.CheckUnchanged(); cerr != nil {
+			wf(w, "  NOTE:      %v — the counts and tail above cover an unknown part of the chain; re-run\n", cerr)
+		}
+	}()
 	var totalSize int64
 	for _, p := range chainFiles {
 		if fi, e := os.Stat(p); e == nil { //nolint:gosec // G304: operator-configured audit log path

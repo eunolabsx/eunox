@@ -303,10 +303,11 @@ func auditKeySymlinkAllowed() bool {
 // HMAC-protected, so redirecting it is detectable, but whoever chooses the KEY chooses
 // what verifies — a key read through an attacker-planted symlink signs a tape the attacker
 // can forge at will, and audit-verify confirms it. Every other file in this package (the
-// log open, both rotation reopens, the tail read, even the never-written lock file) pairs
-// config.RefuseNonRegularPath with config.OpenNoFollow; this one was read with a plain
-// os.ReadFile, which follows symlinks. The guard is applied here, once, for all three
-// readers rather than at each call site.
+// log open, both rotation reopens, the tail read, even the never-written lock file) carries
+// the substitution guards — the Lstat refusal, config.OpenNoFollow and config.OpenNonBlock,
+// and the fstat through the handle; this one was read with a plain os.ReadFile, which
+// follows symlinks. The guard is applied here, once, for all three readers rather than at
+// each call site.
 //
 // A genuinely absent file is returned as an os.IsNotExist error so LoadOrCreateKeys can
 // still mint a key; the caller distinguishes the two.
@@ -321,6 +322,12 @@ func readAuditKeyFile(keyPath string, tighten bool) ([]byte, error) {
 		}
 		flags |= config.OpenNoFollow
 	}
+	// Without O_NONBLOCK the refusal below is unreachable in the case it names: a read-only
+	// open of a FIFO waits INSIDE open(2) for a writer that never comes, so the fstat never
+	// runs and startup hangs before the sink exists — the key is read before the log is even
+	// opened. The flag is applied on the opt-out path too, where it is the only guard left
+	// standing between a swapped projected-secret target and that hang.
+	flags |= config.OpenNonBlock
 	f, err := os.OpenFile(keyPath, flags, 0) //nolint:gosec // G304: path is user-configured audit key location (--audit-key-path or EUNOX_AUDIT_KEY_PATH)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -330,16 +337,11 @@ func readAuditKeyFile(keyPath string, tighten bool) ([]byte, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	// Re-check regularity through the HANDLE. On the opt-out path this is the only
-	// non-regular guard left (a symlink to a FIFO would otherwise block the read here
-	// forever, wedging startup); on the default path it is a cheap confirmation that the
-	// inode opened is the kind Lstat saw.
-	info, statErr := f.Stat()
-	if statErr != nil {
-		return nil, fmt.Errorf("stat audit key file %q: %w", keyPath, statErr)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("refusing audit key file %q: it resolves to a non-regular file (mode %v); the HMAC key must be a regular file", keyPath, info.Mode())
+	// Re-check regularity through the HANDLE — the only guard with no window after it. On
+	// the opt-out path it is also the only non-regular guard left, since a symlink there is
+	// followed by design; the O_NONBLOCK above is what makes it REACHABLE for a FIFO.
+	if err := config.RefuseNonRegularHandle(f, "audit key file", keyPath); err != nil {
+		return nil, err
 	}
 	if tighten {
 		tightenKeyFileMode(f, keyPath)

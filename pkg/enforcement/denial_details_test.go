@@ -255,14 +255,14 @@ func TestBoundDenialDetails_PreservesNilAndShortValues(t *testing.T) {
 	}
 
 	in := map[string]interface{}{
-		"argument":          "filePath",
-		"filePath":          "/srv/data/report.xlsx",
-		"extension":         ".xlsx",
-		"allowedExtensions": []string{".csv", ".txt"},
-		"limit":             10,
-		"current":           11,
-		"retryAfter":        30,
-		"allowed":           false,
+		"argument":            "filePath",
+		"filePath":            "/srv/data/report.xlsx",
+		"extension":           ".xlsx",
+		"allowedExtensions":   []string{".csv", ".txt"},
+		"limit":               10,
+		"current":             11,
+		"retry_after_seconds": 30,
+		"allowed":             false,
 	}
 	out := BoundDenialDetails(in)
 	if len(out) != len(in) {

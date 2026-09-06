@@ -19,7 +19,7 @@ import (
 // fd) so it survives rotation without a release window, named ".<base>.lock" so it
 // stays out of the rotation glob and retention pruning.
 //
-// The open carries BOTH halves of the package's symlink guard, exactly like every
+// The open carries ALL THREE of the package's substitution guards, exactly like every
 // other open on an audit-derived path (see refuseNonRegular in rotate.go). It is not
 // the lock file's CONTENT that needs protecting — nothing is ever written through this
 // handle — it is the lock's EXCLUSIVITY. flock operates on whatever the open resolved

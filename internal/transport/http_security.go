@@ -284,25 +284,30 @@ func (p *HTTPProxy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	if !multiple && p.originAllowed(origin) {
 		return true
 	}
-	// Record every value when several were sent so the smuggled header leaves a trace.
-	recordedOrigin := origin
-	if multiple {
-		recordedOrigin = strings.Join(vals, ", ")
-	}
-	// Bound it before it reaches the tape or stderr: an unauthenticated client can put
-	// ~1 MiB (Go's default MaxHeaderBytes) in an Origin header otherwise.
-	bounded := boundedRefusalDetail(recordedOrigin)
-	details := map[string]interface{}{"origin": bounded}
-	if bounded != recordedOrigin {
-		// Flag it so a reader knows the field is not the header verbatim, mirroring
-		// claimed_session_id_truncated.
-		details["origin_truncated"] = true
-	}
-	recordedOrigin = bounded
+	// Admission FIRST, then the details. This gate is pre-auth and runs at the peer's send rate,
+	// and the peer picks both the size (~1 MiB of header block, Go's default MaxHeaderBytes) and
+	// the count — so the join, the sanitize walk and the map below are exactly the arguments
+	// admitNotice refuses to let a caller build for a write nobody makes. Everything the record
+	// and the diagnostic carry is built under the gate, from ONE value, so the two can never
+	// disagree about what the peer sent.
+	//
 	// Unstamped by design (no route/policy fields): the Origin gate runs before route
 	// resolution — see recordPreSessionDeny. The stderr line is gated on the SAME admission
 	// verdict as the record, for the reason given on requireJSONContentType's stderr gate above.
-	if admitted := p.recordPreSessionDeny(r, codeOriginRejected, catOrigin, details); admitted {
+	if deny, admitted := p.admitRefusalWrite(r, nil, codeOriginRejected, catOrigin); admitted {
+		// Record every value when several were sent so the smuggled header leaves a trace.
+		sent := origin
+		if multiple {
+			sent = strings.Join(vals, ", ")
+		}
+		recordedOrigin := boundedRefusalDetail(sent)
+		details := map[string]interface{}{"origin": recordedOrigin}
+		if recordedOrigin != sent {
+			// Flag it so a reader knows the field is not the header verbatim, mirroring
+			// claimed_session_id_truncated.
+			details["origin_truncated"] = true
+		}
+		deny.write(r.Context(), details)
 		if multiple {
 			_, _ = fmt.Fprintf(p.errOut(),
 				"[eunox] SECURITY: rejected request carrying %d Origin headers (%q); RFC 6454 permits only one (DNS-rebinding guard)\n",
@@ -355,6 +360,13 @@ const maxRefusalDetailLen = 512
 
 // boundedRefusalDetail sanitizes and cuts an attacker-controlled refusal detail to
 // maxRefusalDetailLen, using the same rune-safe, valid-UTF-8 treatment as sanitizeClaimedID.
+//
+// Sanitize-then-cut, never cut-then-sanitize, for sanitizeClaimedID's stated reason and one more
+// this file learned the hard way: ToValidUTF8 collapses each RUN of invalid bytes to a single
+// replacement character, so a byte-prefix cut ahead of it lets a peer erase the field by prefixing
+// its own header with padding the sanitize pass would have folded to three bytes — a smuggled
+// Origin then reaches neither the tape nor stderr, which is the trace this record exists to leave.
+// The whole-input walk is affordable because every caller builds below its own admission gate.
 func boundedRefusalDetail(s string) string {
 	return sanitizeClaimedID(s, maxRefusalDetailLen)
 }
@@ -400,10 +412,11 @@ func addClaimedSessionIDValue(details map[string]interface{}, claimed string) ma
 // turn the 404-vs-401 split into a route-name enumeration oracle. The one refusal that DOES
 // know its route by firing time — the session cap — goes through recordSessionCapDeny
 // instead, which keeps this rate limiter but writes through the route's sink.
-// Returns the rate limiter's verdict so a caller can gate its own stderr diagnostic on the
-// same decision.
-func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) bool {
-	return p.recordRefusal(r.Context(), r, nil, code, category, extra)
+// It returns nothing: a caller that needs the admission verdict — to gate its own stderr
+// diagnostic, or to build details worth building only when they are written — takes
+// admitRefusalWrite, which hands back the verdict and the write together.
+func (p *HTTPProxy) recordPreSessionDeny(r *http.Request, code string, category refusalCategory, extra map[string]interface{}) {
+	p.recordRefusal(r.Context(), r, nil, code, category, extra)
 }
 
 // preSessionKillRecorder returns the recorder a PRE-SESSION kill-switch site must write
@@ -529,43 +542,80 @@ func (p *HTTPProxy) recordSessionCapDeny(ctx context.Context, r *http.Request, r
 // sink when known (nil ⟹ the proxy-wide sink). Returns whether the refusal was ADMITTED by
 // the rate limiter, so a caller whose own stderr diagnostic is part of the same flood
 // (checkOrigin's SECURITY line) can gate it on the same verdict.
+//
+// For a caller whose details are CHEAP — a constant, a count, a classification. One whose details
+// cost anything to build takes admitRefusalWrite directly and builds them below the gate.
 func (p *HTTPProxy) recordRefusal(ctx context.Context, r *http.Request, route *UpstreamRoute, code string, category refusalCategory, extra map[string]interface{}) bool {
+	w, admitted := p.admitRefusalWrite(r, route, code, category)
+	if !admitted {
+		return false
+	}
+	w.write(ctx, extra)
+	return true
+}
+
+// admitRefusalWrite takes the category's admission for a transport-level refusal and hands back the
+// write it authorizes, so a caller builds what the record carries only once it knows the record
+// will be written.
+//
+// That ordering is the whole point, and it is admitNotice's: on the flood path the bucket exists
+// for, everything the caller built above the gate is thrown away — a whole-input UTF-8 walk, a join
+// of every header the peer sent, a map — at an unauthenticated peer's send rate, for a record
+// nobody writes. refuseUnroutable applies the same rule to the record half of its own refusal.
+//
+// A write is handed back rather than a recorder because "admitted" and "there is a tape" are
+// different questions: a nil sink is reachable in production (--require-audit=off with an
+// unopenable path), and the caller's stderr line is admitted there as the refusal's only surviving
+// signal.
+func (p *HTTPProxy) admitRefusalWrite(r *http.Request, route *UpstreamRoute, code string, category refusalCategory) (refusalWrite, bool) {
 	rec := asRecorder(p.sink)
 	if route != nil {
 		rec = asRecorder(route.sink)
 	}
 	// Charged BEFORE the sink is consulted, so the verdict bounds the caller's stderr line
-	// whether or not a tape exists — a nil sink is reachable in production
-	// (--require-audit=off with an unopenable path), and short-circuiting to "admitted"
-	// there would leave stderr, the only surviving signal, completely unbounded.
+	// whether or not a tape exists.
 	//
 	// No nil-limiter fallback for a proxy that HAS a tape: NewHTTPProxyGateway always
 	// builds the limiter, so a nil one alongside a sink is a construction bug that panics
 	// like one rather than silently disabling the DoS bound.
 	if rec == nil && p.preSessionDenies == nil {
-		return true
+		return refusalWrite{}, true
 	}
 	// Through the record half's ONE admission rather than reaching for the buckets directly, so
 	// this path and forCategory resolve the category's declaration from the same place.
 	ok, suppressed := p.preSessionDenies.admitRefusal(category)
 	if !ok {
-		return false
+		return refusalWrite{}, false
 	}
-	if rec == nil {
-		// No sink configured: nothing to write, but the caller's stderr line is admitted
-		// (and rate-limited) as the refusal's only surviving signal.
-		return true
+	return refusalWrite{proxy: p, rec: rec, r: r, code: code, category: category, suppressed: suppressed}, true
+}
+
+// refusalWrite is an admitted pre-session refusal's record, in the mould of noticeLine: obtained
+// from the admission, then handed the details the caller built under it. A zero value writes
+// nothing, which is the no-sink leg — the caller's diagnostic still runs.
+type refusalWrite struct {
+	proxy      *HTTPProxy
+	rec        auditRecorder
+	r          *http.Request
+	code       string
+	category   refusalCategory
+	suppressed uint64
+}
+
+// write stamps extra onto the tape, folding in any rollup the admission carried.
+func (w refusalWrite) write(ctx context.Context, extra map[string]interface{}) {
+	if w.rec == nil {
+		return
 	}
 	// Through the ONE stamper both spellings share, rather than a second copy of its branch. The
 	// copy is DEFENDED the same way too (mergeAuditDetails, never the caller's own map): every
 	// caller here happens to pass a fresh literal or nil today, so mutating in place was invisible —
 	// and the first caller to factor out a reusable base map would have carried a stale rollup onto
 	// every later record built from it.
-	if suppressed > 0 {
-		extra = stampRefusalRollup(mergeAuditDetails(extra, nil), suppressed)
+	if w.suppressed > 0 {
+		extra = stampRefusalRollup(mergeAuditDetails(extra, nil), w.suppressed)
 	}
-	rec.RecordDeny(ctx, "", "", "", code, string(category), p.addRefusalContext(extra, r), false)
-	return true
+	w.rec.RecordDeny(ctx, "", "", "", w.code, string(w.category), w.proxy.addRefusalContext(extra, w.r), false)
 }
 
 // addRefusalContext stamps the two details EVERY refusal record carries: the resolved

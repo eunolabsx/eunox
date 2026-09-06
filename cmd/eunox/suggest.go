@@ -618,8 +618,9 @@ tighten every entry, then 'eunox validate' it before enforcing.
 
 Exit codes:
   0  Draft manifest generated (to stdout or --output).
-  2  Usage, config, or audit-log-read error, or a failure writing --output. There
-     is no findings code: the draft describes the tape, it does not judge it.
+  2  Usage, config, or audit-log-read error, a read a rotation raced
+     (inconclusive - re-run), or a failure writing --output. There is no findings
+     code: the draft describes the tape, it does not judge it.
 
 Flags:
 `
@@ -647,17 +648,11 @@ func cmdSuggest(args []string) int {
 		fmt.Fprintf(os.Stderr, "eunox suggest: --force requires --output (there is no file to overwrite when the draft goes to stdout)\n")
 		return suggestUsageExit
 	}
-	r, closeChain, code, done := openAuditChainOrExit("suggest", logPath, suggestUsageExit)
+	resolvedMaxValues := resolveMaxValues(*maxValues)
+	suggestions, code, done := readAuditChainOrExit("suggest", logPath, suggestUsageExit,
+		func(r io.Reader) (suggestionSet, error) { return computeSuggestions(r, resolvedMaxValues) })
 	if done {
 		return code
-	}
-	defer closeChain()
-
-	resolvedMaxValues := resolveMaxValues(*maxValues)
-	suggestions, err := computeSuggestions(r, resolvedMaxValues)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox suggest: reading log: %v\n", err)
-		return suggestUsageExit
 	}
 	manifest := renderSuggestedManifest(suggestions, *name, resolvedMaxValues)
 

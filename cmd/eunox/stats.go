@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"maps"
 	"os"
@@ -40,9 +39,9 @@ exactly what would be blocked if enforcement were enabled.
 
 Exit codes:
   0  The histogram was printed (including for a log with no denials).
-  2  Usage error, or a config or audit-log-read failure. There is no findings
-     code: stats reports what the log already holds, so a busy histogram is
-     not a failure.
+  2  Usage error, a config or audit-log-read failure, or a read a rotation
+     raced (inconclusive - re-run). There is no findings code: stats reports
+     what the log already holds, so a busy histogram is not a failure.
 
 Flags:
 `
@@ -59,16 +58,9 @@ func cmdStats(args []string) int {
 	if done {
 		return code
 	}
-	r, closeChain, code, done := openAuditChainOrExit("stats", logPath, statsUsageExit)
+	summary, code, done := readAuditChainOrExit("stats", logPath, statsUsageExit, computeAuditStats)
 	if done {
 		return code
-	}
-	defer closeChain()
-
-	summary, err := computeAuditStats(r)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eunox stats: reading log: %v\n", err)
-		return statsUsageExit
 	}
 	printAuditStats(os.Stdout, summary)
 	return 0

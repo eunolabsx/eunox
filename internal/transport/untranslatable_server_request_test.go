@@ -38,9 +38,8 @@ func untranslatableSeam(write func(mcp.RPCMsg) error, rec auditRecorder, lim *ca
 // untranslatableLeg is a server-initiated leg on a session whose HOST pinned 2026-07-28 — the
 // mismatched pair the boundary refuses. forward reports true so a leg that reached it at all would
 // record an ALLOW, which is the failure this refusal exists to prevent rather than a silent no-op.
-func untranslatableLeg(u serverRequestUnblocker, rec auditRecorder) serverRequestParams {
+func untranslatableLeg(u serverRequestUnblocker) serverRequestParams {
 	return serverRequestParams{
-		rec:       rec,
 		sessionID: "s",
 		pdp:       pdp.AlwaysAllowPDP{},
 		revision:  capability.Revision20260728,
@@ -82,7 +81,7 @@ func TestUntranslatableServerRequest_RefusalNamesNoPolicyTargetAndAnswersItsInit
 		untranslatableLeg(untranslatableSeam(func(m mcp.RPCMsg) error {
 			answered = append(answered, m)
 			return nil
-		}, rec, newRefusalRecordLimiter()), rec))
+		}, rec, newRefusalRecordLimiter())))
 	_ = sink.Close()
 
 	got := findAuditRecordByMethod(readAuditRecords(t, logPath), capability.MethodSamplingCreateMessage, "deny")
@@ -108,7 +107,7 @@ func TestUntranslatableServerRequest_RecordChargesItsCategory(t *testing.T) {
 	lim.setNow(func() time.Time { return now })
 
 	const frames = perCategoryDenyBurstSize + 20
-	floodUntranslatable(untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, lim), rec), frames)
+	floodUntranslatable(untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, lim)), frames)
 
 	assert.Less(t, len(rec.records), frames,
 		"an upstream drives this record with no host cooperation; writing one per frame is the flood the declaration exists to bound")
@@ -136,7 +135,7 @@ func TestUntranslatableServerRequest_FloodLeavesTheHostRevisionRefusalWritable(t
 	now := time.Now()
 	lim.setNow(func() time.Time { return now })
 
-	floodUntranslatable(untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, lim), rec),
+	floodUntranslatable(untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, lim)),
 		perCategoryDenyBurstSize+50)
 	recs := refusalLimits{records: lim}.recorders(rec)
 
@@ -160,7 +159,7 @@ func TestUntranslatableServerRequest_RefusesBeforeTheMethodSplit(t *testing.T) {
 			t.Parallel()
 			rec := &fwdRecorder{}
 			var forwarded int
-			fp := untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, newRefusalRecordLimiter()), rec)
+			fp := untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, newRefusalRecordLimiter()))
 			fp.forward = func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded++; return forwardDelivered }
 
 			forwardServerRequest(revisionContext(capability.Revision20260728),
@@ -177,7 +176,7 @@ func TestUntranslatableServerRequest_RefusesBeforeTheMethodSplit(t *testing.T) {
 		t.Parallel()
 		rec := &fwdRecorder{}
 		var forwarded int
-		fp := untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, newRefusalRecordLimiter()), rec)
+		fp := untranslatableLeg(untranslatableSeam(func(mcp.RPCMsg) error { return nil }, rec, newRefusalRecordLimiter()))
 		fp.revision = handshakeRevision
 		fp.forward = func(context.Context, mcp.RPCMsg) forwardOutcome { forwarded++; return forwardDelivered }
 

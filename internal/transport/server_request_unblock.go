@@ -141,6 +141,14 @@ type serverRequestUnblocker struct {
 	report dropReport
 }
 
+// recorder is this leg's tape, with no category admission applied — the recorder for the records
+// that are not resolved per category (see refusalRecorders.unmetered). Nil when the leg has none.
+//
+// It lives here because this is the value that already holds the leg's wiring: a params struct with
+// a sink field beside its unblocker is a second, independently-filled copy of one tape, and filling
+// only one splits that leg's records across two of them with every guard green.
+func (u serverRequestUnblocker) recorder() auditRecorder { return u.report.recs.unmetered() }
+
 // writeUpstream resolves this unblocker's sink into the writer the answering seam takes, or nil when
 // there is genuinely nothing to answer through. Nothing outside this file holds a raw writer any
 // more — the two shapes that used to (the sampling leg's params, the pool's dispatch) carry the whole

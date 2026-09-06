@@ -973,7 +973,7 @@ func TestServerRequestPool_SaturationRefusalNamesTheSessionsRevision(t *testing.
 	t.Cleanup(func() { close(release) })
 	held := make(chan struct{}, maxConcurrentServerRequests)
 	dispatch := serverRequestDispatch{
-		rec: rec, sessionID: "sess", unblocker: writingSeam(func(mcp.RPCMsg) error { return nil }),
+		sessionID: "sess", unblocker: recordingSeam(func(mcp.RPCMsg) error { return nil }, rec),
 		handle:   func(context.Context, mcp.RPCMsg) { held <- struct{}{}; <-release },
 		revision: capability.Revision20260728,
 	}

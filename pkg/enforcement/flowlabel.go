@@ -481,6 +481,9 @@ func constraintHasFlow(matched *capability.Constraint) bool {
 // marker. HARD deny — forwarding the source read while its label failed to persist leaves it
 // unlabeled and a later sink fails open, mirroring recordAuditModeAntecedent's
 // hardDenyResponse for the analogous sequenceBlock case.
+//
+// obligations ride it for recordFailureDenial's reason, which is the whole convention: these two
+// describe the SAME commit failure, so what they carry cannot depend on which namespace faulted.
 func labelRecordFailureDenial(requestID, now string, auditOnly bool, obligations []capability.Obligation) capability.EnforceResponse {
 	return denyResponse(requestID, now, auditOnly, obligations, capability.DenialInfo{
 		Code:          capability.ErrCodeEnforcementError,
