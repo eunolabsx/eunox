@@ -6,7 +6,7 @@
 #
 #   docker build -f demo/mock-mcp-server/Dockerfile -t mock-mcp-server .
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64

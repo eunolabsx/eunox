@@ -201,10 +201,29 @@ func ValidateFlowLabel(label string) error {
 // across one or two taxonomies) and low enough to keep the decision in the tens of
 // microseconds.
 //
-// It bounds the EXTERNAL surfaces only. A manifest's own labelOutput/flowLabel lists are
-// operator-authored config, bounded like the rest of the manifest by maxManifestFileBytes,
-// and the accumulated store set is bounded by what those lists can write.
+// It bounds the EXTERNAL surfaces only; the operator-authored lists carry their own count
+// bound (MaxAuthoredFlowLabels), for a different reason.
 const MaxExternalFlowLabels = 64
+
+// MaxAuthoredFlowLabels bounds how many labels ONE manifest-authored list may carry — a
+// labelOutput directive's `labels`, a flowLabel condition's `allow`.
+//
+// Not a DoS bound: these lists are operator-authored config, so a bad one is an authoring
+// mistake rather than a lever a caller pulls. What it buys differs per token, which is why
+// the load error states the bound rather than one consequence. A labelOutput's list is what
+// the audit record's labels_out/carried_labels are built from, and the manifest file cap
+// (32 MiB) admits tens of thousands of distinct labels on one directive. A flowLabel's
+// `allow` reaches neither field — it is the sink's subset set, rebuilt and walked once per
+// decision, so the bound there is on per-call work.
+//
+// It bounds ONE LIST, and NEITHER record field is one list: labels_out unions every
+// labelOutput on the matched constraint (and, on the principal-blind legs, across every
+// capability naming the target), and carried_labels unions everything the anchor has
+// accrued. A manifest whose every list sits exactly at this cap can still produce either
+// field arbitrarily large, which is why the record carries its own byte backstop beside
+// this rather than because of it. Sixty-four mirrors MaxExternalFlowLabels because a
+// policy declaring dozens of classes on one target is already past anything real.
+const MaxAuthoredFlowLabels = 64
 
 // checkExternalFlowLabels validates one externally-supplied label list: bounded in COUNT,
 // every entry usable on one of the two axes. The single checker for every such boundary, so

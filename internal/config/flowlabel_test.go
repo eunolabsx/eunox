@@ -4,8 +4,11 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/eunolabs/eunox/pkg/capability"
 )
 
 // TestFlowEffect_RequireTheFlowEffectGrammar is the closed-grammar assertion across
@@ -427,5 +430,58 @@ capabilities:
 			t.Errorf("merged namespaces = %v, want %v", merged.FlowLabelNamespaces, want)
 			break
 		}
+	}
+}
+
+// TestFlowLabelSet_CountBounded pins the authored-list count bound on BOTH flow tokens:
+// exactly capability.MaxAuthoredFlowLabels labels load, one more is a load error. The
+// bound is what keeps the audit record's labels_out/carried_labels from being driven past
+// the reader's scan window by a legal manifest — the manifest file cap alone admits tens of
+// thousands of distinct labels — so it is asserted on the shared checker's two callers
+// rather than on one of them.
+func TestFlowLabelSet_CountBounded(t *testing.T) {
+	// Imported labels: the axis with no closed vocabulary, so a list of any length is
+	// otherwise well-formed and the count is the only thing refusing it.
+	labels := func(n int) string {
+		entries := make([]string, n)
+		for i := range entries {
+			entries[i] = fmt.Sprintf("%q", fmt.Sprintf("purview:c%d", i))
+		}
+		return "[" + strings.Join(entries, ", ") + "]"
+	}
+
+	for _, tc := range []struct{ name, block, tokenType, key string }{
+		{"labelOutput labels", "directives", "labelOutput", "labels"},
+		{"flowLabel allow", "conditions", "flowLabel", "allow"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := func(n int) string {
+				return "schemaVersion: \"" + ManifestSchemaVersion02 + `"
+name: p
+version: "0.1.0"
+flowLabelNamespaces: [purview]
+capabilities:
+  - target: "tool:read_secret"
+    actions: [call]
+    ` + tc.block + `:
+      - type: ` + tc.tokenType + `
+        ` + tc.key + ": " + labels(n) + "\n"
+			}
+			if _, err := LoadManifest(writeManifestFile(t, body(capability.MaxAuthoredFlowLabels))); err != nil {
+				t.Fatalf("a list of exactly %d labels must load: %v", capability.MaxAuthoredFlowLabels, err)
+			}
+			_, err := LoadManifest(writeManifestFile(t, body(capability.MaxAuthoredFlowLabels+1)))
+			if err == nil {
+				t.Fatalf("a list of %d labels must be refused", capability.MaxAuthoredFlowLabels+1)
+			}
+			if !strings.Contains(err.Error(), "more than the maximum of") {
+				t.Errorf("error = %q, want the count bound named", err.Error())
+			}
+			// The error names the offending list, not just the manifest: a policy with
+			// several flow tokens is otherwise a search.
+			if !strings.Contains(err.Error(), tc.tokenType) {
+				t.Errorf("error = %q, want it to name the %s list", err.Error(), tc.tokenType)
+			}
+		})
 	}
 }
