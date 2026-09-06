@@ -500,7 +500,29 @@ configured. Point all instances at one Redis (`--redis-addr`) to share both.
 Redis **Cluster is not supported**, and the proxy refuses to start against one
 rather than discovering it later: a capability carrying two quota bounds is
 admitted in a single multi-key script, whose keys can land on different shards.
-Use a single node, or Sentinel for failover.
+Use a single node, or Sentinel for failover. The same refusal covers *client-side*
+sharding (a `redis.Ring`), which is the more dangerous half: a cluster rejects the
+script outright, while a ring routes it by its first key and runs it whole on one
+standalone shard — so one quota bucket's spend splits across servers and its limit
+is enforced once per shard, with nothing to report it.
+
+The rest of this paragraph applies only when **embedding these packages**, not to
+anything reachable through `--redis-addr` — the binary builds a plain single-node
+client. A consumer passing a client whose concrete type says nothing (their own
+`redis.Cmdable`, or a hand-rolled forwarding wrapper; go-redis' own tracing and
+metrics hooks do not change the type and are unaffected) is refused too, and
+declares the topology with `callcounter.WithSingleNodeKeyspace()` /
+`killswitch.WithSingleNodeKeyspace()` — **only if the wrapper really fronts one
+server.** Neither constructor performs I/O, so the declaration is believed rather
+than verified: declared over a wrapper that fronts a ring it reproduces both
+fail-opens in full, split quota accounting and a partial kill set served as
+complete. `callcounter.CheckKeyspaceCoLocated(ctx, client)` is the startup probe
+that checks it — it writes several keys in one script and reads each back
+individually, so a client that routes the script to one shard is caught — and a
+consumer using the escape hatch should run it beside
+`callcounter.CheckServerNotClustered`. A wrapper fronting a ring has no supported
+declaration for the counter at all; the kill switch takes
+`killswitch.WithShardFanOut(killswitch.RingFanOut(ring))`.
 
 > **The Redis kill switch fails closed during a Redis outage by default —
 > monitor Redis health.** The kill switch is checked on the request hot path from

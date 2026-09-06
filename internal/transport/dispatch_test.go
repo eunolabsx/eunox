@@ -596,8 +596,11 @@ func TestAdv6_RateLimit_InMemory_SessionBypass(t *testing.T) {
 	}
 }
 
-// newRedisCounter builds a Redis-backed counter over a single-node test client, where
-// NewRedis's construction refusals (a keyspace-sharding client, crypto/rand) are unreachable.
+// newRedisCounter builds a Redis-backed counter over a single-node test client — a
+// *goredis.Client, which classifies single-node, so none of NewRedis's topology refusals is
+// reachable and crypto/rand is the only one left. A client this parameter's WIDER type also
+// admits (a custom Cmdable, a forwarding wrapper) is refused with ErrUnknownTopology and needs
+// callcounter.WithSingleNodeKeyspace().
 //
 // A copy of callcounter's own NewRedisForTest, which lives in that package's export_test.go
 // and is therefore unreachable from any other package — sharing one helper would mean a

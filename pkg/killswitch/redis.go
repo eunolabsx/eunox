@@ -453,28 +453,31 @@ func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 // and what the consumer declared, returning the wiring fault to latch when the two cannot be
 // settled into one answer.
 //
-// A declaration FILLS an unknown topology and never OVERRIDES an established one. That asymmetry
-// is the whole point: applied unconditionally, WithSingleNodeKeyspace() beside a real cluster
-// client would throw away a working fan-out, leave nothing latched, and put the backend back to
-// scanning one shard and reporting the result as the whole kill set — reachable through the very
-// option added to prevent it. A contradiction is therefore a wiring error rather than a winner.
+// The fills-never-overrides rule is redisutil.Reconcile's, shared with pkg/callcounter so the two
+// backends cannot drift on it. What stays here is what is this backend's alone: nilness, which is
+// a question about the client rather than about a topology, and the wording each refusal needs —
+// the kill switch has two declaring options to name where the counter has one.
 //
 // nilClient is passed rather than re-derived: ClassifyTopology already asked, and a nil client is
 // reported ahead of any topology because it has none and the derived cause would send an operator
 // looking for a wrapper that is not there.
 func (r *Redis) resolveTopology(nilClient bool) error {
-	switch {
-	case nilClient:
+	if nilClient {
 		return ErrNilClient
-	case r.declared == redisutil.TopologyUnknown:
-		if r.topology == redisutil.TopologyUnknown {
-			return ErrUnknownTopology
-		}
-	case r.topology == redisutil.TopologyUnknown:
-		// The case the options exist for: the type established nothing, the consumer knows.
-		r.topology, r.shardFanOut = r.declared, r.declaredFanOut
-	case r.declared != r.topology:
-		return fmt.Errorf("%w: declared %s, but the client's own type is %s", ErrTopologyContradicted, r.declared, r.topology)
+	}
+	resolved, outcome := redisutil.Reconcile(
+		redisutil.Resolution{Topology: r.topology, FanOut: r.shardFanOut},
+		redisutil.Resolution{Topology: r.declared, FanOut: r.declaredFanOut},
+	)
+	switch outcome {
+	case redisutil.ReconcileUndetermined:
+		return fmt.Errorf("%w (got %T)", ErrUnknownTopology, r.client)
+	case redisutil.ReconcileContradicted:
+		// The concrete type as well as the two topologies: the remedy is to pass the client the
+		// declaration describes, and a Ring and a ClusterClient need different ones.
+		return fmt.Errorf("%w: declared %s, but the client's own type is %s (got %T)", ErrTopologyContradicted, r.declared, r.topology, r.client)
+	case redisutil.ReconcileSettled:
+		r.topology, r.shardFanOut = resolved.Topology, resolved.FanOut
 	}
 	return nil
 }

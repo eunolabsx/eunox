@@ -86,7 +86,10 @@ on those paths already denies.
   custom `redis.Cmdable` proves nothing about what it fronts and latches
   `ErrUnknownTopology`, which every reader and writer reports. A consumer that
   knows what its wrapper wraps declares it with `WithSingleNodeKeyspace()` or
-  `WithShardFanOut(...)`. Fail-open is deliberately no escape: it trades
+  `WithShardFanOut(...)`. The call counter refuses an unplaceable client for its
+  own reason — a multi-key `EVAL` routed to one server of several splits a quota
+  bucket's accounting — and takes the same declaration, minus the sharded form a
+  multi-key script cannot use. Fail-open is deliberately no escape: it trades
   revocation for availability during a **transient** outage a reconcile heals,
   and a wiring fault never does. Reachable only by a library consumer wiring the
   backend directly — the shipped binary passes the `*redis.Client` it builds.
