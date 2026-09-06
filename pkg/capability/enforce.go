@@ -46,8 +46,8 @@ type EnforceRequest struct {
 	// direct BuildRegoInput caller may set it to surface directives itself.
 	Directives []Directive `json:"directives,omitempty"`
 	// DeclaredLabels carries a cooperating client's per-call attribution (the
-	// `io.eunolabs.context-manifest` block in the request's `_meta`): native flow labels
-	// it asserts THIS call's inputs carry. They are UNIONED into the session's
+	// `io.eunolabs.context-manifest` block in the request's `_meta`): flow labels on
+	// EITHER axis it asserts THIS call's inputs carry. They are UNIONED into the session's
 	// accumulated set for this call's sink check and are never written into session
 	// state. Union-only is the security property, not a simplification — see
 	// attribution.go. Empty for every non-cooperating client, which is the default and
@@ -87,8 +87,8 @@ type EnforceResponse struct {
 	Obligations []Obligation `json:"obligations,omitempty"`
 	Denial      *DenialInfo  `json:"denial,omitempty"`
 	DecidedAt   string       `json:"decidedAt"`
-	// LabelsOut is the set of native flow labels this call's output asserted into the
-	// session (from its labelOutput directives), and CarriedLabels is the session's
+	// LabelsOut is the set of flow labels this call's output asserted into the session
+	// (from its labelOutput directives, on either axis), and CarriedLabels is the session's
 	// accumulated label set observed at decision time (before this call's own output
 	// is added). Both are populated by the engine only for flow-relevant constraints
 	// (those carrying a flowLabel condition or a labelOutput directive) and are stamped

@@ -211,6 +211,12 @@ func marshalCondition(condition Condition) ([]byte, error) {
 }
 
 func unmarshalCondition(data []byte) (Condition, error) {
+	// Above the envelope decode, not below it: this decode resolves the discriminator
+	// last-wins, so a `"Type"` beside a `"type"` would steer newCondition and report an
+	// unknown condition type the author never wrote. See objectFieldNames.
+	if _, err := objectFieldNames(data, "condition"); err != nil {
+		return nil, err
+	}
 	var envelope conditionEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return nil, err
@@ -242,25 +248,18 @@ func unmarshalCondition(data []byte) (Condition, error) {
 	// recursive unknown-key check, but this decoder is also the exported seam
 	// (ConditionWrapper) a library consumer decodes through, and a security primitive must
 	// not depend on the caller remembering to re-validate.
-	//
-	// Checked by key MEMBERSHIP against the target's field set rather than by handing a
-	// discriminator-stripped copy to DisallowUnknownFields. Stripping means decoding to a
-	// map and re-marshaling, and that round-trip is not identity: it sorts keys and
-	// collapses duplicates, so which of two case-variant siblings won would change from
-	// JSON's last-wins to byte order — a parser differential introduced by the very check
-	// meant to tighten things. Matching is case-insensitive because that is how
-	// encoding/json binds, so this rejects exactly the keys the decode would have ignored,
-	// no more.
+	// What counts as unknown, and why two spellings of one field are refused rather than
+	// resolved, lives on rejectUnknownJSONFields.
 	// "type" is the envelope's discriminator, not a field of any condition struct.
 	if err := rejectUnknownJSONFields(data, target, fmt.Sprintf("condition %q", envelope.Type), "type"); err != nil {
 		return nil, err
 	}
 
-	// Decode the ORIGINAL bytes, so duplicate-key and case-variant binding stay exactly
-	// what encoding/json does everywhere else. UseNumber keeps numeric policy literals as
-	// json.Number rather than widening them to float64 (which rounds integers above 2^53,
-	// e.g. authorizing the neighbour of 9007199254740993). Request arguments are decoded
-	// the same way, and numericEqual compares the preserved json.Number values exactly.
+	// Decode the ORIGINAL bytes rather than anything the check above rebuilt, so binding stays
+	// exactly what encoding/json does everywhere else. UseNumber keeps numeric policy literals
+	// as json.Number rather than widening them to float64 (which rounds integers above 2^53,
+	// e.g. authorizing the neighbour of 9007199254740993). Request arguments are decoded the
+	// same way, and numericEqual compares the preserved json.Number values exactly.
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if err := dec.Decode(target); err != nil {
@@ -296,22 +295,74 @@ var jsonFieldNamesCache sync.Map // reflect.Type -> map[string]bool
 // through FoldJSONKey, the same fold encoding/json's own field binder uses (see its doc:
 // strings.ToLower under-folds runes like U+017F, which the binder itself does not), so this
 // rejects exactly the keys the decode would have ignored, no more.
+//
+// It also refuses two members that are the SAME field to the decoder, which membership alone
+// could not see: both fold to a known name, so both passed, and the decode that followed then
+// bound them last-wins. Through this seam
+// {"type":"recipientDomain","argument":"to","domains":["corp.com"],"Domains":["evil.com"]}
+// loaded clean and enforced evil.com while a reviewer read corp.com — the substitution
+// RefuseAmbiguousJSONKeys refuses one layer down, reaching the one surface it does not cover.
+// The members are enumerated with claimObjectMembers rather than unmarshaled into a map for
+// exactly that reason: a map is where the second spelling disappears.
+//
+// TOP LEVEL only, deliberately, which is what keeps it from being the whole-document walk:
+// a value here is consumed whole, so an extension point's opaque Config payload is the
+// embedder's own object to shape, and the fields this rule protects are the ones this
+// package's own decode binds.
 func rejectUnknownJSONFields(data []byte, target any, context string, allowExtra ...string) error {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return fmt.Errorf("%s: %w", context, err)
+	names, err := objectFieldNames(data, context)
+	if err != nil {
+		return err
 	}
 	known := jsonFieldNames(target)
-	for k := range fields {
-		if known[FoldJSONKey(k)] {
+	for _, name := range names {
+		folded := FoldJSONKey(name)
+		if known[folded] || slices.ContainsFunc(allowExtra, func(e string) bool { return folded == FoldJSONKey(e) }) {
 			continue
 		}
-		if slices.ContainsFunc(allowExtra, func(e string) bool { return FoldJSONKey(k) == FoldJSONKey(e) }) {
-			continue
-		}
-		return fmt.Errorf("%s: unknown field %q", context, k)
+		return fmt.Errorf("%s: unknown field %q", context, name)
 	}
 	return nil
+}
+
+// objectFieldNames returns data's top-level member names in source order, having refused two
+// that are the same field to a JSON decoder.
+//
+// The ambiguity refusal is SEPARABLE from the unknown-key check because it has to run
+// earlier: a caller that resolves a discriminator out of these bytes has already let the
+// decode pick between `"type"` and `"Type"` by the time it knows which field set to check
+// against, and would report an unknown TYPE the author never wrote instead of the ambiguity.
+func objectFieldNames(data []byte, context string) ([]string, error) {
+	members, err := claimObjectMembers(data, context)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(members))
+	// Linear over the folds already in hand rather than a map: these objects carry a handful
+	// of members, and this runs per request on the attribution block.
+	for _, m := range members {
+		folded := FoldJSONKey(m.key)
+		for _, prior := range names {
+			if FoldJSONKey(prior) != folded {
+				continue
+			}
+			if prior == m.key {
+				return nil, foldDuplicateError(context, fmt.Sprintf("member %q is declared twice", m.key))
+			}
+			return nil, foldDuplicateError(context, fmt.Sprintf("members %q and %q are the same field to a JSON decoder", prior, m.key))
+		}
+		names = append(names, m.key)
+	}
+	return names, nil
+}
+
+// foldDuplicateError reports a member named more than once, carrying the same sentinel type
+// RefuseAmbiguousJSONKeys uses so a caller classifying the two seams' refusals sees one kind.
+// The consequence sentence is shared; only what was found differs, since an exact repeat and
+// a case variant are the same hazard reached two ways and a message naming one string twice
+// reads as a bug in the checker.
+func foldDuplicateError(context, found string) error {
+	return &ambiguityRefusal{msg: fmt.Sprintf("%s: %s; the decoder keeps the LAST of them, so which value takes effect depends on their order rather than on anything a reviewer reading the policy can see — declare it once", context, found)}
 }
 
 // jsonFieldNames returns the fold-canonicalized JSON field names encoding/json would bind

@@ -226,6 +226,30 @@ half of it. An action whose size cannot be established must not be treated as sm
 must not contribute 0 to a sum; treating unknown as zero is the fail-open the condition
 exists to prevent.
 
+The **per-call** comparison (`max`, and the ceiling's `maxBlastRadius`) is exact for every
+integer, not merely up to 2^53: an integer magnitude is read with no rounding at all, so
+`18446744073709551617` against a `18446744073709551616` bound exceeds it rather than rounding
+onto it. That matters where magnitudes really are that large — token amounts in wei, row
+counts on a bulk delete — and a comparison that rounds at the boundary fails *open*, admitting
+the one call that is over.
+
+A **fractional** magnitude has no exact binary form at any precision, so it is read at one
+fixed width — the same width on both sides, which is the property that matters. Rounding to
+nearest preserves order, so a value over its bound stays over it; what a common width cannot
+do is separate two values closer together than a 1024-byte decimal literal can express, which
+is no pair an author or a caller can write. Two spellings of one value stay one value (`0.1`
+and `0.10`, `250` and `2.5e2`). A bound the comparison cannot read at all — outside the
+decimal grammar, or past the length/exponent limits — exceeds, fail closed, and says so with
+its own `blast_radius_bound_unreadable` reason rather than reporting the action as too large.
+
+The magnitude an audit record and a denial message carry is rendered at a bounded width: an
+integer in full, anything else at the width the value needs, capped. A caller-supplied
+argument is otherwise a 1 KB literal that renders to thousands of digits on every refusal.
+
+The **cumulative** bound is a different arithmetic and keeps its own rule: `maxTotal` sums in
+double precision to match the Redis backend's Lua, and is capped at 2^53 for that reason (see
+below).
+
 ### Cumulative velocity
 
 `max` bounds one call. `maxTotal` over `windowSeconds` bounds the **summed** magnitude of a

@@ -85,6 +85,11 @@ func marshalDirective(directive Directive) ([]byte, error) {
 }
 
 func unmarshalDirective(data []byte) (Directive, error) {
+	// Above the envelope decode for unmarshalCondition's reason: this decode resolves the
+	// discriminator last-wins, so an ambiguous `"type"` has to be refused before it steers.
+	if _, err := objectFieldNames(data, "directive"); err != nil {
+		return nil, err
+	}
 	var envelope directiveEnvelope
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return nil, err

@@ -211,6 +211,29 @@ a value that validates against its own `effect.ref`. Two spellings of one member
 anywhere in an effect block are therefore refused outright, the same rule the
 contract-registry loader already applies to a corpus entry.
 
+The **ambiguity rule now reaches the objects above it too**. A condition, a
+directive, a constraint, and a client's `io.eunolabs.context-manifest` block each
+carry their own top-level members, and the unknown-key check there matched by
+membership: two case-variant spellings of one known field both folded to a known
+name, so both passed, and the decode kept the last.
+`{"type": "recipientDomain", "argument": "to", "domains": ["corp.com"],
+"Domains": ["evil.com"]}` loaded clean through the library seam and enforced
+`evil.com` while a reviewer read `corp.com` — and the `type` discriminator and a
+constraint's `principal` are swappable the same way. Two members that are one field
+to the decoder are now refused there as well, naming both spellings. The rule stops
+at the object's own members: an extension point's `config` payload is consumed
+whole and stays the embedder's to shape.
+
+Loading through `eunox` was **not** immune. The loader's own recursive key walk
+selects a condition's field set by looking its `type` up byte-exactly, so a
+condition spelled `Type:` matched nothing, was treated as an unknown type, and had
+its per-type key check skipped entirely — after which a fold-equivalent sibling of
+a real field decided the policy last-wins, from a file that loaded clean. That
+lookup now folds the way the decoder does, so the loader keeps reporting the path
+and the "did you mean" (`capabilities[0].conditions[0]: unknown field "Domains"
+(did you mean "domains"?)`), and a second binding spelling of `type` is reported
+rather than resolved.
+
 Loading through `eunox` reports **unknown keys** exactly as before: the manifest
 loader's own walk covers these same structs and still runs first, so a typo keeps
 its path and its "did you mean" suggestion

@@ -165,7 +165,7 @@ func checkPerCallBlastRadius(br *capability.BlastRadiusCondition, limit *big.Flo
 	}
 	return effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 		"this call's blast radius %s exceeds the permitted maximum %s",
-		eff.BlastRadius.Text('f', -1), br.Max.String()),
+		capability.BlastRadiusText(eff.BlastRadius), br.Max.String()),
 		map[string]interface{}{"blast_radius_max": br.Max.String()})
 }
 
@@ -190,7 +190,7 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 	if !weightSummable(weight) {
 		return DeferredCommit{}, false, effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 			"this call's blast radius %s is outside the range a cumulative bound can sum, so it cannot be shown to be within %s",
-			eff.BlastRadius.Text('f', -1), br.MaxTotal.String()), velocityExtras(br))
+			capability.BlastRadiusText(eff.BlastRadius), br.MaxTotal.String()), velocityExtras(br))
 	}
 
 	key, skip, condErr := e.quotaBucketKey(ctx, req, blastRadiusBucketSpec)
@@ -219,7 +219,7 @@ func (e *Engine) velocityBucket(ctx context.Context, br *capability.BlastRadiusC
 			details["retry_after_seconds"] = retryAfterSeconds(retryAfter, br.WindowSeconds)
 			return effectDenial(eff, capability.ConditionTypeBlastRadius, fmt.Sprintf(
 				"this call's blast radius %s would take this session's cumulative total for the target past the permitted %s per %ds (already %s within the window)",
-				eff.BlastRadius.Text('f', -1), br.MaxTotal.String(), br.WindowSeconds, formatTotal(total)), details)
+				capability.BlastRadiusText(eff.BlastRadius), br.MaxTotal.String(), br.WindowSeconds, formatTotal(total)), details)
 		},
 	}, false, nil
 }
@@ -307,11 +307,21 @@ func (h blastRadiusHandler) PrepareCommit(ctx context.Context, cond capability.C
 // pass" and "never declared, so it defaulted to the most consequential reading". Both deny;
 // only the fix differs, and an operator reading a denial needs to know which.
 func unannotatedHint(eff *capability.ResolvedEffect) string {
+	// Nil for the reason its two neighbours in the same Sprintf are nil-safe: an effect that
+	// could not be resolved is unannotated as far as an operator is concerned, and a guard on
+	// two of the three arguments only moves the panic one argument along.
+	if eff == nil {
+		return unannotatedRemediation
+	}
 	if eff.Annotated {
 		return ""
 	}
-	return " — this target declares no effect contract, so it resolves to the fail-closed default (irreversible, unquantified); annotate it to buy it out of maximum friction"
+	return unannotatedRemediation
 }
+
+// unannotatedRemediation is the tail unannotatedHint appends, named so its two returns cannot
+// drift apart.
+const unannotatedRemediation = " — this target declares no effect contract, so it resolves to the fail-closed default (irreversible, unquantified); annotate it to buy it out of maximum friction"
 
 // effectDenial builds the effect layer's policy VERDICT: the contract was resolved, the bound
 // was evaluated, and this call does not pass it. CONDITION_FAILED, so an observing route may
