@@ -6158,6 +6158,51 @@ func TestBuildRegoInput_MinimalRequest(t *testing.T) {
 	}
 }
 
+// TestBuildRegoInput_MapsAreCopies pins the accident guard on both maps in the document.
+// Writing into input.claims corrupted a map memoized and shared across every request on the
+// token; writing into input.arguments reached a map that outlives the decision — the pure
+// conditions ordered after `policy` resolve from it, and the transport builds the tools/call
+// audit record's argument details from it after Decide returns. Only claims was copied, which
+// is the asymmetry this closes; nested values stay shared by design, as the comment states.
+func TestBuildRegoInput_MapsAreCopies(t *testing.T) {
+	ctx := context.Background()
+	req := &capability.EnforceRequest{
+		SessionID:  "sess-copy",
+		TargetName: "query_db",
+		Arguments:  map[string]interface{}{"sql": "SELECT 1"},
+		Claims:     map[string]interface{}{"sub": "user-abc"},
+	}
+
+	input, err := enforcement.BuildRegoInput(ctx, req)
+	if err != nil {
+		t.Fatalf("BuildRegoInput returned error: %v", err)
+	}
+
+	gotArgs, ok := input["arguments"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("input[arguments] type = %T, want map[string]interface{}", input["arguments"])
+	}
+	gotClaims, ok := input["claims"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("input[claims] type = %T, want map[string]interface{}", input["claims"])
+	}
+
+	// An evaluator writing into the document it was handed.
+	gotArgs["sql"] = "DROP TABLE users"
+	gotArgs["injected"] = true
+	gotClaims["sub"] = "user-root"
+
+	if got := req.Arguments["sql"]; got != "SELECT 1" {
+		t.Errorf("req.Arguments[sql] = %v, want the value later conditions and the audit record read", got)
+	}
+	if _, added := req.Arguments["injected"]; added {
+		t.Error("req.Arguments gained a key written into input.arguments")
+	}
+	if got := req.Claims["sub"]; got != "user-abc" {
+		t.Errorf("req.Claims[sub] = %v, want the memoized token claim untouched", got)
+	}
+}
+
 func TestBuildRegoInput_Arguments(t *testing.T) {
 	ctx := context.Background()
 	req := &capability.EnforceRequest{

@@ -814,18 +814,41 @@ argument explicitly.
 > **A `resource:` or `prompt:` claim may condition only on its own target.**
 > `resources/read` and `prompts/get` carry no call arguments: the only value in
 > scope is the target itself, matched under `uri` for a resource and `name` for a
-> prompt (`op` is also accepted, since it scans whatever values exist rather than
-> naming one). A condition on any other key names an argument the decision never
+> prompt. A condition on any other key names an argument the decision never
 > carries, so it could never match and the grant would authorize nothing — an
 > **inert grant**, which is rejected at the token boundary (HTTP 401) rather than
 > issued. `resource:doc://guide?lang=en` and `resource:s3://reports/*?maxCalls=5`
 > are both refused; `resource:s3://reports/*?uri=s3://reports/q3.pdf` is the form
 > that works. Only `tool:` claims carry real arguments, so only they may condition
 > on arbitrary keys.
+>
+> **`op=` is refused there too**, for a sharper version of the same reason: naming
+> no argument, it scans whatever the decision carries — which here is the target
+> name alone. Its verdict would then be a fact about that name's spelling and
+> never about an operation the caller requested. `resource:db://reports/*?op=SELECT`
+> denied `MISSING_CONTEXT` on every call, and a prompt whose name is *spelled*
+> like a granted verb was allowed — the scan uppercases the target's first
+> whitespace-delimited token and folds case, so `select`, `Select` and
+> `select rows` all satisfied `prompt:*?op=SELECT`, a grant decided by a
+> collision rather than by policy. Both are now refused at the token boundary.
+> Restrict a SQL operation on a `tool:` claim, whose call carries real arguments
+> to scan, or a non-SQL one through a manifest constraint naming the operation
+> argument; narrow a resource or prompt grant with its target pattern instead.
+>
+> One spelling is outside all of this: an **http(s)** resource claim cannot carry
+> conditions at all, because its `?` begins the URL's own query (see above), so
+> `resource:https://api.example.com/db?op=SELECT` is *accepted* and the whole
+> `?op=SELECT` becomes part of the URI it pins — matching only a resource whose
+> URI ends in exactly that. That is a target pin, not an operation restriction,
+> and it is the one inert shape this refusal does not reach.
 
 A `&` or `=` that is part of a *value* MUST itself be percent-encoded (`%26`,
 `%3D`) so it is not read as a delimiter. The `mcp.v` value stays `"0.2"`: the
-grammar extends compatibly, so single-condition v0.2 tokens are unaffected.
+grammar extends compatibly, so a v0.2 token is unaffected by the multi-condition
+suffix — but not by the two refusals above, which reject a token carrying such a
+claim however many conditions it has. A token is rejected as a whole, so one
+refused claim also withdraws the working grants beside it: fix the claim at the
+IdP before upgrading.
 
 Tokens are rejected (HTTP 401) when `mcp.v` is absent or unrecognized, when a
 shorthand entry is missing the namespace prefix, or when a suffix cannot be

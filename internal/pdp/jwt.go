@@ -1317,22 +1317,31 @@ func jwtClaimEnforceRequest(sessionID string, target EnforceTarget, args, claims
 	}
 }
 
-// jwtConditionArgs returns the argument map JWT shorthand conditions evaluate
-// against. resources/read and prompts/get carry no real args, so the target name is
-// synthesized under "uri"/"name" to match the inner manifest's synthesis — keep
-// these keys in lockstep with DecideResourceRead/DecidePromptGet.
+// jwtConditionArgs returns the argument map JWT shorthand conditions evaluate against,
+// BUILT from conditionArgumentFor rather than from a switch of its own: a claim key that
+// validates against a map this does not hold is the inert grant rejectInertConditionKeys
+// exists to refuse, so the two answer from one declaration. The synthesized keys still have
+// to match the inner manifest's own synthesis in DecideResourceRead/DecidePromptGet.
 func jwtConditionArgs(target EnforceTarget, args map[string]interface{}) map[string]interface{} {
-	switch target.Type {
-	case capability.TargetTypeResource:
-		return map[string]interface{}{"uri": target.Name}
-	case capability.TargetTypePrompt:
-		return map[string]interface{}{"name": target.Name}
+	key, synthesized, known := conditionArgumentFor(target.Type)
+	switch {
+	case synthesized:
+		return map[string]interface{}{key: target.Name}
+	case known:
+		return args // tools/call: the caller's real arguments
 	default:
-		// tools/call: real arguments. A new target type delegating here with nil args
-		// MUST get its own case above, else its conditions deny with MISSING_CONTEXT.
-		return args
+		// A type this build does not model carries nothing a condition may judge, so its
+		// conditions deny with MISSING_CONTEXT rather than reading a tool's arguments.
+		return map[string]interface{}{}
 	}
 }
+
+// jwtCondKeyOp is the one shorthand key that names no argument, which is the property all
+// four of its rules follow from: it must be a SQL verb, it cannot dispatch through a
+// replaced handler, it scans every argument, and it is meaningful only where the caller
+// supplies those arguments. Single-sourced so an alias added at the builder cannot bypass
+// the validator that refuses the shapes those rules exclude.
+const jwtCondKeyOp = "op"
 
 // jwtCondPair is a single (argument, value) condition parsed from a v0.2 JWT
 // capability shorthand suffix.  The value is already percent-decoded (§ 4.2).
@@ -1401,7 +1410,7 @@ func parseV2Claim(claim string) (prefix capability.TargetType, bareName string, 
 		// here (as the manifest path does) so a malformed pattern is rejected up
 		// front instead of silently matching nothing (VALUE_NOT_PERMITTED).
 		for _, cp := range conds {
-			if cp.key == "op" {
+			if cp.key == jwtCondKeyOp {
 				// "op=" has no explicit argument name, so it runs in scan-all-args
 				// mode, which only supports SQL verbs. Reject a non-SQL verb here so
 				// the misconfiguration surfaces at validation, not as an opaque
@@ -1456,41 +1465,71 @@ func isHTTPResourceValue(bareName string) bool {
 	return strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://")
 }
 
-// conditionArgumentFor names the ONE argument a target type's decision actually carries, or
-// "" for a type carrying real arguments. It is the read side of jwtConditionArgs — keep the
-// two in lockstep, since a key this admits that jwtConditionArgs does not synthesize is a
-// grant that validates and can never match.
-func conditionArgumentFor(prefix capability.TargetType) string {
+// conditionArgumentFor answers what a target type's decision carries for a claim condition to
+// judge: the ONE synthesized argument, or synthesized=false for a type carrying the caller's
+// real arguments. It is the SINGLE source jwtConditionArgs builds from and
+// rejectInertConditionKeys reads, so a key admitted here that the map does not hold is
+// unrepresentable rather than a lockstep two comments ask a reader to maintain.
+//
+// known=false is fail-closed and is why this is not a bare string: every type is named
+// explicitly, so a type this build does not model (a future one, or system: were its earlier
+// refusal ever relaxed) carries nothing a condition can judge instead of falling to the
+// tool arm, which admits every key AND the argument-less op= scan.
+func conditionArgumentFor(prefix capability.TargetType) (argument string, synthesized, known bool) {
 	switch prefix {
 	case capability.TargetTypeResource:
-		return "uri"
+		return "uri", true, true
 	case capability.TargetTypePrompt:
-		return "name"
+		return "name", true, true
+	case capability.TargetTypeTool:
+		return "", false, true
 	default:
-		return ""
+		return "", false, false
 	}
 }
 
-// rejectInertConditionKeys refuses a condition naming an argument the decision for this
-// target type never carries.
+// rejectInertConditionKeys refuses a condition the decision for this target type can never
+// judge on the call's own terms.
 //
 // resources/read and prompts/get carry NO real arguments: jwtConditionArgs synthesizes the
 // target name under "uri"/"name" and nothing else, so every other key becomes an
 // AllowedValues condition on an argument that is always absent, which denies with
 // MISSING_CONTEXT on every call. The grant validates, the operator believes it was issued,
 // and it authorizes nothing — the inert-grant shape this file rejects everywhere else, and
-// the actual root of `resource:doc://guide?lang=en`. "op" is exempt: it scans whatever
-// arguments exist rather than naming one.
+// the actual root of `resource:doc://guide?lang=en`.
+//
+// "op" is refused here for a sharper version of the same reason. Naming no argument, it scans
+// whatever the decision carries — which on these two types is that one synthesized value — so
+// its verdict is a fact about the TARGET's spelling and never about an operation the caller
+// requested. That is inert for an ordinary URI or prompt name (no SQL verb, so
+// `resource:db://reports/*?op=SELECT` denies MISSING_CONTEXT on every call) and worse than
+// inert wherever the two collide: the scan uppercases the target's FIRST whitespace-delimited
+// token and folds case, so "select", "Select" and "select rows" all satisfy
+// `prompt:*?op=SELECT` and are ALLOWED — a grant decided by a spelling, not by policy. The
+// exemption is only meaningful for tool targets, whose decisions carry real arguments to scan.
+//
+// A claim whose target type this build does not model is refused outright: with nothing known
+// to be in scope, EVERY key is one the decision cannot judge.
 func rejectInertConditionKeys(claim string, prefix capability.TargetType, conds []jwtCondPair) error {
-	want := conditionArgumentFor(prefix)
-	if want == "" {
+	want, synthesized, known := conditionArgumentFor(prefix)
+	if known && !synthesized {
 		return nil
 	}
 	for _, cp := range conds {
-		if cp.key == "op" || cp.key == want {
+		if synthesized && cp.key == want {
 			continue
 		}
-		return fmt.Errorf("JWT capability claim %q: condition %q names an argument a %s decision never carries, so this grant could never match — %s: accepts only %q (the target it addresses) and \"op\"",
+		if !known {
+			return fmt.Errorf("JWT capability claim %q: the %s namespace carries no arguments a condition may judge in this build, so condition %q could never match", claim, prefix, cp.key)
+		}
+		if cp.key == jwtCondKeyOp {
+			// The remedy is split because the bare op= form is SQL-only even on a tool claim
+			// (see the isSQLVerb gate in parseV2Claim): sending a non-SQL operation to a tool
+			// claim would just refuse it again, one token re-issue later.
+			return fmt.Errorf("JWT capability claim %q: op= names no argument, so it scans whatever the decision carries — and a %s decision carries only %q (the target it addresses). This grant would judge the target's own spelling rather than any operation the caller requested. Restrict a SQL operation on a tool: claim, whose call carries real arguments to scan, or a non-SQL one through a manifest constraint naming the operation argument; narrow a %s grant with its target pattern instead",
+				claim, prefix, want, prefix)
+		}
+		return fmt.Errorf("JWT capability claim %q: condition %q names an argument a %s decision never carries, so this grant could never match — %s: accepts only %q (the target it addresses)",
 			claim, cp.key, prefix, prefix, want)
 	}
 	return nil
@@ -1584,7 +1623,7 @@ func buildV2Constraint(prefix capability.TargetType, bareName string, conds []jw
 		Actions: []string{requiredActionFor(prefix)},
 	}
 	for _, cp := range conds {
-		if cp.key == "op" {
+		if cp.key == jwtCondKeyOp {
 			c.Conditions = append(c.Conditions, capability.AllowedOperationsCondition{
 				Argument:   "",
 				Operations: []string{cp.value},
@@ -2075,6 +2114,26 @@ func evaluateJWTConditions(ctx context.Context, clock enforcement.Clock, eval cl
 					fmt.Sprintf("%q: the deciding policy redefines %s, and this capability claim's argument-less op= form cannot be judged by that handler; deny (fail closed) — grant the operation through a manifest constraint that names the operation argument instead",
 						name, capability.ConditionTypeAllowedOperations),
 					map[string]interface{}{"conditionType": capability.ConditionTypeAllowedOperations, "reason": "handler_override_unsupported"})
+				return &resp
+			}
+			// The request-time twin of rejectInertConditionKeys' op= refusal, and dead for
+			// the same reason as the guard below rather than for a weaker one: on a target
+			// type whose decision synthesizes its own argument map, this scan reads the
+			// TARGET NAME and matches when that name is spelled like a granted verb —
+			// granting by coincidence. A validated claim cannot reach it, but the fallback
+			// re-parse in parsedCapHeads serves a JWTClaims built directly, and that path
+			// applies the grammar's checks and not the validator's.
+			// An absent target reads as an unmodelled type rather than as a tool: it is the
+			// one shape that cannot show the arguments are the caller's.
+			var targetType capability.TargetType
+			if req.Target != nil {
+				targetType = capability.TargetType(req.Target.Type)
+			}
+			if _, synthesized, known := conditionArgumentFor(targetType); synthesized || !known {
+				resp := denyResponseWithDetails(clock, capability.ErrCodeEnforcementError, capability.ConditionTypeAllowedOperations,
+					fmt.Sprintf("%q: a %s decision carries no caller-supplied arguments, so this capability claim's argument-less op= form has nothing to judge but the target's own name; deny (fail closed) — restrict the operation on a tool: claim, or through a manifest constraint naming the operation argument",
+						name, targetType),
+					map[string]interface{}{"targetType": string(targetType), "reason": "op_scan_without_arguments"})
 				return &resp
 			}
 			if c.Argument != "" {
