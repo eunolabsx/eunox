@@ -337,9 +337,9 @@ func VerifyLog(r io.Reader, verifier *Sink, opts VerifyOptions) (VerifyResult, e
 		v.processLine(line)
 	}
 	// Before the scan-abort return, not after: an aborted scan (over-cap line, mid-archive
-	// read fault) is exactly the corrupted-log case where dropping the elided-unsigned
-	// accounting line would silently under-report.
-	v.reportSuppressedUnsigned()
+	// read fault) is exactly the corrupted-log case where dropping the elided-diagnostic
+	// accounting lines would silently under-report.
+	v.reportSuppressedDiagnostics()
 	if err := scanner.Err(); err != nil {
 		return v.res, err
 	}
@@ -493,9 +493,10 @@ type auditChainVerifier struct {
 	havePrev bool
 	prevHMAC string
 	prevSeq  uint64
-	// unsignedSeen counts HMAC-less records so their per-record diagnostic can be capped
-	// at maxUnsignedDiagnostics; the Invalid tally in res is unaffected and stays exact.
-	unsignedSeen int
+	// diags counts each flood-shaped per-record diagnostic's occurrences, so each is capped
+	// against its OWN budget (see admitDiagnostic); the Invalid tally in res is unaffected by
+	// any of them and stays exact.
+	diags [numDiagnosticKinds]int
 	// prevRecordInvalid is set by classify when the previous record's signature check
 	// REFUSED or FAILED it (the !ok / err cases: an HMAC mismatch under a held key, a
 	// strict-decode refusal, a non-canonical on-disk form) — i.e. nothing established
@@ -513,13 +514,52 @@ type auditChainVerifier struct {
 	prevRecordInvalid bool
 }
 
-// maxUnsignedDiagnostics bounds how many per-record "unsigned record" lines a single
-// verify pass prints. A log with a pre-signing prefix produces one per record, and an
-// unbounded stream of them buries the CHAIN BREAK / INVALID findings the tool exists to
-// surface — the practical result being an operator who suppresses the whole check. Sized
-// to show enough to recognize the shape while leaving the output readable; the exact
-// count always survives in VerifyResult.Invalid and in the closing summary line.
-const maxUnsignedDiagnostics = 10
+// maxRecordDiagnostics bounds how many per-record lines a single verify pass prints for
+// ONE flood-shaped finding. Every kind in cappedDiagnostics can produce one line per input
+// line for a whole log — pre-signing history, a corrupt or non-JSONL file, an
+// attacker-padded archive — and an unbounded stream of them buries the CHAIN BREAK / INVALID
+// findings the tool exists to surface, the practical result being an operator who suppresses
+// the whole check. Sized to show enough to recognize the shape while leaving the output
+// readable; the exact count always survives in VerifyResult.Invalid and in the closing
+// summary line.
+const maxRecordDiagnostics = 10
+
+// diagnosticKind indexes the per-record diagnostics a verify pass caps.
+type diagnosticKind int
+
+const (
+	diagUnsigned diagnosticKind = iota
+	diagMalformed
+	diagDecoy
+	numDiagnosticKinds
+)
+
+// cappedDiagnostic declares one capped diagnostic: the noun its elision notice and its
+// closing summary both name it by — one field, so the two lines cannot end up describing
+// different floods — and the sentence that summary closes with, which is what an operator
+// reading a log in this state has to act on.
+type cappedDiagnostic struct {
+	noun   string
+	remedy string
+}
+
+// cappedDiagnostics is the declaration TestVerifyDiagnostics_EveryKindIsDeclared holds
+// complete, so a fourth capped diagnostic is one row rather than an entry that prints an
+// empty noun.
+var cappedDiagnostics = [numDiagnosticKinds]cappedDiagnostic{
+	diagUnsigned: {
+		noun:   "unsigned",
+		remedy: "none carries an _hmac, so none can be verified. Pre-signing history must be moved aside before upgrading; otherwise reconcile against your external sink.",
+	},
+	diagMalformed: {
+		noun:   "malformed",
+		remedy: "none decodes as a JSON record, so none can be verified. A log in this state is corrupt, truncated, or is not the JSONL audit log; reconcile against your external sink.",
+	},
+	diagDecoy: {
+		noun:   "forged seq-0 decoy",
+		remedy: "a signed chain starts at seq 1, so none was written by this sink. Reconcile against your external sink.",
+	},
+}
 
 // recordDecode is what decodeAuditRecord's pass over a line yields for the two
 // consumers that read it with different tolerances. Holding both verdicts in one
@@ -839,18 +879,46 @@ func (v *auditChainVerifier) updateChain(rec auditRecord) {
 	v.prevSeq = rec.Seq
 }
 
-// reportSuppressedUnsigned prints the one-line tail summary for unsigned records whose
-// individual diagnostics were capped (see maxUnsignedDiagnostics). It names the total so
-// the elided lines are accounted for rather than silently dropped — the same posture the
-// pre-session record limiter takes with suppressed_refusal_count — and repeats the remedy,
-// since a log in this state is one an operator has to act on rather than re-run.
-func (v *auditChainVerifier) reportSuppressedUnsigned() {
-	if v.unsignedSeen <= maxUnsignedDiagnostics {
-		return
+// reportSuppressedDiagnostics prints the one-line tail summary for every capped diagnostic
+// that elided lines (see maxRecordDiagnostics). Each names its own total so the elided lines
+// are accounted for rather than silently dropped — the same posture the pre-session record
+// limiter takes with suppressed_refusal_count — and repeats its remedy, since a log in any of
+// these states is one an operator has to act on rather than re-run.
+//
+// One loop over the declaration rather than a call per kind: the summary is what keeps a
+// capped diagnostic honest, and a kind whose summary a caller forgot would elide lines with
+// nothing accounting for them.
+func (v *auditChainVerifier) reportSuppressedDiagnostics() {
+	for kind, seen := range v.diags {
+		if seen <= maxRecordDiagnostics {
+			continue
+		}
+		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  %d %s record(s) in total (%d diagnostics elided): %s\n",
+			seen, cappedDiagnostics[kind].noun, seen-maxRecordDiagnostics, cappedDiagnostics[kind].remedy)
 	}
-	_, _ = fmt.Fprintf(v.opts.Out,
-		"INVALID  %d unsigned record(s) in total (%d diagnostics elided): none carries an _hmac, so none can be verified. Pre-signing history must be moved aside before upgrading; otherwise reconcile against your external sink.\n",
-		v.unsignedSeen, v.unsignedSeen-maxUnsignedDiagnostics)
+}
+
+// admitDiagnostic counts one occurrence of kind and reports whether the caller prints its
+// per-record line, emitting the one-line elision notice itself at the moment the cap is
+// passed. Each kind is counted against its OWN budget, for the reason the transport's
+// refusal limiter keeps a bucket per category: a whole pre-signing log would otherwise spend
+// the budget and reduce a handful of concurrent malformed lines — the finding an operator is
+// reading for — to a number on somebody else's summary.
+//
+// The answer is taken BEFORE the site formats its diagnostic, which is the expensive part of
+// a line nobody sees: on the flood path this bound exists for, every suppressed line would
+// otherwise pay its formatting and its arguments. Counting and naming are one call, so a
+// kind's budget cannot be spent while another kind's noun is printed.
+func (v *auditChainVerifier) admitDiagnostic(kind diagnosticKind) bool {
+	v.diags[kind]++
+	switch {
+	case v.diags[kind] <= maxRecordDiagnostics:
+		return true
+	case v.diags[kind] == maxRecordDiagnostics+1:
+		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  ... further %s records reported once at the end rather than one line each\n",
+			cappedDiagnostics[kind].noun)
+	}
+	return false
 }
 
 // reportMalformedTime emits the unparseable-`time` diagnostic on the arms that return
@@ -895,18 +963,30 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	// unambiguous corruption. Count it invalid before the filter so an active
 	// --request-id/--since cannot downgrade it to a silent skip and produce a false
 	// PASS over a corrupted log.
+	//
+	// CAPPED for the unsigned arm's reason and with the same natural flood behind it: a
+	// corrupt, truncated, or simply non-JSONL file passed as --audit-log produces one of
+	// these per line.
 	if !dec.wellFormed {
 		v.res.Invalid++
-		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  malformed record %d: not valid JSON\n", v.res.Total)
+		if v.admitDiagnostic(diagMalformed) {
+			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  malformed record %d: not valid JSON\n", v.res.Total)
+		}
 		return recordVerdict{status: StatusInvalid}
 	}
 
 	// A forged seq-0 decoy (Seq==0 + HMAC, anywhere in the stream) is rejected
 	// regardless of whether its HMAC verifies, closing the substitution vector even
 	// against a signing-key holder.
+	//
+	// CAPPED too, and here the flood is the adversary's own: padding an archive with decoys
+	// is free for anyone who can append to it, and an uncapped line each would bury the
+	// CHAIN BREAK that names where the real edit is.
 	if forgedSeq0 {
 		v.res.Invalid++
-		_, _ = fmt.Fprintf(v.opts.Out, "INVALID  record %d: seq 0 with a non-empty HMAC is not a valid record (forged seq-0 decoy)\n", v.res.Total)
+		if v.admitDiagnostic(diagDecoy) {
+			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  record %d: seq 0 with a non-empty HMAC is not a valid record (forged seq-0 decoy)\n", v.res.Total)
+		}
 		return v.decodableVerdict(rec, StatusInvalid)
 	}
 
@@ -923,15 +1003,11 @@ func (v *auditChainVerifier) classify(line []byte, rec auditRecord, dec recordDe
 	// emits well over a hundred megabytes — buries the genuine CHAIN BREAK or INVALID
 	// findings an operator is reading for, which is how a fail-closed check ends up
 	// suppressed with `|| true`. The Invalid COUNT stays exact; only the printing is
-	// bounded, and the tail is summarized once at the end (see reportSuppressedUnsigned).
+	// bounded, and the tail is summarized once at the end (reportSuppressedDiagnostics).
 	if unsigned {
 		v.res.Invalid++
-		v.unsignedSeen++
-		switch {
-		case v.unsignedSeen <= maxUnsignedDiagnostics:
+		if v.admitDiagnostic(diagUnsigned) {
 			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  record %d: unsigned record (seq=%d) carries no _hmac, so it cannot be verified (pre-signing history, or a stripped signature)\n", v.res.Total, rec.Seq)
-		case v.unsignedSeen == maxUnsignedDiagnostics+1:
-			_, _ = fmt.Fprintf(v.opts.Out, "INVALID  ... further unsigned records reported once at the end rather than one line each\n")
 		}
 		return v.decodableVerdict(rec, StatusUnsigned)
 	}

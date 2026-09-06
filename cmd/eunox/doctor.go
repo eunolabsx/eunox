@@ -55,7 +55,8 @@ func (e *errTrackingWriter) Write(p []byte) (int, error) {
 
 // redactedConfigFields names the YAML keys fully replaced with a length-only placeholder.
 // Keep in sync with config.GatewayConfig — every sensitive field must land in this map or
-// urlConfigFields.
+// urlConfigFields. Declared in the canonical spelling and matched case-INSENSITIVELY; see
+// redactedValueFor for why.
 var redactedConfigFields = map[string]bool{
 	"authToken":          true, // listen.authToken
 	"upstreamAuthHeader": true, // upstreams[].upstreamAuthHeader
@@ -71,6 +72,51 @@ var urlConfigFields = map[string]func(string) string{
 	"oauthResource":             config.RedactURL,           // listen.oauthResource (scalar, RFC 9728 resource URI)
 	"oauthAuthorizationServers": config.RedactURL,           // listen.oauthAuthorizationServers (sequence of IdP URLs)
 	"allowedOrigins":            config.RedactURL,           // listen.allowedOrigins (sequence)
+}
+
+// The case-folded indexes the lookup actually reads. Derived from the declarations above so
+// the canonical spelling stays the documented one and the two cannot drift;
+// TestDoctorRedaction_FoldedIndexesAreComplete fails a pair of declared keys that fold
+// together, which would silently drop one.
+var (
+	redactedConfigFieldsFolded = foldConfigKeys(redactedConfigFields)
+	urlConfigFieldsFolded      = foldConfigKeys(urlConfigFields)
+)
+
+// foldConfigKeys re-keys a redaction table by foldConfigKey.
+func foldConfigKeys[V any](m map[string]V) map[string]V {
+	folded := make(map[string]V, len(m))
+	for k, v := range m {
+		folded[foldConfigKey(k)] = v
+	}
+	return folded
+}
+
+// foldConfigKey is the ONE normalization a raw on-disk key goes through before it is matched
+// against the redaction tables.
+func foldConfigKey(k string) string { return strings.ToLower(k) }
+
+// redactedValueFor returns the scrubbed replacement for a config value under key, and
+// whether key names a sensitive field at all.
+//
+// The match is case-INSENSITIVE, which is not a heuristic: it is the same two key names,
+// spelled the way an operator actually typed them. writeDoctorConfig raw-parses the file
+// precisely so a config the typed loader REFUSED still renders — and since that loader
+// rejects unknown keys case-sensitively, the configs only doctor handles are the misspelled
+// ones. `AuthToken:` was therefore the one spelling guaranteed to reach a bundle destined
+// for a public bug report, and the one spelling the allowlist missed.
+//
+// One resolver rather than a lookup pair in each of redactConfigValue's two map arms, so the
+// string-keyed and interface-keyed walks cannot disagree about which keys are sensitive.
+func redactedValueFor(key string, val interface{}) (interface{}, bool) {
+	folded := foldConfigKey(key)
+	if redactedConfigFieldsFolded[folded] {
+		return redactString(val), true
+	}
+	if scrub := urlConfigFieldsFolded[folded]; scrub != nil {
+		return redactURLValue(val, scrub), true
+	}
+	return nil, false
 }
 
 // redactURLValue scrubs a URL-bearing config value of any shape (scalar, sequence, or nested
@@ -141,7 +187,9 @@ Nothing leaves your machine. The bundle prints to stdout (or --output FILE)
 so you control what gets pasted into a bug report. Secrets in named fields
 (authToken, upstreamAuthHeader) are redacted; URL userinfo, query
 values, and fragments are scrubbed in the URL/URI fields (upstreamUrl,
-oauthResource, oauthAuthorizationServers, allowedOrigins).
+oauthResource, oauthAuthorizationServers, allowedOrigins). Field names are
+matched case-insensitively, since a config this command renders may be one
+the loader refused for misspelling them.
 Command-line args, paths, and audit metadata are shown verbatim — skim
 before sharing.
 
@@ -384,34 +432,27 @@ func writeDoctorConfig(w io.Writer, path string) {
 }
 
 // redactConfigValue walks a yaml.Unmarshal-shaped value in place, recursing into maps and
-// slices, applying redactedConfigFields or urlConfigFields at each matching key.
+// slices, applying redactedValueFor at each key.
 func redactConfigValue(v interface{}) {
 	switch x := v.(type) {
 	case map[string]interface{}:
 		for k, val := range x {
-			switch {
-			case redactedConfigFields[k]:
-				x[k] = redactString(val)
-			case urlConfigFields[k] != nil:
-				x[k] = redactURLValue(val, urlConfigFields[k])
-			default:
-				redactConfigValue(val)
+			if red, ok := redactedValueFor(k, val); ok {
+				x[k] = red
+				continue
 			}
+			redactConfigValue(val)
 		}
 	case map[interface{}]interface{}:
 		// yaml.v3 decodes a mapping this way (not map[string]interface{}) whenever ANY key
 		// is non-string. Without this case such a map falls through the no-op default and a
 		// sibling authToken would be emitted verbatim into the bundle.
 		for k, val := range x {
-			ks := fmt.Sprintf("%v", k)
-			switch {
-			case redactedConfigFields[ks]:
-				x[k] = redactString(val)
-			case urlConfigFields[ks] != nil:
-				x[k] = redactURLValue(val, urlConfigFields[ks])
-			default:
-				redactConfigValue(val)
+			if red, ok := redactedValueFor(fmt.Sprintf("%v", k), val); ok {
+				x[k] = red
+				continue
 			}
+			redactConfigValue(val)
 		}
 	case []interface{}:
 		for _, it := range x {

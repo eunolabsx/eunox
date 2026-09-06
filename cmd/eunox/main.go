@@ -655,8 +655,15 @@ func cmdProxy(args []string) (exitCode int) {
 	switch cfg.HostTransport() {
 	case config.HostTransportStdio:
 		serveErr = serveStdioHost(ctx, cfg, sink, counter, flowStore, ks, pf, onServeReady)
-	default: // config.HostTransportHTTP
+	case config.HostTransportHTTP:
 		serveErr = serveHTTPGateway(ctx, cfg, sink, counter, flowStore, ks, pf, onServeReady)
+	default:
+		// Unreachable while GatewayConfig.Validate constrains the value, and named
+		// explicitly anyway: a `default` serving HTTP put this fold in the opposite
+		// direction from validateTransportConditionalFlags, which reads anything that is
+		// not HTTP as stdio — so a third transport value would be served as a gateway
+		// under stdio's flag rules. fetchSpecLive states the package's standard.
+		serveErr = fmt.Errorf("unknown host transport %q", cfg.HostTransport())
 	}
 	if serveErr != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", serveErr)
@@ -1083,15 +1090,33 @@ func httpOnlyFlagsSetOnStdio(fs *flag.FlagSet) []string {
 // configured host transport — each would otherwise silently no-op, letting an operator
 // believe a security-relevant setting took effect. Runs from cmdProxy the moment the
 // transport is known, before the Redis dial and audit key/log creation.
+//
+// Both transports are named and an unrecognized value is REFUSED rather than folded into
+// either: an `if HTTP { … } else { stdio rules }` shape read every unknown value as stdio
+// while cmdProxy's serve switch read it as HTTP, so a third transport value would have been
+// served as a gateway with stdio's flag rules applied to it — the combination that lets an
+// HTTP-only flag through unchecked. Unreachable while Validate constrains the value; stated
+// structurally, as fetchSpecLive does.
 func validateTransportConditionalFlags(hostTransport string, pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
-	if hostTransport == config.HostTransportHTTP {
+	switch hostTransport {
+	case config.HostTransportHTTP:
 		// pf.sessionIDSet (not pf.sessionID, which is never empty — cmdProxy falls back to
 		// a fresh UUID) tracks whether the operator actually passed it.
 		if pf.sessionIDSet {
 			return fmt.Errorf("--session-id requires transport: stdio (a gateway mints its own Mcp-Session-Id per client session)")
 		}
 		return nil
+	case config.HostTransportStdio:
+		return validateStdioConditionalFlags(pf)
+	default:
+		return fmt.Errorf("unknown host transport %q (expected %q or %q)", hostTransport, config.HostTransportStdio, config.HostTransportHTTP)
 	}
+}
+
+// validateStdioConditionalFlags rejects the HTTP-listener flags on a stdio host, split out
+// so validateTransportConditionalFlags' arms stay one statement each and the default arm is
+// visibly the odd one.
+func validateStdioConditionalFlags(pf proxyFlags) error { //nolint:gocritic // hugeParam: pf is a small flag bundle
 	// JWT validation and OAuth metadata are HTTP-listener concerns; a stdio host
 	// has no socket on which to serve them.
 	if pf.jwksURI != "" {

@@ -199,6 +199,75 @@ func TestRedactConfigValue_ScrubsMisconfiguredURLShapes(t *testing.T) {
 	}
 }
 
+// TestRedactConfigValue_ScrubsCaseVariantKeys covers the spelling the allowlist used to
+// miss. writeDoctorConfig raw-parses on-disk YAML so a config the typed loader REFUSED still
+// renders — and that loader rejects unknown keys case-sensitively, so a misspelled
+// `AuthToken:` is exactly the shape only doctor ever prints. Matching case-sensitively meant
+// the one config guaranteed to reach the bundle was the one whose secret went in verbatim.
+func TestRedactConfigValue_ScrubsCaseVariantKeys(t *testing.T) {
+	root := map[string]interface{}{
+		"listen": map[string]interface{}{
+			"AuthToken":     "upper-camel-secret",
+			"authtoken":     "all-lower-secret",
+			"OAUTHRESOURCE": "https://rsuser:shouty-url-secret@rs.example.com/mcp",
+		},
+		"upstreams": []interface{}{
+			map[string]interface{}{
+				"UpstreamAuthHeader": "Authorization: Bearer sk_live_CASEVARIANT",
+				"UPSTREAMURL":        "https://user:shouty-upstream-secret@mcp.example.com/x",
+			},
+		},
+	}
+	redactConfigValue(root)
+	dump := mustJSON(t, root)
+
+	for _, secret := range []string{
+		"upper-camel-secret",
+		"all-lower-secret",
+		"shouty-url-secret",
+		"sk_live_CASEVARIANT",
+		"shouty-upstream-secret",
+	} {
+		if strings.Contains(dump, secret) {
+			t.Errorf("redactConfigValue: secret %q leaked from a case-variant key:\n%s", secret, dump)
+		}
+	}
+	// The non-string-keyed arm reads the same resolver, so it must fold identically.
+	nonString := map[interface{}]interface{}{
+		8080:        "sentinel-int-key",
+		"AuthToken": "non-string-map-secret",
+	}
+	redactConfigValue(nonString)
+	out, err := yaml.Marshal(nonString)
+	if err != nil {
+		t.Fatalf("yaml.Marshal: %v", err)
+	}
+	if strings.Contains(string(out), "non-string-map-secret") {
+		t.Errorf("a case-variant key must be scrubbed in the non-string-keyed arm too:\n%s", out)
+	}
+}
+
+// TestDoctorRedaction_FoldedIndexesAreComplete pins the derivation: two declared keys that
+// fold together would collapse into one index entry and silently stop redacting the other.
+func TestDoctorRedaction_FoldedIndexesAreComplete(t *testing.T) {
+	if got, want := len(redactedConfigFieldsFolded), len(redactedConfigFields); got != want {
+		t.Errorf("redactedConfigFieldsFolded has %d entries, want %d: two declared keys fold together", got, want)
+	}
+	if got, want := len(urlConfigFieldsFolded), len(urlConfigFields); got != want {
+		t.Errorf("urlConfigFieldsFolded has %d entries, want %d: two declared keys fold together", got, want)
+	}
+	for k := range redactedConfigFields {
+		if !redactedConfigFieldsFolded[foldConfigKey(k)] {
+			t.Errorf("declared key %q is missing from the folded index", k)
+		}
+	}
+	for k := range urlConfigFields {
+		if urlConfigFieldsFolded[foldConfigKey(k)] == nil {
+			t.Errorf("declared key %q is missing from the folded index", k)
+		}
+	}
+}
+
 func TestRedactConfigValue_EmptyAndMissingValues(t *testing.T) {
 	// An empty authToken (operator omitted it) must read differently from a
 	// present-but-redacted one — otherwise a bug report "authToken was set" is

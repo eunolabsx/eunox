@@ -2562,7 +2562,7 @@ func TestReadLastAuditLine_WhitespaceFillsWholeWindowFailsClosed(t *testing.T) {
 // instead of being buried under thousands of identical lines.
 func TestVerifyLog_CapsUnsignedDiagnostics(t *testing.T) {
 	t.Parallel()
-	const n = maxUnsignedDiagnostics + 25
+	const n = maxRecordDiagnostics + 25
 	lines := make([][]byte, 0, n)
 	for i := 0; i < n; i++ {
 		lines = append(lines, []byte(fmt.Sprintf(
@@ -2582,8 +2582,8 @@ func TestVerifyLog_CapsUnsignedDiagnostics(t *testing.T) {
 	}
 
 	perRecord := strings.Count(out.String(), "carries no _hmac, so it cannot be verified")
-	if perRecord > maxUnsignedDiagnostics {
-		t.Errorf("printed %d per-record unsigned diagnostics, want at most %d", perRecord, maxUnsignedDiagnostics)
+	if perRecord > maxRecordDiagnostics {
+		t.Errorf("printed %d per-record unsigned diagnostics, want at most %d", perRecord, maxRecordDiagnostics)
 	}
 	// The elided records must still be accounted for, with the true total.
 	if !strings.Contains(out.String(), fmt.Sprintf("%d unsigned record(s) in total", n)) {
@@ -2705,6 +2705,115 @@ func TestVerifyLogFiles_RefusesSymlinkedChainFile(t *testing.T) {
 	}
 }
 
+// TestVerifyLog_CapsMalformedDiagnostics pins the malformed arm to the same bound as its
+// unsigned sibling. A non-JSONL file passed as --audit-log (or a corrupt one) produces a
+// diagnostic per line, and an unbounded stream of them buries the CHAIN BREAK findings the
+// tool exists to surface. The Invalid tally must stay exact and the elided lines accounted
+// for in the closing summary.
+func TestVerifyLog_CapsMalformedDiagnostics(t *testing.T) {
+	t.Parallel()
+	const n = maxRecordDiagnostics + 25
+	var log bytes.Buffer
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&log, "this line %d is not JSON at all\n", i)
+	}
+
+	var out strings.Builder
+	res, err := VerifyLog(&log, &Sink{}, VerifyOptions{Out: &out})
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if res.Invalid != n {
+		t.Fatalf("Invalid = %d, want %d: capping the diagnostics must not change the tally", res.Invalid, n)
+	}
+	if res.OK() {
+		t.Error("a log of malformed lines must fail the verdict")
+	}
+
+	if perRecord := strings.Count(out.String(), "not valid JSON"); perRecord > maxRecordDiagnostics {
+		t.Errorf("printed %d per-record malformed diagnostics, want at most %d", perRecord, maxRecordDiagnostics)
+	}
+	if !strings.Contains(out.String(), fmt.Sprintf("%d malformed record(s) in total", n)) {
+		t.Errorf("expected a closing summary naming all %d malformed records, got:\n%s", n, out.String())
+	}
+	if !strings.Contains(out.String(), fmt.Sprintf("(%d diagnostics elided)", n-maxRecordDiagnostics)) {
+		t.Errorf("the summary must say how many diagnostics were suppressed, got:\n%s", out.String())
+	}
+}
+
+// TestVerifyLog_CapsForgedDecoyDiagnostics pins the third capped arm. Padding an archive
+// with seq-0 decoys is free for anyone who can append to the log, so leaving this line
+// uncapped would keep the very flood the other two caps close: the real CHAIN BREAK scrolls
+// away under thousands of decoy lines.
+func TestVerifyLog_CapsForgedDecoyDiagnostics(t *testing.T) {
+	t.Parallel()
+	const n = maxRecordDiagnostics + 25
+	var log bytes.Buffer
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&log, `{"seq":0,"time":"2026-06-15T10:00:00Z","request_id":"r%d","decision":"allow","_hmac":"deadbeef"}`+"\n", i)
+	}
+
+	var out strings.Builder
+	res, err := VerifyLog(&log, &Sink{}, VerifyOptions{Out: &out})
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if res.Invalid != n {
+		t.Fatalf("Invalid = %d, want %d: capping the diagnostics must not change the tally", res.Invalid, n)
+	}
+	if perRecord := strings.Count(out.String(), "forged seq-0 decoy)"); perRecord > maxRecordDiagnostics {
+		t.Errorf("printed %d per-record decoy diagnostics, want at most %d", perRecord, maxRecordDiagnostics)
+	}
+	if !strings.Contains(out.String(), fmt.Sprintf("%d forged seq-0 decoy record(s) in total", n)) {
+		t.Errorf("expected a closing summary naming all %d decoys, got:\n%s", n, out.String())
+	}
+}
+
+// TestVerifyLog_CapsAreKeptPerKind is the reason the counts are not one shared budget: a
+// whole pre-signing log must not spend the budget a handful of malformed lines need. Both
+// findings are in the same pass here, and the smaller one must still be reported in full.
+func TestVerifyLog_CapsAreKeptPerKind(t *testing.T) {
+	t.Parallel()
+	var log bytes.Buffer
+	for i := 0; i < maxRecordDiagnostics+25; i++ {
+		fmt.Fprintf(&log, `{"time":"2026-06-15T10:00:00Z","request_id":"u%d","session_id":"s","target":"tool:exec","decision":"allow"}`+"\n", i)
+	}
+	const malformed = 3
+	for i := 0; i < malformed; i++ {
+		fmt.Fprintf(&log, "not json %d\n", i)
+	}
+
+	var out strings.Builder
+	if _, err := VerifyLog(&log, &Sink{}, VerifyOptions{Out: &out}); err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if got := strings.Count(out.String(), "not valid JSON"); got != malformed {
+		t.Errorf("printed %d malformed diagnostics, want all %d: the unsigned flood must not spend this kind's budget", got, malformed)
+	}
+	if strings.Contains(out.String(), "malformed record(s) in total") {
+		t.Errorf("nothing was elided for the malformed kind, so it must print no summary:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "unsigned record(s) in total") {
+		t.Errorf("the unsigned flood did exceed the cap and must be summarized:\n%s", out.String())
+	}
+}
+
+// TestVerifyDiagnostics_EveryKindIsDeclared fails the build for a capped diagnostic added
+// without its noun and remedy: the summary is what accounts for the lines a cap elides, so a
+// half-written entry drops them silently — the exact failure the cap exists to avoid.
+func TestVerifyDiagnostics_EveryKindIsDeclared(t *testing.T) {
+	t.Parallel()
+	for kind := range cappedDiagnostics {
+		d := cappedDiagnostics[kind]
+		if d.noun == "" {
+			t.Errorf("cappedDiagnostics[%d]: noun must be declared", kind)
+		}
+		if d.remedy == "" {
+			t.Errorf("cappedDiagnostics[%d]: remedy must be declared", kind)
+		}
+	}
+}
+
 // TestVerifyLog_SuppressedUnsignedSummarySurvivesScanAbort pins the accounting line's one
 // gap: an aborted scan (an over-cap line mid-archive — the corrupted-log case an incident
 // responder is most likely in) must still print the elided-unsigned summary before the
@@ -2715,7 +2824,7 @@ func TestVerifyLog_SuppressedUnsignedSummarySurvivesScanAbort(t *testing.T) {
 	keyPath := filepath.Join(dir, "audit.key")
 
 	var log bytes.Buffer
-	for i := 0; i < maxUnsignedDiagnostics+5; i++ {
+	for i := 0; i < maxRecordDiagnostics+5; i++ {
 		fmt.Fprintf(&log, `{"seq":%d,"decision":"allow"}`+"\n", i+1)
 	}
 	// An over-cap line aborts the scan (bufio.ErrTooLong) after the unsigned prefix.

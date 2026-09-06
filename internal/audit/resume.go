@@ -827,7 +827,16 @@ func readLastAuditLine(path string) (string, error) {
 	// attacker-chosen bytes — or, for a planted FIFO, block forever inside open(2).
 	f, err := openDiscoveredAuditFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// errors.Is, not os.IsNotExist: the latter does not unwrap, and this error reaches us
+		// through openDiscoveredAuditFile, which passes os.OpenFile's raw *fs.PathError along
+		// only by convention — its other caller (verify.go's lazy chain reader) wraps that
+		// same error with %w, which is the natural move here too. If it is ever made, the
+		// non-unwrapping test stops matching and a sibling pruned between the directory
+		// listing and this read reads as UNREADABLE rather than absent: the caller then fails
+		// closed on every startup that races retention, seeding past the on-disk maximum and
+		// stamping chain_resume_failed. keys.go's LoadOrCreateKeys and
+		// highestSeqAcrossChainCapped were converted for exactly this reason.
+		if errors.Is(err, fs.ErrNotExist) {
 			// Absent file: the normal brand-new-install / freshly-rotated case, not an
 			// I/O error. Report empty so the caller resumes from genesis or a sibling.
 			return "", nil

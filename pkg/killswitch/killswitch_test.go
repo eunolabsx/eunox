@@ -130,6 +130,26 @@ func TestInMemory_SessionKillSwitch(t *testing.T) {
 	assert.False(t, blocked)
 }
 
+// TestInMemory_SessionKillIsDurable pins the residual InMemory documents: the session axis
+// declares `expires`, but that lifetime is the Redis backend's key TTL and this backend has
+// none — a killed session stays killed until a revive or Reset. Asserted rather than left to
+// the doc comment so a sweep added later has to change a test that says why the stop is
+// durable, instead of silently withdrawing a revocation on a lifetime nobody configured.
+func TestInMemory_SessionKillIsDurable(t *testing.T) {
+	ks := killswitch.NewInMemory()
+	ctx := context.Background()
+
+	require.NoError(t, ks.KillSession(ctx, "sess-durable"))
+
+	st, err := ks.Status(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, st.KilledSessions, "sess-durable")
+
+	blocked, err := ks.ShouldBlock(ctx, killswitch.Subject{SessionID: "sess-durable"})
+	require.NoError(t, err)
+	assert.True(t, blocked, "an in-memory session kill must not lapse on its own")
+}
+
 func TestInMemory_Reset(t *testing.T) {
 	ks := killswitch.NewInMemory()
 	ctx := context.Background()
