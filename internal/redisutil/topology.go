@@ -18,8 +18,9 @@
 // and a multi-key EVAL routed to one server of several splits a quota bucket's accounting and
 // enforces its limit at a multiple of the declared value. Neither announces itself — client-side
 // sharding raises no CROSSSLOT, the shards being standalone servers — so both are fail-open and
-// silent, and each package offers a declaring option for the consumer who knows what their
-// decorator wraps.
+// silent. Each package offers a SINGLE-NODE declaration for the consumer who knows their wrapper
+// fronts one server; only the kill switch has a sharded one, a keyless SCAN being able to fan out
+// where a multi-key EVAL cannot.
 package redisutil
 
 import (

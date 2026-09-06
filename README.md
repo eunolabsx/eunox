@@ -504,10 +504,20 @@ Use a single node, or Sentinel for failover. The same refusal covers *client-sid
 sharding (a `redis.Ring`), which is the more dangerous half: a cluster rejects the
 script outright, while a ring routes it by its first key and runs it whole on one
 standalone shard — so one quota bucket's spend splits across servers and its limit
-is enforced once per shard, with nothing to report it. A library consumer wiring
-these backends behind a metrics or tracing decorator, which no type check can see
-through, is refused too and declares the topology with
-`callcounter.WithSingleNodeKeyspace()` / `killswitch.WithSingleNodeKeyspace()`.
+is enforced once per shard, with nothing to report it.
+
+The rest of this paragraph applies only when **embedding these packages**, not to
+anything reachable through `--redis-addr` — the binary builds a plain single-node
+client. A consumer passing a client whose concrete type says nothing (their own
+`redis.Cmdable`, or a hand-rolled forwarding wrapper; go-redis' own tracing and
+metrics hooks do not change the type and are unaffected) is refused too, and
+declares the topology with `callcounter.WithSingleNodeKeyspace()` /
+`killswitch.WithSingleNodeKeyspace()` — **only if the wrapper really fronts one
+server.** The declaration is believed, not verified: declared over a wrapper that
+fronts a ring it reproduces both fail-opens in full, split quota accounting and a
+partial kill set served as complete. A wrapper fronting a ring has no supported
+declaration for the counter at all; the kill switch takes
+`killswitch.WithShardFanOut(killswitch.RingFanOut(ring))`.
 
 > **The Redis kill switch fails closed during a Redis outage by default —
 > monitor Redis health.** The kill switch is checked on the request hot path from

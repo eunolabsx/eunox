@@ -40,6 +40,13 @@ func NewRedisForTest(tb testing.TB, client redis.Cmdable, opts ...RedisOption) *
 	return r
 }
 
+// RedisWindowKeyForTest exposes the physical Redis key one (bucket key, window) collapses to, so
+// the external test package can ask go-redis WHICH SHARD a bucket routes to in-process rather than
+// discovering it with a probe loop against live servers. Compiled only under `go test`.
+func RedisWindowKeyForTest(key string, windowSec int) string {
+	return redisWindowKey(key, windowSec)
+}
+
 // ParseAdmitAllReply exposes the unexported AdmitAll reply decoder to the external test
 // package so the fail-closed type-assertion behaviour can be tested with crafted replies (a
 // wrong element type can't be produced through the real Lua script via miniredis). The

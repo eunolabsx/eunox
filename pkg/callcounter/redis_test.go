@@ -147,8 +147,12 @@ func TestNewRedis_AcceptsADeclaredSingleNodeKeyspace(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, counter)
 
+	// TWO buckets, not one: the declaration's whole claim is that AdmitAll's MULTI-key EVAL reaches
+	// every key it names, and a one-key script reaches its one key on every topology — including the
+	// wrapped ring this refusal exists to keep out.
 	admitted, _, _, _, err := counter.AdmitAll(context.Background(), []capability.QuotaBucket{
-		{Key: "declared-single-node", WindowSec: 60, Counted: true, Limit: 1},
+		{Key: "declared-single-node-a", WindowSec: 60, Counted: true, Limit: 1},
+		{Key: "declared-single-node-b", WindowSec: 30, Counted: true, Limit: 1},
 	})
 	require.NoError(t, err)
 	assert.True(t, admitted, "a declared single-node keyspace must be usable, not merely constructible")
@@ -171,49 +175,74 @@ func TestClientSideSharding_SplitsOneBucketsAccountingWithNoCrossSlot(t *testing
 	ring := redis.NewRing(&redis.RingOptions{
 		Addrs:       map[string]string{"a": shardA.Addr(), "b": shardB.Addr()},
 		DialTimeout: 200 * time.Millisecond,
+		// Liveness detection is disabled, not tuned: three missed pings vote a shard down and
+		// REBALANCE the consistent hash, which would move key placement between the lookup below
+		// and the batches. What is under test is routing, not go-redis' health tracking.
+		HeartbeatFn: func(context.Context, *redis.Client) bool { return true },
 	})
 	t.Cleanup(func() { _ = ring.Close() })
 
+	// The declaration is FALSE, and saying so is the only way to reach the shape now refused at
+	// construction.
 	counter, err := callcounter.NewRedis(decoratedClient{Cmdable: ring}, callcounter.WithSingleNodeKeyspace())
 	require.NoError(t, err)
 
 	// Which server a key lands on is go-redis' consistent hashing, not this package's contract, so
-	// the pair is DISCOVERED: admit each candidate alone and see which shard gained the set.
+	// the pair is LOOKED UP rather than probed: GetShardClientForKey answers in-process, where a
+	// probe loop needs round trips and carries a residual "they all landed on one shard" flake.
+	shardAddrOf := func(bucketKey string) string {
+		shard, lookupErr := ring.GetShardClientForKey(callcounter.RedisWindowKeyForTest(bucketKey, 60))
+		require.NoError(t, lookupErr)
+		return shard.Options().Addr
+	}
 	var onA, onB string
 	for i := 0; i < 24 && (onA == "" || onB == ""); i++ {
 		key := "split-probe-" + strconv.Itoa(i)
-		admitted, _, _, _, probeErr := counter.AdmitAll(ctx, []capability.QuotaBucket{{Key: key, WindowSec: 60, Counted: true, Limit: 8}})
-		require.NoError(t, probeErr)
-		require.True(t, admitted)
-		if len(shardA.Keys()) > 0 && onA == "" {
-			onA = key
+		switch shardAddrOf(key) {
+		case shardA.Addr():
+			if onA == "" {
+				onA = key
+			}
+		case shardB.Addr():
+			if onB == "" {
+				onB = key
+			}
 		}
-		if len(shardB.Keys()) > 0 && onB == "" {
-			onB = key
-		}
-		shardA.FlushAll()
-		shardB.FlushAll()
 	}
 	require.NotEmpty(t, onA)
 	require.NotEmpty(t, onB, "the ring placed 24 keys on one shard; the pair this test needs was never found")
 
 	// Same two buckets, same limit of one call each, differing only in which is FIRST.
-	batch := func(first, second string) (bool, error) {
-		admitted, _, _, _, admitErr := counter.AdmitAll(ctx, []capability.QuotaBucket{
+	batch := func(c capability.CallCounter, first, second string) (bool, error) {
+		admitted, _, _, _, admitErr := c.AdmitAll(ctx, []capability.QuotaBucket{
 			{Key: first, WindowSec: 60, Counted: true, Limit: 1},
 			{Key: second, WindowSec: 60, Counted: true, Limit: 1},
 		})
 		return admitted, admitErr
 	}
 
-	admitted, err := batch(onA, onB)
+	// The control, run FIRST so the finding below is a differential rather than a bare pass: on one
+	// keyspace the identical second batch DENIES, both buckets having been spent by the first.
+	single := miniredis.RunT(t)
+	singleClient := redis.NewClient(&redis.Options{Addr: single.Addr()})
+	t.Cleanup(func() { _ = singleClient.Close() })
+	control, err := callcounter.NewRedis(singleClient)
+	require.NoError(t, err)
+	admitted, err := batch(control, onA, onB)
+	require.NoError(t, err)
+	require.True(t, admitted)
+	admitted, err = batch(control, onB, onA)
+	require.NoError(t, err)
+	require.False(t, admitted, "one keyspace must deny the second batch; without this the assertion below proves nothing about sharding")
+
+	admitted, err = batch(counter, onA, onB)
 	require.NoError(t, err, "client-side sharding raises no CROSSSLOT: the script runs whole on the first key's standalone shard")
 	require.True(t, admitted)
 
-	admitted, err = batch(onB, onA)
+	admitted, err = batch(counter, onB, onA)
 	require.NoError(t, err)
 	assert.True(t, admitted,
-		"both buckets were spent by the first batch, so a single keyspace would have denied here; admitting is the split accounting the refusal exists to prevent")
+		"the control just denied this exact batch on one keyspace; admitting it here is the split accounting the refusal exists to prevent")
 	assert.Len(t, shardA.Keys(), 2, "the first batch wrote both buckets to the shard its first key selected")
 	assert.Len(t, shardB.Keys(), 2,
 		"each batch wrote BOTH buckets to its own routed shard, so one bucket's limit is now enforced once per server")
@@ -228,20 +257,86 @@ func TestClientSideSharding_SplitsOneBucketsAccountingWithNoCrossSlot(t *testing
 // other half: ErrClusterUnsupported would tell them to wire the single-node client they believe
 // they already declared.
 func TestNewRedis_RefusesADeclarationContradictingTheClient(t *testing.T) {
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000", "127.0.0.1:7001"}})
+	t.Cleanup(func() { _ = cluster.Close() })
+	ring := redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"}})
+	t.Cleanup(func() { _ = ring.Close() })
+
 	for _, tc := range []struct {
-		name   string
-		client redis.Cmdable
+		name     string
+		client   redis.Cmdable
+		wantType string
 	}{
-		{"cluster", redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000", "127.0.0.1:7001"}})},
-		{"ring", redis.NewRing(&redis.RingOptions{Addrs: map[string]string{"a": "127.0.0.1:7000", "b": "127.0.0.1:7001"}})},
+		{"cluster", cluster, "*redis.ClusterClient"},
+		{"ring", ring, "*redis.Ring"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			counter, err := callcounter.NewRedis(tc.client, callcounter.WithSingleNodeKeyspace())
 			require.ErrorIs(t, err, callcounter.ErrTopologyContradicted)
 			require.Nil(t, counter, "an obeyed declaration here is the fail-open the refusal exists to close")
 			require.Contains(t, err.Error(), "declared single-node, but the client's own type is sharded")
+			// The distinct sentinel's whole justification: construction is refused either way, so
+			// what it buys is NOT being told to wire the single-node client one believes one
+			// declared. That is only true while the cluster sentinel is absent from the chain.
+			require.NotErrorIs(t, err, callcounter.ErrClusterUnsupported,
+				"the declaration is the bug here, not the client; ErrClusterUnsupported's remedy would send the consumer to fix the wrong one")
+			require.Contains(t, err.Error(), "got "+tc.wantType,
+				"the remedy is to pass the client the declaration describes, and a Ring and a ClusterClient need different ones")
 		})
 	}
+}
+
+// TestNewRedis_AcceptsADeclarationAgreeingWithTheClient pins the switch's one implicit arm: a
+// declaration that RESTATES what the concrete type already establishes is redundant, not a
+// conflict.
+//
+// It is the wiring the option's own doc encourages — one spelling for both backends — reached the
+// moment a consumer drops their wrapper and leaves the declaration in, and it matches no case in
+// resolveTopology, so nothing but this test stops a later tightening from refusing it. The kill
+// switch pins the same cell.
+func TestNewRedis_AcceptsADeclarationAgreeingWithTheClient(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	counter, err := callcounter.NewRedis(client, callcounter.WithSingleNodeKeyspace())
+	require.NoError(t, err)
+	require.NotNil(t, counter)
+}
+
+// TestNewRedis_NilClientOutranksADeclaration pins the precedence a declaration must not be able to
+// invert: a nil client classifies UNKNOWN, which is exactly the value the declaration fills, so
+// without the guard inside resolveTopology a declared nil handle settles as single-node,
+// constructs, and panics inside go-redis on the first admission.
+func TestNewRedis_NilClientOutranksADeclaration(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		client redis.Cmdable
+	}{
+		{"untyped nil", nil},
+		{"typed-nil single node", (*redis.Client)(nil)},
+		{"typed-nil ring", (*redis.Ring)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			counter, err := callcounter.NewRedis(tc.client, callcounter.WithSingleNodeKeyspace())
+			require.Error(t, err)
+			require.Nil(t, counter)
+			require.Contains(t, err.Error(), "nil Redis client")
+		})
+	}
+}
+
+// TestNewRedis_RefusesANilOption pins the seam the exported option type opened: a caller assembling
+// options conditionally can hold a nil one, and calling it is a panic inside the constructor every
+// other bad input is refused at.
+func TestNewRedis_RefusesANilOption(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	counter, err := callcounter.NewRedis(client, nil)
+	require.ErrorContains(t, err, "nil RedisOption")
+	require.Nil(t, counter)
 }
 
 // fakeServerInfo answers INFO with a canned reply, so the clustered branch is reachable
