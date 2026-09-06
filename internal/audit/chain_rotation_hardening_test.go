@@ -365,3 +365,54 @@ func TestInterpretAuditTail_RefusesAnUnboundedLeadingRecord(t *testing.T) {
 		t.Fatalf("interpretAuditTail = %q, want the last complete record", line)
 	}
 }
+
+// TestWhitespaceOnlyWindow_BothTailReadersRefuseIdentically pins the fail-closed answer
+// both tail readers owe a scan window that trimmed away entirely without starting at file
+// offset 0. The two exist so the startup path and the read-only path cannot drift on what
+// "the last record" means, and this check plus its wording were spelled out at both; the
+// test drives the readers rather than the helper so a site that stops calling it fails
+// here rather than passing on the helper's own behavior.
+func TestWhitespaceOnlyWindow_BothTailReadersRefuseIdentically(t *testing.T) {
+	const start = 64
+	window := []byte("   \n\t\n")
+	size := int64(start + len(window))
+
+	// The read-only reader (rotated-sibling resume): no handle to re-anchor with, so a
+	// silent ("", nil) makes the caller skip to an older sibling and resume the chain
+	// short of this file's seqs.
+	gotLine, readErr := interpretAuditTail(window, len(window), nil, size, start)
+	if gotLine != "" || !errors.Is(readErr, errAuditTailUnbounded) {
+		t.Fatalf("interpretAuditTail = (%q, %v), want errAuditTailUnbounded", gotLine, readErr)
+	}
+
+	// The startup reader (active log, through the open append handle).
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := os.WriteFile(path, append(bytes.Repeat([]byte("x"), start), window...), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only handle in a test
+	gotLine, windowErr := tailLineFromWindow(f, window, start, size, int64(len(window)))
+	if gotLine != "" || !errors.Is(windowErr, errAuditTailUnbounded) {
+		t.Fatalf("tailLineFromWindow = (%q, %v), want errAuditTailUnbounded", gotLine, windowErr)
+	}
+
+	if readErr.Error() != windowErr.Error() {
+		t.Errorf("the two readers refuse the same window differently:\n  read-only: %v\n  startup:   %v", readErr, windowErr)
+	}
+	if !strings.Contains(readErr.Error(), "entire window is whitespace") {
+		t.Errorf("refusal = %v, want it to name the window it refused", readErr)
+	}
+
+	// A window that DOES begin at file offset 0 is authoritative: an all-whitespace log is
+	// genuinely empty, and ("", nil) is the answer both readers must keep giving for it.
+	if line, err := interpretAuditTail(window, len(window), nil, int64(len(window)), 0); line != "" || err != nil {
+		t.Errorf("interpretAuditTail at offset 0 = (%q, %v), want (\"\", nil)", line, err)
+	}
+	if line, err := tailLineFromWindow(f, window, 0, int64(len(window)), int64(len(window))); line != "" || err != nil {
+		t.Errorf("tailLineFromWindow at offset 0 = (%q, %v), want (\"\", nil)", line, err)
+	}
+}

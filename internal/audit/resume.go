@@ -76,17 +76,11 @@ func interpretAuditTail(buf []byte, n int, readErr error, size, start int64) (st
 		// same input the active log refuses.
 		return "", fmt.Errorf("%w (%d bytes scanned from offset %d, the last record's leading boundary is outside the window)", errAuditTailUnbounded, n, start)
 	}
-	if line == "" && start != 0 {
-		// The entire tail window trimmed away as whitespace (a run of blank lines/spaces
-		// filling the whole scan window) and the window did not begin at file offset 0: a
-		// real record may sit further back than this window reaches. Reporting ("", nil)
-		// here reads as "the file is empty," which for a rotated sibling means the caller
-		// (newestRotatedSiblingWithTail) silently skips to an older sibling and the chain
-		// resumes short of this file's actual seqs — a tamper-shaped duplicate-seq cascade
-		// with no chain_resume_failed marker, the one tail anomaly the package's own
-		// invariant says must never be silent. Fail closed exactly as the newline-less
-		// overflow case does: the boundary cannot be located within the window.
-		return "", fmt.Errorf("%w (%d bytes scanned from offset %d, entire window is whitespace)", errAuditTailUnbounded, n, start)
+	// This caller has no handle to re-read through, so the refusal is final: for a rotated
+	// sibling a silent ("", nil) would make newestRotatedSiblingWithTail skip to an older
+	// sibling and resume the chain short of this file's actual seqs.
+	if err := refuseWhitespaceOnlyWindow(line, n, start); err != nil {
+		return "", err
 	}
 	return line, nil
 }
@@ -131,6 +125,24 @@ func lastCompleteLineFromTail(buf []byte) (line string, bounded bool) {
 		return string(bytes.TrimSpace(trimmed[i+1:])), true
 	}
 	return string(bytes.TrimSpace(trimmed)), false
+}
+
+// refuseWhitespaceOnlyWindow is the fail-closed answer both tail readers owe a scan window
+// that trimmed away entirely (a run of blank lines or spaces filling it) without starting at
+// file offset 0: a real record may sit further back than the window reaches, and reporting
+// ("", nil) reads as "the file is empty" — which restarts the chain from genesis or rewinds
+// it past seqs the file holds, a tamper-shaped duplicate-seq cascade and the one tail anomaly
+// that writes no chain_resume_failed marker. Returns nil when the window can answer.
+//
+// One implementation for the same reason lastCompleteLineFromTail is: these two readers exist
+// so the startup path and the read-only path cannot drift on what "the last record" means, and
+// the check plus its wording were spelled out at both. scanned is each caller's own window
+// length (they differ) so the diagnostic still names the window actually refused.
+func refuseWhitespaceOnlyWindow(line string, scanned int, start int64) error {
+	if line != "" || start == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w (%d bytes scanned from offset %d, entire window is whitespace)", errAuditTailUnbounded, scanned, start)
 }
 
 // recoverWrittenSize recovers the byte count the rotation threshold resumes from on
@@ -413,14 +425,11 @@ func tailWindowStart(size, win int64) int64 {
 // exactly one record, in which case the window starts at 0 and is authoritative.
 func tailLineFromWindow(f *os.File, window []byte, start, size, winSize int64) (string, error) {
 	line, bounded := lastCompleteLineFromTail(window)
-	if line == "" && start != 0 {
-		// The whole window trimmed away as whitespace and the window did not begin at
-		// file offset 0: re-reading with the same winSize would recompute the identical
-		// start (tailWindowStart is a pure function of size and winSize, and size has not
-		// shrunk in this call path), so it cannot resolve the ambiguity. A real record may
-		// exist before this window; reporting "" would read as an empty log and silently
-		// rewind the chain. Fail closed like the newline-less overflow case below.
-		return "", fmt.Errorf("%w (%d bytes scanned from offset %d, entire window is whitespace)", errAuditTailUnbounded, len(window), start)
+	// Refused rather than re-read: re-reading with the same winSize would recompute the
+	// identical start (tailWindowStart is a pure function of size and winSize, and size has
+	// not shrunk in this call path), so a second read cannot resolve the ambiguity.
+	if err := refuseWhitespaceOnlyWindow(line, len(window), start); err != nil {
+		return "", err
 	}
 	if bounded || start == 0 {
 		return line, nil
