@@ -94,12 +94,22 @@ type auditRecord struct {
 	// decision time (carriedLabels), so a source->sink flow reconstructs from the tape
 	// alone. Both span the two-axis vocabulary — a native provenance class, or an
 	// imported "namespace:value" sensitivity class — so they are no longer members of a
-	// five-element set; they still need no length bound of their own, for the reason that
-	// always carried the claim: every entry is written by the POLICY's own labelOutput
-	// directives, never free-form and never IdP- or argument-sourced, so the manifest
-	// bounds them. The externally-supplied lists that do NOT have that guarantee are
-	// bounded at their own boundary (capability.MaxExternalFlowLabels) and reach a
-	// denial's Details, not these fields.
+	// five-element set.
+	//
+	// Every entry is written by the POLICY's own labelOutput directives, never free-form
+	// and never IdP- or argument-sourced, and the manifest loader bounds each label's
+	// bytes and each authored list's COUNT (capability.MaxAuthoredFlowLabels). That is
+	// what keeps a caller from driving these fields — but it bounds NEITHER field, both
+	// being unions the loader does not cap the multiplicand of: labelsOut unions every
+	// labelOutput on the matched constraint and, on the principal-blind legs, across
+	// every capability naming the target; carriedLabels unions every labelOutput the
+	// anchor has accrued over its life. A manifest whose every authored list sits at the
+	// cap still reaches any size the file cap allows. The slices are therefore bounded
+	// here too, like Obligations (boundAuditLabels), so the scan-window invariant
+	// auditScanBufferBytes states is enforced rather than argued from a load-time cap
+	// that covers neither union. The externally-supplied lists with no policy-authored
+	// guarantee at all are bounded at their own boundary
+	// (capability.MaxExternalFlowLabels) and reach a denial's Details, not these fields.
 	// Present only on flow-relevant decisions; omitted otherwise.
 	LabelsOut     []string `json:"labels_out,omitempty"`
 	CarriedLabels []string `json:"carried_labels,omitempty"`
@@ -237,7 +247,8 @@ type Sink struct {
 
 	// queuedBytes tracks the approximate heap held by records awaiting the drainer.
 	// The 4096-slot channel bounds the record COUNT, but each record can carry up to
-	// ~1.1 MiB (Details + Obligations), so the count bound alone permits ~4.3 GiB of
+	// ~1.25 MiB (Details, Obligations and the two label slices — the bounded
+	// variable-length fields queueSize walks), so the count bound alone permits ~5.1 GiB of
 	// retained heap when a slow disk meets audit-mode large-argument logging — enough
 	// to OOM the proxy, taking down enforcement and the audit trail together. This
 	// counter adds an aggregate BYTE bound (auditQueueByteBudget): the enqueue path
@@ -316,7 +327,7 @@ type Sink struct {
 	// that pass's outcome, so no branch inside either can leave its subsystem's status
 	// stale by forgetting to report. Guarded by maintenanceStallMu (written only by the
 	// drainer, since rotation and pruning are drainer-only; read by any goroutine via
-	// MaintenanceStalled) rather than kept lock-free: MaintenanceStalled's only caller is
+	// maintenanceStalled) rather than kept lock-free: its only caller is
 	// /healthz, /metrics, and doctor — never the request hot path — so an uncontended lock
 	// on every read costs nothing worth optimizing away.
 	maintenanceStallMu   sync.Mutex
@@ -898,10 +909,27 @@ func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{})
 }
 
 // auditScanBufferBytes is the line-buffer ceiling every audit-JSONL reader uses.
-// Details is capped at auditDetailsTotalCap (1 MiB) and the envelope is far
-// smaller, so every record stays well under this 4 MiB bound and never trips
+// Every VARIABLE-length field is capped so the sum provably fits: Details at
+// auditDetailsTotalCap (1 MiB), Obligations and each of the two flow-label slices at
+// their own totals (64 KiB each), and the envelope strings at auditEnvelopeFieldCap
+// apiece — so every record stays well under this 4 MiB bound and never trips
 // bufio.ErrTooLong. Centralizing ties the buffer to the record caps rather than
 // leaving independent literals that could drift past 4 MiB.
+//
+// The two kinds of cap are in DIFFERENT units, which anyone re-deriving the headroom
+// has to carry: Details and the three slices are capped by MARSHALED size, while
+// boundFieldTo caps RAW bytes, and a control- or `<`-dense envelope string encodes to
+// 6x its raw length. The envelope's real worst case is therefore ~6x the sum of its
+// caps, putting the true ceiling near 1.7 MiB rather than the ~1.3 MiB a naive sum
+// reads — still comfortably inside the window, but not by the margin the naive sum
+// suggests.
+//
+// The invariant has to hold for a record the WRITER legitimately produces, not just
+// for a hostile one: an over-window line is not merely unreadable here, it aborts the
+// whole pass (bufio.ErrTooLong, no per-record finding), and as a tail it takes the
+// window-clipped resume path on every restart. That is why each field carries a cap
+// of its own rather than the total being argued from what a policy is expected to
+// declare.
 const auditScanBufferBytes = 4 << 20
 
 // NewLineScanner returns a bufio.Scanner sized to hold one audit record, for the
@@ -1138,14 +1166,18 @@ func (s *Sink) Record(ctx context.Context, p RecordParams) {
 		// Bound obligations like Details, before enqueue. redactFields-style directives
 		// emit one obligation per match, so a crafted manifest can grow this slice past
 		// the 4 MiB scanner buffer and defeat the queue's per-record bound.
-		Obligations: boundAuditObligations(slices.Clone(p.Obligations)),
-		// Clone the label slices so the queued record owns immutable bytes (a caller
-		// mutation after Record returns cannot reach the serialized record), mirroring
-		// Obligations. No length bound: labels are drawn from the closed native
-		// vocabulary, not caller free-form text. slices.Clone(nil) is nil, so a non-flow
-		// decision keeps both fields omitted.
-		LabelsOut:     slices.Clone(p.LabelsOut),
-		CarriedLabels: slices.Clone(p.CarriedLabels),
+		//
+		// Bound BEFORE cloning, on all three: the bound returns the caller's slice only
+		// when it kept everything, so cloning the result owns exactly the same bytes as
+		// cloning the input while copying only what survived — and on the path these
+		// bounds exist for, the input is the multi-megabyte one. slices.Clone(nil) is
+		// nil and the bound leaves an empty slice alone, so a decision carrying neither
+		// keeps the fields omitted.
+		Obligations: slices.Clone(boundAuditObligations(p.Obligations)),
+		// Both label slices are bounded for the reason on auditRecord.LabelsOut: each is
+		// a union no per-list load-time cap bounds.
+		LabelsOut:     slices.Clone(boundAuditLabels(p.LabelsOut)),
+		CarriedLabels: slices.Clone(boundAuditLabels(p.CarriedLabels)),
 		KeyID:         s.keyID,
 	}
 
@@ -1342,7 +1374,7 @@ const auditDetailsTotalCap = 1 << 20 // 1 MiB
 
 // auditQueueByteBudget bounds the aggregate heap held by queued-but-undrained audit
 // records (see Sink.queuedBytes). 256 MiB is well above the working set of a healthy
-// drainer (which empties the queue continuously) yet far below the ~4.3 GiB the
+// drainer (which empties the queue continuously) yet far below the ~5.1 GiB the
 // 4096-slot count bound alone would permit, so a slow disk under large-argument load
 // sheds records (counted, tamper-evident) instead of OOM-ing the process.
 const auditQueueByteBudget = 256 << 20 // 256 MiB
@@ -1367,10 +1399,12 @@ const auditRecordEnvelopeEstimate = 512
 // identity claims, the route provenance triple, and the denial taxonomy an external
 // PolicyEvaluator supplies can together retain far more than a flat 512 saw. Under a
 // flood of such records the queue would hold many times the byte budget it is sized to
-// bound — the shed-instead-of-OOM guarantee the budget exists for. Labels are written
-// by the policy's own directives (see LabelsOut) rather than by a caller, so they are
-// counted for completeness, not bounds; so is the enforcement-point stamp, which this
-// process chooses once and repeats on every record.
+// bound — the shed-instead-of-OOM guarantee the budget exists for. The two label slices
+// are counted for that same reason, not the one this comment used to give
+// ("policy-authored, so counted for completeness"): a caller drives their ACCUMULATION
+// even though a policy authors their values, which is why they now carry a cap of their
+// own — see auditRecord.LabelsOut. The enforcement-point stamp is the one counted purely
+// for completeness, this process choosing it once and repeating it on every record.
 //
 // Fields writeRecord stamps (Seq, PrevHMAC, HMAC) must stay inside the flat
 // auditRecordEnvelopeEstimate and out of this walk; the stored charge makes that a
@@ -1577,14 +1611,58 @@ func marshalTruncationMarker(info map[string]interface{}) json.RawMessage {
 // realistic entries while keeping the record far below the window.
 const auditObligationsTotalCap = 64 << 10 // 64 KiB
 
-// boundAuditObligations caps the serialized size of an obligations slice. A slice
-// within auditObligationsTotalCap is returned unchanged; otherwise the leading
-// entries that fit are kept and a single "obligations_truncated:N" sentinel (N =
-// omitted count) is appended, keeping the record valid and the truncation visible.
-// Record() applies it before enqueue, like marshalAndBoundDetails.
-func boundAuditObligations(obligs []string) []string {
-	if len(obligs) == 0 {
-		return obligs
+// auditLabelsTotalCap bounds the marshaled size of EACH flow-label slice (LabelsOut,
+// CarriedLabels) for auditObligationsTotalCap's reason, reached a different way: the
+// manifest bounds one label's bytes and one authored LIST's count, but both fields are
+// unions of many such lists (see auditRecord.LabelsOut), so neither is bounded by it.
+// 64 KiB holds several hundred labels — orders of magnitude past any real flow — while
+// keeping both slices together a rounding error against the 4 MiB window.
+const auditLabelsTotalCap = 64 << 10 // 64 KiB
+
+// boundedList pairs a bounded slice field's cap with the word its truncation sentinel
+// is named for. ONE value rather than two parameters threaded side by side: the pair
+// must agree, and a transposed or mistyped call would put an "obligations_truncated:N"
+// entry in labels_out — a mislabelled field on a signed, append-only tape, which no
+// size assertion can catch while the two caps hold the same number.
+type boundedList struct {
+	cap  int
+	kind string
+}
+
+var (
+	obligationsList = boundedList{auditObligationsTotalCap, "obligations"}
+	// The sentinel this one can append ("labels_truncated:N") is not mistakable for a
+	// label. Not by the charset alone — an imported label's namespace excludes `_` — but
+	// because both producers VALIDATE: recordLabels refuses to write an unparseable label
+	// and peekSessionLabels refuses to evaluate a set holding one, so a foreign writer to
+	// a shared flow store cannot mint one either.
+	labelsList = boundedList{auditLabelsTotalCap, "labels"}
+)
+
+// boundAuditObligations caps an obligations slice at its field's budget.
+func boundAuditObligations(obligs []string) []string { return obligationsList.bound(obligs) }
+
+// boundAuditLabels caps one flow-label slice at its field's budget.
+func boundAuditLabels(labels []string) []string { return labelsList.bound(labels) }
+
+// bound caps the serialized size of one of the record's string slices. A slice within
+// the cap is returned unchanged; otherwise the leading entries that fit are kept and a
+// single "<kind>_truncated:N" sentinel (N = omitted count) is appended, keeping the
+// record valid and the truncation visible. Record() applies it before enqueue, like
+// marshalAndBoundDetails.
+//
+// ONE implementation for every bounded slice rather than a copy per field: the
+// arithmetic below is the load-bearing part (the reserved sentinel, the exact
+// JSON-encoded accounting, the early breaks), and a second copy is where a later
+// correction to it lands on one field and not the other.
+//
+// The result is the CALLER's slice on the pass-through arms and a fresh one otherwise,
+// so a caller that needs to own the bytes clones what comes back rather than what goes
+// in — on the truncating path the input is the large one.
+func (b boundedList) bound(items []string) []string {
+	totalCap := b.cap
+	if len(items) == 0 {
+		return items
 	}
 	const commaOverhead = 1 // one comma per entry (quotes are in the encoded length)
 	// Fast path: a cheap worst-case upper bound on the marshaled size — each input byte
@@ -1598,72 +1676,131 @@ func boundAuditObligations(obligs []string) []string {
 	// by one byte, matching the true `[`+entries+`]` size. Break early so a pathologically
 	// large entry cannot overflow the running sum into a false "fits".
 	upper := 1
-	for _, o := range obligs {
+	for _, o := range items {
 		upper += len(o)*6 + 2 + commaOverhead
-		if upper > auditObligationsTotalCap {
+		if upper > totalCap {
 			break
 		}
 	}
-	if upper <= auditObligationsTotalCap {
-		return obligs
+	if upper <= totalCap {
+		return items
 	}
-	// The cheap bound was exceeded (a large obligations slice). Only here do we pay the
-	// EXACT per-entry accounting (jsonEncodedStringLen marshals each string): if the slice
+	// The cheap bound was exceeded (a large slice). Only here do we pay the EXACT
+	// per-entry accounting (jsonEncodedStringLen marshals each string): if the slice
 	// still fits exactly, return it unchanged; otherwise truncate below.
-	total := 1
-	for _, o := range obligs {
+	//
+	// Break on the same rule the cheap loop does. Its 6x escape allowance means it trips
+	// at roughly a sixth of the real cap, so for the non-escaping entries these fields
+	// actually carry (a flow label is validated printable ASCII) this loop is reached
+	// while the slice still fits comfortably — and a session's carried set only grows, so
+	// without the break every later record on that anchor re-marshals every entry to
+	// re-establish an answer the first few hundred already gave, synchronously on the
+	// enforced request's goroutine.
+	total, fits := 1, true
+	for _, o := range items {
 		total += jsonEncodedStringLen(o) + commaOverhead
+		if total > totalCap {
+			fits = false
+			break
+		}
 	}
-	if total <= auditObligationsTotalCap {
-		return obligs
+	if fits {
+		return items
 	}
 	// Over budget: keep the prefix that fits, accounting each entry by its EXACT
 	// JSON-encoded length (quotes + escaping). A raw len(o) undercounts strings
 	// carrying ", \, or control chars, so the kept slice could still serialize over
-	// cap. Reserve room for the sentinel up front.
+	// cap. Reserve room for the sentinel up front, sized for the count THIS index would
+	// omit: hoisting it at its largest looks conservative and is, but it costs a real
+	// entry in the band where the omitted count loses a digit — a truncation one entry
+	// deeper than the budget requires, on a signed record.
+	//
+	// The per-entry length is bound once and used for both the test and the charge.
+	// Computing it twice was a second marshal of the same string per entry, and left the
+	// budget and what it charges as two expressions an edit could desynchronize.
 	used := 1
-	kept := make([]string, 0, len(obligs))
-	for i, o := range obligs {
-		omitted := len(obligs) - i
-		sentinel := fmt.Sprintf("obligations_truncated:%d", omitted)
-		reserve := jsonEncodedStringLen(sentinel) + commaOverhead
-		if used+jsonEncodedStringLen(o)+commaOverhead+reserve > auditObligationsTotalCap {
-			return truncatedObligations(kept, len(obligs))
+	// The result cannot exceed totalCap bytes and every entry costs at least `""` plus a
+	// comma, so cap/3 is an exact ceiling on what can be kept — sizing this to
+	// len(items) reserved a second full-length backing array for exactly the huge input
+	// this path exists to cut down.
+	kept := make([]string, 0, min(len(items), totalCap/3))
+	for i, o := range items {
+		enc := jsonEncodedStringLen(o) + commaOverhead
+		reserve := jsonEncodedStringLen(b.sentinel(len(items)-i)) + commaOverhead
+		if used+enc+reserve > totalCap {
+			return b.truncate(kept, len(items))
 		}
-		used += jsonEncodedStringLen(o) + commaOverhead
+		used += enc
 		kept = append(kept, o)
 	}
 	// Defensive: the total above exceeded the cap, and each per-entry check additionally
 	// reserves the sentinel, so the loop truncates before reaching here in practice.
-	// Returning kept (== obligs) is the safe fallback if it ever does.
+	// Returning kept (== items) is the safe fallback if it ever does.
 	return kept
 }
 
+// sentinel is the ONE spelling of the marker a truncated slice carries, so the reserve
+// arithmetic and the entry that actually lands in the record cannot be built from two
+// different formats.
+func (b boundedList) sentinel(omitted int) string {
+	return fmt.Sprintf("%s_truncated:%d", b.kind, omitted)
+}
+
 // jsonEncodedStringLen returns the byte count json.Marshal produces for s (quotes
-// plus escaping). boundAuditObligations uses it so accounting matches what lands in
+// plus escaping). boundedList.bound uses it so accounting matches what lands in
 // the record, not the raw UTF-8 length. Marshal of a string does not error; the
 // fallback (6 bytes/rune plus two quotes) is a conservative worst case.
+//
+// The plain-ASCII fast path is what keeps this off the heap: this is called per entry
+// on the enforced request's goroutine, and json.Marshal of a string allocates twice
+// (boxing into an interface, then copying the encode buffer). Both fields' entries are
+// overwhelmingly in that class — a flow label is validated printable ASCII, an
+// obligation is a directive name and a JSON path — so the common case measures with
+// integer arithmetic. Anything the encoder could treat specially falls through to
+// Marshal itself rather than being modelled here.
 func jsonEncodedStringLen(s string) int {
+	if plainASCIIJSON(s) {
+		return len(s) + 2
+	}
 	if b, err := json.Marshal(s); err == nil {
 		return len(b)
 	}
 	return len(s)*6 + 2
 }
 
-// truncatedObligations builds the kept prefix plus a single
-// "obligations_truncated:N" sentinel (N = total - len(kept)) and GUARANTEES the
-// result marshals within auditObligationsTotalCap. boundAuditObligations's
-// incremental budget already reserves room for the sentinel, but only by
-// arithmetic; this final re-marshal makes the invariant explicit, dropping trailing
-// kept entries (folded into N) until the encoding fits. Runs only on the rare
-// truncation path.
-func truncatedObligations(kept []string, total int) []string {
+// plainASCIIJSON reports whether every byte of s is one encoding/json copies verbatim,
+// so the encoded length is len(s)+2. Printable ASCII minus the five bytes the encoder
+// escapes: the two JSON-mandated ones and the three it escapes for HTML safety. DEL and
+// everything above it are excluded rather than reasoned about — multi-byte UTF-8, U+2028
+// and U+2029, and invalid bytes (which become U+FFFD) all change the length, and the
+// point of the predicate is that it needs no model of them.
+func plainASCIIJSON(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c >= 0x7f || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+	}
+	return true
+}
+
+// truncate builds the kept prefix plus a single "<kind>_truncated:N" sentinel (N =
+// total - len(kept)) and GUARANTEES the result marshals within the cap. bound's
+// incremental budget already reserves room for the sentinel, but only by arithmetic;
+// this final re-marshal makes the invariant explicit, dropping trailing kept entries
+// (folded into N) until the encoding fits. Runs only on the rare truncation path.
+//
+// The guarantee holds only for a cap that can hold the lone sentinel — the escape
+// hatch below returns it regardless — which every field's budget does by four orders
+// of magnitude. A field added with a cap near the sentinel's own length would need
+// that checked rather than assumed.
+func (b boundedList) truncate(kept []string, total int) []string {
 	for {
-		sentinel := fmt.Sprintf("obligations_truncated:%d", total-len(kept))
+		sentinel := b.sentinel(total - len(kept))
 		result := make([]string, 0, len(kept)+1)
 		result = append(result, kept...)
 		result = append(result, sentinel)
-		if encoded, err := json.Marshal(result); err == nil && len(encoded) <= auditObligationsTotalCap {
+		if encoded, err := json.Marshal(result); err == nil && len(encoded) <= b.cap {
 			return result
 		}
 		if len(kept) == 0 {
@@ -1785,9 +1922,6 @@ func bareTargetName(tt capability.TargetType, identifier string) string {
 // forgetting to report, and a call reporting rotation's own outcome can never touch
 // retention's field.
 func (s *Sink) setRotationStalled(reason string) {
-	if s == nil {
-		return
-	}
 	s.maintenanceStallMu.Lock()
 	s.rotationStallReason = reason
 	s.maintenanceStallMu.Unlock()
@@ -1796,15 +1930,12 @@ func (s *Sink) setRotationStalled(reason string) {
 // setRetentionStalled is setRotationStalled's mirror for retention pruning:
 // pruneRotated() calls this exactly once per pass, with whatever the pass established.
 func (s *Sink) setRetentionStalled(reason string) {
-	if s == nil {
-		return
-	}
 	s.maintenanceStallMu.Lock()
 	s.retentionStallReason = reason
 	s.maintenanceStallMu.Unlock()
 }
 
-// MaintenanceStalled reports whether size-triggered rotation or retention pruning has
+// maintenanceStalled reports whether size-triggered rotation or retention pruning has
 // stopped making progress, with the reason. Records are still being written and signed —
 // this is NOT an audit-integrity loss and deliberately does not feed the
 // --require-audit=strict gate (see AuditDegraded). It means the configured
@@ -1817,10 +1948,11 @@ func (s *Sink) setRetentionStalled(reason string) {
 // reason names each stalled subsystem, in a fixed rotation-then-retention order (never
 // "whichever failed most recently") so the reported text depends only on what is
 // currently wrong, not on the order the faults appeared in.
+//
+// Not nil-safe, like its two setters: Health returns early for a nil sink, and this
+// package's nil-tolerance lives at the read seams a consumer holding an optional sink
+// reaches.
 func (s *Sink) maintenanceStalled() (stalled bool, reason string) {
-	if s == nil {
-		return false, ""
-	}
 	s.maintenanceStallMu.Lock()
 	defer s.maintenanceStallMu.Unlock()
 	var parts []string
