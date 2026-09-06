@@ -227,7 +227,7 @@ func recordKillDrop(ctx context.Context, rec auditRecorder, deny *capability.Enf
 		identifier, method = auditIdentity(msg)
 	}
 	denial := normalizeDenial(deny.Denial)
-	details := subj.auditDetails(map[string]interface{}{detailTransport: string(leg)})
+	details := subj.auditDetails(transportLegDetail(leg))
 	rec.RecordDeny(ctx, subj.auditSessionID(), identifier, method, denial.Code, denial.ConditionType, details, false)
 }
 
@@ -1191,9 +1191,9 @@ func (fp serverRequestParams) recordForwardOutcome(ctx context.Context, identifi
 			// bucket suppressed this record.
 			if rec := fp.unblocker.report.recs.forCategory(catUndeliveredForward); rec != nil {
 				// Named for recordServerRequestDropped's reason, from the same leg vocabulary: this
-				// is the one drop record on the leg that used to name no site, so when the bucket
-				// suppressed one, the suppressed_refusal_scope rollup rode a record whose category
-				// could not be recovered — the misreading that stamp exists to prevent.
+				// record used to name no site, so when the bucket suppressed one, the
+				// suppressed_refusal_scope rollup rode a record whose category could not be
+				// recovered — the misreading that stamp exists to prevent.
 				rec.RecordDeny(ctx, fp.sessionID, identifier, method, capability.ErrCodeEnforcementError, "",
 					mergeAuditDetails(detail, transportLegDetail(fp.unblocker.report.legs.undelivered)), false)
 			}
@@ -1259,8 +1259,14 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 		// alone sets its rate: on a session whose host declared 2026-07-28, every server-initiated
 		// request it issues takes this arm, needing no host, no tracking and no delivery.
 		if rec := fp.unblocker.report.recs.forCategory(catUntranslatableServerRequest); rec != nil {
+			// Named for the reason every metered refusal on this leg is: an upstream drives this
+			// arm at its own rate, so when the bucket suppresses one the next record's
+			// suppressed_refusal_scope rollup would otherwise ride a record from which the category
+			// cannot be recovered — and this record's DENIAL CODE is the one the host-side revision
+			// refusal also writes, so the site is the only thing separating them on the tape.
 			rec.RecordDeny(ctx, fp.sessionID, identifier, method,
-				capability.ErrCodeUntranslatableAcrossRevisions, "", nil, false)
+				capability.ErrCodeUntranslatableAcrossRevisions, "",
+				transportLegDetail(fp.unblocker.report.legs.untranslatable), false)
 		}
 		fp.answerInitiator(ctx, mcp.ErrorResponse(msg.ID,
 			capability.JSONRPCCodeUnsupportedProtocolVersion, refused.Error()), answerUntranslatableLeg, msg.Method)

@@ -21,6 +21,7 @@ import (
 	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/drift"
 	"github.com/eunolabs/eunox/internal/pdp"
+	"github.com/eunolabs/eunox/pkg/callcounter"
 	"github.com/eunolabs/eunox/pkg/capability"
 	"github.com/eunolabs/eunox/pkg/enforcement"
 	"github.com/eunolabs/eunox/pkg/killswitch"
@@ -137,7 +138,7 @@ func makeJWKSServer(t *testing.T, keys ...testKey) *httptest.Server {
 type mcpClaimSetForTest struct {
 	Version      string    `json:"v"`
 	Capabilities *[]string `json:"capabilities,omitempty"` // nil ⟹ field absent
-	TaskID       string    `json:"task_id"`
+	TaskID       string    `json:"task_id,omitempty"`
 	AgentID      string    `json:"agent_id"`
 }
 
@@ -253,12 +254,26 @@ func newTestManifestPDP(caps ...capability.Constraint) *pdp.ManifestPDP {
 // kill-switch manager, for tests that pre-arm kills or share the manager
 // with a JWT wrapper.
 func newTestManifestPDPWithKS(ks killswitch.Manager, caps ...capability.Constraint) *pdp.ManifestPDP {
+	return newTestManifestPDPAnchored(ks, false, caps...)
+}
+
+// newTestManifestPDPAnchored is newTestManifestPDPWithKS with the engine anchored as a route is.
+//
+// Production derives BOTH from one value (BuildRoutes passes cfg.ResolvedTaskAnchoredState to
+// LoadUpstreamPDP and to the route), so a harness that anchors only the route runs a route/engine
+// disagreement production cannot produce — the very thing the worker key and the decision turn
+// resolve through one resolver to prevent.
+func newTestManifestPDPAnchored(ks killswitch.Manager, taskAnchored bool, caps ...capability.Constraint) *pdp.ManifestPDP {
 	manifest := &config.LocalManifest{
 		Name:         "test-policy",
 		Version:      "1.0.0",
 		Capabilities: caps,
 	}
-	return pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(), ks)
+	opts := []enforcement.Option{enforcement.WithCallCounter(callcounter.NewInMemory())}
+	if taskAnchored {
+		opts = append(opts, enforcement.WithTaskAnchoredState())
+	}
+	return pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(opts...), ks)
 }
 
 // auditToolEntry is a tool entry in audit mode whose allowedValues condition

@@ -249,3 +249,38 @@ the scope-key/revocation-key split, session creation on first enforced request,
 and the negotiation rule above. Implementation status is tracked in
 [the execution plan](../mcp-2026-07-28-execution.md), not here — a record that
 doubles as a status board goes stale while reading as binding.
+
+## Addendum (2026-09-06): the worker key on a task-anchored route
+
+Additive, per this directory's append-only rule: the decision above stands for
+what a worker is keyed ON — the resolved state anchor — and this records what
+that decision underdetermined for the arm added after it.
+
+**The stable caller identity is in the key on every arm.** Keying on the anchor
+alone is correct where the anchor IS that identity, which is the session arm and
+the only one the decision above had in view. On a task-anchored route the anchor
+is the validated `mcp.task_id` and nothing else, so two identities legitimately
+sharing a task — the shape task anchoring exists for — resolved one key: the
+first minted the worker, and every request from the second failed the owner
+binding with `AUTHORIZATION_FAILED`, for that worker's life. The worker key is
+therefore the anchor plus the identity wherever the two differ, giving one
+worker per (identity, task).
+
+This does not weaken the decision it amends. What two identities on a task
+SHARE is accumulated policy state, which the engine keys on the anchor itself
+and which no worker id can fragment; what a worker owns is one upstream and the
+claims captured with it, which two identities were never entitled to share. The
+invariant to preserve is the stronger reading of the original: the key is at
+least as fine as every per-session gate applied to it.
+
+**A worker id is bounded as a whole**, not only per component, at the tightest
+cap it must survive downstream — the bound `/control/kill` applies to a session
+id. An id past it is a worker the targeted emergency stop cannot name, and the
+audit tape's own cap would truncate away the digest that separates two callers.
+
+**Migration.** Task-anchored worker ids change shape, so a session-scoped
+revocation issued against an old id (a Redis tombstone outlives a restart)
+matches nothing after the upgrade, and old and new instances sharing one Redis
+derive different ids for the same caller mid-rollout. Re-issue such a kill
+against the new id, or use the agent or token dimension, which are unaffected.
+Session-anchored ids are unchanged.

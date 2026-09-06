@@ -133,20 +133,52 @@ func stableCallerIdentity(claims *pdp.JWTClaims) (string, bool) {
 // point every worker id is built is what makes "a worker id is printable and injective" a property
 // of the type rather than of remembering which arm produced it.
 //
-// The identity is APPENDED for an anchor that is not the identity itself, which today is the task
-// arm: the anchor alone is coarser than the owner binding every request on the worker must clear,
-// and the two shapes cannot collide because the kind component already separates them. The session
-// arm's anchor IS the identity (firstRequestWorkerKey resolves it as the session id), so appending
-// it there would double a component and change nothing.
+// The identity is APPENDED for an anchor that is not already the identity, which today is the task
+// arm: the anchor alone is coarser than the owner binding every request on the worker must clear.
+// The predicate is the REDUNDANCY itself rather than the anchor kind, which is only a proxy for it
+// (firstRequestWorkerKey resolves the session arm's anchor FROM this identity, so the two coincide
+// today): a kind whose id is something else — a minted id, a second caller, an anchor kind that
+// does not exist yet — would silently drop the identity again under a kind test, which is the
+// lockout this composition exists to close, reintroduced on whichever arm went unexamined.
 //
 // Unambiguous without escaping the other components: a route name matches `^[a-zA-Z0-9_-]+$` and
 // the anchor kind is a closed vocabulary, so neither can carry the `:` they are joined on.
 func workerKey(routeName string, anchor enforcement.StateAnchor, identity string) string {
 	key := routeName + ":" + string(anchor.Kind) + ":" + safeKeyComponent(anchor.ID)
-	if anchor.Kind == enforcement.AnchorKindSession {
+	if anchor.ID != identity {
+		key += ":" + safeKeyComponent(identity)
+	}
+	return boundWorkerKey(key)
+}
+
+// maxWorkerKeyBytes bounds a WHOLE worker id, as maxKeyComponentBytes bounds one component of it.
+//
+// Tied to maxClaimedSessionIDLen because that is the tighter of the two caps this id must survive
+// downstream, and the consequence of crossing it is silent: /control/kill refuses a session id over
+// that bound, on the premise that "an over-length id names no session this proxy ever minted" — so
+// a worker whose own derived id exceeds it is one the TARGETED emergency stop cannot name, leaving
+// only the global, agent and token dimensions. It is also under the audit tape's own
+// auditSessionIDCap, so the recorded session_id is the id rather than a truncation of it — and a
+// truncation is worse than long here, since the per-component digest that separates two callers is
+// at the END of the component the cut would land in.
+//
+// A per-component budget alone cannot hold this: the key is a route name plus up to two bounded
+// components, and one identity on one task already reaches 214 bytes with ordinary enterprise
+// claims (a tenant-scoped issuer, a UUID subject, a dated task id).
+const maxWorkerKeyBytes = maxClaimedSessionIDLen
+
+// boundWorkerKey cuts an over-length worker id and appends a digest of the WHOLE key, so two
+// workers whose ids share a prefix stay distinct across the cut — safeKeyComponent's rule one level
+// up, applied to the joined result rather than to one component, and kept separate from it because
+// the two budgets answer different questions (what one caller-supplied claim may cost, versus what
+// the id as a whole must fit in).
+func boundWorkerKey(key string) string {
+	if len(key) <= maxWorkerKeyBytes {
 		return key
 	}
-	return key + ":" + safeKeyComponent(identity)
+	sum := sha256.Sum256([]byte(key))
+	tail := "~" + hex.EncodeToString(sum[:8])
+	return key[:maxWorkerKeyBytes-len(tail)] + tail
 }
 
 // maxKeyComponentBytes bounds one caller-supplied component of a worker key.

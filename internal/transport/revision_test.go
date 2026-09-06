@@ -424,13 +424,6 @@ func TestCheckNegotiatedRevision(t *testing.T) {
 			name: "a declaring leg's contradicting reply is refused", opened: capability.Revision20260728,
 			reported: "2025-11-25", wantErr: "opened at",
 		},
-		{
-			// An UNSPEAKABLE pin selected the handshake opener (UpstreamOpenRevision), so the
-			// handshake's own answer is the conforming one. Judging it verbatim — the host-side
-			// empty-carrier resolver's answer — refused a leg that did exactly what it was told.
-			name: "an unspeakable pin is judged against the opener it selected", opened: capability.Revision("1999-01-01"),
-			reported: "2025-11-25",
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

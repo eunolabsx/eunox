@@ -409,10 +409,16 @@ Flags:
 
 // printWiretapBanners announces observe mode on stderr, and what it does NOT downgrade.
 //
-// Printed by cmdProxy after the last fail-closed flag guard rather than by resolveProxyConfig,
+// Printed by cmdProxy after the last fail-closed FLAG guard rather than by resolveProxyConfig,
 // which runs before them: `eunox proxy --audit --jwt-issuer x -- cmd` announced the mode twice and
 // then died on the JWKS guard, and in a supervisor log a banner reads as a proxy that came up.
 // Same parse-before-side-effects principle the guards themselves are ordered by.
+//
+// The residual is stated rather than claimed closed: the failures BELOW that point still print it
+// first — a Redis dial, an unopenable audit log, a bind, a mistyped upstream command. Moving the
+// announcement onto the ready hook (where the control-token write and the TTL publish already sit,
+// for this exact reason) would close them, at the cost of announcing the mode after the traffic it
+// describes can already arrive.
 func printWiretapBanners(w io.Writer) {
 	_, _ = fmt.Fprintf(w, "[eunox] WIRETAP MODE: audit-only, no policy — enforced-method calls are forwarded and recorded (…/list calls forwarded unfiltered and recorded as enumeration events). Use 'eunox stats' to inspect the tape.\n")
 	// Named rather than left to be discovered on the tape: observe mode downgrades POLICY
@@ -586,8 +592,8 @@ func cmdProxy(args []string) (exitCode int) {
 		return 1
 	}
 
-	// Past the last guard that can still refuse to start, and before the first side effect. See
-	// printWiretapBanners.
+	// Past the last FLAG guard, and before the first side effect. See printWiretapBanners for what
+	// this placement does not cover.
 	if *f.audit {
 		printWiretapBanners(os.Stderr)
 	}

@@ -1599,6 +1599,11 @@ func releaseSessionObjectState(sess *httpSession) {
 // (unregisterSession's answer); an unconditional release here was the fail-open twin of the
 // unconditional delete: a predecessor unparking after 2x shutdownMs un-quarantined the live
 // successor's broken surface pin and emptied its taint set.
+//
+// It must run AFTER releaseSessionObjectState's bounded in-flight drain, which is why
+// finishSessionCleanup calls them in that order: this Clear would otherwise empty the session's
+// taint between a source's committed Add and a sink still deciding on the same session — the
+// fail-open a teardown racing live decisions opens, and the reason the drain exists at all.
 func releaseSessionIDState(sess *httpSession) {
 	if sess.route == nil {
 		return

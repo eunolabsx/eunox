@@ -843,17 +843,22 @@ var (
 // field would let anyone forge kill records against an arbitrary session id; claimedSession(r)
 // keeps session_id empty and preserves it only as details.claimed_session_id.
 //
-// It is also the only CheckKill argument bounded by nothing but Go's ~1 MiB header cap, which is
-// why an over-length one short-circuits: the value flows into the kill store's key, so without
-// this an unauthenticated POST on an open bind mints a ~1 MiB Redis key per request. Refusing
-// loses no kill — an id this long names no session this proxy ever minted — and it is the rule
-// /control/kill already applies to the body form of the same value (maxClaimedSessionIDLen).
+// It is also the only CheckKill argument bounded by nothing but Go's ~1 MiB header cap, and the
+// value flows into the kill store's key, so an unauthenticated POST on an open bind would mint a
+// ~1 MiB Redis key per request. An over-length id is therefore BLANKED rather than skipping the
+// check: the session is the only dimension this id names, while the global, agent and token
+// dimensions are resolved from the request's own claims (killSubjectFromContext) and must still
+// answer — skipping would let a caller pad the header to turn an emergency stop's KILL_SWITCH deny
+// into a silent 404 and write nothing on the tape, during the incident the tape exists for.
+// Blanking is the shape the sessionless arms already pass (CheckKill(ctx, "")), and it loses no
+// session kill: an id over maxClaimedSessionIDLen names no worker this proxy can mint, which
+// maxWorkerKeyBytes holds by construction rather than by assumption.
 func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, sessionID string, msg mcp.RPCMsg) {
-	if len(sessionID) > maxClaimedSessionIDLen {
-		http.Error(w, "session not found", http.StatusNotFound)
-		return
+	killSubject := sessionID
+	if len(killSubject) > maxClaimedSessionIDLen {
+		killSubject = ""
 	}
-	deny := route.pdp.CheckKill(r.Context(), sessionID)
+	deny := route.pdp.CheckKill(r.Context(), killSubject)
 	if deny == nil {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
@@ -976,9 +981,11 @@ func recordSessionGateDeny(ctx context.Context, rec auditRecorder, sessionID, id
 	if rec == nil {
 		return
 	}
-	details := map[string]interface{}{detailTransport: string(leg)}
+	// Through mergeAuditDetails rather than assigning in: transportLegDetail answers nil for an
+	// unset leg, and a nil map is a panic to write into on a refusal path.
+	details := transportLegDetail(leg)
 	if gate.reason != "" {
-		details["reason"] = gate.reason
+		details = mergeAuditDetails(details, map[string]interface{}{"reason": gate.reason})
 	}
 	rec.RecordDeny(ctx, sessionID, identifier, method, gate.code, gate.conditionType, details, false)
 }

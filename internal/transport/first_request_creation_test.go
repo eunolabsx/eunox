@@ -283,7 +283,9 @@ func newDeclaringHostHarnessAnchored(t *testing.T, taskAnchored bool) *declaring
 	t.Cleanup(upSrv.Close)
 
 	h.ks = killswitch.NewInMemory()
-	inner := newTestManifestPDPWithKS(h.ks, capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
+	// Route AND engine from the one flag, as BuildRoutes pairs them: a harness that anchored only
+	// the route would exercise a disagreement production cannot produce.
+	inner := newTestManifestPDPAnchored(h.ks, taskAnchored, capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
 	jwtPDP, cleanup := makeJWTPDPWithInner(t, h.key, inner)
 	t.Cleanup(cleanup)
 
@@ -390,7 +392,9 @@ func (h *declaringHostHarness) tokenFor(t *testing.T, agentID string) string {
 }
 
 // tokenForTask is tokenFor plus the validated mcp.task_id a task-anchored route resolves its
-// anchor from. Empty leaves the claim absent, which is the ordinary session-anchored token.
+// anchor from. Empty leaves the claim genuinely ABSENT (the field is omitempty), which is both the
+// ordinary session-anchored token and the input the engine's anchorUnresolved arm is about — a
+// present-but-empty claim would pass whatever that arm did.
 func (h *declaringHostHarness) tokenForTask(t *testing.T, agentID, taskID string) string {
 	t.Helper()
 	sig, err := jose.NewSigner(
@@ -1161,4 +1165,48 @@ func TestFirstRequestCreation_TheTaskAnchoredWorkerKeyCarriesTheIdentityToo(t *t
 	identity, ok := stableCallerIdentity(pdp.JWTClaimsPtr(ctx))
 	require.True(t, ok)
 	assert.Equal(t, "r1:"+string(enforcement.AnchorKindSession)+":"+safeKeyComponent(identity), key)
+}
+
+// Separate workers still SHARE the task's accumulated state, which is the claim the split rests on.
+//
+// Giving two identities their own worker is only correct if it does not fragment what they share:
+// a worker owns an upstream and the claims captured with it, while quotas, flow labels and
+// antecedents accrue to the ANCHOR, which the engine resolves for itself from each request's
+// claims. If that were not so, the fix for the lockout would have bought availability by quietly
+// widening every budget on a task-anchored route.
+//
+// Driven through the PDP the route holds, anchored the way BuildRoutes anchors it, with the worker
+// keys asserted distinct in the same cell so the two facts are read together.
+func TestFirstRequestCreation_SeparateWorkersStillShareTheTaskBudget(t *testing.T) {
+	t.Parallel()
+	route := &UpstreamRoute{name: "r1", taskAnchored: true}
+	dp := newTestManifestPDPAnchored(killswitch.NewInMemory(), true, capability.Constraint{
+		Target:     "tool:read_file",
+		Actions:    []string{"call"},
+		Conditions: []capability.Condition{&capability.MaxCallsCondition{Count: 1, WindowSeconds: 60}},
+	})
+	claimsFor := func(sub, task string) *pdp.JWTClaims {
+		return &pdp.JWTClaims{Issuer: "https://idp", Subject: sub, AgentID: "agent-1", TaskID: task}
+	}
+	call := func(claims *pdp.JWTClaims) capability.EnforceResponse {
+		key, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), claims))
+		require.True(t, ok)
+		return dp.Decide(pdp.WithJWTClaims(context.Background(), claims), key,
+			pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"}, map[string]interface{}{}, "")
+	}
+
+	alice, bob := claimsFor("alice", "task-1"), claimsFor("bob", "task-1")
+	aliceKey, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), alice))
+	bobKey, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), bob))
+	require.NotEqual(t, aliceKey, bobKey, "the two identities must hold their own workers")
+
+	require.Equal(t, capability.DecisionAllow, call(alice).Decision, "the first call spends the task's one-call budget")
+	dec := call(bob)
+	assert.Equal(t, capability.DecisionDeny, dec.Decision,
+		"a second identity on the same task was served past a budget the task had already spent; the worker split fragmented the anchor's state")
+
+	// And a DIFFERENT task is a different budget, so the assertion above is about the anchor
+	// rather than about a globally exhausted counter.
+	assert.Equal(t, capability.DecisionAllow, call(claimsFor("carol", "task-2")).Decision,
+		"a distinct task must carry its own budget")
 }

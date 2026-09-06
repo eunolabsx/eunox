@@ -6892,31 +6892,48 @@ func TestHTTPForwardNotification_LocalModeWriteErrorIsReported(t *testing.T) {
 	}
 }
 
-// TestDenyUnresolvedSession_OverLengthSessionIDNeverReachesTheKillStore: an over-length
-// Mcp-Session-Id is answered with the plain 404 BEFORE the kill lookup runs.
+// subjectSpyKillSwitch wraps a real kill switch and records every subject ShouldBlock was asked
+// about, so a cell can assert on the value that reaches the store's KEY rather than only on the
+// answer that comes back.
+type subjectSpyKillSwitch struct {
+	killswitch.Manager
+	mu   sync.Mutex
+	seen []killswitch.Subject
+}
+
+func (k *subjectSpyKillSwitch) ShouldBlock(ctx context.Context, subj killswitch.Subject) (bool, error) {
+	k.mu.Lock()
+	k.seen = append(k.seen, subj)
+	k.mu.Unlock()
+	return k.Manager.ShouldBlock(ctx, subj)
+}
+
+func (k *subjectSpyKillSwitch) subjects() []killswitch.Subject {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return slices.Clone(k.seen)
+}
+
+// TestDenyUnresolvedSession_OverLengthSessionIDIsBlankedNotSkipped: the raw Mcp-Session-Id reaching
+// the kill store is bounded, and the check still RUNS.
 //
-// denyUnresolvedSession is the one CheckKill call site whose subject is the raw client header —
-// bounded by nothing but Go's ~1 MiB header cap — and it flows into the kill store's key, so an
-// unauthenticated POST on an open bind would mint a ~1 MiB Redis key per request. /control/kill
-// already refuses the body form of the same value for exactly this reason (maxClaimedSessionIDLen).
-//
-// Driven under an ACTIVE GLOBAL KILL, which is what makes the assertion about ordering rather than
-// about the answer: with the kill active, any id that reaches the lookup denies with KILL_SWITCH,
-// so a 404 here can only mean the length gate ran first. Nothing is served either way — an
-// over-length id names no session this proxy ever minted.
-func TestDenyUnresolvedSession_OverLengthSessionIDNeverReachesTheKillStore(t *testing.T) {
+// This is the only CheckKill call site whose subject is the unverified header, bounded by nothing
+// but Go's ~1 MiB header cap, and it becomes a store key — so an unauthenticated POST on an open
+// bind would mint a ~1 MiB Redis key per request. But the id names only the SESSION dimension:
+// global, agent and token revocations come from the request's own claims, so skipping the call
+// outright would let a caller pad the header to turn an emergency stop's KILL_SWITCH deny into a
+// silent 404 with nothing on the tape — during the incident the tape exists for.
+func TestDenyUnresolvedSession_OverLengthSessionIDIsBlankedNotSkipped(t *testing.T) {
 	t.Parallel()
-	ks := killswitch.NewInMemory()
-	if err := ks.ActivateGlobal(context.Background()); err != nil {
-		t.Fatalf("ActivateGlobal: %v", err)
-	}
+	spy := &subjectSpyKillSwitch{Manager: killswitch.NewInMemory()}
 	route := &UpstreamRoute{
 		name: "up1",
-		pdp:  newTestManifestPDPWithKS(ks, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
+		pdp:  newTestManifestPDPWithKS(spy, capability.Constraint{Target: "tool:*", Actions: []string{"call"}}),
 		sink: &routeSink{},
 	}
 	proxy := newTestHTTPProxy()
 	msg := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: "tools/call"}
+	huge := strings.Repeat("A", maxClaimedSessionIDLen+1)
 
 	post := func(sessionID string) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
@@ -6926,16 +6943,87 @@ func TestDenyUnresolvedSession_OverLengthSessionIDNeverReachesTheKillStore(t *te
 		return w
 	}
 
-	// The bound holds, so an ordinary unknown id still gets the kill contract's deny.
-	if w := post("short-and-unknown"); w.Code == http.StatusNotFound {
-		t.Fatal("a normal unknown id under a global kill must still deny with KILL_SWITCH, or this cell proves nothing")
+	if w := post(huge); w.Code != http.StatusNotFound {
+		t.Errorf("an unknown session must still 404 with no kill active; got %d (%s)", w.Code, w.Body.String())
+	}
+	for _, subj := range spy.subjects() {
+		if len(subj.SessionID) > maxClaimedSessionIDLen {
+			t.Fatalf("an unbounded client-supplied id reached the kill store as a %d-byte subject", len(subj.SessionID))
+		}
 	}
 
-	w := post(strings.Repeat("A", maxClaimedSessionIDLen+1))
-	if w.Code != http.StatusNotFound {
-		t.Errorf("an over-length session id must be refused before it becomes a kill-store key; got %d (%s)", w.Code, w.Body.String())
+	// The check still runs: under a global stop the padded id is denied KILL_SWITCH like every
+	// other request, rather than being answered a bare 404 that writes nothing.
+	if err := spy.ActivateGlobal(context.Background()); err != nil {
+		t.Fatalf("ActivateGlobal: %v", err)
 	}
-	if strings.Contains(w.Body.String(), capability.ErrCodeKillSwitch) {
-		t.Error("the kill lookup ran on an unbounded, client-supplied id")
+	w := post(huge)
+	if w.Code == http.StatusNotFound {
+		t.Fatalf("a global stop must deny a padded id too; a 404 means the header length skipped the check")
+	}
+	if !strings.Contains(w.Body.String(), capability.ErrCodeKillSwitch) {
+		t.Errorf("body = %s, want the KILL_SWITCH deny the kill contract promises", w.Body.String())
+	}
+}
+
+// A worker id this proxy MINTS always fits the bound that answers the previous cell, so the two
+// changes cannot collide: an over-length id really does name no session eunox created.
+//
+// The premise is load-bearing in two places — maxClaimedSessionIDLen's own rationale on
+// /control/kill ("an over-length id names no session this proxy ever minted", which decides whether
+// the TARGETED emergency stop can name a worker) and the blanking above — and the declaring path
+// derives worker ids from caller-supplied claims, so it is the one that can falsify it. Ordinary
+// enterprise claims on a task-anchored route reach 214 bytes before the whole-key bound.
+func TestWorkerKey_StaysNameableByTheTargetedKill(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("x", 4096)
+	for name, tc := range map[string]struct {
+		route  *UpstreamRoute
+		claims *pdp.JWTClaims
+	}{
+		"enterprise claims on a task-anchored route": {
+			route: &UpstreamRoute{name: "github-prod", taskAnchored: true},
+			claims: &pdp.JWTClaims{
+				Issuer:  "https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0",
+				Subject: "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+				AgentID: "research-assistant-01",
+				TaskID:  "run-2026-09-06T12:00:00Z-wf-42-step-7-attempt-1",
+			},
+		},
+		"every component absurd": {
+			route:  &UpstreamRoute{name: strings.Repeat("r", 300), taskAnchored: true},
+			claims: &pdp.JWTClaims{Issuer: long, Subject: long, AgentID: long, TaskID: long},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			key, ok := firstRequestWorkerKey(tc.route, pdp.WithJWTClaims(context.Background(), tc.claims))
+			if !ok {
+				t.Fatal("these claims carry a stable identity")
+			}
+			if len(key) > maxClaimedSessionIDLen {
+				t.Errorf("worker id is %d bytes; /control/kill refuses a session id over %d, so this worker could not be killed by id", len(key), maxClaimedSessionIDLen)
+			}
+			// Under the audit cap too, so the id an operator copies off the tape is the id, not a
+			// truncation whose cut lands in the digest that separates two callers.
+			if got := audit.SanitizeAuditField(key); got != key {
+				t.Errorf("the worker id must survive audit-field sanitization unchanged")
+			}
+		})
+	}
+
+	// Still INJECTIVE past the bound: the whole-key digest is what keeps two callers whose ids
+	// share a prefix from collapsing onto one worker, one upstream and one recorded session_id.
+	anchored := &UpstreamRoute{name: "r", taskAnchored: true}
+	keyFor := func(sub string) string {
+		key, ok := firstRequestWorkerKey(anchored, pdp.WithJWTClaims(context.Background(),
+			&pdp.JWTClaims{Issuer: strings.Repeat("i", 300), Subject: sub, AgentID: strings.Repeat("a", 300), TaskID: strings.Repeat("t", 300)}))
+		if !ok {
+			t.Fatal("these claims carry a stable identity")
+		}
+		return key
+	}
+	if keyFor("alice") == keyFor("bob") {
+		t.Error("two identities collapsed onto one worker id past the length bound")
 	}
 }

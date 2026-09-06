@@ -165,14 +165,8 @@ func TestUndeliveredServerRequest_RecordNamesItsSite(t *testing.T) {
 		})
 	}
 
-	// The two legs' values are DISTINCT, and distinct from the correction's: sharing one would put
-	// the categories back where a reader cannot tell them apart.
-	seen := map[transportLeg]bool{}
-	for _, leg := range []transportLeg{
-		httpServerRequestLegs.undelivered, stdioServerRequestLegs.undelivered, dropHTTPUndelivered,
-	} {
-		require.NotEmpty(t, leg, "every leg in the vocabulary names a site")
-		require.False(t, seen[leg], "two drop sites share the value %q", leg)
-		seen[leg] = true
-	}
+	// Distinctness across the vocabulary is NOT re-asserted here: TestTransportLeg_IsOneClosedVocabulary
+	// derives that from the declared constants and TestServerRequestLegs_EachTableNamesItsOwnTransport
+	// walks each table's fields reflectively, so a hand-listed copy here would cover a subset and go
+	// stale at the next disposition.
 }
