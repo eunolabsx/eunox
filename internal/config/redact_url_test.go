@@ -35,8 +35,32 @@ func TestRedactURL_ExactOutputs(t *testing.T) {
 		// placeholder rather than passed through — matching redactRawQuery's behavior
 		// on the unparseable path.
 		"https://h/p?verbose": "https://h/p?<redacted len=7>",
-		// A key= with an empty value carries no secret and is left as-is.
-		"https://h/p?flag=": "https://h/p?flag=",
+		// A BASE64-PADDED bare token is the same bare token: the trailing '=' used to read
+		// as a flag-style "key=" and pass the credential through verbatim. Two thirds of
+		// random token lengths pad, so this is most of the population the bare-token arm
+		// exists for.
+		"https://h/p?dG9rZW4=": "https://h/p?<redacted len=8>",
+		// Double padding beside a real parameter: the segment used to be split on its FIRST
+		// '=', redacting the one-byte "=" remainder and leaving the secret standing as the
+		// parameter name. The length covers the whole segment, not the trimmed value.
+		"https://h/p?a=1&c2VjcmV0dA==": "https://h/p?a=<redacted len=1>&<redacted len=12>",
+		// Percent-encoded padding never reached the flag-style arm (no literal '='), and
+		// still reports the DECODED byte count like every other placeholder.
+		"https://h/p?dG9rZW4%3D": "https://h/p?<redacted len=8>",
+		// MIXED padding — one pad byte literal, one percent-encoded. The rule that only asked
+		// what the RAW remainder looked like passed this straight through as
+		// "c2VjcmV0dA=<redacted len=1>", the same leak as the row above it: the value is
+		// decoded before it is judged, so the two spellings of one credential agree.
+		"https://h/p?c2VjcmV0dA=%3D": "https://h/p?<redacted len=12>",
+		// A bare token carrying an INTERIOR '=' is the shape no padding rule reaches: there is
+		// nothing about "eyJ...9=" that marks it as a name rather than the first third of a
+		// token, so a value with an '=' of its own disqualifies the whole segment.
+		"https://h/p?eyJhbGciOiJIUzI1NiJ9=.eyJzdWIiOiIxIn0=.c2ln": "https://h/p?<redacted len=43>",
+		// The cost of the two rows above, and of the padded ones: a genuine flag and a genuine
+		// value containing '=' both lose their NAME. They are the same bytes as a credential,
+		// and this redactor errs toward redacting.
+		"https://h/p?flag=":    "https://h/p?<redacted len=5>",
+		"https://h/p?next=a=b": "https://h/p?<redacted len=8>",
 		// url.Parse fails on the trailing invalid percent escape, but the userinfo must
 		// still be stripped rather than returned verbatim in a support bundle.
 		"https://alice:super-secret@example.com/%": "https://REDACTED@example.com/%",
