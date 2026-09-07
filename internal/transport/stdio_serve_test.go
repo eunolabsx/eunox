@@ -675,7 +675,8 @@ func TestForwardNotification_UntranslatableIsReported(t *testing.T) {
 	// A progress notification whose params are a scalar: admitted at negotiation, unrewritable
 	// here. The host context is the default revision and the leg is addressed as the declaring
 	// one, so the translation runs rather than short-circuiting on a matched pair. Not a cancel,
-	// which stdio drops at the nonce rewrite before the translation is reached.
+	// whose own drop arm would be indistinguishable from this one — see
+	// TestForwardNotification_CancelTranslatesBeforeTheNonceRewrite for that leg.
 	notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress, Params: json.RawMessage(`"scalar"`)}
 
 	t.Run("stdio", func(t *testing.T) {
@@ -710,6 +711,71 @@ func TestForwardNotification_UntranslatableIsReported(t *testing.T) {
 		}
 		if len(uw.messages) != 0 {
 			t.Errorf("an untranslatable notification reached the upstream: %+v", uw.messages)
+		}
+	})
+}
+
+// TestForwardNotification_CancelTranslatesBeforeTheNonceRewrite pins the ORDER both transports
+// apply to a host notifications/cancelled, on the one input where the two orders disagree.
+//
+// The nonce rewrite decodes params with a plain json.Unmarshal and re-marshals them, which
+// silently resolves a duplicate key last-wins; the leg translation refuses one (mcp.DecodeParams).
+// Running the rewrite FIRST therefore laundered a duplicate-key cancel past the strict decode on
+// stdio while HTTP, which already translated first, refused the identical bytes — the same message
+// getting opposite outcomes on the one notification that decides whether an in-flight call is
+// aborted. Both must drop it.
+//
+// hostToUp is populated so the rewrite WOULD succeed: without that the cancel is dropped for
+// having nothing in flight, and the test would pass under either order.
+func TestForwardNotification_CancelTranslatesBeforeTheNonceRewrite(t *testing.T) {
+	t.Parallel()
+	const hostKey = "n:42"
+	nonce := mcp.RawJSON(`"eunox-up-1"`)
+	// A duplicate key in the params of an otherwise ordinary cancel.
+	dupCancel := mcp.RPCMsg{
+		JSONRPC: "2.0",
+		Method:  methodNotificationsCancelled,
+		Params:  json.RawMessage(`{"requestId":42,"requestId":42}`),
+	}
+
+	t.Run("stdio", func(t *testing.T) {
+		t.Parallel()
+		var out bytes.Buffer
+		uw := &mockUpstreamWriter{}
+		p, _ := newStdioProxy(stdioServe{upSink: uw, stderr: &out}, strings.NewReader(""))
+		p.upstreamRev = capability.Revision20260728
+		p.hostToUp[hostKey] = nonce
+
+		p.forwardHostNotification(context.Background(), dupCancel)
+
+		if len(uw.messages) != 0 {
+			t.Errorf("a duplicate-key cancel reached the upstream: %+v", uw.messages)
+		}
+		if got := out.String(); !strings.Contains(got, "could not be translated") {
+			t.Errorf("the drop must be the TRANSLATION's, reported as such; stderr = %q", got)
+		}
+	})
+
+	t.Run("http", func(t *testing.T) {
+		t.Parallel()
+		var out bytes.Buffer
+		uw := &mockUpstreamWriter{}
+		sess := newTestSession(&httpSession{
+			id:          "sess-cancel",
+			done:        make(chan struct{}),
+			upWriter:    mcp.NewMsgWriter(&writerAdapter{uw}),
+			upstreamRev: capability.Revision20260728,
+			proxy:       &HTTPProxy{stderr: &out},
+			hostToUp:    map[string]*json.RawMessage{hostKey: nonce},
+		})
+
+		sess.forwardNotification(context.Background(), dupCancel)
+
+		if len(uw.messages) != 0 {
+			t.Errorf("a duplicate-key cancel reached the upstream: %+v", uw.messages)
+		}
+		if got := out.String(); !strings.Contains(got, "could not be translated") {
+			t.Errorf("the drop must be the TRANSLATION's, reported as such; stderr = %q", got)
 		}
 	})
 }

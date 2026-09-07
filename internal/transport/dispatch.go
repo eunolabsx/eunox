@@ -88,6 +88,13 @@ type dispatchParams struct {
 	// configured key domain. nil (the default) skips the whole surface entirely.
 	receipts *capability.EffectReceiptVerifier
 
+	// now is the clock the receipt FRESHNESS check reads, and the only time-sensitive call in
+	// the dispatch tree. Injectable because a hardcoded time.Now() is the one thing that makes
+	// a stale-receipt verdict undrivable THROUGH the transport — the verifier's own unit tests
+	// can pass any instant, but nothing could pin that this leg hands the right one down.
+	// nil (the default, and every production wiring) means time.Now.
+	now func() time.Time
+
 	// honorAttribution admits the client-supplied attribution interface (_meta's
 	// io.eunolabs.context-manifest block), gated on the route's schemaVersion since the
 	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
@@ -120,6 +127,14 @@ func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPC
 		return recordKillDenial(ctx, d.rec, deny, msg, verifiedSession(d.sessionID)), true
 	}
 	return mcp.RPCMsg{}, false
+}
+
+// clock reads the dispatch clock, defaulting to time.Now for every wiring that sets none.
+func (d dispatchParams) clock() time.Time {
+	if d.now == nil {
+		return time.Now()
+	}
+	return d.now()
 }
 
 // decideCtx applies the audit-mode quota skip: in observe mode MaxCalls is skipped
@@ -982,7 +997,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	// Only an allow carries a resolved contract to check against. Observe-mode forwards are
 	// included deliberately — the call ran, so it's worth the same scrutiny — Verify handles
 	// having no declaration to compare against.
-	result := d.receipts.Verify(raw, tool, dec.Effect, time.Now())
+	result := d.receipts.Verify(raw, tool, dec.Effect, d.clock())
 	if result == nil {
 		return nil
 	}

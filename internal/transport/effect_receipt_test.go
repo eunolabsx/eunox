@@ -75,6 +75,14 @@ func (f *receiptFixture) toolResult(t *testing.T, claims capability.EffectReceip
 // returning result, with the given receipt verifier wired, and returns the audit records.
 func runToolCall(t *testing.T, rec *fwdRecorder, verifier *capability.EffectReceiptVerifier, result json.RawMessage) mcp.RPCMsg {
 	t.Helper()
+	return runToolCallAt(t, rec, verifier, result, nil)
+}
+
+// runToolCallAt is runToolCall with the dispatch clock the receipt FRESHNESS check reads. nil
+// means the production default (time.Now); the freshness verdict is the one thing about this
+// surface that cannot be driven through the transport without it.
+func runToolCallAt(t *testing.T, rec *fwdRecorder, verifier *capability.EffectReceiptVerifier, result json.RawMessage, now func() time.Time) mcp.RPCMsg {
+	t.Helper()
 	dp := newTestManifestPDP(capability.Constraint{Target: "tool:refund", Actions: []string{"call"}})
 	d := dispatchParams{
 		forwardParams: forwardParams{
@@ -86,6 +94,7 @@ func runToolCall(t *testing.T, rec *fwdRecorder, verifier *capability.EffectRece
 		},
 		pdp:      dp,
 		receipts: verifier,
+		now:      now,
 	}
 	msg := mcp.RPCMsg{
 		JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,
@@ -261,4 +270,30 @@ func TestLoadEffectReceiptVerifierResolvesAgainstTheConfigDir(t *testing.T) {
 	v, err := LoadEffectReceiptVerifier(filepath.Dir(f.jwksPath), filepath.Base(f.jwksPath))
 	require.NoError(t, err)
 	require.NotNil(t, v, "a relative key path must resolve beside the config, not the cwd")
+}
+
+// TestEffectReceiptFreshnessReadsTheDispatchClock pins the leg's own clock rather than the
+// verifier's: the freshness window is the one time-sensitive call in the dispatch tree, and
+// with time.Now() hardcoded a stale-receipt verdict could not be driven THROUGH the transport
+// at all — only through the verifier's own unit tests, which say nothing about what this leg
+// hands down.
+func TestEffectReceiptFreshnessReadsTheDispatchClock(t *testing.T) {
+	f := newReceiptFixture(t)
+	signed := time.Now()
+	result := f.toolResult(t, capability.EffectReceiptClaims{
+		Tool: "refund", Class: capability.EffectReversible, BlastRadius: receiptNum("1"), IssuedAt: signed.Unix(),
+	})
+
+	fresh := &fwdRecorder{}
+	runToolCallAt(t, fresh, f.verifier, result, func() time.Time { return signed })
+	assert.Equal(t, "verified", receiptRecord(t, fresh)["effect_receipt"],
+		"a receipt read at its own instant is fresh")
+
+	// The SAME bytes, read past the freshness window: a replay, and the tape must say so.
+	stale := &fwdRecorder{}
+	late := signed.Add(capability.DefaultReceiptMaxAge + capability.DefaultReceiptLeeway + time.Minute)
+	out := runToolCallAt(t, stale, f.verifier, result, func() time.Time { return late })
+	assert.Equal(t, "unverified", receiptRecord(t, stale)["effect_receipt"],
+		"a receipt older than the freshness window is not evidence")
+	assert.Nil(t, out.Error, "the surface stays post-hoc: a stale receipt is never a late denial")
 }

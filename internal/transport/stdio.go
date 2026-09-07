@@ -1222,17 +1222,10 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 		recordKillDrop(ctx, gate.recorders.forCategory(catKill), kill, gate.subject, msg, gate.leg)
 		return false
 	}
-	// Translate a cancel's params.requestId from the host id to the nonce the upstream
-	// saw; drop it if the target request is no longer in flight. Others forward verbatim.
-	if msg.Method == methodNotificationsCancelled {
-		rewritten, ok := rewriteCancelToNonce(&p.pendingMu, p.hostToUp, msg)
-		if !ok {
-			return false
-		}
-		msg = rewritten
-	}
 	// The boundary applies to notifications too, and they do not reach it through the upstream
 	// call — this write IS the leg's outbound seam for them. See translateNotificationForLeg.
+	//
+	// ABOVE the cancel rewrite, the order rewriteCancelToNonce states and HTTP already used.
 	outbound, err := translateNotificationForLeg(msg, requestRevision(ctx), p.upstreamRev)
 	if err != nil {
 		// A drop with no diagnostic: the peer cannot be answered (JSON-RPC forbids it) and the
@@ -1243,6 +1236,15 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 				audit.BoundEnvelopeField(msg.Method), err)
 		}
 		return false
+	}
+	// Translate a cancel's params.requestId from the host id to the nonce the upstream
+	// saw; drop it if the target request is no longer in flight. Others forward verbatim.
+	if outbound.Method == methodNotificationsCancelled {
+		rewritten, ok := rewriteCancelToNonce(&p.pendingMu, p.hostToUp, outbound)
+		if !ok {
+			return false
+		}
+		outbound = rewritten
 	}
 	// The same obligation HTTP's two arms carry, on the same declared site: once a write timeout
 	// has poisoned the writer, or the child has closed stdin, every forward is dropped -- a
@@ -1650,6 +1652,13 @@ const methodNotificationsCancelled = "notifications/cancelled"
 // matches; false when the notification is malformed or nothing is in flight. Only the
 // nonce-rewriting upstream paths call this; the gateway remote-HTTP path forwards host ids
 // unchanged and must NOT rewrite.
+//
+// ORDER: both transports run this AFTER translateNotificationForLeg, never before. The two
+// steps commute in effect — translation touches only _meta, this only requestId — but not in
+// what the strict decode SEES: the plain json.Unmarshal below resolves a duplicate key
+// last-wins and re-marshals clean params, so a cancel carrying one used to be laundered past
+// mcp.DecodeParams on stdio while HTTP refused the identical bytes. Same message, opposite
+// outcomes, on the one notification that decides whether an in-flight call is aborted.
 func rewriteCancelToNonce(mu *sync.Mutex, hostToUp map[string]*json.RawMessage, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if msg.Method != methodNotificationsCancelled || len(msg.Params) == 0 {
 		return msg, false

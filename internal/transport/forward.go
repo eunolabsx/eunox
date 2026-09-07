@@ -1297,6 +1297,10 @@ func forwardServerRequest(ctx context.Context, msg mcp.RPCMsg, fp serverRequestP
 	// The initiator is ANSWERED rather than left hanging, per this leg's one rule: eunox may
 	// answer a blocked initiator wherever it can do so without acting on a second identity's
 	// behalf, and a refusal of its own says nothing about the host.
+	//
+	// msg.Method is upstream-controlled here and is echoed into the refusal's own text; the
+	// bound and the control-rune strip are refuseAcrossRevisions', applied where the value
+	// becomes part of an error string rather than at this one caller.
 	if refused := refuseServerRequestAcrossRevisions(msg.Method, resolveRevision(fp.revision)); refused != nil {
 		// Metered, and through the unblocker's own wiring — this leg's tape paired with its buckets —
 		// exactly as recordForwardOutcome's refusal arm is. It used to write straight through fp.rec,
