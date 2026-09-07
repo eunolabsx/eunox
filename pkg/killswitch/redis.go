@@ -145,6 +145,37 @@ var ErrIncompleteEnumeration = redisutil.ErrIncompleteFanOut
 // siblings: a declaration that contradicts the client is a wiring bug, and it never heals.
 var ErrTopologyContradicted = errors.New("killswitch: the declared keyspace topology contradicts the Redis client's own type; failing closed (drop the declaration, or pass the client the declaration describes)")
 
+// ErrServerClustered refuses a client whose keyspace topology resolved SINGLE-NODE while the
+// server behind it reports that it is a node of a Redis Cluster.
+//
+// The half redisutil.ClassifyTopology structurally cannot answer: a plain *redis.Client aimed at
+// one node of a cluster is a single-node client by every property visible in-process, so it
+// classifies TopologySingleNode, no fan-out is built, and the keyless SCAN that loads the kill set
+// enumerates only the slots that node owns. When the aimed node happens to own the global stop's
+// slot the refresh's GET succeeds too, lastRefreshErr stays nil and HealthStatus reports ready —
+// so ShouldBlock answers "not killed" for every session whose key hashed elsewhere while the
+// backend claims it can confirm its kill set. That is the same fail-open ErrUnknownTopology and
+// ErrIncompleteEnumeration close from the other two directions, and the Manager contract forbids
+// it outright.
+//
+// Established at Start rather than at construction because only a round trip can establish it and
+// NewRedis performs none; once latched it is fail-closed like its construction-time siblings,
+// since cluster_enabled does not flip back and a wiring fault never heals. A consumer reaching a
+// cluster deliberately passes a *redis.ClusterClient, which classifies sharded and is enumerated
+// per master.
+//
+// TWO residuals follow from establishing it at Start, both stated rather than papered over:
+//
+//   - A consumer that only WRITES — NewRedis plus KillSession, never Start — never runs the probe,
+//     so unlike ErrNilClient this one cannot be reported by a writer on a switch that was never
+//     started. Such a consumer should run callcounter.CheckServerNotClustered on the same client.
+//   - It over-approximates. A single-shard cluster, and a cluster-fronting proxy presenting one
+//     logical keyspace, both answer cluster_enabled:1 while a keyless SCAN through them really is
+//     complete — and neither declaring option overrides this, since the probe deliberately covers
+//     a DECLARED single-node client too. That is the fail-closed direction, and the same posture
+//     callcounter.CheckServerNotClustered has taken since it shipped.
+var ErrServerClustered = errors.New("killswitch: the redis server behind this single-node client reports cluster_enabled:1, so a keyless SCAN reaches only the slots that one node owns and loads a PARTIAL kill set; failing closed. Pass a *redis.ClusterClient (enumerated per master), or point the client at the standalone server that holds the whole keyspace")
+
 // ErrPublishFailed marks a failure that happened AFTER the durable write already landed: the
 // revocation (or its undo) is in Redis and every replica converges on its next reconcile tick,
 // but the real-time pub/sub notification did not go out.
@@ -165,9 +196,27 @@ type Redis struct {
 	client redis.Cmdable
 	// wiringErr latches a construction-time fault that makes the client unusable for the
 	// instance's whole life. Immutable after NewRedis, so it is read without the lock; every
-	// entry point that would touch the client checks it FIRST, which is what makes the refusal
-	// cover the write and pub/sub paths rather than only the node enumeration.
+	// entry point that would touch the client checks it FIRST — through wiringFault, which is
+	// what makes the refusal cover the write and pub/sub paths rather than only the node
+	// enumeration.
 	wiringErr error
+	// serverClustered latches the fault established over the NETWORK instead of from the client's
+	// type: ErrServerClustered, which only an INFO can answer and which NewRedis therefore
+	// cannot, performing no I/O. A BOOL rather than the error, so "latched but carrying nothing"
+	// is unrepresentable — wiringFault would have handed a stored nil back to eleven callers that
+	// all read it as no-fault, the fail-open direction on the emergency stop — and because the
+	// error is a pure function of r.client, which never changes. atomic rather than under mu
+	// because its readers take no lock at all, the property that makes wiringErr free to read.
+	//
+	// Set before started, so a reader sees either the unstarted refusal or this one; and set only
+	// by probeServerTopology, which never clears it, so no reader can observe it flapping.
+	serverClustered atomic.Bool
+	// serverProbed records that the INFO probe got an ANSWER, clustered or not. Separate from the
+	// verdict because an unanswered probe is not a negative: a Redis that is down when Start runs
+	// is explicitly tolerated (the initial refresh is allowed to fail), and treating that silence
+	// as "not a cluster node" would forfeit the refusal for the process's life on an ordinary
+	// startup ordering. Until this is set the reconcile loop re-asks.
+	serverProbed atomic.Bool
 	// topology is how this client spreads its keyspace, and shardFanOut is the iterator that
 	// visits every server it spreads over (nil when the whole keyspace lives on one). Resolved
 	// ONCE at construction, from the client's type or from the consumer's declaration, so no
@@ -430,6 +479,12 @@ func WithFailOpen(failOpen bool) RedisOption {
 // constructor makes on its own initiative, and it is a trade: it refuses a decorator wrapping a
 // perfectly ordinary single-node client until its consumer says so, in exchange for never serving
 // a partial kill set as complete. See ErrUnknownTopology.
+//
+// What a TYPE cannot establish is whether the server behind a single-node client is a cluster
+// node; that needs a round trip, which this constructor does not make. Start asks it (and keeps
+// asking until it gets an answer) and latches ErrServerClustered, so a consumer wiring this
+// backend on its own inherits the refusal rather than having to run a probe of their own — with
+// the caveat that a consumer which never calls Start never gets it. See ErrServerClustered.
 func NewRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 	r := &Redis{
 		client:            client,
@@ -482,6 +537,65 @@ func (r *Redis) resolveTopology(nilClient bool) error {
 	return nil
 }
 
+// wiringFault reports the latched fault this backend can never serve past — the construction-time
+// one, or the Start-time server probe's.
+//
+// ONE reader for the two, so a fault established over the network is refused everywhere the
+// constructor's is (every reader, every writer, the pub/sub and session-TTL paths) rather than
+// only where it was found. Neither read takes a lock: wiringErr is immutable after NewRedis, and
+// the network half is a one-way atomic latch nothing clears.
+//
+// The two are not established at the same TIME, which is the asymmetry a caller has to know
+// about: the network half is only ever set by Start, so a consumer that writes without starting
+// is guarded by the constructor's half alone. See ErrServerClustered's residuals.
+func (r *Redis) wiringFault() error {
+	if r.wiringErr != nil {
+		return r.wiringErr
+	}
+	if r.serverClustered.Load() {
+		return fmt.Errorf("%w (got %T)", ErrServerClustered, r.client)
+	}
+	return nil
+}
+
+// probeServerTopology asks the SERVER what the client's concrete type could not: whether it is a
+// node of a Redis Cluster. See ErrServerClustered for what that costs a single-node client. It
+// latches the fault itself and reports whether it got an ANSWER, so a caller knows to ask again.
+//
+// Scoped to a resolved SINGLE-NODE topology, which is the only one whose premise the answer can
+// falsify — a sharded client IS the supported way to reach a cluster, and its fan-out visits every
+// master. That covers a DECLARED single-node decorator too, which is the one part of
+// WithSingleNodeKeyspace's believed-not-checked claim anything here can check.
+//
+// BOUNDED on its own deadline rather than the caller's, for the reason subscribeConfirmTimeout
+// states about the read below it: Start holds lifeMu across this, and the caller's context is
+// routinely deadline-free, so an unbounded round trip here is a concurrent Stop blocked for as
+// long as go-redis' own retries take. A probe that times out is simply unanswered.
+//
+// The residual an answer cannot close: a proxy fronting a sharded backend reports itself a plain
+// server, and a single-shard cluster reports cluster_enabled:1 while its keyless SCAN really is
+// complete — this refuses the second, which is the fail-closed direction and the same posture
+// callcounter.CheckServerNotClustered has taken since it shipped.
+func (r *Redis) probeServerTopology(ctx context.Context) (answered bool) {
+	if r.topology != redisutil.TopologySingleNode {
+		// Nothing an answer could falsify, so the question is settled without asking and the
+		// reconcile loop stops re-entering: a sharded client IS the supported way to reach a
+		// cluster, and its fan-out visits every master.
+		r.serverProbed.Store(true)
+		return true
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, subscribeConfirmTimeout)
+	defer cancel()
+	clustered, answered := redisutil.ServerReportsClustered(probeCtx, r.client)
+	if clustered {
+		r.serverClustered.Store(true)
+	}
+	if answered {
+		r.serverProbed.Store(true)
+	}
+	return answered
+}
+
 // Start begins the pub/sub subscription for state synchronization. Call once at startup.
 // It is idempotent: repeated calls launch the listener and reconcile loop only once (a
 // second call would otherwise overwrite r.cancel and run duplicate loops).
@@ -510,16 +624,27 @@ func (r *Redis) startUnderLifeMu(ctx context.Context) []Revocation {
 	if r.startedOnce || r.stopped {
 		return nil
 	}
+	// The SERVER-side half of the topology refusal, asked here because it needs a round trip and
+	// NewRedis performs none: a client aimed at one node of a Redis Cluster resolves single-node
+	// and its keyless SCAN then loads a partial kill set (see ErrServerClustered). It latches into
+	// the same exit below, so it is refused exactly as a construction-time fault is. Guarded on
+	// wiringErr, since the fault that arm reports may be a nil client, which panics on any command.
+	// An UNANSWERED probe is not a negative and does not stop the start; the reconcile loop asks
+	// again until it gets one (see reconcileRefresh).
+	if r.wiringErr == nil {
+		r.probeServerTopology(ctx)
+	}
 	// A latched wiring fault means this backend can never confirm its kill set — the client
-	// would panic on every command, or the servers holding the keyspace cannot be enumerated —
-	// so nothing is subscribed and no goroutine is launched. started stays false and every
-	// reader reports the cause (fail closed) instead of a cache nobody can refresh. The message
-	// names no specific cause: there is more than one, and the one that applies rides the error
-	// attribute rather than being restated (wrongly) in prose.
-	if r.wiringErr != nil {
+	// would panic on every command, the servers holding the keyspace cannot be enumerated, or
+	// the one server it reaches holds part of them — so nothing is subscribed and no goroutine
+	// is launched. started stays false and every reader reports the cause (fail closed) instead
+	// of a cache nobody can refresh. The message names no specific cause: there is more than one,
+	// and the one that applies rides the error attribute rather than being restated (wrongly) in
+	// prose.
+	if err := r.wiringFault(); err != nil {
 		if r.logger != nil {
 			r.logger.Error("kill switch: wiring fault; the switch is permanently degraded and every check fails closed",
-				slog.String("error", r.wiringErr.Error()))
+				slog.String("error", err.Error()))
 		}
 		return nil
 	}
@@ -665,6 +790,17 @@ func (r *Redis) drainRefreshTrigger(ctx context.Context) {
 // logs edge-triggered: one warning on healthy->failing, one notice on recovery, so a
 // sustained outage does not log every tick. HealthStatus() is the authoritative signal.
 func (r *Redis) reconcileRefresh(ctx context.Context) {
+	// Re-ask the server-topology probe until it ANSWERS once. Start tolerates a Redis that is not
+	// up yet, so its probe routinely goes unanswered on an ordinary container ordering — and
+	// unlike callcounter, whose CROSSSLOT reports the same fault at request time, this backend's
+	// keyless SCAN succeeds against one node of a cluster and reports a partial kill set as
+	// complete. Without the retry that silence is a verdict for the process's life.
+	//
+	// Rides this tick rather than owning a timer (one command on a loop that already runs), and
+	// stops for good once answered: cluster_enabled cannot change under a live server.
+	if !r.serverProbed.Load() {
+		r.probeServerTopology(ctx)
+	}
 	_ = r.refreshState(ctx)
 	if r.logger == nil {
 		return
@@ -726,8 +862,8 @@ func (r *Redis) HealthStatus() error {
 	// Mirror ShouldBlock's gate ORDER exactly so a health probe and the data plane never
 	// disagree. Checked before r.mu so a never-Started switch (which denies 100% of
 	// traffic) reports the wiring cause instead of a misleading nil "healthy".
-	if r.wiringErr != nil {
-		return r.wiringErr
+	if err := r.wiringFault(); err != nil {
+		return err
 	}
 	if !r.started.Load() {
 		return ErrNotStarted
@@ -762,8 +898,8 @@ func (r *Redis) ShouldBlock(_ context.Context, subj Subject) (bool, error) {
 	// wired in but never Started would otherwise ignore every kill in Redis silently.
 	// Ahead of the started gate: a nil client is a permanent wiring fault, and reporting it
 	// as "never started" would send an operator looking for a missing Start call.
-	if r.wiringErr != nil {
-		return false, r.wiringErr
+	if err := r.wiringFault(); err != nil {
+		return false, err
 	}
 	if !r.started.Load() {
 		return false, ErrNotStarted
@@ -891,8 +1027,8 @@ func (r *Redis) staleLocked() bool {
 
 // ActivateGlobal activates the global kill switch.
 func (r *Redis) ActivateGlobal(ctx context.Context) error {
-	if r.wiringErr != nil {
-		return r.wiringErr
+	if err := r.wiringFault(); err != nil {
+		return err
 	}
 	if err := r.client.Set(ctx, redisGlobalKey, "1", 0).Err(); err != nil {
 		return err
@@ -916,8 +1052,8 @@ func (r *Redis) ActivateGlobal(ctx context.Context) error {
 
 // DeactivateGlobal deactivates the global kill switch.
 func (r *Redis) DeactivateGlobal(ctx context.Context) error {
-	if r.wiringErr != nil {
-		return r.wiringErr
+	if err := r.wiringFault(); err != nil {
+		return err
 	}
 	if err := r.client.Del(ctx, redisGlobalKey).Err(); err != nil {
 		return err
@@ -937,8 +1073,8 @@ func (r *Redis) DeactivateGlobal(ctx context.Context) error {
 // or add a dimension whose revocation nothing ever notifies. An empty id is rejected rather
 // than writing the bare prefix key and triggering a spurious full refresh on every replica.
 func (r *Redis) setBlock(ctx context.Context, kill bool, dim *killDimension, id string) error {
-	if r.wiringErr != nil {
-		return r.wiringErr
+	if err := r.wiringFault(); err != nil {
+		return err
 	}
 	if id == "" {
 		method := dim.killMethod
@@ -1028,8 +1164,8 @@ func (r *Redis) ReviveJTI(ctx context.Context, jti string) error {
 
 // Reset clears all kill-switch state.
 func (r *Redis) Reset(ctx context.Context) error {
-	if r.wiringErr != nil {
-		return r.wiringErr
+	if err := r.wiringFault(); err != nil {
+		return err
 	}
 	// Delete the global key; propagate the error so a silent failure does not leave
 	// the global switch active while the caller believes it cleared.
@@ -1092,8 +1228,8 @@ func (r *Redis) Reset(ctx context.Context) error {
 // three readers from disagreeing about the same instance.
 func (r *Redis) Status(_ context.Context) (*Status, error) {
 	// Before mu, as the siblings do: a never-Started switch has no cache to lock over.
-	if r.wiringErr != nil {
-		return nil, r.wiringErr
+	if err := r.wiringFault(); err != nil {
+		return nil, err
 	}
 	if !r.started.Load() {
 		return nil, ErrNotStarted
@@ -1118,7 +1254,7 @@ func (r *Redis) Status(_ context.Context) (*Status, error) {
 // already happened, so a publish failure does NOT undo the kill — it only delays remote
 // convergence to the next reconcile. Publish is part of redis.Cmdable, so no assertion needed.
 //
-// No wiringErr check of its own: every caller returns on it before reaching a durable write,
+// No wiringFault check of its own: every caller returns on it before reaching a durable write,
 // so one here could only ever be dead code that reads as a live guard.
 //
 // That same "the durable write already happened" precondition is what makes this the one place
@@ -1145,8 +1281,8 @@ func (r *Redis) recordRefreshErr(err error) error {
 }
 
 func (r *Redis) refreshState(ctx context.Context) error {
-	if r.wiringErr != nil {
-		return r.recordRefreshErr(r.wiringErr)
+	if err := r.wiringFault(); err != nil {
+		return r.recordRefreshErr(err)
 	}
 	gained, err := r.serializedRefresh(ctx)
 	// Observers run with refreshMu RELEASED, matching the pub/sub delivery path: the

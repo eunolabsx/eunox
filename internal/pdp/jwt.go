@@ -1029,7 +1029,12 @@ func (p *JWTPDP) CheckAudience(ctx context.Context) *capability.EnforceResponse 
 	}
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
-		resp := p.audienceDeny("token audience does not satisfy the route's required audience")
+		// An authentication boundary, as it is in Decide/DecideResourceCancel/DecideSampling:
+		// Nothing was validated, so there is no audience to have mismatched: reporting the
+		// mismatch would attribute an authentication failure to a tenancy one on the signed
+		// tape. Defensive today — the transports validate before the session-creating
+		// initialize reaches this — which is exactly why it must not be the arm that lies.
+		resp := p.noClaimsDeny()
 		return &resp
 	}
 	return p.audienceDenial(claims)
@@ -1056,8 +1061,7 @@ func (p *JWTPDP) DecideResourceCancel(ctx context.Context, sessionID, uri, sourc
 	}
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
-		// An authentication boundary, exactly as in Decide: the token was never validated.
-		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
+		return p.noClaimsDeny()
 	}
 	if deny := p.audienceDenial(claims); deny != nil {
 		return *deny
@@ -1116,7 +1120,7 @@ func (p *JWTPDP) DecideSampling(ctx context.Context, sessionID, sourceIP string)
 	// silently reopening it.
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
-		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
+		return p.noClaimsDeny()
 	}
 	// Per-route audience pin, mirroring Decide/filterList: a no-op when
 	// routeAudience is unset (single-upstream, or stdio with no JWT). Spelled with the
@@ -1180,6 +1184,18 @@ func (p *JWTPDP) audienceDeny(message string) capability.EnforceResponse {
 	return resp
 }
 
+// noClaimsDeny is the refusal for a request that reached a decision with no VALIDATED token on
+// its context: an authentication boundary, so it is hard rather than downgradable — an --audit
+// route must not forward a call whose caller was never authenticated.
+//
+// One implementation, beside audienceDeny and for the same reason: this is the arm every entry
+// point on this PDP has to answer identically, and the four hand-copied spellings it replaces are
+// how CheckAudience came to report an audience MISMATCH here instead — an authentication failure
+// recorded on the signed tape as a tenancy one.
+func (p *JWTPDP) noClaimsDeny() capability.EnforceResponse {
+	return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
+}
+
 // withInnerVerdicts composes the inner PDP's own verdicts onto one of JWTPDP's own
 // denies produced by short-circuiting above the inner PDP.
 //
@@ -1227,9 +1243,7 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 
 	claims, ok := jwtClaimsFromContext(ctx)
 	if !ok {
-		// An authentication boundary, stronger than the cross-audience deny below,
-		// so it must not be downgraded to a logged forward under --audit.
-		return hardDenyResponse(p.clock, capability.ErrCodeNoJWTClaims, "no JWT claims in context — token was not validated")
+		return p.noClaimsDeny()
 	}
 
 	// Per-route audience pin: the shared validator accepted this token for SOME

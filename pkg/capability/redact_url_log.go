@@ -16,7 +16,8 @@ const redactedPath = "/[redacted]"
 // replaced with "/[redacted]".
 //
 // Deliberately STRICTER than the operator-facing redactor used by the doctor support bundle
-// (config.RedactURL), which preserves query parameter names, secret lengths, and the path —
+// (config.RedactURL), which preserves the path, the redacted span's length, and the name of an
+// unambiguous name=value query parameter (any other segment goes whole, name included) —
 // appropriate there since the bundle's audit tail needs the path as content, but a length
 // oracle and credential leak in a startup banner or CI log, a commonly lower protection tier
 // than the config file the secret came from.

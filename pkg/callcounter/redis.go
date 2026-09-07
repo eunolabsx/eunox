@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -175,6 +174,11 @@ var ErrTopologyContradicted = errors.New("callcounter: the declared keyspace top
 // ServerInfoReader is the one command CheckServerNotClustered issues. A narrow parameter type
 // so a caller can drive the check with a canned reply, since standing up a cluster in a test
 // is not a thing that can be done from Go.
+//
+// Declared rather than aliased to the internal package that performs the read: an alias would be
+// nameable outside this module too (Go's internal rule is on import paths, not type identity),
+// but it would render in this function's godoc as a type whose own documentation no consumer can
+// open. One method is cheap to restate; a signature a caller cannot read is not.
 type ServerInfoReader interface {
 	Info(ctx context.Context, section ...string) *redis.StringCmd
 }
@@ -184,17 +188,15 @@ type ServerInfoReader interface {
 // ordinary *redis.Client is classified single-node and still cannot run AdmitAll's multi-key
 // EVAL when the server behind it is a cluster node.
 //
-// It reads `INFO cluster` — not `CLUSTER INFO`, whose reply carries no cluster_enabled field
-// at all (that lives only in INFO's Cluster section), and which a standalone server refuses
-// outright, so a check written against it could never fire in either direction.
-//
-// A server that cannot answer INFO (an emulator, a proxy, an ACL that denies it) is treated as
-// unclustered, since the alternative is refusing to start against every Redis-protocol server
-// that answers the commands eunox actually issues. That branch is inconclusive rather than
-// safe, which is why AdmitAll also maps a CROSSSLOT back to this error at request time.
+// The READING is redisutil.ServerReportsClustered — shared with pkg/killswitch, which asks the
+// same question about the same client for a different reason (a keyless SCAN against a cluster
+// node enumerates only that node's slots) and so needs a different refusal. What stays here is
+// that refusal, and what this caller does with an INFO nobody could answer: it does NOT refuse,
+// and does not re-ask either, because AdmitAll maps a CROSSSLOT back to this error at request
+// time — a backstop the kill switch's keyless SCAN has no equivalent of, which is why it treats
+// the same unanswered probe differently.
 func CheckServerNotClustered(ctx context.Context, client ServerInfoReader) error {
-	info, err := client.Info(ctx, "cluster").Result()
-	if err != nil || !strings.Contains(info, "cluster_enabled:1") {
+	if clustered, _ := redisutil.ServerReportsClustered(ctx, client); !clustered {
 		return nil
 	}
 	return fmt.Errorf("%w (the server at the configured address reports cluster_enabled:1)", ErrClusterUnsupported)
