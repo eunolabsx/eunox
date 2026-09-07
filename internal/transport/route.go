@@ -104,14 +104,17 @@ type UpstreamRoute struct {
 // *http.Transport for its remote-HTTP upstream. upstreamTimeMs is constant for the
 // proxy's lifetime, so a single build is correct.
 //
-// Residual, stated rather than closed: a Routes map may legitimately be shared by two
-// proxies (the per-route bind check went with the per-route state it protected), and the
-// FIRST caller's value binds ResponseHeaderTimeout for both — including a proxy running
-// unbounded inheriting the other's bound. Narrow by construction, since that field is only
-// the backstop: every foreground call stays bounded by its own per-request deadline, which
-// is each proxy's own. Refusing a later disagreement would need an error this signature
-// does not carry, and building a second transport would silently drop the pooling this
-// exists for, so the assumption a shared Routes map makes is an agreed upstreamTimeMs.
+// Residual, stated rather than closed: nothing binds a Routes map to one proxy since the
+// per-route bind check was removed, and the FIRST caller's value binds ResponseHeaderTimeout
+// for every proxy sharing the route. That is NOT merely a looser backstop for the loser: at
+// --upstream-timeout 0 boundUpstreamCall attaches no per-request deadline at all, so an
+// inherited bound becomes the only one that proxy has — a bound its operator disabled — and
+// which proxy wins is whichever opens the first remote session. Refusing a later disagreement
+// would need an error this signature does not carry, and a second transport would drop the
+// pooling this exists for, so a shared Routes map assumes an agreed upstreamTimeMs. It assumes
+// more besides: route.pdp holds per-SESSION Tier-2 and flow-label state, under ids the
+// declaring path derives from caller identity rather than minting, so two proxies sharing a
+// route can release each other's live sessions. Sharing one is not endorsed here.
 func (r *UpstreamRoute) sharedUpstreamTransport(upstreamTimeMs int) *http.Transport {
 	r.upstreamTransportOnce.Do(func() {
 		r.upstreamTransport.Store(buildUpstreamTransport(r.upstreamTLSSkipVerify, upstreamTimeMs))

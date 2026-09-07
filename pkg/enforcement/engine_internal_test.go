@@ -1475,8 +1475,8 @@ func TestExactRat_BoundsTheParse(t *testing.T) {
 }
 
 // keylessBucketHandler is a custom CommittingConditionHandler that populates a bucket's
-// window/weight/limit and leaves its Key empty — the third-party plugin bug V2 names. It is
-// the shape Commits() cannot distinguish from the legitimate per-call-only zero.
+// window/weight/limit and leaves its Key empty: the shape Commits() cannot distinguish from
+// the legitimate per-call-only zero.
 type keylessBucketHandler struct{}
 
 func (keylessBucketHandler) PrepareCommit(_ context.Context, cond capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {

@@ -58,13 +58,13 @@ type Config struct {
 	FailureThreshold int
 	// CooldownDuration is how long to remain open before transitioning to half-open.
 	CooldownDuration time.Duration
-	// HalfOpenMaxProbes is the number of probes CONCURRENTLY OUTSTANDING in a half-open
-	// window, and also the exact number that must succeed to close the breaker. Any single
-	// probe failure re-opens it.
+	// HalfOpenMaxProbes is the number of probes admitted per half-open window, and also the
+	// number that must succeed to close the breaker. Any single probe failure re-opens it.
 	//
-	// Outstanding, not admitted: recordDrop deliberately returns a slot whose probe reported
-	// no outcome, so a window admits an unbounded number of probes over time and at most this
-	// many at once.
+	// An admission BUDGET, not a concurrency limit: recordSuccess leaves the count alone, so a
+	// probe that has already succeeded still holds its slot for the window's life. Only
+	// recordDrop returns one, for a probe that reported no outcome at all — so a window admits
+	// this many probes plus however many were dropped.
 	HalfOpenMaxProbes int
 }
 

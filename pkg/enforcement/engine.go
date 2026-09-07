@@ -127,14 +127,14 @@ type DeferredCommit struct {
 // by condition TYPE and the per-call-only shape reaches PrepareCommit too.
 func (d DeferredCommit) Commits() bool { return d.Bucket.Key != "" }
 
-// Prepared reports whether the handler populated the bucket AT ALL — its key, or any of the
-// content that only means something alongside one.
+// Prepared reports whether the handler populated the bucket at all — a zero-value test, so a
+// bucket is prepared if it names a key OR carries any of the content that only means something
+// alongside one.
 //
-// It exists because Commits() alone cannot tell the two ways of not committing apart: the
+// It exists because Commits() alone cannot tell the two ways of NOT committing apart: the
 // per-call-only configuration that legitimately derives nothing, and a handler that filled a
-// bucket's window/weight/limit and left its Key empty. Read as the former, the second silently
-// enforces no quota on every call — the one shape of malformed commit that produces neither a
-// deny nor a HandlerFault. See commitDeferredConditions.
+// bucket's window/weight/limit and left its Key empty. Read as the former, the second enforces
+// no quota on any call, with neither a deny nor a HandlerFault. See commitDeferredConditions.
 func (d DeferredCommit) Prepared() bool { return d.Bucket != (capability.QuotaBucket{}) }
 
 // CommittingConditionHandler evaluates a condition that commits state (consumes a quota slot)
@@ -1125,8 +1125,7 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, ec evalCtx, defer
 			// posture requires, not violating the contract's other half.
 			continue
 		}
-		keyless := !commit.Commits()
-		if keyless && !commit.Prepared() {
+		if !commit.Prepared() {
 			// This particular condition consumes nothing — its configuration has no cumulative
 			// bound. Its pure checks ran inside PrepareCommit and passed, so there is no bucket.
 			continue
@@ -1145,13 +1144,10 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, ec evalCtx, defer
 			}
 			continue
 		}
-		if keyless {
-			// A bucket with content but no Key: the handler meant to consume a quota and named
-			// no counter to consume it from. Commits() reads that as the legitimate per-call-only
-			// zero, so the declared bound would be checked by nothing, on every call, with no
-			// deny and no fault — the fail-open the sibling assertions above and below refuse
-			// loudly. Nothing here can repair it (the key is the handler's to derive), so it
-			// denies, exactly as the unauthorized skip does.
+		if !commit.Commits() {
+			// Prepared but keyless: the declared bound would be checked by nothing, and the key
+			// is the handler's to derive — so this denies, like the unauthorized skip above (see
+			// CommittingConditionHandler).
 			return faults, ec.denyFromConditionError(conditionFault(condType,
 				"committing condition handler prepared a quota bucket with no key"))
 		}

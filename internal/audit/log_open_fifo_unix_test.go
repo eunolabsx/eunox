@@ -21,6 +21,11 @@ import (
 // package's whole run instead of naming itself.
 const openBlockDeadline = 10 * time.Second
 
+// fifoRaceCoverageBudget bounds how long the FIFO-plant race is retried while it has not yet
+// covered its window. It exists so the coverage assertion reports a filesystem or platform that
+// cannot produce the race at all, rather than a scheduler that happened not to on this run.
+const fifoRaceCoverageBudget = 10 * time.Second
+
 type openResult struct {
 	f   *os.File
 	err error
@@ -170,7 +175,14 @@ func TestActiveLogOpen_FIFOPlantedInTheCreateWindow(t *testing.T) {
 			})
 
 			refusals := 0
-			for i := 0; i < 400; i++ {
+			// Iterated to a DEADLINE once the fixed budget is spent without covering the
+			// window, rather than to a count alone: whether an open lands on a planted FIFO is
+			// a scheduling outcome, so a fixed budget makes the assertion below fail under load
+			// for a reason that says nothing about the guard it covers — and a test that fails
+			// when the package gains an unrelated serial test is one CI learns to ignore. The
+			// 400 floor keeps the covered case exercised exactly as often as before.
+			deadline := time.Now().Add(fifoRaceCoverageBudget)
+			for i := 0; i < 400 || (refusals == 0 && time.Now().Before(deadline)); i++ {
 				f, err := openWithin(t, site.name, func() (*os.File, error) { return site.open(logPath) })
 				if err != nil {
 					refusals++
@@ -189,7 +201,7 @@ func TestActiveLogOpen_FIFOPlantedInTheCreateWindow(t *testing.T) {
 			// a filesystem that refused mkfifo, a scheduler that never interleaved — and a
 			// vacuous pass is indistinguishable from a real one in CI.
 			if refusals == 0 {
-				t.Fatal("no open ever landed on a planted FIFO; this run covered nothing")
+				t.Fatalf("no open ever landed on a planted FIFO within %s; this run covered nothing", fifoRaceCoverageBudget)
 			}
 		})
 	}
