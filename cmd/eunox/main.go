@@ -333,7 +333,7 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		killswitchFailOpen:   fs.Bool("killswitch-fail-open", false, "Redis kill-switch behaviour during a Redis outage. By default the kill switch\nfails CLOSED: while Redis is unreachable the proxy denies every request\n(KILL_SWITCH_ERROR) because a kill issued during the outage cannot be confirmed.\nSet this flag to fail OPEN instead -- serve the last-known kill state and allow\ntraffic not already known to be killed -- trading guaranteed revocation for\ndata-plane availability. Only affects --redis-addr deployments. See ADR-0003."),
 		killswitchReconcile:  fs.Duration("killswitch-reconcile-interval", 0, fmt.Sprintf("How often the Redis kill switch reconciles its local cache against Redis\n(default %s). Lower values shorten the kill-propagation window and, in the\ndefault fail-closed mode, the data-plane denial window that persists after a\ntransient Redis blip recovers -- recovery is bounded by this interval, not Redis.\nVery low values increase Redis load. 0 uses the default. Only affects --redis-addr.", killswitch.DefaultReconcileInterval)),
 		killswitchSessionTTL: fs.Duration("killswitch-session-ttl", 0, fmt.Sprintf("How long a SESSION kill tombstone lives in Redis before it is garbage\ncollected (default %s). This is a memory bound, not a policy\nexpiry: when the tombstone expires the kill is LIFTED, so a value shorter\nthan the longest session your deployment holds open re-admits a revoked\nsession. Relevant when a stdio agent pins and reuses one --session-id for\nmonths. Negative disables expiry entirely; 0 uses the default. Agent kills\nare never expired. Only affects --redis-addr.", describeDefaultSessionKillTTL())),
-		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct ANCHORS — one key per session, or under\ntaskAnchoredState one per TASK, which OUTLIVES the session that created it. Both\nstores reclaim an idle anchor on a periodic sweep, so the ceiling bounds LIVE\nanchors; a warning is logged as it is approached. 0 disables the bound. Ignored when --redis-addr is\nset (Redis keeps this state off the Go heap, with TTLs)."),
+		maxCallCounterKeys:   fs.Int("max-call-counter-keys", defaultMaxCallCounterKeys, "Maximum distinct keys the in-memory maxCalls/sequenceBlock counter holds at once.\nEach live (session, tool) pair is one key, reclaimed only on the periodic cleanup;\nthis ceiling bounds the heap a flood of unique session IDs can pin between cleanups\n(a call under a new key past the limit fails closed). The same bound also caps the\nin-memory flow-label store's distinct ANCHORS — one key per session, or under\ntaskAnchoredState one per TASK, which OUTLIVES the session that created it. Both\nstores reclaim an idle anchor on a periodic sweep, so the ceiling bounds LIVE\nanchors; a warning is logged as it is approached. 0 disables the bound. Refused with\n--redis-addr, which keeps this state in Redis under TTLs of its own, so the\nceiling would configure nothing."),
 
 		// Compliance flags.
 		strictDrift: fs.Bool("strict-drift", false, "Promote startup drift warnings to fatal errors that abort session startup: a new\nupstream tool matched by a manifest glob, a manifest entry that matches no live\ntool, or an upstream version that does not satisfy the manifest's serverVersion\npin. (A condition argument absent from the live schema and the uncovered-tool\nINFO stay advisory, never fatal.) A launch-time global override: applies to every\npoliced route, regardless of a per-route 'strictDrift' in the config. Routes with\nno policy are unaffected; the proxy warns if the flag matched no policed route\n(e.g. with --audit)."),
@@ -564,8 +564,12 @@ func cmdProxy(args []string) (exitCode int) {
 		return 1
 	}
 
-	// Fail closed if a Redis-only flag was set without --redis-addr, before any side effect
-	// runs — same reasoning as the JWT guard above.
+	// Fail closed if a Redis-only flag was set without --redis-addr, or an in-memory-only one
+	// WITH it, before any side effect runs — same reasoning as the JWT guard above.
+	if err := validateInMemoryFlagsRejectRedisAddr(fs, *f.redisAddr); err != nil {
+		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		return 1
+	}
 	if err := validateRedisFlagsRequireRedisAddr(fs, *f.redisAddr); err != nil {
 		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
 		return 1
@@ -1084,10 +1088,15 @@ func refuseActiveFlags(active []string, detail string) error {
 
 // rejectGatedFlags refuses the flags in names the operator ACTIVATED (explicitlyActiveFlags:
 // value detection for a zero-default flag, explicit-set for the rest). This is the rejector
-// for a gate whose hazard is that the flags are silently IGNORED — a flag explicitly set to
-// its own default configures nothing, so there is nothing being ignored and nothing to
-// refuse. Where the hazard is instead that the operator believes something else about the
-// run, use rejectPassedFlags.
+// for a gate whose hazard is that the flags are silently IGNORED.
+//
+// "Activated" is per FLAG, not one rule: for a zero-default flag, one explicitly set to its own
+// default configures nothing and is not refused; for a non-zero-default flag, setting it is the
+// signal, since its value cannot be read as absent. Every flag routed through here today has a
+// zero default, so the second arm is currently unexercised — a gate over a non-zero-default
+// flag that wants the first rule asks for it explicitly (flagsSetAwayFromDefault). Where the
+// hazard is instead that the operator believes something else about the run, use
+// rejectPassedFlags.
 func rejectGatedFlags(fs *flag.FlagSet, names []string, detail string) error {
 	return refuseActiveFlags(explicitlyActiveFlags(fs, names), detail)
 }
@@ -1191,10 +1200,58 @@ func validateProxyAuditPEPFlag(f *proxyCLIFlags) error {
 	return nil
 }
 
+// inMemoryOnlyFlags is the INVERSE of redisGatedFlags: proxy flags that take effect only
+// WITHOUT --redis-addr, because the state they bound lives on the Go heap and Redis keeps it
+// off it (with TTLs of its own). Passing one alongside --redis-addr configures nothing.
+//
+// A list rather than one condition, for redisGatedFlags' reason: the next such flag is a row
+// here rather than a second guard that can drift from this one.
+var inMemoryOnlyFlags = []string{
+	"max-call-counter-keys",
+}
+
+// validateInMemoryFlagsRejectRedisAddr fails closed when an in-memory-only flag is set
+// together with --redis-addr. The binary's stated rule is that an unpaired flag is a usage
+// error rather than a no-op — enforced for --max-sessions on stdio, for the Redis-gated flags
+// without --redis-addr, and for the JWT flags without --jwks-uri — and this was the one
+// explicit-value flag that silently did nothing instead.
+func validateInMemoryFlagsRejectRedisAddr(fs *flag.FlagSet, redisAddr string) error {
+	if redisAddr == "" {
+		return nil
+	}
+	return refuseActiveFlags(flagsSetAwayFromDefault(fs, inMemoryOnlyFlags),
+		"cannot be combined with --redis-addr: they bound state the IN-MEMORY backends keep on the Go heap, and the Redis backends keep that state in Redis under TTLs of their own, so the ceiling would configure nothing. Remove them, or remove --redis-addr to use the in-memory backends")
+}
+
+// flagsSetAwayFromDefault returns the "--"-prefixed names of every flag in names whose value
+// DIFFERS from its default — explicitlyActiveFlags' value-detection rule, applied whatever the
+// default is.
+//
+// Separate from rejectGatedFlags rather than folded into it, because explicitlyActiveFlags
+// selects that rule only for a ZERO-default flag and --max-call-counter-keys is the first gated
+// flag with a non-zero one. Under the set detection it would otherwise take, templating the
+// flag at its own default — the shape a Helm chart or a unit file produces — became a fatal
+// startup error for a value that configures nothing, which is the outcome rejectGatedFlags' own
+// doc says there is nothing to refuse. What stays refused is a ceiling the operator really
+// chose and this backend will not apply, which is the usage error the gate is for.
+//
+// Widening explicitlyActiveFlags itself would have been the tidier change and is deliberately
+// not made: the jwks- and HTTP-only gates run over flags with non-zero defaults where the set
+// rule is what they enforce today, and relaxing three guards is not this gate's business.
+func flagsSetAwayFromDefault(fs *flag.FlagSet, names []string) []string {
+	var out []string
+	for _, name := range names {
+		f := fs.Lookup(name)
+		if f != nil && flagWasSet(fs, name) && f.Value.String() != f.DefValue {
+			out = append(out, "--"+name)
+		}
+	}
+	return out
+}
+
 // redisGatedFlags is the single authoritative list of proxy flags that take effect ONLY
-// when --redis-addr configures a Redis backend; without it each is silently dropped.
-// --max-call-counter-keys is deliberately NOT here — it's the inverse, meaningful without
-// Redis.
+// when --redis-addr configures a Redis backend; without it each is silently dropped. The
+// inverse direction is inMemoryOnlyFlags above.
 var redisGatedFlags = []string{
 	"redis-password",
 	"redis-tls",
@@ -1330,8 +1387,15 @@ func validateJWTIssuerConfig(jwksURI, jwtIssuer string, allowAnyIssuer bool) err
 	if jwksURI == "" {
 		return nil
 	}
-	if jwtIssuer == "" && !allowAnyIssuer {
+	if strings.TrimSpace(jwtIssuer) == "" && !allowAnyIssuer {
 		return fmt.Errorf(`--jwks-uri requires --jwt-issuer (the expected "iss" claim) so a token from another issuer sharing the JWKS endpoint cannot be replayed against eunox; pass --jwt-allow-any-issuer to accept any issuer (not recommended)`)
+	}
+	// The padded-value guard its --jwt-audience twin has, for the identical reason: the issuer
+	// is compared VERBATIM against a token's "iss" claim, so a trailing space passes startup
+	// validation and then 401s every request with invalid_issuer — the baffling fail-closed
+	// outage the audience guard exists to prevent, on the flag beside it.
+	if jwtIssuer != strings.TrimSpace(jwtIssuer) {
+		return fmt.Errorf("--jwt-issuer %q has leading or trailing whitespace; the issuer is matched verbatim against a token's \"iss\" claim, so this value would never match and would silently deny every call", jwtIssuer)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@
 package audit
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/hmac"
 	"encoding/json"
@@ -323,12 +324,16 @@ func SanitizeAuditField(s string) string {
 // leading removal cannot be proven from the file alone — that needs an external
 // high-water mark. Interior deletion, reordering, insertion, and modification ARE
 // detected here.
+//
+// Returns ErrUnterminatedTail when the stream's last line carried no newline. That is a
+// NO-VERDICT exit, not a finding — see the error.
 func VerifyLog(r io.Reader, verifier *Sink, opts VerifyOptions) (VerifyResult, error) {
 	v := &auditChainVerifier{verifier: verifier, opts: opts}
 	if v.opts.Out == nil {
 		v.opts.Out = io.Discard
 	}
-	scanner := NewLineScanner(r)
+	torn := false
+	scanner := NewLineScanner(r, &torn)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -343,7 +348,46 @@ func VerifyLog(r io.Reader, verifier *Sink, opts VerifyOptions) (VerifyResult, e
 	if err := scanner.Err(); err != nil {
 		return v.res, err
 	}
+	if torn {
+		return v.res, ErrUnterminatedTail
+	}
 	return v.res, nil
+}
+
+// ErrUnterminatedTail reports that the verified stream's LAST line carried no terminating
+// newline. That is either a write still in flight or a truncation, and this pass cannot tell
+// them apart, so it is the same no-verdict answer ErrChainRotated gives rather than a finding:
+// audit-verify runs lock-free against a live proxy by design, and a near-cap record's write(2)
+// spans several pages, so a reader reaching EOF mid-write is ordinary rather than adversarial.
+//
+// The fragment itself is never classified — see scanSignedLines — so the result returned
+// alongside this error describes the COMPLETE records that preceded it and carries no INVALID
+// for the torn one. It is still not a verdict: what follows the fragment is unknown.
+var ErrUnterminatedTail = errors.New("audit log ends with an unterminated record — an in-progress write, or a truncation")
+
+// scanSignedLines is bufio.ScanLines with one change: a final non-blank fragment carrying no
+// newline is DROPPED, and recorded in torn when the caller passed one.
+//
+// Dropping rather than classifying is the point. strictDecodeAuditRecord refuses a torn line,
+// classify counts it INVALID and OK() then fails — a tampering verdict, with no attacker, on a
+// healthy log. The resume path already reads this exact shape as "a partial in-progress write,
+// never a complete record" (lastCompleteLineFromTail); this is the verify side of the same
+// disposition, and returning no token is what keeps the spurious finding off the operator's
+// terminal as well as out of the counts.
+//
+// Only the WHOLE stream's final token can be torn: VerifyLogFiles joins its files with an
+// injected newline, so an interior file's unterminated tail is a complete token here and stays
+// the finding it is (the live base is last in chain order).
+func scanSignedLines(torn *bool) bufio.SplitFunc {
+	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		if atEOF && bytes.IndexByte(data, '\n') < 0 && len(bytes.TrimSpace(data)) > 0 {
+			if torn != nil {
+				*torn = true
+			}
+			return len(data), nil, nil
+		}
+		return bufio.ScanLines(data, atEOF)
+	}
 }
 
 // VerifyLogFiles verifies an ordered set of audit-log files as ONE continuous

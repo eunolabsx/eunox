@@ -251,7 +251,7 @@ func TestVerifyLog_GoodAndTampered(t *testing.T) {
 	lines[1] = tampered
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifier, VerifyOptions{Out: &out})
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(lines)), verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestVerifyLog_WithSinceFilterSkips(t *testing.T) {
 	// (base+1h) stays in the report window.
 	cutoff := base.Add(30 * time.Minute)
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(logLines(t, logPath), []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(logLines(t, logPath))),
 		verifier, VerifyOptions{Since: cutoff, Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)

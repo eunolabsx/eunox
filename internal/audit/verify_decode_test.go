@@ -172,7 +172,7 @@ func TestVerifyLog_UnknownFieldMatchesVerifyRecord(t *testing.T) {
 	}
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(tampered), verifier, VerifyOptions{Out: &out})
+	res, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{tampered})), verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestVerifyLog_ChainStateSurvivesAnUnverifiableRecord(t *testing.T) {
 	tampered2 := append([]byte(`{"operator_override":"approved",`), line2[1:]...)
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join([][]byte{line1, tampered2, line3}, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{line1, tampered2, line3})),
 		verifier, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)

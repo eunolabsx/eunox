@@ -1271,8 +1271,26 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 	// returns hardDenyResponse to stay non-downgradable even under audit (see that
 	// helper for how BlockOverride survives stamp() and isObserveDeny).
 	if matched.ArgumentSchema != nil && schema != validateSchema {
-		return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
-			fmt.Sprintf("constraint %q carries an argumentSchema, which is tool-only and not enforced on %s; refusing to forward a request guarded by an unenforced schema (fail closed)", matched.Target, targetOperationPhrase(target.Type)))
+		return p.strayToolOnlyRefusal(matched.Target, "an argumentSchema", targetOperationPhrase(target.Type),
+			"refusing to forward a request guarded by an unenforced schema")
+	}
+
+	// Stray-redactFields fail-closed guard, the sibling of the one above and justified the
+	// same way: redactFields is tool-only (the proxy redacts tools/call results), the loader
+	// refuses one on a resource:/prompt: target, and a manifest built IN-PROCESS could carry
+	// one. The ATTACHMENT is stopped structurally one layer down — CollectObligations skips a
+	// response directive whose constraint names a non-tool target, which is what covers the
+	// two naming-based fills this early return sits above — so what is left here is the
+	// declaration itself: an author who wrote a redaction believes the response is masked, and
+	// forwarding it silently unmasked is the fail-open, not the obligation.
+	//
+	// Keyed on the TARGET TYPE rather than the schema mode its sibling uses. The two coincide
+	// for every in-tree caller, but Decide is exported on the PolicyDecisionPoint contract and
+	// takes a caller-supplied target of any type, so the mode is a proxy for the question and
+	// the type IS the question.
+	if target.Type != capability.TargetTypeTool && capability.ConstraintHasResponseDirective(matched) {
+		return p.strayToolOnlyRefusal(matched.Target, "a redactFields directive", targetOperationPhrase(target.Type),
+			strayRedactConsequence)
 	}
 
 	// A constraint in audit (observe) mode downgrades its own denial to a
@@ -1354,6 +1372,28 @@ func (p *ManifestPDP) evaluateAndRecord(ctx context.Context, req *capability.Enf
 // CAPABILITY_DENIED and stray-argumentSchema denials, preserving the wording each
 // Decide* path historically emitted: "resource reads" for resources/read,
 // "prompts/get" for prompts/get, and the bare target type ("tool") otherwise.
+// strayToolOnlyRefusal is the fail-closed answer for a matched constraint declaring a
+// TOOL-ONLY property on a leg that cannot enforce it. property names the thing (an
+// argumentSchema, a redactFields directive), leg is the operation phrase, and consequence
+// says what forwarding would mean.
+//
+// ENFORCEMENT_ERROR, not a policy verdict: the loader refuses every one of these, so reaching
+// here means a manifest built IN-PROCESS, i.e. an engine/wiring fault. hardDenyResponse keeps
+// it non-downgradable, which is the whole point — an observing route would otherwise forward
+// the very request the declaration says is guarded.
+//
+// One builder because the four sites had already drifted: the sampling copies spelled their
+// leg as a literal while their decideTarget twins resolved it through targetOperationPhrase,
+// so one fault produced two differently-shaped messages for a SIEM rule to miss.
+func (p *ManifestPDP) strayToolOnlyRefusal(constraintTarget, property, leg, consequence string) capability.EnforceResponse {
+	return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
+		fmt.Sprintf("constraint %q carries %s, which is tool-only and not enforced on %s; %s (fail closed)",
+			constraintTarget, property, leg, consequence))
+}
+
+// strayRedactConsequence is the tail both redactFields refusals share.
+const strayRedactConsequence = "refusing to forward a response the manifest declares redacted under a directive this leg cannot apply"
+
 func targetOperationPhrase(t capability.TargetType) string {
 	switch t {
 	case capability.TargetTypeResource:
@@ -2306,8 +2346,17 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 	// ValidateArgumentSchema, so a stray schema here would be a declared guard with no
 	// runtime effect (fail-open). Refuse with a non-downgradable ENFORCEMENT_ERROR.
 	if matched.ArgumentSchema != nil {
-		return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
-			fmt.Sprintf("constraint %q carries an argumentSchema, which is tool-only and not enforced on sampling; refusing to forward a request guarded by an unenforced schema (fail closed)", matched.Target))
+		return p.strayToolOnlyRefusal(matched.Target, "an argumentSchema", "sampling",
+			"refusing to forward a request guarded by an unenforced schema")
+	}
+
+	// The stray-redactFields guard decideTarget applies, on the leg with no target type of its
+	// own to key it on. Sampling's obligations are never even read (forwardServerRequest
+	// records with a nil obligation list), so nothing here is recorded as applied — the fault
+	// is the DECLARATION, exactly as it is for the argumentSchema above: a redaction the
+	// manifest asserts and this leg will never perform.
+	if capability.ConstraintHasResponseDirective(matched) {
+		return p.strayToolOnlyRefusal(matched.Target, "a redactFields directive", "sampling", strayRedactConsequence)
 	}
 
 	// Sampling has no per-entry audit (observe) mode: enforcement: audit is rejected

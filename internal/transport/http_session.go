@@ -1658,6 +1658,7 @@ func (s *httpSession) forwardNotification(ctx context.Context, msg mcp.RPCMsg) {
 	}
 	// Subprocess upstream: the request id was nonce-rewritten, so translate a cancel's
 	// params.requestId to that nonce; drop it if the target request is no longer in flight.
+	// Below the leg translation above, matching stdio.
 	//
 	// Best-effort on HTTP: unlike stdio's single serve loop, each HTTP POST is an independent
 	// goroutine, so a cancel on a concurrent connection can arrive before the target request's

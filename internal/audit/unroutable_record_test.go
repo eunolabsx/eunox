@@ -57,7 +57,7 @@ func TestUnroutableRecordSignAndVerifyRoundTrip(t *testing.T) {
 		t.Fatalf("want 2 records, got %d", len(lines))
 	}
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), verifierFor(t, keyPath), VerifyOptions{Out: &sb})
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(lines)), verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}

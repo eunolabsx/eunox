@@ -114,7 +114,11 @@ func ParseVariableRef(s string) (string, bool) {
 func ValidateVariableRef(s string) error {
 	name, ok := ParseVariableRef(s)
 	if !ok {
-		return fmt.Errorf("value %q contains a ${...} reference but is not one: a task-context variable must be the ENTIRE value (%q), never interpolated into surrounding text — an interpolated value would be glob-matched text built partly from a token claim", s, "${"+TaskVarID+"}")
+		// The message names the accepted gap explicitly (docs/capability-manifest-guide.md
+		// § 5c): this grammar has no escape spelling for a LITERAL "${", so an author whose
+		// tool argument legitimately equals one has no way to write it here and needs to be
+		// told that rather than left rereading the rule for a typo that is not there.
+		return fmt.Errorf("value %q contains a ${...} reference but is not one: a task-context variable must be the ENTIRE value (%q), never interpolated into surrounding text — an interpolated value would be glob-matched text built partly from a token claim. There is no escape spelling for a literal %q under this grammar: match such a value with an argumentSchema pattern or an external policy evaluator, or keep the entry under schemaVersion \"0.1\", where it is ordinary literal text", s, "${"+TaskVarID+"}", "${")
 	}
 	if _, known := taskVarClaims[name]; !known {
 		return fmt.Errorf("unknown task-context variable %q — the closed set is %s", "${"+name+"}", strings.Join(bracketed(TaskVarNames()), ", "))

@@ -24,7 +24,7 @@ const DefaultIdleTTL = 24 * time.Hour
 type Redis struct {
 	client redis.Cmdable
 	// ttl is the configured idle TTL as passed to WithRedisIdleTTL, stored verbatim;
-	// effectiveTTL applies the non-positive guard at the point of use.
+	// effectiveTTL applies the sub-second guard at the point of use.
 	ttl time.Duration
 }
 
@@ -33,8 +33,9 @@ type RedisOption func(*Redis)
 
 // WithRedisIdleTTL overrides the idle TTL stamped (and refreshed) on each anchor's label
 // set — a safety-reclamation bound for an orphaned anchor, NOT a taint lifetime, since a
-// live anchor keeps refreshing it. A non-positive d falls back to DefaultIdleTTL rather
-// than dropping a live taint immediately (fail safe, not open).
+// live anchor keeps refreshing it. A d under one second falls back to DefaultIdleTTL rather
+// than dropping a live taint almost immediately (fail safe, not open): Redis expiry is
+// second-granular, so a sub-second bound is not a shorter TTL but an unpredictable one.
 func WithRedisIdleTTL(d time.Duration) RedisOption {
 	return func(r *Redis) {
 		r.ttl = d

@@ -143,7 +143,7 @@ func BenchmarkVerifyRecordKeyRing(b *testing.B) {
 func BenchmarkVerifyLog(b *testing.B) {
 	const records = 512
 	lines, verifier := benchCorpus(b, records)
-	joined := bytes.Join(lines, []byte("\n"))
+	joined := joinLogLines(lines)
 
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -200,7 +200,8 @@ Exit codes:
      unverifiable or unknown-key record). Reserved for findings, so a cron or
      CI job can gate on it; never used for usage errors.
   2  Usage error, a config, key-resolution, or log-read failure, or a pass that
-     a rotation raced (inconclusive — re-run).
+     a rotation raced or that ended on a half-written record (inconclusive —
+     re-run).
 
 Flags:
 `
@@ -362,11 +363,30 @@ func verifyOneTape(t auditTape, opts audit.VerifyOptions, rings verifiedRings) (
 	// them, for the same reason: a sequence assembled from a chain nobody could read is
 	// not evidence of an order.
 	if err := snap.CheckUnchanged(); err != nil {
-		fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: %v; no verdict was reached — re-run "+
-			"(against a quiescent log, or a copy of the chain)\n", t.logPath, err)
-		return audit.VerifyResult{}, nil, auditVerifyUsageExit
+		return noVerdictExit(t.logPath, err)
 	}
+	// The findings are released HERE, above the torn-tail arm and below the rotation bracket,
+	// and the asymmetry is the whole reason those two inconclusive causes are not one arm: a
+	// raced rotation FABRICATES findings (a fresh base's head chained onto the previous
+	// sibling's tail), so its lines must be dropped unread, while a torn tail fabricates none
+	// — scanSignedLines never let the fragment reach classify. Suppressing these would let one
+	// stripped newline hide a tamper the pass had already proved.
 	held.release()
+	if errors.Is(verifyErr, audit.ErrUnterminatedTail) {
+		// A FINDING outranks the missing verdict. Exit 1 is reserved for a log that fails
+		// verification precisely so a cron/CI job can gate on it, and a torn tail is one byte
+		// an attacker can append: taking the inconclusive exit here would hand them a way to
+		// move any tamper out of that bucket permanently, since re-running a file nobody is
+		// appending to answers the same thing forever.
+		if !res.OK() {
+			printVerifySummary(res)
+			fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: %v; the findings above stand — they "+
+				"describe complete records — but anything past that final fragment was not read\n",
+				t.logPath, verifyErr)
+			return res, recs, 0
+		}
+		return noVerdictExit(t.logPath, verifyErr)
+	}
 	if verifyErr != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log %s: %v\n", t.logPath, verifyErr)
 		return audit.VerifyResult{}, nil, auditVerifyUsageExit
@@ -382,6 +402,20 @@ func verifyOneTape(t auditTape, opts audit.VerifyOptions, rings verifiedRings) (
 	}
 	printVerifySummary(res)
 	return res, recs, 0
+}
+
+// noVerdictExit is the answer for a pass that covered something other than the chain it was
+// asked about — a rotation landed inside it, or its last record was still being written. It is
+// NOT a finding, so it takes auditVerifyUsageExit (2) rather than the 1 a cron job gates on,
+// and it carries no result: a verdict over a chain nobody could read whole is not one.
+//
+// One function because the two callers must not drift on the advice an operator's runbook
+// greps for; which of them may release its held findings first is the caller's own question,
+// and it differs (see verifyOneTape).
+func noVerdictExit(logPath string, err error) (audit.VerifyResult, []audit.JoinedRecord, int) {
+	fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: %v; no verdict was reached — re-run "+
+		"(against a quiescent log, or a copy of the chain)\n", logPath, err)
+	return audit.VerifyResult{}, nil, auditVerifyUsageExit
 }
 
 // heldFindingsCap bounds what a bracketed pass withholds. A rotation racing the pass

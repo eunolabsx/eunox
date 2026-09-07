@@ -310,7 +310,8 @@ func TestEnforcedForwardCore_AllowDetailsAreNotTheCallersMap(t *testing.T) {
 	live := map[string]interface{}{"path": "/tmp/x"}
 
 	enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
-		capability.EnforceResponse{Decision: capability.DecisionAllow}, "tools/call", "sanitize", "sanitize", "tool", false,
+		capability.EnforceResponse{Decision: capability.DecisionAllow},
+		callIdentity{method: "tools/call", auditID: "sanitize", denialTarget: "sanitize", kind: "tool"}, false,
 		func(context.Context, mcp.RPCMsg) map[string]interface{} {
 			// The caller's live map, returned as the allow details exactly as the tools/call
 			// closure does under --audit.

@@ -113,7 +113,7 @@ func computeSuggestions(r io.Reader, maxValues int) (suggestionSet, error) {
 		targets:  make(map[string]*observedTarget),
 		sessions: make(map[string]struct{}),
 	}
-	scanner := audit.NewLineScanner(r)
+	scanner := audit.NewLineScanner(r, nil)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {

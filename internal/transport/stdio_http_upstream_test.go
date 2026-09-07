@@ -399,7 +399,8 @@ func TestStdioProxy_HTTPUpstream_InfraFailureRecordsDeny(t *testing.T) {
 	rec := &fwdRecorder{}
 	fp := forwardParams{rec: rec, sessionID: "s1", callUpstream: p.callUpstream}
 	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)},
-		allowDecision(), "tools/call", "read_file", "read_file", "tool", false, upstreamErrorDetail)
+		allowDecision(),
+		callIdentity{method: "tools/call", auditID: "read_file", denialTarget: "read_file", kind: "tool"}, false, upstreamErrorDetail)
 
 	require.NotNil(t, resp.Error, "host must receive an upstream-error response")
 	require.Len(t, rec.records, 1)

@@ -2515,6 +2515,21 @@ template-shaped text — `"${HOME}/reports"`, `"${BUILD_ID}"` — keeps loading 
 as it always did. A *recognized* reference is still refused under `0.1`, naming the
 revision that introduced it, like every other `0.2` token.
 
+> **Accepted gap: a literal `${` cannot be allowlisted under `"0.2"`.** The closed
+> grammar has no escape spelling, so *any* `allowedValues` string containing `${`
+> that is not exactly one recognized variable is refused at load — including a value
+> a tool argument legitimately equals, such as `"${STAGE}"` or `"job-${task.id}"` as
+> a literal. Two consequences worth knowing before you migrate: a valid `"0.1"`
+> manifest carrying such a value does **not** load as `"0.2"` unchanged, and there is
+> no way to write it. Every other place the codebase meets this shape provides an
+> escape (`$$` for a config env reference, `$$.` for the argument-path sentinel);
+> this one does not, deliberately, because adding one is a grammar change and the
+> value it would buy is narrow. Workarounds, in order of preference: match the value
+> with a different condition (an `argumentSchema` `pattern`, or an external
+> `PolicyEvaluator`); or keep the entry on `"0.1"`, where the text is an ordinary
+> literal. The load error names the value, so this is a startup failure with an
+> explanation, never a silent deny.
+
 References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
 manifest is an ordinary literal string, which for a security rule means it matches
 nothing — the fail-closed direction, but not what the author intended.
@@ -2598,7 +2613,8 @@ byte-for-byte what it was before this option existed.
 > session-anchored key already has a reclamation path (the transport's teardown), so
 > expiring it would age a taint out from under a session that is merely quiet — a
 > fail-open — which is why the default backend does not expire anything.
-> `--max-call-counter-keys` remains a fail-closed *admission ceiling* behind all of this,
+> `--max-call-counter-keys` (in-memory only — it is refused alongside `--redis-addr`, which
+> holds this state under TTLs of its own) remains a fail-closed *admission ceiling* behind all of this,
 > not a reaper; the proxy logs a warning as the count approaches it, and at it a new
 > anchor's first labelled call is denied (over-blocking, never a bypass). **Redis is still
 > the backend for a multi-instance deployment of this mode** — a task's state has to be

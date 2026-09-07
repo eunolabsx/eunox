@@ -532,6 +532,8 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 		return
 	}
 	if sess.route != route {
+		// The 409-before-gates ordering is the same accepted existence oracle handleMCPDelete
+		// states in full; a derived worker id makes it reachable without a session.
 		http.Error(w, "session does not belong to this upstream route", http.StatusConflict)
 		return
 	}
@@ -857,6 +859,9 @@ func (p *HTTPProxy) denyUnresolvedSession(w http.ResponseWriter, r *http.Request
 // KILL_SWITCH deny for a reaped killed session, and DELETE resolves under p.mu for an
 // atomic check-and-delete with 409-before-404 — both different shapes a shared helper
 // would obscure.
+//
+// The 404/409 split is the accepted existence oracle handleMCPDelete states in full, including
+// why a derived worker id makes it reachable with no session in hand.
 func (p *HTTPProxy) resolveSessionForRoute(w http.ResponseWriter, sessionID string, route *UpstreamRoute) *httpSession {
 	sess := p.getSession(sessionID)
 	if sess == nil {
@@ -1322,10 +1327,16 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		// SSE-GET and POST paths: without these a sibling-audience token (or a same-audience
 		// different identity that learned the victim's Mcp-Session-Id) could tear down
 		// another client's session. Enforced only once the session is confirmed to exist AND
-		// belong to this route, ordering responses 404/409/403 — a weak existence oracle
-		// (a 403 confirms a live session id on this route), but session ids are unguessable
-		// UUIDs, and an unauthenticated caller never gets past the auth check upstream of
-		// this handler anyway. The kill switch is deliberately NOT consulted: tearing a
+		// belong to this route, ordering responses 404/409/403 — a weak existence oracle (403
+		// confirms a live id on this route, 409 one on a sibling), ACCEPTED. Not on the old
+		// grounds that session ids are unguessable UUIDs: a declaring peer's worker id is
+		// DERIVED from its claims and its task, so a caller who can name those probes liveness
+		// with no session (see recordSessionGateDeny, which re-argued the same premise). What
+		// leaks is liveness alone — the gates still refuse the teardown and the record is
+		// metered — and closing it needs the gates above the route check, where the per-route
+		// audience gate would judge a wrong-route caller against the wrong audience.
+		//
+		// The kill switch is deliberately NOT consulted: tearing a
 		// session down is always permitted (a killed session's cleanup must still succeed).
 		//
 		// route is dereferenced unconditionally: handleMCP 404s an unknown route before
@@ -1797,7 +1808,8 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 // pre-session siblings: catRevision is the cheapest refusal an attacker can force, so a
 // dropped tally here is exactly the flood volume an incident responder would under-count.
 //
-// Nil-limiter tolerance mirrors recordRefusal's: a proxy built without one (tests) records
+// Nil-limiter tolerance is refusalRecorders.forCategory's — it hands back the bare recorder
+// when the wiring holds no record table — so a proxy built without one (tests) records
 // unbounded rather than not at all.
 func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder {
 	// p is nil only on a bare-struct-literal session (as tests build) reaching this through

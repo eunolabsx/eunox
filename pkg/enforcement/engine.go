@@ -1749,6 +1749,18 @@ func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, n
 		if dir.DirectiveType() == capability.DirectiveTypeLabelOutput {
 			continue
 		}
+		// A RESPONSE-mutating directive on a non-tool target produces no obligation at all.
+		// The proxy redacts tools/call results and nothing else, so collecting one here put a
+		// redaction the redactor cannot perform onto a resources/read or prompts/get forward:
+		// a `contents[].blob` body is not the `content` shape it inspects, so it passed
+		// uninspected while the tape recorded the obligation as APPLIED — a record that lies
+		// about what was masked. Skipped rather than refused because the callers that reach
+		// here with a non-tool target are the two NAMING-based fills, whose constraint is
+		// synthesized from every entry naming the target and is not an authored declaration to
+		// refuse; the authored case is refused above this layer, by the PDP's own guard.
+		if responseDirectiveOnNonTool(matched.Target, dir) {
+			continue
+		}
 		ob := dir.ToObligation()
 		if !knownObligationTypes[ob.Type] {
 			// No BlockOverride: an unwired directive is an engine bug, and ENFORCEMENT_ERROR's
@@ -1763,6 +1775,20 @@ func (e *Engine) CollectObligations(matched *capability.Constraint, requestID, n
 		obligations = append(obligations, ob)
 	}
 	return obligations, nil
+}
+
+// responseDirectiveOnNonTool reports whether dir mutates a RESPONSE while constraintTarget
+// names something other than a tool — the one combination that can never be discharged.
+//
+// The target type is read off the constraint rather than taken as a parameter because both
+// naming-based fills already build their synthetic constraint's Target from the request's own
+// resolved target, so the answer is already in hand at every call site.
+func responseDirectiveOnNonTool(constraintTarget string, dir capability.Directive) bool {
+	if !capability.IsRedactFieldsDirective(dir) {
+		return false
+	}
+	targetType, _ := splitEnginePrefix(constraintTarget)
+	return targetType != string(capability.TargetTypeTool)
 }
 
 // MatchesResource reports whether a capability resource pattern matches the tool name,

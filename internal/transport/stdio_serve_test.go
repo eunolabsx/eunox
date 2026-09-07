@@ -675,7 +675,8 @@ func TestForwardNotification_UntranslatableIsReported(t *testing.T) {
 	// A progress notification whose params are a scalar: admitted at negotiation, unrewritable
 	// here. The host context is the default revision and the leg is addressed as the declaring
 	// one, so the translation runs rather than short-circuiting on a matched pair. Not a cancel,
-	// which stdio drops at the nonce rewrite before the translation is reached.
+	// whose own drop arm would be indistinguishable from this one — see
+	// TestForwardNotification_CancelTranslatesBeforeTheNonceRewrite for that leg.
 	notif := mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsProgress, Params: json.RawMessage(`"scalar"`)}
 
 	t.Run("stdio", func(t *testing.T) {
@@ -710,6 +711,86 @@ func TestForwardNotification_UntranslatableIsReported(t *testing.T) {
 		}
 		if len(uw.messages) != 0 {
 			t.Errorf("an untranslatable notification reached the upstream: %+v", uw.messages)
+		}
+	})
+}
+
+// TestForwardNotification_DuplicateKeyCancelIsDroppedEverywhere pins the disposition for the
+// one notification that decides whether an in-flight call is aborted, across both transports
+// AND both revision pairings.
+//
+// The nonce rewrite used to decode params with a plain json.Unmarshal and re-marshal them,
+// silently resolving a duplicate key last-wins. Whether that laundering was caught depended on
+// two things it should not have: which transport (stdio ran the rewrite before the strict leg
+// translation, HTTP after) and whether the revision pair was MISMATCHED (a matched pair
+// short-circuits the translation entirely, so no strict decode ran at all). The rewrite now
+// refuses the ambiguity itself, so the answer is the same everywhere.
+//
+// hostToUp is populated so the rewrite WOULD otherwise succeed: without that the cancel is
+// dropped for having nothing in flight and the test proves nothing.
+func TestForwardNotification_DuplicateKeyCancelIsDroppedEverywhere(t *testing.T) {
+	t.Parallel()
+	const hostKey = "n:42"
+	nonce := mcp.RawJSON(`"eunox-up-1"`)
+	// A duplicate key in the params of an otherwise ordinary cancel.
+	dupCancel := mcp.RPCMsg{
+		JSONRPC: "2.0",
+		Method:  methodNotificationsCancelled,
+		Params:  json.RawMessage(`{"requestId":42,"requestId":42}`),
+	}
+
+	// Both pairings: the MATCHED one is the ordinary deployment, where the leg translation
+	// short-circuits and the rewrite is the only thing that can refuse the ambiguity.
+	for _, rev := range []capability.Revision{capability.Revision20260728, UpstreamOpenRevision("")} {
+		t.Run("stdio/"+string(rev), func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			uw := &mockUpstreamWriter{}
+			p, _ := newStdioProxy(stdioServe{upSink: uw, stderr: &out}, strings.NewReader(""))
+			p.upstreamRev = rev
+			p.hostToUp[hostKey] = nonce
+
+			p.forwardHostNotification(context.Background(), dupCancel)
+
+			if len(uw.messages) != 0 {
+				t.Errorf("a duplicate-key cancel reached the upstream: %+v", uw.messages)
+			}
+		})
+
+		t.Run("http/"+string(rev), func(t *testing.T) {
+			t.Parallel()
+			var out bytes.Buffer
+			uw := &mockUpstreamWriter{}
+			sess := newTestSession(&httpSession{
+				id:          "sess-cancel-" + string(rev),
+				done:        make(chan struct{}),
+				upWriter:    mcp.NewMsgWriter(&writerAdapter{uw}),
+				upstreamRev: rev,
+				proxy:       &HTTPProxy{stderr: &out},
+				hostToUp:    map[string]*json.RawMessage{hostKey: nonce},
+			})
+
+			sess.forwardNotification(context.Background(), dupCancel)
+
+			if len(uw.messages) != 0 {
+				t.Errorf("a duplicate-key cancel reached the upstream: %+v", uw.messages)
+			}
+		})
+	}
+
+	// The control: an ordinary cancel is still rewritten and forwarded on both pairings.
+	t.Run("clean cancel still forwards", func(t *testing.T) {
+		t.Parallel()
+		uw := &mockUpstreamWriter{}
+		p, _ := newStdioProxy(stdioServe{upSink: uw, stderr: &bytes.Buffer{}}, strings.NewReader(""))
+		p.upstreamRev = UpstreamOpenRevision("")
+		p.hostToUp[hostKey] = nonce
+
+		p.forwardHostNotification(context.Background(),
+			mcp.RPCMsg{JSONRPC: "2.0", Method: methodNotificationsCancelled, Params: json.RawMessage(`{"requestId":42}`)})
+
+		if len(uw.messages) != 1 {
+			t.Fatalf("an unambiguous cancel must still reach the upstream, got %+v", uw.messages)
 		}
 	})
 }

@@ -682,7 +682,7 @@ func tailAuditLines(r io.Reader, n int) ([]string, error) {
 	if n <= 0 {
 		return nil, nil
 	}
-	sc := audit.NewLineScanner(r)
+	sc := audit.NewLineScanner(r, nil)
 	// Cap the up-front allocation: --audit-tail has no upper bound, and make([]string, 0, n)
 	// would reserve ~32GB for a one-line log at n=2e9. The ring still grows to n via append.
 	const maxTailPrealloc = 8192

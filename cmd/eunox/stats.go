@@ -113,7 +113,7 @@ func computeAuditStats(r io.Reader) (auditStatsSummary, error) {
 		blockedDenials:  make(map[denialKey]int),
 		observedDenials: make(map[denialKey]int),
 	}
-	scanner := audit.NewLineScanner(r)
+	scanner := audit.NewLineScanner(r, nil)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {

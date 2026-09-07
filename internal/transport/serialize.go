@@ -259,8 +259,10 @@ func (g *decisionSerializer) beginWithin(t decisionTicket, w turnWait) (end func
 		return func() {}, true
 	}
 	// sync.Cond has no bounded Wait, so the bound is a timer that broadcasts. expired is
-	// this call's own variable, written and read under g.mu; a broadcast wakes every
-	// waiter on the anchor and each re-checks its own conditions.
+	// this call's own variable, written and read under the registry lock (g.queues) — the
+	// one lock this file's safety argument rests on, and the one every queue's cond is built
+	// over; a broadcast wakes every waiter on the anchor and each re-checks its own
+	// conditions.
 	expired := false
 	var timer *time.Timer
 	var deadline time.Time

@@ -631,3 +631,35 @@ func TestRevisionRefusal_WireAndTapeNameTheSameCode(t *testing.T) {
 		})
 	}
 }
+
+// TestRefuseAcrossRevisions_BoundsAnUpstreamControlledMethod is the regression for the doc that
+// said every part of this error is from a closed set. The server-initiated leg reaches it with
+// a method the UPSTREAM chose and no allowlist ahead of it, and the text becomes a wire error
+// that upstream reads back — so an unbounded, unsanitized method was both a per-frame string
+// build an upstream drives at its send rate and a way to put control runes in front of whoever
+// prints the error.
+func TestRefuseAcrossRevisions_BoundsAnUpstreamControlledMethod(t *testing.T) {
+	t.Parallel()
+
+	hostile := strings.Repeat("A", 64<<10) + "\n[eunox] SECURITY: forged line"
+	err := refuseServerRequestAcrossRevisions(hostile, capability.Revision20260728)
+	if err == nil {
+		t.Fatal("a declaring host must refuse every server-initiated request")
+	}
+	got := err.Error()
+	if len(got) > 8<<10 {
+		t.Errorf("the refusal text is unbounded (%d bytes); an upstream chooses the method", len(got))
+	}
+	if strings.ContainsRune(got, '\n') {
+		t.Error("a newline survived into the refusal text; an upstream can forge a log line with it")
+	}
+	if strings.Contains(got, "forged line") {
+		t.Error("the whole hostile method survived the bound")
+	}
+
+	// The host-side callers are unaffected: their methods really are from the closed set.
+	plain := refuseServerRequestAcrossRevisions(capability.MethodSamplingCreateMessage, capability.Revision20260728)
+	if plain == nil || !strings.Contains(plain.Error(), capability.MethodSamplingCreateMessage) {
+		t.Errorf("an ordinary method must still be named verbatim: %v", plain)
+	}
+}

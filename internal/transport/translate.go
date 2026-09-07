@@ -144,14 +144,24 @@ func boundaryDisposition(msg mcp.RPCMsg) crossRevisionDeclaration {
 // refuseAcrossRevisions builds the boundary error for a message that may not cross, naming
 // both revisions and the method.
 //
-// Every part of the message is from a closed set — two published revisions and a method this
-// build routes — so it is safe to surface to the host verbatim, which revisionRefusalReason
-// relies on for the sibling revision errors.
+// The two REVISIONS are from a closed set — two published values this build speaks — so they
+// are safe to surface verbatim, which revisionRefusalReason relies on for the sibling revision
+// errors. The METHOD is not, and never was for every caller: the server-initiated leg reaches
+// this with an upstream-controlled method and no allowlist ahead of it (see
+// refuseServerRequestAcrossRevisions), so it is bounded and sanitized HERE rather than at that
+// caller — the text becomes a wire error the sending upstream reads back and an unbounded
+// per-frame string build besides, and a bound placed on one caller is one the next does not
+// inherit. A no-op for the host-side callers, whose methods really are from the closed set.
 func refuseAcrossRevisions(method string, hostRev, legRev capability.Revision, why string) error {
-	subject := method
-	if subject == "" {
-		subject = "a response"
+	// The sentinel is read off the RAW method, never the bounded one: BoundConsoleDetail trims
+	// whitespace, so " " would otherwise collapse into the empty string that means "this
+	// message carries no method at all" and a REQUEST would be reported as a response — the
+	// one fact this error exists to state, invertible by a peer choosing a whitespace method.
+	if method == "" {
+		return fmt.Errorf("%w: a response cannot cross a host %s / upstream %s pair (%s)",
+			errUntranslatableAcrossRevisions, hostRev, legRev, why)
 	}
+	subject := BoundConsoleDetail(method)
 	return fmt.Errorf("%w: %s cannot cross a host %s / upstream %s pair (%s)",
 		errUntranslatableAcrossRevisions, subject, hostRev, legRev, why)
 }

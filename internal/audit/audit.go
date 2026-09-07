@@ -951,15 +951,24 @@ func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{})
 // declare.
 const auditScanBufferBytes = 4 << 20
 
-// NewLineScanner returns a bufio.Scanner sized to hold one audit record, for the
-// readers that scan a log line by line (audit-verify, stats, suggest), keeping
-// their buffer bound identical.
-func NewLineScanner(r io.Reader) *bufio.Scanner {
+// NewLineScanner returns a bufio.Scanner over the audit records in r, for the readers that
+// scan a log line by line (audit-verify, stats, suggest, doctor), keeping their buffer bound
+// AND their record disposition identical.
+//
+// torn, when non-nil, is set if the stream's last line carried no terminating newline. That is
+// a write still in flight or a truncation, and the fragment is DROPPED either way — every
+// reader here reads the same live chain through the same lazy by-name opens, so a half-written
+// tail that one of them classified and another did not is two commands disagreeing about one
+// file. Only audit-verify has a verdict to withhold over it (see ErrUnterminatedTail); for the
+// reporting readers the drop is the whole disposition, which is why the flag is optional
+// rather than a second constructor.
+func NewLineScanner(r io.Reader, torn *bool) *bufio.Scanner {
 	scanner := bufio.NewScanner(r)
 	// Start small and grow on demand up to the cap: an eager auditScanBufferBytes
 	// allocation would reserve the full buffer up front for every reader even when
 	// records are far smaller.
 	scanner.Buffer(make([]byte, 0, 64<<10), auditScanBufferBytes)
+	scanner.Split(scanSignedLines(torn))
 	return scanner
 }
 

@@ -88,6 +88,13 @@ type dispatchParams struct {
 	// configured key domain. nil (the default) skips the whole surface entirely.
 	receipts *capability.EffectReceiptVerifier
 
+	// now is the clock the receipt FRESHNESS check reads, and the only time-sensitive call in
+	// the dispatch tree. Injectable because a hardcoded time.Now() is the one thing that makes
+	// a stale-receipt verdict undrivable THROUGH the transport — the verifier's own unit tests
+	// can pass any instant, but nothing could pin that this leg hands the right one down.
+	// nil (the default, and every production wiring) means time.Now.
+	now func() time.Time
+
 	// honorAttribution admits the client-supplied attribution interface (_meta's
 	// io.eunolabs.context-manifest block), gated on the route's schemaVersion since the
 	// manifest-side grammar gate can't cover a token that arrives on a REQUEST. False means
@@ -120,6 +127,13 @@ func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPC
 		return recordKillDenial(ctx, d.rec, deny, msg, verifiedSession(d.sessionID)), true
 	}
 	return mcp.RPCMsg{}, false
+}
+
+func (d dispatchParams) clock() time.Time {
+	if d.now == nil {
+		return time.Now()
+	}
+	return d.now()
 }
 
 // decideCtx applies the audit-mode quota skip: in observe mode MaxCalls is skipped
@@ -900,7 +914,8 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if (d.audit || dec.AuditOnly) && len(params.Arguments) > 0 {
 		toolDetails = quarantineReservedArgs(params.Arguments)
 	}
-	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
+	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodToolsCall, auditID: params.Name, denialTarget: params.Name, kind: "tool"}, true,
 		func(ctx context.Context, upResp mcp.RPCMsg) map[string]interface{} {
 			// Record the upstream's forwarded error code so a rejected call isn't identical to
 			// a clean success on the tape. Merges into a COPY of toolDetails — never mutates
@@ -981,7 +996,7 @@ func (d dispatchParams) effectReceiptDetail(upResp mcp.RPCMsg, dec capability.En
 	// Only an allow carries a resolved contract to check against. Observe-mode forwards are
 	// included deliberately — the call ran, so it's worth the same scrutiny — Verify handles
 	// having no declaration to compare against.
-	result := d.receipts.Verify(raw, tool, dec.Effect, time.Now())
+	result := d.receipts.Verify(raw, tool, dec.Effect, d.clock())
 	if result == nil {
 		return nil
 	}
@@ -1016,7 +1031,8 @@ func dispatchResourcesRead(ctx context.Context, d dispatchParams, msg mcp.RPCMsg
 	// also enforce resource reads.
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodResourcesRead, auditID: params.URI, denialTarget: params.URI, kind: "resource"}, true, upstreamErrorDetail)
 }
 
 // dispatchResourcesSubscribe enforces resources/subscribe under the same
@@ -1033,7 +1049,8 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
 	// recordObligations is false: a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodResourcesSubscribe, auditID: params.URI, denialTarget: params.URI, kind: "resource subscription"}, false, upstreamErrorDetail)
 }
 
 // dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest entry
@@ -1059,7 +1076,8 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodResourcesUnsubscribe, auditID: params.URI, denialTarget: params.URI, kind: "resource subscription"}, false, upstreamErrorDetail)
 }
 
 // dispatchPromptsGet enforces the capability manifest for prompts/get requests.
@@ -1077,7 +1095,8 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	dec := d.pdp.DecidePromptGet(d.decideCtx(ctx), d.sessionID, params.Name, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
 	// auditID carries the "prompts/" display prefix; denialTarget is the bare name.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodPromptsGet, auditID: "prompts/" + params.Name, denialTarget: params.Name, kind: "prompt"}, true, upstreamErrorDetail)
 }
 
 // dispatchList forwards a */list request to the upstream and prunes the result to permitted
@@ -1088,9 +1107,15 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// The kill-switch check runs at the dispatchRequest boundary (a killed session must not
 	// enumerate the catalog), so this handler no longer self-gates.
 
+	// Resolved ONCE for the whole function: every exit and every record below stamps it, which
+	// is what makes callIdentity's contract ("the per-call identity every exit stamps") true
+	// here rather than three of five exits taking it and the two record sites spelling the
+	// method twice, positionally, where a swap compiles.
+	id := methodIdentity(msg.Method)
+
 	// --require-audit=strict: fail the enumeration closed rather than forward an unrecorded
-	// one. The three string args collapse to the method name: a */list has no sub-target.
-	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method, capability.EnforceResponse{}); blocked {
+	// one. A */list has no sub-target, so every identifier field is the method itself.
+	if denied, blocked := d.strictAuditDenial(ctx, msg, id, capability.EnforceResponse{}); blocked {
 		return denied
 	}
 
@@ -1102,20 +1127,20 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		// The same mode enforcedForwardCore reads (see forwardParams.callUpstream): a leg with no
 		// upstream cannot enumerate one, and a nil call here would be a crash where the honest
 		// answer is a fail-closed refusal naming the wiring fault.
-		return d.refuseUpstreamless(ctx, msg, msg.Method, msg.Method, msg.Method, capability.EnforceResponse{})
+		return d.refuseUpstreamless(ctx, msg, id, capability.EnforceResponse{})
 	}
 	upResp, err := d.callUpstream(ctx, msg)
 	if err != nil {
-		return d.recordUpstreamFailure(ctx, msg, err, msg.Method, msg.Method, nil)
+		return d.recordUpstreamFailure(ctx, msg, err, id, nil)
 	}
 
 	// Defense-in-depth: a neither-result-nor-error reply is malformed, and forwarding it
 	// would bypass list filtering. callUpstream now rejects this before returning, so it's
 	// no longer reachable live — kept as a backstop against a future bypass.
 	if upResp.Error == nil && upResp.Result == nil {
-		warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
+		warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, id.kind, id.denialTarget, func() {
 			if d.rec != nil {
-				d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeEnforcementError, "", nil, false)
+				d.rec.RecordDeny(ctx, d.sessionID, id.auditID, id.method, capability.ErrCodeEnforcementError, "", nil, false)
 			}
 		})
 		return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "upstream returned a malformed list response (no result and no error)")
@@ -1155,9 +1180,9 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// AuditOnly never applies to list methods, so d.audit alone carries the observe posture.
 	// Details carry filter statistics so an auditor can tell filtering from a genuinely empty
 	// upstream apart.
-	warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
+	warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, id.kind, id.denialTarget, func() {
 		if d.rec != nil {
-			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(ctx, upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
+			d.rec.RecordAllow(ctx, d.sessionID, id.auditID, id.method, listAllowDetails(ctx, upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
 		}
 	})
 

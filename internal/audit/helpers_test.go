@@ -96,9 +96,17 @@ func logLines(t *testing.T, logPath string) [][]byte {
 	return bytes.Split(bytes.TrimRight(raw, "\n"), []byte("\n"))
 }
 
+// joinLogLines renders lines the way they sit on disk: newline-SEPARATED and newline-
+// TERMINATED. The terminator is not cosmetic — VerifyLog reads an unterminated final line as
+// a half-written record (ErrUnterminatedTail), a no-verdict exit rather than a verdict, and
+// logLines is what strips it.
+func joinLogLines(lines [][]byte) []byte {
+	return append(bytes.Join(lines, []byte("\n")), '\n')
+}
+
 func verifyBytes(t *testing.T, lines [][]byte, verifier *Sink) VerifyResult {
 	t.Helper()
-	joined := bytes.Join(lines, []byte("\n"))
+	joined := joinLogLines(lines)
 	res, err := VerifyLog(bytes.NewReader(joined), verifier, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)

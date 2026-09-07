@@ -21,6 +21,14 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
+// joinAuditLog renders lines the way an audit log sits on disk: newline-SEPARATED and
+// newline-TERMINATED. The terminator is not cosmetic — every chain reader drops an
+// unterminated final line as a half-written record (audit.NewLineScanner), so a fixture
+// without one silently loses its last entry.
+func joinAuditLog(lines []string) string {
+	return strings.Join(lines, "\n") + "\n"
+}
+
 // auditLine builds one audit-log JSON line carrying the structured target fields
 // the proxy writes (target_type/target/method), for the suggest tests. ns is the
 // enforcement namespace ("tool"|"resource"|"prompt"|"system") and target is the
@@ -46,7 +54,10 @@ func auditLine(decision, ns, target string, extra map[string]any) string {
 	if err != nil {
 		panic(err)
 	}
-	return string(b)
+	// Newline-TERMINATED, as an on-disk record is: every chain reader drops an unterminated
+	// final line as a half-written record, so an un-terminated fixture loses its last entry.
+	// Concatenating two of these leaves a blank line between them, which every reader skips.
+	return string(b) + "\n"
 }
 
 // ─── resolveTarget (structured target fields) ────────────────────────────────
@@ -84,14 +95,14 @@ func TestResolveTarget(t *testing.T) {
 // tool name, or one prefixed "prompts/") that no string heuristic could place
 // correctly.
 func TestComputeSuggestions_ClassifiesFromStructuredTargetFields(t *testing.T) {
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		auditLine("allow", "resource", "urn:isbn:0451450523", nil),
 		auditLine("allow", "resource", "mailto:ops@example.com", nil),
 		auditLine("allow", "resource", "memory:session", nil),
 		auditLine("allow", "tool", "weird://connector", nil),
 		auditLine("allow", "tool", "prompts/run", nil),
 		auditLine("allow", "prompt", "code_review", nil),
-	}, "\n")
+	})
 
 	s, err := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	if err != nil {
@@ -120,12 +131,12 @@ func TestComputeSuggestions_ClassifiesFromStructuredTargetFields(t *testing.T) {
 func TestComputeSuggestions_UnmappedMethodDenialExcluded(t *testing.T) {
 	// Records produced by the unmapped-method default branch: method is set but
 	// target_type/target are empty (no valid enforcement target exists).
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		`{"decision":"deny","method":"tools/execute","denial_code":"AUTHORIZATION_FAILED"}`,
 		`{"decision":"deny","method":"resources/patch","denial_code":"AUTHORIZATION_FAILED"}`,
 		// A genuine policy deny on a real tool must still appear.
 		auditLine("deny", "tool", "write_file", map[string]any{"denial_code": "AUTHORIZATION_FAILED"}),
-	}, "\n")
+	})
 
 	s, err := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	if err != nil {
@@ -147,13 +158,13 @@ func TestComputeSuggestions_InfraDenialExcluded(t *testing.T) {
 	// timeout reads as target_type "tool", a prompts/list timeout as "prompt")
 	// but are transport noise, not policy signals. They must not surface as
 	// draft targets.
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		`{"decision":"deny","target_type":"tool","target":"tools/list","method":"tools/list","denial_code":"UPSTREAM_TIMEOUT"}`,
 		`{"decision":"deny","target_type":"prompt","target":"list","method":"prompts/list","denial_code":"UPSTREAM_TIMEOUT"}`,
 		`{"decision":"deny","target_type":"tool","target":"read_file","method":"tools/call","denial_code":"UPSTREAM_ERROR"}`,
 		// A genuine policy deny on the same tool must still appear.
 		`{"decision":"deny","target_type":"tool","target":"read_file","method":"tools/call","denial_code":"AUTHORIZATION_FAILED"}`,
-	}, "\n")
+	})
 
 	s, err := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	if err != nil {
@@ -183,13 +194,13 @@ func TestComputeSuggestions_InfraDenialExcluded(t *testing.T) {
 // a "tool:tools/list" entry would be meaningless (and was being emitted before
 // this fix).
 func TestComputeSuggestions_ListEnumerationExcluded(t *testing.T) {
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		`{"decision":"allow","target_type":"tool","target":"tools/list","method":"tools/list"}`,
 		`{"decision":"allow","target_type":"resource","target":"resources/list","method":"resources/list"}`,
 		`{"decision":"allow","target_type":"prompt","target":"prompts/list","method":"prompts/list"}`,
 		// A genuine tools/call on the same session must still appear.
 		auditLine("allow", "tool", "read_file", nil),
-	}, "\n")
+	})
 
 	s, err := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	if err != nil {
@@ -213,7 +224,7 @@ func TestComputeSuggestions_ListEnumerationExcluded(t *testing.T) {
 // ─── computeSuggestions ─────────────────────────────────────────────────────
 
 func TestComputeSuggestions_AggregatesAndMinesArgs(t *testing.T) {
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		auditLine("allow", "tool", "read_file", map[string]any{"session_id": "s1", "details": map[string]any{"path": "/reports/q3.pdf"}}),
 		auditLine("allow", "tool", "read_file", map[string]any{"session_id": "s1", "details": map[string]any{"path": "/reports/q4.pdf"}}),
 		auditLine("allow", "tool", "read_file", map[string]any{"session_id": "s2", "details": map[string]any{"path": "/reports/q3.pdf"}}), // duplicate value
@@ -221,7 +232,7 @@ func TestComputeSuggestions_AggregatesAndMinesArgs(t *testing.T) {
 		auditLine("deny", "tool", "write_file", map[string]any{"session_id": "s1", "denial_code": "AUTHORIZATION_FAILED"}),
 		"", // blank
 		"not json",
-	}, "\n")
+	})
 
 	s, err := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	if err != nil {
@@ -319,14 +330,14 @@ func TestComputeSuggestions_DenyRecordsDoNotMineArgs(t *testing.T) {
 // proxy runs at load. A draft that `eunox validate` rejects would be a
 // broken first-touch experience.
 func TestRenderSuggestedManifest_RoundTripsThroughValidate(t *testing.T) {
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		auditLine("allow", "tool", "read_file", map[string]any{"session_id": "s1", "details": map[string]any{"path": "/reports/q3.pdf"}}),
 		auditLine("allow", "tool", "query_db", map[string]any{"session_id": "s1", "details": map[string]any{"sql": "SELECT 1"}}),
 		auditLine("allow", "prompt", "code_review", map[string]any{"session_id": "s1", "details": map[string]any{"name": "code_review"}}),
 		auditLine("allow", "resource", "db://warehouse/orders", map[string]any{"session_id": "s1", "details": map[string]any{"uri": "db://warehouse/orders"}}),
 		auditLine("allow", "system", "sampling/createMessage", map[string]any{"session_id": "s1"}),
 		auditLine("deny", "tool", "write_file", map[string]any{"session_id": "s1", "denial_code": "AUTHORIZATION_FAILED"}),
-	}, "\n")
+	})
 
 	s, err := computeSuggestions(strings.NewReader(log), suggestMaxValuesDefault)
 	if err != nil {
@@ -672,7 +683,7 @@ func TestRenderSuggestedManifest_TooManyValuesDowngradesToComment(t *testing.T) 
 	for i := 0; i < 5; i++ {
 		lines = append(lines, auditLine("allow", "tool", "echo", map[string]any{"details": map[string]any{"msg": "v" + string(rune('a'+i))}}))
 	}
-	s, _ := computeSuggestions(strings.NewReader(strings.Join(lines, "\n")), suggestMaxValuesDefault)
+	s, _ := computeSuggestions(strings.NewReader(joinAuditLog(lines)), suggestMaxValuesDefault)
 	out := renderSuggestedManifest(s, "m", 3) // 5 distinct values > maxValues=3
 
 	if strings.Contains(out, "allowedValues") {
@@ -724,7 +735,7 @@ func TestRenderSuggestedManifest_OverflowedArgumentReportsCountBound(t *testing.
 	for i := 0; i < 1000; i++ {
 		lines = append(lines, auditLine("allow", "tool", "fetch", map[string]any{"details": map[string]any{"id": fmt.Sprintf("id-%d", i)}}))
 	}
-	s, err := computeSuggestions(strings.NewReader(strings.Join(lines, "\n")), maxValues)
+	s, err := computeSuggestions(strings.NewReader(joinAuditLog(lines)), maxValues)
 	if err != nil {
 		t.Fatalf("computeSuggestions: %v", err)
 	}
@@ -753,7 +764,7 @@ func TestRenderSuggestedManifest_OverflowedArgumentAlsoNonStringReportsOverflow(
 	}
 	// One additional call where "id" is a non-string value.
 	lines = append(lines, auditLine("allow", "tool", "fetch", map[string]any{"details": map[string]any{"id": 42}}))
-	s, err := computeSuggestions(strings.NewReader(strings.Join(lines, "\n")), maxValues)
+	s, err := computeSuggestions(strings.NewReader(joinAuditLog(lines)), maxValues)
 	if err != nil {
 		t.Fatalf("computeSuggestions: %v", err)
 	}
@@ -921,7 +932,7 @@ func TestRenderSuggestedManifest_ValuesRenderThroughTheSharedYAMLRenderer(t *tes
 	for _, v := range vals {
 		lines = append(lines, auditLine("allow", "tool", "fetch", map[string]any{"details": map[string]any{"path": v}}))
 	}
-	sset, _ := computeSuggestions(strings.NewReader(strings.Join(lines, "\n")), suggestMaxValuesDefault)
+	sset, _ := computeSuggestions(strings.NewReader(joinAuditLog(lines)), suggestMaxValuesDefault)
 	out := renderSuggestedManifest(sset, "m", suggestMaxValuesDefault)
 
 	for _, v := range vals {

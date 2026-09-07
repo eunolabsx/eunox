@@ -62,9 +62,9 @@ func TestAdmitAllScript_DenyPathRefreshesTTLWhenKeyExists(t *testing.T) {
 	// A deny driven by limit<1 (a misconfigured/relaxed limit invoking the script
 	// directly, bypassing the Go bucket validation) reaches the deny branch. It must
 	// refresh the TTL because the key EXISTS. Before the fix the branch refreshed only
-	// when the bucket held entries; the EXISTS gate makes the refresh robust for any
+	// when the bucket held entries; refreshing UNCONDITIONALLY makes it robust for any
 	// reachable deny on a live key, so the key cannot silently expire and reset the
-	// quota window.
+	// quota window. See the sibling test for why the refresh needs no EXISTS probe.
 	run(0, "m-0000000002")
 
 	require.True(t, mr.Exists(key), "key must still exist after the deny call")
@@ -76,6 +76,33 @@ func TestAdmitAllScript_DenyPathRefreshesTTLWhenKeyExists(t *testing.T) {
 	card, err := client.ZCard(ctx, key).Result()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), card, "the in-window entry must remain (deny adds none)")
+}
+
+// TestAdmitAllScript_DenyPathCreatesNoKey is the other half of the unconditional TTL refresh.
+// The refresh used to be EXISTS-gated on the stated rationale "refresh, never re-create" —
+// which EXPIRE gives for free: on a key that does not exist it returns 0 and does nothing. The
+// probe therefore bought nothing and doubled the per-bucket command count on the denied-
+// admission hot path. This pins the property the probe was standing in for.
+func TestAdmitAllScript_DenyPathCreatesNoKey(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+
+	now := time.Unix(1_700_000_000, 0)
+	const windowSec = 60
+	const ttlSec = windowSec * cleanupMarginFactor
+	key := "callcounter:itest-absent:60"
+	require.False(t, mr.Exists(key), "precondition: the bucket has never been written")
+
+	cutoff := now.Add(-time.Duration(windowSec) * time.Second).UnixMicro()
+	_, err := admitAllScript.Run(ctx, client, []string{key},
+		now.UnixMicro(), cutoff, "m-0000000001", int64(0), ttlSec, int64(windowSec)*1_000_000, 1, 0,
+		MaxWeightedEntriesPerKey).Result()
+	require.NoError(t, err)
+
+	require.False(t, mr.Exists(key),
+		"a denied admission must leave no bucket behind: EXPIRE on an absent key is a no-op, never a create")
 }
 
 // TestRedisAdmitAll_WeightedEntryCeilingRefusesRatherThanGrowing is the Redis half of
