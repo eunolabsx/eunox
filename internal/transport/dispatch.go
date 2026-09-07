@@ -900,7 +900,8 @@ func dispatchToolsCall(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) mc
 	if (d.audit || dec.AuditOnly) && len(params.Arguments) > 0 {
 		toolDetails = quarantineReservedArgs(params.Arguments)
 	}
-	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodToolsCall, params.Name, params.Name, "tool", true,
+	out := enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodToolsCall, auditID: params.Name, denialTarget: params.Name, kind: "tool"}, true,
 		func(ctx context.Context, upResp mcp.RPCMsg) map[string]interface{} {
 			// Record the upstream's forwarded error code so a rejected call isn't identical to
 			// a clean success on the tape. Merges into a COPY of toolDetails — never mutates
@@ -1016,7 +1017,8 @@ func dispatchResourcesRead(ctx context.Context, d dispatchParams, msg mcp.RPCMsg
 	// also enforce resource reads.
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesRead, params.URI, params.URI, "resource", true, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodResourcesRead, auditID: params.URI, denialTarget: params.URI, kind: "resource"}, true, upstreamErrorDetail)
 }
 
 // dispatchResourcesSubscribe enforces resources/subscribe under the same
@@ -1033,7 +1035,8 @@ func dispatchResourcesSubscribe(ctx context.Context, d dispatchParams, msg mcp.R
 	dec := d.pdp.DecideResourceRead(d.decideCtx(ctx), d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
 	// recordObligations is false: a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesSubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodResourcesSubscribe, auditID: params.URI, denialTarget: params.URI, kind: "resource subscription"}, false, upstreamErrorDetail)
 }
 
 // dispatchResourcesUnsubscribe enforces resources/unsubscribe against the SAME manifest entry
@@ -1059,7 +1062,8 @@ func dispatchResourcesUnsubscribe(ctx context.Context, d dispatchParams, msg mcp
 	dec := d.pdp.DecideResourceCancel(ctx, d.sessionID, params.URI, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
 	// recordObligations is false: cancelling a subscription does not log obligation names.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodResourcesUnsubscribe, params.URI, params.URI, "resource subscription", false, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodResourcesUnsubscribe, auditID: params.URI, denialTarget: params.URI, kind: "resource subscription"}, false, upstreamErrorDetail)
 }
 
 // dispatchPromptsGet enforces the capability manifest for prompts/get requests.
@@ -1077,7 +1081,8 @@ func dispatchPromptsGet(ctx context.Context, d dispatchParams, msg mcp.RPCMsg) m
 	dec := d.pdp.DecidePromptGet(d.decideCtx(ctx), d.sessionID, params.Name, d.sourceIP)
 	d.finishDecision() // release the decision turn before the forward
 	// auditID carries the "prompts/" display prefix; denialTarget is the bare name.
-	return enforcedForwardCore(ctx, d.forwardParams, msg, dec, capability.MethodPromptsGet, "prompts/"+params.Name, params.Name, "prompt", true, upstreamErrorDetail)
+	return enforcedForwardCore(ctx, d.forwardParams, msg, dec,
+		callIdentity{method: capability.MethodPromptsGet, auditID: "prompts/" + params.Name, denialTarget: params.Name, kind: "prompt"}, true, upstreamErrorDetail)
 }
 
 // dispatchList forwards a */list request to the upstream and prunes the result to permitted
@@ -1090,7 +1095,7 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 
 	// --require-audit=strict: fail the enumeration closed rather than forward an unrecorded
 	// one. The three string args collapse to the method name: a */list has no sub-target.
-	if denied, blocked := d.strictAuditDenial(ctx, msg, msg.Method, msg.Method, msg.Method, capability.EnforceResponse{}); blocked {
+	if denied, blocked := d.strictAuditDenial(ctx, msg, methodIdentity(msg.Method), capability.EnforceResponse{}); blocked {
 		return denied
 	}
 
@@ -1102,11 +1107,11 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		// The same mode enforcedForwardCore reads (see forwardParams.callUpstream): a leg with no
 		// upstream cannot enumerate one, and a nil call here would be a crash where the honest
 		// answer is a fail-closed refusal naming the wiring fault.
-		return d.refuseUpstreamless(ctx, msg, msg.Method, msg.Method, msg.Method, capability.EnforceResponse{})
+		return d.refuseUpstreamless(ctx, msg, methodIdentity(msg.Method), capability.EnforceResponse{})
 	}
 	upResp, err := d.callUpstream(ctx, msg)
 	if err != nil {
-		return d.recordUpstreamFailure(ctx, msg, err, msg.Method, msg.Method, nil)
+		return d.recordUpstreamFailure(ctx, msg, err, methodIdentity(msg.Method), nil)
 	}
 
 	// Defense-in-depth: a neither-result-nor-error reply is malformed, and forwarding it

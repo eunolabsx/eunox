@@ -2300,7 +2300,8 @@ func TestEnforcedForwardCore_StrictGateBeforeAuditOnlyRecord(t *testing.T) {
 		Denial:    &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed},
 	}
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}
-	resp := enforcedForwardCore(context.Background(), fp, msg, dec, "tools/call", "secret_tool", "secret_tool", "tool", true,
+	resp := enforcedForwardCore(context.Background(), fp, msg, dec,
+		callIdentity{method: "tools/call", auditID: "secret_tool", denialTarget: "secret_tool", kind: "tool"}, true,
 		func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 
 	if rec.forward {
@@ -2342,7 +2343,8 @@ func TestStrictAuditDenial_StructuredDetailIsDiscrete(t *testing.T) {
 	// A clean allow that the strict gate then blocks on the degraded trail.
 	dec := capability.EnforceResponse{Decision: capability.DecisionAllow}
 	msg := mcp.RPCMsg{ID: mcp.RawJSON(`1`), Method: "tools/call"}
-	resp := enforcedForwardCore(context.Background(), fp, msg, dec, "tools/call", "tool_x", "tool_x", "tool", true,
+	resp := enforcedForwardCore(context.Background(), fp, msg, dec,
+		callIdentity{method: "tools/call", auditID: "tool_x", denialTarget: "tool_x", kind: "tool"}, true,
 		func(context.Context, mcp.RPCMsg) map[string]interface{} { return nil })
 
 	if resp.Error == nil || resp.Error.Code != denialToJSONRPCCode(capability.ErrCodeAuditUnavailable) {

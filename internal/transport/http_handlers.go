@@ -261,7 +261,7 @@ func (p *HTTPProxy) creationStrictAuditDenial(ctx context.Context, route *Upstre
 		limits:           refusalLimits{notices: p.noticeWriter()},
 	}
 	// Zero decision: nothing exists yet to have cleared a flow label.
-	return fp.strictAuditDenial(ctx, msg, identifier, method, method, capability.EnforceResponse{})
+	return fp.strictAuditDenial(ctx, msg, callIdentity{method: method, auditID: identifier, denialTarget: method}, capability.EnforceResponse{})
 }
 
 // creationAudienceDenial applies the per-route JWT audience pin to a request that would create

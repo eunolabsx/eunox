@@ -415,16 +415,20 @@ func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, 
 
 // recordUpstreamFailure records the deny for a callUpstream error and returns the host-facing
 // JSON-RPC error response. Shared by the forward core and */list dispatch so both produce
-// byte-identical records for the same physical outage. dispatchList passes the method as
-// both auditID and method (no sub-target); the forward core passes the per-target audit id.
-func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, auditID, method string, detail map[string]interface{}) mcp.RPCMsg {
+// byte-identical records for the same physical outage. dispatchList names the method in every
+// field (no sub-target); the forward core passes the per-target audit id.
+func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, id callIdentity, detail map[string]interface{}) mcp.RPCMsg {
 	code, reason, rpcCode := upstreamErrInfo(fp.limits.notices, err, fp.upstreamTimeMs)
 	// This deny records a call already forwarded to (and answered, however badly, by)
 	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
 	// for, so it gets the same immediate diagnostic under strict mode.
-	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, method, auditID, func() {
+	//
+	// Named by METHOD rather than by kind/denialTarget, unlike the core's other warning sites:
+	// */list reaches this helper with no target below the method at all, so the pair the others
+	// use would render the noun half empty on the one leg that has none.
+	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, id.method, id.auditID, func() {
 		if fp.rec != nil {
-			fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, code, "", detail, false)
+			fp.rec.RecordDeny(ctx, fp.sessionID, id.auditID, id.method, code, "", detail, false)
 		}
 	})
 	return refusalError(msg.ID, rpcCode, reason)
@@ -485,9 +489,9 @@ func mergeAuditDetails(base, extra map[string]interface{}) map[string]interface{
 // a fabricated outage on the tamper-evident tape — the failure mode the substituted sink this mode
 // replaced actually produced. The refusal is hard whatever the posture, since an observing route
 // downgrades a verdict into a forward and there is nothing here to forward through.
-func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, dec capability.EnforceResponse) mcp.RPCMsg {
+func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, id callIdentity, dec capability.EnforceResponse) mcp.RPCMsg {
 	if fp.rec != nil {
-		fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "",
+		fp.rec.RecordDeny(ctx, fp.sessionID, id.auditID, id.method, capability.ErrCodeEnforcementError, "",
 			handlerFaultDetail(dec), false)
 	}
 	// Admitted before the arguments are built: a wiring fault refuses every request on this leg, so
@@ -495,9 +499,9 @@ func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, 
 	// variadic boxing that heap-allocates every argument (see admitNotice).
 	if line, ok := fp.limits.notices.admitNotice(siteUpstreamlessForward); ok {
 		line.writef("[eunox] SECURITY: %q was authorized but this path has no upstream to forward it to; refused (ENFORCEMENT_ERROR) — a proxy wiring fault, not an upstream failure\n",
-			audit.SanitizeAuditField(method))
+			audit.SanitizeAuditField(id.method))
 	}
-	return refusalResponse(msg.ID, capability.ErrCodeEnforcementError, "", denialTarget, "")
+	return refusalResponse(msg.ID, capability.ErrCodeEnforcementError, "", id.denialTarget, "")
 }
 
 // strictAuditDenial implements the --require-audit=strict gate for the host-facing path: when
@@ -511,7 +515,7 @@ func (fp forwardParams) refuseUpstreamless(ctx context.Context, msg mcp.RPCMsg, 
 // it whenever the trail is healthy — every call in a healthy deployment — so building the map
 // at the call site would allocate for a value nothing reads. A value, not a callback: nothing
 // below the decision mutates state, unlike the compensating version this replaced.
-func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, auditID, method, denialTarget string, dec capability.EnforceResponse) (mcp.RPCMsg, bool) {
+func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, id callIdentity, dec capability.EnforceResponse) (mcp.RPCMsg, bool) {
 	tripped, reason, detail := auditGateTripped(fp.rec, fp.requireAuditStrict)
 	if !tripped {
 		return mcp.RPCMsg{}, false
@@ -520,9 +524,9 @@ func (fp forwardParams) strictAuditDenial(ctx context.Context, msg mcp.RPCMsg, a
 	// detail carries discrete counts (dropped_count/write_failure_count); the prose
 	// reason is for the host-facing error and the stderr warning only, never the
 	// structured audit field.
-	fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeAuditUnavailable, "", detail, false)
+	fp.rec.RecordDeny(ctx, fp.sessionID, id.auditID, id.method, capability.ErrCodeAuditUnavailable, "", detail, false)
 	warnStrictAuditOnce(fp.errOutOrStderr(), fp.strictAuditWarned, reason)
-	return refusalResponse(msg.ID, capability.ErrCodeAuditUnavailable, "", denialTarget, ""), true
+	return refusalResponse(msg.ID, capability.ErrCodeAuditUnavailable, "", id.denialTarget, ""), true
 }
 
 // refusalResponse builds the host-facing denial, or the zero message for a message that has no
@@ -576,6 +580,36 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 	return denial.Downgradable() && (auditMode || auditOnly)
 }
 
+// callIdentity is the per-call identity every exit below the decision stamps: which method ran,
+// which id the RECORD claims, which target a host-facing DENIAL names, and the noun an
+// operator-facing line calls it.
+//
+// One keyed struct rather than four adjacent strings, for the reason audit.RecordParams and
+// serverRequestDispatch are: the core and its three refusal helpers had drifted into two
+// different ORDERS for the same tail, and three of the four fields hold the same value on the
+// tools/call and resources/* legs — so a transposed edit there compiles, passes every test, and
+// mis-stamps the signed tape only on prompts/get, the one leg whose auditID ("prompts/x") and
+// denialTarget ("x") differ.
+type callIdentity struct {
+	// method is the MCP method, recorded verbatim as the record's method field.
+	method string
+	// auditID is the identifier the record CLAIMS as its target. It is the method itself on a
+	// leg with no sub-target (*/list, the locally-answered methods).
+	auditID string
+	// denialTarget is the target named in the host-facing denial envelope — what the CALLER is
+	// told it was refused, which is not always what the tape is keyed on.
+	denialTarget string
+	// kind is the operator-facing noun ("tool", "resource", "prompt") for stderr lines only,
+	// never for a structured field.
+	kind string
+}
+
+// methodIdentity is the callIdentity for a leg with no target below its method: */list and the
+// locally-answered methods, where all three identifier fields are the method itself.
+func methodIdentity(method string) callIdentity {
+	return callIdentity{method: method, auditID: method, denialTarget: method}
+}
+
 // enforcedForwardCore is the shared deny/observe/forward/record decision both transports apply
 // to every enforced method. Returns the JSON-RPC message to deliver to the host — a denial, an
 // upstream transport error, or the (possibly redacted) response. Transports differ only in
@@ -585,7 +619,7 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 // deny to a logged forward (kill-switch always hard-blocks); a transport failure records the
 // upstream error code; success applies redactFields obligations (fail closed) and records an
 // allow with obligation tokens and allowDetails.
-func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, dec capability.EnforceResponse, method, auditID, denialTarget, kind string, recordObligations bool, allowDetails func(context.Context, mcp.RPCMsg) map[string]interface{}) (reply mcp.RPCMsg) {
+func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, dec capability.EnforceResponse, id callIdentity, recordObligations bool, allowDetails func(context.Context, mcp.RPCMsg) map[string]interface{}) (reply mcp.RPCMsg) {
 	// A message with NO ID has no reply channel — JSON-RPC forbids answering it — and the zero
 	// RPCMsg is how this package spells "nothing to send" (see refusalResponse).
 	//
@@ -624,10 +658,10 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		if !observe {
 			// A genuine hard deny: record it (upstream never called) and return.
 			if fp.rec != nil {
-				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType,
+				fp.rec.RecordDeny(ctx, fp.sessionID, id.auditID, id.method, denial.Code, denial.ConditionType,
 					mergeAuditDetails(denial.Details, handlerFaultDetail(dec)), false)
 			}
-			return refusalResponse(msg.ID, denial.Code, denial.ConditionType, denialTarget, denialArgument(denial))
+			return refusalResponse(msg.ID, denial.Code, denial.ConditionType, id.denialTarget, denialArgument(denial))
 		}
 		// observe: downgrade to a forwarded call. The audit_only=true record is
 		// written below, AFTER the strict-audit gate, so a gate-blocked call never
@@ -639,7 +673,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// audit_only=true record contradicting the AUDIT_UNAVAILABLE hard-block.
 	//
 	// The FIRST of three exits below the decision.
-	if denied, blocked := fp.strictAuditDenial(ctx, msg, auditID, method, denialTarget, dec); blocked {
+	if denied, blocked := fp.strictAuditDenial(ctx, msg, id, dec); blocked {
 		return denied
 	}
 
@@ -649,15 +683,15 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// The same annotation merge the hard-deny arm makes: no exit below the decision may
 		// silently drop a decision-side fact.
 		observeDetail := mergeAuditDetails(denial.Details, handlerFaultDetail(dec))
-		warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
+		warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, id.kind, id.denialTarget, func() {
 			if fp.rec != nil {
-				fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, denial.Code, denial.ConditionType, observeDetail, true)
+				fp.rec.RecordDeny(ctx, fp.sessionID, id.auditID, id.method, denial.Code, denial.ConditionType, observeDetail, true)
 			}
 		})
 		if line, ok := fp.limits.notices.admitNotice(siteObserveDowngrade); ok {
 			line.writef(
 				"[eunox] AUDIT: %s %q would be denied (%s) — forwarding (audit mode)\n",
-				kind, denialTarget, denial.Code,
+				id.kind, id.denialTarget, denial.Code,
 			)
 		}
 	}
@@ -668,7 +702,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// caller and it always denies — but a nil call here would be a crash where the honest
 		// answer is a fail-closed refusal NAMING the wiring fault, rather than a transport failure
 		// blamed on an upstream nothing contacted.
-		return fp.refuseUpstreamless(ctx, msg, auditID, method, denialTarget, dec)
+		return fp.refuseUpstreamless(ctx, msg, id, dec)
 	}
 	upResp, fwdErr := fp.callUpstream(ctx, msg)
 	if fwdErr != nil {
@@ -680,7 +714,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// budget on calls that never executed — the fail-closed direction (over-count, never
 		// under-count), visible on the tape via this deny's upstream error code.
 
-		return fp.recordUpstreamFailure(ctx, msg, fwdErr, auditID, method, handlerFaultDetail(dec))
+		return fp.recordUpstreamFailure(ctx, msg, fwdErr, id, handlerFaultDetail(dec))
 	}
 
 	// Apply post-allow obligations (redactFields) before the response reaches the host. Only
@@ -701,13 +735,13 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 			// one exit an adversarial upstream can drive at will. The notice's arguments are
 			// already in scope, so the admit-before-building-args discipline is unaffected.
 			redactDetail := handlerFaultDetail(dec)
-			warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
+			warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, id.kind, id.denialTarget, func() {
 				if fp.rec != nil {
-					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
+					fp.rec.RecordDeny(ctx, fp.sessionID, id.auditID, id.method, capability.ErrCodeEnforcementError, "", redactDetail, false)
 				}
 			})
 			if line, ok := fp.limits.notices.admitNotice(siteRedactionFault); ok {
-				line.writef("[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
+				line.writef("[eunox] SECURITY: redaction failed for %s %q: %v\n", id.kind, id.denialTarget, redactErr)
 			}
 			return refusalError(msg.ID, jsonRPCCodeInternalError, "internal error: response redaction failed")
 		}
@@ -718,7 +752,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	// a redactable value through error.data, a free-form channel the redact paths can't verify.
 	if upResp.Error != nil && upResp.Error.Data != nil && hasRedactFieldsObligation(dec.Obligations) {
 		if line, ok := fp.limits.notices.admitNotice(siteRedactionFault); ok {
-			line.writef("[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", kind, denialTarget)
+			line.writef("[eunox] SECURITY: dropping error.data on %s %q — a redactFields obligation cannot be verified against the free-form JSON-RPC error channel\n", id.kind, id.denialTarget)
 		}
 		upResp.Error.Data = nil
 	}
@@ -741,7 +775,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 
 	// Carry dec.AuditOnly so a per-entry audit-mode forward is not logged as a
 	// genuine allow. allowDetails supplies the structured details.
-	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
+	warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, id.kind, id.denialTarget, func() {
 		if fp.rec == nil {
 			return
 		}
@@ -749,7 +783,7 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// closure's base under --audit is the caller's live parsed argument map, so writing
 		// into whatever that chain hands back would rewrite the request being described.
 		details := mergeAuditDetails(allowDetails(ctx, upResp), declDetail)
-		fp.rec.RecordAllow(ctx, fp.sessionID, auditID, method, details, oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
+		fp.rec.RecordAllow(ctx, fp.sessionID, id.auditID, id.method, details, oblNames, fp.audit || dec.AuditOnly, dec.LabelsOut, dec.CarriedLabels)
 	})
 	upResp.ID = msg.ID
 	return upResp
@@ -857,7 +891,8 @@ func refuseUnroutable(ctx context.Context, fp forwardParams, recs refusalRecorde
 	}
 	// Record-before-act: the core writes the audit record, then the stderr notice follows, so a
 	// crash between the two never leaves a SIEM alert with no corresponding audit trail entry.
-	resp := enforcedForwardCore(ctx, fp, msg, dec, method, identifier, sanitizedMethod, "method", false, nil)
+	resp := enforcedForwardCore(ctx, fp, msg, dec,
+		callIdentity{method: method, auditID: identifier, denialTarget: sanitizedMethod, kind: "method"}, false, nil)
 	// The BOUNDED half. An unbuffered write syscall per refused frame is what a peer looping
 	// `{"jsonrpc":"2.0","method":"x/bogus"}` drives at its full send rate — no id, no handler slot,
 	// no upstream round trip — and nothing bounded it: it is the same order of cost as the whole
