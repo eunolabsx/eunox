@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/alicebob/miniredis/v2 v2.39.0
-	github.com/go-jose/go-jose/v4 v4.1.4
+	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/stretchr/testify v1.12.1
