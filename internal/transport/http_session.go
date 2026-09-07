@@ -1762,13 +1762,7 @@ func awaitAndDropDecideGate(sess *httpSession) {
 // releasing flow state before they finish could drop a live taint. Bounded and poll-based: the
 // wait must never be unbounded on a wedged handler.
 func (s *httpSession) awaitInFlightDrained(timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for s.inFlight.Load() > 0 {
-		if !time.Now().Before(deadline) {
-			return
-		}
-		time.Sleep(inFlightDrainPoll)
-	}
+	awaitDrained(&s.inFlight, timeout)
 }
 
 // close shuts down the session.

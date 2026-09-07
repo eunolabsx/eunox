@@ -118,9 +118,6 @@ func WriteControlTokenFile(ctx context.Context, path, token string, errOut io.Wr
 		return "", err
 	}
 	dir := filepath.Dir(expanded)
-	if dir == "" {
-		dir = "."
-	}
 	if dir != "." {
 		// Whether the directory ALREADY exists decides how its mode is handled: MkdirAll
 		// creates any MISSING dir at 0700, so a dir eunox creates needs nothing further.

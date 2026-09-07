@@ -771,3 +771,73 @@ func TestTier2_BrokenSetIsBounded(t *testing.T) {
 		t.Error("a name dropped at the cap must still be broken through the whole-session flag")
 	}
 }
+
+// TestTier2_SurfaceChangeIsReportedOncePerSession pins the dedup the removal case already
+// had: a break is sticky, so a host that polls tools/list (on notifications/tools/list_changed,
+// say) keeps re-advertising the changed surface, and every later listing re-diffed it against
+// the RETAINED baseline. Nothing deduped that — markBroken's return value reports overflow, not
+// novelty — so one changed tool produced one ERROR line per poll for the rest of the session,
+// unmetered, on a path with no notice budget over it.
+func TestTier2_SurfaceChangeIsReportedOncePerSession(t *testing.T) {
+	b := NewSurfaceBaseline()
+	b.Observe("s", []ToolSurface{{Name: "a", Hash: "h1"}}, true)
+
+	changed := []ToolSurface{{Name: "a", Hash: "h2"}}
+	got := b.Observe("s", changed, true)
+	if len(got) != 1 || got[0].Tool != "a" || got[0].Kind != SurfaceChanged {
+		t.Fatalf("the break must be reported once, got %+v", got)
+	}
+	if got := b.Observe("s", changed, true); len(got) != 0 {
+		t.Fatalf("a still-changed tool has not broken again, got %+v", got)
+	}
+	// The stated cost: a SECOND, distinct rewrite of an already-broken tool no longer logs.
+	// The tool is denied and hidden either way, so nothing about the session changes.
+	if got := b.Observe("s", []ToolSurface{{Name: "a", Hash: "h3"}}, true); len(got) != 0 {
+		t.Fatalf("an already-broken tool reports no further changes, got %+v", got)
+	}
+	if !b.Broken("s", "a") {
+		t.Fatal("the pin must stay broken across every re-observation")
+	}
+	// Silence is dedup, not a lost break: a DIFFERENT tool changing still reports.
+	got = b.Observe("s", []ToolSurface{{Name: "a", Hash: "h3"}, {Name: "b", Hash: "h4"}}, true)
+	if len(got) != 1 || got[0].Tool != "b" || got[0].Kind != SurfaceAdded {
+		t.Fatalf("want b=added, got %+v", got)
+	}
+	got = b.Observe("s", []ToolSurface{{Name: "a", Hash: "h3"}, {Name: "b", Hash: "h5"}}, true)
+	if len(got) != 1 || got[0].Tool != "b" || got[0].Kind != SurfaceChanged {
+		t.Fatalf("a newly-broken sibling must still report, got %+v", got)
+	}
+}
+
+// TestTier2_SurfaceChangeStillReportsForAnAlreadyBrokenTool is why the dedup keys on the
+// findings this path emitted rather than on the broken set: MarkBroken and BreakAll deny a
+// tool without emitting any line, so reading "broken" as "reported" would leave an operator
+// with no Tier-2 line at all for a tool first broken by ambiguous bytes and later seen with a
+// genuinely changed surface.
+func TestTier2_SurfaceChangeStillReportsForAnAlreadyBrokenTool(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(b *SurfaceBaseline)
+	}{
+		{"MarkBroken", func(b *SurfaceBaseline) { b.MarkBroken("s", "a") }},
+		{"BreakAll", func(b *SurfaceBaseline) { b.BreakAll("s") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := NewSurfaceBaseline()
+			b.Observe("s", []ToolSurface{{Name: "a", Hash: "h1"}}, true)
+			tc.break_(b)
+			if !b.Broken("s", "a") {
+				t.Fatal("test setup: the tool must be broken before the change")
+			}
+			changed := []ToolSurface{{Name: "a", Hash: "h2"}}
+			got := b.Observe("s", changed, true)
+			if len(got) != 1 || got[0].Kind != SurfaceChanged {
+				t.Fatalf("the break must still be reported once, got %+v", got)
+			}
+			// And still only once: the flood is what the dedup exists for.
+			if got := b.Observe("s", changed, true); len(got) != 0 {
+				t.Fatalf("a still-changed tool has not broken again, got %+v", got)
+			}
+		})
+	}
+}

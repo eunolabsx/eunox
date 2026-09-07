@@ -127,6 +127,16 @@ type DeferredCommit struct {
 // by condition TYPE and the per-call-only shape reaches PrepareCommit too.
 func (d DeferredCommit) Commits() bool { return d.Bucket.Key != "" }
 
+// Prepared reports whether the handler populated the bucket at all — a zero-value test, so a
+// bucket is prepared if it names a key OR carries any of the content that only means something
+// alongside one.
+//
+// It exists because Commits() alone cannot tell the two ways of NOT committing apart: the
+// per-call-only configuration that legitimately derives nothing, and a handler that filled a
+// bucket's window/weight/limit and left its Key empty. Read as the former, the second enforces
+// no quota on any call, with neither a deny nor a HandlerFault. See commitDeferredConditions.
+func (d DeferredCommit) Prepared() bool { return d.Bucket != (capability.QuotaBucket{}) }
+
 // CommittingConditionHandler evaluates a condition that commits state (consumes a quota slot)
 // on admit, so it must run after all pure predicates and participate in the engine's atomic
 // multi-condition commit instead of committing per-bucket (a check->commit TOCTOU across
@@ -152,10 +162,17 @@ func (d DeferredCommit) Commits() bool { return d.Bucket.Key != "" }
 //     arguments) fails the buckets it never checked open. Nothing can stand in for the
 //     verdicts that never ran, so this direction refuses with ENFORCEMENT_ERROR, whose class
 //     no observing route downgrades.
+//   - Outside SkipQuota(ctx), a bucket is either fully derived or absent: a bucket carrying
+//     content but no Key is refused the same way and for the same reason. The engine cannot
+//     invent the key the handler meant, so the quota that bucket declares would go unchecked
+//     and unconsumed on every call — a restriction left unevaluated, which is a denial rather
+//     than a repair (see [capability.EnforceResponse.HandlerFaults]).
 //   - Under SkipQuota(ctx), a handler MUST NOT return a bucket: it either reports skip, or
 //     reports a zero DeferredCommit because this configuration consumes nothing (a per-call
 //     only blastRadius). A bucket here is dropped and REPORTED rather than refused; the
-//     reasoning lives on [capability.EnforceResponse.HandlerFaults].
+//     reasoning lives on [capability.EnforceResponse.HandlerFaults]. A keyless-but-populated
+//     bucket is repaired identically: this posture consumes nothing either way, so dropping it
+//     IS the conforming outcome and refusing would block the one posture that must not.
 //
 // A condition type is "deferred" precisely when it was registered as committing, so an
 // embedder's committing handler participates in the atomic commit automatically.
@@ -1108,7 +1125,7 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, ec evalCtx, defer
 			// posture requires, not violating the contract's other half.
 			continue
 		}
-		if !commit.Commits() {
+		if !commit.Prepared() {
 			// This particular condition consumes nothing — its configuration has no cumulative
 			// bound. Its pure checks ran inside PrepareCommit and passed, so there is no bucket.
 			continue
@@ -1126,6 +1143,13 @@ func (e *Engine) commitDeferredConditions(ctx context.Context, ec evalCtx, defer
 				faults = append(faults, fault)
 			}
 			continue
+		}
+		if !commit.Commits() {
+			// Prepared but keyless: the declared bound would be checked by nothing, and the key
+			// is the handler's to derive — so this denies, like the unauthorized skip above (see
+			// CommittingConditionHandler).
+			return faults, ec.denyFromConditionError(conditionFault(condType,
+				"committing condition handler prepared a quota bucket with no key"))
 		}
 		buckets = append(buckets, commit.Bucket)
 		denies = append(denies, commit.Deny)

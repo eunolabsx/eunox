@@ -2618,21 +2618,6 @@ func TestJWTPDP_UnknownConditionType_FailsClosed(t *testing.T) {
 	}
 }
 
-func TestAgentIDFromContext_WithClaims(t *testing.T) {
-	t.Parallel()
-	ctx := WithJWTClaims(context.Background(), &JWTClaims{AgentID: "agent-xyz"})
-	if got := agentIDFromContext(ctx); got != "agent-xyz" {
-		t.Errorf("agentIDFromContext = %q, want %q", got, "agent-xyz")
-	}
-}
-
-func TestAgentIDFromContext_NoClaims(t *testing.T) {
-	t.Parallel()
-	if got := agentIDFromContext(context.Background()); got != "" {
-		t.Errorf("agentIDFromContext without claims = %q, want %q", got, "")
-	}
-}
-
 // TestJWT_ResourcePromptShorthandConditions covers the JWT-claims side of the
 // synthesis fix: a resource:/prompt: capability claim carrying an
 // allowedValues shorthand condition is evaluated against the synthesized

@@ -1473,3 +1473,106 @@ func TestExactRat_BoundsTheParse(t *testing.T) {
 		})
 	}
 }
+
+// keylessBucketHandler is a custom CommittingConditionHandler that populates a bucket's
+// window/weight/limit and leaves its Key empty: the shape Commits() cannot distinguish from
+// the legitimate per-call-only zero.
+type keylessBucketHandler struct{}
+
+func (keylessBucketHandler) PrepareCommit(_ context.Context, cond capability.Condition, _ *capability.EnforceRequest) (DeferredCommit, bool, *ConditionError) {
+	mc, condErr := castCondition[capability.MaxCallsCondition](cond)
+	if condErr != nil {
+		return DeferredCommit{}, false, condErr
+	}
+	return DeferredCommit{
+		Bucket: capability.QuotaBucket{
+			// Key deliberately absent: everything else is filled.
+			WindowSec: mc.WindowSeconds,
+			Counted:   true,
+			Limit:     float64(mc.Count),
+		},
+		Deny: func(float64, time.Duration) *ConditionError {
+			return conditionFault(capability.ConditionTypeMaxCalls, "unreachable: this bucket names no counter")
+		},
+	}, false, nil
+}
+
+// TestCommitDeferredAtomic_KeylessPopulatedBucketFailsClosed pins the direction the engine's
+// sibling assertions already take: a bucket carrying content but no Key leaves a declared
+// quota checked by nothing, on every call. Commits() reads it as the per-call-only zero, so
+// the condition silently enforced nothing with no deny and no fault — the one malformed
+// commit that produced neither. Nothing here can repair it (the key is the handler's to
+// derive), so it denies with ENFORCEMENT_ERROR, exactly as an unauthorized skip does.
+func TestCommitDeferredAtomic_KeylessPopulatedBucketFailsClosed(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, keylessBucketHandler{}))
+	req := &capability.EnforceRequest{SessionID: "sess-1", TargetName: "tool"}
+	caps := []capability.Constraint{{
+		Target:     "tool",
+		Actions:    []string{"*"},
+		Conditions: []capability.Condition{&capability.MaxCallsCondition{Count: 1, WindowSeconds: 60}},
+	}}
+
+	// The bound is 1 call, so a silent non-enforcement shows up as the second call allowed.
+	for i := range 2 {
+		resp := e.ValidateAction(context.Background(), req, caps)
+		if resp.Decision != capability.DecisionDeny {
+			t.Fatalf("call %d: decision = %q, want deny — a quota bucket naming no counter is a restriction nothing evaluated", i, resp.Decision)
+		}
+		if resp.Denial == nil || resp.Denial.Code != capability.ErrCodeEnforcementError {
+			t.Fatalf("call %d: denial = %+v, want ENFORCEMENT_ERROR: no verdict was reached, so this is a fault rather than a policy refusal", i, resp.Denial)
+		}
+		if resp.Denial.Downgradable() {
+			t.Errorf("call %d: the refusal must not be downgradable — an observing route forwarding it is the fail-open this closes", i)
+		}
+	}
+}
+
+// TestCommitDeferredAtomic_KeylessPopulatedBucketUnderObserveIsAbsorbed is the other half of
+// the contract: under observe nothing commits whether or not the handler named a key, so the
+// conforming outcome for this posture is exactly the drop — refusing would block on the one
+// posture whose whole contract is that it never blocks.
+func TestCommitDeferredAtomic_KeylessPopulatedBucketUnderObserveIsAbsorbed(t *testing.T) {
+	counter := callcounter.NewInMemory()
+	e := New(WithCallCounter(counter), WithCommittingConditionHandler(capability.ConditionTypeMaxCalls, keylessBucketHandler{}))
+	req := &capability.EnforceRequest{SessionID: "s", TargetName: "tool"}
+	caps := []capability.Constraint{{
+		Target:     "tool",
+		Actions:    []string{"*"},
+		Conditions: []capability.Condition{&capability.MaxCallsCondition{Count: 1, WindowSeconds: 60}},
+	}}
+
+	resp := e.ValidateAction(WithSkipQuota(context.Background()), req, caps)
+	if resp.Decision != capability.DecisionAllow {
+		t.Fatalf("decision = %q, want allow; denial %+v", resp.Decision, resp.Denial)
+	}
+	if got := resp.HandlerFaults; len(got) != 1 || got[0] != wantQuotaSkipFault {
+		t.Errorf("HandlerFaults = %v, want [%+v]: the repair must still name the misbehaving handler", got, wantQuotaSkipFault)
+	}
+}
+
+// TestDeferredCommit_PreparedSeparatesTheTwoWaysOfNotCommitting is the unit-level statement of
+// what Commits() alone could not answer.
+func TestDeferredCommit_PreparedSeparatesTheTwoWaysOfNotCommitting(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		commit            DeferredCommit
+		commits, prepared bool
+	}{
+		{"zero: the per-call-only configuration", DeferredCommit{}, false, false},
+		{"keyed: a real bucket", DeferredCommit{Bucket: capability.QuotaBucket{Key: "k", WindowSec: 60, Counted: true, Limit: 1}}, true, true},
+		{"keyless but windowed", DeferredCommit{Bucket: capability.QuotaBucket{WindowSec: 60}}, false, true},
+		{"keyless but weighted", DeferredCommit{Bucket: capability.QuotaBucket{Weight: 1}}, false, true},
+		{"keyless but limited", DeferredCommit{Bucket: capability.QuotaBucket{Limit: 1}}, false, true},
+		{"keyless but counted", DeferredCommit{Bucket: capability.QuotaBucket{Counted: true}}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.commit.Commits(); got != tc.commits {
+				t.Errorf("Commits() = %v, want %v", got, tc.commits)
+			}
+			if got := tc.commit.Prepared(); got != tc.prepared {
+				t.Errorf("Prepared() = %v, want %v", got, tc.prepared)
+			}
+		})
+	}
+}
