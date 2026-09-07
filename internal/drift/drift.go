@@ -105,7 +105,8 @@ const (
 	Fm2Pinned Kind = "fm2_pinned"
 	// Fm6 — the live inputSchema's parameter surface diverges from the manifest's
 	// argumentSchema in a way FM-3 does not cover: a new parameter under a closed schema, or
-	// a declared parameter's changed type. Warn only, since benign schema evolution is common.
+	// a declared parameter's changed type. Advisory in the default mode, since benign schema
+	// evolution is common; fatal under --strict-drift like FM-1/FM-2/FM-4 (see IsFatal).
 	Fm6 Kind = "fm6"
 	// Uncovered — upstream tool has no manifest entry (informational; denied by default).
 	Uncovered Kind = "uncovered"

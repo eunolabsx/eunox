@@ -1874,8 +1874,12 @@ before in the session.
 - The rule is **directional**: with the policy above, `read_credentials` →
   `write_external` is blocked, but `write_external` → `read_credentials` is
   allowed (nothing read credentials before the write).
-- It is **session-scoped**: history is keyed by session ID, so one session's
-  activity can never gate another's. Recording happens whenever the antecedent
+- It is **session-scoped by default**: history is keyed by session ID, so one
+  session's activity can never gate another's. Under
+  [`taskAnchoredState`](#5e-cross-pep-state--taskanchoredstate) it is keyed by the validated
+  `mcp.task_id` claim instead, and history is then deliberately shared by every
+  session presenting that task — the same anchoring the accumulated flow-label
+  set follows. Recording happens whenever the antecedent
   **actually runs**: an allowed call arms the block, and a hard-denied call (the
   upstream is never reached) does not. The one subtlety is **audit (observe)
   mode**: an antecedent that is **forwarded despite a failing condition** —

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// sensitiveUpstreamEnvPrefixes are the eunox-owned environment variables that must
+// sensitiveUpstreamEnvNames are the eunox-owned environment variables that must
 // never cross into an upstream MCP server subprocess — the least-trusted process the
 // proxy launches. A subprocess spawned with cmd.Env left nil inherits the proxy's
 // entire os.Environ(), including these:

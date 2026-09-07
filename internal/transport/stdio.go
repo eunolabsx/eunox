@@ -481,7 +481,14 @@ func (p *StdioProxy) Start(ctx context.Context) error {
 		// Reap the killed subprocess: killUpstream only signals, so without Wait the child
 		// stays a zombie and os/exec never closes the stdin/stdout pipe FDs. No reader races
 		// Wait since the inline startup fn has returned; a no-op for a remote HTTP upstream.
-		p.waitUpstream()
+		//
+		// BOUNDED, and still synchronous: a caller whose Start returns must not be handed a
+		// zombie (integration_test pins ProcessState for that reason), but this is Start's own
+		// goroutine, so a child that does not answer Wait would hang startup outright. The
+		// normal reap lands in microseconds and sets ProcessState before the wait returns.
+		reaped := make(chan struct{})
+		go func() { p.waitUpstream(); close(reaped) }()
+		waitBounded(reaped, p.killDelay(), "upstream process", p.errOut())
 		return err
 	}
 

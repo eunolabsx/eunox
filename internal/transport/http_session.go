@@ -663,7 +663,13 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 	// subprocess directly since readUpstream isn't running yet to close sess.done.
 	if err := p.registerSession(sess, startGen); err != nil {
 		killUpstreamProcess(cmd.Process)
-		_ = cmd.Wait()
+		// BOUNDED: this runs on the HTTP request goroutine with the capacity reservation still
+		// held, so a child that does not answer Wait would park the handler and its slot rather
+		// than costing one goroutine. Kept on this path rather than deferred, so the ordinary
+		// case still reaps before newSession returns.
+		reaped := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(reaped) }()
+		waitBounded(reaped, sess.shutdownBudget(), "upstream process", sess.errOut())
 		return nil, err
 	}
 
@@ -687,7 +693,18 @@ func (p *HTTPProxy) newSession(ctx context.Context, route *UpstreamRoute, client
 		case <-waited:
 		case <-time.After(msToDuration(p.shutdownMs)):
 			killUpstreamCmd(sess.upCmd)
-			<-waited
+			// Bounded so a child that does not reap cannot park this goroutine short of
+			// finishSessionCleanup, which is what unregisters the session — an unbounded wait
+			// here pinned its maxSessions slot and its per-session state for the proxy's life.
+			// NOT the escaped-descendant case waitBounded's own message names: nothing in this
+			// Cmd's wiring makes Wait join a pipe copier (stderr is an *os.File, stdin/stdout
+			// are parent pipes), so what this bounds is an unreapable child.
+			//
+			// Through shutdownBudget rather than the raw field, as this file's other waits are:
+			// shutdownMs is 0 under the documented `--shutdown-timeout 0` ("use the default"),
+			// and a raw msToDuration(0) makes every ordinary teardown abandon instantly and
+			// print the alarm.
+			waitBounded(waited, sess.shutdownBudget(), "upstream process", p.errOut())
 		}
 		p.finishSessionCleanup(sess)
 	}()

@@ -688,21 +688,27 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 	if len(dec.Obligations) > 0 && upResp.Result != nil {
 		redacted, redactErr := pdp.ApplyRedactObligs(upResp.Result, dec.Obligations)
 		if redactErr != nil {
-			if line, ok := fp.limits.notices.admitNotice(siteRedactionFault); ok {
-				line.writef("[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
-			}
 			// Record a deny so the call stays visible on the tape — otherwise an adversarial
 			// upstream could return a redaction-failing response to make every redactFields-
 			// guarded call vanish from the audit trail.
 			//
 			// The third exit below the decision, and the only one the upstream may have
 			// ANSWERED before it was taken.
+			//
+			// BEFORE the stderr notice, this leg's half of the rule refuseUnroutable states:
+			// the tape entry is the tamper-evident half, so a crash between the two must never
+			// leave a SIEM-visible SECURITY line with no record behind it — least of all on the
+			// one exit an adversarial upstream can drive at will. The notice's arguments are
+			// already in scope, so the admit-before-building-args discipline is unaffected.
 			redactDetail := handlerFaultDetail(dec)
 			warnIfStrictAuditJustDegraded(fp.errOutOrStderr(), fp.requireAuditStrict, fp.rec, kind, denialTarget, func() {
 				if fp.rec != nil {
 					fp.rec.RecordDeny(ctx, fp.sessionID, auditID, method, capability.ErrCodeEnforcementError, "", redactDetail, false)
 				}
 			})
+			if line, ok := fp.limits.notices.admitNotice(siteRedactionFault); ok {
+				line.writef("[eunox] SECURITY: redaction failed for %s %q: %v\n", kind, denialTarget, redactErr)
+			}
 			return refusalError(msg.ID, jsonRPCCodeInternalError, "internal error: response redaction failed")
 		}
 		upResp.Result = redacted

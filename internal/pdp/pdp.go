@@ -140,9 +140,14 @@ type PolicyDecisionPoint interface {
 	//   - MUST NOT turn a refusal into an allow, and MUST NOT return anything softer than
 	//     what it was given: not downgradable if the input was not, and never dropping
 	//     obligations from a refusal that remains forwardable.
-	//   - MUST NOT commit session state. It runs on a path the PDP deliberately never
-	//     reached, for a call that will not be forwarded, so a committing check here would
-	//     leave exactly the phantom state the decision path's ordering prevents.
+	//   - MUST NOT commit session state from a VERDICT leg. A refusal a leg HARDENS is never
+	//     forwarded, so state committed for it would be exactly the phantom the decision
+	//     path's ordering prevents. The refusal that remains FORWARDABLE is the opposite
+	//     case and the reason this is not a blanket prohibition: an --audit route forwards
+	//     it, the target runs, and this PDP's own decision path never reached the call — so
+	//     an implementation with state to commit MUST commit what that forwarded call leaves
+	//     behind, as ManifestPDP's tail does (the labelOutput taint and the sequenceBlock
+	//     antecedent, without which a later ENFORCED sink or sequence read fails OPEN).
 	//   - MUST be a safe identity for a PDP with nothing to contribute (AlwaysAllowPDP,
 	//     DenyAllPDP), and for an allow.
 	HardenRefusal(ctx context.Context, sessionID string, r capability.EnforceResponse, target EnforceTarget, args map[string]interface{}) capability.EnforceResponse

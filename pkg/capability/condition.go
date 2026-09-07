@@ -445,7 +445,8 @@ type AllowedValuesCondition struct {
 }
 
 // SequenceBlockCondition denies the call when any tool named in AfterTools was
-// already invoked (and allowed) earlier in the same session. It expresses
+// already invoked (and allowed) earlier under the same state anchor — the session by
+// default; see the anchoring note below. It expresses
 // cross-tool sequencing ("deny B after A"), which a stateless per-evaluation
 // policy engine (OPA, Envoy ext_authz) cannot represent.
 //
@@ -454,7 +455,10 @@ type AllowedValuesCondition struct {
 // before matching. An entry that strips to empty (e.g. "", "tool:", "  ") also
 // fails closed rather than being silently skipped, so a list whose every entry is
 // empty cannot pass unconditionally. Call history is keyed by session ID, so one
-// session's activity never gates another's.
+// session's activity never gates another's — unless the engine runs under
+// enforcement.WithTaskAnchoredState, where history follows the validated task id and
+// deliberately spans the sessions sharing it, exactly as the flow-label set does
+// (FlowLabelCondition).
 //
 // Example — block any external write once credentials have been read:
 //

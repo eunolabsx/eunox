@@ -339,9 +339,12 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// initUsageExit is init's exit code for a usage error: 2, matching validate/contracts
-// rather than 1, since init reports no findings and 1 would mean nothing here.
-const initUsageExit = 2
+// initFailExit is init's exit code for ANY failure — a usage error, an upstream that could
+// not be probed, an output that could not be written: 2, matching validate/contracts rather
+// than 1, since init reports no findings and 1 would mean nothing here. One constant because
+// the command has one failure code; the four sites that spelled the literal beside it were
+// the ones a change to that answer would have missed.
+const initFailExit = 2
 
 // initUsage is the `init` subcommand's help text, a constant so the command body does not
 // carry a screen of prose inline.
@@ -387,14 +390,14 @@ func cmdInit(args []string) int {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
-		return initUsageExit
+		return initFailExit
 	}
 
 	// Reject before the live upstream fetch — otherwise the operator waits out the whole
 	// introspection only to be told their flags were incoherent.
 	if *configOutput != "" && *output == "" {
 		fmt.Fprintf(os.Stderr, "eunox init: --config-output requires --output (the config references the manifest file)\n")
-		return initUsageExit
+		return initFailExit
 	}
 	// --force names files to overwrite, and with the manifest going to stdout there are none.
 	// Rejected rather than left inert, per the binary-wide rule stated at cmdContracts' own
@@ -402,14 +405,14 @@ func cmdInit(args []string) int {
 	// the manifest on stdout with nothing saying the invocation was incoherent.
 	if *force && *output == "" {
 		fmt.Fprintf(os.Stderr, "eunox init: --force requires --output (there is no file to overwrite when the manifest goes to stdout)\n")
-		return initUsageExit
+		return initFailExit
 	}
 
 	positional := fs.Args()
 	spec, err := buildInitUpstreamSpec(*transportFlag, *upstreamURL, *authHeader, *tlsSkipVerify, positional, *protocolVersion)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
-		return initUsageExit
+		return initFailExit
 	}
 
 	fmt.Fprintf(os.Stderr, "Fetching tool list from upstream...")
@@ -419,7 +422,7 @@ func cmdInit(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  FAILED\n")
 		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
-		return 2
+		return initFailExit
 	}
 	fmt.Fprintf(os.Stderr, "  %d tool(s)\n\n", len(info.Tools))
 
@@ -434,7 +437,7 @@ func cmdInit(args []string) int {
 
 	if err := writeGeneratedFile(*output, manifest, *force); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
-		return 2
+		return initFailExit
 	}
 	fmt.Fprintf(os.Stderr, "Generated manifest %s — review and uncomment the capabilities you want to permit.\n", *output)
 
@@ -443,12 +446,12 @@ func cmdInit(args []string) int {
 		absManifest, err := filepath.Abs(*output)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "eunox init: resolving manifest path: %v\n", err)
-			return 2
+			return initFailExit
 		}
 		cfg := generateInitConfigYAML(spec, absManifest)
 		if err := writeGeneratedFile(*configOutput, cfg, *force); err != nil {
 			fmt.Fprintf(os.Stderr, "eunox init: %v\n", err)
-			return 2
+			return initFailExit
 		}
 		fmt.Fprintf(os.Stderr, "Generated config %s — run: eunox proxy --config %s\n", *configOutput, *configOutput)
 		if spec.AuthHeader != "" {

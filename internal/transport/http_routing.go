@@ -1653,7 +1653,8 @@ func (p *HTTPProxy) negotiateHostRevision(w http.ResponseWriter, r *http.Request
 	// sessionlessLeg's question, and it depends on the message rather than on the arm. Branched
 	// rather than built unconditionally, since evaluating the sessionless peer's literal would
 	// put its allocation back on every established request.
-	leg, peer := sessionlessLeg(msg), hostGatePeer(nil)
+	leg := sessionlessLeg(msg)
+	var peer hostGatePeer
 	if sess != nil {
 		leg, peer = sess.leg(), sess
 	} else {

@@ -354,12 +354,18 @@ func ConstraintHasFlow(c *Constraint) bool {
 	return false
 }
 
-// FlowLabelCondition denies a call when the session's accumulated flow labels (the
-// set-union of every labelOutput asserted earlier in session) are not a subset of Allow —
+// FlowLabelCondition denies a call when the accumulated flow labels (the set-union of every
+// labelOutput asserted earlier under the same state anchor) are not a subset of Allow —
 // the sink half of the source->sink invariant. An empty Allow admits only an unlabeled
 // (clean-context) flow, the strictest fail-closed default; a violation is a flowLabel
 // CONDITION_FAILED, distinct from a capability denial. Reads eunox's own state, never the
 // payload, so it stays deterministic with no model in the decision path.
+//
+// The anchor is the SESSION by default, so one session's taint does not reach another's. Under
+// enforcement.WithTaskAnchoredState it is the validated task id instead, and the label set is
+// then deliberately shared by every session presenting that task — the point of the feature,
+// and the direction that matters, since a sink reasoning about one session is in fact reasoning
+// about one task.
 type FlowLabelCondition struct {
 	Allow []string `json:"allow"`
 }
@@ -371,7 +377,8 @@ func (FlowLabelCondition) ConditionType() string { return ConditionTypeFlowLabel
 func (c FlowLabelCondition) MarshalJSON() ([]byte, error) { return marshalCondition(c) }
 
 // LabelOutputDirective asserts — by policy, never by content inference — that the output of
-// an allowed call carries the named Labels into the session's accumulated set, where a later
+// an allowed call carries the named Labels into the anchor's accumulated set (see
+// FlowLabelCondition for what the anchor is), where a later
 // flowLabel condition checks them (the source half of the source->sink
 // invariant). Unlike redactFields it does not mutate the response: its effect is a
 // per-session state write on allow, so it produces no response obligation and is valid on

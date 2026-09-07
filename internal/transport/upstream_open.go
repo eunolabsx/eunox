@@ -153,11 +153,14 @@ const metaMember = "_meta"
 // into its params — and into whatever `_meta` block they already carry — or msg unchanged on a
 // leg that negotiated once.
 //
-// Only for requests eunox ORIGINATES — the opener and the session-start drift probe. A host's
-// own params are forwarded verbatim, `_meta` included: adding a member to them is translation,
-// which the mismatched-pair boundary governs and this build does not do. The consequence is
-// stated in docs/conformance.md rather than papered over here: a host message reaching a
-// declaring leg must carry its own declaration, which on a matched pair it already does.
+// For requests eunox ORIGINATES — the opener and the session-start drift probe — and for the
+// ONE case that writes to a host's own params: translateRequest, crossing a MISMATCHED pair
+// toward a declaring upstream, where the member is what that revision requires of any client
+// and the host had no way to know it needed one. On a MATCHED pair a host's params are
+// forwarded verbatim, `_meta` included, and the consequence is stated in docs/conformance.md
+// rather than papered over here: such a message must carry its own declaration, which on a
+// matched pair it already does. Reviewers audit this seam for "what can rewrite host params",
+// so the exception is named here rather than left to be discovered at the call site.
 //
 // Merged at BOTH levels, not just the params one. Replacing `_meta` wholesale would silently
 // drop whatever else the caller put there — a progress token, an attribution block — and the
