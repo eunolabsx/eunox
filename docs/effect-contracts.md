@@ -487,7 +487,7 @@ Verdicts are a closed vocabulary, recorded under `details.effect_receipt`:
 | --- | --- |
 | `verified` | Signature checked against this upstream's key domain, and consistent with the declaration. |
 | `inconsistent` | Signature checked; the server's own account contradicts the contract. Evidence, never a late denial. |
-| `unverified` | Unknown key, bad signature, stale or future-dated. Earns nothing. |
+| `unverified` | Unknown key, bad signature, stale or future-dated, or a payload that verified but does not mean one thing (ambiguous member names, trailing data). Earns nothing. |
 | `malformed` | A block is present but is not a well-formed envelope. Earns nothing. |
 
 Four properties are load-bearing:
