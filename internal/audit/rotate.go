@@ -957,7 +957,9 @@ func describeChainDelta(before, after []string) string {
 	}
 }
 
-// chainNamesMissingFrom returns the entries of want that have does not contain.
+// chainNamesMissingFrom returns the entries of the want list that are absent from the have
+// list — the one-directional difference describeChainDelta runs in both directions to name a
+// gain and a loss separately.
 func chainNamesMissingFrom(have, want []string) []string {
 	present := make(map[string]struct{}, len(have))
 	for _, p := range have {

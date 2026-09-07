@@ -121,7 +121,7 @@ func TestAuditChain_InteriorDeletionReportsBothBreakAndGap(t *testing.T) {
 	// Delete records #3 and #4 (indices 2,3), leaving seq 1,2,5.
 	tampered := [][]byte{lines[0], lines[1], lines[4]}
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(tampered)),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -170,7 +170,7 @@ func TestAuditChain_PreSigningRecordsAreInvalid(t *testing.T) {
 	}
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(logLines(t, logPath), []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(logLines(t, logPath))),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -214,7 +214,7 @@ func TestAuditChain_MalformedLineInvalidUnderFilter(t *testing.T) {
 	// A request-id filter that matches no record. Under the old code every valid
 	// record is skipped AND the corrupted line is skipped by the filter before
 	// VerifyRecord runs, so invalid stays 0 and ok() falsely reports PASS.
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(lines)),
 		verifierFor(t, keyPath), VerifyOptions{RequestID: "no-such-request-id", Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -270,7 +270,7 @@ func TestAuditChain_PerRecordHMACVerifiedUnderSinceFilter(t *testing.T) {
 	// tampered record was never recomputed and audit-verify falsely PASSED.
 	future := time.Now().Add(24 * time.Hour)
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(lines)),
 		verifierFor(t, keyPath), VerifyOptions{Since: future, Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -313,7 +313,7 @@ func TestAuditChain_MalformedLineDoesNotPoisonChain(t *testing.T) {
 	// the log, so there is no genuine following gap to report.
 	tampered := [][]byte{lines[0], lines[1], []byte("GARBAGE-NOT-JSON")}
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(tampered)),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -344,7 +344,7 @@ func TestAuditChain_FilterDoesNotDisableChainCheck(t *testing.T) {
 
 	// A --request-id filter that matches nothing must still catch the deletion.
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(tampered)),
 		verifierFor(t, keyPath), VerifyOptions{RequestID: "req-nomatch", Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -354,7 +354,7 @@ func TestAuditChain_FilterDoesNotDisableChainCheck(t *testing.T) {
 	}
 	// And a since filter that matches nothing must likewise still catch it.
 	sb.Reset()
-	res, err = VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
+	res, err = VerifyLog(bytes.NewReader(joinLogLines(tampered)),
 		verifierFor(t, keyPath), VerifyOptions{Since: time.Now().Add(24 * time.Hour), Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -2683,7 +2683,7 @@ func TestAuditChain_DetectsRewrittenGenesis(t *testing.T) {
 	tampered := [][]byte{[]byte(survivor), lines[2]}
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(tampered)),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)

@@ -61,7 +61,7 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 
 	// Empty ring: no candidate key, so UNVERIFIABLE (not INVALID); verdict still fails.
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, VerifyOptions{Out: &out})
+	res, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{line})), &Sink{verifyKeys: map[string][]byte{}}, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog (empty ring): %v", err)
 	}
@@ -79,7 +79,7 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 	// from tampering, so it stays INVALID — the defensible fail-closed default.
 	other := make([]byte, 32)
 	other[0] = 0xAB
-	res2, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{hmacKeyID(other): other}}, VerifyOptions{Out: &strings.Builder{}})
+	res2, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{line})), &Sink{verifyKeys: map[string][]byte{hmacKeyID(other): other}}, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLog (wrong key): %v", err)
 	}
@@ -88,7 +88,7 @@ func TestVerifyAuditLog_EmptyKeyIDNoKeysIsUnverifiable(t *testing.T) {
 	}
 
 	// Ring holds the MATCHING key: verifies clean.
-	res3, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{hmacKeyID(key): key}}, VerifyOptions{Out: &strings.Builder{}})
+	res3, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{line})), &Sink{verifyKeys: map[string][]byte{hmacKeyID(key): key}}, VerifyOptions{Out: &strings.Builder{}})
 	if err != nil {
 		t.Fatalf("VerifyLog (matching key): %v", err)
 	}
@@ -113,7 +113,7 @@ func TestVerifyAuditLog_MalformedTimeReportedOnUnverifiableRecord(t *testing.T) 
 	})
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(line), &Sink{verifyKeys: map[string][]byte{}}, VerifyOptions{Out: &out})
+	res, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{line})), &Sink{verifyKeys: map[string][]byte{}}, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -714,9 +714,7 @@ func flipLastByte(s string) string {
 
 func rewriteLines(t *testing.T, logPath string, lines [][]byte) {
 	t.Helper()
-	joined := bytes.Join(lines, []byte("\n"))
-	joined = append(joined, '\n')
-	if err := os.WriteFile(logPath, joined, 0o600); err != nil {
+	if err := os.WriteFile(logPath, joinLogLines(lines), 0o600); err != nil {
 		t.Fatalf("rewrite log: %v", err)
 	}
 }
@@ -850,7 +848,7 @@ func TestVerifyAuditLog_ForgedLegacySeq0DoesNotSuppressSeqGap(t *testing.T) {
 	tampered := [][]byte{lines[0], lines[1], lines[2], decoy, lines[4]}
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(tampered)),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -928,7 +926,7 @@ func TestVerifyAuditLog_ForgedSeq0DoesNotSuppressSeqGap(t *testing.T) {
 	tampered := [][]byte{lines[0], lines[1], lines[2], decoy, lines[4]}
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(tampered, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(tampered)),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -1280,7 +1278,7 @@ func TestVerifyAuditLog_Seq0WithHMACIsAlwaysForged(t *testing.T) {
 			}
 
 			var sb strings.Builder
-			res, err := VerifyLog(bytes.NewReader(bytes.Join(tc.build(t, key), []byte("\n"))),
+			res, err := VerifyLog(bytes.NewReader(joinLogLines(tc.build(t, key))),
 				verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 			if err != nil {
 				t.Fatalf("VerifyLog: %v", err)
@@ -1341,7 +1339,7 @@ func TestVerifyAuditLog_MissingHMACSeqGt0_DoesNotPoisonChain(t *testing.T) {
 	line3 := signAuditLine(t, key, rec3)
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join([][]byte{line1, line2, line3}, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{line1, line2, line3})),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -1437,7 +1435,7 @@ func TestVerifyAuditLog_Seq0AfterNonWrap_StillForged(t *testing.T) {
 	line2 := signAuditLine(t, key, rec2)
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join([][]byte{line1, line2}, []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines([][]byte{line1, line2})),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("verifyAuditLog: %v", err)
@@ -2364,7 +2362,7 @@ func TestVerifyAuditLog_AllUnsignedLogFailsVerdict(t *testing.T) {
 	legacy := func(reqID string) []byte {
 		return []byte(fmt.Sprintf(`{"time":"2026-06-15T10:00:00Z","request_id":%q,"session_id":"s","target":"tool:exec","decision":"allow"}`, reqID))
 	}
-	log := bytes.Join([][]byte{legacy("a"), legacy("b"), legacy("c")}, []byte("\n"))
+	log := joinLogLines([][]byte{legacy("a"), legacy("b"), legacy("c")})
 
 	for _, tc := range []struct {
 		name     string
@@ -2570,7 +2568,7 @@ func TestVerifyLog_CapsUnsignedDiagnostics(t *testing.T) {
 	}
 
 	var out strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, VerifyOptions{Out: &out})
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(lines)), &Sink{}, VerifyOptions{Out: &out})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -2604,7 +2602,7 @@ func TestVerifyLog_UnsignedDiagnosticsUncappedBelowLimit(t *testing.T) {
 		[]byte(`{"time":"2026-06-15T10:00:01Z","request_id":"b","session_id":"s","target":"tool:exec","decision":"allow"}`),
 	}
 	var out strings.Builder
-	if _, err := VerifyLog(bytes.NewReader(bytes.Join(lines, []byte("\n"))), &Sink{}, VerifyOptions{Out: &out}); err != nil {
+	if _, err := VerifyLog(bytes.NewReader(joinLogLines(lines)), &Sink{}, VerifyOptions{Out: &out}); err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
 	if got := strings.Count(out.String(), "carries no _hmac"); got != 2 {

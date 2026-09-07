@@ -200,7 +200,8 @@ Exit codes:
      unverifiable or unknown-key record). Reserved for findings, so a cron or
      CI job can gate on it; never used for usage errors.
   2  Usage error, a config, key-resolution, or log-read failure, or a pass that
-     a rotation raced (inconclusive — re-run).
+     a rotation raced or that ended on a half-written record (inconclusive —
+     re-run).
 
 Flags:
 `
@@ -364,6 +365,15 @@ func verifyOneTape(t auditTape, opts audit.VerifyOptions, rings verifiedRings) (
 	if err := snap.CheckUnchanged(); err != nil {
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: %v; no verdict was reached — re-run "+
 			"(against a quiescent log, or a copy of the chain)\n", t.logPath, err)
+		return audit.VerifyResult{}, nil, auditVerifyUsageExit
+	}
+	// Above held.release() for the bracket's reason, and before the read-error arm because
+	// this is not one: a torn final line is an append still in flight, so the pass covered a
+	// prefix of the chain rather than the chain. Releasing the findings first would print the
+	// tamper alarm the next line retracts.
+	if errors.Is(verifyErr, audit.ErrUnterminatedTail) {
+		fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: %v; no verdict was reached — re-run "+
+			"(against a quiescent log, or a copy of the chain)\n", t.logPath, verifyErr)
 		return audit.VerifyResult{}, nil, auditVerifyUsageExit
 	}
 	held.release()

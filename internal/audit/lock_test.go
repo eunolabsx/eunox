@@ -54,7 +54,7 @@ func TestAuditSink_SecondOpenSamePath_FailsClosed(t *testing.T) {
 	}
 
 	var sb strings.Builder
-	res, err := VerifyLog(bytes.NewReader(bytes.Join(logLines(t, logPath), []byte("\n"))),
+	res, err := VerifyLog(bytes.NewReader(joinLogLines(logLines(t, logPath))),
 		verifierFor(t, keyPath), VerifyOptions{Out: &sb})
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
