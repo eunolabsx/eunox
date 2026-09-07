@@ -109,8 +109,9 @@ func (r *Redis) SessionKillTTL() time.Duration {
 // unparseable reports false. The read is best-effort (a failed GET yields no diagnostic,
 // but still publishes); only a failed SET is returned as an error.
 func (r *Redis) PublishSessionKillTTL(ctx context.Context) (prior time.Duration, differs bool, err error) {
-	if r.wiringErr != nil {
-		return 0, false, r.wiringErr
+	// Named result, so the fault is bound to its own name rather than shadowing err.
+	if fault := r.wiringFault(); fault != nil {
+		return 0, false, fault
 	}
 	// Arm the reconcile loop's republish HERE, regardless of how the round trip goes: once
 	// the caller's ready hook has run, a FAILED publish is exactly the case the loop should

@@ -70,15 +70,17 @@ on those paths already denies.
   refresh. This is the intended trade-off for an emergency-stop control, but it
   means **Redis is now on the data-plane critical path for `--redis-addr`
   deployments** unless `--killswitch-fail-open` is set. Run Redis with HA
-  (Sentinel; Redis Cluster is unsupported and refused at startup, since the call
-  counter admits a multi-bucket quota in one multi-key script) and size the
+  (Sentinel; Redis Cluster is unsupported and refused at startup — by the call
+  counter, which admits a multi-bucket quota in one multi-key script, and
+  independently by the kill switch, whose keyless `SCAN` against one node of a
+  cluster loads only that node's slots) and size the
   reconcile interval accordingly. Recovery from a
   transient blip is bounded by the reconcile interval (the denial window persists
   until the next successful refresh, not until Redis itself recovers), so
   fail-closed deployments can shorten it with `--killswitch-reconcile-interval`
   to trade Redis load for a tighter post-recovery window.
-- **A client whose keyspace topology cannot be established is refused at
-  construction, and fail-open does not soften it.** The kill set is loaded by a
+- **A client whose keyspace topology cannot be established, or is contradicted by
+  the server, is refused and fail-open does not soften it.** The kill set is loaded by a
   keyless `SCAN`, which reaches one server: a client that spreads the keyspace
   must be enumerated per server or the reconciled cache holds a PARTIAL kill set
   while `HealthStatus()` reports ready. `killswitch.NewRedis` classifies the
@@ -86,7 +88,16 @@ on those paths already denies.
   custom `redis.Cmdable` proves nothing about what it fronts and latches
   `ErrUnknownTopology`, which every reader and writer reports. A consumer that
   knows what its wrapper wraps declares it with `WithSingleNodeKeyspace()` or
-  `WithShardFanOut(...)`. The call counter refuses an unplaceable client for its
+  `WithShardFanOut(...)`. What a concrete type cannot establish is whether the
+  SERVER behind a single-node client is a cluster node — an ordinary
+  `*redis.Client` aimed at one classifies single-node and its `SCAN` then reaches
+  only that node's slots — so `Start` reads `INFO cluster` and latches
+  `ErrServerClustered` on a positive. That one is established at `Start` rather
+  than at construction, since only a round trip can answer it and `NewRedis`
+  performs no I/O; an unanswered probe (a Redis not up yet) latches nothing and is
+  re-asked on the reconcile tick until it answers, so a transient outage at
+  startup does not silently forfeit the refusal. A consumer that only writes and
+  never calls `Start` should run `callcounter.CheckServerNotClustered` itself. The call counter refuses an unplaceable client for its
   own reason — a multi-key `EVAL` routed to one server of several splits a quota
   bucket's accounting — and takes the same declaration, minus the sharded form a
   multi-key script cannot use. Fail-open is deliberately no escape: it trades

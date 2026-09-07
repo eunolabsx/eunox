@@ -1535,12 +1535,27 @@ func newDoubleRedis(client redis.Cmdable, opts ...RedisOption) *Redis {
 	return NewRedis(client, append([]RedisOption{WithSingleNodeKeyspace()}, opts...)...)
 }
 
+// unclusteredCmdable answers Start's server-side cluster probe as a standalone server, for the
+// doubles below that would otherwise reach it through a NIL embedded redis.Cmdable and panic on
+// the INFO it issues.
+//
+// Embedded IN PLACE OF redis.Cmdable, which is what makes one stub serve them all: Info resolves
+// at depth one from here and the rest of Cmdable at depth two, so the shallower wins and nothing
+// is ambiguous. (Embedding this ALONGSIDE redis.Cmdable would be — two Infos at the same depth
+// drop the method from the set entirely.) A double added later inherits the reply by embedding
+// rather than by remembering to hand-write a seventh copy.
+type unclusteredCmdable struct{ redis.Cmdable }
+
+func (unclusteredCmdable) Info(_ context.Context, _ ...string) *redis.StringCmd {
+	return redis.NewStringResult("# Cluster\r\ncluster_enabled:0\r\n", nil)
+}
+
 // fakeCmdable implements just enough of redis.Cmdable for refreshState, Reset,
 // and deleteByPrefix. The embedded nil interface satisfies the rest of the
 // (large) Cmdable surface; any unexpected call would panic, which keeps the
 // fake honest about which methods the code under test actually exercises.
 type fakeCmdable struct {
-	redis.Cmdable
+	unclusteredCmdable
 	getVal     string
 	getErr     error
 	scanKeys   []string
@@ -1583,7 +1598,7 @@ func (f *fakeCmdable) Publish(_ context.Context, _ string, _ interface{}) *redis
 // publishFailFake has a succeeding Set/Del and a failing Publish, so a mutation's
 // durable write lands but pub/sub propagation fails.
 type publishFailFake struct {
-	redis.Cmdable
+	unclusteredCmdable
 	pubErr error
 }
 
@@ -1906,7 +1921,7 @@ func TestRedis_Reconcile_RecoversLostPubSubEvent(t *testing.T) {
 // trailing refreshState reads Redis. (The first Del — of the global key — flips
 // `deleted`, after which agent SCANs surface the raced key.)
 type resetRaceFake struct {
-	redis.Cmdable
+	unclusteredCmdable
 	mu      sync.Mutex
 	deleted bool
 	agentID string // the bare agent id whose kill races in
@@ -1967,7 +1982,7 @@ func TestRedis_Reset_ReseedsRacedKill(t *testing.T) {
 // surfaces (rather than silently tolerates) a reseed that is ever wired back to
 // the caller's ctx instead of the switch's long-lived runCtx.
 type cancelDuringResetFake struct {
-	redis.Cmdable
+	unclusteredCmdable
 	cancelFn context.CancelFunc
 }
 
@@ -2038,7 +2053,7 @@ func TestRedis_Reset_TrailingReseedIgnoresCanceledCallerContext(t *testing.T) {
 // pub/sub event arrives. A replica that merely cleared its local cache (without
 // re-reading Redis) would miss it; Scan always surfaces the agent key.
 type pubsubResetFake struct {
-	redis.Cmdable
+	unclusteredCmdable
 	agentID string
 }
 
@@ -2633,7 +2648,7 @@ func TestRedis_DurableWriteFailure_IsNotAPublishFailure(t *testing.T) {
 
 // writeFailFake fails the durable write itself (SET and DEL), the opposite of publishFailFake.
 type writeFailFake struct {
-	redis.Cmdable
+	unclusteredCmdable
 	setErr error
 	delErr error
 }
@@ -2644,4 +2659,220 @@ func (f *writeFailFake) Set(_ context.Context, _ string, _ interface{}, _ time.D
 
 func (f *writeFailFake) Del(_ context.Context, _ ...string) *redis.IntCmd {
 	return redis.NewIntResult(0, f.delErr)
+}
+
+// TestServerClustered_FailsClosedRatherThanServingOneNodesSlots is the regression for the half of
+// the topology refusal a concrete-type match structurally cannot make.
+//
+// A client aimed at ONE node of a Redis Cluster is a single-node client by every property visible
+// in-process: it classifies TopologySingleNode, no fan-out is built, and the keyless SCAN that
+// loads the kill set enumerates only the slots that node owns. When the aimed node owns the global
+// stop's slot the refresh's GET succeeds as well, so lastRefreshErr stays nil and HealthStatus
+// reports ready while ShouldBlock answers "not killed" for every session hashed elsewhere — the
+// fail-open on the emergency stop that the Manager contract forbids outright.
+//
+// Only a round trip can establish it, so it is asked at Start and latched exactly as a
+// construction-time fault is: reported from every reader and writer, and not softened by
+// WithFailOpen, since cluster_enabled does not flip back.
+func TestServerClustered_FailsClosedRatherThanServingOneNodesSlots(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	inner, mr := newRawTestClient(t)
+	require.NoError(t, mr.Set(redisSessionPfx+"sess-1", "1"))
+
+	// Declared single-node over a wrapper: the resolved topology a plain *redis.Client aimed at a
+	// cluster node also lands on, and the only way to reach it without a real cluster.
+	r := NewRedis(clusterInfoTestClient{Cmdable: inner, info: "# Cluster\r\ncluster_enabled:1\r\n"},
+		WithSingleNodeKeyspace(), WithFailOpen(true))
+	r.Start(ctx)
+	defer r.Stop()
+
+	blocked, err := r.ShouldBlock(ctx, Subject{AgentID: "agent", SessionID: "sess-1"})
+	assert.False(t, blocked)
+	assert.ErrorIs(t, err, ErrServerClustered,
+		"fail-OPEN must not soften a wiring fault: it trades revocation for availability during a TRANSIENT outage, and a clustered server never becomes the standalone one this client assumes")
+	assert.ErrorIs(t, r.HealthStatus(), ErrServerClustered)
+	assert.ErrorIs(t, r.ActivateGlobal(ctx), ErrServerClustered)
+	assert.ErrorIs(t, r.KillSession(ctx, "sess"), ErrServerClustered)
+	assert.ErrorIs(t, r.KillAgent(ctx, "agent"), ErrServerClustered)
+	assert.ErrorIs(t, r.RevokeJTI(ctx, "jti"), ErrServerClustered)
+	assert.ErrorIs(t, r.Reset(ctx), ErrServerClustered)
+	_, _, ttlErr := r.PublishSessionKillTTL(ctx)
+	assert.ErrorIs(t, ttlErr, ErrServerClustered)
+	_, statusErr := r.Status(ctx)
+	assert.ErrorIs(t, statusErr, ErrServerClustered)
+}
+
+// TestServerClustered_LatchedFaultLaunchesNothing pins the other half of the refusal: a backend
+// that can never confirm its kill set subscribes to nothing and starts no goroutine, exactly as a
+// construction-time fault does. Otherwise a reconcile loop keeps SCANning one node of a cluster
+// and committing its slots as the whole kill set behind a reader that already refuses.
+func TestServerClustered_LatchedFaultLaunchesNothing(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	inner, _ := newRawTestClient(t)
+	var logs bytes.Buffer
+
+	r := NewRedis(clusterInfoTestClient{Cmdable: inner, info: "cluster_enabled:1"},
+		WithSingleNodeKeyspace(), WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	r.Start(ctx)
+	defer r.Stop()
+
+	assert.False(t, r.started.Load(), "a latched fault must leave the switch unstarted, not converging a partial view")
+	assert.False(t, r.startedOnce, "nothing may be launched for a backend every reader already refuses")
+	assert.Contains(t, logs.String(), "wiring fault", "the operator's channel names the fault the readers report")
+	assert.Contains(t, logs.String(), "cluster_enabled:1")
+}
+
+// TestProbeServerTopology_AsksOnlyWhereTheAnswerCanFalsifyThePremise covers what the probe itself
+// owns: its SCOPE, and its two-part answer. The reply-shape matrix belongs to
+// redisutil.TestServerReportsClustered and is not re-pinned here.
+//
+// A SHARDED client is not asked at all: a *redis.ClusterClient is the supported way to reach a
+// cluster and its fan-out visits every master, so a positive answer there would refuse correct
+// wiring. It is reported ANSWERED so the reconcile loop stops asking.
+//
+// An INFO nobody could answer latches nothing and reports UNANSWERED — the distinction that keeps
+// a Redis which was merely down at Start from forfeiting the refusal for the process's life.
+func TestProbeServerTopology_AsksOnlyWhereTheAnswerCanFalsifyThePremise(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	inner, _ := newRawTestClient(t)
+
+	cases := []struct {
+		name         string
+		topology     redisutil.Topology
+		client       redis.Cmdable
+		wantFault    bool
+		wantAnswered bool
+	}{
+		{"single-node aimed at a cluster node", redisutil.TopologySingleNode,
+			clusterInfoTestClient{Cmdable: inner, info: "# Cluster\r\ncluster_enabled:1\r\n"}, true, true},
+		{"single-node aimed at a standalone server", redisutil.TopologySingleNode,
+			clusterInfoTestClient{Cmdable: inner, info: "# Cluster\r\ncluster_enabled:0\r\n"}, false, true},
+		{"an INFO nobody could answer is unanswered, not a negative", redisutil.TopologySingleNode,
+			clusterInfoTestClient{Cmdable: inner, err: errors.New("ERR unknown section")}, false, false},
+		{"a sharded client is never asked, and never asked again", redisutil.TopologySharded,
+			clusterInfoTestClient{Cmdable: inner, info: "cluster_enabled:1"}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := &Redis{client: tc.client, topology: tc.topology}
+			assert.Equal(t, tc.wantAnswered, r.probeServerTopology(ctx))
+			if tc.wantFault {
+				assert.ErrorIs(t, r.wiringFault(), ErrServerClustered)
+				return
+			}
+			assert.NoError(t, r.wiringFault())
+		})
+	}
+}
+
+// TestServerClustered_UnansweredProbeIsRetriedRatherThanTakenAsANegative is the regression for the
+// way this refusal was reachable-but-inert on an ordinary boot.
+//
+// A Redis that is not up when Start runs is explicitly tolerated — the initial refresh is allowed
+// to fail and self-correct — so the probe routinely goes unanswered on plain container ordering.
+// Reading that silence as "not a cluster node" forfeited the refusal for the process's life:
+// once the server came back, the keyless SCAN succeeded against its one node, lastRefreshErr
+// cleared, HealthStatus reported ready, and ShouldBlock answered "not killed" for every session
+// hashed to another slot. callcounter can absorb the same silence because AdmitAll maps a
+// CROSSSLOT back at request time; a SCAN raises nothing, so this backend has to ask again.
+func TestServerClustered_UnansweredProbeIsRetriedRatherThanTakenAsANegative(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	inner, _ := newRawTestClient(t)
+
+	client := &flakyInfoTestClient{Cmdable: inner}
+	client.setErr(errors.New("dial tcp: connect: connection refused"))
+	r := NewRedis(client, WithSingleNodeKeyspace(), WithReconcileInterval(5*time.Millisecond))
+	r.Start(ctx)
+	defer r.Stop()
+
+	require.True(t, r.started.Load(), "an unanswered probe must not stop the start: a down Redis is tolerated by design")
+	require.NoError(t, r.wiringFault(), "an unanswered probe latches nothing")
+
+	// The server comes back, and says what it is.
+	client.setInfo("# Cluster\r\ncluster_enabled:1\r\n")
+	require.Eventually(t, func() bool { return errors.Is(r.HealthStatus(), ErrServerClustered) }, 3*time.Second, 5*time.Millisecond,
+		"the reconcile tick must re-ask until the probe answers, or a transient outage at Start becomes a verdict")
+
+	blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess-1"})
+	assert.False(t, blocked)
+	assert.ErrorIs(t, err, ErrServerClustered, "a fault established mid-life is refused exactly as one found at Start is")
+}
+
+// TestServerClustered_AnsweredProbeIsNotReasked pins the other half: cluster_enabled cannot change
+// under a live server, so one answer ends the retry rather than putting an INFO on every tick.
+func TestServerClustered_AnsweredProbeIsNotReasked(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	inner, _ := newRawTestClient(t)
+
+	client := &flakyInfoTestClient{Cmdable: inner}
+	client.setInfo("# Cluster\r\ncluster_enabled:0\r\n")
+	r := NewRedis(client, WithSingleNodeKeyspace(), WithReconcileInterval(5*time.Millisecond))
+	r.Start(ctx)
+	defer r.Stop()
+
+	afterStart := client.infoCalls()
+	require.Positive(t, afterStart, "Start must have asked once")
+	time.Sleep(60 * time.Millisecond) // ~12 reconcile ticks at the interval above
+	assert.Equal(t, afterStart, client.infoCalls(), "an answered probe must not be re-issued on every tick")
+	assert.NoError(t, r.wiringFault())
+}
+
+// clusterInfoTestClient answers INFO with a canned reply, standing in for a server no Go test can
+// run: a Redis Cluster cannot be brought up in-process, and miniredis refuses INFO's Cluster
+// section outright. Everything else forwards to the embedded client, so the backend's real
+// lifecycle drives the probe.
+type clusterInfoTestClient struct {
+	redis.Cmdable
+	info string
+	err  error
+}
+
+func (c clusterInfoTestClient) Info(_ context.Context, _ ...string) *redis.StringCmd {
+	return redis.NewStringResult(c.info, c.err)
+}
+
+// flakyInfoTestClient is clusterInfoTestClient with a reply that can CHANGE between calls, plus a
+// call count — what the retry regressions need and a canned one cannot express.
+type flakyInfoTestClient struct {
+	redis.Cmdable
+	mu    sync.Mutex
+	info  string
+	err   error
+	calls int
+}
+
+func (c *flakyInfoTestClient) setInfo(info string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.info, c.err = info, nil
+}
+
+func (c *flakyInfoTestClient) setErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.info, c.err = "", err
+}
+
+func (c *flakyInfoTestClient) infoCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+func (c *flakyInfoTestClient) Info(_ context.Context, _ ...string) *redis.StringCmd {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return redis.NewStringResult(c.info, c.err)
 }

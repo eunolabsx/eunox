@@ -103,10 +103,15 @@ type Manager interface {
 	// ShouldBlock cannot answer, since a caller cannot tell "not ready yet" from "backend
 	// down" from an error it must fail closed on either way.
 	//
-	// It reports the CURRENT cause, not a latched one: a backend that recovers reports nil
-	// again. Implementations answer through the same gate chain their readers use — and it is
-	// the one reader that reports a cause even under fail-open, where the others deliberately
-	// serve the cache, so it is what an operator alerts on.
+	// It reports the CURRENT cause for anything that can RECOVER: a backend whose connectivity
+	// comes back reports nil again. The exception is a WIRING fault — a client that can never
+	// load the kill set at all — which is latched deliberately and reported for the instance's
+	// life, because it does not heal and serving nil would be the fail-open this reader exists
+	// to prevent. So an alert on this must not assume it will clear on its own; a cause that
+	// persists across recoveries is a wiring bug to fix, not an outage to wait out.
+	// Implementations answer through the same gate chain their readers use — and it is the one
+	// reader that reports a cause even under fail-open, where the others deliberately serve the
+	// cache, so it is what an operator alerts on.
 	HealthStatus() error
 
 	// ActivateGlobal activates the global kill switch (blocks all requests).
