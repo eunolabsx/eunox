@@ -2515,6 +2515,21 @@ template-shaped text — `"${HOME}/reports"`, `"${BUILD_ID}"` — keeps loading 
 as it always did. A *recognized* reference is still refused under `0.1`, naming the
 revision that introduced it, like every other `0.2` token.
 
+> **Accepted gap: a literal `${` cannot be allowlisted under `"0.2"`.** The closed
+> grammar has no escape spelling, so *any* `allowedValues` string containing `${`
+> that is not exactly one recognized variable is refused at load — including a value
+> a tool argument legitimately equals, such as `"${STAGE}"` or `"job-${task.id}"` as
+> a literal. Two consequences worth knowing before you migrate: a valid `"0.1"`
+> manifest carrying such a value does **not** load as `"0.2"` unchanged, and there is
+> no way to write it. Every other place the codebase meets this shape provides an
+> escape (`$$` for a config env reference, `$$.` for the argument-path sentinel);
+> this one does not, deliberately, because adding one is a grammar change and the
+> value it would buy is narrow. Workarounds, in order of preference: match the value
+> with a different condition (an `argumentSchema` `pattern`, or an external
+> `PolicyEvaluator`); or keep the entry on `"0.1"`, where the text is an ordinary
+> literal. The load error names the value, so this is a startup failure with an
+> explanation, never a silent deny.
+
 References are resolved in `allowedValues` **only**. A `${...}` elsewhere in the
 manifest is an ordinary literal string, which for a security rule means it matches
 nothing — the fail-closed direction, but not what the author intended.

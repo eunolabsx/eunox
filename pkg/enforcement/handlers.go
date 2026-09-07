@@ -499,8 +499,9 @@ func (h maxCallsHandler) PrepareCommit(ctx context.Context, cond capability.Cond
 const detailRetryAfterSeconds = "retry_after_seconds"
 
 // retryAfterSeconds converts a backend retry-after estimate to whole seconds (rounded up),
-// falling back to the full window when unavailable. Shared by the commit and check-only
-// maxCalls denial paths.
+// falling back to the full window when unavailable. Shared by the maxCalls commit denial and
+// the cumulative blastRadius one (effect.go), which is why the key it feeds is the one thing
+// those two records spell the same.
 func retryAfterSeconds(d time.Duration, windowSec int) int64 {
 	// Must precede the ceiling below: a negative sub-second duration truncates to 0,
 	// which the fractional ceiling would otherwise round up to 1s.
@@ -515,8 +516,8 @@ func retryAfterSeconds(d time.Duration, windowSec int) int64 {
 	return secs
 }
 
-// maxCallsRateLimited builds the RATE_LIMITED ConditionError shared by the commit
-// and check-only maxCalls denial paths, keeping the Details shape identical.
+// maxCallsRateLimited builds the RATE_LIMITED ConditionError for a maxCalls denial, keeping
+// the Details shape in one place.
 //
 // The keys are snake_case and name their UNIT, the effect layer's convention. What is actually
 // SHARED with the cumulative blastRadius denial is retry_after_seconds alone (both compute it with

@@ -482,12 +482,14 @@ end
 
 local function refresh_ttls()
   -- Refresh TTL on every non-admitting path too, or a bucket that's never admitted could
-  -- expire mid-window and silently reset. EXISTS-gated: refresh, never re-create.
+  -- expire mid-window and silently reset. UNGUARDED: EXPIRE on a key that does not exist
+  -- returns 0 and does nothing -- it cannot create one -- so the EXISTS probe this used to
+  -- run bought nothing and doubled the per-bucket command count on the denied-admission hot
+  -- path. The admit tail below already relies on exactly that, EXPIREing a bucket whose ZADD
+  -- was skipped for a zero weight.
   for i = 1, n do
     local base = 1 + (i-1)*7
-    if redis.call('EXISTS', KEYS[i]) == 1 then
-      redis.call('EXPIRE', KEYS[i], ARGV[base+4])
-    end
+    redis.call('EXPIRE', KEYS[i], ARGV[base+4])
   end
 end
 

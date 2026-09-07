@@ -1770,6 +1770,14 @@ func TestValidateJWTIssuerConfig(t *testing.T) {
 		{"jwks without issuer fails closed", "https://idp.example/jwks", "", false, true},
 		{"jwks without issuer but explicit opt-out is allowed", "https://idp.example/jwks", "", true, false},
 		{"jwks with issuer and opt-out is allowed", "https://idp.example/jwks", "https://idp.example", true, false},
+		// The padded-value guard its --jwt-audience twin has: the issuer is compared verbatim,
+		// so a trailing space passes startup validation and then 401s every request with
+		// invalid_issuer. Refused under --jwt-allow-any-issuer too — the flag is why the value
+		// is unused, not a reason to accept one that could never work.
+		{"trailing whitespace fails closed", "https://idp.example/jwks", "https://idp.example ", false, true},
+		{"leading whitespace fails closed", "https://idp.example/jwks", " https://idp.example", false, true},
+		{"whitespace-only is no issuer at all", "https://idp.example/jwks", "   ", false, true},
+		{"padded issuer is refused under the opt-out too", "https://idp.example/jwks", "https://idp.example ", true, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -107,7 +107,7 @@ func unmarshalDirective(data []byte) (Directive, error) {
 	// Reject unknown fields, by the same rule and for the same reason as
 	// unmarshalCondition (see jsonFieldNames): a lenient decode silently drops a
 	// misspelled key. For a directive that is worse than for a condition —
-	// {"type":"redactFields","pathss":[...]} decodes to an EMPTY path list, and an empty
+	// {"type":"redactFields","fieldss":[...]} decodes to an EMPTY path list, and an empty
 	// list means the forward path attaches the redactFields obligation (so the tape
 	// records a redaction as applied) while masking nothing. Matching is case-insensitive
 	// because that is how encoding/json binds.

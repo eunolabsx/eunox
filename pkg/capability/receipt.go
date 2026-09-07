@@ -6,7 +6,9 @@ package capability
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -88,9 +90,11 @@ const (
 	// ReceiptMalformed — a receipt block is present but is not a well-formed envelope. It
 	// earns nothing; the shape is the server's to fix.
 	ReceiptMalformed ReceiptVerdict = "malformed"
-	// ReceiptUnverified — the signature could not be verified: an unknown key, a bad
-	// signature, a stale or future-dated receipt. Fail-closed; kept distinct from "no
-	// receipt at all" (a server that USED to attest and now cannot is a different event).
+	// ReceiptUnverified — the receipt cannot be treated as the server's word: an unknown
+	// key, a bad signature, a stale or future-dated receipt, or a payload that verified but
+	// does not mean ONE thing (ambiguous member names, trailing data). Fail-closed; kept
+	// distinct from "no receipt at all" (a server that USED to attest and now cannot is a
+	// different event).
 	//
 	// This deliberately COLLAPSES what internal/registry's attestation verifier SPLITS
 	// (there, an unheld key is inert while a held key's failed signature is a hard error):
@@ -336,13 +340,31 @@ func (v *EffectReceiptVerifier) verifySignature(compact string, now time.Time) (
 		return nil, fmt.Errorf("effect receipt names key %q, which is not in this upstream's receipt key set", kid)
 	}
 
+	// The signature proves the upstream authored these bytes; it says nothing about them
+	// meaning ONE thing. A payload carrying `"class":"irreversible","CLASS":"reversible"`
+	// binds last-wins here while any byte-exact reader of the same signed evidence sees the
+	// other value — and for a surface whose whole product is evidence on the tape, an
+	// attestation whose meaning depends on member order is worth less than none. Refused
+	// before the decode, as the rest of this package refuses it (claim_json.go,
+	// json_ambiguous.go, effect_json.go). The cost is a walk of an already-verified payload,
+	// paid only by a route that configured effectReceiptKeys.
+	if err := RefuseAmbiguousJSONKeys(payload); err != nil {
+		return nil, fmt.Errorf("effect receipt claims are ambiguous: %w", err)
+	}
 	var claims EffectReceiptClaims
 	// BlastRadius is a typed *json.Number, so the literal's exact text is preserved — a
 	// magnitude for a large row count is never widened through float64 and compared against
 	// a value the server never signed. bytes.NewReader avoids the []byte->string->Reader copy
 	// of the whole payload on every verification.
-	if err := json.NewDecoder(bytes.NewReader(payload)).Decode(&claims); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	if err := dec.Decode(&claims); err != nil {
 		return nil, fmt.Errorf("decoding effect receipt claims: %w", err)
+	}
+	// Trailing data is the same divergence one level out: a second JSON value after the claim
+	// object is signed alongside the first, ignored by this decoder, and read by anything that
+	// scans the payload rather than decoding one value from it.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("trailing data after the effect receipt claim object")
 	}
 	if claims.IssuedAt == 0 {
 		return nil, fmt.Errorf("effect receipt carries no 'iat'; an undated attestation is replayable forever")

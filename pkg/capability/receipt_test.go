@@ -485,3 +485,87 @@ func TestEffectReceiptZeroValueVerifierFailsClosed(t *testing.T) {
 	block := s.sign(t, &capability.EffectReceiptClaims{Tool: "refund", IssuedAt: time.Now().Unix()})
 	assert.Nil(t, (&capability.EffectReceiptVerifier{}).Verify(block, "refund", nil, time.Now()))
 }
+
+// signRaw signs an arbitrary payload — the shape a hostile-but-key-holding upstream can
+// produce and json.Marshal of the claims struct cannot.
+func (s *receiptSigner) signRaw(t *testing.T, payload []byte) json.RawMessage {
+	t.Helper()
+	obj, err := s.signer.Sign(payload)
+	require.NoError(t, err)
+	compact, err := obj.CompactSerialize()
+	require.NoError(t, err)
+	block, err := json.Marshal(capability.EffectReceipt{JWS: compact})
+	require.NoError(t, err)
+	return block
+}
+
+// TestEffectReceiptAmbiguousClaimsEarnNothing: the signature proves the upstream authored the
+// bytes, not that they mean one thing. A payload whose members fold to one name binds
+// last-wins in Go while a byte-exact reader of the same signed evidence sees the other value —
+// and this surface's whole product is evidence on the tape. Refused, as everywhere else in
+// this package, rather than decoded into a verdict two readers disagree about.
+func TestEffectReceiptAmbiguousClaimsEarnNothing(t *testing.T) {
+	t.Parallel()
+	s := newReceiptSigner(t, "k")
+	v := newVerifier(t, s)
+	now := time.Now()
+
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "case-variant class",
+			payload: `{"tool":"refund","iat":%d,"class":"irreversible","CLASS":"reversible"}`,
+		},
+		{
+			name:    "exact duplicate class",
+			payload: `{"tool":"refund","iat":%d,"class":"irreversible","class":"reversible"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			block := s.signRaw(t, fmt.Appendf(nil, tc.payload, now.Unix()))
+			got := v.Verify(block, "refund", declaredRefund(), now)
+			require.NotNil(t, got)
+			// Unverified, not malformed: the ENVELOPE was well-formed and the signature
+			// verified. This is the collapse ReceiptUnverified documents — everything that
+			// cannot be treated as the server's word earns exactly the same nothing.
+			assert.Equal(t, capability.ReceiptUnverified, got.Verdict,
+				"an attestation whose meaning depends on member order attests to nothing")
+			assert.Nil(t, got.Claims, "no ambiguous claim may be recorded as a fact about what the server did")
+		})
+	}
+}
+
+// TestEffectReceiptTrailingDataEarnsNothing is the same divergence one level out: a second
+// JSON value after the claim object is signed alongside the first, ignored by a decoder that
+// reads one value, and read by anything that scans the payload.
+func TestEffectReceiptTrailingDataEarnsNothing(t *testing.T) {
+	t.Parallel()
+	s := newReceiptSigner(t, "k")
+	v := newVerifier(t, s)
+	now := time.Now()
+
+	block := s.signRaw(t, fmt.Appendf(nil, `{"tool":"refund","iat":%d,"class":"reversible"} {"class":"irreversible"}`, now.Unix()))
+	got := v.Verify(block, "refund", declaredRefund(), now)
+	require.NotNil(t, got)
+	assert.Equal(t, capability.ReceiptUnverified, got.Verdict)
+	assert.Nil(t, got.Claims)
+}
+
+// TestEffectReceiptUnambiguousClaimsStillVerify is the control: the guards refuse ambiguity,
+// not ordinary receipts, including one carrying a member this build does not know.
+func TestEffectReceiptUnambiguousClaimsStillVerify(t *testing.T) {
+	t.Parallel()
+	s := newReceiptSigner(t, "k")
+	v := newVerifier(t, s)
+	now := time.Now()
+
+	block := s.signRaw(t, fmt.Appendf(nil, `{"tool":"refund","iat":%d,"class":"compensable","blastRadius":100,"unit":"usd","compensatingAction":"tool:reverse_refund","somethingNewer":1}`, now.Unix()))
+	got := v.Verify(block, "refund", declaredRefund(), now)
+	require.NotNil(t, got)
+	assert.Equal(t, capability.ReceiptVerified, got.Verdict)
+	require.NotNil(t, got.Claims)
+	assert.Equal(t, "100", got.Claims.BlastRadius.String())
+}

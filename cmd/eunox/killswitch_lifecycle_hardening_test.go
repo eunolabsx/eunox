@@ -10,6 +10,7 @@ package main
 
 import (
 	"flag"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -58,6 +59,54 @@ func TestValidateRedisFlagsRequireRedisAddr(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatalf("args %v: want nil, got %v", tc.args, err)
+			}
+		})
+	}
+}
+
+// TestValidateInMemoryFlagsRejectRedisAddr is the INVERSE gate: a flag bounding state the
+// in-memory backends keep on the Go heap configures nothing when Redis keeps that state in
+// Redis. The binary's stated rule is that an unpaired flag is a usage error rather than a
+// no-op, and this was the one explicit-value flag that silently did nothing instead.
+func TestValidateInMemoryFlagsRejectRedisAddr(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantErr  bool
+		wantFlag string
+	}{
+		{"nothing set", nil, false, ""},
+		{"keys ceiling alone", []string{"--max-call-counter-keys", "500"}, false, ""},
+		{"redis addr alone", []string{"--redis-addr", "localhost:6379"}, false, ""},
+		{"keys ceiling WITH redis", []string{"--redis-addr", "localhost:6379", "--max-call-counter-keys", "500"}, true, "--max-call-counter-keys"},
+		// A non-zero-default flag takes explicitlyActiveFlags' SET detection rather than its
+		// value detection, so passing the default explicitly is still an operator asking for a
+		// ceiling this backend will not apply. Same rule the other non-zero-default gated flags
+		// (e.g. --killswitch-reconcile-interval) already take.
+		{"keys ceiling set to its default WITH redis", []string{"--redis-addr", "localhost:6379", "--max-call-counter-keys", strconv.Itoa(defaultMaxCallCounterKeys)}, true, "--max-call-counter-keys"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+			f := registerProxyFlags(fs)
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+			err := validateInMemoryFlagsRejectRedisAddr(fs, *f.redisAddr)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("args %v: want nil, got %v", tc.args, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("args %v: want error, got nil", tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.wantFlag) {
+				t.Errorf("error %q does not name %q", err, tc.wantFlag)
+			}
+			if !strings.Contains(err.Error(), "--redis-addr") {
+				t.Errorf("error %q should name the flag it conflicts with", err)
 			}
 		})
 	}

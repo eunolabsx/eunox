@@ -1275,6 +1275,20 @@ func (p *ManifestPDP) decideTarget(ctx context.Context, sessionID string, target
 			fmt.Sprintf("constraint %q carries an argumentSchema, which is tool-only and not enforced on %s; refusing to forward a request guarded by an unenforced schema (fail closed)", matched.Target, targetOperationPhrase(target.Type)))
 	}
 
+	// Stray-redactFields fail-closed guard, the sibling of the one above and justified the
+	// same way. redactFields is tool-only (the proxy redacts tools/call results) and the
+	// loader refuses one on a resource:/prompt: target, but a manifest built IN-PROCESS could
+	// carry one — and enforcement.CollectObligations is target-type-blind, so it would be
+	// collected and enforcedForwardCore would run the redactor over whatever envelope this
+	// method returns. That is worse than the schema case rather than merely equal to it: a
+	// resources/read `contents[].blob` body is not the `content` shape the redactor inspects,
+	// so it passes uninspected while the tape records the obligation as applied — the exact
+	// embedded-body evasion the tools/call path fails closed on (redact.go's resource item).
+	if schema != validateSchema && hasResponseDirective(matched) {
+		return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
+			fmt.Sprintf("constraint %q carries a redactFields directive, which is tool-only and not enforced on %s; refusing to forward a response whose declared redaction would be recorded as applied without being applied (fail closed)", matched.Target, targetOperationPhrase(target.Type)))
+	}
+
 	// A constraint in audit (observe) mode downgrades its own denial to a
 	// logged-but-forwarded allow. stamp applies that downgrade only to the verdicts
 	// returned BELOW this point: the kill-switch, no-match, stray-schema, and
@@ -1354,6 +1368,22 @@ func (p *ManifestPDP) evaluateAndRecord(ctx context.Context, req *capability.Enf
 // CAPABILITY_DENIED and stray-argumentSchema denials, preserving the wording each
 // Decide* path historically emitted: "resource reads" for resources/read,
 // "prompts/get" for prompts/get, and the bare target type ("tool") otherwise.
+// hasResponseDirective reports whether a constraint carries a RESPONSE-mutating directive —
+// today redactFields, the only one. Read off the directive's own discriminator rather than a
+// type assertion, so a second response directive is one branch here rather than a new guard
+// each leg has to remember.
+func hasResponseDirective(c *capability.Constraint) bool {
+	if c == nil {
+		return false
+	}
+	for _, d := range c.Directives {
+		if d != nil && d.DirectiveType() == capability.DirectiveTypeRedactFields {
+			return true
+		}
+	}
+	return false
+}
+
 func targetOperationPhrase(t capability.TargetType) string {
 	switch t {
 	case capability.TargetTypeResource:
@@ -2308,6 +2338,14 @@ func (p *ManifestPDP) DecideSampling(ctx context.Context, sessionID, sourceIP st
 	if matched.ArgumentSchema != nil {
 		return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
 			fmt.Sprintf("constraint %q carries an argumentSchema, which is tool-only and not enforced on sampling; refusing to forward a request guarded by an unenforced schema (fail closed)", matched.Target))
+	}
+
+	// The stray-redactFields guard decideTarget applies, on the leg that has no schema mode to
+	// key it on: sampling forwards a host-answered request, so a declared redaction here is
+	// recorded as applied and applied to nothing.
+	if hasResponseDirective(matched) {
+		return hardDenyResponse(p.engineClock(), capability.ErrCodeEnforcementError,
+			fmt.Sprintf("constraint %q carries a redactFields directive, which is tool-only and not enforced on sampling; refusing to forward a response whose declared redaction would be recorded as applied without being applied (fail closed)", matched.Target))
 	}
 
 	// Sampling has no per-entry audit (observe) mode: enforcement: audit is rejected
