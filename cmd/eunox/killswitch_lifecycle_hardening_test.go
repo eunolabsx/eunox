@@ -79,11 +79,13 @@ func TestValidateInMemoryFlagsRejectRedisAddr(t *testing.T) {
 		{"keys ceiling alone", []string{"--max-call-counter-keys", "500"}, false, ""},
 		{"redis addr alone", []string{"--redis-addr", "localhost:6379"}, false, ""},
 		{"keys ceiling WITH redis", []string{"--redis-addr", "localhost:6379", "--max-call-counter-keys", "500"}, true, "--max-call-counter-keys"},
-		// A non-zero-default flag takes explicitlyActiveFlags' SET detection rather than its
-		// value detection, so passing the default explicitly is still an operator asking for a
-		// ceiling this backend will not apply. Same rule the other non-zero-default gated flags
-		// (e.g. --killswitch-reconcile-interval) already take.
-		{"keys ceiling set to its default WITH redis", []string{"--redis-addr", "localhost:6379", "--max-call-counter-keys", strconv.Itoa(defaultMaxCallCounterKeys)}, true, "--max-call-counter-keys"},
+		// Set to its OWN default it configures nothing, so there is nothing being ignored and
+		// nothing to refuse — the rule rejectGatedFlags states, applied here through
+		// flagsSetAwayFromDefault. Templating the flag at its default is what a Helm chart or a
+		// unit file produces, and refusing that would be a startup outage on upgrade for a value
+		// with no effect either way.
+		{"keys ceiling set to its default WITH redis", []string{"--redis-addr", "localhost:6379", "--max-call-counter-keys", strconv.Itoa(defaultMaxCallCounterKeys)}, false, ""},
+		{"a ceiling the operator really chose IS refused", []string{"--redis-addr", "localhost:6379", "--max-call-counter-keys", "0"}, true, "--max-call-counter-keys"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1327,23 +1327,14 @@ func (p *HTTPProxy) handleMCPDelete(w http.ResponseWriter, r *http.Request, rout
 		// SSE-GET and POST paths: without these a sibling-audience token (or a same-audience
 		// different identity that learned the victim's Mcp-Session-Id) could tear down
 		// another client's session. Enforced only once the session is confirmed to exist AND
-		// belong to this route, ordering responses 404/409/403 — a weak existence oracle: a
-		// 403 confirms a live session id on this route, a 409 one live on a sibling.
-		//
-		// That oracle is ACCEPTED, and the acceptance is no longer the one this comment used
-		// to give ("session ids are unguessable UUIDs"). It still holds for a minted id, but a
-		// declaring peer's worker id is DERIVED from its own claims and, on a task-anchored
-		// route, from the task id — so a caller holding a valid token for any route audience
-		// who can name (issuer, subject, agent id) and a possibly low-entropy task id can
-		// probe worker liveness without holding a session at all. What that buys is liveness
-		// alone: the gates above still refuse the teardown, and recordSessionGateDeny meters
-		// the record the probe writes, which was the OTHER thing the unguessable-id premise
-		// was carrying. Answering 404 uniformly would close it, but only by running the
-		// gates ABOVE the route check — and the audience gate is per-route, so a wrong-route
-		// caller would then be judged against an audience that is not the session's. The
-		// premise was true when it was written and was falsified by a change three files
-		// away, which is why the reasoning is kept here rather than replaced: the next id
-		// scheme has to re-argue it. See first_request_session.go for what derives the id.
+		// belong to this route, ordering responses 404/409/403 — a weak existence oracle (403
+		// confirms a live id on this route, 409 one on a sibling), ACCEPTED. Not on the old
+		// grounds that session ids are unguessable UUIDs: a declaring peer's worker id is
+		// DERIVED from its claims and its task, so a caller who can name those probes liveness
+		// with no session (see recordSessionGateDeny, which re-argued the same premise). What
+		// leaks is liveness alone — the gates still refuse the teardown and the record is
+		// metered — and closing it needs the gates above the route check, where the per-route
+		// audience gate would judge a wrong-route caller against the wrong audience.
 		//
 		// The kill switch is deliberately NOT consulted: tearing a
 		// session down is always permitted (a killed session's cleanup must still succeed).

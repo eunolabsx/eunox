@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/capability"
+	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
 // INVARIANT: a redactFields directive on a non-tool target is a HARD deny, the sibling of the
@@ -115,5 +116,71 @@ func TestRedactFields_OnAToolTargetStillApplies(t *testing.T) {
 	}
 	if len(resp.Obligations) != 1 || resp.Obligations[0].Type != capability.DirectiveTypeRedactFields {
 		t.Fatalf("a tool entry must still carry its redactFields obligation, got %+v", resp.Obligations)
+	}
+}
+
+// TestStrayRedactFields_TypedNilDirectiveDoesNotPanic: DirectiveType has a VALUE receiver, so
+// a typed-nil directive pointer boxed in the interface survives a bare `d != nil` check and
+// panics on the auto-generated dereference. A decision point that crashes produces no decision
+// at all, which is this package's fail-OPEN reading — and the population that can carry a
+// typed nil is exactly the in-process consumer these guards exist for.
+func TestStrayRedactFields_TypedNilDirectiveDoesNotPanic(t *testing.T) {
+	t.Parallel()
+	p := newTestManifestPDP(capability.Constraint{
+		Target:     "resource:secrets/*",
+		Actions:    []string{"read"},
+		Directives: []capability.Directive{(*capability.RedactFieldsDirective)(nil)},
+	})
+
+	resp := p.DecideResourceRead(context.Background(), "s", "secrets/db", "")
+	if resp.Decision == "" {
+		t.Fatal("a typed-nil directive must still produce a decision")
+	}
+}
+
+// TestStrayRedactFields_NoMatchForwardCarriesNoRedaction is the path the matched-constraint
+// guard sits BELOW and therefore cannot cover: no entry is selected, so the forwarded refusal
+// fills its obligations from every entry NAMING the target — a deliberately wider,
+// principal-blind union — and that fill used to pick a stray resource-entry redactFields up
+// and hand it to the tools/call-shaped redactor. The obligation is now dropped where it is
+// collected, so the tape stops claiming a redaction nothing performed.
+func TestStrayRedactFields_NoMatchForwardCarriesNoRedaction(t *testing.T) {
+	t.Parallel()
+	p := newTestManifestPDP(capability.Constraint{
+		// Principal-scoped away from this caller, so findConstraint selects nothing.
+		Target:     "resource:secrets/*",
+		Actions:    []string{"read"},
+		Principal:  map[string][]string{"agent_id": {"someone-else"}},
+		Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"users.ssn"}}},
+	})
+
+	// --audit: the no-match deny is downgradable, so this is the posture that forwards it.
+	resp := p.DecideResourceRead(enforcement.WithSkipQuota(context.Background()), "s", "secrets/db", "")
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (nothing matched)", resp.Decision)
+	}
+	if len(resp.Obligations) != 0 {
+		t.Fatalf("a forwarded resources/read refusal must carry no redactFields obligation the redactor cannot discharge, got %v", resp.Obligations)
+	}
+}
+
+// TestRedactFields_ToolNoMatchForwardStillCarriesIt is the control for the guard above: the
+// same wider fill on a TOOL target is the case it exists for, and must be untouched.
+func TestRedactFields_ToolNoMatchForwardStillCarriesIt(t *testing.T) {
+	t.Parallel()
+	p := newTestManifestPDP(capability.Constraint{
+		Target:     "tool:read_record",
+		Actions:    []string{"call"},
+		Principal:  map[string][]string{"agent_id": {"someone-else"}},
+		Directives: []capability.Directive{&capability.RedactFieldsDirective{Fields: []string{"users.ssn"}}},
+	})
+
+	resp := p.Decide(enforcement.WithSkipQuota(context.Background()), "s",
+		EnforceTarget{Type: capability.TargetTypeTool, Name: "read_record"}, map[string]interface{}{}, "")
+	if resp.Decision != capability.DecisionDeny {
+		t.Fatalf("decision = %q, want deny (principal-scoped away)", resp.Decision)
+	}
+	if len(resp.Obligations) != 1 {
+		t.Fatalf("a forwarded tools/call refusal must still be masked by an entry naming the tool, got %v", resp.Obligations)
 	}
 }

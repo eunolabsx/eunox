@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -83,14 +85,35 @@ func TestCallIdentity_PromptsGetKeepsItsFourFieldsApart(t *testing.T) {
 	}
 }
 
-// TestCallIdentity_MethodIdentityNamesTheMethodEverywhere pins the shape */list and the
-// locally-answered methods use: no target below the method, so all three identifier fields
-// are the method itself and only kind is left empty.
-func TestCallIdentity_MethodIdentityNamesTheMethodEverywhere(t *testing.T) {
+// TestCallIdentity_EveryConstructedIdentityCarriesANoun is the structural half of the same
+// hazard the transposition test covers: an EMPTY field is not a smaller mistake than a swapped
+// one. kind is rendered into five operator-facing lines by enforcedForwardCore, so a
+// kind-less identity reaching it prints a security line with a blank noun and compiles.
+//
+// Asserted over every constructor and every hand-built literal in the package rather than over
+// methodIdentity's three lines, which would only restate what that constructor assigns.
+func TestCallIdentity_EveryConstructedIdentityCarriesANoun(t *testing.T) {
 	t.Parallel()
 	id := methodIdentity(capability.MethodToolsList)
 	assert.Equal(t, capability.MethodToolsList, id.method)
 	assert.Equal(t, capability.MethodToolsList, id.auditID)
 	assert.Equal(t, capability.MethodToolsList, id.denialTarget)
-	assert.Empty(t, id.kind, "a leg with no target below its method has no noun to name either")
+	assert.Equal(t, "method", id.kind,
+		"a leg with no target below its method still has a noun; refuseUnroutable passes the same one")
+
+	// Every callIdentity literal in the production sources names all four fields. A composite
+	// literal with a missing key is what silently yields the empty noun.
+	src, err := os.ReadFile("dispatch.go")
+	require.NoError(t, err)
+	for _, f := range []string{"forward.go", "http_handlers.go"} {
+		more, err := os.ReadFile(f)
+		require.NoError(t, err)
+		src = append(src, more...)
+	}
+	for _, lit := range regexp.MustCompile(`callIdentity\{[^}]*\}`).FindAllString(string(src), -1) {
+		for _, field := range []string{"method:", "auditID:", "denialTarget:", "kind:"} {
+			assert.Contains(t, lit, field,
+				"every callIdentity literal must name %s; an omitted field is an empty operator-facing value", field)
+		}
+	}
 }

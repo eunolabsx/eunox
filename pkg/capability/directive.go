@@ -44,3 +44,30 @@ func (RedactFieldsDirective) DirectiveType() string { return DirectiveTypeRedact
 func (d RedactFieldsDirective) ToObligation() Obligation {
 	return Obligation{Type: DirectiveTypeRedactFields, Paths: d.Fields}
 }
+
+// IsRedactFieldsDirective reports whether d is a redactFields directive (value or pointer
+// form). Single-sourced alongside IsLabelOutputDirective and NIL-SAFE, which is the point:
+// DirectiveType has a VALUE receiver, so a typed-nil *RedactFieldsDirective boxed in the
+// interface survives a `d != nil` check and panics on the auto-generated dereference — the
+// shape an in-process manifest can carry and the one enforcement.CollectObligations already
+// guards. AsValueOrPointer answers without dereferencing.
+func IsRedactFieldsDirective(d Directive) bool {
+	_, ok := AsValueOrPointer[RedactFieldsDirective](d)
+	return ok
+}
+
+// ConstraintHasResponseDirective reports whether c carries a RESPONSE-mutating directive —
+// today redactFields, the only one. Single-sourced so the engine's collect-time skip and the
+// PDP's fail-closed guard cannot drift on what counts as one. Nil-safe on both the constraint
+// and its entries.
+func ConstraintHasResponseDirective(c *Constraint) bool {
+	if c == nil {
+		return false
+	}
+	for _, d := range c.Directives {
+		if IsRedactFieldsDirective(d) {
+			return true
+		}
+	}
+	return false
+}

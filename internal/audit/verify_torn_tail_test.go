@@ -180,3 +180,40 @@ func TestVerifyLog_TrailingWhitespaceIsNotATornTail(t *testing.T) {
 		t.Fatalf("expected a clean single-record pass, got %+v", res)
 	}
 }
+
+// TestNewLineScanner_DropsATornTailForEveryReader: the scanner is the seam that keeps
+// audit-verify, stats, suggest and doctor reading one chain the same way, and all four reach
+// it through the same lazy by-name opens. A half-written tail that one classifies and another
+// drops is two commands disagreeing about one file — stats counting it as a record with an
+// unrecognized decision, doctor printing half a record as the newest line.
+func TestNewLineScanner_DropsATornTailForEveryReader(t *testing.T) {
+	t.Parallel()
+	// The reporting readers pass no flag: for them the drop IS the whole disposition.
+	sc := NewLineScanner(strings.NewReader("{\"a\":1}\n{\"b\":2"), nil)
+	var got []string
+	for sc.Scan() {
+		got = append(got, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(got) != 1 || got[0] != `{"a":1}` {
+		t.Fatalf("the torn fragment must not be handed to a reader, got %q", got)
+	}
+
+	torn := false
+	sc = NewLineScanner(strings.NewReader("{\"a\":1}\n{\"b\":2"), &torn)
+	for sc.Scan() { //nolint:revive // draining is the point
+	}
+	if !torn {
+		t.Error("a caller that passes a flag must be told the stream ended mid-record")
+	}
+
+	torn = false
+	sc = NewLineScanner(strings.NewReader("{\"a\":1}\n"), &torn)
+	for sc.Scan() { //nolint:revive // draining is the point
+	}
+	if torn {
+		t.Error("a newline-terminated stream is not torn")
+	}
+}

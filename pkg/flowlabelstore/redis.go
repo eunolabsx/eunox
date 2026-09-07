@@ -24,7 +24,7 @@ const DefaultIdleTTL = 24 * time.Hour
 type Redis struct {
 	client redis.Cmdable
 	// ttl is the configured idle TTL as passed to WithRedisIdleTTL, stored verbatim;
-	// effectiveTTL applies the non-positive guard at the point of use.
+	// effectiveTTL applies the sub-second guard at the point of use.
 	ttl time.Duration
 }
 

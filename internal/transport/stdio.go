@@ -1225,7 +1225,8 @@ func (p *StdioProxy) forwardHostNotification(ctx context.Context, msg mcp.RPCMsg
 	// The boundary applies to notifications too, and they do not reach it through the upstream
 	// call — this write IS the leg's outbound seam for them. See translateNotificationForLeg.
 	//
-	// ABOVE the cancel rewrite, the order rewriteCancelToNonce states and HTTP already used.
+	// Above the cancel rewrite, matching HTTP. The two commute — translation touches only
+	// _meta, the rewrite only requestId — and neither now depends on the other for strictness.
 	outbound, err := translateNotificationForLeg(msg, requestRevision(ctx), p.upstreamRev)
 	if err != nil {
 		// A drop with no diagnostic: the peer cannot be answered (JSON-RPC forbids it) and the
@@ -1653,18 +1654,19 @@ const methodNotificationsCancelled = "notifications/cancelled"
 // nonce-rewriting upstream paths call this; the gateway remote-HTTP path forwards host ids
 // unchanged and must NOT rewrite.
 //
-// ORDER: both transports run this AFTER translateNotificationForLeg, never before. The two
-// steps commute in effect — translation touches only _meta, this only requestId — but not in
-// what the strict decode SEES: the plain json.Unmarshal below resolves a duplicate key
-// last-wins and re-marshals clean params, so a cancel carrying one used to be laundered past
-// mcp.DecodeParams on stdio while HTTP refused the identical bytes. Same message, opposite
-// outcomes, on the one notification that decides whether an in-flight call is aborted.
+// mcp.DecodeParams, not a plain json.Unmarshal: this was the tree's only lax decode-and-
+// re-marshal of msg.Params, and re-marshalling silently resolved a duplicate key last-wins.
+// That laundered ambiguous params into clean ones on the one notification that decides whether
+// an in-flight call is aborted — and did it BELOW the strict decode, so the outcome depended on
+// whether the leg's revision pair happened to be mismatched (a matched pair short-circuits the
+// translation entirely). Refusing here makes the answer the same on both transports and every
+// revision pair, which is what the call ORDER alone could never buy.
 func rewriteCancelToNonce(mu *sync.Mutex, hostToUp map[string]*json.RawMessage, msg mcp.RPCMsg) (mcp.RPCMsg, bool) {
 	if msg.Method != methodNotificationsCancelled || len(msg.Params) == 0 {
 		return msg, false
 	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(msg.Params, &fields); err != nil {
+	if err := mcp.DecodeParams(msg.Params, &fields); err != nil {
 		return msg, false
 	}
 	rawID, ok := fields["requestId"]

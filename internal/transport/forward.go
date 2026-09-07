@@ -591,7 +591,6 @@ func isObserveDeny(denial *capability.DenialInfo, auditMode, auditOnly bool) boo
 // mis-stamps the signed tape only on prompts/get, the one leg whose auditID ("prompts/x") and
 // denialTarget ("x") differ.
 type callIdentity struct {
-	// method is the MCP method, recorded verbatim as the record's method field.
 	method string
 	// auditID is the identifier the record CLAIMS as its target. It is the method itself on a
 	// leg with no sub-target (*/list, the locally-answered methods).
@@ -605,9 +604,14 @@ type callIdentity struct {
 }
 
 // methodIdentity is the callIdentity for a leg with no target below its method: */list and the
-// locally-answered methods, where all three identifier fields are the method itself.
+// locally-answered methods.
+//
+// kind is "method" rather than left empty, which is the same noun refuseUnroutable passes by
+// hand for this shape. An empty one is not a smaller mistake than a transposed field: the core
+// renders it into five operator-facing lines, so a leg routed through enforcedForwardCore with
+// a kind-less identity would print `AUDIT:  "tools/list" would be denied` and compile.
 func methodIdentity(method string) callIdentity {
-	return callIdentity{method: method, auditID: method, denialTarget: method}
+	return callIdentity{method: method, auditID: method, denialTarget: method, kind: "method"}
 }
 
 // enforcedForwardCore is the shared deny/observe/forward/record decision both transports apply

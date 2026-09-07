@@ -611,7 +611,7 @@ func TestToolEntryYAMLLines_WithSchema(t *testing.T) {
 		},
 	}
 	lines := toolEntryYAMLLines(tool, false)
-	joined := strings.Join(lines, "\n")
+	joined := joinAuditLog(lines)
 
 	for _, want := range []string{
 		"- target: tool:read_file",
@@ -657,7 +657,7 @@ func TestArgumentSchemaYAML_MultipleProperties_SortedAlphabetically(t *testing.T
 		},
 	}
 	lines := argumentSchemaYAML(schema)
-	joined := strings.Join(lines, "\n")
+	joined := joinAuditLog(lines)
 
 	aPos := strings.Index(joined, "a_param")
 	mPos := strings.Index(joined, "m_param")
@@ -680,7 +680,7 @@ func TestArgumentSchemaYAML_RequiredFields(t *testing.T) {
 		"required": []interface{}{"a", "b"},
 	}
 	lines := argumentSchemaYAML(schema)
-	joined := strings.Join(lines, "\n")
+	joined := joinAuditLog(lines)
 
 	if !strings.Contains(joined, "required: [a, b]") {
 		t.Errorf("should contain required: [a, b], got:\n%s", joined)
@@ -700,7 +700,7 @@ func TestArgumentSchemaYAML_RequiredFiltersAbsentFromProperties(t *testing.T) {
 		"required": []interface{}{"path", "ghost"}, // ghost is not in properties
 	}
 	lines := argumentSchemaYAML(schema)
-	joined := strings.Join(lines, "\n")
+	joined := joinAuditLog(lines)
 
 	if !strings.Contains(joined, "required: [path]") {
 		t.Errorf("required should be filtered to [path] (ghost dropped), got:\n%s", joined)
@@ -790,7 +790,7 @@ func TestArgumentSchemaYAML_UnionType(t *testing.T) {
 		},
 	}
 	lines := argumentSchemaYAML(schema)
-	joined := strings.Join(lines, "\n")
+	joined := joinAuditLog(lines)
 
 	// A union/array type must keep its real members, not collapse to `string`,
 	// otherwise an uncommented entry would deny legitimate calls of the other type.
@@ -1169,7 +1169,7 @@ func TestToolEntryYAMLLines_PinDescriptions(t *testing.T) {
 	desc := "Executes a database query."
 	tool := drift.UpstreamTool{Name: "query_db", Description: desc}
 	lines := toolEntryYAMLLines(tool, true)
-	joined := strings.Join(lines, "\n")
+	joined := joinAuditLog(lines)
 
 	expectedHash := capability.ComputeToolHash(desc, nil)
 	if !strings.Contains(joined, expectedHash) {

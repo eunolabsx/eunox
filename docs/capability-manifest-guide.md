@@ -2613,7 +2613,8 @@ byte-for-byte what it was before this option existed.
 > session-anchored key already has a reclamation path (the transport's teardown), so
 > expiring it would age a taint out from under a session that is merely quiet — a
 > fail-open — which is why the default backend does not expire anything.
-> `--max-call-counter-keys` remains a fail-closed *admission ceiling* behind all of this,
+> `--max-call-counter-keys` (in-memory only — it is refused alongside `--redis-addr`, which
+> holds this state under TTLs of its own) remains a fail-closed *admission ceiling* behind all of this,
 > not a reaper; the proxy logs a warning as the count approaches it, and at it a new
 > anchor's first labelled call is denied (over-blocking, never a bypass). **Redis is still
 > the backend for a multi-instance deployment of this mode** — a task's state has to be

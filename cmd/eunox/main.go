@@ -1088,10 +1088,15 @@ func refuseActiveFlags(active []string, detail string) error {
 
 // rejectGatedFlags refuses the flags in names the operator ACTIVATED (explicitlyActiveFlags:
 // value detection for a zero-default flag, explicit-set for the rest). This is the rejector
-// for a gate whose hazard is that the flags are silently IGNORED — a flag explicitly set to
-// its own default configures nothing, so there is nothing being ignored and nothing to
-// refuse. Where the hazard is instead that the operator believes something else about the
-// run, use rejectPassedFlags.
+// for a gate whose hazard is that the flags are silently IGNORED.
+//
+// "Activated" is per FLAG, not one rule: for a zero-default flag, one explicitly set to its own
+// default configures nothing and is not refused; for a non-zero-default flag, setting it is the
+// signal, since its value cannot be read as absent. Every flag routed through here today has a
+// zero default, so the second arm is currently unexercised — a gate over a non-zero-default
+// flag that wants the first rule asks for it explicitly (flagsSetAwayFromDefault). Where the
+// hazard is instead that the operator believes something else about the run, use
+// rejectPassedFlags.
 func rejectGatedFlags(fs *flag.FlagSet, names []string, detail string) error {
 	return refuseActiveFlags(explicitlyActiveFlags(fs, names), detail)
 }
@@ -1214,8 +1219,34 @@ func validateInMemoryFlagsRejectRedisAddr(fs *flag.FlagSet, redisAddr string) er
 	if redisAddr == "" {
 		return nil
 	}
-	return rejectGatedFlags(fs, inMemoryOnlyFlags,
+	return refuseActiveFlags(flagsSetAwayFromDefault(fs, inMemoryOnlyFlags),
 		"cannot be combined with --redis-addr: they bound state the IN-MEMORY backends keep on the Go heap, and the Redis backends keep that state in Redis under TTLs of their own, so the ceiling would configure nothing. Remove them, or remove --redis-addr to use the in-memory backends")
+}
+
+// flagsSetAwayFromDefault returns the "--"-prefixed names of every flag in names whose value
+// DIFFERS from its default — explicitlyActiveFlags' value-detection rule, applied whatever the
+// default is.
+//
+// Separate from rejectGatedFlags rather than folded into it, because explicitlyActiveFlags
+// selects that rule only for a ZERO-default flag and --max-call-counter-keys is the first gated
+// flag with a non-zero one. Under the set detection it would otherwise take, templating the
+// flag at its own default — the shape a Helm chart or a unit file produces — became a fatal
+// startup error for a value that configures nothing, which is the outcome rejectGatedFlags' own
+// doc says there is nothing to refuse. What stays refused is a ceiling the operator really
+// chose and this backend will not apply, which is the usage error the gate is for.
+//
+// Widening explicitlyActiveFlags itself would have been the tidier change and is deliberately
+// not made: the jwks- and HTTP-only gates run over flags with non-zero defaults where the set
+// rule is what they enforce today, and relaxing three guards is not this gate's business.
+func flagsSetAwayFromDefault(fs *flag.FlagSet, names []string) []string {
+	var out []string
+	for _, name := range names {
+		f := fs.Lookup(name)
+		if f != nil && flagWasSet(fs, name) && f.Value.String() != f.DefValue {
+			out = append(out, "--"+name)
+		}
+	}
+	return out
 }
 
 // redisGatedFlags is the single authoritative list of proxy flags that take effect ONLY

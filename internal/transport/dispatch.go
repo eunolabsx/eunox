@@ -129,7 +129,6 @@ func (d dispatchParams) killDenied(ctx context.Context, msg mcp.RPCMsg) (mcp.RPC
 	return mcp.RPCMsg{}, false
 }
 
-// clock reads the dispatch clock, defaulting to time.Now for every wiring that sets none.
 func (d dispatchParams) clock() time.Time {
 	if d.now == nil {
 		return time.Now()
@@ -1108,9 +1107,15 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// The kill-switch check runs at the dispatchRequest boundary (a killed session must not
 	// enumerate the catalog), so this handler no longer self-gates.
 
+	// Resolved ONCE for the whole function: every exit and every record below stamps it, which
+	// is what makes callIdentity's contract ("the per-call identity every exit stamps") true
+	// here rather than three of five exits taking it and the two record sites spelling the
+	// method twice, positionally, where a swap compiles.
+	id := methodIdentity(msg.Method)
+
 	// --require-audit=strict: fail the enumeration closed rather than forward an unrecorded
-	// one. The three string args collapse to the method name: a */list has no sub-target.
-	if denied, blocked := d.strictAuditDenial(ctx, msg, methodIdentity(msg.Method), capability.EnforceResponse{}); blocked {
+	// one. A */list has no sub-target, so every identifier field is the method itself.
+	if denied, blocked := d.strictAuditDenial(ctx, msg, id, capability.EnforceResponse{}); blocked {
 		return denied
 	}
 
@@ -1122,20 +1127,20 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		// The same mode enforcedForwardCore reads (see forwardParams.callUpstream): a leg with no
 		// upstream cannot enumerate one, and a nil call here would be a crash where the honest
 		// answer is a fail-closed refusal naming the wiring fault.
-		return d.refuseUpstreamless(ctx, msg, methodIdentity(msg.Method), capability.EnforceResponse{})
+		return d.refuseUpstreamless(ctx, msg, id, capability.EnforceResponse{})
 	}
 	upResp, err := d.callUpstream(ctx, msg)
 	if err != nil {
-		return d.recordUpstreamFailure(ctx, msg, err, methodIdentity(msg.Method), nil)
+		return d.recordUpstreamFailure(ctx, msg, err, id, nil)
 	}
 
 	// Defense-in-depth: a neither-result-nor-error reply is malformed, and forwarding it
 	// would bypass list filtering. callUpstream now rejects this before returning, so it's
 	// no longer reachable live — kept as a backstop against a future bypass.
 	if upResp.Error == nil && upResp.Result == nil {
-		warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
+		warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, id.kind, id.denialTarget, func() {
 			if d.rec != nil {
-				d.rec.RecordDeny(ctx, d.sessionID, msg.Method, msg.Method, capability.ErrCodeEnforcementError, "", nil, false)
+				d.rec.RecordDeny(ctx, d.sessionID, id.auditID, id.method, capability.ErrCodeEnforcementError, "", nil, false)
 			}
 		})
 		return mcp.ErrorResponse(msg.ID, jsonRPCCodeInternalError, "upstream returned a malformed list response (no result and no error)")
@@ -1175,9 +1180,9 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 	// AuditOnly never applies to list methods, so d.audit alone carries the observe posture.
 	// Details carry filter statistics so an auditor can tell filtering from a genuinely empty
 	// upstream apart.
-	warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, msg.Method, msg.Method, func() {
+	warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, id.kind, id.denialTarget, func() {
 		if d.rec != nil {
-			d.rec.RecordAllow(ctx, d.sessionID, msg.Method, msg.Method, listAllowDetails(ctx, upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
+			d.rec.RecordAllow(ctx, d.sessionID, id.auditID, id.method, listAllowDetails(ctx, upResp, upstreamCount, filteredCount, d.audit), nil, d.audit, nil, nil)
 		}
 	})
 

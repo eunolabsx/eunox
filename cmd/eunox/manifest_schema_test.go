@@ -494,13 +494,13 @@ func TestComputeAuditStats_UnroutableIsCountedAndCalledOut(t *testing.T) {
 	marker := func(reason string) string {
 		return `{"` + audit.UnroutableKey + `":{"reason":"` + reason + `","revision":"2026-07-28"}}`
 	}
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		`{"decision":"deny","method":"resources/subscribe","denial_code":"AUTHORIZATION_FAILED","details":` + marker(audit.UnroutableRemovedInRevision) + `}`,
 		`{"decision":"deny","method":"agents/delegate","target":"agents/delegate","denial_code":"AUTHORIZATION_FAILED","details":` + marker(audit.UnroutableUnknownMethod) + `}`,
 		`{"decision":"deny","method":"agents/delegate","target":"agents/delegate","denial_code":"AUTHORIZATION_FAILED","details":` + marker(audit.UnroutableUnknownMethod) + `}`,
 		// A genuine policy denial, which must NOT be folded in.
 		`{"decision":"deny","target_type":"tool","target":"read_file","denial_code":"AUTHORIZATION_FAILED"}`,
-	}, "\n")
+	})
 	got, err := computeAuditStats(strings.NewReader(log))
 	if err != nil {
 		t.Fatalf("computeAuditStats: %v", err)
@@ -554,11 +554,11 @@ func TestComputeAuditStats_HandlerFaultIsCountedAndCalledOut(t *testing.T) {
 
 	// Both records a fault can ride: the allow it was decided on, and the deny a route running
 	// --audit forwards anyway (where the deny record is the one an operator reads).
-	log := strings.Join([]string{
+	log := joinAuditLog([]string{
 		`{"decision":"allow","target":"read_file","details":{"` + audit.HandlerFaultKey + `":[{"type":"maxCalls","contract":"quota_bucket_under_skip_quota"}]}}`,
 		`{"decision":"deny","audit_only":true,"target":"read_file","denial_code":"CONDITION_FAILED","details":{"` + audit.HandlerFaultKey + `":[{"type":"maxCalls","contract":"quota_bucket_under_skip_quota"}]}}`,
 		`{"decision":"allow","target":"read_file","details":{"path":"/tmp/x"}}`,
-	}, "\n")
+	})
 	got, err := computeAuditStats(strings.NewReader(log))
 	if err != nil {
 		t.Fatalf("computeAuditStats: %v", err)

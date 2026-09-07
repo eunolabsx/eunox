@@ -332,9 +332,8 @@ func VerifyLog(r io.Reader, verifier *Sink, opts VerifyOptions) (VerifyResult, e
 	if v.opts.Out == nil {
 		v.opts.Out = io.Discard
 	}
-	scanner := NewLineScanner(r)
 	torn := false
-	scanner.Split(scanSignedLines(&torn))
+	scanner := NewLineScanner(r, &torn)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -367,7 +366,7 @@ func VerifyLog(r io.Reader, verifier *Sink, opts VerifyOptions) (VerifyResult, e
 var ErrUnterminatedTail = errors.New("audit log ends with an unterminated record — an in-progress write, or a truncation")
 
 // scanSignedLines is bufio.ScanLines with one change: a final non-blank fragment carrying no
-// newline is DROPPED and recorded in torn instead of being returned as a token.
+// newline is DROPPED, and recorded in torn when the caller passed one.
 //
 // Dropping rather than classifying is the point. strictDecodeAuditRecord refuses a torn line,
 // classify counts it INVALID and OK() then fails — a tampering verdict, with no attacker, on a
@@ -382,7 +381,9 @@ var ErrUnterminatedTail = errors.New("audit log ends with an unterminated record
 func scanSignedLines(torn *bool) bufio.SplitFunc {
 	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		if atEOF && bytes.IndexByte(data, '\n') < 0 && len(bytes.TrimSpace(data)) > 0 {
-			*torn = true
+			if torn != nil {
+				*torn = true
+			}
 			return len(data), nil, nil
 		}
 		return bufio.ScanLines(data, atEOF)

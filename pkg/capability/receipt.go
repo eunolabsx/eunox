@@ -363,8 +363,11 @@ func (v *EffectReceiptVerifier) verifySignature(compact string, now time.Time) (
 	// Trailing data is the same divergence one level out: a second JSON value after the claim
 	// object is signed alongside the first, ignored by this decoder, and read by anything that
 	// scans the payload rather than decoding one value from it.
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("trailing data after the effect receipt claim object")
+	if tok, err := dec.Token(); !errors.Is(err, io.EOF) {
+		// The decoder's own answer, not a constant: it distinguishes a genuine second value
+		// from a syntax error carrying an offset, and this surface's whole product is
+		// evidence — an operator debugging why every receipt lands unverified has only this.
+		return nil, fmt.Errorf("trailing data after the effect receipt claim object (%v, %v)", tok, err)
 	}
 	if claims.IssuedAt == 0 {
 		return nil, fmt.Errorf("effect receipt carries no 'iat'; an undated attestation is replayable forever")

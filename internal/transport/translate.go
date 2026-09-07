@@ -153,10 +153,15 @@ func boundaryDisposition(msg mcp.RPCMsg) crossRevisionDeclaration {
 // per-frame string build besides, and a bound placed on one caller is one the next does not
 // inherit. A no-op for the host-side callers, whose methods really are from the closed set.
 func refuseAcrossRevisions(method string, hostRev, legRev capability.Revision, why string) error {
-	subject := BoundConsoleDetail(method)
-	if subject == "" {
-		subject = "a response"
+	// The sentinel is read off the RAW method, never the bounded one: BoundConsoleDetail trims
+	// whitespace, so " " would otherwise collapse into the empty string that means "this
+	// message carries no method at all" and a REQUEST would be reported as a response — the
+	// one fact this error exists to state, invertible by a peer choosing a whitespace method.
+	if method == "" {
+		return fmt.Errorf("%w: a response cannot cross a host %s / upstream %s pair (%s)",
+			errUntranslatableAcrossRevisions, hostRev, legRev, why)
 	}
+	subject := BoundConsoleDetail(method)
 	return fmt.Errorf("%w: %s cannot cross a host %s / upstream %s pair (%s)",
 		errUntranslatableAcrossRevisions, subject, hostRev, legRev, why)
 }
