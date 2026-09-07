@@ -1992,34 +1992,31 @@ func refuseNonRegularOutput(path string) error {
 	return config.RefuseNonRegularPath(path, "output file")
 }
 
-// openGuardedOutput opens path for a TRUNCATING write at mode 0600, refusing anything that
-// is not a regular file at every point the answer can still change. It is the whole guard
-// sequence, in the one order that holds:
+// openGuardedOutput opens path for a TRUNCATING write at mode 0600, refusing anything that is
+// not a regular file at each point the answer can still change: the name refusal cannot see a
+// substitution made after its Lstat, O_NOFOLLOW covers that window for a symlink but not for a
+// FIFO (whose write-only open would block inside open(2) until a reader arrives, leaving no
+// post-open check reachable at all), and only the handle check describes what is actually
+// about to be written. The re-tighten is last because O_CREATE applies the mode on creation
+// alone, and it follows the handle check so a substituted object is refused rather than
+// re-moded.
 //
-//  1. refuseNonRegularOutput on the NAME, which refuses a planted symlink or FIFO outright;
-//  2. config.OpenNoFollow, which closes the Lstat->open race the refusal above cannot for a
-//     symlink, and config.OpenNonBlock, which closes it for a FIFO — whose write-only open
-//     would otherwise block inside open(2) until a reader arrives, leaving no post-open check
-//     reachable at all;
-//  3. config.RefuseNonRegularHandle through the HANDLE, so the verdict describes what is
-//     about to be written rather than what the name resolved to before the open — the one
-//     question with no window after it;
-//  4. Chmod on the open fd, since O_CREATE applies the mode only on creation and a
-//     pre-existing looser-mode file would otherwise keep it. Ahead of the write so a
-//     regenerated credential-bearing file never lands loose, and after the handle check so a
-//     substituted object is refused rather than re-moded.
+// What it does NOT cover: an intermediate path component. Lstat and O_NOFOLLOW both speak
+// only about the final one, so a swapped ANCESTOR directory redirects the whole open and every
+// check here still passes.
 //
 // One function rather than the two hand-mirrored copies it replaces (this one and doctor's
-// --output): each step exists for a race the next one cannot cover, so a copy that loses a
-// step loses it silently. The file is closed on every failure past the open, so a caller owns
-// the handle only on success.
+// --output), because each step covers a race the next cannot and a copy that loses one loses
+// it silently. Each failure names its stage — the caller prints the error verbatim, and
+// "refused / could not open / could not re-tighten" are different operator problems. The file
+// is closed on every failure past the open, so a caller owns the handle only on success.
 func openGuardedOutput(path string) (*os.File, error) {
 	if err := refuseNonRegularOutput(path); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: path is an operator-supplied output destination, and 0600 is the intended restrictive mode
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("opening %q: %w", path, err)
 	}
 	if rerr := config.RefuseNonRegularHandle(f, "output file", path); rerr != nil {
 		_ = f.Close()

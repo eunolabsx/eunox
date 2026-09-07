@@ -212,6 +212,11 @@ func TestEnforcedForwardCore_RedactionFailure_RecordsBeforeLogging(t *testing.T)
 	r, w, err := os.Pipe()
 	require.NoError(t, err)
 	os.Stderr = w
+	// Deferred, unlike this file's older copies of the harness: the assertions below sit
+	// inside the swap window, and a require there is a Goexit that would leave the package's
+	// os.Stderr pointing at a pipe nothing drains — one failed assertion becomes a deadlock
+	// at the 64 KiB buffer instead of a readable failure.
+	defer func() { os.Stderr = old }()
 
 	fp := forwardParams{
 		// forwardOrderRecorder's RecordDeny writes its sentinel to os.Stderr, and the
@@ -229,15 +234,14 @@ func TestEnforcedForwardCore_RedactionFailure_RecordsBeforeLogging(t *testing.T)
 		Obligations: []capability.Obligation{{Type: capability.DirectiveTypeRedactFields, Paths: []string{"ssn"}}},
 	}
 	resp := enforcedForwardCore(context.Background(), fp, mcp.RPCMsg{ID: mcp.RawJSON(`1`)}, dec, "tools/call", "read_file", "read_file", "tool", true, upstreamErrorDetail)
-	require.NotNil(t, resp.Error, "host must receive an internal error when redaction fails")
-
 	_ = w.Close()
-	os.Stderr = old
 
 	var buf bytes.Buffer
 	_, _ = io.Copy(&buf, r)
+	_ = r.Close()
 	logged := buf.String()
 
+	require.NotNil(t, resp.Error, "host must receive an internal error when redaction fails")
 	recordIdx := strings.Index(logged, "RECORD_DENY_CALLED")
 	logIdx := strings.Index(logged, "SECURITY: redaction failed")
 	require.NotEqual(t, -1, recordIdx, "RecordDeny was not called; got: %q", logged)

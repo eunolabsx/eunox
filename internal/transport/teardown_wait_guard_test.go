@@ -11,22 +11,26 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// TestPostKillWaitsAreBounded scans this package's non-test sources for a bare channel
-// receive taken after a forced kill in the same block.
+// TestPostKillWaitsAreBounded scans this package's non-test sources for a wait with no
+// ceiling taken after a forced kill in the same statement list.
 //
-// waitBounded exists because the thing being waited for may never arrive: a descendant that
-// escaped the process group (a double-fork, an explicit setsid, a platform with no
-// process-group teardown) holds the pipe open, cmd.Wait never returns, and the teardown
-// goroutine parked on it never reaches the cleanup below. Every such wait in this package
-// is bounded — the session cleanup goroutine's was the one that was not, which pinned a
-// maxSessions slot and the session's state for the proxy's life — and "every" is a claim a
-// scan can hold where a reviewer counting sites cannot.
+// The thing being waited for may never arrive: a descendant that escaped the process group
+// holds a pipe open so the reader never finishes, or a child in an unreapable state never
+// answers Wait. Either way the goroutine parked on it never reaches the teardown below, and
+// on the three sites this found that meant a pinned maxSessions slot, a parked HTTP request
+// handler, and a hung Start. The answer is waitBounded, or a reap moved to its own goroutine
+// where parking costs one goroutine instead of the caller.
+//
+// What the scan holds is exactly that: within ONE statement list, a kill followed by a wait.
+// It does not chase a wait through a helper, and it does not see a kill nested in a
+// conditional — so it is a floor under the rule, not a proof of it.
 func TestPostKillWaitsAreBounded(t *testing.T) {
 	t.Parallel()
 	for _, src := range packageSources(t) {
@@ -65,9 +69,9 @@ func unboundedPostKillWaits(fset *token.FileSet, f *ast.File) []string {
 				killed = true
 				continue
 			}
-			if killed && isBareReceive(stmt) {
+			if killed && isUnboundedWait(stmt) {
 				violations = append(violations, fmt.Sprintf(
-					"%s: unbounded receive after a forced kill; use waitBounded(ch, d, what, errOut) so an escaped descendant cannot park this teardown forever",
+					"%s: unbounded wait after a forced kill; use waitBounded(ch, d, what, errOut), or move the reap to its own goroutine, so a child that never answers cannot park this caller",
 					fset.Position(stmt.Pos())))
 			}
 		}
@@ -76,7 +80,19 @@ func unboundedPostKillWaits(fset *token.FileSet, f *ast.File) []string {
 	return violations
 }
 
-// isForceKillCall reports whether stmt is a call to one of this package's force-kill helpers.
+// forceKillNames are the spellings of "stop the upstream now" in this package. Both the
+// package-level helpers and the METHODS that wrap them, because a predicate matching only a
+// bare identifier passes over the majority of this package's kill sites — `p.killUpstream()`
+// and `s.killSubprocess()` are selector calls, and they are the ones the stdio teardown paths
+// use.
+var forceKillNames = map[string]bool{
+	"killUpstreamCmd":     true,
+	"killUpstreamProcess": true,
+	"killUpstream":        true,
+	"killSubprocess":      true,
+}
+
+// isForceKillCall reports whether stmt calls one of them, in either spelling.
 func isForceKillCall(stmt ast.Stmt) bool {
 	expr, ok := stmt.(*ast.ExprStmt)
 	if !ok {
@@ -86,25 +102,61 @@ func isForceKillCall(stmt ast.Stmt) bool {
 	if !ok {
 		return false
 	}
-	fn, ok := call.Fun.(*ast.Ident)
-	return ok && (fn.Name == "killUpstreamCmd" || fn.Name == "killUpstreamProcess")
+	return forceKillNames[calleeName(call.Fun)]
 }
 
-// isBareReceive reports whether stmt is `<-ch` as a statement — a receive whose value is
-// discarded, which is the spelling of "wait for this, however long it takes".
-func isBareReceive(stmt ast.Stmt) bool {
-	expr, ok := stmt.(*ast.ExprStmt)
-	if !ok {
-		return false
+// calleeName is the called function's own name for either spelling, `f(...)` or `x.f(...)`.
+func calleeName(fun ast.Expr) string {
+	switch f := fun.(type) {
+	case *ast.Ident:
+		return f.Name
+	case *ast.SelectorExpr:
+		return f.Sel.Name
 	}
-	unary, ok := expr.X.(*ast.UnaryExpr)
+	return ""
+}
+
+// isUnboundedWait reports whether stmt waits with no ceiling. Three spellings, because the
+// hazard is the WAIT and not the syntax that discards its value: a bare `<-ch`, the same
+// receive assigned away (`_ = <-ch`, `v := <-ch`), and a blocking `Wait()` call — which is
+// what `<-ch` is standing in for at every site here, and what the two synchronous waits this
+// guard found were spelled as.
+func isUnboundedWait(stmt ast.Stmt) bool {
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		return isReceive(s.X) || isBlockingWait(s.X)
+	case *ast.AssignStmt:
+		for _, rhs := range s.Rhs {
+			if isReceive(rhs) || isBlockingWait(rhs) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isReceive(e ast.Expr) bool {
+	unary, ok := e.(*ast.UnaryExpr)
 	return ok && unary.Op == token.ARROW
 }
 
-// TestUnboundedPostKillWaits_DetectsTheShape proves the scan fires on the shape it is about
-// rather than merely passing over sources that happen to be clean — and that the two
-// legitimate spellings beside it (a bounded wait, and a receive with no kill above it) are
-// not flagged.
+// isBlockingWait reports whether e is a `Wait()`-named call — `cmd.Wait()`, or a method that
+// wraps one (`p.waitUpstream()`), matched by name for isForceKillCall's reason.
+func isBlockingWait(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	name := calleeName(call.Fun)
+	return name == "Wait" || strings.HasPrefix(name, "wait") && name != "waitBounded"
+}
+
+// TestUnboundedPostKillWaits_DetectsTheShape proves the scan fires on every spelling it
+// claims rather than merely passing over sources that happen to be clean — the bare receive,
+// the same receive assigned away, a blocking Wait, and the method spellings of both halves —
+// and that the three legitimate shapes beside them are not: a bounded wait, a reap moved to
+// its own goroutine, and a wait with no kill above it. A predicate widened without this is as
+// unproven as the narrow one it replaced.
 func TestUnboundedPostKillWaits_DetectsTheShape(t *testing.T) {
 	t.Parallel()
 	const snippet = `package transport
@@ -123,9 +175,29 @@ func offenderInSelectClause(waited, other chan struct{}) {
 	}
 }
 
+func offenderAssignedReceive(waited chan struct{}) {
+	killUpstreamProcess(nil)
+	_ = <-waited
+}
+
+func offenderBlockingWait(p *StdioProxy, cmd *exec.Cmd) {
+	killUpstreamCmd(cmd)
+	_ = cmd.Wait()
+}
+
+func offenderThroughMethodSpellings(p *StdioProxy) {
+	p.killUpstream()
+	p.waitUpstream()
+}
+
 func bounded(waited chan struct{}) {
 	killUpstreamCmd(nil)
-	waitBounded(waited, 0, "upstream output stream", nil)
+	waitBounded(waited, 0, "upstream process", nil)
+}
+
+func backgroundReap(cmd *exec.Cmd) {
+	killUpstreamCmd(cmd)
+	go func() { _ = cmd.Wait() }()
 }
 
 func noKill(waited chan struct{}) {
@@ -137,8 +209,8 @@ func noKill(waited chan struct{}) {
 	require.NoError(t, err)
 
 	got := unboundedPostKillWaits(fset, file)
-	require.Len(t, got, 2, "exactly the two offenders must be flagged; got %v", got)
+	require.Len(t, got, 5, "every offending spelling must be flagged and no legitimate one; got %v", got)
 	for _, v := range got {
-		assert.Contains(t, v, "unbounded receive after a forced kill")
+		assert.Contains(t, v, "unbounded wait after a forced kill")
 	}
 }

@@ -276,8 +276,7 @@ func cmdDoctor(args []string) int {
 	}
 	// The bundle always truncates (there is no --force gate here), so it takes the guarded
 	// open unconditionally — otherwise a planted link's TARGET would be truncated and
-	// re-moded. openGuardedOutput is the whole chain: the name refusal, the O_NOFOLLOW /
-	// O_NONBLOCK open that closes the race it cannot, the handle check, and the re-tighten.
+	// re-moded.
 	f, err := openGuardedOutput(outPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox doctor: %v\n", err)

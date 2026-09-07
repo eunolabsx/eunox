@@ -18,11 +18,11 @@ import (
 // stdout there is no file to overwrite, so the flag is a no-op and an operator who believed
 // they had named an --output gets the manifest on stdout with nothing saying otherwise.
 //
-// The exit code alone proves nothing here — initFailExit is the command's one failure code,
-// a failed upstream fetch included — so this asserts on the message AND on the upstream never
-// being contacted, which is
-// the second half of the guard's placement (rejecting after the introspection would make the
-// operator wait out the whole probe to be told their flags were incoherent).
+// The exit code alone proves nothing here — initFailExit is the command's one failure code, a
+// failed upstream fetch included — so this asserts on the message AND on the upstream never
+// being contacted, which is the second half of the guard's placement (rejecting after the
+// introspection would make the operator wait out the whole probe to be told their flags were
+// incoherent).
 func TestCmdInit_ForceWithoutOutput(t *testing.T) {
 	var hits atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

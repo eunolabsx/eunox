@@ -93,7 +93,10 @@ func TestWriteGeneratedFile_RefusesClobberAndTightens(t *testing.T) {
 func TestCmdDoctor_NeverWritesThroughASymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "victim")
-	if err := os.WriteFile(target, []byte("victim contents"), 0o600); err != nil {
+	// 0644, NOT the 0600 the guard re-tightens to: a victim created at the chain's own target
+	// mode makes the re-mode assertion below unfalsifiable, which is how its sibling's copy of
+	// that assertion came to assert nothing.
+	if err := os.WriteFile(target, []byte("victim contents"), 0o644); err != nil { //nolint:gosec // test fixture: deliberately loose, so a re-mode is visible
 		t.Fatalf("write target: %v", err)
 	}
 	link := filepath.Join(dir, "bundle.txt")
@@ -102,14 +105,42 @@ func TestCmdDoctor_NeverWritesThroughASymlink(t *testing.T) {
 	}
 
 	// The bundle always truncates — there is no --force gate — so the refusal is unconditional.
-	code := cmdDoctor([]string{"--output", link, "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
+	var code int
+	errOut := captureStderr(t, func() {
+		code = cmdDoctor([]string{"--output", link, "--audit-log", filepath.Join(dir, "absent.jsonl"), "--audit-tail", "0"})
+	})
 	if code == 0 {
-		t.Error("writing the bundle to a symlinked destination must be refused")
+		t.Fatal("writing the bundle to a symlinked destination must be refused")
 	}
-	if b, _ := os.ReadFile(target); string(b) != "victim contents" {
+	// Asserted on the MESSAGE, not the exit code alone: doctor returns the same code from five
+	// sites, so a refusal that came from a flag error would pass a code-only check while the
+	// guard this test is named for did nothing.
+	if !strings.Contains(errOut, "symbolic link") {
+		t.Errorf("the refusal must name the symlink guard; got %q", errOut)
+	}
+	assertSymlinkTargetUntouched(t, target)
+}
+
+// assertSymlinkTargetUntouched is the pair of checks every planted-link test makes: the target
+// was neither written through nor re-moded by the chain's fd Chmod. One helper because the
+// property belongs to openGuardedOutput rather than to either caller, and a copy per caller is
+// what the extraction under test exists to stop.
+func assertSymlinkTargetUntouched(t *testing.T, target string) {
+	t.Helper()
+	b, err := os.ReadFile(target)
+	if err != nil {
+		// Read failure is its own finding, not evidence of a write-through: reporting it as one
+		// sends the next reader after the wrong guard.
+		t.Fatalf("reading the symlink target: %v", err)
+	}
+	if string(b) != "victim contents" {
 		t.Fatalf("the symlink target was written through: %q", b)
 	}
-	if fi, err := os.Stat(target); err == nil && fi.Mode().Perm() != 0o600 {
+	fi, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat of the symlink target: %v", err)
+	}
+	if fi.Mode().Perm() != 0o644 {
 		t.Errorf("the symlink target was re-moded to %v", fi.Mode().Perm())
 	}
 }
@@ -123,7 +154,7 @@ func TestCmdDoctor_NeverWritesThroughASymlink(t *testing.T) {
 func TestWriteGeneratedFile_NeverWritesThroughASymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "victim")
-	if err := os.WriteFile(target, []byte("victim contents"), 0o600); err != nil {
+	if err := os.WriteFile(target, []byte("victim contents"), 0o644); err != nil { //nolint:gosec // test fixture: deliberately loose, so a re-mode is visible
 		t.Fatalf("write target: %v", err)
 	}
 	link := filepath.Join(dir, "out.yaml")
@@ -135,10 +166,5 @@ func TestWriteGeneratedFile_NeverWritesThroughASymlink(t *testing.T) {
 	if err := writeGeneratedFile(link, "attacker", true); err == nil {
 		t.Fatal("a forced overwrite of a symlinked destination must be refused")
 	}
-	if b, _ := os.ReadFile(target); string(b) != "victim contents" {
-		t.Fatalf("the symlink target was written through: %q", b)
-	}
-	if fi, err := os.Stat(target); err == nil && fi.Mode().Perm() != 0o600 {
-		t.Errorf("the symlink target was re-moded to %v", fi.Mode().Perm())
-	}
+	assertSymlinkTargetUntouched(t, target)
 }
