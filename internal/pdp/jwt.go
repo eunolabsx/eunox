@@ -1223,6 +1223,15 @@ func (p *JWTPDP) withInnerVerdicts(ctx context.Context, sessionID string, r capa
 		// Never downgraded to a forward, so nothing to redact or harden.
 		return r
 	}
+	// The inner never DECIDED this request, so under a wiring where the two hold DIFFERENT kill
+	// managers its revocations have not been consulted — and this deny is downgradable by
+	// definition of the arm above, so an observing route forwards the call and the upstream runs
+	// it for a revoked session. Asked on this funnel rather than in each Decide* prologue: every
+	// short-circuit deny passes through here, while an ALLOW (the hot path, where decideInner
+	// consults the inner itself) pays nothing.
+	if deny := p.inner.CheckKill(ctx, sessionID); deny != nil {
+		return *deny
+	}
 	return p.inner.HardenRefusal(ctx, sessionID, r, target, args)
 }
 
@@ -1243,6 +1252,11 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// early-return paths that never reach decideInner (unlisted target, failing JWT
 	// conditions), so deferring to the inner would leave the kill unconsulted there.
 	// DecideSampling runs it unconditionally too, for its own reason (see there).
+	//
+	// This is the WRAPPER's manager; the inner's is consulted by decideInner on the paths that
+	// reach it, and by withInnerVerdicts on the short-circuit denies that do not. Asking the
+	// union here instead would put a third lookup on every ALLOW, which the shipped
+	// single-manager wiring pays for nothing.
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}

@@ -1,10 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// The two properties every refusal taken with NO policy decision behind it owes the signed
-// tape: it may not fabricate a target the sink derives from a method name, and — on an
-// established session — it may not record the absence that means "written before a revision
-// could be resolved".
+// The three properties every refusal taken with NO policy decision behind it owes the signed
+// tape: it may not fabricate a target the sink derives from a method name; on an established
+// session it may not record the absence that means "written before a revision could be
+// resolved"; and two DIFFERENT security events may not write the same record.
 
 package transport
 
@@ -134,6 +134,25 @@ func TestSmuggledEnforcedNotification_RecordDiffersFromMalformedParams(t *testin
 	if _, ok := malformedDetails[detailTransport]; ok {
 		t.Errorf("malformed-params record carries details.%s = %v; the two events must not share the marker",
 			detailTransport, malformedDetails[detailTransport])
+	}
+
+	// Both transports, or the property holds on whichever one the test happens to drive: the two
+	// legs construct their own gate, so a literal that omits `leg` on one is invisible to the
+	// other's coverage.
+	stdioRec := &fwdRecorder{}
+	gate := hostNotificationGate{
+		recorders: staticRecorder(stdioRec), subject: verifiedSession("sess"), established: true,
+		checkKill: noKill, leg: legStdioNotification,
+	}
+	if outcome := gate.admit(revisionContext(capability.DefaultRevision),
+		mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodToolsCall}); outcome != notificationRefused {
+		t.Fatalf("stdio gate outcome = %v, want the smuggled notification refused", outcome)
+	}
+	if len(stdioRec.records) != 1 {
+		t.Fatalf("stdio records = %+v, want one", stdioRec.records)
+	}
+	if got, _ := stdioRec.records[0].details[detailTransport].(string); got != string(legStdioNotification) {
+		t.Errorf("stdio record details.%s = %q, want %q", detailTransport, got, legStdioNotification)
 	}
 }
 

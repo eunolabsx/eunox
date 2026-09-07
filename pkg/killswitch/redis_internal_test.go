@@ -829,6 +829,24 @@ func TestDeclaredTopology_IsTheEscapeHatchTheRefusalNeeds(t *testing.T) {
 		r := NewRedis(hookedTestClient{Cmdable: inner}, WithShardFanOut(nil))
 		assert.ErrorIs(t, r.HealthStatus(), ErrUnknownTopology)
 	})
+
+	// RingFanOut over a NIL ring must reach that same arm rather than declaring an iterator that
+	// fails per pass: a per-pass failure is an ErrIncompleteEnumeration, which WithFailOpen softens
+	// into a permanent silent all-clear here, and a nil ring never heals. Asserted WITH fail-open
+	// set, since that is the posture the softening would have applied under.
+	t.Run("RingFanOut over a nil ring declares nothing", func(t *testing.T) {
+		t.Parallel()
+		inner, _ := newRawTestClient(t)
+		r := NewRedis(hookedTestClient{Cmdable: inner}, WithShardFanOut(RingFanOut(nil)), WithFailOpen(true))
+		assert.ErrorIs(t, r.HealthStatus(), ErrUnknownTopology)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		blocked, err := r.ShouldBlock(ctx, Subject{SessionID: "sess"})
+		assert.ErrorIs(t, err, ErrUnknownTopology,
+			"a wiring fault must be refused from every reader regardless of WithFailOpen")
+		assert.False(t, blocked)
+	})
 }
 
 // TestNilClient_OutranksTheTopologyRefusal: a nil client has no topology, so reporting the

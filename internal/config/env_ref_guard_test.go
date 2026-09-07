@@ -193,6 +193,17 @@ upstreams:
 	if _, err := LoadGatewayConfig(writeConfig(t, base(`  oauthResource: "https://$EUNOX_TEST_OAUTH_HOST/mcp"`))); err != nil {
 		t.Errorf("a resolved reference whose value contains placeholder-shaped text must load, got: %v", err)
 	}
+
+	// And the URL grammar's positional split applies here as it does to upstreamUrl: a bare "$"
+	// in the QUERY is ordinary content (OData's "?$select="), so guarding it would refuse a whole
+	// config to load over a variable named `select` the operator never wrote.
+	cfg, err := LoadGatewayConfig(writeConfig(t, base(`  oauthResource: "https://rs.example.com/mcp?$select=all"`)))
+	if err != nil {
+		t.Fatalf("a bare $ in an OAuth URI query must be literal, as it is in upstreamUrl: %v", err)
+	}
+	if got := cfg.Listen.OAuthResource; got != "https://rs.example.com/mcp?$select=all" {
+		t.Errorf("oauthResource = %q, want the query's bare $ left verbatim", got)
+	}
 }
 
 // The braced-only guard ignores the "$$" escape exactly as the full one does, so an operator
@@ -460,14 +471,17 @@ func TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag(t *testing.T) {
 		guard envGrammar
 		path  string
 	}{
-		"upstreamUrl":        {upstreamURLEnvGrammar, "upstreams.upstreamUrl"},
-		"command":            {upstreamCommandEnvGrammar, "upstreams.command"},
-		"args":               {upstreamArgsEnvGrammar, "upstreams.args"},
-		"upstreamAuthHeader": {upstreamAuthHeaderEnvGrammar, "upstreams.upstreamAuthHeader"},
-		"allowedOrigins":     {allowedOriginsEnvGrammar, "listen.allowedOrigins"},
-		"authToken":          {listenAuthTokenEnvGrammar, "listen.authToken"},
-		"audit.log":          {auditLogEnvGrammar, "audit.log"},
-		"audit.keyPath":      {auditKeyPathEnvGrammar, "audit.keyPath"},
+		"upstreamUrl":               {upstreamURLEnvGrammar, "upstreams.upstreamUrl"},
+		"command":                   {upstreamCommandEnvGrammar, "upstreams.command"},
+		"args":                      {upstreamArgsEnvGrammar, "upstreams.args"},
+		"upstreamAuthHeader":        {upstreamAuthHeaderEnvGrammar, "upstreams.upstreamAuthHeader"},
+		"allowedOrigins":            {allowedOriginsEnvGrammar, "listen.allowedOrigins"},
+		"authToken":                 {listenAuthTokenEnvGrammar, "listen.authToken"},
+		"audit.log":                 {auditLogEnvGrammar, "audit.log"},
+		"audit.keyPath":             {auditKeyPathEnvGrammar, "audit.keyPath"},
+		"audit.pep":                 {auditPEPEnvGrammar, "audit.pep"},
+		"oauthResource":             {oauthResourceEnvGrammar, "listen.oauthResource"},
+		"oauthAuthorizationServers": {oauthAuthzServersEnvGrammar, "listen.oauthAuthorizationServers"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := declaredEnvGrammarAt(tc.path); got != tc.guard {
@@ -479,10 +493,15 @@ func TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag(t *testing.T) {
 	if upstreamURLEnvGrammar != envGrammarURL {
 		t.Errorf("upstreamUrl = %d, want the URL grammar", upstreamURLEnvGrammar)
 	}
+	// The published OAuth URIs are URLs too, so they take the same positional split: refusing a
+	// bare "$" in their query would fail a whole config to load over an OData-shaped URI.
+	if oauthResourceEnvGrammar != envGrammarURL || oauthAuthzServersEnvGrammar != envGrammarURL {
+		t.Errorf("oauth URIs = %d/%d, want the URL grammar", oauthResourceEnvGrammar, oauthAuthzServersEnvGrammar)
+	}
 	if upstreamCommandEnvGrammar != envGrammarBraced || upstreamArgsEnvGrammar != envGrammarBraced {
 		t.Errorf("command/args = %d/%d, want braced-only", upstreamCommandEnvGrammar, upstreamArgsEnvGrammar)
 	}
-	for _, g := range []envGrammar{upstreamAuthHeaderEnvGrammar, allowedOriginsEnvGrammar, listenAuthTokenEnvGrammar, auditLogEnvGrammar, auditKeyPathEnvGrammar} {
+	for _, g := range []envGrammar{upstreamAuthHeaderEnvGrammar, allowedOriginsEnvGrammar, listenAuthTokenEnvGrammar, auditLogEnvGrammar, auditKeyPathEnvGrammar, auditPEPEnvGrammar} {
 		if g != envGrammarFull {
 			t.Errorf("an undeclared field = %d, want the full default", g)
 		}

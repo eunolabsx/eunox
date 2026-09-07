@@ -188,7 +188,9 @@ func transportLegDetail(leg transportLeg) map[string]interface{} {
 	return map[string]interface{}{detailTransport: string(leg)}
 }
 
-// The kill-drop legs (recordKillDrop).
+// The notification/server-message legs. recordKillDrop names all of them; hostNotificationGate's
+// smuggled-enforced-method reject names the two notification ones, where the leg is what tells its
+// INVALID_REQUEST record from malformedDeny's.
 const (
 	legHTTPNotification          transportLeg = "http-notification"
 	legHTTPServerResponse        transportLeg = "http-server-response"

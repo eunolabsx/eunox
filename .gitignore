@@ -30,6 +30,10 @@ go.work.sum
 /govulncheck.json
 /summary.md
 
+# go test -json transcript (the Go CI test job tees it here for the artifact; a
+# contributor reproducing that command locally writes it at the repo root too)
+/test-results.json
+
 # Environment variables
 .env
 .env.local

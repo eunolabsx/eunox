@@ -143,7 +143,8 @@ func ClassifyTopology(client redis.Cmdable) (Topology, ShardFanOut) {
 // unchecked ForEachShard — so without this the escape hatch reintroduces exactly the fail-open the
 // check exists to close. See pkg/killswitch's RingFanOut.
 //
-// A NIL ring yields an iterator that always returns ErrIncompleteFanOut, never one that panics.
+// A NIL ring yields an iterator that always returns ErrIncompleteFanOut, never one that panics;
+// see killswitch.RingFanOut for why a DECLARING consumer is answered above this instead.
 //
 // How many servers a pass SHOULD have covered is deliberately not Ring.Len() ALONE, which counts
 // the LIVE shards — the same set ForEachShard visits, so comparing a pass against it would be a
@@ -164,13 +165,12 @@ func ClassifyTopology(client redis.Cmdable) (Topology, ShardFanOut) {
 //     dead" from "grown to 3". What IS caught is the failure this exists for: a shard that goes
 //     down while the ring is in service, at any size the wrapper has already seen.
 func WholeRingFanOut(ring *redis.Ring) ShardFanOut {
-	// A NIL ring gets an iterator that refuses rather than one that panics. ClassifyTopology never
-	// reaches this (IsNilClient answers first), but the exported form is the escape hatch a
-	// consumer behind a decorator declares with, and WithShardFanOut nil-checks only the FUNC —
-	// which is non-nil here — so `WithShardFanOut(RingFanOut(nil))` otherwise recreated one seam
-	// over exactly the shape ClassifyTopology's typed-nil guard exists to stop: `ring.Len()`
-	// dereferences nil on the kill switch's reconcile goroutine, which is process death instead of
-	// the refusal every other nil in these packages produces.
+	// ClassifyTopology never reaches this (IsNilClient answers first); a caller who built the
+	// iterator directly would otherwise dereference nil in ring.Len() on whichever goroutine runs
+	// the pass — for the kill switch, its reconcile loop. A consumer DECLARING one to a backend is
+	// answered a layer up instead (killswitch.RingFanOut hands back no iterator at all, so the
+	// topology stays undeclared and latches), because a refusal reported per pass is softened by
+	// that backend's fail-open posture and a nil ring never heals.
 	if ring == nil {
 		return func(context.Context, func(ctx context.Context, node *redis.Client) error) error {
 			return fmt.Errorf("%w: the fan-out was built over a nil *redis.Ring, so it can enumerate nothing", ErrIncompleteFanOut)

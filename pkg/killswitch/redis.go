@@ -421,10 +421,16 @@ func WithSingleNodeKeyspace() RedisOption {
 //
 // Passing the ring itself to NewRedis needs none of this: it is classified, and wrapped, there.
 //
-// A NIL ring yields an iterator that always reports ErrIncompleteEnumeration, so a fan-out
-// declared over one surfaces as this backend's own refresh failure rather than as a nil
-// dereference on the reconcile goroutine.
+// A NIL ring yields NO iterator, so WithShardFanOut declares nothing and the backend latches
+// ErrUnknownTopology — fail-closed regardless of WithFailOpen, which is the disposition every
+// never-healing wiring fault in this package takes. Handing back an always-erroring iterator
+// instead would route it through ErrIncompleteEnumeration, the one error here that honours
+// WithFailOpen because a down shard comes back; a nil ring does not, so under fail-open it would
+// have served a permanent silent all-clear on the emergency stop.
 func RingFanOut(ring *redis.Ring) ShardFanOut {
+	if ring == nil {
+		return nil
+	}
 	return ShardFanOut(redisutil.WholeRingFanOut(ring))
 }
 

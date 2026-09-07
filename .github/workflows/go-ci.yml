@@ -84,26 +84,37 @@ jobs:
           go-version: "1.27.1"
           cache-dependency-path: go.sum
 
-      # `-json`, teed to an artifact. Plain `go test` output interleaves under parallel
-      # package load, so a package that fails once in several runs is reported with no test
-      # name at all -- and a CI flake at that rate is equally anonymous, leaving a re-run as
-      # the only way to learn what broke. `go test -json` tags every event with its package
-      # and test (the go command runs test2json per package, so nothing interleaves), which
-      # makes the next occurrence attributable from the artifact rather than from a
-      # reproduction nobody has.
+      # `-json`, teed to an artifact: plain `go test` output interleaves under parallel package
+      # load, so a package that fails once in several runs is reported with no test name at all
+      # — as anonymous in CI as it was locally, leaving a re-run as the only way to learn what
+      # broke. Every event in this stream carries its package and test.
       #
-      # The console keeps a readable rendering: jq replays the stream's output events, minus
-      # the per-test RUN/PAUSE/CONT/PASS lines `-json` forces on (it implies verbose), so this
-      # step still reads as a list of package results with the failures spelled out. The
-      # unfiltered stream is in the artifact. pipefail so the pipeline reports `go test`'s
-      # status rather than jq's, and `-j` because .Output already ends in its own newline.
+      # The console keeps the pre-`-json` rendering: build/vet diagnostics (which arrive as
+      # `build-output`, NOT `output` — filtering on `output` alone prints `[build failed]` with no
+      # message) plus the package-level result lines. Per-test chatter, which `-json` forces on,
+      # goes to the artifact and to the failure report below. pipefail so the pipeline reports
+      # `go test`'s status, and `-j` because .Output already ends in its newline.
       - name: Run tests with race detector
         run: |
           set -o pipefail
           go test -json -race -count=1 -coverprofile=coverage.out -covermode=atomic ./... \
             | tee test-results.json \
-            | jq -j --unbuffered 'select(.Action=="output") | .Output
-                | select(test("^(=== (RUN|PAUSE|CONT|NAME)|( *)--- PASS:)") | not)'
+            | jq -j --unbuffered 'select(.Action=="build-output" or (.Action=="output" and .Test==null)) | .Output'
+
+      # The point of the whole change: name every failing test and print its output, which
+      # interleaved plain output could not attribute. Correlating output to a test needs the
+      # verdict, which arrives after it, so this slurps the finished stream rather than streaming.
+      - name: Report failing tests
+        if: failure()
+        run: |
+          jq -rs '
+            . as $ev
+            | ($ev | map(select(.Action=="fail" and .Test != null) | {pkg: .Package, test: .Test})) as $failed
+            | $failed[]
+            | . as $f
+            | ["", "=== FAIL: \($f.pkg) \($f.test)"]
+              + ($ev | map(select(.Action=="output" and .Package==$f.pkg and .Test==$f.test) | .Output | rtrimstr("\n")))
+            | .[]' test-results.json
 
       # always(): the run this exists for is the FAILING one.
       - name: Upload test results (JSON)

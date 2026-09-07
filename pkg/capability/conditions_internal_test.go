@@ -420,6 +420,15 @@ func TestArgumentSchemaUnmarshalJSON_ReplacesRatherThanMerges(t *testing.T) {
 		s.Properties != nil || s.Minimum != nil || s.Maximum != nil {
 		t.Errorf("the second document declares only a type, but the decoded schema kept %+v", s)
 	}
+
+	// null is the exception the reset must not swallow: this package's convention is that a null
+	// leaves the destination alone, so the reset sits below that check rather than above it.
+	if err := s.UnmarshalJSON([]byte("null")); err != nil {
+		t.Fatalf("null decode: %v", err)
+	}
+	if s.Type.IsZero() {
+		t.Error("a null decode wiped the schema; null is a no-op in this package (see Constraint.UnmarshalJSON)")
+	}
 }
 
 // Neither strict decoder may reject what a lenient decode would have bound: every real

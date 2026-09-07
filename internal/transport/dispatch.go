@@ -677,7 +677,9 @@ type hostNotificationGate struct {
 	// TestSessionLeg_RevocationIsLookedUpAtMostOncePerPost counts it rather than leaving the
 	// claim to the comment. Never nil: every gate below calls it unconditionally.
 	checkKill func() *capability.EnforceResponse
-	// leg names this transport's notification leg in a kill-drop record.
+	// leg names this transport's notification leg in the records this gate writes — the kill
+	// drop, and the smuggled-enforced-method reject, where it is the only thing separating the
+	// record from malformedDeny's.
 	leg transportLeg
 }
 

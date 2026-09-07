@@ -320,10 +320,15 @@ type GatewayConfig struct {
 		// OAuthResource is this resource server's URI (RFC 9728), published in the
 		// protected-resource metadata and WWW-Authenticate challenges. Never derived from
 		// the request Host header.
-		OAuthResource string `yaml:"oauthResource"`
+		//
+		// env:"url" for upstreamUrl's reason: these are URLs, so a bare "$" in the query or
+		// fragment is ordinary content (an OData "?$select=") rather than a reference, while the
+		// authority has no legitimate one. Untagged, the unset-reference guard read "?$select="
+		// as a variable named `select` and refused the whole config at load.
+		OAuthResource string `yaml:"oauthResource" env:"url"`
 		// OAuthAuthorizationServers lists the authorization server URIs published in the
 		// protected-resource metadata document. Defaults to --jwt-issuer when unset.
-		OAuthAuthorizationServers []string `yaml:"oauthAuthorizationServers"`
+		OAuthAuthorizationServers []string `yaml:"oauthAuthorizationServers" env:"url"`
 		// AllowedOrigins extends the built-in Origin allowlist used by the DNS-rebinding
 		// guard. List full origins, e.g. "https://app.example.com". HTTP transport only.
 		AllowedOrigins []string `yaml:"allowedOrigins"`

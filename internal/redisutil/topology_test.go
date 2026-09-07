@@ -207,11 +207,10 @@ func TestRingFanOut_RefusesAPassOverNoServers(t *testing.T) {
 }
 
 // TestWholeRingFanOut_RefusesANilRing covers the seam ClassifyTopology's typed-nil guard does not
-// reach: the EXPORTED wrapper, which a consumer whose ring sits behind a decorator declares with.
-// A nil ring there built a non-nil closure whose first ring.Len() was a nil dereference on the
-// kill switch's reconcile goroutine — process death rather than the fail-closed refusal every
-// other nil in these packages produces, and invisible to WithShardFanOut, which nil-checks the
-// func alone.
+// reach: the EXPORTED wrapper, whose first ring.Len() over a nil ring is a dereference on
+// whichever goroutine runs the pass (for the kill switch, its reconcile loop). The iterator
+// refuses instead; a consumer DECLARING one to a backend is refused a layer up, where the
+// disposition can be the latched, fail-open-proof one (see killswitch.RingFanOut).
 func TestWholeRingFanOut_RefusesANilRing(t *testing.T) {
 	t.Parallel()
 	fanOut := WholeRingFanOut(nil)

@@ -103,10 +103,12 @@ func run(args []string) int {
 		// An explicit help request is a successful query: usage to stdout, exit 0.
 		printUsage(os.Stdout)
 	default:
-		// 2, the binary-wide USAGE code, not 1: every subcommand reserves 1 for a finding in
-		// its own domain (validate's drift, audit-verify's failed tape, doctor's unloadable
-		// config), so a typo'd `eunox valdiate m.yaml` exiting 1 reads to a script written
-		// against `validate`'s documented contract as "drift findings present".
+		// 2, the code the subcommands use for a usage error, rather than 1 — which each of them
+		// gives a MEANING OF ITS OWN (validate's drift, audit-verify's failed tape, doctor's
+		// unloadable config, proxy's "did not serve"). A typo'd `eunox valdiate m.yaml` exiting 1
+		// therefore reads to a script gating on `validate`'s documented contract as "drift
+		// findings present"; 2 borrows no command's domain code. (`kill` documents its own
+		// deviation: it returns 1 for a usage error too.)
 		fmt.Fprintf(os.Stderr, "eunox: unknown subcommand %q\n\nRun 'eunox --help' for usage.\n", args[1])
 		return 2
 	}
