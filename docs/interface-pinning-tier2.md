@@ -87,9 +87,17 @@ Tier-2 closes the two gaps `descriptionHash` leaves:
   drift=tier2` line. Dropping entries instead would silently *un-pin* tools, and evicting
   the oldest would let an upstream choose which pin to evict. No real catalog approaches
   it: an upstream rotating 100k names within one session is itself the anomaly.
-- **Findings are logged.** Each finding emits one structured stderr line
+- **Findings are logged, once each.** Each finding emits one structured stderr line
   (`[eunox] ERROR drift=tier2 tool="..." — ...`), matching the shape `internal/drift`
-  emits for FM-1..FM-6 so an operator greps interface findings uniformly.
+  emits for FM-1..FM-6 so an operator greps interface findings uniformly. A break is
+  reported on the transition, like a removal: the pin is sticky, so a host that polls
+  `tools/list` keeps re-advertising the changed surface, and re-diffing it against the
+  retained baseline would emit the same line once per poll per changed tool for the rest
+  of the session. The cost is that a *second*, distinct rewrite of an already-reported tool
+  logs nothing — the tool is denied and hidden either way. What is deduped is the finding
+  this comparison emitted, not the fact that the tool is broken: a tool denied earlier by
+  untrustworthy bytes (which logs no line of its own) still reports once when its surface is
+  later seen to have changed.
 
 ## Scope: per session, not per process
 

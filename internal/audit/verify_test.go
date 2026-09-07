@@ -3022,3 +3022,90 @@ func TestVerifyLog_SuppressedUnsignedSummarySurvivesScanAbort(t *testing.T) {
 		t.Errorf("the elided-unsigned summary must be printed even when the scan aborts; output:\n%s", out.String())
 	}
 }
+
+// TestTailReadShrank_OneInterpretationForThreeReads pins the condition all three tail reads
+// share. The read-only caller (interpretAuditTail) fails closed on it with dedicated tests;
+// the ACTIVE log's two reads accepted it — buf = buf[:n] — so a file externally truncated
+// between Stat and ReadAt (a rotation daemon racing a restart; the audit lock excludes other
+// eunox writers, not external tools) was processed as authoritative: the chain could resume
+// from a record no longer on disk, later read as a tamper-shaped CHAIN BREAK, or a
+// shrunk-to-empty log could silently rewind to a rotated sibling.
+func TestTailReadShrank_OneInterpretationForThreeReads(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		n, bufLen  int
+		readErr    error
+		wantShrank bool
+	}{
+		{"whole read", 64, 64, nil, false},
+		{"whole read at EOF", 64, 64, io.EOF, false},
+		{"short read with EOF: the file was truncated", 20, 64, io.EOF, true},
+		{"shrunk to empty", 0, 64, io.EOF, true},
+		// Not a shrink: a short read whose error is not EOF is the transient I/O fault the
+		// callers already refuse on their own, ahead of this check.
+		{"short read, other error", 20, 64, errors.New("EIO"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tailReadShrank(tc.n, tc.bufLen, tc.readErr); got != tc.wantShrank {
+				t.Fatalf("tailReadShrank = %v, want %v", got, tc.wantShrank)
+			}
+			err := refuseShrunkTailRead(tc.n, tc.bufLen, 4096, tc.readErr)
+			if !tc.wantShrank {
+				if err != nil {
+					t.Fatalf("refuseShrunkTailRead = %v, want nil (a whole read is not a shrink)", err)
+				}
+				return
+			}
+			// errAuditTailProbe, not errAuditFileShrunk: this is the ACTIVE log's disposition,
+			// the sentinel recoverPartialTail already routes to a fail-closed Open.
+			if !errors.Is(err, errAuditTailProbe) {
+				t.Fatalf("refuseShrunkTailRead = %v, want it to wrap errAuditTailProbe", err)
+			}
+		})
+	}
+}
+
+// TestTailLineFromWindow_ShrinkBetweenStatAndReadFailsClosed drives a REAL shrink through the
+// re-anchoring read: the geometry is the clipping test's (a window starting inside r2, whose
+// leading boundary is therefore outside the bytes in hand), and the file is then truncated on
+// disk under the still-open handle — what an external rotation daemon does. The re-read comes
+// back short with io.EOF, which this path used to slice and interpret: the record it extracted
+// from a stale prefix would then be the one the chain resumes from, and audit-verify reads a
+// chain resumed from a record no longer on disk as a tamper-shaped CHAIN BREAK.
+//
+// The initial probe's read shares the one guard (refuseShrunkTailRead), pinned directly above
+// — its own Stat and ReadAt sit inside one function, with no seam to shrink the file between.
+func TestTailLineFromWindow_ShrinkBetweenStatAndReadFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	r1 := `{"seq":1,"decision":"allow"}`
+	r2 := `{"seq":2,"decision":"allow"}`
+	orphan := `{"seq":3,"decision":"allo` // no trailing newline: a partial write
+	content := r1 + "\n" + r2 + "\n" + orphan
+	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_RDWR, 0o600) //nolint:gosec // G304: test-controlled path
+	if err != nil {
+		t.Fatalf("open O_RDWR: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	winSize := int64(len(orphan) + len(r2)/2)
+	start := int64(len(content)) - winSize
+	newSize := int64(len(r1) + 1 + len(r2) + 1)
+	window := []byte(content[start:newSize])
+	reStart := tailWindowStart(newSize, winSize)
+	if reStart >= start {
+		t.Fatalf("test setup: re-anchor offset %d must move below the window start %d, or no re-read happens", reStart, start)
+	}
+	// Shrink under the handle, leaving one byte at the re-anchor offset so the read comes back
+	// SHORT rather than empty — the shape the old `buf = buf[:n]` accepted as authoritative.
+	if err := os.Truncate(logPath, reStart+1); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	if _, err := tailLineFromWindow(f, window, start, newSize, winSize); !errors.Is(err, errAuditTailProbe) {
+		t.Fatalf("error = %v, want it to wrap errAuditTailProbe (a tail read the file shrank under is not a clean tail)", err)
+	}
+}

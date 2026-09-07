@@ -676,11 +676,16 @@ func (p *HTTPProxy) handleSessionPost(w http.ResponseWriter, r *http.Request, ro
 			// A plain function-scoped defer suffices: the notification branch always returns
 			// two lines below, so it fires effectively immediately.
 			defer sess.releaseNotifySlot()
-			// Re-arm before the forward: this runs against the entry deadline, so a slow
-			// upstream can leave it past by 202-write time and drop a connection for a
-			// notification that was in fact delivered.
-			rearmWriteDeadline(w, p.upstreamTimeMs)
 			sess.forwardNotification(ctx, msg)
+			// Re-armed AFTER the forward, matching the request arm: the entry deadline is
+			// measured from handler entry, and the forward is bounded independently
+			// (notifyPostTimeout on the remote arm, not at all on the local one), so a forward
+			// taking about the window leaves the deadline already past at 202-write time and
+			// drops the connection for a notification that was in fact delivered. Arming ahead
+			// of the forward could not prevent that — the forward spends the window it arms.
+			// Budget 0 for the same reason the request arm passes 0: what remains is the
+			// client-facing flush, not upstream work.
+			rearmWriteDeadline(w, 0)
 		}
 		w.WriteHeader(http.StatusAccepted)
 		return

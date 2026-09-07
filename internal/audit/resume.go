@@ -52,16 +52,15 @@ func interpretAuditTail(buf []byte, n int, readErr error, size, start int64) (st
 	// daemon racing a restart, or a stale NFS size cache. Reporting this as ("", nil)
 	// would let the caller start a fresh chain and leave an unmarked gap, so return a
 	// distinguishable error and let Open write an in-band marker.
-	// A short read with io.EOF (n < len(buf), zero included) is a shrink: buf was sized
-	// to exactly the bytes Stat reported, so fewer means truncation between Stat and
-	// ReadAt. Processing buf[:n] would validate a stale or fragmentary record as the
-	// tail and mask the shrink.
+	// Processing buf[:n] would validate a stale or fragmentary record as the tail and mask
+	// the shrink; see tailReadShrank for the condition, which the active log's two reads
+	// interpret the same way under their own sentinel.
 	//
 	// One branch, not two: an n == 0 arm ahead of this one was a strict subset of it
 	// (the caller guarantees len(buf) >= 1, so 0 < len(buf) always holds) differing
 	// only in the wording of an error nothing branches on — two exits to keep in step
 	// for one condition.
-	if n < len(buf) && errors.Is(readErr, io.EOF) {
+	if tailReadShrank(n, len(buf), readErr) {
 		return "", fmt.Errorf("audit tail read: file shrank from %d bytes (read %d of %d tail bytes) between stat and read: %w", size, n, len(buf), errAuditFileShrunk)
 	}
 	line, bounded := lastCompleteLineFromTail(buf[:n])
@@ -353,6 +352,13 @@ func truncatePartialTailWindowed(f *os.File, winSize int64) (truncated int64, la
 		// next append.
 		return 0, "", fmt.Errorf("%w: read: %v", errAuditTailProbe, err)
 	}
+	// The shrink interpretAuditTail refuses, on the ACTIVE log: processing buf[:n] would treat
+	// a stale or fragmentary record as the authoritative tail, so the chain would resume from a
+	// record no longer on disk (read later as a tamper-shaped CHAIN BREAK), or a shrunk-to-empty
+	// log would silently rewind to a rotated sibling.
+	if shrunk := refuseShrunkTailRead(n, len(buf), size, err); shrunk != nil {
+		return 0, "", shrunk
+	}
 	buf = buf[:n]
 	if len(buf) == 0 || buf[len(buf)-1] == '\n' {
 		// The tail ends at a record boundary: nothing to recover. buf is already the
@@ -397,6 +403,29 @@ func truncatePartialTailWindowed(f *os.File, winSize int64) (truncated int64, la
 		return 0, "", err
 	}
 	return size - newSize, line, nil
+}
+
+// tailReadShrank reports the one condition all three tail reads interpret identically: the
+// buffer was sized to exactly the bytes Stat reported, so fewer bytes back paired with io.EOF
+// means the file was truncated between the two syscalls (a rotation daemon racing a restart —
+// the audit lock excludes other eunox writers, not external tools).
+//
+// A predicate rather than a refusal because the DISPOSITION differs by caller and the
+// interpretation must not: a read-only caller reports errAuditFileShrunk, while the active
+// log's probe reports errAuditTailProbe. Sharing only the condition is what kept the third
+// site from quietly accepting what the first two fail closed on.
+func tailReadShrank(n, bufLen int, readErr error) bool {
+	return n < bufLen && errors.Is(readErr, io.EOF)
+}
+
+// refuseShrunkTailRead is the ACTIVE log's disposition for that condition: errAuditTailProbe,
+// which recoverPartialTail already routes to a fail-closed Open. nil when the read was whole.
+func refuseShrunkTailRead(n, bufLen int, size int64, readErr error) error {
+	if !tailReadShrank(n, bufLen, readErr) {
+		return nil
+	}
+	return fmt.Errorf("%w: read: file shrank from %d bytes (read %d of %d tail bytes) between stat and read",
+		errAuditTailProbe, size, n, bufLen)
 }
 
 // tailWindowStart returns the offset a size-byte log's trailing win-byte scan window
@@ -448,6 +477,12 @@ func tailLineFromWindow(f *os.File, window []byte, start, size, winSize int64) (
 		// Same stance as the probe failure above: on a non-empty log a read we cannot
 		// complete must not be reported as a clean tail.
 		return "", fmt.Errorf("%w: read: %v", errAuditTailProbe, err)
+	}
+	// A shrink between the caller's Stat and THIS read: the re-anchor runs after the truncation,
+	// so size is post-truncation, and the file can still move under it. Same refusal as the
+	// probe's, for the same reason.
+	if shrunk := refuseShrunkTailRead(n, len(buf), size, err); shrunk != nil {
+		return "", shrunk
 	}
 	line, _ = lastCompleteLineFromTail(buf[:n])
 	// Unreachable today — the re-read window is a superset of one already proven non-blank —

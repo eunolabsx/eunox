@@ -103,6 +103,15 @@ type UpstreamRoute struct {
 // sharedUpstreamTransport lazily builds (once) and returns this route's shared
 // *http.Transport for its remote-HTTP upstream. upstreamTimeMs is constant for the
 // proxy's lifetime, so a single build is correct.
+//
+// Residual, stated rather than closed: a Routes map may legitimately be shared by two
+// proxies (the per-route bind check went with the per-route state it protected), and the
+// FIRST caller's value binds ResponseHeaderTimeout for both — including a proxy running
+// unbounded inheriting the other's bound. Narrow by construction, since that field is only
+// the backstop: every foreground call stays bounded by its own per-request deadline, which
+// is each proxy's own. Refusing a later disagreement would need an error this signature
+// does not carry, and building a second transport would silently drop the pooling this
+// exists for, so the assumption a shared Routes map makes is an agreed upstreamTimeMs.
 func (r *UpstreamRoute) sharedUpstreamTransport(upstreamTimeMs int) *http.Transport {
 	r.upstreamTransportOnce.Do(func() {
 		r.upstreamTransport.Store(buildUpstreamTransport(r.upstreamTLSSkipVerify, upstreamTimeMs))

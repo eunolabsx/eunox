@@ -122,6 +122,18 @@ type sessionSurface struct {
 	// vanished tool doesn't log on every later listing; dropped from the set when
 	// seen again, so a second disappearance reports.
 	reportedGone map[string]struct{}
+	// reportedChanged is the same discipline for the noisier finding: a break is STICKY and a
+	// removed tool's baseline is RETAINED, so a host that polls tools/list keeps re-advertising
+	// the changed surface and every later listing re-diffed it against the same baseline —
+	// one ERROR line per poll per changed tool for the rest of the session. Never cleared,
+	// unlike reportedGone: a disappearance is a repeatable transition, a break is not.
+	//
+	// Its own set rather than reading `broken`: that map answers "is this denied", which is
+	// also true for a tool MarkBroken/BreakAll broke, and NEITHER of those emits a line — so
+	// reusing it would leave the operator with no Tier-2 line at all for a tool first broken
+	// by ambiguous bytes and later seen with a genuinely changed surface. Bounded by
+	// construction, being a subset of the capped hashes map (only a BASELINED tool can change).
+	reportedChanged map[string]struct{}
 }
 
 // markBroken sticky-breaks name, or — at the cap — breaks the WHOLE session instead of growing
@@ -211,6 +223,14 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 				s.overflowed = true
 				changes = append(changes, SurfaceChange{Tool: t.Name, Kind: SurfaceOverflow})
 			}
+			// Reported on the TRANSITION, like a removal (see reportedChanged). markBroken's
+			// return value cannot answer this — it reports overflow, not novelty. The cost is
+			// that a SECOND, distinct rewrite of an already-reported tool does not log; the
+			// tool is denied and hidden either way, so nothing about the session changes.
+			if _, already := s.reportedChanged[t.Name]; already {
+				continue
+			}
+			s.reportedChanged[t.Name] = struct{}{}
 			changes = append(changes, SurfaceChange{
 				Tool: t.Name, Kind: SurfaceChanged, Baseline: baseline, Observed: t.Hash,
 			})
@@ -289,6 +309,9 @@ func (b *SurfaceBaseline) session(sessionID string) *sessionSurface {
 	}
 	if s.reportedGone == nil {
 		s.reportedGone = make(map[string]struct{})
+	}
+	if s.reportedChanged == nil {
+		s.reportedChanged = make(map[string]struct{})
 	}
 	return s
 }

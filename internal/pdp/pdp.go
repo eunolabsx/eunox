@@ -1742,7 +1742,10 @@ func (p *ManifestPDP) withForwardObligationsFor(ctx context.Context, r capabilit
 // WHICH selection it is filling from: HardenRefusal passes its hardenSelection's, where the
 // two selections sit side by side and the widening is documented.
 func (p *ManifestPDP) withForwardObligations(ctx context.Context, r capability.EnforceResponse, target EnforceTarget, naming namingSelector) capability.EnforceResponse {
-	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 || !enforcement.SkipQuota(ctx) {
+	// willForwardDeny(ctx, nil), not SkipQuota(ctx) spelled out: the wrapper is the ONE
+	// spelling of "this deny is really a forward" so call sites cannot drift, and it already
+	// defines the no-constraint case as exactly this one — no constraint was selected here.
+	if r.Decision == capability.DecisionAllow || len(r.Obligations) > 0 || !willForwardDeny(ctx, nil) {
 		return r
 	}
 	dirs := naming()
@@ -3892,16 +3895,6 @@ func JWTClaimsPtr(ctx context.Context) *JWTClaims {
 // choose it could choose not to share one.
 func TaskAnchor(claims *JWTClaims) (string, bool) {
 	return capability.ResolveTaskVar(capability.TaskVarID, claims.flatMap())
-}
-
-// agentIDFromContext returns the agent_id from any JWT claims stored in ctx,
-// or "" when no JWT claims are present.  Used by kill-switch callers to
-// thread the agent dimension into ShouldBlock.
-func agentIDFromContext(ctx context.Context) string {
-	if c, ok := jwtClaimsFromContext(ctx); ok {
-		return c.AgentID
-	}
-	return ""
 }
 
 // killSubjectFromContext builds the identity a kill check is asked about, from the request's

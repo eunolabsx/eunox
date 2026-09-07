@@ -368,8 +368,13 @@ func (e *Engine) checkEffectCeiling(ec evalCtx, eff *capability.ResolvedEffect, 
 	details := eff.AuditDetails()
 	details["ceiling_exceeded"] = reasons
 	if len(carriedLabels) > 0 {
-		// Stamped into the escalation's details (not the allow-only top-level carried_labels
-		// field) since an escalation is the one refusal a human is expected to act on.
+		// The audit RECORD's top-level carried_labels is written only by RecordAllow, and an
+		// escalation is recorded through the deny recorder, so the details map is the only
+		// place these reach the tape — which is where they belong anyway, since an escalation
+		// is the one refusal a human is expected to act on and "which provenance produced
+		// this" is the first thing they ask. Distinct from EnforceResponse.CarriedLabels, the
+		// in-process decision artifact this response also carries on an escalation (see
+		// CeilingVerdictFor): that field is for a composing layer, not the record.
 		details["carried_labels"] = carriedLabels
 	}
 	if e.effectCeiling.MaxEffectClass != "" {

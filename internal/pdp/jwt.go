@@ -1233,10 +1233,10 @@ func (p *JWTPDP) withInnerVerdicts(ctx context.Context, sessionID string, r capa
 // of the same target, BOTH must pass — achieved by evaluating JWT conditions here
 // then delegating to the inner PDP, so neither side can waive the other's.
 func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTarget, args map[string]interface{}, sourceIP string) capability.EnforceResponse {
-	// Unconditional (not skipped when the inner shares the kill manager, as
-	// DecideSampling can be): Decide has early-return paths that never reach
-	// decideInner (unlisted target, failing JWT conditions), so deferring to the
-	// inner would leave the kill unconsulted there.
+	// Unconditional (never skipped when the inner shares the kill manager): Decide has
+	// early-return paths that never reach decideInner (unlisted target, failing JWT
+	// conditions), so deferring to the inner would leave the kill unconsulted there.
+	// DecideSampling runs it unconditionally too, for its own reason (see there).
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}
