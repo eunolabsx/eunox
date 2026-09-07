@@ -492,7 +492,7 @@ type rolledUpRecorder struct {
 //
 // Into a map this wrapper OWNS, never the caller's: a details map reaching a recorder may be one
 // the record is supposed to describe rather than one built for it (the engine's own denial.Details
-// now travels here directly when there is nothing to fold in — see foldDecisionDetail), and writing
+// now travels here directly when there is nothing to fold in — see mergeAuditDetails), and writing
 // two proxy annotations into that would corrupt what the tape says the engine decided.
 func (r rolledUpRecorder) RecordDeny(ctx context.Context, sessionID, identifier, method, denialCode, condType string, details map[string]interface{}, observe bool) {
 	details = stampRefusalRollup(mergeAuditDetails(details, nil), r.suppressed)

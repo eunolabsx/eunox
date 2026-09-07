@@ -5955,9 +5955,19 @@ func TestJWTPDP_CheckAudience_GatesSessionCreation(t *testing.T) {
 	if deny := anyAud.CheckAudience(ctx); deny != nil {
 		t.Fatalf("CheckAudience with AllowAnyAudience must permit, got %+v", deny.Denial)
 	}
-	// Missing claims under a set pin → fail closed (deny).
-	if deny := routeWrapper(validator, "svc-a").CheckAudience(context.Background()); deny == nil {
+	// Missing claims under a set pin → fail closed, and named for what it IS. Nothing was
+	// validated, so there is no audience to have mismatched: reporting the mismatch its three
+	// sibling decision methods report as ErrCodeNoJWTClaims would put an authentication failure
+	// on the signed tape as a tenancy one.
+	noClaims := routeWrapper(validator, "svc-a").CheckAudience(context.Background())
+	if noClaims == nil || noClaims.Denial == nil {
 		t.Fatal("CheckAudience must fail closed when no claims are in context")
+	}
+	if noClaims.Denial.Code != capability.ErrCodeNoJWTClaims {
+		t.Fatalf("CheckAudience with no claims must deny %s, got %s", capability.ErrCodeNoJWTClaims, noClaims.Denial.Code)
+	}
+	if !noClaims.Denial.BlockOverride {
+		t.Fatal("an authentication boundary must resist an --audit route's downgrade, as the audience pin does")
 	}
 }
 
