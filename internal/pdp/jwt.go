@@ -1005,16 +1005,22 @@ func (p *JWTPDP) memoizeRefusal(cacheKey string, err error, signatureVerified bo
 // (or the kill store errors, fail closed). The */list handlers call it before
 // contacting the upstream so a killed session cannot enumerate the catalog.
 //
-// With no kill switch of its own it delegates to the wrapped PDP rather than answering
-// "not killed": a wrapper built with Inner set but KillSwitch nil is a legitimate library
-// wiring (the shipped binary passes both), and answering nil there silently disarmed the
-// emergency stop on every path that routes through this method — the */list handlers,
-// initialize, and the notification gate.
+// The two managers are UNIONED, exactly as every decision path unions them (Decide runs its own
+// killCheck and then decideInner, which runs the inner's; so do DecideSampling and
+// DecideResourceCancel). This method gates precisely the paths that do NOT flow through Decide —
+// the */list handlers, the session-creating initialize, and the notification gate — so consulting
+// only one of two DIFFERENT managers left a session revoked in the other one enumerating the
+// catalog while every call it made was denied. A wrapper built with Inner set but KillSwitch nil
+// is a legitimate library wiring (the shipped binary passes one manager everywhere), which is why
+// neither side may be the only one asked.
 func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	if p.ks == nil && p.inner != nil {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
+		return deny
+	}
+	if p.inner != nil {
 		return p.inner.CheckKill(ctx, sessionID)
 	}
-	return killCheck(ctx, p.clock, p.ks, sessionID)
+	return nil
 }
 
 // CheckAudience enforces this route's audience pin at session creation, before any

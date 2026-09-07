@@ -492,7 +492,7 @@ Drop the `protocolVersion` pin from an upstream config while pointing it at a
 startup failure names the remedy:
 
 ```
-[eunox] Fatal: upstream open at 2025-11-25 (initialize): upstream initialize
+eunox proxy: upstream open at 2025-11-25 (initialize): upstream initialize
 rejected: method not found: initialize (code -32601); this upstream does not
 implement the opener for 2025-11-25. If it speaks 2026-07-28, pin
 `protocolVersion: "2026-07-28"` on this upstream — eunox opens with the pinned

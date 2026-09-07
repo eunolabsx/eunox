@@ -251,6 +251,8 @@ var (
 	auditLogEnvGrammar           = declaredEnvGrammarAt("audit.log")
 	auditKeyPathEnvGrammar       = declaredEnvGrammarAt("audit.keyPath")
 	auditPEPEnvGrammar           = declaredEnvGrammarAt("audit.pep")
+	oauthResourceEnvGrammar      = declaredEnvGrammarAt("listen.oauthResource")
+	oauthAuthzServersEnvGrammar  = declaredEnvGrammarAt("listen.oauthAuthorizationServers")
 )
 
 // gatewayNumericKeys are the gateway-config scalar fields holding a bare number that yaml.v3
@@ -507,6 +509,9 @@ type gatewayConfigRawFields struct {
 	auditKeyPath   string
 	auditPEP       string
 	allowedOrigins []string
+	// The two URIs served verbatim in the RFC 9728 metadata document.
+	oauthResource     string
+	oauthAuthzServers []string
 	// upstreamAuth/upstreamURL/command/args are per-upstream, indexed like cfg.Upstreams.
 	upstreamAuth []string
 	upstreamURL  []string
@@ -518,15 +523,17 @@ type gatewayConfigRawFields struct {
 // gatewayConfigRawFields.
 func captureGatewayConfigRawFields(cfg *GatewayConfig) gatewayConfigRawFields {
 	f := gatewayConfigRawFields{
-		authToken:      cfg.Listen.AuthToken,
-		auditLog:       cfg.Audit.Log,
-		auditKeyPath:   cfg.Audit.KeyPath,
-		auditPEP:       cfg.Audit.PEP,
-		allowedOrigins: slices.Clone(cfg.Listen.AllowedOrigins),
-		upstreamAuth:   make([]string, len(cfg.Upstreams)),
-		upstreamURL:    make([]string, len(cfg.Upstreams)),
-		command:        make([]string, len(cfg.Upstreams)),
-		args:           make([][]string, len(cfg.Upstreams)),
+		authToken:         cfg.Listen.AuthToken,
+		auditLog:          cfg.Audit.Log,
+		auditKeyPath:      cfg.Audit.KeyPath,
+		auditPEP:          cfg.Audit.PEP,
+		allowedOrigins:    slices.Clone(cfg.Listen.AllowedOrigins),
+		oauthResource:     cfg.Listen.OAuthResource,
+		oauthAuthzServers: slices.Clone(cfg.Listen.OAuthAuthorizationServers),
+		upstreamAuth:      make([]string, len(cfg.Upstreams)),
+		upstreamURL:       make([]string, len(cfg.Upstreams)),
+		command:           make([]string, len(cfg.Upstreams)),
+		args:              make([][]string, len(cfg.Upstreams)),
 	}
 	for i := range cfg.Upstreams {
 		f.upstreamAuth[i] = cfg.Upstreams[i].UpstreamAuthHeader
@@ -661,19 +668,10 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 		return nil, err
 	}
 
-	// Fail closed on an unset env reference in the audit log or key path: an unset
-	// ${VAR}/$VAR survives as literal text, silently misdirecting the tamper-evident tape or
-	// its HMAC key. Mirrors the upstreamUrl leg, detecting on the RAW text.
-	for _, f := range []struct {
-		label, raw string
-		grammar    envGrammar
-	}{
-		{"audit.log", rawFields.auditLog, auditLogEnvGrammar},
-		{"audit.keyPath", rawFields.auditKeyPath, auditKeyPathEnvGrammar},
-	} {
-		if err := failOnUnsetEnvRefUnder(path, f.label, f.raw, f.grammar); err != nil {
-			return nil, err
-		}
+	// The audit-path and OAuth-URI legs of the same rule, kept together in one helper as the
+	// argv/Origin legs above are.
+	if err := failOnUnsetAuditAndOAuthEnvRefs(path, &rawFields); err != nil {
+		return nil, err
 	}
 
 	// audit.pep's fail-closed case is the SET-BUT-BLANK one, which the two fields above do
@@ -719,9 +717,16 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	return &cfg, nil
 }
 
-// ContainsEnvRef reports whether s still contains an unexpanded ${VAR}/$VAR reference. After
-// LoadGatewayConfig's expansion pass, a residual reference means the variable was unset;
-// callers that publish the value (e.g. OAuth authorization-server URIs) use this to fail closed.
+// ContainsEnvRef reports whether s contains ${VAR}/$VAR reference TEXT (the "$$" escape aside).
+// Callers that publish a value verbatim — the OAuth metadata URIs — use it to fail closed on
+// text no client should be served.
+//
+// On POST-expansion text it does NOT establish that a variable was unset, which is why the
+// loader's own guards scan the RAW text instead: "$$" collapses to a literal "$" during
+// expansion (so `pa$$word` becomes `pa$word`, which matches here as `$word`), and a SET
+// variable whose value contains "$NAME" survives expansion as apparent-reference text too. Both
+// misread as unset, in the refusing direction — a spurious refusal with a wrong diagnosis, never
+// a value published.
 func ContainsEnvRef(s string) bool {
 	return len(realEnvRefs(s)) > 0
 }
@@ -820,6 +825,38 @@ func failOnUnsetArgvAndOriginEnvRefs(path string, cfg *GatewayConfig, rawCommand
 	}
 	for i, rawOrigin := range rawAllowedOrigins {
 		if err := failOnUnsetEnvRefUnder(path, fmt.Sprintf("listen.allowedOrigins[%d]", i), rawOrigin, allowedOriginsEnvGrammar); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// failOnUnsetAuditAndOAuthEnvRefs fails closed on an unset environment reference in the audit
+// log or key path, or in either URI published in the RFC 9728 protected-resource document.
+//
+// The audit paths: an unset ${VAR}/$VAR survives as literal text, silently misdirecting the
+// tamper-evident tape or its HMAC key. The OAuth URIs are the upstreamUrl rule one step worse —
+// the reference survives expansion as literal text url.Parse accepts, and these two are then
+// SERVED to every client rather than dialed once. All four detect on the RAW text so the
+// diagnosis names the operator's unset variable; the publish-time backstop in the proxy wiring
+// sees expanded text alone, where a "$" out of a SET variable's value, or a collapsed "$$"
+// escape, is indistinguishable from a reference (see ContainsEnvRef).
+func failOnUnsetAuditAndOAuthEnvRefs(path string, raw *gatewayConfigRawFields) error {
+	for _, f := range []struct {
+		label, raw string
+		grammar    envGrammar
+	}{
+		{"audit.log", raw.auditLog, auditLogEnvGrammar},
+		{"audit.keyPath", raw.auditKeyPath, auditKeyPathEnvGrammar},
+		{"listen.oauthResource", raw.oauthResource, oauthResourceEnvGrammar},
+	} {
+		if err := failOnUnsetEnvRefUnder(path, f.label, f.raw, f.grammar); err != nil {
+			return err
+		}
+	}
+	for i, server := range raw.oauthAuthzServers {
+		label := fmt.Sprintf("listen.oauthAuthorizationServers[%d]", i)
+		if err := failOnUnsetEnvRefUnder(path, label, server, oauthAuthzServersEnvGrammar); err != nil {
 			return err
 		}
 	}

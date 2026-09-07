@@ -1810,7 +1810,10 @@ func (p *HTTPProxy) routeHostServerResponse(ctx context.Context, route *Upstream
 //
 // Nil-limiter tolerance is refusalRecorders.forCategory's — it hands back the bare recorder
 // when the wiring holds no record table — so a proxy built without one (tests) records
-// unbounded rather than not at all.
+// unbounded rather than not at all. The pre-session sibling takes the OPPOSITE disposition
+// deliberately, so neither reads as the other's precedent: admitRefusalWrite panics on a
+// sink-plus-nil-limiter proxy, because NewHTTPProxyGateway always builds that limiter and a
+// missing one there is a construction bug rather than a leg a test may legitimately omit.
 func (p *HTTPProxy) revisionRefusalRecorder(route *UpstreamRoute) auditRecorder {
 	// p is nil only on a bare-struct-literal session (as tests build) reaching this through
 	// httpSession.revisionRefusalRecorder; the limits below already tolerate one, and a refusal

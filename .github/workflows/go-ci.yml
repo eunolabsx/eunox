@@ -84,8 +84,35 @@ jobs:
           go-version: "1.27.1"
           cache-dependency-path: go.sum
 
+      # `-json`, teed to an artifact. Plain `go test` output interleaves under parallel
+      # package load, so a package that fails once in several runs is reported with no test
+      # name at all -- and a CI flake at that rate is equally anonymous, leaving a re-run as
+      # the only way to learn what broke. `go test -json` tags every event with its package
+      # and test (the go command runs test2json per package, so nothing interleaves), which
+      # makes the next occurrence attributable from the artifact rather than from a
+      # reproduction nobody has.
+      #
+      # The console keeps a readable rendering: jq replays the stream's output events, minus
+      # the per-test RUN/PAUSE/CONT/PASS lines `-json` forces on (it implies verbose), so this
+      # step still reads as a list of package results with the failures spelled out. The
+      # unfiltered stream is in the artifact. pipefail so the pipeline reports `go test`'s
+      # status rather than jq's, and `-j` because .Output already ends in its own newline.
       - name: Run tests with race detector
-        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+        run: |
+          set -o pipefail
+          go test -json -race -count=1 -coverprofile=coverage.out -covermode=atomic ./... \
+            | tee test-results.json \
+            | jq -j --unbuffered 'select(.Action=="output") | .Output
+                | select(test("^(=== (RUN|PAUSE|CONT|NAME)|( *)--- PASS:)") | not)'
+
+      # always(): the run this exists for is the FAILING one.
+      - name: Upload test results (JSON)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-results-json
+          path: test-results.json
+          retention-days: 30
 
       - name: Check coverage threshold (80% for pkg/, internal/ and cmd/)
         run: |

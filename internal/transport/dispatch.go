@@ -740,7 +740,15 @@ func (g hostNotificationGate) admit(ctx context.Context, msg mcp.RPCMsg) notific
 			// resolves a target type, so naming one here fabricates a policy target for a
 			// message the PDP never saw.
 			identifier, method := auditIdentity(msg)
-			rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, method, codeInvalidRequest, "", g.subject.auditDetails(nil), false)
+			// The LEG is what separates this record from dispatchParams.malformedDeny's. Both write
+			// INVALID_REQUEST for the same enforced method under the identifier auditIdentity blanks,
+			// and on an established session neither carries a claimed id — so the two were
+			// byte-identical on the tape and an operator could not tell a peer routing tools/call past
+			// the PDP by dropping the id (this arm, an enforcement-confusion probe) from a peer sending
+			// unparseable params (ordinary malformation). Naming the notification leg says which
+			// framing it arrived in, the whole difference between the two events.
+			rec.RecordDeny(ctx, g.subject.auditSessionID(), identifier, method, codeInvalidRequest, "",
+				g.subject.auditDetails(transportLegDetail(g.leg)), false)
 		}
 		return notificationRefused
 	}

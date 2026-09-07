@@ -420,6 +420,10 @@ func WithSingleNodeKeyspace() RedisOption {
 // fail-open ErrIncompleteEnumeration exists to close.
 //
 // Passing the ring itself to NewRedis needs none of this: it is classified, and wrapped, there.
+//
+// A NIL ring yields an iterator that always reports ErrIncompleteEnumeration, so a fan-out
+// declared over one surfaces as this backend's own refresh failure rather than as a nil
+// dereference on the reconcile goroutine.
 func RingFanOut(ring *redis.Ring) ShardFanOut {
 	return ShardFanOut(redisutil.WholeRingFanOut(ring))
 }

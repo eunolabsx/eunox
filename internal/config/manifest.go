@@ -688,7 +688,23 @@ func MergeManifests(ms []*LocalManifest) (*LocalManifest, error) {
 		// skips validateLocalManifest.
 		return &LocalManifest{}, nil
 	}
+	// A nil element has no fields to merge or validate and every arm below dereferences it, so
+	// it is refused rather than left to panic: this is an exported seam and its whole
+	// programmatic-input class (see validateQuotaBucketsDistinct's typed-nil note) is the reason
+	// the guards below exist.
+	for i, m := range ms {
+		if m == nil {
+			return nil, fmt.Errorf("manifest %d of %d is nil", i+1, len(ms))
+		}
+	}
 	if len(ms) == 1 {
+		// Validated like the merged union below rather than returned as-is: LoadManifest already
+		// validates what it produces, but this seam also takes manifests a caller built in
+		// process, and skipping here made the fail-closed property the guards inside
+		// validateLocalManifest are written for hold for 0 and N inputs and silently not for 1.
+		if err := validateLocalManifest(ms[0]); err != nil {
+			return nil, fmt.Errorf("manifest %q is invalid: %w", ms[0].Name, err)
+		}
 		return ms[0], nil
 	}
 	if err := detectMergeConflicts(ms); err != nil {

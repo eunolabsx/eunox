@@ -6391,6 +6391,60 @@ func TestJWTPDP_CheckKill_FallsBackToTheInnerPDP(t *testing.T) {
 	}
 }
 
+// TestJWTPDP_CheckKill_UnionsBothManagers pins the both-set leg of the same library seam. Every
+// decision path unions the wrapper's manager with the inner PDP's (Decide runs its own check then
+// delegates); CheckKill gates the paths that do NOT flow through Decide, so consulting the
+// wrapper's alone let a session revoked only in the inner's manager enumerate the catalog through
+// */list while every call it made was denied.
+func TestJWTPDP_CheckKill_UnionsBothManagers(t *testing.T) {
+	cases := []struct {
+		name        string
+		killInOuter bool
+		killInInner bool
+	}{
+		{name: "live in both"},
+		{name: "revoked in the wrapper's manager", killInOuter: true},
+		{name: "revoked in the inner PDP's manager", killInInner: true},
+		{name: "revoked in both", killInOuter: true, killInInner: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			// Two DIFFERENT managers: the shipped binary passes one everywhere, so a shared
+			// manager cannot tell the union apart from consulting either half.
+			outerKS, innerKS := killswitch.NewInMemory(), killswitch.NewInMemory()
+			if tc.killInOuter {
+				if err := outerKS.KillSession(ctx, "sess-1"); err != nil {
+					t.Fatalf("KillSession(outer): %v", err)
+				}
+			}
+			if tc.killInInner {
+				if err := innerKS.KillSession(ctx, "sess-1"); err != nil {
+					t.Fatalf("KillSession(inner): %v", err)
+				}
+			}
+			wrapper := NewJWTPDP(JWTPDPOptions{
+				Inner:            NewManifestPDP(nil, enforcement.New(), innerKS),
+				KillSwitch:       outerKS,
+				AllowAnyAudience: true,
+				Issuer:           "https://issuer.example",
+			})
+
+			deny := wrapper.CheckKill(ctx, "sess-1")
+			wantDeny := tc.killInOuter || tc.killInInner
+			if (deny != nil) != wantDeny {
+				t.Fatalf("CheckKill(sess-1) = %+v, want deny = %v", deny, wantDeny)
+			}
+			if wantDeny && (deny.Denial == nil || deny.Denial.Code != capability.ErrCodeKillSwitch) {
+				t.Errorf("denial = %+v, want %s", deny.Denial, capability.ErrCodeKillSwitch)
+			}
+			if deny := wrapper.CheckKill(ctx, "sess-other"); deny != nil {
+				t.Errorf("a session neither manager revoked must not be refused; got %+v", deny)
+			}
+		})
+	}
+}
+
 // decodeJWTClaimsFromToken is the test-side composition of the two steps ValidateToken now
 // performs separately: the payload segment is decoded once there and threaded to both
 // readers, so the whole-token form no longer exists in production.

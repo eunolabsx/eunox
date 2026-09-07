@@ -402,6 +402,26 @@ func TestArgumentSchemaUnmarshalJSON_RejectsUnknownField(t *testing.T) {
 	}
 }
 
+// TestArgumentSchemaUnmarshalJSON_ReplacesRatherThanMerges is EffectContract's reset rule for
+// the third decoder that writes through its receiver. encoding/json MERGES into a non-zero
+// destination, so a reused value kept constraints the second document never declared — a schema
+// that rejects an argument no reviewer of that document could see it constrain.
+func TestArgumentSchemaUnmarshalJSON_ReplacesRatherThanMerges(t *testing.T) {
+	var s ArgumentSchema
+	first := `{"type":"object","pattern":"^/tmp/","minLength":2,"enum":["a"],"required":["path"],` +
+		`"properties":{"path":{"type":"string"}},"minimum":1,"maximum":8}`
+	if err := s.UnmarshalJSON([]byte(first)); err != nil {
+		t.Fatalf("first decode: %v", err)
+	}
+	if err := s.UnmarshalJSON([]byte(`{"type":"string"}`)); err != nil {
+		t.Fatalf("second decode: %v", err)
+	}
+	if s.Pattern != "" || s.MinLength != nil || s.Enum != nil || s.Required != nil ||
+		s.Properties != nil || s.Minimum != nil || s.Maximum != nil {
+		t.Errorf("the second document declares only a type, but the decoded schema kept %+v", s)
+	}
+}
+
 // Neither strict decoder may reject what a lenient decode would have bound: every real
 // field, in any case spelling, and a full round-trip of what MarshalJSON emits.
 func TestStrictDecoders_AcceptEveryRealField(t *testing.T) {

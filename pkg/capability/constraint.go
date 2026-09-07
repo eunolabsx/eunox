@@ -395,6 +395,12 @@ func (a ArgumentSchema) MarshalJSON() ([]byte, error) { //nolint:gocritic // hug
 // boundary). enum literals already get UseNumber treatment (see Constraint.UnmarshalJSON);
 // this extends the same exact-decode guarantee to the bounds.
 func (a *ArgumentSchema) UnmarshalJSON(data []byte) error {
+	// Reset first, for EffectContract.UnmarshalJSON's reason: encoding/json MERGES into a
+	// non-zero destination, and this decoder writes THROUGH the receiver (the alias below aliases
+	// it), so a reused value kept a stale pattern, enum, required set or properties map the new
+	// document does not declare — a schema that constrains arguments no reviewer of the second
+	// document could see. In-tree paths decode into fresh values; this is the exported seam.
+	*a = ArgumentSchema{}
 	// alias drops ArgumentSchema's method set (so this does not recurse) while keeping
 	// its fields; the outer json.Number minimum/maximum shadow the alias's *float64 ones
 	// (shallower field wins), capturing the raw literals before any float64 coercion.

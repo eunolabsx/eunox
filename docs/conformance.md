@@ -356,7 +356,7 @@ the revision a leg was opened at comes back `-32601`, eunox says so and names th
 remedy:
 
 ```
-[eunox] Fatal: upstream open at 2025-11-25 (initialize): upstream initialize rejected:
+eunox proxy: upstream open at 2025-11-25 (initialize): upstream initialize rejected:
 method not found: initialize (code -32601); this upstream does not implement the opener
 for 2025-11-25. If it speaks 2026-07-28, pin `protocolVersion: "2026-07-28"` on this
 upstream — eunox opens with the pinned revision's opener and does not probe for one
