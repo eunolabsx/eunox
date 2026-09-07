@@ -3,7 +3,7 @@ module github.com/eunolabs/eunox
 go 1.27.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.22.0
