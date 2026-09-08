@@ -1005,16 +1005,22 @@ func (p *JWTPDP) memoizeRefusal(cacheKey string, err error, signatureVerified bo
 // (or the kill store errors, fail closed). The */list handlers call it before
 // contacting the upstream so a killed session cannot enumerate the catalog.
 //
-// With no kill switch of its own it delegates to the wrapped PDP rather than answering
-// "not killed": a wrapper built with Inner set but KillSwitch nil is a legitimate library
-// wiring (the shipped binary passes both), and answering nil there silently disarmed the
-// emergency stop on every path that routes through this method — the */list handlers,
-// initialize, and the notification gate.
+// The two managers are UNIONED, exactly as every decision path unions them (Decide runs its own
+// killCheck and then decideInner, which runs the inner's; so do DecideSampling and
+// DecideResourceCancel). This method gates precisely the paths that do NOT flow through Decide —
+// the */list handlers, the session-creating initialize, and the notification gate — so consulting
+// only one of two DIFFERENT managers left a session revoked in the other one enumerating the
+// catalog while every call it made was denied. A wrapper built with Inner set but KillSwitch nil
+// is a legitimate library wiring (the shipped binary passes one manager everywhere), which is why
+// neither side may be the only one asked.
 func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse {
-	if p.ks == nil && p.inner != nil {
+	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
+		return deny
+	}
+	if p.inner != nil {
 		return p.inner.CheckKill(ctx, sessionID)
 	}
-	return killCheck(ctx, p.clock, p.ks, sessionID)
+	return nil
 }
 
 // CheckAudience enforces this route's audience pin at session creation, before any
@@ -1217,6 +1223,15 @@ func (p *JWTPDP) withInnerVerdicts(ctx context.Context, sessionID string, r capa
 		// Never downgraded to a forward, so nothing to redact or harden.
 		return r
 	}
+	// The inner never DECIDED this request, so under a wiring where the two hold DIFFERENT kill
+	// managers its revocations have not been consulted — and this deny is downgradable by
+	// definition of the arm above, so an observing route forwards the call and the upstream runs
+	// it for a revoked session. Asked on this funnel rather than in each Decide* prologue: every
+	// short-circuit deny passes through here, while an ALLOW (the hot path, where decideInner
+	// consults the inner itself) pays nothing.
+	if deny := p.inner.CheckKill(ctx, sessionID); deny != nil {
+		return *deny
+	}
 	return p.inner.HardenRefusal(ctx, sessionID, r, target, args)
 }
 
@@ -1237,6 +1252,11 @@ func (p *JWTPDP) Decide(ctx context.Context, sessionID string, target EnforceTar
 	// early-return paths that never reach decideInner (unlisted target, failing JWT
 	// conditions), so deferring to the inner would leave the kill unconsulted there.
 	// DecideSampling runs it unconditionally too, for its own reason (see there).
+	//
+	// This is the WRAPPER's manager; the inner's is consulted by decideInner on the paths that
+	// reach it, and by withInnerVerdicts on the short-circuit denies that do not. Asking the
+	// union here instead would put a third lookup on every ALLOW, which the shipped
+	// single-manager wiring pays for nothing.
 	if deny := killCheck(ctx, p.clock, p.ks, sessionID); deny != nil {
 		return *deny
 	}

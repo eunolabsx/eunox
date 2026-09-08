@@ -206,6 +206,23 @@ func TestRingFanOut_RefusesAPassOverNoServers(t *testing.T) {
 		"a pass that visited no servers at all must not report a complete enumeration of the keyspace")
 }
 
+// TestWholeRingFanOut_RefusesANilRing covers the seam ClassifyTopology's typed-nil guard does not
+// reach: the EXPORTED wrapper, whose first ring.Len() over a nil ring is a dereference on
+// whichever goroutine runs the pass (for the kill switch, its reconcile loop). The iterator
+// refuses instead; a consumer DECLARING one to a backend is refused a layer up, where the
+// disposition can be the latched, fail-open-proof one (see killswitch.RingFanOut).
+func TestWholeRingFanOut_RefusesANilRing(t *testing.T) {
+	t.Parallel()
+	fanOut := WholeRingFanOut(nil)
+	require.NotNil(t, fanOut, "the contract is an iterator that refuses, not an absent one a caller then calls")
+	err := fanOut(context.Background(), func(context.Context, *redis.Client) error {
+		t.Fatal("a fan-out over a nil ring must visit nothing")
+		return nil
+	})
+	assert.ErrorIs(t, err, ErrIncompleteFanOut,
+		"a fan-out that can enumerate nothing must report an incomplete pass, not panic and not succeed")
+}
+
 // TestRingFanOut_RefusesAShortPassOnAGrownRing is the direction the first version of this check
 // did not consider, and it is the fail-OPEN one.
 //

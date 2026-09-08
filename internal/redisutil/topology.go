@@ -143,6 +143,9 @@ func ClassifyTopology(client redis.Cmdable) (Topology, ShardFanOut) {
 // unchecked ForEachShard — so without this the escape hatch reintroduces exactly the fail-open the
 // check exists to close. See pkg/killswitch's RingFanOut.
 //
+// A NIL ring yields an iterator that always returns ErrIncompleteFanOut, never one that panics;
+// see killswitch.RingFanOut for why a DECLARING consumer is answered above this instead.
+//
 // How many servers a pass SHOULD have covered is deliberately not Ring.Len() ALONE, which counts
 // the LIVE shards — the same set ForEachShard visits, so comparing a pass against it would be a
 // tautology that agrees with itself while a shard is down. It is the ring's CONFIGURED count,
@@ -162,6 +165,17 @@ func ClassifyTopology(client redis.Cmdable) (Topology, ShardFanOut) {
 //     dead" from "grown to 3". What IS caught is the failure this exists for: a shard that goes
 //     down while the ring is in service, at any size the wrapper has already seen.
 func WholeRingFanOut(ring *redis.Ring) ShardFanOut {
+	// ClassifyTopology never reaches this (IsNilClient answers first); a caller who built the
+	// iterator directly would otherwise dereference nil in ring.Len() on whichever goroutine runs
+	// the pass — for the kill switch, its reconcile loop. A consumer DECLARING one to a backend is
+	// answered a layer up instead (killswitch.RingFanOut hands back no iterator at all, so the
+	// topology stays undeclared and latches), because a refusal reported per pass is softened by
+	// that backend's fail-open posture and a nil ring never heals.
+	if ring == nil {
+		return func(context.Context, func(ctx context.Context, node *redis.Client) error) error {
+			return fmt.Errorf("%w: the fan-out was built over a nil *redis.Ring, so it can enumerate nothing", ErrIncompleteFanOut)
+		}
+	}
 	// highWater is the widest this ring has been observed. Atomic because nothing serializes two
 	// passes: the kill switch's reconcile holds its own mutex, but a Reset enumerating for
 	// deletion does not take it.

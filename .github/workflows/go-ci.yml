@@ -84,8 +84,46 @@ jobs:
           go-version: "1.27.1"
           cache-dependency-path: go.sum
 
+      # `-json`, teed to an artifact: plain `go test` output interleaves under parallel package
+      # load, so a package that fails once in several runs is reported with no test name at all
+      # — as anonymous in CI as it was locally, leaving a re-run as the only way to learn what
+      # broke. Every event in this stream carries its package and test.
+      #
+      # The console keeps the pre-`-json` rendering: build/vet diagnostics (which arrive as
+      # `build-output`, NOT `output` — filtering on `output` alone prints `[build failed]` with no
+      # message) plus the package-level result lines. Per-test chatter, which `-json` forces on,
+      # goes to the artifact and to the failure report below. pipefail so the pipeline reports
+      # `go test`'s status, and `-j` because .Output already ends in its newline.
       - name: Run tests with race detector
-        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+        run: |
+          set -o pipefail
+          go test -json -race -count=1 -coverprofile=coverage.out -covermode=atomic ./... \
+            | tee test-results.json \
+            | jq -j --unbuffered 'select(.Action=="build-output" or (.Action=="output" and .Test==null)) | .Output'
+
+      # The point of the whole change: name every failing test and print its output, which
+      # interleaved plain output could not attribute. Correlating output to a test needs the
+      # verdict, which arrives after it, so this slurps the finished stream rather than streaming.
+      - name: Report failing tests
+        if: failure()
+        run: |
+          jq -rs '
+            . as $ev
+            | ($ev | map(select(.Action=="fail" and .Test != null) | {pkg: .Package, test: .Test})) as $failed
+            | $failed[]
+            | . as $f
+            | ["", "=== FAIL: \($f.pkg) \($f.test)"]
+              + ($ev | map(select(.Action=="output" and .Package==$f.pkg and .Test==$f.test) | .Output | rtrimstr("\n")))
+            | .[]' test-results.json
+
+      # always(): the run this exists for is the FAILING one.
+      - name: Upload test results (JSON)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-results-json
+          path: test-results.json
+          retention-days: 30
 
       - name: Check coverage threshold (80% for pkg/, internal/ and cmd/)
         run: |

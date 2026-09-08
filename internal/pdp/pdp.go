@@ -73,6 +73,11 @@ type PolicyDecisionPoint interface {
 	// BEFORE contacting the upstream — the Decide* paths embed the same check, but
 	// */list does not flow through them, so without it a killed session could still
 	// enumerate the catalog. A PDP with no kill switch wired returns nil.
+	//
+	// A COMPOSING implementation must union its own manager with the wrapped PDP's, as its
+	// Decide* methods already do: this method gates the paths those do not cover, so
+	// consulting one of two managers leaves a session revoked in the other enumerating the
+	// catalog while every call it makes is denied.
 	CheckKill(ctx context.Context, sessionID string) *capability.EnforceResponse
 
 	// CheckAudience returns a non-nil deny when the session's validated token does not

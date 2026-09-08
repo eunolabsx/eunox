@@ -103,8 +103,14 @@ func run(args []string) int {
 		// An explicit help request is a successful query: usage to stdout, exit 0.
 		printUsage(os.Stdout)
 	default:
+		// 2, the code the subcommands use for a usage error, rather than 1 — which each of them
+		// gives a MEANING OF ITS OWN (validate's drift, audit-verify's failed tape, doctor's
+		// unloadable config, proxy's "did not serve"). A typo'd `eunox valdiate m.yaml` exiting 1
+		// therefore reads to a script gating on `validate`'s documented contract as "drift
+		// findings present"; 2 borrows no command's domain code. (`kill` documents its own
+		// deviation: it returns 1 for a usage error too.)
 		fmt.Fprintf(os.Stderr, "eunox: unknown subcommand %q\n\nRun 'eunox --help' for usage.\n", args[1])
-		return 1
+		return 2
 	}
 	return 0
 }
@@ -414,11 +420,7 @@ func printWiretapBanners(w io.Writer) {
 func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConfig, error) {
 	switch {
 	case *f.audit:
-		cfg, err := buildAuditWiretapConfig(fs.Args(), *f.wiretapURL, *f.wiretapAuthHeader, *f.wiretapTLSSkipVerify, *f.wiretapProtocolVer)
-		if err != nil {
-			return nil, err
-		}
-		return cfg, nil
+		return buildAuditWiretapConfig(fs.Args(), *f.wiretapURL, *f.wiretapAuthHeader, *f.wiretapTLSSkipVerify, *f.wiretapProtocolVer)
 	case *f.configPath != "":
 		// The upstream command comes from the config in this mode; a trailing
 		// "-- <command>" would be silently dropped, so reject stray positionals rather
@@ -444,6 +446,12 @@ func resolveProxyConfig(fs *flag.FlagSet, f *proxyCLIFlags) (*config.GatewayConf
 // The return value is NAMED so the deferred audit-sink Close can fail the command: a Close
 // error means buffered records may not have reached disk, the failure an audit tool exists
 // to prevent.
+//
+// Every failure it prints is prefixed `eunox proxy: `, the spelling every sibling subcommand
+// uses. It used to split arbitrarily between that and `[eunox] Fatal: ` with no principle
+// dividing them, so a supervisor grepping for this command's refusals needed both — and the
+// `[eunox] ` family is the RUNTIME banner namespace (NOTICE/WARNING/SECURITY/AUDIT), which the
+// transports write; a subcommand's own exit reason is not one of those.
 func cmdProxy(args []string) (exitCode int) {
 	// ContinueOnError, like every sibling subcommand: ExitOnError would terminate the
 	// process inside Parse, reintroducing the untestable exit this function avoids.
@@ -533,7 +541,7 @@ func cmdProxy(args []string) (exitCode int) {
 		redisConfigured:      *f.redisAddr != "",
 		auditPEP:             *f.auditPEP,
 		controlTokenPath:     *f.controlTokenPath,
-		httpOnlyFlagsSet:     httpOnlyFlagsSetOnStdio(fs),
+		httpOnlyFlagsSet:     activeHTTPOnlyFlags(fs),
 	}
 
 	// Fail closed if any JWT flag was supplied without --jwks-uri, so a forgotten flag
@@ -542,7 +550,7 @@ func cmdProxy(args []string) (exitCode int) {
 	// (a Redis dial, minting an audit key/log), so a trivially-fixable flag error is
 	// reported before anything is touched.
 	if err := validateJWTFlagsRequireJWKS(pf); err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
 
@@ -550,7 +558,7 @@ func cmdProxy(args []string) (exitCode int) {
 	// the first side effect — these checks used to sit inside the serve functions, firing
 	// only after the Redis dial and audit key/log creation had already happened.
 	if err := validateTransportConditionalFlags(cfg.HostTransport(), pf); err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
 
@@ -560,18 +568,18 @@ func cmdProxy(args []string) (exitCode int) {
 	// effect on this transport at all should be reported as that, not critiqued for its
 	// combination with flags that equally cannot take effect.
 	if err := validateJWTFlagCombinations(pf); err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
 
 	// Fail closed if a Redis-only flag was set without --redis-addr, or an in-memory-only one
 	// WITH it, before any side effect runs — same reasoning as the JWT guard above.
 	if err := validateInMemoryFlagsRejectRedisAddr(fs, *f.redisAddr); err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
 	if err := validateRedisFlagsRequireRedisAddr(fs, *f.redisAddr); err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
 
@@ -599,7 +607,7 @@ func cmdProxy(args []string) (exitCode int) {
 	// the CLI flags so every route shares one tape.
 	sink, err := openConfiguredAuditSink(*f.auditLog, *f.auditKeyPath, *f.auditPEP, *f.auditRotateSize, *f.auditRetainRotated, flagWasSet(fs, "audit-retain"), cfg, f.requireAudit.required())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", err)
 		return 1
 	}
 	if sink != nil {
@@ -607,7 +615,7 @@ func cmdProxy(args []string) (exitCode int) {
 			// Registered last among the defers here, so it flushes after the kill switch
 			// has stopped.
 			if err := sink.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "[eunox] Fatal: audit sink close failed; the audit trail may be incomplete: %v\n", err)
+				fmt.Fprintf(os.Stderr, "eunox proxy: audit sink close failed; the audit trail may be incomplete: %v\n", err)
 				// Only ever UPGRADE from success; must not overwrite a more specific
 				// non-zero code (e.g. 2 for a usage error) the function already chose.
 				if exitCode == 0 {
@@ -671,7 +679,7 @@ func cmdProxy(args []string) (exitCode int) {
 		serveErr = errUnknownHostTransport(cfg.HostTransport())
 	}
 	if serveErr != nil {
-		fmt.Fprintf(os.Stderr, "[eunox] Fatal: %v\n", serveErr)
+		fmt.Fprintf(os.Stderr, "eunox proxy: %v\n", serveErr)
 		return 1
 	}
 	return 0
@@ -1129,10 +1137,14 @@ var httpOnlyProxyFlags = []string{
 	"trust-forwarded-for",
 }
 
-// httpOnlyFlagsSetOnStdio returns the "--"-prefixed names of every
-// httpOnlyProxyFlags flag the operator activated, for the transport-conditional
-// rejection guard.
-func httpOnlyFlagsSetOnStdio(fs *flag.FlagSet) []string {
+// activeHTTPOnlyFlags returns the "--"-prefixed names of every httpOnlyProxyFlags flag the
+// operator activated, for the transport-conditional rejection guard.
+//
+// It is computed on every invocation regardless of transport and says nothing about one: the
+// "…OnStdio" it used to be named for is validateTransportConditionalFlags' decision, made from
+// the resolved transport, and a name that pre-empts it invites the next reader to assume this
+// list is already narrowed.
+func activeHTTPOnlyFlags(fs *flag.FlagSet) []string {
 	return explicitlyActiveFlags(fs, httpOnlyProxyFlags)
 }
 
@@ -1169,7 +1181,7 @@ func validateTransportConditionalFlags(hostTransport string, pf proxyFlags) erro
 		if pf.oauthAuthzServer != "" {
 			return fmt.Errorf("--oauth-authorization-server requires transport: http (a stdio host has no HTTP listener)")
 		}
-		// Every other HTTP-only flag: httpOnlyFlagsSetOnStdio (precomputed into
+		// Every other HTTP-only flag: activeHTTPOnlyFlags (precomputed into
 		// pf.httpOnlyFlagsSet) is the single source of truth, so a future HTTP-only flag is
 		// covered automatically.
 		if len(pf.httpOnlyFlagsSet) > 0 {
@@ -1343,7 +1355,7 @@ type proxyFlags struct {
 	controlTokenPath     string // --control-token-path: where to write the /control/kill control token; HTTP only
 
 	// httpOnlyFlagsSet holds the "--"-prefixed names of every HTTP-only flag the operator
-	// activated, precomputed by httpOnlyFlagsSetOnStdio.
+	// activated, precomputed by activeHTTPOnlyFlags.
 	httpOnlyFlagsSet []string
 }
 
@@ -1477,8 +1489,14 @@ func validateOAuthURI(label, uri string, allowEmpty bool) error {
 	}
 	// url.Parse accepts "${VAR}" in a path or query position, so without this the
 	// literal text would be published verbatim in the metadata document.
+	//
+	// This sees the value as it will be PUBLISHED, which is the right input for "may this be
+	// served" and the wrong one for "was a variable unset": a "$" out of a set variable's value,
+	// or a collapsed "$$" escape, reads the same here (see config.ContainsEnvRef). The config
+	// loader diagnoses the unset case on the raw text; this refuses the text either way, so the
+	// message names what is wrong with the VALUE rather than asserting a cause it cannot know.
 	if config.ContainsEnvRef(uri) {
-		return fmt.Errorf("%s %q contains an unexpanded ${VAR}/$VAR reference (the environment variable is unset, so the literal text would be published in the OAuth metadata document); set the variable, or remove the reference", label, uri)
+		return fmt.Errorf("%s %q contains ${VAR}/$VAR reference text, which would be published verbatim in the OAuth metadata document (the variable is unset, or a set value/`$$` escape left a literal '$' where a reference is read); set the variable, or remove the '$'", label, uri)
 	}
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -2050,12 +2068,6 @@ func bindExposesAllInterfaces(bindHost string) bool {
 	return false
 }
 
-// refuseNonRegularOutput fails closed unless path is a regular file or genuinely absent;
-// see config.RefuseNonRegularPath for what the guard covers.
-func refuseNonRegularOutput(path string) error {
-	return config.RefuseNonRegularPath(path, "output file")
-}
-
 // openGuardedOutput opens path for a TRUNCATING write at mode 0600, refusing anything that is
 // not a regular file at each point the answer can still change: the name refusal cannot see a
 // substitution made after its Lstat, O_NOFOLLOW covers that window for a symlink but not for a
@@ -2075,7 +2087,9 @@ func refuseNonRegularOutput(path string) error {
 // "refused / could not open / could not re-tighten" are different operator problems. The file
 // is closed on every failure past the open, so a caller owns the handle only on success.
 func openGuardedOutput(path string) (*os.File, error) {
-	if err := refuseNonRegularOutput(path); err != nil {
+	// Fails closed unless path is a regular file or genuinely absent; see
+	// config.RefuseNonRegularPath for what this first stage covers.
+	if err := config.RefuseNonRegularPath(path, "output file"); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|config.OpenNoFollow|config.OpenNonBlock, 0o600) //nolint:gosec // G304: path is an operator-supplied output destination, and 0600 is the intended restrictive mode

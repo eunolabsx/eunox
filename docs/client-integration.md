@@ -814,7 +814,7 @@ eunox cannot **route** has no verdict to downgrade, so it is still refused — i
 | A method absent from the MCP revision the host negotiated | `UNROUTABLE_METHOD` | The revision's routing table holds no handler for it; forwarding it would be inventing a route, not observing one. |
 | A method this build dispatches under no revision | `UNROUTABLE_METHOD` | Same — the fail-closed default, unchanged since before revision scoping. Covers a method nobody has heard of and one the negotiated revision mandates that eunox has not implemented yet. |
 | A method sent in a framing its revision does not dispatch | `UNROUTABLE_METHOD` | A notification-only method sent as a request, or a locally-answered one sent as a notification. |
-| An *enforced* method sent in notification framing | `INVALID_REQUEST` | Forwarding it verbatim would bypass both the decision and the record. Refused separately, and it carries no marker. |
+| An *enforced* method sent in notification framing | `INVALID_REQUEST` | Forwarding it verbatim would bypass both the decision and the record. Refused separately, so it carries no `_eunox_unroutable` marker; it names its notification leg in `details.transport` (`http-notification` / `stdio-notification`), which is what tells it apart from the malformed-params refusal that records the same code. |
 | A protocol revision that cannot be established, or that disagrees with the context it arrived in | `UNSUPPORTED_PROTOCOL_VERSION` | There is no revision to route by; picking one would be a guess, and each way of guessing contradicts either the declaration or the leg eunox already opened. |
 
 The routing refusals — the three `UNROUTABLE_METHOD` rows above, and only

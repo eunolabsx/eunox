@@ -137,6 +137,75 @@ upstreams:
 	}
 }
 
+// The published OAuth metadata URIs are the same rule one step worse than upstreamUrl: an unset
+// reference survives expansion as literal text url.Parse accepts, and the value is then SERVED to
+// every client in the RFC 9728 document. The proxy's own publish-time check sees expanded text
+// alone, where a "$" out of a set variable's VALUE reads the same as an unset reference — so the
+// unset diagnosis is made here, on the raw text, like every other field's.
+func TestLoadGatewayConfig_RejectsUnsetEnvRefInOAuthMetadataURIs(t *testing.T) {
+	base := func(listen string) string {
+		return `
+schemaVersion: "0.1"
+transport: http
+listen:
+  bind: 127.0.0.1
+  port: 3000
+  authToken: static-token
+` + listen + `
+upstreams:
+  - name: fs
+    transport: stdio
+    command: /usr/bin/server
+    policy: ["fs.yaml"]
+`
+	}
+	cases := []struct {
+		name, listen, wantLabel, wantVar string
+	}{
+		{
+			name:      "oauthResource",
+			listen:    "  oauthResource: \"https://${EUNOX_TEST_NO_SUCH_RESOURCE}/mcp\"",
+			wantLabel: "listen.oauthResource", wantVar: "EUNOX_TEST_NO_SUCH_RESOURCE",
+		},
+		{
+			name:      "oauthAuthorizationServers",
+			listen:    "  oauthAuthorizationServers: [\"https://idp.example\", \"$EUNOX_TEST_NO_SUCH_IDP\"]",
+			wantLabel: "listen.oauthAuthorizationServers[1]", wantVar: "EUNOX_TEST_NO_SUCH_IDP",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadGatewayConfig(writeConfig(t, base(tc.listen)))
+			if err == nil {
+				t.Fatalf("expected a load error for an unset reference in %s", tc.wantLabel)
+			}
+			for _, want := range []string{tc.wantLabel, tc.wantVar, "unset"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to mention %q", err, want)
+				}
+			}
+		})
+	}
+
+	// A SET variable whose own value carries placeholder-shaped text must still load: the
+	// reference the operator wrote did resolve, and only the raw-text reading can tell.
+	t.Setenv("EUNOX_TEST_OAUTH_HOST", "rs.example.com/${TENANT}")
+	if _, err := LoadGatewayConfig(writeConfig(t, base(`  oauthResource: "https://$EUNOX_TEST_OAUTH_HOST/mcp"`))); err != nil {
+		t.Errorf("a resolved reference whose value contains placeholder-shaped text must load, got: %v", err)
+	}
+
+	// And the URL grammar's positional split applies here as it does to upstreamUrl: a bare "$"
+	// in the QUERY is ordinary content (OData's "?$select="), so guarding it would refuse a whole
+	// config to load over a variable named `select` the operator never wrote.
+	cfg, err := LoadGatewayConfig(writeConfig(t, base(`  oauthResource: "https://rs.example.com/mcp?$select=all"`)))
+	if err != nil {
+		t.Fatalf("a bare $ in an OAuth URI query must be literal, as it is in upstreamUrl: %v", err)
+	}
+	if got := cfg.Listen.OAuthResource; got != "https://rs.example.com/mcp?$select=all" {
+		t.Errorf("oauthResource = %q, want the query's bare $ left verbatim", got)
+	}
+}
+
 // The braced-only guard ignores the "$$" escape exactly as the full one does, so an operator
 // escaping a literal dollar is not told a variable is unset. The escape is deliberately NOT
 // part of what a grammar narrows: it is how a literal "${" is written at all, which a
@@ -402,14 +471,17 @@ func TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag(t *testing.T) {
 		guard envGrammar
 		path  string
 	}{
-		"upstreamUrl":        {upstreamURLEnvGrammar, "upstreams.upstreamUrl"},
-		"command":            {upstreamCommandEnvGrammar, "upstreams.command"},
-		"args":               {upstreamArgsEnvGrammar, "upstreams.args"},
-		"upstreamAuthHeader": {upstreamAuthHeaderEnvGrammar, "upstreams.upstreamAuthHeader"},
-		"allowedOrigins":     {allowedOriginsEnvGrammar, "listen.allowedOrigins"},
-		"authToken":          {listenAuthTokenEnvGrammar, "listen.authToken"},
-		"audit.log":          {auditLogEnvGrammar, "audit.log"},
-		"audit.keyPath":      {auditKeyPathEnvGrammar, "audit.keyPath"},
+		"upstreamUrl":               {upstreamURLEnvGrammar, "upstreams.upstreamUrl"},
+		"command":                   {upstreamCommandEnvGrammar, "upstreams.command"},
+		"args":                      {upstreamArgsEnvGrammar, "upstreams.args"},
+		"upstreamAuthHeader":        {upstreamAuthHeaderEnvGrammar, "upstreams.upstreamAuthHeader"},
+		"allowedOrigins":            {allowedOriginsEnvGrammar, "listen.allowedOrigins"},
+		"authToken":                 {listenAuthTokenEnvGrammar, "listen.authToken"},
+		"audit.log":                 {auditLogEnvGrammar, "audit.log"},
+		"audit.keyPath":             {auditKeyPathEnvGrammar, "audit.keyPath"},
+		"audit.pep":                 {auditPEPEnvGrammar, "audit.pep"},
+		"oauthResource":             {oauthResourceEnvGrammar, "listen.oauthResource"},
+		"oauthAuthorizationServers": {oauthAuthzServersEnvGrammar, "listen.oauthAuthorizationServers"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := declaredEnvGrammarAt(tc.path); got != tc.guard {
@@ -421,10 +493,15 @@ func TestDeclaredEnvGrammar_ReadsTheFieldsOwnTag(t *testing.T) {
 	if upstreamURLEnvGrammar != envGrammarURL {
 		t.Errorf("upstreamUrl = %d, want the URL grammar", upstreamURLEnvGrammar)
 	}
+	// The published OAuth URIs are URLs too, so they take the same positional split: refusing a
+	// bare "$" in their query would fail a whole config to load over an OData-shaped URI.
+	if oauthResourceEnvGrammar != envGrammarURL || oauthAuthzServersEnvGrammar != envGrammarURL {
+		t.Errorf("oauth URIs = %d/%d, want the URL grammar", oauthResourceEnvGrammar, oauthAuthzServersEnvGrammar)
+	}
 	if upstreamCommandEnvGrammar != envGrammarBraced || upstreamArgsEnvGrammar != envGrammarBraced {
 		t.Errorf("command/args = %d/%d, want braced-only", upstreamCommandEnvGrammar, upstreamArgsEnvGrammar)
 	}
-	for _, g := range []envGrammar{upstreamAuthHeaderEnvGrammar, allowedOriginsEnvGrammar, listenAuthTokenEnvGrammar, auditLogEnvGrammar, auditKeyPathEnvGrammar} {
+	for _, g := range []envGrammar{upstreamAuthHeaderEnvGrammar, allowedOriginsEnvGrammar, listenAuthTokenEnvGrammar, auditLogEnvGrammar, auditKeyPathEnvGrammar, auditPEPEnvGrammar} {
 		if g != envGrammarFull {
 			t.Errorf("an undeclared field = %d, want the full default", g)
 		}

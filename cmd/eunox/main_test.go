@@ -118,7 +118,9 @@ func TestRun_ExitCodes(t *testing.T) {
 		{"help word", []string{"eunox", "help"}, 0},
 		{"version", []string{"eunox", "version"}, 0},
 		{"version flag", []string{"eunox", "--version"}, 0},
-		{"unknown subcommand", []string{"eunox", "bogus"}, 1},
+		// 2 (usage), not 1: 1 is every subcommand's FINDINGS code, so a typo'd subcommand
+		// exiting 1 reads as "the command ran and found something" to a script gating on it.
+		{"unknown subcommand", []string{"eunox", "bogus"}, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

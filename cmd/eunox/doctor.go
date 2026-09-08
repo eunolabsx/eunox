@@ -209,6 +209,13 @@ the loader refused for misspelling them.
 Command-line args, paths, and audit metadata are shown verbatim — skim
 before sharing.
 
+Exit codes:
+  0  Bundle written and the config (if any) loaded.
+  1  The config would not load — doctor's one FINDING, so 'eunox doctor
+     --config X' is usable as a pre-flight gate. The bundle is STILL written:
+     a config that will not parse is the case it is most needed for.
+  2  Usage error, or the bundle could not be written (--output).
+
 Flags:
 `
 
@@ -551,16 +558,6 @@ func writeDoctorManifests(w io.Writer, cfg *config.GatewayConfig, cfgErr error) 
 	}
 }
 
-// doctorLoadAuditKeys reads the audit key file for the bundle's loadability line, kept
-// separate so the caller can distinguish "path never resolved" from "path resolved but
-// unloadable" rather than naming the wrong problem.
-func doctorLoadAuditKeys(resolvedKey string, resolveErr error) ([][]byte, error) {
-	if resolveErr != nil {
-		return nil, nil
-	}
-	return audit.LoadKeys(resolvedKey)
-}
-
 // writeDoctorAudit prints aggregated counts from the audit log, then the last `tail`
 // records with `details` scrubbed and the HMAC stripped — re-verifiable via
 // `eunox audit-verify` after sharing.
@@ -572,16 +569,18 @@ func writeDoctorAudit(w io.Writer, logPath, keyPath string, tail int) {
 		wf(w, "  log path:  %s\n", resolvedLog)
 	}
 
+	// A path that never resolved is a different operator problem from one that resolved and
+	// would not load, so the load runs only past the resolve rather than being asked to answer
+	// for both.
 	resolvedKey, keyErr := audit.ResolveKeyPath(keyPath)
-	switch keys, loadErr := doctorLoadAuditKeys(resolvedKey, keyErr); {
-	case keyErr != nil:
+	if keyErr != nil {
 		wf(w, "  key path:  (cannot resolve: %v)\n", keyErr)
-	case loadErr != nil:
+	} else if keys, loadErr := audit.LoadKeys(resolvedKey); loadErr != nil {
 		// LOADABILITY, not mere existence — a key file that exists but is unreadable,
 		// truncated, or not hex used to report "(present)" in exactly the deployment
 		// chasing UNKNOWN_KEY_ID. LoadKeys is read-only and mints nothing.
 		wf(w, "  key path:  %s (NOT loadable: %v)\n", resolvedKey, loadErr)
-	default:
+	} else {
 		wf(w, "  key path:  %s (present, %d key(s) loadable)\n", resolvedKey, len(keys))
 	}
 

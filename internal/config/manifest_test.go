@@ -1466,6 +1466,42 @@ func TestMergeManifests_EmptyInput(t *testing.T) {
 	}
 }
 
+// TestMergeManifests_SingleManifestIsValidated closes the seam's validation asymmetry: the
+// N>=2 arm re-validates the merged union while the one-element arm returned its input
+// untouched, so every guard validateLocalManifest applies held for 0 and N programmatic inputs
+// and silently not for 1. LoadManifest's output is already valid, so only a caller building a
+// manifest in process could reach it — the exact input class those guards are written for.
+func TestMergeManifests_SingleManifestIsValidated(t *testing.T) {
+	// Valid but for the semver 'version', which validateLocalManifest refuses.
+	bad := &LocalManifest{
+		SchemaVersion: "0.1", Name: "solo", Version: "1.0",
+		Capabilities: []capability.Constraint{{Target: "tool:read_file", Actions: []string{"call"}}},
+	}
+	if _, err := MergeManifests([]*LocalManifest{bad}); err == nil {
+		t.Error("a single invalid manifest passed the merge seam unvalidated")
+	}
+
+	good := &LocalManifest{
+		SchemaVersion: "0.1", Name: "solo", Version: "1.0.0",
+		Capabilities: []capability.Constraint{{Target: "tool:read_file", Actions: []string{"call"}}},
+	}
+	merged, err := MergeManifests([]*LocalManifest{good})
+	if err != nil {
+		t.Fatalf("MergeManifests(one valid manifest): %v", err)
+	}
+	if merged != good {
+		t.Error("the single-manifest arm must still return the input pointer, not a copy")
+	}
+
+	// A nil element is refused rather than dereferenced: validating one arm and panicking on
+	// the other would move the seam's failure from closed to fatal.
+	for _, ms := range [][]*LocalManifest{{nil}, {good, nil}} {
+		if _, err := MergeManifests(ms); err == nil {
+			t.Errorf("MergeManifests(%d manifests, one nil) returned no error", len(ms))
+		}
+	}
+}
+
 // TestMergeManifests_RejectsCrossFileConflict covers the fail-open the merge
 // guards against: two --policy files declaring the same target with overlapping
 // actions and principal scopes a single request can satisfy at once tie in the

@@ -188,7 +188,9 @@ func transportLegDetail(leg transportLeg) map[string]interface{} {
 	return map[string]interface{}{detailTransport: string(leg)}
 }
 
-// The kill-drop legs (recordKillDrop).
+// The notification/server-message legs. recordKillDrop names all of them; hostNotificationGate's
+// smuggled-enforced-method reject names the two notification ones, where the leg is what tells its
+// INVALID_REQUEST record from malformedDeny's.
 const (
 	legHTTPNotification          transportLeg = "http-notification"
 	legHTTPServerResponse        transportLeg = "http-server-response"
@@ -384,9 +386,17 @@ func warnStrictAuditOnce(w io.Writer, warned *noticeLatch, reason string) {
 	}
 }
 
-// warnIfStrictAuditJustDegraded runs recordFn (a RecordAllow/RecordDeny for a call already
-// forwarded) and, under strict mode, emits an immediate SECURITY warning if the trail
+// warnIfStrictAuditJustDegraded runs recordFn (the RecordAllow/RecordDeny for one call at the
+// upstream boundary) and, under strict mode, emits an immediate SECURITY warning if the trail
 // transitioned healthy-to-degraded across that exact call.
+//
+// Its callers do NOT all sit on the same side of the forward, which is why neither the doc nor
+// the line it writes may assert one: the observe downgrade records above callUpstream, the
+// redaction failure below it, and recordUpstreamFailure covers both at once — a real upstream
+// outage is a call that reached the server, while errUntranslatableAcrossRevisions reaches the
+// same seam having refused the REQUEST at the revision boundary with nothing sent. What is true
+// at every one of them is the part that matters here: a record for a decided call may have been
+// lost, so that call could be unaudited.
 //
 // Narrows, but doesn't close, the strict gate's retrospective window: the gate check runs
 // BEFORE callUpstream using counters that only reflect prior calls, so the boundary call
@@ -407,7 +417,7 @@ func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, 
 	}
 	if postDegraded, reason, _ := rec.AuditDegraded(); postDegraded {
 		_, _ = fmt.Fprintf(w,
-			"[eunox] SECURITY: --require-audit=strict: the audit record for the %s %q request just forwarded to the upstream may itself have been lost (%s) — that call could be unaudited; every subsequent forward is now denied.\n",
+			"[eunox] SECURITY: --require-audit=strict: the audit record for the %s %q request just decided at the upstream boundary may itself have been lost (%s) — that call could be unaudited; every subsequent forward is now denied.\n",
 			kind, target, reason,
 		)
 	}
@@ -419,9 +429,12 @@ func warnIfStrictAuditJustDegraded(w io.Writer, strict bool, rec auditRecorder, 
 // field (no sub-target); the forward core passes the per-target audit id.
 func (fp forwardParams) recordUpstreamFailure(ctx context.Context, msg mcp.RPCMsg, err error, id callIdentity, detail map[string]interface{}) mcp.RPCMsg {
 	code, reason, rpcCode := upstreamErrInfo(fp.limits.notices, err, fp.upstreamTimeMs)
-	// This deny records a call already forwarded to (and answered, however badly, by)
-	// the upstream — the same boundary-call shape warnIfStrictAuditJustDegraded exists
-	// for, so it gets the same immediate diagnostic under strict mode.
+	// This deny records a call that reached the upstream and failed there — with ONE exception
+	// that shares the seam without sharing the shape: errUntranslatableAcrossRevisions is
+	// produced by the translation wrapper AROUND callUpstream, which refuses a request the
+	// mismatched pair cannot carry before any bytes are sent (a RESULT refused by the same
+	// wrapper is the ordinary shape again — the call did run). Either way the record for a
+	// decided call may be the one lost, which is what the strict-mode diagnostic reports.
 	//
 	// Named by METHOD rather than by kind/denialTarget, unlike the core's other warning sites:
 	// */list reaches this helper with no target below the method at all, so the pair the others
@@ -717,6 +730,14 @@ func enforcedForwardCore(ctx context.Context, fp forwardParams, msg mcp.RPCMsg, 
 		// Accepted cost: an upstream that stops draining stdin can burn a caller's whole
 		// budget on calls that never executed — the fail-closed direction (over-count, never
 		// under-count), visible on the tape via this deny's upstream error code.
+		//
+		// One class is definitely in that accepted cost rather than merely maybe:
+		// errUntranslatableAcrossRevisions refuses a REQUEST at the revision boundary with
+		// nothing sent (see recordUpstreamFailure), so its slot covers a call that did not run.
+		// It stays unrefunded all the same — a refund path that must decide which failures ran
+		// is the fail-open direction for every failure it gets wrong, and this class is nearly
+		// unreachable in live traffic, since checkUpstreamHonorable refuses such a pair at
+		// negotiation.
 
 		return fp.recordUpstreamFailure(ctx, msg, fwdErr, id, handlerFaultDetail(dec))
 	}

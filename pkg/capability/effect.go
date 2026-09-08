@@ -422,16 +422,6 @@ func (c *EffectCeiling) Exceeds(eff *ResolvedEffect) (exceeds bool, reasons []st
 	return len(reasons) > 0, reasons
 }
 
-// exceedsNumber reports whether value is strictly greater than limit. An unreadable limit
-// reports true (fail closed: a bound that cannot be read bounds nothing, and treating it as
-// satisfied would silently disable the check). A nil value is handled by the caller's
-// Quantified test and never reaches here.
-//
-// Unreadable now includes a limit outside NumericLiteralBounded, which this site used to
-// parse verbatim: the loader already refuses such a bound on an authored ceiling, so this
-// only closes the exported WithEffectCeiling seam that never passes through it — and reading
-// the two sides of one comparison through the SAME parse is what makes the comparison mean
-// anything.
 // boundReadable reports whether limit is a bound this comparison can read at all, which is
 // the question exceedsNumber folds into its fail-closed true and a caller reporting a reason
 // has to ask separately.
@@ -440,6 +430,15 @@ func boundReadable(limit json.Number) bool {
 	return ok
 }
 
+// exceedsNumber reports whether value is strictly greater than limit. An unreadable limit
+// reports true (fail closed: a bound that cannot be read bounds nothing, and treating it as
+// satisfied would silently disable the check). A nil value is handled by the caller's
+// Quantified test and never reaches here.
+//
+// Unreadable includes a limit outside NumericLiteralBounded, which this site used to parse
+// verbatim: the loader already refuses such a bound on an authored ceiling, so this only closes
+// the exported WithEffectCeiling seam that never passes through it — and reading the two sides
+// of one comparison through the SAME parse is what makes the comparison mean anything.
 func exceedsNumber(value *big.Float, limit json.Number) bool {
 	lim, ok := parseBoundedNumber(limit.String())
 	if !ok {

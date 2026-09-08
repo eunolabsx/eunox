@@ -1956,8 +1956,8 @@ func TestValidateJWKSURIScheme_InvalidURL(t *testing.T) {
 
 func TestValidateOAuthAuthzServerURI_EnvRef(t *testing.T) {
 	err := validateOAuthURI("oauth authorization server", "${ISSUER}", false)
-	if err == nil || !strings.Contains(err.Error(), "unexpanded") {
-		t.Fatalf("want an unexpanded-env-ref error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "reference text") {
+		t.Fatalf("want an env-ref-text error, got %v", err)
 	}
 }
 
@@ -2143,8 +2143,8 @@ func TestServeHTTPGateway_OAuthAuthzServerError(t *testing.T) {
 	pf := proxyFlags{}
 
 	err := serveHTTPGateway(context.Background(), cfg, nil, nil, nil, nil, pf, func(context.Context) {})
-	if err == nil || !strings.Contains(err.Error(), "unexpanded") {
-		t.Fatalf("want an unexpanded-env-ref authz-server error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "reference text") {
+		t.Fatalf("want an env-ref-text authz-server error, got %v", err)
 	}
 }
 
@@ -2288,7 +2288,7 @@ func TestValidateTransportConditionalFlags_UnknownTransportRefused(t *testing.T)
 }
 
 // TestServeStdioHost_HTTPOnlyFlagsRejected is a regression: before
-// httpOnlyFlagsSetOnStdio existed, --control-token-path, --session-idle-timeout,
+// activeHTTPOnlyFlags existed, --control-token-path, --session-idle-timeout,
 // --max-sessions, --unsafe-bind-all, and --trust-forwarded-for were silently
 // accepted (and ignored) on a stdio host instead of being rejected like
 // --jwks-uri/--oauth-resource/--oauth-authorization-server above.
@@ -2331,10 +2331,10 @@ func TestHTTPOnlyFlagsSetOnStdio_DetectsEachFlag(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	_ = f
-	got := httpOnlyFlagsSetOnStdio(fs)
+	got := activeHTTPOnlyFlags(fs)
 	want := []string{"--control-token-path", "--session-idle-timeout", "--max-sessions", "--unsafe-bind-all", "--trust-forwarded-for"}
 	if len(got) != len(want) {
-		t.Fatalf("httpOnlyFlagsSetOnStdio = %v, want %v", got, want)
+		t.Fatalf("activeHTTPOnlyFlags = %v, want %v", got, want)
 	}
 	for _, w := range want {
 		found := false
@@ -2355,8 +2355,8 @@ func TestHTTPOnlyFlagsSetOnStdio_EmptyWhenUnset(t *testing.T) {
 	if err := fs.Parse(nil); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if got := httpOnlyFlagsSetOnStdio(fs); len(got) != 0 {
-		t.Errorf("httpOnlyFlagsSetOnStdio with no flags set = %v, want empty", got)
+	if got := activeHTTPOnlyFlags(fs); len(got) != 0 {
+		t.Errorf("activeHTTPOnlyFlags with no flags set = %v, want empty", got)
 	}
 }
 

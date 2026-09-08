@@ -1,10 +1,10 @@
 // Copyright 2026 Eunolabs, LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// The two properties every refusal taken with NO policy decision behind it owes the signed
-// tape: it may not fabricate a target the sink derives from a method name, and — on an
-// established session — it may not record the absence that means "written before a revision
-// could be resolved".
+// The three properties every refusal taken with NO policy decision behind it owes the signed
+// tape: it may not fabricate a target the sink derives from a method name; on an established
+// session it may not record the absence that means "written before a revision could be
+// resolved"; and two DIFFERENT security events may not write the same record.
 
 package transport
 
@@ -94,6 +94,66 @@ func TestMalformedDeny_RecordsNoPhantomTarget(t *testing.T) {
 		t.Fatalf("an empty tools/call name left no %s record; got %+v", codeInvalidRequest, records)
 	}
 	requireNoPhantomTarget(t, rec, codeInvalidRequest)
+}
+
+// TestSmuggledEnforcedNotification_RecordDiffersFromMalformedParams is the tape-shape
+// regression for the third property: two DIFFERENT security events may not write the same
+// record. An enforced method framed as a notification (routing tools/call past the PDP by
+// dropping the id) and an enforced request whose params do not parse both record
+// INVALID_REQUEST, under the same method and the identifier auditIdentity blanks for both — so
+// on an established session, where neither carries a claimed id, the two lines were identical
+// and an operator could not tell an enforcement-confusion probe from ordinary malformation.
+func TestSmuggledEnforcedNotification_RecordDiffersFromMalformedParams(t *testing.T) {
+	t.Parallel()
+	toolsCall := capability.Constraint{Target: "tool:*", Actions: []string{"call"}}
+
+	smuggled := findAuditRecordByCode(recordsFromSessionPost(t, newTestManifestPDP(toolsCall),
+		mcp.RPCMsg{
+			JSONRPC: "2.0", Method: capability.MethodToolsCall,
+			Params: json.RawMessage(`{"name":"read_file","arguments":{}}`),
+		}), codeInvalidRequest)
+	if smuggled == nil {
+		t.Fatal("a notification-framed tools/call left no INVALID_REQUEST record")
+	}
+	malformed := findAuditRecordByCode(recordsFromSessionPost(t, newTestManifestPDP(toolsCall),
+		mcp.RPCMsg{
+			JSONRPC: "2.0", ID: mcp.RawJSON(`1`), Method: capability.MethodToolsCall,
+			Params: json.RawMessage(`{"name":""}`),
+		}), codeInvalidRequest)
+	if malformed == nil {
+		t.Fatal("an empty tools/call name left no INVALID_REQUEST record")
+	}
+
+	details, _ := smuggled["details"].(map[string]interface{})
+	if got, _ := details[detailTransport].(string); got != string(legHTTPNotification) {
+		t.Errorf("smuggled-notification record details.%s = %q, want %q", detailTransport, got, legHTTPNotification)
+	}
+	// The malformed twin names no leg, which is what makes the key a discriminator rather than
+	// a label both events happen to carry.
+	malformedDetails, _ := malformed["details"].(map[string]interface{})
+	if _, ok := malformedDetails[detailTransport]; ok {
+		t.Errorf("malformed-params record carries details.%s = %v; the two events must not share the marker",
+			detailTransport, malformedDetails[detailTransport])
+	}
+
+	// Both transports, or the property holds on whichever one the test happens to drive: the two
+	// legs construct their own gate, so a literal that omits `leg` on one is invisible to the
+	// other's coverage.
+	stdioRec := &fwdRecorder{}
+	gate := hostNotificationGate{
+		recorders: staticRecorder(stdioRec), subject: verifiedSession("sess"), established: true,
+		checkKill: noKill, leg: legStdioNotification,
+	}
+	if outcome := gate.admit(revisionContext(capability.DefaultRevision),
+		mcp.RPCMsg{JSONRPC: "2.0", Method: capability.MethodToolsCall}); outcome != notificationRefused {
+		t.Fatalf("stdio gate outcome = %v, want the smuggled notification refused", outcome)
+	}
+	if len(stdioRec.records) != 1 {
+		t.Fatalf("stdio records = %+v, want one", stdioRec.records)
+	}
+	if got, _ := stdioRec.records[0].details[detailTransport].(string); got != string(legStdioNotification) {
+		t.Errorf("stdio record details.%s = %q, want %q", detailTransport, got, legStdioNotification)
+	}
 }
 
 // TestEstablishedSessionLegsStampTheSessionRevision is the A4 regression. The upstream-driven
