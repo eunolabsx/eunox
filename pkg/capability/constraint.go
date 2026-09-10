@@ -496,11 +496,15 @@ const (
 //
 // This is the single definition of "exactly representable as an int64" shared by both
 // halves of the numeric-bound path: manifest load-time bound validation here, and the
-// runtime comparison in pkg/enforcement (compareToBound/asInt64), which switches to
-// exact-integer precision on exactly this predicate. It lives in capability because
-// the import direction is enforcement -> capability; a second copy on the enforcement
-// side carried a "must be kept in sync" comment and the standing risk that the
-// validator and the comparator would disagree about which bounds are exact.
+// runtime comparison in pkg/enforcement, which reads a BOUND with it and screens an
+// argument's int64 tier with it. It lives in capability because the import direction is
+// enforcement -> capability; a second copy on the enforcement side carried a "must be
+// kept in sync" comment and the standing risk that the validator and the comparator
+// would disagree about which bounds are exact.
+//
+// It answers about a float64, so on the ARGUMENT side it is a VETO and never the verdict:
+// a caller's literal can carry digits its float64 does not (9007199254740993.0 rounds onto
+// 2^53), so a value this admits is confirmed against the literal before it is believed.
 func FloatToInt64(f float64) (int64, bool) {
 	if f < minInt64Float || f >= twoTo63Float {
 		return 0, false

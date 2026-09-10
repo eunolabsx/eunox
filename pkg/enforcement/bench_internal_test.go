@@ -20,7 +20,9 @@ package enforcement
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,6 +144,41 @@ func BenchmarkAnchoredKey(b *testing.B) {
 				if key := tc.engine.sequenceHistoryKey(tc.req, string(capability.TargetTypeTool), "read_file"); key == "" {
 					b.Fatal("empty key")
 				}
+			}
+		})
+	}
+}
+
+// BenchmarkNumericComparison covers the tier ladder the numeric keywords share, which
+// BenchmarkValidateAction_PureConditions cannot see: its allowedValues cell compares
+// STRINGS and so never reaches the json.Number arms at all. The cells are the shapes whose
+// cost differs — a plain integer (no exact reading), a respelled one (an exact reading is
+// what makes the spelling stop mattering), an ordinary fraction, and a caller-chosen
+// literal at capability.NumericLiteralBounded, which is the budget the DoS guard sizes.
+func BenchmarkNumericComparison(b *testing.B) {
+	long := json.Number(strings.Repeat("7", 1000) + ".5")
+	lo, hi := 0.0, 1000.0
+	bounded := &capability.ArgumentSchema{Minimum: &lo, Maximum: &hi}
+
+	cells := []struct {
+		name string
+		run  func()
+	}{
+		{"equal/plain-integer", func() { numericEqual(json.Number("5"), 5) }},
+		{"equal/respelled-integer", func() { numericEqual(json.Number("2.0"), 2) }},
+		{"equal/fractional", func() { numericEqual(json.Number("0.1"), 0.1) }},
+		{"equal/past-int64", func() {
+			numericEqual(json.Number("9223372036854775808"), json.Number("9223372036854775809"))
+		}},
+		{"equal/at-the-literal-bound", func() { numericEqual(long, int64(3)) }},
+		{"bounds/integer-on-the-bound", func() { _ = schemaValidateNumber("p", 0, json.Number("0"), bounded) }},
+		{"bounds/fractional-inside", func() { _ = schemaValidateNumber("p", 0.7, json.Number("0.7"), bounded) }},
+	}
+	for _, c := range cells {
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				c.run()
 			}
 		})
 	}

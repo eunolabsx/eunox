@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"math/big"
 	"net"
 	"path"
@@ -1092,49 +1093,62 @@ func OperationVerb(s string) string {
 // concrete Go type — manifest values decode as YAML int while request arguments decode as
 // float64, so a bare manifest integer would not reflect.DeepEqual-match the same number.
 //
-// When both represent an integer they are compared exactly (int64 within range, an exact
-// rational beyond it), so two distinct integers sharing a float64 are never conflated —
-// integrality is read off the EXACT literal, never off its float64 rounding, which is what
-// keeps the caller's choice of spelling ("2.0", exponent form) from selecting a tier.
-// Only genuinely FRACTIONAL values fall back to the float64 comparison.
+// Integers are compared exactly at any magnitude, so two distinct integers sharing a
+// float64 are never conflated — and WHICH tier an operand lands in is decided from its
+// exact value, never from a coercion the caller's spelling can steer. Only when neither
+// side is an integer does the float64 comparison decide.
 func numericEqual(a, b any) bool {
 	ia, aInt := asInt64(a)
 	ib, bInt := asInt64(b)
 	if aInt && bInt {
 		return ia == ib
 	}
-	// Exactly one side is an int64-representable integer, so the pair cannot be equal:
-	// an integer inside that range and one outside it are different numbers, and a
-	// non-integer is not an integer at all. Answered HERE rather than left to the tail
-	// because exactRat has no int64 arm, so the out-of-range pair (math.MaxInt64 against
-	// 9223372036854775808) would reach the float64 compare and round together.
+	// Exactly one side reads as an int64 integer, so the pair cannot be equal: the other
+	// is either not an integer at all or an integer outside that range. Answered here
+	// rather than below so the expensive tier is reached only when NEITHER side has the
+	// cheap reading.
 	if aInt != bInt {
 		return false
 	}
-	// Neither is int64-representable but both are still integers: compare exactly, since
-	// the float64 fallback below would round distinct integers above 2^63 together (a
-	// fail-open — allowedValues: [9223372036854775808] would admit 9223372036854775809).
-	//
-	// Restricted to integers: a fractional decimal literal and its float64 coercion are
-	// genuinely different rationals (0.1 is not the binary double nearest 0.1), so
-	// comparing those exactly would make an argument of 0.1 stop matching a
-	// manifest value of 0.1 — breaking working policies to no security benefit, since
-	// the float64 approximation is consistent on both sides.
-	if ra, ok := exactIntegerRat(a); ok {
-		if rb, ok := exactIntegerRat(b); ok {
-			return ra.Cmp(rb) == 0
-		}
+	ra, aIsInt := exactIntegerRat(a)
+	rb, bIsInt := exactIntegerRat(b)
+	// An integer and a non-integer are different numbers, and the float64 tail would
+	// round them together: allowedValues: [9223372036854775808] matched an argument of
+	// 9223372036854775808.5. A literal this layer cannot read exactly (past
+	// capability.NumericLiteralBounded) answers false here too and so cannot match an
+	// integer, which is the fail-closed direction.
+	if aIsInt != bIsInt {
+		return false
 	}
+	if aIsInt {
+		return ra.Cmp(rb) == 0
+	}
+	// Neither is an integer. A fractional decimal literal and its float64 coercion are
+	// genuinely different rationals (0.1 is not the binary double nearest 0.1), so
+	// comparing those exactly would make an argument of 0.1 stop matching a manifest
+	// value of 0.1 — breaking working policies to no security benefit, since the
+	// approximation is consistent on both sides. Residual: two DISTINCT fractional
+	// literals sharing one float64 still match, which needs a fractional manifest
+	// literal at or above 2^53 to reach.
 	fa, aOK := toFloat64(a)
 	fb, bOK := toFloat64(b)
 	return aOK && bOK && fa == fb
 }
 
 // exactIntegerRat returns v's exact value as a *big.Rat when v holds an INTEGER of any
-// magnitude, false for a fractional/non-numeric/non-finite value. The beyond-int64
-// companion to asInt64, so a numeric comparison stays exact past 2^63 rather than
-// lapsing to float64 rounding.
+// magnitude, false for a fractional/non-numeric/non-finite value. It is where every
+// numeric comparison in this package settles integrality, with asInt64 as its cheap tier
+// above and the float64 comparison as the tail below, reached only when neither side is
+// an integer.
 func exactIntegerRat(v any) (*big.Rat, bool) {
+	// Every integer's float64 rounding is itself integral, so a coercion carrying a
+	// fraction PROVES v is not one — answered without the arbitrary-precision parse,
+	// which is paid per comparison per allowedValues entry. The converse does not hold
+	// (2^53+0.5 has no float64 of its own), so an integral-LOOKING value still goes on
+	// to be confirmed exactly.
+	if f, ok := toFloat64(v); ok && f != math.Trunc(f) {
+		return nil, false
+	}
 	r, ok := exactRat(v)
 	if !ok || !r.IsInt() {
 		return nil, false
@@ -1151,8 +1165,9 @@ func exactIntegerRat(v any) (*big.Rat, bool) {
 // policy writes. The bound itself lives in pkg/capability.NumericLiteralBounded, shared
 // with the JSON-RPC id parse and the effect layer's blast-radius parse.
 
-// exactRat returns v's exact value as a *big.Rat, without the float64 round-trip
-// asInt64/toFloat64 take, for the types that can carry a value outside int64 range.
+// exactRat returns v's exact value as a *big.Rat, taking no float64 round-trip of its own,
+// so a value outside int64 range or a literal carrying digits its double does not is read
+// as written.
 func exactRat(v any) (*big.Rat, bool) {
 	switch n := v.(type) {
 	case json.Number:
@@ -1162,6 +1177,22 @@ func exactRat(v any) (*big.Rat, bool) {
 			return nil, false
 		}
 		return new(big.Rat).SetString(string(n))
+	case int:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int8:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int16:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int32:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int64:
+		return new(big.Rat).SetInt64(n), true
+	case uint8:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case uint16:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case uint32:
+		return new(big.Rat).SetInt64(int64(n)), true
 	case uint64:
 		return new(big.Rat).SetInt(new(big.Int).SetUint64(n)), true
 	case uint:
@@ -1185,25 +1216,32 @@ func ratFromFloat(f float64) (*big.Rat, bool) {
 // maxInt64Uint is math.MaxInt64 as a uint64, for the unsigned arms of asInt64.
 const maxInt64Uint = uint64(1<<63 - 1)
 
-// asInt64 reports the int64 value of v when v holds an integer, letting numericEqual
-// compare integers exactly instead of through a lossy float64 round-trip; out-of-range or
-// fractional values report false so the caller falls back to float64. json.Number is
-// handled for arguments decoded in UseNumber mode.
+// asInt64 reports the int64 value of v when v holds an integer THAT CHEAPLY READS AS ONE.
+// It is the fast tier under exactIntegerRat, never a second opinion on integrality: a
+// value it declines (out of range, fractional, or a literal spelled so Int64 rejects it)
+// is one the caller re-asks exactly, so false here never decides a comparison.
 func asInt64(v any) (int64, bool) {
 	switch n := v.(type) {
 	case json.Number:
 		if i, err := n.Int64(); err == nil {
 			return i, true
 		}
-		// Int64 rejects every literal carrying a '.' or an exponent, and that SPELLING is
-		// the caller's to choose: reading integrality off the float64 coercion endorsed the
-		// ROUNDED value as exact, so "9007199254740993.0" reported 2^53 and satisfied a
-		// bound it exceeds, and "9007199254740992.5" reported an integer it is not. Read
-		// the literal exactly instead; a fractional or out-of-int64-range value is simply
-		// not an int64 integer, and the callers' exact-rational tiers handle it.
+		// Int64 rejects any literal carrying a '.' or an exponent, and that SPELLING is
+		// the caller's, so the fallback may not answer off the ROUNDING: it endorsed
+		// 9007199254740993.0 as 2^53. The rounding is still a sound VETO — an int64
+		// integer always rounds to an integral float64 in range — so it screens out the
+		// parse for the literals that cannot be one, and decides none that could.
+		f, err := n.Float64()
+		if err != nil {
+			return 0, false
+		}
+		if _, couldBe := capability.FloatToInt64(f); !couldBe {
+			return 0, false
+		}
 		if r, ok := exactIntegerRat(n); ok && r.Num().IsInt64() {
 			return r.Num().Int64(), true
 		}
+		return 0, false
 	case int:
 		return int64(n), true
 	case int8:

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"sync"
 	"unicode/utf8"
 
@@ -146,10 +147,21 @@ func schemaValidateValue(jsonPath string, val interface{}, schema *capability.Ar
 		return fmt.Errorf("%s: non-finite numeric value", jsonPath)
 	}
 
+	// PADDING a literal past the exact-parse budget is a spelling the CALLER chooses, so
+	// falling back to the rounding reopened by length the bypass the exact tiers close
+	// (9007199254740993 with 1100 trailing zeros passed a maximum of 2^53). Refused
+	// instead, as pkg/capability's blast-radius parse already refuses this input class.
+	// Placed below the non-finite guard, which owns the better diagnostic for the other
+	// literals this bound rejects, and above the type check, which cannot answer
+	// "integer" about a value it cannot read.
+	if n, isNum := original.(json.Number); isNum && !capability.NumericLiteralBounded(string(n)) {
+		return fmt.Errorf("%s: numeric literal too long to compare exactly", jsonPath)
+	}
+
 	// Enforce schema.Type before keyword checks to catch mismatches that would
 	// otherwise silently pass (e.g. a number where maxLength is declared).
 	if !schema.Type.IsZero() {
-		if err := schemaCheckType(jsonPath, val, schema.Type); err != nil {
+		if err := schemaCheckType(jsonPath, val, original, schema.Type); err != nil {
 			return err
 		}
 	}
@@ -210,23 +222,24 @@ func schemaValidateNativeComposite(jsonPath string, val interface{}, schema *cap
 	}
 }
 
-// schemaCheckType verifies that val's JSON type matches typ.
-func schemaCheckType(jsonPath string, val interface{}, typ capability.SchemaType) error {
+// schemaCheckType verifies that val's JSON type matches typ. raw is val before the
+// float64 coercion, since "integer" is a question about the value and not its rounding.
+func schemaCheckType(jsonPath string, val, raw interface{}, typ capability.SchemaType) error {
 	got := schemaJSONTypeOf(val)
 	if typ.Single != "" {
-		if !schemaTypeCompatible(got, typ.Single, val) {
+		if !schemaTypeCompatible(got, typ.Single, raw) {
 			// A fractional number reports JSON type "number", so a generic "expected
 			// integer, got number" would mislead (42 is "number" yet passes). Surface
 			// the fractional part as the cause.
 			if typ.Single == "integer" && got == "number" {
-				return fmt.Errorf("%s: expected integer, got non-integer number %g", jsonPath, val.(float64))
+				return fmt.Errorf("%s: expected integer, got non-integer number %s", jsonPath, numericLiteral(raw, val))
 			}
 			return fmt.Errorf("%s: expected type %q, got %q", jsonPath, typ.Single, got)
 		}
 		return nil
 	}
 	for _, t := range typ.Multiple {
-		if schemaTypeCompatible(got, t, val) {
+		if schemaTypeCompatible(got, t, raw) {
 			return nil
 		}
 	}
@@ -313,6 +326,10 @@ func nativeCompositeJSONType(val interface{}) string {
 	return ""
 }
 
+// schemaTypeCompatible reports whether a value of JSON type gotType satisfies schemaType.
+// val is the argument BEFORE the float64 coercion: reading integrality off the coercion
+// admitted 9007199254740992.5, whose rounding is integral because 2^53+0.5 has no float64
+// of its own, under a schema declaring the argument an integer.
 func schemaTypeCompatible(gotType, schemaType string, val interface{}) bool {
 	if gotType == schemaType {
 		return true
@@ -321,8 +338,8 @@ func schemaTypeCompatible(gotType, schemaType string, val interface{}) bool {
 	// satisfies "integer" only when it has no fractional part, else e.g. LIMIT 3.14
 	// would slip through.
 	if schemaType == "integer" && gotType == "number" {
-		f, ok := val.(float64)
-		return ok && f == math.Trunc(f)
+		_, isInt := exactIntegerRat(val)
+		return isInt
 	}
 	return false
 }
@@ -347,35 +364,58 @@ func schemaValidateString(p, v string, s *capability.ArgumentSchema) error {
 	return nil
 }
 
-// schemaValidateNumber enforces minimum/maximum. raw is the argument before the
-// float64 coercion in schemaValidateValue; v is that coercion. When both the
-// argument and the bound are exact int64 integers the comparison runs at int64
-// precision (see compareToBound), so an integer >= 2^53 is not first rounded into a
-// neighbouring value that would let an over-bound argument pass.
+// schemaValidateNumber enforces minimum/maximum. raw is the argument before the float64
+// coercion in schemaValidateValue and v is that coercion, because a value at or above
+// 2^53 rounds onto a neighbour and the bound is exactly where that must not decide
+// anything (see compareToBound).
 func schemaValidateNumber(p string, v float64, raw interface{}, s *capability.ArgumentSchema) error {
 	if s.Minimum != nil && compareToBound(raw, v, *s.Minimum) < 0 {
-		return fmt.Errorf("%s: value %g is less than minimum %g", p, v, *s.Minimum)
+		return fmt.Errorf("%s: value %s is less than minimum %g", p, numericLiteral(raw, v), *s.Minimum)
 	}
 	if s.Maximum != nil && compareToBound(raw, v, *s.Maximum) > 0 {
-		return fmt.Errorf("%s: value %g exceeds maximum %g", p, v, *s.Maximum)
+		return fmt.Errorf("%s: value %s exceeds maximum %g", p, numericLiteral(raw, v), *s.Maximum)
 	}
 	return nil
 }
 
-// compareToBound orders a numeric argument against a minimum/maximum bound,
-// returning -1, 0, or 1. raw is the un-coerced argument and f its float64 coercion.
-// When both the argument and the bound are integers the comparison is exact at any
-// magnitude — int64 within that range, an exact rational beyond it. Only a genuinely
-// FRACTIONAL operand falls back to the float64 comparison.
+// numericLiteral renders an argument for a denial message. The literal rather than its
+// float64 coercion, because the whole point of the comparison above is that the two are
+// different numbers: rendering the coercion produced "value 9.007199254740992e+15 exceeds
+// maximum 9.007199254740992e+15", which reads as a bug in eunox and leaves the value the
+// caller actually sent nowhere on the tape. Bounded because it is caller-chosen text.
+func numericLiteral(raw, coerced interface{}) string {
+	if n, ok := raw.(json.Number); ok {
+		return capability.BoundString(n.String(), maxDeniedLiteralBytes)
+	}
+	if f, ok := coerced.(float64); ok {
+		return strconv.FormatFloat(f, 'g', -1, 64)
+	}
+	return fmt.Sprintf("%v", coerced)
+}
+
+// maxDeniedLiteralBytes bounds a caller's literal in a denial message. Well above any
+// real argument and far below capability.MaxNumericLiteralLen, which is a DoS budget for
+// PARSING rather than a length anyone wants in a JSON-RPC error or an audit record.
+const maxDeniedLiteralBytes = 64
+
+// compareToBound orders a numeric argument against a minimum/maximum bound, returning
+// -1, 0, or 1. raw is the un-coerced argument and f its float64 coercion, which the
+// caller has already proved finite.
 //
-// Which tier raw takes is decided from its exact literal (see asInt64), NOT from a float64
-// coercion the caller can steer: spelling an over-bound integer "9007199254740993.0" used
-// to round it onto the bound and pass. Stated residual: a genuinely fractional argument
-// stays float64-approximate here, so one within half a ULP of an integral bound (2^53+0.5
-// against a maximum of 2^53) still compares equal to it — the documented policy for
-// fractional values, whose exact comparison would break an authored bound like 0.1 that is
-// not the double nearest 0.1.
+// A STRICT float64 verdict is exact and needs no more work: rounding to nearest is
+// monotonic and the bound is itself a float64, so a value above the bound cannot round
+// below it. A TIE is the only verdict the rounding can manufacture — 9007199254740993
+// and 9007199254740993.0 both land on a maximum of 2^53 — so that is the one case worth
+// an exact reading, which is what keeps the exactness off the hot path entirely.
 func compareToBound(raw interface{}, f, bound float64) int {
+	switch {
+	case f < bound:
+		return -1
+	case f > bound:
+		return 1
+	}
+	// The tie is nearly always an argument sitting exactly ON an integral bound, which
+	// both sides answer at int64 precision for free.
 	if ri, ok := asInt64(raw); ok {
 		if bi, ok := capability.FloatToInt64(bound); ok {
 			switch {
@@ -388,23 +428,25 @@ func compareToBound(raw interface{}, f, bound float64) int {
 			}
 		}
 	}
-	// Both sides are integers but outside int64 range, so the float64 fallback would
-	// round them together (9223372036854775809 vs a maximum of 9223372036854775808
-	// would compare equal). Integers only, like numericEqual's exact arm: a fractional
-	// bound's float64 coercion is a different rational and must not be compared exactly.
-	if rr, ok := exactIntegerRat(raw); ok {
-		if br, ok := exactIntegerRat(bound); ok {
-			return rr.Cmp(br)
-		}
-	}
-	switch {
-	case f < bound:
-		return -1
-	case f > bound:
-		return 1
-	default:
+	// Confirmed against an INTEGRAL bound only. capability.exactFloatBound refuses an
+	// authored integral bound that does not round-trip, so that bound's float64 IS the
+	// literal the operator wrote; a FRACTIONAL bound's is a different rational (0.1 is
+	// not the binary double nearest 0.1), and comparing an argument of 0.1 against it
+	// exactly would report it below a minimum of 0.1 and break a working policy.
+	br, ok := exactIntegerRat(bound)
+	if !ok {
 		return 0
 	}
+	// Deliberately NOT exactIntegerRat: a FRACTIONAL argument tying with an integral
+	// bound is over or under it by up to half a ULP (1000000000000000063.5 against a
+	// maximum of 10^18), which the exactness rule above has no reason to exempt. A
+	// literal too long to read exactly is refused by schemaValidateValue before it
+	// reaches here, so this tie is never resolved on the rounding.
+	rr, ok := exactRat(raw)
+	if !ok {
+		return 0
+	}
+	return rr.Cmp(br)
 }
 
 func schemaValidateObject(p string, v map[string]interface{}, s *capability.ArgumentSchema) error {

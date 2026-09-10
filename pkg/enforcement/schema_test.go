@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -1287,4 +1288,147 @@ func TestValidateArgumentSchema_NamedScalarArguments(t *testing.T) {
 		require.Error(t, err, "json.Number must stay on the exact numeric path")
 		assert.Contains(t, err.Error(), "maximum")
 	})
+}
+
+// The exactness of a numeric comparison must not be selectable by how LONG the caller
+// writes the literal. capability.NumericLiteralBounded caps the exact parse, and a value
+// past it used to fall back to the float64 rounding — so an over-bound integer padded
+// with trailing zeros passed a maximum the same number spelled plainly was denied
+// against. Refused now, the disposition the effect layer already takes for such a
+// literal, and the one that keeps enum and minimum/maximum answering alike.
+func TestValidateArgumentSchema_PaddedLiteralRefusedRatherThanRounded(t *testing.T) {
+	t.Parallel()
+
+	padded := json.Number("9007199254740993." + strings.Repeat("0", 1100))
+	cases := []struct {
+		name   string
+		schema *capability.ArgumentSchema
+		errSub string
+	}{
+		{name: "maximum", schema: &capability.ArgumentSchema{Maximum: floatPtrC(9007199254740992)}, errSub: "too long to compare exactly"},
+		{name: "minimum", schema: &capability.ArgumentSchema{Minimum: floatPtrC(9007199254740992)}, errSub: "too long to compare exactly"},
+		{name: "type", schema: &capability.ArgumentSchema{Type: capability.SchemaType{Single: "integer"}}, errSub: "too long to compare exactly"},
+		// enum runs above the guard and answers for itself: a value with no exact
+		// reading is not an integer, so it matches no integer entry. Same disposition,
+		// its own (accurate) diagnostic.
+		{name: "enum", schema: &capability.ArgumentSchema{Enum: []interface{}{int64(9007199254740992)}}, errSub: "not in enum"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			schema := &capability.ArgumentSchema{Properties: map[string]*capability.ArgumentSchema{"n": tc.schema}}
+			err := enforcement.ValidateArgumentSchema(map[string]interface{}{"n": padded}, schema)
+			require.Error(t, err, "a literal too long to read exactly must not be compared through its rounding")
+			assert.Contains(t, err.Error(), tc.errSub)
+		})
+	}
+}
+
+// A FRACTIONAL argument tying with an INTEGRAL bound is over or under it by up to half a
+// unit in the last place, and the caller picks the fraction: at the 10^18 magnitudes a
+// token-transfer tool carries that is 64 units past a declared maximum. The bound's own
+// float64 is exact (capability.exactFloatBound refuses an authored integral bound that
+// does not round-trip), so the tie is resolved against the literal. A FRACTIONAL bound is
+// deliberately left alone: its double is a different rational from the text the operator
+// wrote, so an argument of 0.1 must keep satisfying a minimum of 0.1.
+func TestValidateArgumentSchema_FractionalArgumentAgainstIntegralBound(t *testing.T) {
+	t.Parallel()
+
+	prop := func(s *capability.ArgumentSchema) *capability.ArgumentSchema {
+		return &capability.ArgumentSchema{Properties: map[string]*capability.ArgumentSchema{"n": s}}
+	}
+	cases := []struct {
+		name    string
+		schema  *capability.ArgumentSchema
+		value   interface{}
+		wantErr string
+	}{
+		{name: "just under an integral minimum", schema: prop(&capability.ArgumentSchema{Minimum: floatPtrC(2)}),
+			value: json.Number("1.9999999999999999"), wantErr: "minimum"},
+		{name: "over an integral maximum at 10^18", schema: prop(&capability.ArgumentSchema{Maximum: floatPtrC(1e18)}),
+			value: json.Number("1000000000000000063.5"), wantErr: "maximum"},
+		{name: "over an integral maximum at 2^53", schema: prop(&capability.ArgumentSchema{Maximum: floatPtrC(9007199254740992)}),
+			value: json.Number("9007199254740992.5"), wantErr: "maximum"},
+		{name: "under an integral maximum still passes", schema: prop(&capability.ArgumentSchema{Maximum: floatPtrC(1e18)}),
+			value: json.Number("999999999999999937.5")},
+		{name: "a fractional argument well inside its bounds", schema: prop(&capability.ArgumentSchema{Minimum: floatPtrC(0), Maximum: floatPtrC(1)}),
+			value: json.Number("0.7")},
+		// The carve-out: an authored 0.1 is stored as the double NEAREST 0.1, which is
+		// strictly greater than the rational the caller wrote. Comparing those exactly
+		// would deny an argument identical to the bound.
+		{name: "a fractional bound met exactly", schema: prop(&capability.ArgumentSchema{Minimum: floatPtrC(0.1)}),
+			value: json.Number("0.1")},
+		{name: "a fractional bound met exactly from above", schema: prop(&capability.ArgumentSchema{Maximum: floatPtrC(0.1)}),
+			value: json.Number("0.1")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := enforcement.ValidateArgumentSchema(map[string]interface{}{"n": tc.value}, tc.schema)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// `type: integer` asks whether the VALUE is a whole number, and it was answered from the
+// float64 coercion: at and above 2^52 a fractional literal rounds onto an integral double,
+// so a schema declaring an argument an integer admitted one that is not — and eunox
+// forwards the caller's original bytes, so the upstream received the fraction.
+func TestValidateArgumentSchema_IntegerTypeReadsTheValueNotItsRounding(t *testing.T) {
+	t.Parallel()
+
+	schema := &capability.ArgumentSchema{Properties: map[string]*capability.ArgumentSchema{
+		"n": {Type: capability.SchemaType{Single: "integer"}},
+	}}
+	cases := []struct {
+		name    string
+		value   interface{}
+		wantErr bool
+	}{
+		{name: "a plain integer", value: json.Number("42")},
+		{name: "a respelled integer", value: json.Number("42.0")},
+		{name: "an integer past 2^53", value: json.Number("9007199254740993")},
+		{name: "an obviously fractional value", value: json.Number("3.14"), wantErr: true},
+		{name: "fractional at 2^53, whose double is integral", value: json.Number("9007199254740992.5"), wantErr: true},
+		{name: "fractional at 2^52, whose double is integral", value: json.Number("4503599627370496.5"), wantErr: true},
+		{name: "fractional just under 1, whose double is 1", value: json.Number("0.99999999999999999999"), wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := enforcement.ValidateArgumentSchema(map[string]interface{}{"n": tc.value}, schema)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "integer")
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// A bound denial must name the literal the caller sent, not its float64 coercion: the
+// coercion IS the bound in exactly the cases the exact comparison exists for, so the
+// message read "value 9.007199254740992e+15 exceeds maximum 9.007199254740992e+15" — a
+// self-contradiction on the JSON-RPC error and on the signed record, with the value
+// actually sent recoverable from neither.
+func TestValidateArgumentSchema_BoundDenialNamesTheLiteralSent(t *testing.T) {
+	t.Parallel()
+
+	schema := &capability.ArgumentSchema{Properties: map[string]*capability.ArgumentSchema{
+		"n": {Maximum: floatPtrC(9007199254740992)},
+	}}
+	for _, lit := range []string{"9007199254740993", "9007199254740993.0", "9.007199254740993e15"} {
+		t.Run(lit, func(t *testing.T) {
+			t.Parallel()
+			err := enforcement.ValidateArgumentSchema(map[string]interface{}{"n": json.Number(lit)}, schema)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), lit, "the denial must carry the literal the caller sent")
+		})
+	}
 }
