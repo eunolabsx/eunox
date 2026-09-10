@@ -60,7 +60,7 @@ var boundedRecordFields = map[string]recordFieldBound{
 }
 
 // TestScanWindow_EveryVariableFieldIsBoundedAndTheSumFits is the guard the
-// auditScanBufferBytes comment cannot be. The window invariant — every record fits the
+// ScanBufferBytes comment cannot be. The window invariant — every record fits the
 // 4 MiB line buffer every reader uses — was argued in prose from a hand-kept list of
 // caps, and that is exactly how it broke: labels_out/carried_labels were COUNTED by
 // queueSize, so the reflective queue-budget guard beside this one stayed green while the
@@ -93,7 +93,7 @@ func TestScanWindow_EveryVariableFieldIsBoundedAndTheSumFits(t *testing.T) {
 		assert.Truef(t, bounded || fixed,
 			"%s can carry variable-length bytes to disk but is declared in neither boundedRecordFields "+
 				"nor fixedWidthRecordFields, so nothing keeps a record inside the %d-byte scan window. "+
-				"Bound it and declare the cap, or declare why its width is fixed.", f.Name, auditScanBufferBytes)
+				"Bound it and declare the cap, or declare why its width is fixed.", f.Name, ScanBufferBytes)
 		assert.Falsef(t, bounded && fixed, "%s is declared both bounded and fixed-width", f.Name)
 		if bounded {
 			declared++
@@ -109,8 +109,8 @@ func TestScanWindow_EveryVariableFieldIsBoundedAndTheSumFits(t *testing.T) {
 	for _, b := range boundedRecordFields {
 		worst += b.contribution()
 	}
-	assert.Lessf(t, worst, auditScanBufferBytes,
+	assert.Lessf(t, worst, ScanBufferBytes,
 		"the declared caps sum to %d encoded bytes, at or over the %d-byte scan window: a record at "+
 			"every cap at once would abort every reader of the tape. Lower a cap or raise the window.",
-		worst, auditScanBufferBytes)
+		worst, ScanBufferBytes)
 }

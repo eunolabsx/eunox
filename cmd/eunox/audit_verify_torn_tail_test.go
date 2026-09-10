@@ -23,6 +23,39 @@ func stripTrailingNewline(t *testing.T, logPath string) {
 	}
 }
 
+// tapeLines reads a tape as its records. Shared by the tamper fixtures below and by the
+// scan-abort tests, so one convention decides how a tape is split and re-terminated.
+func tapeLines(t *testing.T, logPath string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	return strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+}
+
+// deleteInteriorRecord removes the second record, leaving BOTH proofs an interior deletion
+// produces — a prev_hmac mismatch and a seq gap — well before the tape's final line, so
+// whatever a test then does to that line cannot be what the finding rests on. Shared with
+// the scan-abort tests: the two files assert one rule (a finding outranks a missing verdict)
+// over the two writes that can withhold a verdict, against the same tampered fixture.
+//
+// Four records are the minimum for that contract, not three: at three, the survivors are the
+// first and third, so BOTH proofs land ON the final line — which stripTrailingNewline then
+// drops as a fragment, leaving a fixture that proves nothing and a test failure that blames
+// production code for it.
+func deleteInteriorRecord(t *testing.T, logPath string) {
+	t.Helper()
+	lines := tapeLines(t, logPath)
+	if len(lines) < 4 {
+		t.Fatalf("expected at least 4 records to delete an interior one, got %d", len(lines))
+	}
+	kept := append([]string{lines[0]}, lines[2:]...)
+	if err := os.WriteFile(logPath, []byte(strings.Join(kept, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+}
+
 // TestCmdAuditVerify_TornTailNeverSuppressesAFinding is the regression for the way the
 // no-verdict exit can be turned into a tamper-suppression primitive.
 //
@@ -35,25 +68,14 @@ func TestCmdAuditVerify_TornTailNeverSuppressesAFinding(t *testing.T) {
 	dir := t.TempDir()
 	logPath, keyPath := writeTapeFor(t, dir, "tape", "", "task-1", "a", "b", "c", "d")
 
-	// Delete an INTERIOR record: a prev_hmac mismatch AND a seq gap, both proven well before
-	// the final line the strip below turns into a fragment.
-	raw, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	if len(lines) != 4 {
-		t.Fatalf("expected 4 records, got %d", len(lines))
-	}
-	tampered := lines[0] + "\n" + lines[2] + "\n" + lines[3] + "\n"
-	if err := os.WriteFile(logPath, []byte(tampered), 0o600); err != nil {
-		t.Fatalf("rewrite: %v", err)
-	}
+	// A prev_hmac mismatch AND a seq gap, both proven well before the final line the strip
+	// below turns into a fragment.
+	deleteInteriorRecord(t, logPath)
 
 	// Control: the tamper is reported, exit 1.
 	code, stdout, _ := runAuditVerifyCapturing(t, "--audit-log", logPath, "--audit-key-path", keyPath)
-	if code != 1 {
-		t.Fatalf("a tampered chain must exit 1 (findings), got %d\n%s", code, stdout)
+	if code != auditVerifyFindingsExit {
+		t.Fatalf("a tampered chain must exit %d (findings), got %d\n%s", auditVerifyFindingsExit, code, stdout)
 	}
 	if !strings.Contains(stdout, "CHAIN BREAK") {
 		t.Fatalf("expected the chain-break finding on stdout:\n%s", stdout)
@@ -63,8 +85,9 @@ func TestCmdAuditVerify_TornTailNeverSuppressesAFinding(t *testing.T) {
 	// and the same exit code.
 	stripTrailingNewline(t, logPath)
 	code, stdout, stderr := runAuditVerifyCapturing(t, "--audit-log", logPath, "--audit-key-path", keyPath)
-	if code != 1 {
-		t.Fatalf("one stripped newline must not move a proven tamper out of the exit-1 bucket, got %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	if code != auditVerifyFindingsExit {
+		t.Fatalf("one stripped newline must not move a proven tamper out of the exit-%d bucket, got %d\nstdout:\n%s\nstderr:\n%s",
+			auditVerifyFindingsExit, code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "CHAIN BREAK") {
 		t.Fatalf("the finding must still be printed:\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
@@ -96,9 +119,9 @@ func TestCmdAuditVerify_TornTailOnACleanTapeIsInconclusive(t *testing.T) {
 	}
 }
 
-// TestCmdAuditVerify_TornTailDoesNotAbortSiblingTapes: one tape's torn tail used to return a
-// non-zero code from verifyOneTape, which runAuditVerify propagates immediately — so a
-// stripped byte on tape 1 left every later enforcement point's tape unverified.
+// TestCmdAuditVerify_TornTailDoesNotAbortSiblingTapes: a torn tail on tape 1 must leave every
+// later enforcement point's tape verified. It used to abandon them by returning a non-zero
+// code the loop propagated at once; the loop now attempts every tape and ranks afterwards.
 func TestCmdAuditVerify_TornTailDoesNotAbortSiblingTapes(t *testing.T) {
 	dir := t.TempDir()
 	log1, key1 := writeTapeFor(t, dir, "one", "gateway", "task-1", "a", "b", "c", "d")
@@ -106,21 +129,16 @@ func TestCmdAuditVerify_TornTailDoesNotAbortSiblingTapes(t *testing.T) {
 
 	// Tape 1 carries a proven tamper (an interior record deleted) AND a torn tail; tape 2 is
 	// clean.
-	raw, err := os.ReadFile(log1)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	if err := os.WriteFile(log1, []byte(lines[0]+"\n"+lines[2]+"\n"+lines[3]), 0o600); err != nil {
-		t.Fatalf("rewrite: %v", err)
-	}
+	deleteInteriorRecord(t, log1)
+	stripTrailingNewline(t, log1)
 
 	code, stdout, stderr := runAuditVerifyCapturing(t,
 		"--audit-log", log1, "--audit-key-path", key1,
 		"--audit-log", log2, "--audit-key-path", key2)
 
-	if code != 1 {
-		t.Fatalf("a proven tamper on tape 1 must still exit 1, got %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	if code != auditVerifyFindingsExit {
+		t.Fatalf("a proven tamper on tape 1 must still exit %d, got %d\nstdout:\n%s\nstderr:\n%s",
+			auditVerifyFindingsExit, code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, filepath.Base(log2)) {
 		t.Fatalf("tape 2 must still be verified rather than abandoned:\n%s", stdout)

@@ -2536,10 +2536,10 @@ func TestTruncatePartialTail_WhitespaceFillsWholeWindowFailsClosed(t *testing.T)
 // higher seqs, the same duplicate-seq cascade the active-log path guards against.
 func TestReadLastAuditLine_WhitespaceFillsWholeWindowFailsClosed(t *testing.T) {
 	rec := `{"seq":1,"decision":"allow"}`
-	whitespace := strings.Repeat("\n", auditScanBufferBytes+10)
+	whitespace := strings.Repeat("\n", ScanBufferBytes+10)
 	buf := []byte(rec + "\n" + whitespace)
 	size := int64(len(buf))
-	start := tailWindowStart(size, auditScanBufferBytes)
+	start := tailWindowStart(size, ScanBufferBytes)
 	if start == 0 {
 		t.Fatalf("test setup: window must not start at file offset 0 (size=%d)", size)
 	}
@@ -3009,7 +3009,7 @@ func TestVerifyLog_SuppressedUnsignedSummarySurvivesScanAbort(t *testing.T) {
 		fmt.Fprintf(&log, `{"seq":%d,"decision":"allow"}`+"\n", i+1)
 	}
 	// An over-cap line aborts the scan (bufio.ErrTooLong) after the unsigned prefix.
-	log.WriteString(strings.Repeat("x", auditScanBufferBytes+1) + "\n")
+	log.WriteString(strings.Repeat("x", ScanBufferBytes+1) + "\n")
 
 	var out strings.Builder
 	_, err := VerifyLog(&log, verifierFor(t, keyPath), VerifyOptions{Out: &out})

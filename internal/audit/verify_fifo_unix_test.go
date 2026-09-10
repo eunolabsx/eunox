@@ -89,7 +89,7 @@ func TestScanSeqContribution_RefusesFIFO(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if _, parsed, _ := scanSeqContribution(fifo, auditScanBufferBytes); parsed {
+		if _, parsed, _ := scanSeqContribution(fifo, ScanBufferBytes); parsed {
 			t.Error("a FIFO must never be reported as a cleanly-parsed audit log")
 		}
 	}()

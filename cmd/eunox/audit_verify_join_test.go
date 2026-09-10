@@ -390,11 +390,13 @@ func TestCmdAuditVerify_TaskIDOnOneTapeStillPrintsTheSequence(t *testing.T) {
 	}
 }
 
-// TestCmdAuditVerify_CrossPEP_UnreadableTapeStopsTheRun asserts the run does not print a
-// sequence assembled from the tapes it COULD read: a join silently missing an enforcement
-// point's records is the one way this report can mislead about the thing it exists to
-// show, so an unreadable tape is an operational failure (exit 2), not a skipped one.
-func TestCmdAuditVerify_CrossPEP_UnreadableTapeStopsTheRun(t *testing.T) {
+// TestCmdAuditVerify_CrossPEP_UnreadableTapeWithholdsTheSequence asserts the run does not
+// print a sequence assembled from the tapes it COULD read: a join silently missing an
+// enforcement point's records is the one way this report can mislead about the thing it
+// exists to show, so an unreadable tape is an operational failure (exit 2), not a skipped
+// one. The other tapes are still VERIFIED — abandoning them let one unreadable tape hide a
+// sibling's finding — but the sequence is withheld, and says so by name.
+func TestCmdAuditVerify_CrossPEP_UnreadableTapeWithholdsTheSequence(t *testing.T) {
 	dir := t.TempDir()
 	logA, keyA := writeTapeFor(t, dir, "edge", "edge-1", "task-A", "read_file")
 	missing := filepath.Join(dir, "never-written.jsonl")
@@ -406,8 +408,11 @@ func TestCmdAuditVerify_CrossPEP_UnreadableTapeStopsTheRun(t *testing.T) {
 	if code != auditVerifyUsageExit {
 		t.Fatalf("an unreadable tape is an operational failure (exit %d), got %d\n%s", auditVerifyUsageExit, code, out)
 	}
-	if strings.Contains(out, "Sequence for task_id") {
-		t.Errorf("no sequence may be printed when a tape could not be read:\n%s", out)
+	if !strings.Contains(out, "NOT printed") {
+		t.Errorf("no sequence may be assembled when a tape could not be read, and the run must say so:\n%s", out)
+	}
+	if !strings.Contains(out, "Tape 1 verdict: PASS") {
+		t.Errorf("the readable tape must still be verified rather than abandoned:\n%s", out)
 	}
 }
 

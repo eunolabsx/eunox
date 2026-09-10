@@ -317,14 +317,14 @@ var errAuditTailUnbounded = errors.New("audit partial-tail exceeds the scan wind
 // Returns the number of bytes truncated (0 when the tail already ends at a record
 // boundary). Runs under the exclusive audit lock, before the drainer starts.
 func truncatePartialTail(f *os.File) (truncated int64, last string, err error) {
-	return truncatePartialTailWindowed(f, auditScanBufferBytes)
+	return truncatePartialTailWindowed(f, ScanBufferBytes)
 }
 
 // truncatePartialTailWindowed is truncatePartialTail with the tail scan window injected,
 // so a test can drive the window-boundary paths against a few dozen bytes instead of
 // staging a multi-megabyte file. Mirrors highestSeqAcrossChainCapped / scanSeqContribution,
 // which take their scan cap the same way and for the same reason. Production always passes
-// auditScanBufferBytes.
+// ScanBufferBytes.
 func truncatePartialTailWindowed(f *os.File, winSize int64) (truncated int64, last string, err error) {
 	return truncatePartialTailAttempt(f, winSize, 0)
 }
@@ -505,7 +505,7 @@ func tailWindowStart(size, win int64) int64 {
 // only happen after a truncation shortened the window, and the re-read is anchored at
 // the new EOF through the SAME handle — never a second open. One re-read always
 // suffices: the window now ends at a record boundary and a record is capped far below
-// auditScanBufferBytes, so the preceding boundary is inside it unless the file holds
+// ScanBufferBytes, so the preceding boundary is inside it unless the file holds
 // exactly one record, in which case the window starts at 0 and is authoritative.
 func tailLineFromWindow(f *os.File, window []byte, start, size, winSize int64) (string, error) {
 	line, bounded := lastCompleteLineFromTail(window)
@@ -951,11 +951,11 @@ func readLastAuditLine(path string) (string, error) {
 	}
 	// Details is capped at 1 MiB and the envelope is far smaller, so a record (plus
 	// its preceding boundary newline) is always captured within this tail. Sized from
-	// auditScanBufferBytes rather than a second 4 MiB literal: the tail window and the
+	// ScanBufferBytes rather than a second 4 MiB literal: the tail window and the
 	// line-scan ceiling must agree, or a record one reader accepts is one the other
 	// truncates.
 	size := info.Size()
-	start := tailWindowStart(size, auditScanBufferBytes)
+	start := tailWindowStart(size, ScanBufferBytes)
 	buf := make([]byte, size-start)
 	n, err := f.ReadAt(buf, start)
 	// errors.Is for the reason the open arm above carries: interpretAuditTail already reads
