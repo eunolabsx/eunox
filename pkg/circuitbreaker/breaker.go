@@ -8,8 +8,11 @@
 //   - Closed: requests flow normally; consecutive failures are counted.
 //   - Open: requests are rejected immediately until a cooldown elapses, then
 //     half-open.
-//   - HalfOpen: up to HalfOpenMaxProbes probes are allowed. The breaker closes
-//     once every admitted probe has succeeded; any probe failure re-opens it.
+//   - HalfOpen: HalfOpenMaxProbes probes are admitted — a budget for the window, not a
+//     concurrency limit — and the breaker closes once that many have SUCCEEDED. A success
+//     count rather than "every admitted probe": a dropped probe returns its slot, so a
+//     window can admit more than that many. Any probe failure re-opens it. See
+//     Config.HalfOpenMaxProbes.
 package circuitbreaker
 
 import (

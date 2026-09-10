@@ -1561,6 +1561,12 @@ const killScopeAll = "all"
 // dimension is a separate field from scope because their VALUES collide: a session id is
 // operator-settable and could literally be "all", so `{"sessionId":"all"}` would otherwise
 // be indistinguishable from a deployment-wide stop.
+//
+// Unmetered, unlike every refusal record this file writes: reaching it means passing both the
+// loopback guard and the control token, so it is not a peer-drivable flood — and the single
+// record explaining a whole run of KILL_SWITCH denials is the last write an emergency stop may
+// suppress. A kill dimension added on a path a peer CAN reach inherits neither half of that and
+// needs a bucket.
 func (p *HTTPProxy) recordKillActivated(r *http.Request, scope, dimension string) {
 	if p.sink == nil {
 		return
