@@ -90,6 +90,12 @@ type PolicyDecisionPoint interface {
 	// A PDP that pins no token audience (every non-JWT PDP, or a JWT route with no
 	// audience pinned / --jwt-allow-any-audience) returns nil.
 	//
+	// A COMPOSING implementation must union its own pin with the wrapped PDP's, as CheckKill
+	// requires for the manager and for the same reason: this method gates a path the Decide*
+	// methods do not cover, so consulting one of two pins leaves an inner PDP's own audience
+	// unenforced at the one point it decides nothing — session creation — while every call it
+	// later decides is still gated by it.
+	//
 	// CONTRACT: an implementation MUST be CPU-only and non-blocking — decide from the
 	// claims already on ctx and return. Do NOT perform network I/O, acquire contended
 	// locks, or sleep. Callers evaluate this gate on latency-sensitive paths, including

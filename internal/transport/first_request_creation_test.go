@@ -1129,6 +1129,60 @@ func TestFirstRequestCreation_TwoIdentitiesOnOneTaskAreNotLockedOut(t *testing.T
 	assert.Equal(t, 3, h.proxy.sessionCount(), "a repeat request minted a second worker for one identity and task")
 }
 
+// A caller whose token cannot ANCHOR is refused before the upstream is spawned.
+//
+// On a task-anchored route, an authenticated declaring caller carrying no mcp.task_id resolves a
+// non-empty session-fallback anchor, so it keys a worker perfectly well — and the engine then hard
+// denies every enforced call on it (anchorUnresolved), forever. Without this gate that is one
+// subprocess per identity, forked to serve traffic of which nothing is servable, and the deciding
+// fact was knowable from the claims before the fork.
+func TestFirstRequestCreation_AnUnanchorableCallerIsRefusedBeforeTheSpawn(t *testing.T) {
+	t.Parallel()
+	h := newDeclaringHostHarnessAnchored(t, true)
+
+	// tokenFor leaves mcp.task_id genuinely absent, which is the shape the engine refuses.
+	resp := h.call(t, "agent-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+	assert.Contains(t, resp.body, capability.ErrCodeMissingContext,
+		"an unanchorable caller must get the engine's own verdict, not a second wording of it")
+	assert.Zero(t, h.proxy.sessionCount(), "a caller nothing can serve must not hold a worker")
+	// The sharp assertion, as the kill gate has: refused one gate later still denies the call, so
+	// asserting on the denial alone would pass with the whole spawn still happening.
+	assert.Nil(t, h.upstreamSaw(mcp.MethodInitialize),
+		"the upstream was contacted for a caller whose every enforced call the engine then denies")
+
+	// The same route serves the same identity the moment its token carries a task, so the refusal
+	// is about the anchor rather than about a route that cannot serve anyone.
+	anchored := h.callAs(t, "agent-1", "task-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+	require.Equal(t, http.StatusOK, anchored.status, "body: %s", anchored.body)
+	assert.Equal(t, 1, h.proxy.sessionCount())
+
+	// And it is on the tape, under the engine's own code: the record an operator reads at this
+	// gate is the one they would have read per call without it.
+	var anchorDenies int
+	for _, rec := range h.tape(t) {
+		if code, _ := rec["denial_code"].(string); code != capability.ErrCodeMissingContext {
+			continue
+		}
+		d, _ := rec["details"].(map[string]interface{})
+		if reason, _ := d["reason"].(string); reason == "no_task_id" {
+			anchorDenies++
+		}
+	}
+	assert.Equal(t, 1, anchorDenies, "the pre-spawn anchor refusal must be recorded exactly once")
+}
+
+// A SESSION-anchored route is untouched by that gate: a token with no task id is the ordinary
+// shape there, and refusing it would take the default deployment offline.
+func TestFirstRequestCreation_TheAnchorGateIsOnlyForTaskAnchoredRoutes(t *testing.T) {
+	t.Parallel()
+	h := newDeclaringHostHarness(t)
+
+	resp := h.call(t, "agent-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+	require.Equal(t, http.StatusOK, resp.status, "body: %s", resp.body)
+	assert.NotContains(t, resp.body, capability.ErrCodeMissingContext)
+	assert.Equal(t, 1, h.proxy.sessionCount())
+}
+
 // The task-anchored worker key carries BOTH dimensions, asserted on the key itself.
 //
 // The end-to-end cell above proves the lockout is gone; this one pins why, because the failure it

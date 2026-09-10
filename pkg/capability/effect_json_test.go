@@ -263,6 +263,35 @@ func TestEffectDecode_ReplacesRatherThanMerges(t *testing.T) {
 	}
 }
 
+// null is the exception the reset above must not swallow: encoding/json calls an Unmarshaler for
+// a null too, and this package's convention (Constraint.UnmarshalJSON, applied by both wrappers
+// and by ArgumentSchema) is that such a call leaves the destination alone. The two effect
+// decoders reset FIRST, so a null wiped a reused value while every sibling preserved it.
+func TestEffectDecode_NullIsANoOp(t *testing.T) {
+	var e EffectContract
+	if err := json.Unmarshal([]byte(`{"class":"irreversible","ref":"pinned"}`), &e); err != nil {
+		t.Fatalf("first decode: %v", err)
+	}
+	if err := json.Unmarshal([]byte("null"), &e); err != nil {
+		t.Fatalf("null decode: %v", err)
+	}
+	if want := (EffectContract{Class: EffectIrreversible, Ref: "pinned"}); !reflect.DeepEqual(e, want) {
+		t.Errorf("a null decode left %+v, want %+v — null is a no-op in this package", e, want)
+	}
+
+	var c EffectCeiling
+	if err := json.Unmarshal([]byte(`{"maxEffectClass":"reversible","onExceed":"deny"}`), &c); err != nil {
+		t.Fatalf("first ceiling decode: %v", err)
+	}
+	before := c
+	if err := json.Unmarshal([]byte("null"), &c); err != nil {
+		t.Fatalf("null ceiling decode: %v", err)
+	}
+	if !reflect.DeepEqual(c, before) {
+		t.Errorf("a null decode left %+v, want %+v — null is a no-op in this package", c, before)
+	}
+}
+
 // Strictness comes from ONE decoder per block, which works only because dropping the
 // outermost type's method set lets DisallowUnknownFields recurse into the nested types
 // itself. A nested type that grew its own UnmarshalJSON would silently opt its whole subtree

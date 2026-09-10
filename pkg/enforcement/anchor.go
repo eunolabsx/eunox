@@ -111,6 +111,27 @@ func (e *Engine) anchorUnresolved(req *capability.EnforceRequest) bool {
 	return !ok
 }
 
+// UnanchorableDenial is the verdict for an authenticated caller a task-anchored policy cannot
+// anchor: a token was presented and it carries no usable mcp.task_id (see anchorUnresolved).
+//
+// Exported because a transport can reach that conclusion from the same claims BEFORE the engine
+// ever sees a request — early enough to refuse without spawning an upstream whose every call this
+// verdict would then deny — and a second wording of it there would put two different findings on
+// the tape for one fact.
+//
+// BlockOverride: a downgradable refusal is FORWARDED on an audit-only constraint, and the observe
+// path's antecedent recorder would then key this call's labels and sequence marker on the SESSION
+// anyway — the very split this refusal exists to reject.
+func UnanchorableDenial() capability.DenialInfo {
+	return capability.DenialInfo{
+		Code:          capability.ErrCodeMissingContext,
+		ConditionType: string(AnchorKindTask),
+		BlockOverride: true,
+		Message:       "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
+		Details:       map[string]interface{}{"anchor": string(AnchorKindTask), "reason": "no_task_id"},
+	}
+}
+
 // anchoredKey builds a counter/store key for this request's anchor: route namespace, then
 // anchor, then the bucket-specific tail. The one place the anchor is spliced in, so a new
 // piece of state can't accidentally land on session keying while everything else follows the

@@ -872,6 +872,36 @@ func TestGenerateAndPersistAuditKey_CreateRaceReadsWinnerKey(t *testing.T) {
 	}
 }
 
+// TestGenerateAndPersistAuditKey_CreateRaceSurvivesAWrappedLinkError pins the race arm on
+// errors.Is rather than os.IsExist.
+//
+// os.IsExist does not unwrap, and osLink is a swappable seam — so nothing but a comment held the
+// arm's raw-*os.LinkError assumption. A %w wrap there (the natural edit, and what every other
+// error on this path already does) would turn the benign lost-create race into a hard startup
+// failure for the loser, on a path whose whole job is converging two concurrent starters on one
+// key. The same trap LoadOrCreateKeys states twice for the ENOENT side.
+func TestGenerateAndPersistAuditKey_CreateRaceSurvivesAWrappedLinkError(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+
+	winner := nonZeroTestKey()
+	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(winner)+"\n"), 0o600); err != nil {
+		t.Fatalf("pre-publish winner key: %v", err)
+	}
+
+	orig := osLink
+	t.Cleanup(func() { osLink = orig })
+	osLink = func(string, string) error { return fmt.Errorf("linking audit key: %w", os.ErrExist) }
+
+	got, err := generateAndPersistAuditKey(keyPath)
+	if err != nil {
+		t.Fatalf("a WRAPPED EEXIST must still be read as the create race, not a failure: %v", err)
+	}
+	if len(got) != 1 || !bytes.Equal(got[0], winner) {
+		t.Fatal("create-race path must return the pre-published winner key, not a fresh one")
+	}
+}
+
 // TestReadLastAuditLine_OffsetTailWindow covers the size > maxTail branch of
 // readLastAuditLine: a log larger than the 4 MiB tail window must read only the
 // trailing window (start = size - maxTail) and still return the true last line.

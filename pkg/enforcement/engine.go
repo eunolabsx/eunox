@@ -1324,17 +1324,7 @@ func (e *Engine) evaluateMatched(ctx context.Context, ec evalCtx) (resp capabili
 	// caller split its own taint, budgets and antecedents across two buckets by
 	// alternating tokens — see anchorUnresolved.
 	if e.anchorUnresolved(ec.req) {
-		return ec.deny(nil, capability.DenialInfo{
-			Code:          capability.ErrCodeMissingContext,
-			ConditionType: string(AnchorKindTask),
-			// BlockOverride: a downgradable refusal is FORWARDED on an audit-only constraint, and
-			// the observe path's antecedent recorder would then key this call's labels and
-			// sequence marker on the SESSION anyway — the very split this check exists to
-			// refuse.
-			BlockOverride: true,
-			Message:       "this route anchors enforcement state on the task, but the presented token carries no mcp.task_id; refusing rather than accounting this call against a second, session-keyed bucket (fail closed)",
-			Details:       map[string]interface{}{"anchor": string(AnchorKindTask), "reason": "no_task_id"},
-		})
+		return ec.deny(nil, UnanchorableDenial())
 	}
 
 	// Peek the incoming accumulated flow-label set up front (only for flow-relevant

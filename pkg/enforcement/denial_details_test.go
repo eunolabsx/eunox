@@ -465,6 +465,59 @@ func TestBoundDenialDetails_ReservedMarkerIsNotForgeable(t *testing.T) {
 	}
 }
 
+// TestBoundDenialDetails_TruncatedKeyCollisionIsMarked pins that two distinct keys sharing one
+// bounded spelling cannot make an entry vanish.
+//
+// Keys at this depth are caller-supplied (Details["value"] is an echoed argument object), and the
+// bounded spelling is a prefix plus the original LENGTH — so two same-length keys agreeing on that
+// prefix truncate to one string. The second write then replaced the first in the output map with
+// no marker and both still charged against the budget, which is the silent omission this file's
+// marker convention exists to rule out: an attacker could make one echoed entry disappear from the
+// signed record while the count claimed nothing was cut.
+func TestBoundDenialDetails_TruncatedKeyCollisionIsMarked(t *testing.T) {
+	t.Parallel()
+
+	// Same length, sharing every byte the truncation keeps, so both bound to one spelling.
+	prefix := strings.Repeat("a", 2*maxDenialDetailStringLen)
+	first, second := prefix+"1", prefix+"2"
+	bounded := boundDetailString(first)
+	if bounded != boundDetailString(second) {
+		t.Fatalf("test setup: the two keys bound to different spellings (%q vs %q)", bounded, boundDetailString(second))
+	}
+
+	for _, tc := range []struct {
+		name string
+		out  map[string]interface{}
+	}{
+		{"top level", BoundDenialDetails(map[string]interface{}{first: "kept", second: "shadowing"})},
+		{"nested", func() map[string]interface{} {
+			out := BoundDenialDetails(map[string]interface{}{
+				"value": map[string]interface{}{first: "kept", second: "shadowing"},
+			})
+			nested, _ := out["value"].(map[string]interface{})
+			return nested
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.out == nil {
+				t.Fatal("want the object preserved")
+			}
+			// Sorted order decides which survives, so the loser is named rather than guessed at.
+			if got := tc.out[bounded]; got != "kept" {
+				t.Errorf("out[<bounded key>] = %#v, want the FIRST key's value: a colliding later key must not overwrite it", got)
+			}
+			marker, ok := tc.out[DenialDetailElidedKey].(string)
+			if !ok {
+				t.Fatalf("out[%q] = %#v, want a marker naming the dropped entry — a silent overwrite is the omission the convention forbids",
+					DenialDetailElidedKey, tc.out[DenialDetailElidedKey])
+			}
+			if want := "1 of 2 entries elided"; marker != want {
+				t.Errorf("elision marker = %q, want %q", marker, want)
+			}
+		})
+	}
+}
+
 // TestCeilingRefusalDetailsAreBounded pins that BOTH effect-ceiling outcomes go through
 // the shared response constructors, which is where boundDenialDetails runs.
 //

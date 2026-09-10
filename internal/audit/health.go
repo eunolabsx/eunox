@@ -46,10 +46,16 @@ import "errors"
 // subsystem answering the same seam reported an outage from ITS zero value. One seam whose two
 // implementations fail in opposite directions is a seam with no rule.
 type Health struct {
-	// Present reports that there IS a sink behind this reading. False means the sample was taken of
-	// nothing: the counters below are zero because nothing was measured, not because nothing was
-	// lost, which is the distinction a consumer rendering them needs — and the reason this is a
-	// field rather than a nil sample.
+	// Present reports that there IS a sink behind this reading — one that RECORDS, which is the
+	// only kind this sample can be about. False means the sample was taken of nothing: the counters
+	// below are zero because nothing was measured, not because nothing was lost, which is the
+	// distinction a consumer rendering them needs — and the reason this is a field rather than a nil
+	// sample.
+	//
+	// A verify-only Sink (NewVerifier, or the zero value) is therefore NOT present: it opens no log
+	// and writes nothing, so answering true would report a fully healthy trail for a sink recording
+	// none — the same reading the nil case was given this field to stop, one constructor along, and
+	// the one spot where "the zero value fails safe" would not hold in this package.
 	//
 	// Not the kind of field the doc below refuses. That argument is about carrying a VERDICT beside
 	// the counters it should be derived from; this is an input to the verdict, and the only
@@ -76,8 +82,8 @@ type Health struct {
 	MaintenanceReason  string
 }
 
-// Health samples this sink's operational state. A nil sink answers the zero value — not present,
-// and therefore degraded — for the reason stated on
+// Health samples this sink's operational state. A nil sink — and a verify-only one, which records
+// nothing — answers not present, and therefore degraded, for the reason stated on
 // the type — nil-safe deliberately, so a consumer holding an optional sink takes one reading
 // through the same call rather than branching before it and answering for absence itself.
 //
@@ -88,7 +94,10 @@ func (s *Sink) Health() Health {
 	if s == nil {
 		return Health{}
 	}
-	h := Health{Present: true, Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
+	// The record CHANNEL, not the log file: s.f is owned by the drainer (rotate reassigns it), so
+	// reading it here would race every rotation, while s.records is written once in New and is
+	// precisely what separates a recording sink from a verify-only one.
+	h := Health{Present: s.records != nil, Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
 	h.MaintenanceStalled, h.MaintenanceReason = s.maintenanceStalled()
 	return h
 }

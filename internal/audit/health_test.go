@@ -95,3 +95,30 @@ func TestHealth_AbsenceIsPartOfTheSample(t *testing.T) {
 	assert.Zero(t, h.Dropped+h.WriteFailures)
 	assert.False(t, h.MaintenanceStalled)
 }
+
+// TestHealth_AVerifierIsNotPresent extends absence from the nil case to the other sink that
+// records nothing.
+//
+// A NewVerifier sink (and the zero value) opens no log and writes nothing, yet answered Present
+// with zero counters — a fully healthy verdict for a sink recording no trail at all, which is the
+// exact reading Present was added to stop one constructor along, and the one place in this package
+// where the zero value would not fail safe.
+func TestHealth_AVerifierIsNotPresent(t *testing.T) {
+	t.Parallel()
+
+	for name, s := range map[string]*Sink{
+		"verifier":   NewVerifier([][]byte{[]byte("0123456789abcdef0123456789abcdef")}),
+		"zero value": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := s.Health()
+			assert.False(t, h.Present, "a sink that records nothing is a reading taken of no trail")
+			require.Error(t, h.HealthStatus())
+			assert.Contains(t, h.HealthStatus().Error(), "no audit sink")
+		})
+	}
+
+	// And the reading a RECORDING sink gives is unchanged, which is what keeps the field about
+	// having a trail rather than about which constructor built the value.
+	assert.True(t, openHealthSink(t).Health().Present)
+}

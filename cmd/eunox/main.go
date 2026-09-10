@@ -2048,8 +2048,8 @@ func terminatorFired(fs *flag.FlagSet, args []string, consumed int) bool {
 // bindExposesAllInterfaces reports whether bindHost (already stripped of any surrounding
 // IPv6 brackets) will make the listener accept connections on every interface. Comparing
 // the PARSED address catches every unspecified-address spelling ("0.0.0.0", "::", "::0",
-// …) uniformly. net.ParseIP alone misses inet_aton-style integer hosts ("0", "0x0") that a
-// cgo resolver's getaddrinfo still resolves to 0.0.0.0, so those are decoded separately.
+// …) uniformly. net.ParseIP alone misses the inet_aton-style hosts a cgo resolver's
+// getaddrinfo still resolves to 0.0.0.0, so those are decoded separately.
 // Deliberately no DNS lookup: resolving an operator-supplied name would be background
 // network activity for a check that must work offline.
 func bindExposesAllInterfaces(bindHost string) bool {
@@ -2060,12 +2060,37 @@ func bindExposesAllInterfaces(bindHost string) bool {
 		// An empty host in "host:port" means all interfaces to net.Listen.
 		return true
 	}
-	// strconv handles the 0x / 0o / leading-0 bases the resolver accepts; a parse failure
-	// means this is a name, not an integer.
-	if n, err := strconv.ParseUint(bindHost, 0, 64); err == nil {
-		return n == 0
+	return zeroInetAtonHost(bindHost)
+}
+
+// zeroInetAtonHost reports whether host is an inet_aton spelling of 0.0.0.0 that net.ParseIP
+// rejects.
+//
+// inet_aton — the parse getaddrinfo falls back to, and the whole reason this check cannot stop at
+// net.ParseIP — accepts ONE to FOUR dot-separated parts, each in any C integer base. So "0",
+// "0x0", "0.0", "0.0.0" and "00.0.0.0" all resolve to 0.0.0.0 while ParseIP rejects every one of
+// them (Go's IP grammar wants four decimal parts with no leading zeros). Reading only the
+// single-part form left the PARTIAL-dotted spellings binding every interface with no refusal on a
+// cgo-resolver build, which is the case the integer arm existed for.
+//
+// Only the ALL-ZERO composition is flagged, and that is exact rather than conservative: each part
+// occupies its own bit field of the assembled address, so no non-zero part composes to 0.0.0.0.
+// strconv's grammar is slightly WIDER than inet_aton's (it takes Go's "0b0" and "0_0"), so a
+// spelling the resolver would reject can be refused here — the fail-closed direction, and it costs
+// an operator who wrote one a --unsafe-bind-all.
+func zeroInetAtonHost(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) > 4 {
+		return false
 	}
-	return false
+	for _, part := range parts {
+		n, err := strconv.ParseUint(part, 0, 64)
+		if err != nil || n != 0 {
+			// A parse failure means this is a name, not an inet_aton address.
+			return false
+		}
+	}
+	return true
 }
 
 // openGuardedOutput opens path for a TRUNCATING write at mode 0600, refusing anything that is

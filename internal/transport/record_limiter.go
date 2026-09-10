@@ -81,6 +81,14 @@ const (
 	// on this transport — a 2026-07-28 host's sessionless POST, which negotiates fine and then finds
 	// no session and no way to create one.
 	catUnservable refusalCategory = "unservable_revision"
+	// catUnanchorable bounds the pre-spawn refusal for a declaring caller whose validated token
+	// cannot anchor on a task-anchored route. Its own bucket, not catUnservable's: that one is
+	// reachable with NO credential at all, so sharing would let the free flood elide the record
+	// saying an authenticated caller is repeatedly presenting a token this route can never serve —
+	// which is a configuration finding an operator has to act on. Metered for catAudience's reason,
+	// which is the same shape: one valid token drives one record per request, with no session
+	// created and no upstream spawned.
+	catUnanchorable refusalCategory = "unanchorable_first_request"
 	// catSessionGate bounds the per-session gate refusals — the audience pin and the owner binding —
 	// on an already-resolved session. Metered because session creation on the first enforced request
 	// makes a declaring peer's worker id DERIVABLE from its own claims, so any caller who can name a
@@ -147,7 +155,7 @@ var exemptRefusals = map[refusalCategory]string{
 var allRefusalCategories = []refusalCategory{
 	catOrigin, catJWT, catAuth, catControl, catLoopback, catBody, catContentType,
 	catSaturation, catKill, catAudience, catRevision, catHeaderMismatch, catUnservable,
-	catSessionGate, catUnroutable, catSmuggled, catServerRequestFailed,
+	catUnanchorable, catSessionGate, catUnroutable, catSmuggled, catServerRequestFailed,
 	catUndeliveredForward, catUnroutableID, catDisplaced, catRefusalUndeliverable,
 	catUntranslatableServerRequest,
 }

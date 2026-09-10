@@ -2592,7 +2592,10 @@ conventional:
    of that split is a fail-open. An operator who enables this has an IdP minting the claim;
    a token without it on such a route is a misconfiguration the proxy cannot account for
    safely. eunox prints a startup notice if the option is on with no JWT validation
-   configured at all, since it would then do nothing.
+   configured at all, since it would then do nothing. On a revision with no handshake, where
+   the first enforced request is what mints the worker owning the upstream, that denial is
+   taken **before** the spawn — the deciding fact is in the claims, so a token that can never
+   anchor on this route forks no subprocess to be denied on.
 
 On such a route the **subject** a `maxCalls`, cumulative `blastRadius` or `sequenceBlock`
 bound is keyed on is the anchor, not the session: a request carrying a validated `task_id` and

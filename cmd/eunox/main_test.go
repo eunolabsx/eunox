@@ -3758,11 +3758,15 @@ func TestAuditSink_NormalWrite_StillWorks(t *testing.T) {
 // The guard used to test net.ParseIP alone, which is a narrower grammar than
 // getaddrinfo: "0" and hex/octal shorthands are not Go IP literals, so ParseIP returned
 // nil, the guard was skipped entirely, and on a cgo-resolver build the listener bound
-// every interface with no opt-in and no warning.
+// every interface with no opt-in and no warning. The integer arm that closed that read
+// only the SINGLE-part form, so inet_aton's partial-dotted spellings ("0.0", "0.0.0")
+// walked through the same hole.
 func TestBindExposesAllInterfaces(t *testing.T) {
 	exposed := []string{
 		"0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0", // IP literals ParseIP already caught
 		"0", "00", "0x0", "0X0", "0o0", // inet_aton-style integer forms it did not
+		"0.0", "0.0.0", // inet_aton's PARTIAL-dotted forms: getent hosts 0.0 -> 0.0.0.0
+		"00.0.0.0", "0x0.0.0.0", "0.0x0", // per-part bases, which Go's IP grammar rejects outright
 		"", // empty host in "host:port" means all interfaces
 	}
 	for _, h := range exposed {
@@ -3772,9 +3776,13 @@ func TestBindExposesAllInterfaces(t *testing.T) {
 	}
 	confined := []string{
 		"127.0.0.1", "::1", "localhost", "192.168.1.10", "example.com",
-		"0.0.0.1", // numerically nonzero
-		"1",       // inet_aton 0.0.0.1, not unspecified
-		"0abc",    // a name, not an integer
+		"0.0.0.1",   // numerically nonzero
+		"1",         // inet_aton 0.0.0.1, not unspecified
+		"0abc",      // a name, not an integer
+		"0.1",       // partial-dotted but nonzero: inet_aton 0.0.0.1
+		"0.0.0.0.0", // five parts: inet_aton takes at most four, so this is a name
+		"0.a",       // one part is not an integer, so the whole is a name
+		"0.",        // trailing dot leaves an empty part, which parses as nothing
 	}
 	for _, h := range confined {
 		if bindExposesAllInterfaces(h) {

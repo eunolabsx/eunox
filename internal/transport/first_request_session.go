@@ -239,8 +239,9 @@ func safeKeyComponent(s string) string {
 // generation is captured BEFORE anything that can block, the kill switch is consulted before an
 // upstream is spawned, the audience pin before that spawn is a side effect a cross-audience token
 // caused, and `--require-audit=strict` before a privileged action runs untraceably. What differs
-// is only that the identity is required first — with no credential there is no worker key, so
-// there is nothing for the later gates to be about.
+// is at the two ENDS: the identity is required first — with no credential there is no worker key,
+// so there is nothing for the later gates to be about — and the anchor is required last, that gate
+// being this path's alone (see creationAnchorDenial).
 func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, route *UpstreamRoute, rev capability.Revision, msg mcp.RPCMsg) *httpSession {
 	// Captured before anything that can block, for registerSession's reason: a kill sweep
 	// landing inside the creation window must not let this worker register into the fresh map.
@@ -294,6 +295,10 @@ func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, 
 		writeDispatchResult(w, denied)
 		return nil
 	}
+	if denied, blocked := p.creationAnchorDenial(ctx, route, msg, identifier, method); blocked {
+		writeDispatchResult(w, denied)
+		return nil
+	}
 	return p.createFirstRequestSession(ctx, w, r, route, key, rev, startGen)
 }
 
@@ -332,6 +337,46 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 		return nil
 	}
 	return sess
+}
+
+// creationAnchorDenial refuses a declaring request whose validated claims this route cannot anchor
+// — task anchoring is on and the token carries no mcp.task_id — before the upstream is spawned.
+//
+// The deciding fact is knowable from the claims alone, and the engine hard-denies every enforced
+// call for it (see enforcement.UnanchorableDenial), so without this gate an authenticated caller
+// forks one subprocess per identity to serve traffic of which nothing is servable. Scoped to THIS
+// path rather than to session creation generally: the worker key is derived from the resolved
+// anchor, so an unanchorable request maps to a worker only unanchorable requests can ever reach,
+// while a session-creating `initialize` must spawn to answer the handshake and its session goes on
+// to serve later requests whose own tokens may carry a task id.
+//
+// LAST of the four pre-spawn gates, below kill, audience and strict-audit rather than beside the
+// identity check above them: those three each name a caller who tried to cause the spawn and must
+// keep the record, while this one names a deployment/token mismatch that is permanent and will be
+// reported on the caller's next request too.
+//
+// The verdict is the ENGINE's own, not a second wording of it, so the record an operator reads at
+// this gate and the per-call records they read without it are one finding.
+func (p *HTTPProxy) creationAnchorDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg, identifier, method string) (mcp.RPCMsg, bool) {
+	// Only the claims and the route's own setting — no engine, no request: this runs before there
+	// is anything to decide, which is the whole point of deciding it here.
+	if route == nil || !route.taskAnchored {
+		return mcp.RPCMsg{}, false
+	}
+	claims := pdp.JWTClaimsPtr(ctx)
+	if claims == nil {
+		// No token at all anchors on the session, exactly as the engine's fallback does — and this
+		// path already refused an unkeyable caller above, so this is the defensive arm.
+		return mcp.RPCMsg{}, false
+	}
+	if _, ok := pdp.TaskAnchor(claims); ok {
+		return mcp.RPCMsg{}, false
+	}
+	d := enforcement.UnanchorableDenial()
+	if rec := p.preSessionRefusalRecorders(route).forCategory(catUnanchorable); rec != nil {
+		rec.RecordDeny(ctx, "", identifier, method, d.Code, d.ConditionType, d.Details, false)
+	}
+	return denialResult(msg.ID, d.Code, d.ConditionType, method, ""), true
 }
 
 // refuseUnkeyableFirstRequest answers a declaring request that presented no stable identity.

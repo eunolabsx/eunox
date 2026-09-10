@@ -146,6 +146,14 @@ func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
 	out := make(map[string]interface{}, len(keys)+1)
 	for _, k := range keys {
 		bk := escapeReservedDetailKey(boundDetailString(k))
+		if _, taken := out[bk]; taken {
+			// Two distinct keys can share one bounded spelling (same kept prefix, same original
+			// length), and the caller supplies keys at this depth — so writing the second would let
+			// an echoed entry silently REPLACE another on the signed record, which is the omission
+			// this file's marker convention exists to rule out. Counted as an elision instead.
+			elided++
+			continue
+		}
 		budget := share - len(bk)
 		out[bk] = boundDetailValue(in[k], &budget, 0)
 	}
@@ -177,19 +185,27 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 	sort.Strings(keys)
 
 	out := make(map[string]interface{}, len(keys))
+	// Keys dropped because their bounded spelling was already written — counted, never silently
+	// overwritten, for BoundDenialDetails' reason. Added to every marker below so "written plus
+	// elided equals len(in)" holds on whichever exit this level takes.
+	collided := 0
 	for i, k := range keys {
 		bk := escapeReservedDetailKey(boundDetailString(k))
 		*budget -= len(bk)
 		if *budget < 0 {
 			// ONE marker naming the elision, not one per dropped key — a per-key marker would
 			// itself be proportional to the input.
-			out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-i, len(in))
+			out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-i+collided, len(in))
 			return out
+		}
+		if _, taken := out[bk]; taken {
+			collided++
+			continue
 		}
 		out[bk] = boundDetailValue(in[k], budget, depth)
 	}
-	if len(keys) < len(in) {
-		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-len(keys), len(in))
+	if dropped := len(in) - len(keys) + collided; dropped > 0 {
+		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", dropped, len(in))
 	}
 	return out
 }

@@ -204,7 +204,12 @@ func generateAndPersistAuditKey(keyPath string) ([][]byte, error) {
 	}
 
 	if err := osLink(tmpName, keyPath); err != nil {
-		if os.IsExist(err) {
+		// errors.Is, not os.IsExist, for the reason LoadOrCreateKeys states for the ENOENT side:
+		// the predicate does not unwrap, and osLink is a swappable seam (var osLink = os.Link), so
+		// nothing holds it to the raw *os.LinkError this arm would otherwise depend on. A %w wrap
+		// there would turn the benign lost-create race — two proxies starting on one key path,
+		// converging on the winner's key — into a startup failure.
+		if errors.Is(err, fs.ErrExist) {
 			// Another process linked first; read and return its key. No syncDir: the
 			// race winner owns the directory-entry fsync.
 			return readPublishedAuditKeys(keyPath, "after create race")

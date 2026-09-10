@@ -93,6 +93,13 @@ type (
 // UnmarshalJSON deserializes an EffectContract and everything under it, refusing an unknown
 // or ambiguous key at any depth.
 func (e *EffectContract) UnmarshalJSON(data []byte) error {
+	// null is a NO-OP, ahead of the reset: this package's convention (stated on
+	// Constraint.UnmarshalJSON, applied by both wrappers and by ArgumentSchema) is that a null
+	// leaves the destination alone, which the reset below would otherwise turn into a wipe at the
+	// same exported seam the reset exists for.
+	if string(data) == "null" {
+		return nil
+	}
 	// Reset first: encoding/json MERGES into a non-zero destination, so re-decoding a
 	// reused value would carry fields the new document does not declare — including a
 	// stale ref, an integrity pin over content that is no longer there. Constraint's own
@@ -103,6 +110,10 @@ func (e *EffectContract) UnmarshalJSON(data []byte) error {
 
 // UnmarshalJSON deserializes an EffectCeiling, refusing an unknown or ambiguous key.
 func (c *EffectCeiling) UnmarshalJSON(data []byte) error {
+	// null is a no-op ahead of the reset, for EffectContract.UnmarshalJSON's reason.
+	if string(data) == "null" {
+		return nil
+	}
 	*c = EffectCeiling{}
 	return decodeStrictEffectBlock(data, (*effectCeilingFields)(c), reflect.TypeOf(EffectCeiling{}), "effectCeiling")
 }

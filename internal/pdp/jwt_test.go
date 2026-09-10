@@ -6472,6 +6472,92 @@ func TestJWTPDP_CheckKill_UnionsBothManagers(t *testing.T) {
 	}
 }
 
+// audiencePinningPDP is an inner PDP that pins an audience of its own — the third-party shape the
+// PolicyDecisionPoint contract exists for, and one no in-tree inner has (every one of them returns
+// nil, so only a double can observe the composition).
+type audiencePinningPDP struct {
+	denyAllPDP
+	deny *capability.EnforceResponse
+}
+
+func (p audiencePinningPDP) CheckAudience(_ context.Context) *capability.EnforceResponse {
+	return p.deny
+}
+
+// TestJWTPDP_CheckAudience_UnionsBothPins is CheckKill's union one gate over: CheckAudience is the
+// same pre-spawn check, on the one method that does not flow through Decide, so consulting the
+// wrapper's pin alone let an inner PDP's own audience go unenforced at session creation — the one
+// point it decides nothing — while every call it later decided was still gated by it.
+func TestJWTPDP_CheckAudience_UnionsBothPins(t *testing.T) {
+	key := newTestKey(t, "k1")
+	srv := makeJWKSServer(t, key)
+	defer srv.Close()
+
+	validator := NewJWTPDP(JWTPDPOptions{
+		JWKSURI:                  srv.URL + "/",
+		AllowAnyIssuer:           true,
+		AcceptedAudiences:        []string{"svc-a", "svc-b"},
+		ExperimentalCapabilities: true,
+	})
+	token := makeIDPToken(t, key, []string{"tool:read_file"}, "", "svc-a", "agent-1", time.Now().Add(time.Hour))
+	ctx, err := validator.ValidateToken(context.Background(), "Bearer "+token)
+	if err != nil {
+		t.Fatalf("ValidateToken: %v", err)
+	}
+
+	innerDeny := &capability.EnforceResponse{
+		Decision: capability.DecisionDeny,
+		Denial:   &capability.DenialInfo{Code: capability.ErrCodeAuthorizationFailed, Message: "inner pin"},
+	}
+	cases := []struct {
+		name      string
+		routeAud  string
+		inner     PolicyDecisionPoint
+		wantDeny  bool
+		wantInner bool
+	}{
+		{name: "neither pin refuses", routeAud: "svc-a", inner: audiencePinningPDP{}},
+		{
+			// The wiring the gap was about: the wrapper pins nothing, so the inner's pin is the
+			// only one there is.
+			name:  "wrapper pins nothing, inner refuses",
+			inner: audiencePinningPDP{deny: innerDeny}, wantDeny: true, wantInner: true,
+		},
+		{
+			name: "wrapper's pin passes, inner refuses", routeAud: "svc-a",
+			inner: audiencePinningPDP{deny: innerDeny}, wantDeny: true, wantInner: true,
+		},
+		{
+			// The wrapper's own refusal short-circuits, so the record names the route pin that
+			// actually failed rather than the inner's.
+			name: "wrapper's pin refuses", routeAud: "svc-b",
+			inner: audiencePinningPDP{deny: innerDeny}, wantDeny: true,
+		},
+		{name: "no inner at all", routeAud: "svc-a"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wrapper := NewJWTPDPWithCache(JWTPDPOptions{
+				AllowAnyIssuer:           true,
+				RouteAudience:            tc.routeAud,
+				ExperimentalCapabilities: true,
+				Inner:                    tc.inner,
+			}, validator.Cache())
+
+			deny := wrapper.CheckAudience(ctx)
+			if (deny != nil) != tc.wantDeny {
+				t.Fatalf("CheckAudience = %+v, want deny = %v", deny, tc.wantDeny)
+			}
+			if tc.wantInner && deny != innerDeny {
+				t.Errorf("CheckAudience = %+v, want the INNER PDP's own refusal verbatim", deny)
+			}
+			if tc.wantDeny && !tc.wantInner && deny == innerDeny {
+				t.Error("the wrapper's own pin failed, so its refusal — not the inner's — must be what a record names")
+			}
+		})
+	}
+}
+
 // decodeJWTClaimsFromToken is the test-side composition of the two steps ValidateToken now
 // performs separately: the payload segment is decoded once there and threaded to both
 // readers, so the whole-token form no longer exists in production.

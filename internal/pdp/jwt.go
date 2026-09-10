@@ -1029,7 +1029,27 @@ func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.En
 // this route's upstream via initialize. Decide/filterList/DecideSampling embed the
 // same pin for enforced actions; this covers the session-creating initialize, which
 // doesn't flow through them. Returns nil when no audience is pinned.
+//
+// UNIONED with the wrapped PDP's, for CheckKill's reason and on the same gate: this is the
+// pre-spawn check for the one method that does not flow through Decide, so consulting only the
+// wrapper's pin let a third-party inner PDP that pins its own audience lose its initialize-time
+// gate the moment it was wrapped — while every enforced call it then decided was still gated.
+// A wrapper with no pin of its own (none configured, or --jwt-allow-any-audience) is exactly the
+// wiring where the inner's is the only one there is, so the delegation is not conditional on this
+// side having pinned anything.
 func (p *JWTPDP) CheckAudience(ctx context.Context) *capability.EnforceResponse {
+	if deny := p.routeAudienceDenial(ctx); deny != nil {
+		return deny
+	}
+	if p.inner != nil {
+		return p.inner.CheckAudience(ctx)
+	}
+	return nil
+}
+
+// routeAudienceDenial is this wrapper's own half of CheckAudience: the per-route pin, with no
+// composition. Split out so the union above reads as the two managers CheckKill's does.
+func (p *JWTPDP) routeAudienceDenial(ctx context.Context) *capability.EnforceResponse {
 	if p.routeAudience == "" || p.allowAnyAudience {
 		return nil
 	}
