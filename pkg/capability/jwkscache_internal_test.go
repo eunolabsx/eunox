@@ -53,6 +53,60 @@ func TestIsLoopbackHost(t *testing.T) {
 	}
 }
 
+// TestIsUnspecifiedHost covers every spelling a RESOLVER reads as the wildcard, not just the ones
+// Go's IP-literal grammar accepts — the gap that let `bind: 0.0` listen on every interface with no
+// --unsafe-bind-all and then be added to the Origin allowlist as an ordinary hostname.
+func TestIsUnspecifiedHost(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		// Go IP literals.
+		{"0.0.0.0", true},
+		{"::", true},
+		{"::0", true},
+		{"0:0:0:0:0:0:0:0", true},
+		{"::ffff:0.0.0.0", true}, // the 4-in-6 spelling of the same address
+		// ZONED: net.ParseIP rejects a zone outright, while net.Listen binds the wildcard.
+		{"::%lo", true},
+		{"::0%eth0", true},
+		// inet_aton, which getaddrinfo falls back to: one to four parts, any C integer base.
+		{"0", true},
+		{"00", true},
+		{"0x0", true},
+		{"0X0", true},
+		{"0o0", true},
+		{"0.0", true},
+		{"0.0.0", true},
+		{"00.0.0.0", true},
+		{"0x0.0.0.0", true},
+		{"0.0x0", true},
+		// Not the wildcard.
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"fe80::1%eth0", false},
+		{"192.168.1.10", false},
+		{"localhost", false},
+		{"example.com", false},
+		{"0.0.0.1", false}, // dotted but nonzero
+		{"1", false},       // inet_aton 0.0.0.1
+		{"0.1", false},     // partial-dotted but nonzero
+		{"0abc", false},    // a name, not an integer
+		{"0.a", false},     // one part is not an integer, so the whole is a name
+		{"0.0.0.0.0", false},
+		{"0.", false}, // a trailing dot leaves an empty part, which parses as nothing
+		// Empty is a net.Listen semantic ("all interfaces" in "host:port"), not an address
+		// spelling, so it is the bind gate's own case rather than this predicate's — answering
+		// true here would add nothing and would make the Origin allowlist's "" arm ambiguous.
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := IsUnspecifiedHost(tc.host); got != tc.want {
+			t.Errorf("IsUnspecifiedHost(%q) = %v, want %v", tc.host, got, tc.want)
+		}
+	}
+}
+
 // TestJWKSCache_ForceRefresh_BypassesTTL verifies the force-refresh path that
 // fixes the kid-miss-during-rotation gap: GetKeys and Refresh
 // serve from cache while within the TTL, but ForceRefresh always issues an HTTP

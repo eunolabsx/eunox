@@ -94,13 +94,19 @@ func (s *Sink) Health() Health {
 	if s == nil {
 		return Health{}
 	}
-	// The record CHANNEL, not the log file: s.f is owned by the drainer (rotate reassigns it), so
-	// reading it here would race every rotation, while s.records is written once in New and is
-	// precisely what separates a recording sink from a verify-only one.
-	h := Health{Present: s.records != nil, Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
+	h := Health{Present: s.recording(), Dropped: s.dropped.Load(), WriteFailures: s.writeFailures.Load()}
 	h.MaintenanceStalled, h.MaintenanceReason = s.maintenanceStalled()
 	return h
 }
+
+// recording reports whether this sink has a drainer behind it — a trail records are written to —
+// as opposed to the verify-only shape NewVerifier builds.
+//
+// The record CHANNEL answers it, not the log file: s.f is owned by the drainer (rotate reassigns
+// it), so reading that here would race every rotation, while s.records is written once in the
+// constructor and never again. One predicate rather than two readings of the same field, since
+// Close asks the same question to decide whether there is anything to close and drain.
+func (s *Sink) recording() bool { return s != nil && s.records != nil }
 
 // HealthStatus reports whether the audit trail is operating normally: nil when it is, the cause
 // otherwise. It is the readiness verdict — strictly wider than the enforcement one, and this is the

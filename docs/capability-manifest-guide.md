@@ -2595,7 +2595,10 @@ conventional:
    configured at all, since it would then do nothing. On a revision with no handshake, where
    the first enforced request is what mints the worker owning the upstream, that denial is
    taken **before** the spawn — the deciding fact is in the claims, so a token that can never
-   anchor on this route forks no subprocess to be denied on.
+   anchor on this route forks no subprocess to be denied on. That pre-spawn refusal is scoped to
+   what the engine itself would refuse: a route with no policy at all never blocks, and a
+   locally-answered method (`tools/list` and its siblings, served by the list filter) is still
+   served, so discovery works before a task-scoped token is minted.
 
 On such a route the **subject** a `maxCalls`, cumulative `blastRadius` or `sequenceBlock`
 bound is keyed on is the anchor, not the session: a request carrying a validated `task_id` and

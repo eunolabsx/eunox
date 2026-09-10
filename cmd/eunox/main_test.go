@@ -3767,7 +3767,9 @@ func TestBindExposesAllInterfaces(t *testing.T) {
 		"0", "00", "0x0", "0X0", "0o0", // inet_aton-style integer forms it did not
 		"0.0", "0.0.0", // inet_aton's PARTIAL-dotted forms: getent hosts 0.0 -> 0.0.0.0
 		"00.0.0.0", "0x0.0.0.0", "0.0x0", // per-part bases, which Go's IP grammar rejects outright
-		"", // empty host in "host:port" means all interfaces
+		"::%lo", "::0%eth0", // ZONED: net.ParseIP rejects a zone, net.Listen binds the wildcard
+		"::ffff:0.0.0.0", // the 4-in-6 spelling of the same address
+		"",               // empty host in "host:port" means all interfaces
 	}
 	for _, h := range exposed {
 		if !bindExposesAllInterfaces(h) {
@@ -3776,13 +3778,14 @@ func TestBindExposesAllInterfaces(t *testing.T) {
 	}
 	confined := []string{
 		"127.0.0.1", "::1", "localhost", "192.168.1.10", "example.com",
-		"0.0.0.1",   // numerically nonzero
-		"1",         // inet_aton 0.0.0.1, not unspecified
-		"0abc",      // a name, not an integer
-		"0.1",       // partial-dotted but nonzero: inet_aton 0.0.0.1
-		"0.0.0.0.0", // five parts: inet_aton takes at most four, so this is a name
-		"0.a",       // one part is not an integer, so the whole is a name
-		"0.",        // trailing dot leaves an empty part, which parses as nothing
+		"0.0.0.1",      // numerically nonzero
+		"1",            // inet_aton 0.0.0.1, not unspecified
+		"0abc",         // a name, not an integer
+		"0.1",          // partial-dotted but nonzero: inet_aton 0.0.0.1
+		"0.0.0.0.0",    // five parts: inet_aton takes at most four, so this is a name
+		"0.a",          // one part is not an integer, so the whole is a name
+		"0.",           // trailing dot leaves an empty part, which parses as nothing
+		"fe80::1%eth0", // a zoned address that is not the wildcard
 	}
 	for _, h := range confined {
 		if bindExposesAllInterfaces(h) {

@@ -1030,10 +1030,13 @@ func (p *JWTPDP) CheckKill(ctx context.Context, sessionID string) *capability.En
 // same pin for enforced actions; this covers the session-creating initialize, which
 // doesn't flow through them. Returns nil when no audience is pinned.
 //
-// UNIONED with the wrapped PDP's, for CheckKill's reason and on the same gate: this is the
-// pre-spawn check for the one method that does not flow through Decide, so consulting only the
-// wrapper's pin let a third-party inner PDP that pins its own audience lose its initialize-time
-// gate the moment it was wrapped — while every enforced call it then decided was still gated.
+// UNIONED with the wrapped PDP's, for CheckKill's reason and on the same gates: the pre-spawn
+// check for the one method that does not flow through Decide, and the per-request session gate
+// beside it. Consulting only the wrapper's pin let a third-party inner PDP that pins its own
+// audience lose both the moment it was wrapped — while every enforced call it then decided was
+// still gated by that pin. Unconditional on the inner ENFORCING, exactly as CheckKill is and
+// unlike the Decide* delegations: those compose a policy VERDICT, which a non-enforcing backstop
+// has no business contributing, while this is a boundary the wrapper cannot answer for it.
 // A wrapper with no pin of its own (none configured, or --jwt-allow-any-audience) is exactly the
 // wiring where the inner's is the only one there is, so the delegation is not conditional on this
 // side having pinned anything.

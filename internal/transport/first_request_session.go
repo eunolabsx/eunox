@@ -60,13 +60,16 @@ import (
 	"github.com/eunolabs/eunox/pkg/enforcement"
 )
 
-// firstRequestWorkerKey names the worker a declaring peer's request maps to, and reports whether
-// the caller presented the identity one can be keyed on.
+// firstRequestWorkerKey names the worker a declaring peer's request maps to, hands back the anchor
+// it resolved under, and reports whether the caller presented the identity one can be keyed on.
 //
 // The ANCHOR is resolved through the route's own resolver, so a task-anchored route separates its
 // workers by task exactly as it keys the decision turn and the engine keys its state — one
 // resolution, three consumers, no chance of two of them disagreeing about which subject a request
-// belongs to.
+// belongs to. It is RETURNED rather than kept because the pre-spawn anchor gate needs the same
+// answer: reading the claims a second time there made "can this request anchor" a fourth predicate
+// beside the resolver, the engine's and the turn's, and the copy already disagreed with the engine
+// about a caller whose claims flatten to nothing.
 //
 // The IDENTITY rides alongside it rather than being folded into it, because the anchor is not
 // always as fine as the gates every request on the worker must clear: the task arm resolves the
@@ -75,17 +78,17 @@ import (
 // first mint a worker whose ownerMismatch then refuses every request from the second for that
 // worker's whole life. Sharing an anchor is sharing STATE, which the engine keys on the anchor
 // itself; it was never sharing the upstream and the captured claims a worker owns.
-func firstRequestWorkerKey(route *UpstreamRoute, ctx context.Context) (string, bool) {
+func firstRequestWorkerKey(route *UpstreamRoute, ctx context.Context) (string, enforcement.StateAnchor, bool) {
 	claims := pdp.JWTClaimsPtr(ctx)
 	identity, ok := stableCallerIdentity(claims)
 	if !ok {
-		return "", false
+		return "", enforcement.StateAnchor{}, false
 	}
 	anchor := route.decisionAnchor(identity, claims)
 	if anchor.ID == "" {
-		return "", false
+		return "", enforcement.StateAnchor{}, false
 	}
-	return workerKey(route.name, anchor, identity), true
+	return workerKey(route.name, anchor, identity), anchor, true
 }
 
 // stableCallerIdentity is the correlator a worker and its policy state are keyed on.
@@ -248,7 +251,7 @@ func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, 
 	startGen := p.currentReapGen()
 	ctx := capability.WithProtocolRevision(r.Context(), rev)
 
-	key, ok := firstRequestWorkerKey(route, ctx)
+	key, anchor, ok := firstRequestWorkerKey(route, ctx)
 	if !ok {
 		p.refuseUnkeyableFirstRequest(ctx, w, r, route, rev, msg)
 		return nil
@@ -295,7 +298,7 @@ func (p *HTTPProxy) firstRequestSession(w http.ResponseWriter, r *http.Request, 
 		writeDispatchResult(w, denied)
 		return nil
 	}
-	if denied, blocked := p.creationAnchorDenial(ctx, route, msg, identifier, method); blocked {
+	if denied, blocked := p.creationAnchorDenial(ctx, route, key, anchor, msg, identifier, method); blocked {
 		writeDispatchResult(w, denied)
 		return nil
 	}
@@ -339,44 +342,64 @@ func (p *HTTPProxy) createFirstRequestSession(ctx context.Context, w http.Respon
 	return sess
 }
 
-// creationAnchorDenial refuses a declaring request whose validated claims this route cannot anchor
-// — task anchoring is on and the token carries no mcp.task_id — before the upstream is spawned.
+// creationAnchorDenial refuses a declaring request this route's policy cannot anchor — task
+// anchoring is on and the token carries no mcp.task_id — before the upstream is spawned.
 //
-// The deciding fact is knowable from the claims alone, and the engine hard-denies every enforced
-// call for it (see enforcement.UnanchorableDenial), so without this gate an authenticated caller
-// forks one subprocess per identity to serve traffic of which nothing is servable. Scoped to THIS
-// path rather than to session creation generally: the worker key is derived from the resolved
-// anchor, so an unanchorable request maps to a worker only unanchorable requests can ever reach,
-// while a session-creating `initialize` must spawn to answer the handshake and its session goes on
-// to serve later requests whose own tokens may carry a task id.
+// The deciding fact is knowable from the claims alone, and the engine hard-denies the call for it
+// (see enforcement.UnanchorableDenial), so without this gate an authenticated caller forks one
+// subprocess per identity to serve calls of which none is servable.
+//
+// It STANDS IN for a verdict the engine would reach, so it fires only where that engine exists and
+// only for the requests that reach it. Both halves are load-bearing rather than defensive:
+//
+//   - A POLICYLESS route decides through AlwaysAllowPDP and has no engine at all, while
+//     route.taskAnchored is set from config for every route regardless. Reading the config bool
+//     alone hard-denied a wiretap route whose whole contract is to observe and never block, with a
+//     record citing a verdict no PDP on that route holds.
+//   - A method the tables answer LOCALLY never reaches the engine's anchor check: */list is served
+//     by the filter path, which evaluates no condition. On a revision with no handshake, discovery
+//     IS the first request, so refusing it left a caller unable to see the surface it needs a task
+//     id for — turning what this route serves today into a policy-class deny.
+//
+// The enforced set is read from the dispatch tables (isEnforcedMethod) rather than hand-listed, so
+// a method added to them is covered. The residual that costs: a first-request `resources/unsubscribe`
+// is enforced but decided by MATCH alone, so the engine would not anchor-refuse it — refusing it here
+// takes nothing away, since a worker that does not exist yet holds no subscription to cancel.
+//
+// Scoped to THIS path rather than to session creation generally: the worker key is derived from the
+// resolved anchor, so an unanchorable request maps to a worker only unanchorable requests can ever
+// reach, while a session-creating `initialize` must spawn to answer the handshake and its session
+// goes on to serve later requests whose own tokens may carry a task id.
 //
 // LAST of the four pre-spawn gates, below kill, audience and strict-audit rather than beside the
 // identity check above them: those three each name a caller who tried to cause the spawn and must
 // keep the record, while this one names a deployment/token mismatch that is permanent and will be
-// reported on the caller's next request too.
+// reported on the caller's next request too. gate_order_test.go pins that, since a comment cannot.
 //
-// The verdict is the ENGINE's own, not a second wording of it, so the record an operator reads at
-// this gate and the per-call records they read without it are one finding.
-func (p *HTTPProxy) creationAnchorDenial(ctx context.Context, route *UpstreamRoute, msg mcp.RPCMsg, identifier, method string) (mcp.RPCMsg, bool) {
-	// Only the claims and the route's own setting — no engine, no request: this runs before there
-	// is anything to decide, which is the whole point of deciding it here.
-	if route == nil || !route.taskAnchored {
+// The verdict is the ENGINE's own rather than a second wording of it. What the record cannot carry
+// is the TARGET the per-call deny named: auditIdentity drops the identifier for a method that
+// resolves one, because no policy here resolved a target and stamping the method would fabricate a
+// tool named after it. So the two records name one cause and only the engine's names the tool.
+func (p *HTTPProxy) creationAnchorDenial(ctx context.Context, route *UpstreamRoute, key string, anchor enforcement.StateAnchor, msg mcp.RPCMsg, identifier, method string) (mcp.RPCMsg, bool) {
+	// The anchor the worker key was resolved under, NOT a second reading of the claims: on a
+	// task-anchored route a session-kinded anchor is exactly the engine's anchorUnresolved, since
+	// the identity gate above already refused a caller carrying no claims at all.
+	if !route.taskAnchored || anchor.Kind == enforcement.AnchorKindTask {
 		return mcp.RPCMsg{}, false
 	}
-	claims := pdp.JWTClaimsPtr(ctx)
-	if claims == nil {
-		// No token at all anchors on the session, exactly as the engine's fallback does — and this
-		// path already refused an unkeyable caller above, so this is the defensive arm.
-		return mcp.RPCMsg{}, false
-	}
-	if _, ok := pdp.TaskAnchor(claims); ok {
+	if route.manifest == nil || !isEnforcedMethod(ctx, msg.Method) {
 		return mcp.RPCMsg{}, false
 	}
 	d := enforcement.UnanchorableDenial()
+	// The derived worker key as the subject, for the kill gate's reason: it is eunox's own
+	// derivation from claims a signature validated, it is the subject this refusal is about, and
+	// stamping it is what lets an operator join this record to that caller's other attempts.
 	if rec := p.preSessionRefusalRecorders(route).forCategory(catUnanchorable); rec != nil {
-		rec.RecordDeny(ctx, "", identifier, method, d.Code, d.ConditionType, d.Details, false)
+		rec.RecordDeny(ctx, key, identifier, method, d.Code, d.ConditionType, d.Details, false)
 	}
-	return denialResult(msg.ID, d.Code, d.ConditionType, method, ""), true
+	// refusalResponse, not denialResult: the no-id rule is structural here as it is for the
+	// strict-audit sibling, rather than resting on the caller's IsRequest precondition.
+	return refusalResponse(msg.ID, d.Code, d.ConditionType, method, ""), true
 }
 
 // refuseUnkeyableFirstRequest answers a declaring request that presented no stable identity.

@@ -243,12 +243,14 @@ func buildAllowedOriginHosts(bind string) map[string]bool {
 	// returns the host without them); otherwise a legitimate IPv6 Origin is rejected.
 	b := strings.ToLower(strings.TrimSpace(bind))
 	b = strings.Trim(b, "[]")
-	// Exclude every spelling of the unspecified address via IsUnspecified() rather than a
-	// brittle string match, so an alternate wildcard spelling isn't added to the allowlist.
-	if b != "" {
-		if ip := net.ParseIP(b); ip == nil || !ip.IsUnspecified() {
-			hosts[b] = true
-		}
+	// Exclude every spelling of the unspecified address rather than matching a string, so an
+	// alternate wildcard spelling isn't added to the allowlist. Through capability's predicate,
+	// which is also the one cmd/eunox's --unsafe-bind-all gate asks: a local net.ParseIP test
+	// answered NO for the inet_aton and zoned spellings that gate refuses, so a `bind: 0.0` an
+	// operator had to pass --unsafe-bind-all for was then admitted here as an ordinary hostname —
+	// and a page served from http://0.0 cleared the DNS-rebinding guard.
+	if b != "" && !capability.IsUnspecifiedHost(b) {
+		hosts[b] = true
 	}
 	return hosts
 }

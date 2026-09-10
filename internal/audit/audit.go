@@ -2739,7 +2739,7 @@ func (s *Sink) Close() error {
 		// guard the close: close(nil) panics, and there is nothing to drain or wait on.
 		s.mu.Lock()
 		s.closed = true
-		if s.records != nil {
+		if s.recording() {
 			close(s.records) // signal the drainer to exit after draining
 		}
 		s.mu.Unlock()

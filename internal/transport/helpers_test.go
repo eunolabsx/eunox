@@ -267,6 +267,14 @@ func newTestManifestPDPWithKS(ks killswitch.Manager, caps ...capability.Constrai
 // package has always got: adding one for the anchored cells' sake would change what a quota
 // condition does in a hundred tests that never asked for a counter.
 func newTestManifestPDPAnchored(ks killswitch.Manager, taskAnchored bool, caps ...capability.Constraint) *pdp.ManifestPDP {
+	dp, _ := newTestPolicyAnchored(ks, taskAnchored, caps...)
+	return dp
+}
+
+// newTestPolicyAnchored is newTestManifestPDPAnchored returning the manifest BESIDE the PDP, for a
+// harness that must hand the route both — a route holding one without the other is the
+// policyless/policied disagreement BuildRoutes cannot produce.
+func newTestPolicyAnchored(ks killswitch.Manager, taskAnchored bool, caps ...capability.Constraint) (*pdp.ManifestPDP, *config.LocalManifest) {
 	manifest := &config.LocalManifest{
 		Name:         "test-policy",
 		Version:      "1.0.0",
@@ -282,7 +290,7 @@ func newTestManifestPDPAnchored(ks killswitch.Manager, taskAnchored bool, caps .
 			enforcement.WithCallCounter(callcounter.NewInMemory()),
 		}
 	}
-	return pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(opts...), ks)
+	return pdp.NewManifestPDP(manifest.Capabilities, enforcement.New(opts...), ks), manifest
 }
 
 // auditToolEntry is a tool entry in audit mode whose allowedValues condition
@@ -353,6 +361,12 @@ type httpProxyOptions struct {
 	// decision turn and its worker keys resolve on the validated mcp.task_id claim.
 	TaskAnchored bool
 
+	// Manifest is the loaded policy behind PDP, paired with it exactly as BuildRoutes pairs the
+	// two (LoadUpstreamPDP returns a nil manifest precisely when it returns AlwaysAllowPDP). Left
+	// nil, a route is POLICYLESS — the wiretap shape — whatever PDP it was handed, so a test that
+	// wires a ManifestPDP and leaves this unset exercises a disagreement production cannot produce.
+	Manifest *config.LocalManifest
+
 	// Stderr, when set, captures this proxy's diagnostic lines instead of the real
 	// os.Stderr — the injectable-writer seam a test asserting on a startup/lifecycle line
 	// uses instead of swapping the process-global (see HTTPProxy.stderr).
@@ -384,6 +398,7 @@ func newHTTPProxy(opts httpProxyOptions) *HTTPProxy {
 		upstreamTLSSkipVerify:   opts.UpstreamTLSSkipVerify,
 		upstreamProtocolVersion: opts.UpstreamProtocolVersion,
 		pdp:                     opts.PDP,
+		manifest:                opts.Manifest,
 		audit:                   opts.Audit,
 		driftCheck:              opts.DriftCheck,
 		taskAnchored:            opts.TaskAnchored,

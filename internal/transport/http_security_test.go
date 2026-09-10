@@ -473,7 +473,14 @@ func TestOriginAllowed_AllowlistFoldIsASCIIOnly(t *testing.T) {
 // "0.0.0.0", "::", and the alternate IPv6 wildcard spellings "::0" and the fully
 // expanded form must all be excluded, while a real bind host is still added.
 func TestBuildAllowedOriginHosts_WildcardSpellingsExcluded(t *testing.T) {
-	for _, wildcard := range []string{"0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0", "[::0]"} {
+	// The inet_aton and zoned spellings are here because the BIND gate refuses them: an operator
+	// who passes --unsafe-bind-all for `bind: 0.0` then had it admitted as an ordinary hostname,
+	// so a page served from http://0.0 (which resolves to this listener) cleared the
+	// DNS-rebinding guard. One predicate answers both gates now — see capability.IsUnspecifiedHost.
+	for _, wildcard := range []string{
+		"0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0", "[::0]",
+		"0", "0.0", "0.0.0", "00.0.0.0", "0x0", "[::%lo]", "::ffff:0.0.0.0",
+	} {
 		hosts := buildAllowedOriginHosts(wildcard)
 		stripped := strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(wildcard), "["), "]")
 		if hosts[stripped] {

@@ -7131,7 +7131,7 @@ func TestWorkerKey_StaysNameableByTheTargetedKill(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			key, ok := firstRequestWorkerKey(tc.route, pdp.WithJWTClaims(context.Background(), tc.claims))
+			key, _, ok := firstRequestWorkerKey(tc.route, pdp.WithJWTClaims(context.Background(), tc.claims))
 			if !ok {
 				t.Fatal("these claims carry a stable identity")
 			}
@@ -7150,7 +7150,7 @@ func TestWorkerKey_StaysNameableByTheTargetedKill(t *testing.T) {
 	// share a prefix from collapsing onto one worker, one upstream and one recorded session_id.
 	anchored := &UpstreamRoute{name: "r", taskAnchored: true}
 	keyFor := func(sub string) string {
-		key, ok := firstRequestWorkerKey(anchored, pdp.WithJWTClaims(context.Background(),
+		key, _, ok := firstRequestWorkerKey(anchored, pdp.WithJWTClaims(context.Background(),
 			&pdp.JWTClaims{Issuer: strings.Repeat("i", 300), Subject: sub, AgentID: strings.Repeat("a", 300), TaskID: strings.Repeat("t", 300)}))
 		if !ok {
 			t.Fatal("these claims carry a stable identity")

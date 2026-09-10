@@ -97,6 +97,11 @@ func (e *EffectContract) UnmarshalJSON(data []byte) error {
 	// Constraint.UnmarshalJSON, applied by both wrappers and by ArgumentSchema) is that a null
 	// leaves the destination alone, which the reset below would otherwise turn into a wipe at the
 	// same exported seam the reset exists for.
+	//
+	// Reached only by a decode into a VALUE. Every in-tree field of this type is a pointer, and
+	// encoding/json nils a settable pointer on null without consulting its Unmarshaler at all — so
+	// a manifest's `effect: null` still clears the block, and this arm governs the exported seam
+	// alone (a reused value, a slice element decoded in place).
 	if string(data) == "null" {
 		return nil
 	}

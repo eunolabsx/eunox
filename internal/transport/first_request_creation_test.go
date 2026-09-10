@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/eunolabs/eunox/internal/audit"
+	"github.com/eunolabs/eunox/internal/config"
 	"github.com/eunolabs/eunox/internal/mcp"
 	"github.com/eunolabs/eunox/internal/pdp"
 	"github.com/eunolabs/eunox/pkg/capability"
@@ -97,7 +98,7 @@ func TestFirstRequestCreation_TheWorkerKeyIsTheStateAnchor(t *testing.T) {
 	base := &pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1", TokenID: "jti-a"}
 	ctx := pdp.WithJWTClaims(context.Background(), base)
 
-	key, ok := firstRequestWorkerKey(route, ctx)
+	key, _, ok := firstRequestWorkerKey(route, ctx)
 	require.True(t, ok)
 	identity, ok := stableCallerIdentity(base)
 	require.True(t, ok)
@@ -113,7 +114,7 @@ func TestFirstRequestCreation_TheWorkerKeyIsTheStateAnchor(t *testing.T) {
 	// refresh forks a new upstream and restarts the identity's accumulated state.
 	rotated := pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1", TokenID: "jti-b"})
-	rotatedKey, ok := firstRequestWorkerKey(route, rotated)
+	rotatedKey, _, ok := firstRequestWorkerKey(route, rotated)
 	require.True(t, ok)
 	assert.Equal(t, key, rotatedKey, "the worker key must survive token rotation")
 
@@ -122,20 +123,20 @@ func TestFirstRequestCreation_TheWorkerKeyIsTheStateAnchor(t *testing.T) {
 	// on — AUTHORIZATION_FAILED per attempt, forever, for legitimate traffic.
 	otherSubject := pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "bob", AgentID: "agent-1"})
-	bobKey, ok := firstRequestWorkerKey(route, otherSubject)
+	bobKey, _, ok := firstRequestWorkerKey(route, otherSubject)
 	require.True(t, ok)
 	assert.NotEqual(t, key, bobKey, "two subjects sharing an agent id must not share a worker the owner binding then refuses")
 
 	otherIssuer := pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://other-idp", Subject: "alice", AgentID: "agent-1"})
-	issuerKey, ok := firstRequestWorkerKey(route, otherIssuer)
+	issuerKey, _, ok := firstRequestWorkerKey(route, otherIssuer)
 	require.True(t, ok)
 	assert.NotEqual(t, key, issuerKey, "the owner binding compares the issuer too")
 
 	// Route-namespaced: p.sessions is one flat map across a gateway's upstreams, and
 	// handleSessionPost answers 409 on a route mismatch, so one identity reaching two routes
 	// must not collide on a key a UUID could never have collided on.
-	other, ok := firstRequestWorkerKey(&UpstreamRoute{name: "r2"}, ctx)
+	other, _, ok := firstRequestWorkerKey(&UpstreamRoute{name: "r2"}, ctx)
 	require.True(t, ok)
 	assert.NotEqual(t, key, other, "one identity on two routes must get two workers")
 }
@@ -181,7 +182,7 @@ func TestFirstRequestCreation_TheLoserOfACreationRaceAdoptsTheWinner(t *testing.
 	route := h.proxy.routes[""]
 	ctx := pdp.WithJWTClaims(capability.WithProtocolRevision(context.Background(), capability.Revision20260728),
 		&pdp.JWTClaims{AgentID: "agent-1"})
-	key, ok := firstRequestWorkerKey(route, ctx)
+	key, _, ok := firstRequestWorkerKey(route, ctx)
 	require.True(t, ok)
 
 	req := httptest.NewRequest(http.MethodPost, "/mcp", http.NoBody)
@@ -258,6 +259,15 @@ func newDeclaringHostHarnessWithTape(t *testing.T) *declaringHostHarness {
 // about the arm whose anchor is not the caller.
 func newDeclaringHostHarnessAnchored(t *testing.T, taskAnchored bool) *declaringHostHarness {
 	t.Helper()
+	return newDeclaringHostHarnessOn(t, taskAnchored, true)
+}
+
+// newDeclaringHostHarnessOn adds the POLICYLESS arm: with policied false the route carries no
+// manifest and decides through AlwaysAllowPDP, which is what a `enforcement: audit` upstream with no
+// `policy:` gets from LoadUpstreamPDP — a wiretap whose contract is to observe and never block, and
+// which `defaults: {taskAnchoredState: true}` still marks task-anchored.
+func newDeclaringHostHarnessOn(t *testing.T, taskAnchored, policied bool) *declaringHostHarness {
+	t.Helper()
 	h := &declaringHostHarness{seen: map[string]mcp.RPCMsg{}, key: newTestKey(t, "k1")}
 
 	fake := newFakeUpstream()
@@ -284,8 +294,15 @@ func newDeclaringHostHarnessAnchored(t *testing.T, taskAnchored bool) *declaring
 
 	h.ks = killswitch.NewInMemory()
 	// Route AND engine from the one flag, as BuildRoutes pairs them: a harness that anchored only
-	// the route would exercise a disagreement production cannot produce.
-	inner := newTestManifestPDPAnchored(h.ks, taskAnchored, capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
+	// the route would exercise a disagreement production cannot produce. The MANIFEST travels with
+	// the PDP for that same reason — LoadUpstreamPDP returns them together, and a route holding a
+	// ManifestPDP with no manifest is the policyless shape production reserves for AlwaysAllowPDP.
+	var inner pdp.PolicyDecisionPoint = pdp.NewAlwaysAllowPDP(h.ks)
+	var manifest *config.LocalManifest
+	if policied {
+		inner, manifest = newTestPolicyAnchored(h.ks, taskAnchored,
+			capability.Constraint{Target: "tool:read_file", Actions: []string{"call"}})
+	}
 	jwtPDP, cleanup := makeJWTPDPWithInner(t, h.key, inner)
 	t.Cleanup(cleanup)
 
@@ -298,6 +315,7 @@ func newDeclaringHostHarnessAnchored(t *testing.T, taskAnchored bool) *declaring
 		KS:           h.ks,
 		Sink:         sink,
 		TaskAnchored: taskAnchored,
+		Manifest:     manifest,
 	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", h.proxy.handleMCP)
@@ -501,7 +519,7 @@ func TestFirstRequestCreation_TheWorkerIDIsPrintableAndInjective(t *testing.T) {
 	route := &UpstreamRoute{name: "r1"}
 
 	forged := "x\n[eunox] FORGED LOG LINE"
-	key, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
+	key, _, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: forged}))
 	require.True(t, ok)
 	assert.NotContains(t, key, "\n", "a claim forged a console line into the worker id")
@@ -511,10 +529,10 @@ func TestFirstRequestCreation_TheWorkerIDIsPrintableAndInjective(t *testing.T) {
 	// Injective where sanitization is LOSSY: these two collapse to the same string under
 	// SanitizeAuditField, so a key that relied on sanitizing would let two callers share one
 	// worker, its quota and its upstream.
-	tab, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
+	tab, _, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "a\tb"}))
 	require.True(t, ok)
-	soh, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
+	soh, _, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "a\x01b"}))
 	require.True(t, ok)
 	require.Equal(t, audit.SanitizeAuditField("a\tb"), audit.SanitizeAuditField("a\x01b"),
@@ -524,11 +542,11 @@ func TestFirstRequestCreation_TheWorkerIDIsPrintableAndInjective(t *testing.T) {
 	// Bounded, and still injective past the bound: a validated claim is not a bounded one, and
 	// the id becomes a map key, an audit field and a log line.
 	long := strings.Repeat("a", 4096)
-	longKey, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
+	longKey, _, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: long}))
 	require.True(t, ok)
 	assert.Less(t, len(longKey), 1024, "an unbounded claim produced an unbounded worker id")
-	otherLong, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
+	otherLong, _, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: long + "b"}))
 	require.True(t, ok)
 	assert.NotEqual(t, longKey, otherLong, "truncation made two identities one worker")
@@ -543,7 +561,7 @@ func TestFirstRequestCreation_TheWorkerIDIsPrintableAndInjective(t *testing.T) {
 func TestFirstRequestCreation_TheTaskAnchoredKeyIsEncodedToo(t *testing.T) {
 	t.Parallel()
 	route := &UpstreamRoute{name: "r1", taskAnchored: true}
-	key, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
+	key, _, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1", TaskID: "t\n[eunox] FORGED"}))
 	require.True(t, ok)
 	assert.NotContains(t, key, "\n", "a task id forged a console line into the worker id")
@@ -602,7 +620,7 @@ func TestFirstRequestCreation_TheResolvePathWaitsForEstablishment(t *testing.T) 
 	route := h.proxy.routes[""]
 	ctx := pdp.WithJWTClaims(capability.WithProtocolRevision(context.Background(), capability.Revision20260728),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1"})
-	key, ok := firstRequestWorkerKey(route, ctx)
+	key, _, ok := firstRequestWorkerKey(route, ctx)
 	require.True(t, ok)
 
 	// A worker for this key, registered but still coming up — the window registerSession opens
@@ -685,7 +703,7 @@ func TestFirstRequestCreation_TheSessionGateRefusalIsMetered(t *testing.T) {
 	// A victim worker, established the ordinary way.
 	require.Equal(t, http.StatusOK,
 		h.call(t, "victim", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`).status)
-	victimKey, ok := firstRequestWorkerKey(h.proxy.routes[""], pdp.WithJWTClaims(context.Background(),
+	victimKey, _, ok := firstRequestWorkerKey(h.proxy.routes[""], pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Subject: "victim", AgentID: "victim"}))
 	require.True(t, ok)
 	require.NotNil(t, h.proxy.getSession(victimKey), "the victim worker's id is derivable, which is the premise")
@@ -967,7 +985,7 @@ func TestFirstRequestCreation_AnAbortedRequestDoesNotReachCreation(t *testing.T)
 	ctx, cancel := context.WithCancel(pdp.WithJWTClaims(
 		capability.WithProtocolRevision(context.Background(), capability.Revision20260728),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1"}))
-	key, ok := firstRequestWorkerKey(route, ctx)
+	key, _, ok := firstRequestWorkerKey(route, ctx)
 	require.True(t, ok)
 
 	// A worker for this key, registered but still coming up: the window in which a joiner waits.
@@ -1156,31 +1174,81 @@ func TestFirstRequestCreation_AnUnanchorableCallerIsRefusedBeforeTheSpawn(t *tes
 	require.Equal(t, http.StatusOK, anchored.status, "body: %s", anchored.body)
 	assert.Equal(t, 1, h.proxy.sessionCount())
 
-	// And it is on the tape, under the engine's own code: the record an operator reads at this
-	// gate is the one they would have read per call without it.
+	// And it is on the tape, under the engine's own code, naming the worker key it refused for:
+	// the record an operator reads at this gate carries the cause and the subject the per-call
+	// record would have (its TARGET is auditIdentity's to drop — no policy here resolved one).
 	var anchorDenies int
 	for _, rec := range h.tape(t) {
 		if code, _ := rec["denial_code"].(string); code != capability.ErrCodeMissingContext {
 			continue
 		}
 		d, _ := rec["details"].(map[string]interface{})
-		if reason, _ := d["reason"].(string); reason == "no_task_id" {
-			anchorDenies++
+		if reason, _ := d["reason"].(string); reason != "no_task_id" {
+			continue
 		}
+		anchorDenies++
+		assert.NotEmpty(t, rec["session_id"], "the refusal must name the worker key it was decided for")
 	}
 	assert.Equal(t, 1, anchorDenies, "the pre-spawn anchor refusal must be recorded exactly once")
 }
 
-// A SESSION-anchored route is untouched by that gate: a token with no task id is the ordinary
-// shape there, and refusing it would take the default deployment offline.
-func TestFirstRequestCreation_TheAnchorGateIsOnlyForTaskAnchoredRoutes(t *testing.T) {
+// The gate stands in for a verdict the ENGINE reaches, so it must not fire where that engine does
+// not exist or would not reach it. Both cells drive the route that WOULD refuse an enforced call,
+// so each isolates one half of the gate's scope rather than the anchoring flag.
+func TestFirstRequestCreation_TheAnchorGateOnlyStandsInForAVerdictTheEngineReaches(t *testing.T) {
 	t.Parallel()
-	h := newDeclaringHostHarness(t)
+
+	// A POLICYLESS route decides through AlwaysAllowPDP and has no engine at all, while
+	// taskAnchoredState still marks it anchored — the wiretap posture, whose contract is to observe
+	// and never block. Reading the config flag alone took it offline for every task-less caller.
+	t.Run("policyless route", func(t *testing.T) {
+		t.Parallel()
+		h := newDeclaringHostHarnessOn(t, true, false)
+
+		resp := h.call(t, "agent-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+		require.Equal(t, http.StatusOK, resp.status, "body: %s", resp.body)
+		assert.NotContains(t, resp.body, capability.ErrCodeMissingContext,
+			"a wiretap route holds no engine to have produced this verdict, and never blocks")
+		assert.Equal(t, 1, h.proxy.sessionCount())
+	})
+
+	// A LOCALLY-answered method never reaches the engine's anchor check: */list is served by the
+	// filter path, which evaluates no condition. On a revision with no handshake discovery IS the
+	// first request, so refusing it left a caller unable to see the surface it needs a task id for.
+	t.Run("locally answered method", func(t *testing.T) {
+		t.Parallel()
+		h := newDeclaringHostHarnessAnchored(t, true)
+
+		// Non-empty params: callWithToken splices the `_meta` revision declaration in before the
+		// closing brace, which an empty object has nothing to separate from.
+		resp := h.call(t, "agent-1", capability.MethodToolsList, `{"cursor":"c1"}`)
+		require.Equal(t, http.StatusOK, resp.status, "body: %s", resp.body)
+		assert.NotContains(t, resp.body, capability.ErrCodeMissingContext,
+			"tools/list is answered by the filter path, which never anchor-denies — discovery must still work")
+		assert.Contains(t, resp.body, `"result"`)
+
+		// And the enforced call on that same worker is still refused, so the cell above is about
+		// the METHOD rather than about a gate that stopped firing.
+		call := h.call(t, "agent-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
+		assert.Contains(t, call.body, capability.ErrCodeMissingContext)
+	})
+}
+
+// A caller who is BOTH revoked and unanchorable records the kill, which is what places the anchor
+// gate below the kill check. Asserted rather than left to the doc comment: each of the four
+// pre-spawn gates is otherwise exercised alone, so a hoist — the natural "decide the cheap thing
+// first" refactor, since this is the only one needing no I/O — would hide an emergency-stop attempt
+// from KILL_SWITCH-keyed monitoring with every other test still green.
+func TestFirstRequestCreation_TheKillGateOutranksTheAnchorGate(t *testing.T) {
+	t.Parallel()
+	h := newDeclaringHostHarnessAnchored(t, true)
+	require.NoError(t, h.ks.KillAgent(context.Background(), "agent-1"))
 
 	resp := h.call(t, "agent-1", capability.MethodToolsCall, `{"name":"read_file","arguments":{"path":"/tmp/x"}}`)
-	require.Equal(t, http.StatusOK, resp.status, "body: %s", resp.body)
+	assert.Contains(t, resp.body, capability.ErrCodeKillSwitch,
+		"a revoked caller that also cannot anchor must be recorded as the emergency stop it is")
 	assert.NotContains(t, resp.body, capability.ErrCodeMissingContext)
-	assert.Equal(t, 1, h.proxy.sessionCount())
+	assert.Zero(t, h.proxy.sessionCount())
 }
 
 // The task-anchored worker key carries BOTH dimensions, asserted on the key itself.
@@ -1194,7 +1262,7 @@ func TestFirstRequestCreation_TheTaskAnchoredWorkerKeyCarriesTheIdentityToo(t *t
 	keyFor := func(sub, task string) string {
 		ctx := pdp.WithJWTClaims(context.Background(),
 			&pdp.JWTClaims{Issuer: "https://idp", Subject: sub, AgentID: "agent-1", TaskID: task})
-		key, ok := firstRequestWorkerKey(route, ctx)
+		key, _, ok := firstRequestWorkerKey(route, ctx)
 		require.True(t, ok)
 		return key
 	}
@@ -1214,7 +1282,7 @@ func TestFirstRequestCreation_TheTaskAnchoredWorkerKeyCarriesTheIdentityToo(t *t
 	sessionOnly := &UpstreamRoute{name: "r1"}
 	ctx := pdp.WithJWTClaims(context.Background(),
 		&pdp.JWTClaims{Issuer: "https://idp", Subject: "alice", AgentID: "agent-1", TaskID: "task-1"})
-	key, ok := firstRequestWorkerKey(sessionOnly, ctx)
+	key, _, ok := firstRequestWorkerKey(sessionOnly, ctx)
 	require.True(t, ok)
 	identity, ok := stableCallerIdentity(pdp.JWTClaimsPtr(ctx))
 	require.True(t, ok)
@@ -1243,15 +1311,15 @@ func TestFirstRequestCreation_SeparateWorkersStillShareTheTaskBudget(t *testing.
 		return &pdp.JWTClaims{Issuer: "https://idp", Subject: sub, AgentID: "agent-1", TaskID: task}
 	}
 	call := func(claims *pdp.JWTClaims) capability.EnforceResponse {
-		key, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), claims))
+		key, _, ok := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), claims))
 		require.True(t, ok)
 		return dp.Decide(pdp.WithJWTClaims(context.Background(), claims), key,
 			pdp.EnforceTarget{Type: capability.TargetTypeTool, Name: "read_file"}, map[string]interface{}{}, "")
 	}
 
 	alice, bob := claimsFor("alice", "task-1"), claimsFor("bob", "task-1")
-	aliceKey, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), alice))
-	bobKey, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), bob))
+	aliceKey, _, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), alice))
+	bobKey, _, _ := firstRequestWorkerKey(route, pdp.WithJWTClaims(context.Background(), bob))
 	require.NotEqual(t, aliceKey, bobKey, "the two identities must hold their own workers")
 
 	require.Equal(t, capability.DecisionAllow, call(alice).Decision, "the first call spends the task's one-call budget")

@@ -81,13 +81,13 @@ const (
 	// on this transport — a 2026-07-28 host's sessionless POST, which negotiates fine and then finds
 	// no session and no way to create one.
 	catUnservable refusalCategory = "unservable_revision"
-	// catUnanchorable bounds the pre-spawn refusal for a declaring caller whose validated token
-	// cannot anchor on a task-anchored route. Its own bucket, not catUnservable's: that one is
-	// reachable with NO credential at all, so sharing would let the free flood elide the record
-	// saying an authenticated caller is repeatedly presenting a token this route can never serve —
-	// which is a configuration finding an operator has to act on. Metered for catAudience's reason,
-	// which is the same shape: one valid token drives one record per request, with no session
-	// created and no upstream spawned.
+	// catUnanchorable names the pre-spawn refusal for a declaring caller whose validated token
+	// cannot anchor on a task-anchored route. The THIRD declared-exempt category, and the one whose
+	// exemption is the least optional: the refusal carries the engine's own MISSING_CONTEXT verdict,
+	// which ClassifyDenialCode calls a POLICY class, and it fires only where that engine would have
+	// reached the same verdict on the same request (see creationAnchorDenial). So metering it would
+	// admission-control a policy decision — and buy nothing, since without the gate every one of
+	// those requests writes the engine's own unmetered policy deny at the same one-per-message cost.
 	catUnanchorable refusalCategory = "unanchorable_first_request"
 	// catSessionGate bounds the per-session gate refusals — the audience pin and the owner binding —
 	// on an already-resolved session. Metered because session creation on the first enforced request
@@ -95,9 +95,9 @@ const (
 	// victim's issuer, subject and agent id can address that worker and drive one audit record per
 	// attempt with no session of its own.
 	catSessionGate refusalCategory = "session_gate"
-	// catUnroutable and catSmuggled are the two DECLARED-EXEMPT categories: they name a
-	// refusal so its non-metering is an answer on the record rather than an absent call. See
-	// exemptRefusals for the reason, which is the same for both.
+	// catUnroutable and catSmuggled are two of the three DECLARED-EXEMPT categories (catUnanchorable
+	// above is the third): they name a refusal so its non-metering is an answer on the record rather
+	// than an absent call. See exemptRefusals for the reason, which is the same for all three.
 	catUnroutable refusalCategory = "unroutable"
 	catSmuggled   refusalCategory = "smuggled_notification"
 	// catServerRequestFailed bounds the records for a server-initiated request this proxy had
@@ -145,8 +145,9 @@ const exemptBecausePolicyDenyCostsTheSame = "reaching it needs a peer whose ordi
 // declaration: a category absent here is metered, which is the bounded direction for one added
 // without an answer.
 var exemptRefusals = map[refusalCategory]string{
-	catUnroutable: exemptBecausePolicyDenyCostsTheSame,
-	catSmuggled:   exemptBecausePolicyDenyCostsTheSame,
+	catUnroutable:   exemptBecausePolicyDenyCostsTheSame,
+	catSmuggled:     exemptBecausePolicyDenyCostsTheSame,
+	catUnanchorable: exemptBecausePolicyDenyCostsTheSame,
 }
 
 // allRefusalCategories is every category this package can charge, exempt ones included. One list,

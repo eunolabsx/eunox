@@ -267,12 +267,17 @@ a worker whose own id exceeds it is one the targeted emergency stop cannot name.
 The kill gate, the audience pin and `--require-audit=strict` all run BEFORE the upstream is
 spawned, and a first request re-enters through the established-session arm rather than growing a
 creating path's own copy of the per-request gates. So does the ANCHOR check on a task-anchored
-route: a token carrying no `mcp.task_id` is one the engine hard-denies every enforced call for,
-and it keys a worker perfectly well, so without a pre-spawn refusal each such identity forked a
-subprocess to serve traffic of which nothing was servable. The refusal is the engine's own
-`MISSING_CONTEXT` verdict rather than a second wording of it, and it is this path's alone — a
-session-creating `initialize` must spawn to answer the handshake, and its session goes on to serve
-later requests whose own tokens may carry a task id.
+route: a token carrying no `mcp.task_id` is one the engine hard-denies the matched enforced call
+for, and it keys a worker perfectly well, so without a pre-spawn refusal each such identity forked
+a subprocess to serve calls of which none was servable. The refusal is the engine's own
+`MISSING_CONTEXT` verdict rather than a second wording of it, and because it STANDS IN for that
+verdict it fires only where the engine exists and only for the requests that reach it: not on a
+policyless route, which decides through `AlwaysAllowPDP` and never blocks, and not for a method the
+tables answer locally — `tools/list` is served by the filter path, which evaluates no condition, and
+on this revision discovery is the first request, so refusing it would leave a caller unable to see
+the surface it needs a task id for. It is also this path's alone: a session-creating `initialize`
+must spawn to answer the handshake, and its session goes on to serve later requests whose own tokens
+may carry a task id.
 
 Two things it found on the way. `registerSession` ASSIGNED into the session map, which was
 correct while every id was a minted UUID and became a leak once ids are derived: two concurrent

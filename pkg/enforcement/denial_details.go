@@ -137,9 +137,7 @@ func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
 	// Go's randomized map iteration would otherwise make two identical denied calls write
 	// different records.
 	sort.Strings(keys)
-	elided := 0
 	if len(keys) > maxDenialDetailTopLevelKeys {
-		elided = len(keys) - maxDenialDetailTopLevelKeys
 		keys = keys[:maxDenialDetailTopLevelKeys]
 	}
 
@@ -150,17 +148,28 @@ func BoundDenialDetails(in map[string]interface{}) map[string]interface{} {
 			// Two distinct keys can share one bounded spelling (same kept prefix, same original
 			// length), and the caller supplies keys at this depth — so writing the second would let
 			// an echoed entry silently REPLACE another on the signed record, which is the omission
-			// this file's marker convention exists to rule out. Counted as an elision instead.
-			elided++
+			// this file's marker convention exists to rule out. It is left for markElided to count.
 			continue
 		}
 		budget := share - len(bk)
 		out[bk] = boundDetailValue(in[k], &budget, 0)
 	}
-	if elided > 0 {
-		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", elided, len(in))
-	}
+	markElided(out, len(in))
 	return out
+}
+
+// markElided writes the one marker naming how many of total did not reach out, or nothing when
+// they all did.
+//
+// DERIVED from the output rather than tallied beside it: every exit's answer is "the input minus
+// what was written", whatever mixture of breadth cap, exhausted budget and truncation collision
+// produced it, so a running counter would be a second statement of a fact the map already carries —
+// and the next exit added to either level would have to remember to fold every cause into it. Must
+// run before the marker is in the map, which is its own entry.
+func markElided(out map[string]interface{}, total int) {
+	if dropped := total - len(out); dropped > 0 {
+		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", dropped, total)
+	}
 }
 
 // escapeReservedDetailKey re-spells a caller key colliding with the reserved elision marker,
@@ -185,28 +194,24 @@ func boundDetailMap(in map[string]interface{}, budget *int, depth int) map[strin
 	sort.Strings(keys)
 
 	out := make(map[string]interface{}, len(keys))
-	// Keys dropped because their bounded spelling was already written — counted, never silently
-	// overwritten, for BoundDenialDetails' reason. Added to every marker below so "written plus
-	// elided equals len(in)" holds on whichever exit this level takes.
-	collided := 0
-	for i, k := range keys {
+	for _, k := range keys {
 		bk := escapeReservedDetailKey(boundDetailString(k))
+		// Collision checked ABOVE the charge, as the top level's is: a key that produces no output
+		// byte must cost no budget, or a run of caller-supplied keys sharing one bounded spelling
+		// elides later entries that would have fit. See BoundDenialDetails for what the drop is.
+		if _, taken := out[bk]; taken {
+			continue
+		}
 		*budget -= len(bk)
 		if *budget < 0 {
 			// ONE marker naming the elision, not one per dropped key — a per-key marker would
 			// itself be proportional to the input.
-			out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", len(in)-i+collided, len(in))
+			markElided(out, len(in))
 			return out
-		}
-		if _, taken := out[bk]; taken {
-			collided++
-			continue
 		}
 		out[bk] = boundDetailValue(in[k], budget, depth)
 	}
-	if dropped := len(in) - len(keys) + collided; dropped > 0 {
-		out[DenialDetailElidedKey] = fmt.Sprintf("%d of %d entries elided", dropped, len(in))
-	}
+	markElided(out, len(in))
 	return out
 }
 

@@ -14,7 +14,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -252,6 +254,49 @@ func IsLoopbackHost(host string) bool {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+// IsUnspecifiedHost reports whether host (no port, no surrounding IPv6 brackets) names the
+// unspecified address — the one a listener binds to reach every interface. IsLoopbackHost's
+// counterpart, exported for the same reason: cmd/eunox's --unsafe-bind-all gate and
+// internal/transport's DNS-rebinding Origin allowlist both ask it, and two independent copies
+// answered differently for the same operator string — one refusing `bind: 0.0` while the other
+// added it to the allowlist as an ordinary hostname.
+//
+// netip rather than net.ParseIP because a ZONE ("::%eth0") is outside Go's IP-literal grammar and
+// ParseIP rejects it, while net.Listen resolves it and binds the wildcard — the zone is dropped
+// before the comparison for the same reason the 4-in-6 form is unmapped: both name that address.
+//
+// The dotted arm is inet_aton, the parse getaddrinfo falls back to on a cgo build and the whole
+// reason this cannot stop at a Go IP literal: it accepts ONE to FOUR parts in any C integer base,
+// so "0", "0x0", "0.0", "0.0.0" and "00.0.0.0" all resolve to 0.0.0.0 while Go's grammar (four
+// decimal parts, no leading zeros) rejects every one of them. Only the ALL-ZERO composition is
+// reported, which is exact rather than conservative: each part occupies its own bit field of the
+// assembled address, so no non-zero part composes to the wildcard.
+//
+// What it deliberately does NOT do is resolve a NAME — that would be background network activity
+// in a check that must work offline — so a hosts-file entry pointing a name at 0.0.0.0 is outside
+// what any caller here can see.
+func IsUnspecifiedHost(host string) bool {
+	if a, err := netip.ParseAddr(host); err == nil {
+		return a.WithZone("").Unmap().IsUnspecified()
+	}
+	if host == "" {
+		return false
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) > 4 {
+		return false
+	}
+	for _, part := range parts {
+		// strconv's grammar is slightly wider than inet_aton's here (it takes Go's "0b0" and
+		// "0_0"), so a spelling the resolver would reject can be reported — the fail-closed
+		// direction for every caller, which either refuses a bind or withholds an allowlist entry.
+		if n, err := strconv.ParseUint(part, 0, 64); err != nil || n != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // freshAt reports whether a key set is installed and still inside its TTL as of now — the
