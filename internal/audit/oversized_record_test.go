@@ -40,7 +40,7 @@ func lastEntry(t *testing.T, field string, entries []string) string {
 
 // TestRecord_OversizedLabelSetStaysInsideTheScanWindow is the oversized-record shape: a
 // record whose flow-label fields would, unbounded, put the line past
-// auditScanBufferBytes. No attacker is involved — each field is a union of many authored
+// ScanBufferBytes. No attacker is involved — each field is a union of many authored
 // lists, so the per-list count cap the manifest loader applies bounds neither, and a
 // policy with enough labelled constraints reaches this on its own.
 //
@@ -75,9 +75,9 @@ func TestRecord_OversizedLabelSetStaysInsideTheScanWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal fixture: %v", err)
 	}
-	if len(unbounded) <= auditScanBufferBytes {
+	if len(unbounded) <= ScanBufferBytes {
 		t.Fatalf("fixture is only %d bytes; it must exceed the %d-byte scan window to exercise the bound",
-			len(unbounded), auditScanBufferBytes)
+			len(unbounded), ScanBufferBytes)
 	}
 
 	sink, err := Open(logPath, keyPath, 0, 0)
@@ -93,8 +93,8 @@ func TestRecord_OversizedLabelSetStaysInsideTheScanWindow(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(lines))
 	}
-	if len(lines[0]) > auditScanBufferBytes {
-		t.Fatalf("record is %d bytes, over the %d-byte scan window", len(lines[0]), auditScanBufferBytes)
+	if len(lines[0]) > ScanBufferBytes {
+		t.Fatalf("record is %d bytes, over the %d-byte scan window", len(lines[0]), ScanBufferBytes)
 	}
 
 	// The truncation is VISIBLE in the record rather than silent: a reader must be able

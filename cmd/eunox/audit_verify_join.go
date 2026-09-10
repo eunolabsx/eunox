@@ -160,9 +160,16 @@ func (v verifiedRings) verifierFor(keyPath string) (*audit.Sink, error) {
 // single tape the exit code says the same thing, and with several it does not — "tape B
 // has a break" and "the run failed" are different findings, and only one of them fits in
 // an exit status.
-func printTapeVerdict(t auditTape, res audit.VerifyResult) {
-	verdict := "PASS"
-	if !res.OK() {
+//
+// A tape the pass reached no verdict on gets a line too, for that same reason: it is the
+// one an exit code can least afford to swallow, since the run may report a SIBLING's
+// finding and a reader counting FAIL lines would otherwise see nothing said about this one.
+func printTapeVerdict(t auditTape, out tapeOutcome) {
+	verdict := "NO VERDICT"
+	switch {
+	case out.verdict && out.res.OK():
+		verdict = "PASS"
+	case out.verdict:
 		verdict = "FAIL"
 	}
 	fmt.Printf("Tape %d verdict: %s (%s)\n", t.num, verdict, t.logPath)

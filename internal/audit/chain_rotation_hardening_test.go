@@ -114,7 +114,7 @@ func TestOpenFailsClosedOnOversizedOrphanTail(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 	keyPath := filepath.Join(dir, "audit.key")
 	// A newline-less blob larger than the scan window: no record boundary is locatable.
-	blob := bytes.Repeat([]byte("x"), auditScanBufferBytes+1024)
+	blob := bytes.Repeat([]byte("x"), ScanBufferBytes+1024)
 	if err := os.WriteFile(logPath, blob, 0o600); err != nil {
 		t.Fatalf("write oversized orphan: %v", err)
 	}

@@ -109,7 +109,7 @@ type auditRecord struct {
 	// anchor has accrued over its life. A manifest whose every authored list sits at the
 	// cap still reaches any size the file cap allows. The slices are therefore bounded
 	// here too, like Obligations (boundAuditLabels), so the scan-window invariant
-	// auditScanBufferBytes states is enforced rather than argued from a load-time cap
+	// ScanBufferBytes states is enforced rather than argued from a load-time cap
 	// that covers neither union. The externally-supplied lists with no policy-authored
 	// guarantee at all are bounded at their own boundary
 	// (capability.MaxExternalFlowLabels) and reach a denial's Details, not these fields.
@@ -927,7 +927,7 @@ func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{})
 	s.writeRecord(&marker)
 }
 
-// auditScanBufferBytes is the line-buffer ceiling every audit-JSONL reader uses.
+// ScanBufferBytes is the line-buffer ceiling every audit-JSONL reader uses.
 // Every VARIABLE-length field is capped so the sum provably fits: Details at
 // auditDetailsTotalCap (1 MiB), Obligations and each of the two flow-label slices at
 // their own totals (64 KiB each), and the envelope strings at auditEnvelopeFieldCap
@@ -949,7 +949,7 @@ func (s *Sink) writeIntegrityMarker(kind string, details map[string]interface{})
 // window-clipped resume path on every restart. That is why each field carries a cap
 // of its own rather than the total being argued from what a policy is expected to
 // declare.
-const auditScanBufferBytes = 4 << 20
+const ScanBufferBytes = 4 << 20
 
 // NewLineScanner returns a bufio.Scanner over the audit records in r, for the readers that
 // scan a log line by line (audit-verify, stats, suggest, doctor), keeping their buffer bound
@@ -964,10 +964,10 @@ const auditScanBufferBytes = 4 << 20
 // rather than a second constructor.
 func NewLineScanner(r io.Reader, torn *bool) *bufio.Scanner {
 	scanner := bufio.NewScanner(r)
-	// Start small and grow on demand up to the cap: an eager auditScanBufferBytes
+	// Start small and grow on demand up to the cap: an eager ScanBufferBytes
 	// allocation would reserve the full buffer up front for every reader even when
 	// records are far smaller.
-	scanner.Buffer(make([]byte, 0, 64<<10), auditScanBufferBytes)
+	scanner.Buffer(make([]byte, 0, 64<<10), ScanBufferBytes)
 	scanner.Split(scanSignedLines(torn))
 	return scanner
 }

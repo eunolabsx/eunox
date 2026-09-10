@@ -270,7 +270,7 @@ func TestScanHighestSeq_ReadsPastLargeLineInOnePass(t *testing.T) {
 	b.WriteString(`{"seq":1}` + "\n")
 	// A line larger than the old 4 MiB primary buffer but well within the 64 MiB cap:
 	// the single wide-buffer pass reads past it cleanly to the higher-seq record below.
-	b.Write(append(bytes.Repeat([]byte("a"), auditScanBufferBytes+10), '\n'))
+	b.Write(append(bytes.Repeat([]byte("a"), ScanBufferBytes+10), '\n'))
 	// A higher-seq record AFTER the large line: the pass must reach it.
 	b.WriteString(`{"seq":9999}` + "\n")
 	if err := os.WriteFile(logPath, b.Bytes(), 0o600); err != nil {
@@ -582,7 +582,7 @@ func TestScanSeqContribution_RefusesSymlinkedLog(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	parsedMax, parsed, unread := scanSeqContribution(link, auditScanBufferBytes)
+	parsedMax, parsed, unread := scanSeqContribution(link, ScanBufferBytes)
 	if parsed || parsedMax != 0 {
 		t.Fatalf("scanSeqContribution parsed content through a symlink: max=%d parsed=%v", parsedMax, parsed)
 	}

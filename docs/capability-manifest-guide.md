@@ -2734,19 +2734,21 @@ on (a bad flag, an unreadable config, a log it could not open, an `--output`
 it could not write). `1` is reserved per command for a *finding* — drift for
 `validate`, a failed chain for `audit-verify`, a config that will not load for
 `doctor` (the bundle is still written) — so a gate can tell "the check ran and
-found something" from "the check never ran".
-
-An `audit-verify` run that reaches no verdict is `2`, not `1`: a rotation raced
-the pass, or it stopped on a half-written record or a read error with nothing
-proven against the part it did read. But a finding it *did* prove outranks the
-part it could not read, and is reported as `1` even when the pass stopped short
-— of one tape's records, or of a whole later tape. Otherwise a single appended
-byte (a stripped newline, an over-sized line that aborts the scan) would move
-any tamper into the inconclusive bucket permanently, since re-running a file
-nobody is appending to answers the same thing forever. `eunox kill` is the one deliberate exception and returns
+found something" from "the check never ran". `eunox kill` is the one deliberate exception and returns
 `1` for every failure: under an emergency stop the only question is whether the
 revocation landed, and a second failure code invites a script that treats one of
 them as success.
+
+An `audit-verify` run that reaches no verdict is `2`, not `1`: a rotation raced
+the pass, or it stopped on a half-written record or a read error with nothing
+proved against the part it did read. But a finding it *did* prove outranks the
+part it could not cover, and is reported as `1` — even when another tape reached
+no verdict at all. Otherwise one appended byte (a stripped newline, or a line
+past the scan window) would move a tamper into the inconclusive bucket for good,
+since re-running a file nobody is truncating answers the same thing forever.
+Every tape is attempted either way, each reports its own `PASS`/`FAIL`/`NO
+VERDICT` line, and with `--task-id` the joined sequence is withheld — naming the
+tapes it could not read to the end — rather than assembled from a partial read.
 
 Relative `policy:` paths in a gateway config are resolved against the **config
 file's directory**, not the process working directory — so

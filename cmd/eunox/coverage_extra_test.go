@@ -1567,12 +1567,11 @@ func TestRun_DispatchesSuggestAndDoctor(t *testing.T) {
 
 // ───────────────────────── scanner errors (line too long) ──────────────────
 
-// hugeLineReader yields a single line longer than the audit scan buffer (4 MiB)
-// with no newline, forcing the bufio.Scanner used by computeAuditStats and
+// hugeLineReader yields a single line longer than the audit scan buffer with no
+// newline, forcing the bufio.Scanner used by computeAuditStats and
 // computeSuggestions to return bufio.ErrTooLong from Err().
 func hugeLineReader() io.Reader {
-	const oversize = (4 << 20) + 16
-	return strings.NewReader(strings.Repeat("a", oversize))
+	return strings.NewReader(strings.Repeat("a", overCapLineBytes))
 }
 
 // TestComputeAuditStats_ScannerError covers the scanner.Err() return in
@@ -2717,9 +2716,13 @@ func TestCmdKill_ProxyResponseIsBoundedAndStripped(t *testing.T) {
 // ───────────────────────── cmdAuditVerify error branches ────────────────────
 
 // Every branch below is an OPERATIONAL failure — a missing log, an unparseable
-// flag, an unreadable key — and must exit auditVerifyUsageExit (2). Exit 1 is
-// reserved for a log that fails verification, so a cron or CI job gating on this
-// command can tell "the tape is bad" from "this host is misconfigured".
+// flag, an unreadable key — on a run where nothing else was proved, and must exit
+// auditVerifyUsageExit (2). Exit 1 is reserved for a log that fails verification,
+// so a cron or CI job gating on this command can tell "the tape is bad" from "this
+// host is misconfigured". These are all SINGLE-tape: across tapes a proved finding
+// outranks a tape the run could not speak for (auditVerifyFindingsExit), so the
+// same operational failure on one tape of several reports 1 when another tape
+// failed verification.
 
 func TestCmdAuditVerify_NoAuditLog(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
