@@ -172,6 +172,18 @@ func readAuditChainOrExit[T any](name, logPath string, usageExit int, consume fu
 // parseReaderArgs reports usage errors as 1, so this command translates at the call site.
 const auditVerifyUsageExit = 2
 
+// auditVerifyFindingsExit is the code a log that FAILS verification reports, and it OUTRANKS
+// the inconclusive exit wherever a pass proved a finding without reaching the end of what it
+// was asked to read — a tail fragment, a scan the read aborted, or a sibling tape that
+// stopped the run. Each of those is something an attacker with write access can APPEND (one
+// stripped newline; one over-cap line, which aborts the scan with no per-record finding of
+// its own), so answering "re-run" over a tamper the pass had already proved would move it out
+// of the bucket a cron/CI gate watches permanently: re-running a file nobody is appending to
+// reports the same thing forever. A rotation-raced pass is the one that stays inconclusive —
+// its findings can be fabricated by the rotation itself, so they are dropped unread and
+// nothing is proved.
+const auditVerifyFindingsExit = 1
+
 // auditVerifySummaryFormat is hoisted to a constant so the site-drift test can assert the
 // landing-page demo still quotes tallies this command actually emits.
 const auditVerifySummaryFormat = "Checked %d record(s): %d valid, %d invalid, %d skipped, %d unknown-key, %d unverifiable; %d chain break(s).\n"
@@ -198,10 +210,16 @@ Exit codes:
   0  Every record verified and the tamper-evident chain is intact, on every tape.
   1  A tape failed verification (an invalid record, a chain break, an
      unverifiable or unknown-key record). Reserved for findings, so a cron or
-     CI job can gate on it; never used for usage errors.
+     CI job can gate on it; never used for usage errors. A finding the pass
+     PROVED outranks the part it could not read: a half-written record, a read
+     error that aborts the scan, or a later tape with no verdict still reports
+     1, since one appended byte would otherwise move any tamper into the
+     inconclusive bucket for good.
   2  Usage error, a config, key-resolution, or log-read failure, or a pass that
-     a rotation raced or that ended on a half-written record (inconclusive —
-     re-run).
+     a rotation raced or that ended on a half-written record — with nothing
+     proven against the part that WAS read (inconclusive — re-run). A rotation
+     raced mid-pass is always 2: the findings such a pass reports can be
+     fabricated by the rotation itself, so they are dropped rather than shown.
 
 Flags:
 `
@@ -270,10 +288,11 @@ func applyConfigAuditDefaultsList(cmdName, configPath string, logs, keys *repeat
 // never handled them is expected, unlike a gap inside one chain), so it can never fail a
 // run on its own.
 //
-// A tape that cannot be read, or whose pass a rotation raced, stops the run at exit 2
-// rather than being skipped: continuing would print a sequence missing that tape's
-// records with nothing in the output saying so, which is the one way this report can
-// mislead about the thing it exists to show.
+// A tape that cannot be read, or whose pass a rotation raced, stops the run rather than
+// being skipped: continuing would print a sequence missing that tape's records with
+// nothing in the output saying so, which is the one way this report can mislead about
+// the thing it exists to show. It stops at exit 2 only while nothing has been proved —
+// see the code the stop returns below.
 func runAuditVerify(tapes []auditTape, opts audit.VerifyOptions) int {
 	if len(tapes) > 1 {
 		fmt.Printf("Verifying %d audit tapes as %d INDEPENDENT chains: each enforcement point signs its own\n"+
@@ -288,6 +307,15 @@ func runAuditVerify(tapes []auditTape, opts audit.VerifyOptions) int {
 		}
 		res, recs, code := verifyOneTape(t, opts, rings)
 		if code != 0 {
+			// A FINDING outranks a missing verdict ACROSS tapes exactly as it does within one
+			// (see auditVerifyFindingsExit): a verdict an earlier tape already proved is not
+			// retracted by a later tape nobody could read, so making one tape unreadable — a
+			// stripped newline, an appended over-cap line, an unlinked key file — must not move
+			// a sibling's tamper into the inconclusive bucket. The run still STOPS here: the
+			// sequence would otherwise be missing that tape's records with nothing saying so.
+			if failed {
+				return auditVerifyFindingsExit
+			}
 			return code
 		}
 		joined = append(joined, recs...)
@@ -304,15 +332,17 @@ func runAuditVerify(tapes []auditTape, opts audit.VerifyOptions) int {
 		fmt.Println("\nPass --task-id to print the sequence these tapes share for one task, attributed by `pep`.")
 	}
 	if failed {
-		return 1
+		return auditVerifyFindingsExit
 	}
 	return 0
 }
 
 // verifyOneTape runs the single-tape pass — key ring, rotated-sibling discovery, the
 // bracketed verification, the tallies — and collects the task's records out of that same
-// pass. code is non-zero when the caller must stop (a read, key, or inconclusive
-// failure); res and recs are meaningful only when it is 0.
+// pass. code is non-zero when the caller must stop: auditVerifyUsageExit for a read, key,
+// or inconclusive failure, and auditVerifyFindingsExit when a read error stopped the pass
+// short of this tape's end AFTER it had already proved a finding. res and recs are
+// meaningful only when it is 0.
 func verifyOneTape(t auditTape, opts audit.VerifyOptions, rings verifiedRings) (audit.VerifyResult, []audit.JoinedRecord, int) {
 	verifier, err := rings.verifierFor(t.keyPath)
 	if err != nil {
@@ -373,21 +403,38 @@ func verifyOneTape(t auditTape, opts audit.VerifyOptions, rings verifiedRings) (
 	// stripped newline hide a tamper the pass had already proved.
 	held.release()
 	if errors.Is(verifyErr, audit.ErrUnterminatedTail) {
-		// A FINDING outranks the missing verdict. Exit 1 is reserved for a log that fails
-		// verification precisely so a cron/CI job can gate on it, and a torn tail is one byte
-		// an attacker can append: taking the inconclusive exit here would hand them a way to
-		// move any tamper out of that bucket permanently, since re-running a file nobody is
-		// appending to answers the same thing forever.
+		// A FINDING outranks the missing verdict — see auditVerifyFindingsExit for why a torn
+		// tail must not be able to move one out of the bucket a gate watches.
 		if !res.OK() {
 			printVerifySummary(res)
 			fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: %v; the findings above stand — they "+
 				"describe complete records — but anything past that final fragment was not read\n",
 				t.logPath, verifyErr)
+			// Code 0, unlike the read-error arm below: a torn tail leaves no COMPLETE record
+			// unread (scanSignedLines drops the fragment and there is nothing past it), so this
+			// tape's contribution to a join is whole and the run may go on.
 			return res, recs, 0
 		}
 		return noVerdictExit(t.logPath, verifyErr)
 	}
 	if verifyErr != nil {
+		// The torn tail's rule, for the read errors that ABORT the scan — an over-cap line is
+		// as appendable as a stripped newline and produces no per-record finding of its own
+		// (bufio.ErrTooLong), so discarding what the pass had already proved would hand an
+		// attacker the same permanent move into the inconclusive bucket. Every finding
+		// released above describes a record classified BEFORE the abort, and nothing the scan
+		// failed to reach can retract one; the rotation bracket has already run, so these are
+		// not the fabricated findings a raced pass produces.
+		if !res.OK() {
+			printVerifySummary(res)
+			fmt.Fprintf(os.Stderr, "eunox audit-verify: %s: reading log: %v; the findings above "+
+				"stand — they describe records read before the failure — but nothing past it was read\n",
+				t.logPath, verifyErr)
+			// Stops the run where the torn-tail arm lets it continue: an aborted scan leaves an
+			// unread SUFFIX of this tape, so its records cannot go into a joined sequence whose
+			// header tells the reader that absence from a tape is expected rather than lost.
+			return audit.VerifyResult{}, nil, auditVerifyFindingsExit
+		}
 		fmt.Fprintf(os.Stderr, "eunox audit-verify: reading log %s: %v\n", t.logPath, verifyErr)
 		return audit.VerifyResult{}, nil, auditVerifyUsageExit
 	}
