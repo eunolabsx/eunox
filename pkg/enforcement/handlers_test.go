@@ -5,6 +5,7 @@ package enforcement_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/eunolabs/eunox/pkg/callcounter"
@@ -544,4 +545,56 @@ func TestHandleRecipientDomain_WhitespaceEntryStillMatches(t *testing.T) {
 	assert.Equal(t, capability.DecisionDeny, denyResp.Decision)
 	require.NotNil(t, denyResp.Denial)
 	assert.Equal(t, capability.ErrCodeConditionFailed, denyResp.Denial.Code)
+}
+
+// An argument outside an allowedValues set must stay outside it however the caller
+// SPELLS it. Arguments decode in UseNumber mode, so the literal is the caller's:
+// json.Number.Int64 rejects a trailing ".0" or an exponent, and the float64 fallback
+// that took over rounded 2^53+1 onto the authorized 2^53 and endorsed the rounding as
+// exact — the plain spelling was denied while the respelled one was allowed.
+func TestAllowedValues_LiteralSpellingCannotWidenTheSet(t *testing.T) {
+	t.Parallel()
+
+	constraints := []capability.Constraint{{
+		Target:  "transfer",
+		Actions: []string{"call"},
+		Conditions: []capability.Condition{
+			&capability.AllowedValuesCondition{
+				Argument: "amount",
+				Values:   []interface{}{json.Number("9007199254740992")}, // 2^53
+			},
+		},
+	}}
+
+	cases := []struct {
+		name  string
+		value interface{}
+		allow bool
+	}{
+		{name: "the authorized value", value: json.Number("9007199254740992"), allow: true},
+		{name: "the authorized value respelled", value: json.Number("9007199254740992.0"), allow: true},
+		{name: "the authorized value in exponent form", value: json.Number("9.007199254740992e15"), allow: true},
+		{name: "its float64 neighbour", value: json.Number("9007199254740993"), allow: false},
+		{name: "its float64 neighbour respelled", value: json.Number("9007199254740993.0"), allow: false},
+		{name: "its float64 neighbour in exponent form", value: json.Number("9.007199254740993e15"), allow: false},
+		// 2^53+0.5 has no float64 of its own; its coercion is the authorized value.
+		{name: "a fractional value sharing that float64", value: json.Number("9007199254740992.5"), allow: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := enforcement.New()
+			resp := e.ValidateAction(context.Background(), &capability.EnforceRequest{
+				SessionID:  "sess",
+				TargetName: "transfer",
+				Arguments:  map[string]interface{}{"amount": tc.value},
+			}, constraints)
+			if tc.allow {
+				require.Equal(t, capability.DecisionAllow, resp.Decision, "denial: %+v", resp.Denial)
+				return
+			}
+			require.Equal(t, capability.DecisionDeny, resp.Decision)
+			assert.Equal(t, capability.ErrCodeValueNotPermitted, resp.Denial.Code)
+		})
+	}
 }

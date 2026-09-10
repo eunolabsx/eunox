@@ -1318,6 +1318,102 @@ func TestCollectObligationsValueDirective(t *testing.T) {
 
 // ---- merged from numeric_equal_test.go ----
 
+// exactIntegerRat is the one place integrality is decided, and it must decide from the
+// value rather than from a float64 coercion the caller's choice of SPELLING steers: Int64
+// rejects every literal carrying a '.' or an exponent, and reading the fallback off the
+// rounding endorsed a neighbouring integer ("9007199254740993.0" answered 2^53) and a
+// fractional value as an integer ("9007199254740992.5").
+func TestExactIntegerRat_DecidedFromTheValueNotItsRounding(t *testing.T) {
+	cases := []struct {
+		name  string
+		v     any
+		isInt bool
+		want  string // the exact value, when it is an integer
+	}{
+		// Respelling an integer must keep it one, or "2.0" stops matching an
+		// allowedValues: [2] that it matches today.
+		{name: "trailing zero", v: json.Number("2.0"), isInt: true, want: "2"},
+		{name: "negative trailing zeroes", v: json.Number("-7.00"), isInt: true, want: "-7"},
+		{name: "exponent form", v: json.Number("1e3"), isInt: true, want: "1000"},
+
+		// The bypass: under float64 both of these round onto a DIFFERENT integer.
+		{name: "2^53+1 spelled with a trailing zero", v: json.Number("9007199254740993.0"), isInt: true, want: "9007199254740993"},
+		{name: "10^16+1 in exponent form", v: json.Number("10000000000000001e0"), isInt: true, want: "10000000000000001"},
+
+		// 2^53+0.5 has no float64 of its own, so its coercion IS integral — the case
+		// that made a fractional argument answer "integer".
+		{name: "fractional past float64 resolution", v: json.Number("9007199254740992.5")},
+		{name: "plainly fractional", v: json.Number("1.5")},
+
+		// Past int64, where the exact tier does the comparing.
+		{name: "2^63 spelled with a trailing zero", v: json.Number("9223372036854775808.0"), isInt: true, want: "9223372036854775808"},
+
+		// Every Go numeric kind reaches an exact reading, which is what lets
+		// numericEqual's tier answer "one of these is an integer and one is not".
+		{name: "int", v: 5, isInt: true, want: "5"},
+		{name: "int64", v: int64(-9223372036854775808), isInt: true, want: "-9223372036854775808"},
+		{name: "uint64 past int64", v: uint64(18446744073709551615), isInt: true, want: "18446744073709551615"},
+		{name: "integral float64", v: float64(3), isInt: true, want: "3"},
+		{name: "fractional float64", v: 3.5},
+		{name: "non-numeric", v: "5"},
+
+		// The exact read stays behind capability.NumericLiteralBounded, so a literal
+		// past that budget is NOT an integer here — schemaValidateValue refuses one
+		// outright and numericEqual answers no-match, both fail-closed.
+		{name: "outside the DoS literal bound", v: json.Number("1e1000000")},
+		{name: "padded past the length bound", v: json.Number("1." + strings.Repeat("0", 1500))},
+		{name: "beyond float64 range but exactly read", v: json.Number("1e400"), isInt: true, want: "1" + strings.Repeat("0", 400)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, ok := exactIntegerRat(tc.v)
+			if ok != tc.isInt {
+				t.Fatalf("exactIntegerRat(%v) ok = %v, want %v", tc.v, ok, tc.isInt)
+			}
+			if ok && r.Num().String() != tc.want {
+				t.Errorf("exactIntegerRat(%v) = %s, want %s", tc.v, r.Num(), tc.want)
+			}
+		})
+	}
+}
+
+// asInt64 answers for the int64 tier, and its json.Number arm must answer from the VALUE:
+// Int64 rejects a '.' or an exponent, and the fallback that took over read integrality off
+// the float64 rounding, endorsing 9007199254740993.0 as 2^53. The rounding survives only
+// as a VETO — an int64 integer always rounds to an integral float64 in range — so it costs
+// nothing on the values that cannot be one and decides none that could.
+func TestAsInt64_AnswersFromTheValueWithTheRoundingOnlyAsAVeto(t *testing.T) {
+	for _, tc := range []struct {
+		lit  json.Number
+		want int64
+		ok   bool
+	}{
+		{lit: "42", want: 42, ok: true},
+		{lit: "-9223372036854775808", want: -9223372036854775808, ok: true},
+		// Respelled: same number, same answer, whatever the caller wrote.
+		{lit: "2.0", want: 2, ok: true},
+		{lit: "-7.00", want: -7, ok: true},
+		{lit: "1e3", want: 1000, ok: true},
+		{lit: "9007199254740993.0", want: 9007199254740993, ok: true},
+		{lit: "10000000000000001e0", want: 10000000000000001, ok: true},
+		// Vetoed by the rounding, at no parse cost.
+		{lit: "1.5"},
+		{lit: "9223372036854775808"},
+		{lit: "1e400"},
+		// Rounds to an int64-looking value, so the veto passes it — and the exact read
+		// then refuses it, which is the half the veto cannot do.
+		{lit: "9007199254740992.5"},
+		{lit: "1." + json.Number(strings.Repeat("0", 1500))},
+	} {
+		t.Run(string(tc.lit[:min(len(tc.lit), 24)]), func(t *testing.T) {
+			got, ok := asInt64(tc.lit)
+			if ok != tc.ok || (ok && got != tc.want) {
+				t.Errorf("asInt64(%q) = (%d, %v), want (%d, %v)", tc.lit, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func TestNumericEqual(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1364,6 +1460,31 @@ func TestNumericEqual(t *testing.T) {
 		{"json.Number negative vs int", json.Number("-3"), -3, true},
 		{"json.Number large int distinct", json.Number("9007199254740993"), int64(9007199254740992), false},
 		{"json.Number large int equal", json.Number("9007199254740993"), int64(9007199254740993), true},
+
+		// The same integers RESPELLED. json.Number.Int64 rejects a '.' or an exponent,
+		// so these took a float64 fallback that rounded 2^53+1 onto 2^53 and reported it
+		// as exact — an argument outside an allowedValues set admitted by respelling it.
+		// The spelling must select nothing: same verdicts as the plain literals above.
+		{"trailing-zero large int distinct", json.Number("9007199254740993.0"), int64(9007199254740992), false},
+		{"trailing-zero large int equal", json.Number("9007199254740993.0"), int64(9007199254740993), true},
+		{"exponent-form large int distinct", json.Number("10000000000000001e0"), int64(10000000000000000), false},
+		{"exponent-form large int equal", json.Number("10000000000000001e0"), int64(10000000000000001), true},
+		// Respelling a small integer still matches, or "2.0" would stop satisfying an
+		// allowedValues: [2] that it satisfies today.
+		{"trailing-zero small int equal", json.Number("2.0"), 2, true},
+		{"trailing-zero small int distinct", json.Number("2.0"), 3, false},
+
+		// 2^53+0.5 has no float64 of its own, so its coercion is integral: reading
+		// integrality after the rounding made a FRACTIONAL argument match an integer.
+		{"fractional past float64 resolution vs its rounding", json.Number("9007199254740992.5"), int64(9007199254740992), false},
+		{"fractional past float64 resolution matches itself", json.Number("9007199254740992.5"), json.Number("9007199254740992.5"), true},
+		// Past int64 the same shape reached the float64 tail, where the two round
+		// together: allowedValues: [9223372036854775808] admitted 9223372036854775808.5.
+		// An integer and a non-integer are answered as different numbers now, before it.
+		{"integer above 2^63 vs a fractional sharing its float64", json.Number("9223372036854775808"), json.Number("9223372036854775808.5"), false},
+		// A literal this layer cannot read exactly is not an integer here, so it cannot
+		// match one — the fail-closed half of refusing to compare it rounded.
+		{"literal padded past the length bound", json.Number("1." + strings.Repeat("0", 1500)), 1, false},
 
 		// Above 2^63 NEITHER operand is int64-representable, so the exact int64 arm
 		// and the one-side-only guard both fall through and the float64 fallback

@@ -172,9 +172,38 @@ A bound that *is* exactly representable but sits above int64 range — `2^63`
 (`9223372036854775808`) is a power of two, so it loads — is now compared **exactly**
 rather than through a 64-bit float. `9223372036854775809` no longer passes a
 `maximum` of `9223372036854775808` by rounding onto the same float, and the same
-exactness applies to `allowedValues` / `enum` membership at any magnitude. Only
-genuinely **fractional** operands still compare as floats, where a decimal literal
-and its 64-bit approximation are consistent on both sides.
+exactness applies to `allowedValues` / `enum` membership at any magnitude. Two
+genuinely **fractional** values compare as floats, where a decimal literal and its
+64-bit approximation are consistent on both sides.
+
+The **argument's spelling does not select** that exactness. `9007199254740993`,
+`9007199254740993.0` and `9.007199254740993e15` are one number to every comparison,
+so a value outside an `allowedValues` set or `enum`, or above a `maximum`, cannot be
+admitted by writing it with a trailing `.0` or in exponent form — earlier builds
+read whether an argument was a whole number from its 64-bit *coercion*, which rounded
+the respelled literal onto the neighbouring integer and endorsed it as exact. A
+respelled integer still matches (`2.0` satisfies `allowedValues: [2]`), and `type:
+integer` likewise asks about the value rather than its rounding, so a fractional
+argument at or above 2^52 (`9007199254740992.5`, whose 64-bit coercion *is* a whole
+number) is no longer accepted as an integer.
+
+A **fractional** argument is compared exactly against an *integral* bound too: at
+10^18 magnitudes half a unit in the last place is 64 whole units, so `maximum:
+1000000000000000000` denies `1000000000000000063.5` and `minimum: 2` denies
+`1.9999999999999999`. A **fractional bound** is the deliberate exception, because
+an authored `0.1` is stored as the 64-bit double *nearest* `0.1` rather than the
+decimal the operator wrote: comparing exactly there would report an argument of
+`0.1` below a `minimum` of `0.1`. Two distinct fractional values that share one
+double therefore still match a fractional `allowedValues` / `enum` entry, and still
+compare equal to a fractional bound.
+
+There is a **length ceiling** on all of this. A numeric argument longer than 1024
+bytes (or carrying an exponent above 1024) is past what the proxy will parse exactly
+— an unbounded parse is a CPU and memory denial-of-service reachable with one tool
+argument — and such a value is **denied** rather than compared through its rounding,
+since padding a literal with trailing zeros is a spelling the caller chooses. Real
+arguments are far below that ceiling; a value that legitimately needs more digits
+belongs in a string argument with a `pattern`.
 
 Like `directives` (§ 5a), `argumentSchema` applies to **`tool:` targets only**
 (SPEC § 3.2.2): it validates the shape of a tool call's argument map, which
