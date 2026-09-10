@@ -125,10 +125,11 @@ func NewSignaturePayload(c *Contract, role, statement string) ([]byte, error) {
 // Validate checks a signature's structure — everything checkable without a key. Runs at
 // corpus load so a malformed signature rejects the entry, rather than silently looking
 // like assurance later.
+//
+// No nil guard: the receiver is always an element of the Contract.Signatures VALUE slice, so a
+// JSON `null` array element arrives here as a zero Signature and is refused by the keyId check
+// below, not as a nil this could report on.
 func (s *Signature) Validate(contractID string) error {
-	if s == nil {
-		return fmt.Errorf("contract %q has a null entry in 'signatures'", contractID)
-	}
 	if strings.TrimSpace(s.KeyID) == "" {
 		return fmt.Errorf("contract %q: a signature is missing 'keyId'", contractID)
 	}
