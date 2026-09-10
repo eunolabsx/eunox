@@ -367,6 +367,14 @@ func schemaValidateNumber(p string, v float64, raw interface{}, s *capability.Ar
 // When both the argument and the bound are integers the comparison is exact at any
 // magnitude — int64 within that range, an exact rational beyond it. Only a genuinely
 // FRACTIONAL operand falls back to the float64 comparison.
+//
+// Which tier raw takes is decided from its exact literal (see asInt64), NOT from a float64
+// coercion the caller can steer: spelling an over-bound integer "9007199254740993.0" used
+// to round it onto the bound and pass. Stated residual: a genuinely fractional argument
+// stays float64-approximate here, so one within half a ULP of an integral bound (2^53+0.5
+// against a maximum of 2^53) still compares equal to it — the documented policy for
+// fractional values, whose exact comparison would break an authored bound like 0.1 that is
+// not the double nearest 0.1.
 func compareToBound(raw interface{}, f, bound float64) int {
 	if ri, ok := asInt64(raw); ok {
 		if bi, ok := capability.FloatToInt64(bound); ok {

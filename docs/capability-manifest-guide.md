@@ -176,6 +176,18 @@ exactness applies to `allowedValues` / `enum` membership at any magnitude. Only
 genuinely **fractional** operands still compare as floats, where a decimal literal
 and its 64-bit approximation are consistent on both sides.
 
+The **argument's spelling does not select** that exactness. `9007199254740993`,
+`9007199254740993.0` and `9.007199254740993e15` are one number to every comparison,
+so a value outside an `allowedValues` set or `enum`, or above a `maximum`, cannot be
+admitted by writing it with a trailing `.0` or in exponent form — earlier builds
+read whether an argument was a whole number from its 64-bit *coercion*, which rounded
+the respelled literal onto the neighbouring integer and endorsed it as exact. A
+respelled small integer still matches (`2.0` satisfies `allowedValues: [2]`). The
+residual is unchanged: a genuinely fractional argument still compares to a
+`minimum` / `maximum` as a float, so one within half a unit in the last place of an
+integral bound (`9007199254740992.5` against a `maximum` of `9007199254740992`)
+compares equal to it.
+
 Like `directives` (§ 5a), `argumentSchema` applies to **`tool:` targets only**
 (SPEC § 3.2.2): it validates the shape of a tool call's argument map, which
 `resource:`, `prompt:`, and `system:` requests do not carry — `resources/read`

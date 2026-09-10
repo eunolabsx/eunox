@@ -1093,7 +1093,9 @@ func OperationVerb(s string) string {
 // float64, so a bare manifest integer would not reflect.DeepEqual-match the same number.
 //
 // When both represent an integer they are compared exactly (int64 within range, an exact
-// rational beyond it), so two distinct integers sharing a float64 are never conflated.
+// rational beyond it), so two distinct integers sharing a float64 are never conflated —
+// integrality is read off the EXACT literal, never off its float64 rounding, which is what
+// keeps the caller's choice of spelling ("2.0", exponent form) from selecting a tier.
 // Only genuinely FRACTIONAL values fall back to the float64 comparison.
 func numericEqual(a, b any) bool {
 	ia, aInt := asInt64(a)
@@ -1193,8 +1195,14 @@ func asInt64(v any) (int64, bool) {
 		if i, err := n.Int64(); err == nil {
 			return i, true
 		}
-		if f, err := n.Float64(); err == nil {
-			return capability.FloatToInt64(f)
+		// Int64 rejects every literal carrying a '.' or an exponent, and that SPELLING is
+		// the caller's to choose: reading integrality off the float64 coercion endorsed the
+		// ROUNDED value as exact, so "9007199254740993.0" reported 2^53 and satisfied a
+		// bound it exceeds, and "9007199254740992.5" reported an integer it is not. Read
+		// the literal exactly instead; a fractional or out-of-int64-range value is simply
+		// not an int64 integer, and the callers' exact-rational tiers handle it.
+		if r, ok := exactIntegerRat(n); ok && r.Num().IsInt64() {
+			return r.Num().Int64(), true
 		}
 	case int:
 		return int64(n), true

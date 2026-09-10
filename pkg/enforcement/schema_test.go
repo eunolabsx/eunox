@@ -775,6 +775,15 @@ func TestValidateArgumentSchema_EnumLargeIntPrecision(t *testing.T) {
 	}{
 		{name: "exact large int matches", value: json.Number("9007199254740992")},
 		{name: "distinct large int denied", value: json.Number("9007199254740993"), wantErr: true},
+		// The literal SPELLING is the caller's, and json.Number.Int64 rejects a '.' or an
+		// exponent: reading those off the float64 coercion rounded 2^53+1 onto the enum
+		// entry and admitted a value outside the declared set. Same verdicts as above.
+		{name: "exact large int respelled matches", value: json.Number("9007199254740992.0")},
+		{name: "distinct large int respelled denied", value: json.Number("9007199254740993.0"), wantErr: true},
+		{name: "distinct large int in exponent form denied", value: json.Number("9.007199254740993e15"), wantErr: true},
+		// 2^53+0.5 rounds onto the entry too, and its float64 is integral, so the
+		// rounded read called a fractional argument the enum's integer.
+		{name: "fractional past float64 resolution denied", value: json.Number("9007199254740992.5"), wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1161,6 +1170,14 @@ func TestValidateArgumentSchema_BoundLargeIntPrecision(t *testing.T) {
 		{name: "2^53 at max allowed", schema: maxSchema(), value: json.Number("9007199254740992")},
 		{name: "-(2^53+1) under min denied", schema: minSchema(), value: json.Number("-9007199254740993"), wantErr: true},
 		{name: "-2^53 at min allowed", schema: minSchema(), value: json.Number("-9007199254740992")},
+		// A bound is only as exact as the tier the ARGUMENT lands in, and the caller
+		// picks the spelling: a '.' or an exponent used to route the value onto its
+		// float64 rounding, which is the bound itself, so an over-bound integer passed.
+		{name: "2^53+1 over max denied, trailing-zero spelling", schema: maxSchema(), value: json.Number("9007199254740993.0"), wantErr: true},
+		{name: "2^53+1 over max denied, exponent spelling", schema: maxSchema(), value: json.Number("9.007199254740993e15"), wantErr: true},
+		{name: "2^53 at max allowed, trailing-zero spelling", schema: maxSchema(), value: json.Number("9007199254740992.0")},
+		{name: "-(2^53+1) under min denied, trailing-zero spelling", schema: minSchema(), value: json.Number("-9007199254740993.0"), wantErr: true},
+		{name: "-2^53 at min allowed, exponent spelling", schema: minSchema(), value: json.Number("-9.007199254740992e15")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
