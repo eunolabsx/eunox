@@ -1144,9 +1144,12 @@ func dispatchList(ctx context.Context, d dispatchParams, msg mcp.RPCMsg, filter 
 		return d.recordUpstreamFailure(ctx, msg, err, id, nil)
 	}
 
-	// Defense-in-depth: a neither-result-nor-error reply is malformed, and forwarding it
-	// would bypass list filtering. callUpstream now rejects this before returning, so it's
-	// no longer reachable live — kept as a backstop against a future bypass.
+	// A neither-result-nor-error reply is malformed, and forwarding it would bypass list
+	// filtering. Every read path behind callUpstream refuses one first (isMalformedResponse,
+	// via awaitNonced and correlateUpstreamReply), but that is a DEPENDENCY rather than a
+	// structural property — the wrappers callUpstream is built from relay whatever the read
+	// path hands back — so this stays as a fail-closed backstop against a future read path
+	// that does not. Same hedge translateReply's doc makes about the same guards.
 	if upResp.Error == nil && upResp.Result == nil {
 		warnIfStrictAuditJustDegraded(d.errOutOrStderr(), d.requireAuditStrict, d.rec, id.kind, id.denialTarget, func() {
 			if d.rec != nil {

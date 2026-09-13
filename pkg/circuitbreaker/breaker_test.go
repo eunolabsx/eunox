@@ -459,9 +459,12 @@ func TestBreaker_Stats_LastTransitionAtProjectedInLogicalHalfOpen(t *testing.T) 
 	}
 }
 
-// TestBreaker_HalfOpenClosesOnlyAfterAllProbesSucceed verifies the breaker closes
-// once HalfOpenMaxProbes probes have all succeeded, and not before.
-func TestBreaker_HalfOpenClosesOnlyAfterAllProbesSucceed(t *testing.T) {
+// TestBreaker_HalfOpenClosesOnMaxProbeSuccesses verifies the breaker closes once
+// HalfOpenMaxProbes probes have SUCCEEDED, and not before. Named for the success COUNT
+// rather than "all admitted probes": the two coincide here only because this window drops
+// none — see TestBreaker_HalfOpenAdmitsBeyondBudgetWhenAProbeDrops for the case that
+// separates them.
+func TestBreaker_HalfOpenClosesOnMaxProbeSuccesses(t *testing.T) {
 	var mu sync.Mutex
 	current := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	clock := func() time.Time {
@@ -500,10 +503,67 @@ func TestBreaker_HalfOpenClosesOnlyAfterAllProbesSucceed(t *testing.T) {
 
 	b.markSuccess()
 	if s := b.State(); s != StateClosed {
-		t.Fatalf("expected StateClosed after all probes succeeded, got %q", s)
+		t.Fatalf("expected StateClosed after the second probe success, got %q", s)
 	}
 	if !b.allowReq() {
 		t.Fatal("expected Allow() once the breaker has closed")
+	}
+}
+
+// TestBreaker_HalfOpenAdmitsBeyondBudgetWhenAProbeDrops pins the half-open rule the package
+// doc states: HalfOpenMaxProbes is an admission BUDGET and the close condition is that many
+// SUCCESSES, so a dropped probe returning its slot lets one window admit more probes than the
+// budget names — and the breaker closes with the dropped one never having succeeded. Without
+// this case the budget and "every admitted probe succeeded" are indistinguishable, which is
+// how the package doc came to state the latter.
+func TestBreaker_HalfOpenAdmitsBeyondBudgetWhenAProbeDrops(t *testing.T) {
+	var mu sync.Mutex
+	current := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return current
+	}
+	advanceClock := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		current = current.Add(d)
+	}
+
+	cfg := Config{
+		FailureThreshold:  2,
+		CooldownDuration:  5 * time.Second,
+		HalfOpenMaxProbes: 2,
+	}
+	b := New(cfg, WithClock(clock))
+
+	b.markFailure()
+	b.markFailure()
+	advanceClock(6 * time.Second)
+
+	admittedA, probeA := b.allowProbe()
+	admittedB, probeB := b.allowProbe()
+	if !admittedA || !admittedB {
+		t.Fatal("expected both budgeted half-open probes to be admitted")
+	}
+	if admitted, _ := b.allowProbe(); admitted {
+		t.Fatal("a third probe must be refused while the budget is spent")
+	}
+
+	// Neither success nor failure: the slot comes back, the success tally does not move.
+	probeA.drop()
+	admittedC, probeC := b.allowProbe()
+	if !admittedC {
+		t.Fatal("the dropped probe's slot must be reusable — this window now admits 3 probes on a budget of 2")
+	}
+
+	probeB.success()
+	if s := b.State(); s != StateHalfOpen {
+		t.Fatalf("expected StateHalfOpen after one of two required successes, got %q", s)
+	}
+	probeC.success()
+	if s := b.State(); s != StateClosed {
+		t.Fatalf("expected StateClosed on the second SUCCESS, with the dropped probe never having succeeded, got %q", s)
 	}
 }
 
