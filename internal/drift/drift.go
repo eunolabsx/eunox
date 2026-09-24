@@ -16,8 +16,8 @@
 //
 // In non-strict mode findings are logged to stderr and the session continues — EXCEPT FM-5 and
 // Fm2Pinned, which both abort startup UNCONDITIONALLY (see hasCriticalDrift). With
-// --strict-drift, FM-1, FM-2 and FM-4/FM-6 also abort. FM-3 and "uncovered" are always
-// advisory. (IsFatal, which is what --strict-drift reads, also answers true for Fm2Pinned —
+// --strict-drift, FM-1, FM-2 and FM-4/FM-6 also abort. FM-3, "uncovered" and SchemaAbsent
+// are always advisory. (IsFatal, which is what --strict-drift reads, also answers true for Fm2Pinned —
 // no behavior of its own, since that kind aborts unconditionally either way.)
 //
 // The comparison is pure. Shared by two consumers: the transport runtime drives it through

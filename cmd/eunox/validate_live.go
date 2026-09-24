@@ -523,11 +523,15 @@ func cmdValidate(args []string) int {
 	var manifests []*config.LocalManifest
 	for _, f := range files {
 		m, err := config.LoadManifest(f)
+		lr := transport.PolicyLoadResult{Path: f, Manifest: m, Err: err}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "FAIL  %s: %v\n", f, err)
+			// stderr, as every other refusal in this positional mode is; the --config
+			// mode reports into one writer because its FAIL lines sit inside a per-route
+			// report that would be unreadable split across two streams.
+			writePolicyLoadResult(os.Stderr, "", lr)
 			ok = false
 		} else {
-			fmt.Printf("OK    %s  (name=%q version=%q capabilities=%d)\n", f, m.Name, m.Version, len(m.Capabilities))
+			writePolicyLoadResult(os.Stdout, "", lr)
 			manifests = append(manifests, m)
 		}
 	}
@@ -581,17 +585,23 @@ func cmdValidate(args []string) int {
 }
 
 // writePolicyLoadResults prints one FAIL/OK line per outcome.LoadResults entry to out, each
-// indented by prefix, so validate and doctor cannot diverge on how a route's per-file
-// manifest load result is reported.
+// indented by prefix.
 func writePolicyLoadResults(out io.Writer, prefix string, results []transport.PolicyLoadResult) {
-	wf, _ := writers(out)
 	for _, lr := range results {
-		if lr.Err != nil {
-			wf("%sFAIL  %s: %v\n", prefix, lr.Path, lr.Err)
-			continue
-		}
-		wf("%sOK    %s  (name=%q version=%q capabilities=%d)\n", prefix, lr.Path, lr.Manifest.Name, lr.Manifest.Version, len(lr.Manifest.Capabilities))
+		writePolicyLoadResult(out, prefix, lr)
 	}
+}
+
+// writePolicyLoadResult is the one rendering of a manifest load result, so validate's
+// positional mode, its --config mode and doctor cannot diverge on the line; positional
+// mode calls it per file because it routes the two outcomes to different streams.
+func writePolicyLoadResult(out io.Writer, prefix string, lr transport.PolicyLoadResult) {
+	wf, _ := writers(out)
+	if lr.Err != nil {
+		wf("%sFAIL  %s: %v\n", prefix, lr.Path, lr.Err)
+		return
+	}
+	wf("%sOK    %s  (name=%q version=%q capabilities=%d)\n", prefix, lr.Path, lr.Manifest.Name, lr.Manifest.Version, len(lr.Manifest.Capabilities))
 }
 
 // reportRouteOutcome prints outcome's FAIL/OK/policy-config report for one route and

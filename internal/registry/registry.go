@@ -192,6 +192,12 @@ func (c *Contract) Validate() error {
 	if err := checkPinnableNumbers(c.Effect); err != nil {
 		return fmt.Errorf("contract %q: %w", c.ID, err)
 	}
+	// Shape first, so a declared digest that was never a digest (a truncated paste,
+	// uppercase hex) is not reported below as an entry edited after publishing — that
+	// diagnosis points at re-digesting, when the fix is to digest it at all.
+	if err := capability.ValidateSHA256Pin("digest", c.Digest); err != nil {
+		return fmt.Errorf("contract %q: %w", c.ID, err)
+	}
 	actual, err := capability.EffectContractDigest(c.Effect)
 	if err != nil {
 		return fmt.Errorf("contract %q: %w", c.ID, err)

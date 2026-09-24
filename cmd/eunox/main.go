@@ -98,8 +98,14 @@ func run(args []string) int {
 	case "doctor":
 		return cmdDoctor(subArgs)
 	case "version", "--version", "-version":
+		if code, stray := refuseStrayArgs(args[1], subArgs); stray {
+			return code
+		}
 		cmdVersion()
 	case "--help", "-help", "-h", "help":
+		if code, stray := refuseStrayArgs(args[1], subArgs); stray {
+			return code
+		}
 		// An explicit help request is a successful query: usage to stdout, exit 0.
 		printUsage(os.Stdout)
 	default:
@@ -113,6 +119,18 @@ func run(args []string) int {
 		return 2
 	}
 	return 0
+}
+
+// refuseStrayArgs holds the two argument-less arms to the rule every other subcommand
+// applies to a stray positional: `eunox help proxy` printing the top-level screen, or
+// `eunox version --help` printing a version, answers a question the operator did not ask
+// with exit 0. Usage-error code 2, as for an unknown subcommand.
+func refuseStrayArgs(name string, rest []string) (code int, stray bool) {
+	if len(rest) == 0 {
+		return 0, false
+	}
+	fmt.Fprintf(os.Stderr, "eunox %s: unexpected argument %q (takes no arguments)\n", name, rest[0])
+	return 2, true
 }
 
 // cmdVersion prints the build version and exits.
@@ -315,8 +333,8 @@ func registerProxyFlags(fs *flag.FlagSet) *proxyCLIFlags {
 		sessionID:          fs.String("session-id", "", "Session ID to use (default: random UUID). (transport: stdio only — a gateway\nmints its own Mcp-Session-Id per client session.)"),
 		shutdownTimeout:    fs.Int("shutdown-timeout", 5000, "Milliseconds to wait for graceful upstream shutdown before SIGKILL."),
 		upstreamTimeout:    fs.Int("upstream-timeout", transport.UpstreamTimeoutUnset, "Milliseconds to wait for the upstream to respond. An explicit value takes\nprecedence over the config's defaults.upstreamTimeoutMs: 0 disables the timeout,\na positive value sets it. -1 (the default) defers to the config, or to the\nbuilt-in default (30000) when the config does not set one either; any other\nnegative value is rejected rather than silently deferring. For a remote\nHTTP upstream (gateway upstreamUrl), a forwarded host notification (e.g.\nnotifications/cancelled) is independently capped at 30s regardless of this flag,\nso a stalling upstream cannot pin the notification's in-flight slot indefinitely;\nfor a subprocess (command) upstream, notification writes share this flag's bound\nlike any other write to that upstream, so 0 leaves them unbounded too."),
-		maxSessions:        fs.Int("max-sessions", defaultMaxSessions, "Cap on concurrent client sessions (transport: http). A new session beyond the cap\nis refused with 503 rather than spawning an unbounded number of upstreams.\nDefaults to a safe backstop (512); pass 0 to disable the cap (unlimited).\nAny listen.maxSessions in the config overrides this flag, including 0, which\ndisables the backstop: a present config value always wins."),
-		sessionIdleTimeout: fs.Int("session-idle-timeout", 0, "Close a session whose host has sent no request for this many milliseconds\n(transport: http), so idle sessions cannot pin upstream processes.\n0 = no idle reaping. Overridden by the config's listen.sessionIdleTimeoutMs."),
+		maxSessions:        fs.Int("max-sessions", defaultMaxSessions, "Cap on concurrent client sessions (transport: http). A new session beyond the cap\nis refused with 503 rather than spawning an unbounded number of upstreams.\nDefaults to a safe backstop (512); pass 0 to disable the cap (unlimited).\nAny listen.maxSessions in the config overrides this flag, including 0, which\ndisables the backstop: a present config value always wins, and an explicitly-\npassed flag it discards is named in a startup warning."),
+		sessionIdleTimeout: fs.Int("session-idle-timeout", 0, "Close a session whose host has sent no request for this many milliseconds\n(transport: http), so idle sessions cannot pin upstream processes.\n0 = no idle reaping. Overridden by the config's listen.sessionIdleTimeoutMs\n(an explicitly-passed flag it discards is named in a startup warning)."),
 
 		// JWT PDP flags (transport: http only).
 		jwksURI:             fs.String("jwks-uri", "", "JWKS endpoint URI for IdP-issued capability JWTs (e.g. https://idp.example.com/.well-known/jwks.json).\nWhen set, every request must carry a valid Bearer JWT with eunox capability claims.\nRequires transport: http."),
@@ -537,7 +555,9 @@ func cmdProxy(args []string) (exitCode int) {
 		strictDrift:          *f.strictDrift,
 		requireAuditStrict:   f.requireAudit.strict(),
 		maxSessions:          *f.maxSessions,
+		maxSessionsSet:       flagWasSet(fs, "max-sessions"),
 		sessionIdleTimeoutMs: *f.sessionIdleTimeout,
+		sessionIdleSet:       flagWasSet(fs, "session-idle-timeout"),
 		redisConfigured:      *f.redisAddr != "",
 		auditPEP:             *f.auditPEP,
 		controlTokenPath:     *f.controlTokenPath,
@@ -872,6 +892,18 @@ func sessionKillTTLNotice(ttl time.Duration) string {
 // ints) values, since the four callers' fields differ in type.
 func warnAuditFlagOverridden(flagName, flagRepr, cfgField, cfgRepr string) {
 	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %s is overridden by the config's %s %s; the config's audit block always takes precedence for `proxy` so every route shares one tape.\n", flagName, flagRepr, cfgField, cfgRepr)
+}
+
+// warnListenFlagOverridden is the listen-block counterpart of warnAuditFlagOverridden:
+// config wins over these two flags as it does over the audit ones, and an explicitly-passed
+// flag is never discarded in silence — the first symptom of a lost --max-sessions is
+// otherwise a capacity refusal with nothing on stderr pointing at its cause. Silent when
+// the two agree, since nothing was discarded.
+func warnListenFlagOverridden(flagSet bool, flagName string, flagVal int, cfgField string, cfgVal *int) {
+	if !flagSet || cfgVal == nil || *cfgVal == flagVal {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[eunox] WARNING: %s %d is overridden by the config's %s %d; a present config value always takes precedence.\n", flagName, flagVal, cfgField, *cfgVal)
 }
 
 // resolveAuditPEP applies the audit block's precedence to the enforcement-point name alone,
@@ -1354,6 +1386,11 @@ type proxyFlags struct {
 	auditPEP             string // --audit-pep: this enforcement point's name, before the config's audit.pep takes precedence
 	controlTokenPath     string // --control-token-path: where to write the /control/kill control token; HTTP only
 
+	// maxSessionsSet/sessionIdleSet record whether those two were passed explicitly: both
+	// have a meaningful default (512 and 0), so the value alone cannot tell an operator's
+	// choice from the default when deciding whether a config override discards one.
+	maxSessionsSet, sessionIdleSet bool
+
 	// httpOnlyFlagsSet holds the "--"-prefixed names of every HTTP-only flag the operator
 	// activated, precomputed by activeHTTPOnlyFlags.
 	httpOnlyFlagsSet []string
@@ -1793,8 +1830,10 @@ func serveHTTPGateway(ctx context.Context, cfg *config.GatewayConfig, sink *audi
 	// Config takes precedence over the flag; an explicit listen.maxSessions overrides even
 	// at 0, so config can still express "unlimited" despite the flag's non-zero default.
 	maxSessions := transport.ResolveMaxSessions(pf.maxSessions, cfg.Listen.MaxSessions)
+	warnListenFlagOverridden(pf.maxSessionsSet, "--max-sessions", pf.maxSessions, "listen.maxSessions", cfg.Listen.MaxSessions)
 	// Mirrors ResolveMaxSessions: a present config value wins, including an explicit 0.
 	sessionIdleMs := transport.ResolveSessionIdleTimeout(pf.sessionIdleTimeoutMs, cfg.Listen.SessionIdleTimeoutMs)
+	warnListenFlagOverridden(pf.sessionIdleSet, "--session-idle-timeout", pf.sessionIdleTimeoutMs, "listen.sessionIdleTimeoutMs", cfg.Listen.SessionIdleTimeoutMs)
 	// listen.trustedProxyHops is config-only (no flag): a property of deployment topology.
 	var trustedProxyHops int
 	if h := cfg.Listen.TrustedProxyHops; h != nil {

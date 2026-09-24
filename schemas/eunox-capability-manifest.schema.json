@@ -595,7 +595,7 @@
         "argument": {
           "type": "string",
           "minLength": 1,
-          "description": "The call argument carrying the magnitude; a list contributes its LENGTH."
+          "description": "The call argument carrying the magnitude; a list contributes its LENGTH, and a list with a list among its elements resolves to unquantified."
         },
         "unit": {
           "type": "string",

@@ -89,7 +89,7 @@ type killDimension struct {
 // ahead of every policy evaluation — a by-value range copies it per dimension per call for
 // nothing. The entries are package-level and never mutated, so the pointer is to fixed data.
 //
-// ORDER is the gate order ShouldBlock and HealthStatus both walk. It does not decide the
+// ORDER is the gate order ShouldBlock and Status both walk. It does not decide the
 // answer — a match on any dimension blocks — but it decides which revocation a request is
 // attributed to when several match, and both backends walk it identically so they cannot
 // disagree about that.

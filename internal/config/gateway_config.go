@@ -646,12 +646,12 @@ func LoadGatewayConfig(path string) (*GatewayConfig, error) {
 	// upstreamAuthHeader that listen.authToken gets above: an unset/blank ref yields an
 	// auth header the upstream rejects on every call. Fail closed.
 	for i := range cfg.Upstreams {
-		raw := rawFields.upstreamAuth[i]
-		if raw == "" || cfg.Upstreams[i].Transport != "http" {
+		rawAuth := rawFields.upstreamAuth[i]
+		if rawAuth == "" || cfg.Upstreams[i].Transport != "http" {
 			continue
 		}
 		label := fmt.Sprintf("upstream %q upstreamAuthHeader", cfg.Upstreams[i].Name)
-		if err := validateCredentialEnvRefs(path, label, raw, upstreamAuthHeaderEnvGrammar); err != nil {
+		if err := validateCredentialEnvRefs(path, label, rawAuth, upstreamAuthHeaderEnvGrammar); err != nil {
 			return nil, err
 		}
 	}

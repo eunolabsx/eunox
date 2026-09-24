@@ -125,7 +125,7 @@
           "minimum": 0
         },
         "argument": {
-          "description": "The call argument carrying the magnitude. A list argument contributes its LENGTH; a non-numeric string has no magnitude and resolves to unquantified rather than being counted by characters.",
+          "description": "The call argument carrying the magnitude. A list argument contributes its LENGTH (a list with a list among its elements resolves to unquantified); a non-numeric string has no magnitude and resolves to unquantified rather than being counted by characters.",
           "type": "string",
           "minLength": 1
         },

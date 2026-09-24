@@ -101,6 +101,24 @@ func TestResolveEffect(t *testing.T) {
 			wantAnnotated: true,
 		},
 		{
+			name:          "a list of objects still counts by length",
+			contract:      &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "to"}},
+			args:          map[string]interface{}{"to": []interface{}{map[string]interface{}{"addr": "a@x"}, map[string]interface{}{"addr": "b@x"}}},
+			wantClass:     EffectIrreversible,
+			wantQuant:     true,
+			wantRadius:    "2",
+			wantAnnotated: true,
+		},
+		{
+			// An upstream that flattens would touch every inner entry; counting the
+			// wrapper as one would let the caller choose its own magnitude.
+			name:          "a list containing a nested list is unquantified, not counted as one",
+			contract:      &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "to"}},
+			args:          map[string]interface{}{"to": []interface{}{[]interface{}{"a@x", "b@x", "c@x"}}},
+			wantClass:     EffectIrreversible,
+			wantAnnotated: true,
+		},
+		{
 			name:          "a non-numeric string argument has no magnitude and is not counted by length",
 			contract:      &EffectContract{Class: EffectIrreversible, BlastRadius: &BlastRadiusSpec{Argument: "note"}},
 			args:          map[string]interface{}{"note": "delete everything"},

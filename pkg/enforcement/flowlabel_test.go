@@ -253,6 +253,8 @@ func TestFlowLabel_AxesAreIndependent(t *testing.T) {
 	sink := eng.ValidateAction(ctx, req("s", "send_email"), sinkCaps("send_email", capability.NativeFlowLabelVocabulary()...))
 	require.Equal(t, capability.DecisionDeny, sink.Decision)
 	assert.Equal(t, []string{"msip:confidential"}, sink.Denial.Details["blockedLabels"])
+	assert.Equal(t, "msip:confidential", sink.Denial.Details["blockedLabel"],
+		"with no native label blocked, the singular falls back to the last imported one")
 
 	// The mirror: a native taint against a sink that admits only imported classes.
 	require.Equal(t, capability.DecisionAllow,
@@ -287,4 +289,6 @@ func TestFlowLabel_MixedAxisCarriedLabelsAreCanonical(t *testing.T) {
 		capability.FlowLabelPII, capability.FlowLabelUntrusted,
 		"msip:general", "purview:secret",
 	}, sink.CarriedLabels, "carried_labels renders native-first then imported, sorted")
+	assert.Equal(t, capability.FlowLabelUntrusted, sink.Denial.Details["blockedLabel"],
+		"the singular names the last blocked NATIVE class; an imported label sorting after it must not displace it")
 }

@@ -251,7 +251,7 @@ type httpSession struct {
 const maxConcurrentSessionRequests = 256
 
 // maxConcurrentSessionNotifications bounds in-flight notification forwards per HTTP session,
-// mirroring the stdio bridge's maxInflightPosts but scaled down since this pool is per-session.
+// the same value as the stdio bridge's maxInflightPosts; this one applies per session.
 const maxConcurrentSessionNotifications = 64
 
 // tryAcquireNotifySlot non-blocking-acquires the session's notification semaphore, false at

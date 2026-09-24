@@ -2446,6 +2446,10 @@ The call is denied when the session's accumulated set is **not a subset** of
 here. The denial names the offending labels and is distinguishable from a
 capability denial (a `flow: true` detail plus `blockedLabels`), so an operator
 can tell "this tool is not granted" from "this data may not go there".
+`blockedLabels` is the complete set; the singular `blockedLabel` beside it is a
+one-value summary naming the last blocked **native** class in vocabulary order
+(so `untrusted` or `pii` when present), and an imported label only when no
+native one is blocked.
 
 An **empty** `allow` is valid and is the strictest sink: it admits only an
 unlabeled, clean-context flow.

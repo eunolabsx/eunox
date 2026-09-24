@@ -1561,6 +1561,70 @@ func TestResolveMaxSessions(t *testing.T) {
 	}
 }
 
+// TestRun_VersionAndHelpRefuseStrayArgs pins that the two argument-less arms refuse a
+// trailing argument with the usage-error code rather than answering a different question.
+func TestRun_VersionAndHelpRefuseStrayArgs(t *testing.T) {
+	for _, argv := range [][]string{
+		{"eunox", "version", "--help"},
+		{"eunox", "--version", "extra"},
+		{"eunox", "help", "proxy"},
+		{"eunox", "-h", "proxy"},
+	} {
+		var code int
+		errOut := captureStderr(t, func() {
+			_ = captureStdout(t, func() { code = run(argv) })
+		})
+		if code != 2 {
+			t.Errorf("%v: exit %d, want 2", argv, code)
+		}
+		if !strings.Contains(errOut, "unexpected argument") {
+			t.Errorf("%v: stderr %q must name the stray argument", argv, errOut)
+		}
+	}
+	for _, argv := range [][]string{{"eunox", "version"}, {"eunox", "help"}} {
+		var code int
+		_ = captureStdout(t, func() { code = run(argv) })
+		if code != 0 {
+			t.Errorf("%v: exit %d, want 0", argv, code)
+		}
+	}
+}
+
+// TestWarnListenFlagOverridden pins that an explicit --max-sessions/--session-idle-timeout
+// discarded by the config is named on stderr, and that neither the default value nor an
+// agreeing config produces a line — a warning on every run would train operators to ignore it.
+func TestWarnListenFlagOverridden(t *testing.T) {
+	tests := []struct {
+		name     string
+		set      bool
+		flag     int
+		cfg      *int
+		wantWarn bool
+	}{
+		{"explicit flag discarded by config", true, 100, intPtr(5), true},
+		{"explicit flag discarded by config 0", true, 100, intPtr(0), true},
+		{"flag left at its default", false, defaultMaxSessions, intPtr(5), false},
+		{"config agrees with the flag", true, 5, intPtr(5), false},
+		{"no config value", true, 100, nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureStderr(t, func() {
+				warnListenFlagOverridden(tc.set, "--max-sessions", tc.flag, "listen.maxSessions", tc.cfg)
+			})
+			if !tc.wantWarn {
+				if out != "" {
+					t.Fatalf("no warning expected, got %q", out)
+				}
+				return
+			}
+			if want := "WARNING: --max-sessions 100 is overridden by the config's listen.maxSessions"; !strings.Contains(out, want) {
+				t.Fatalf("stderr %q must contain %q", out, want)
+			}
+		})
+	}
+}
+
 // ===== merged from operational_hardening_test.go =====
 
 // -----------------------------------------------------------------

@@ -145,7 +145,7 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 					// Distinguishes a source->sink flow denial from a plain
 					// capability/argument denial.
 					capability.FlowAuditDetailKey: true,
-					"blockedLabel":                blocked[len(blocked)-1],
+					"blockedLabel":                primaryBlockedLabel(blocked),
 					"blockedLabels":               blocked,
 					"allowLabels":                 effectiveAllow,
 				}
@@ -159,6 +159,22 @@ func (e *Engine) handleFlowLabel(ctx context.Context, cond capability.Condition,
 		}
 	}
 	return nil
+}
+
+// primaryBlockedLabel picks the singular blockedLabel detail: the last NATIVE label in
+// blocked, falling back to the last label only when every blocked label is imported.
+// blocked is canonically ordered, native vocabulary first and imported labels after it,
+// so taking the last element outright let any blocked imported label displace the native
+// class ranked highest in the vocabulary (untrusted, pii) — a SIEM keying on the singular
+// then read an alphabetically arbitrary taxonomy name in place of the class eunox owns.
+// blockedLabels stays the complete set; this is the one-value summary beside it.
+func primaryBlockedLabel(blocked []string) string {
+	for i := len(blocked) - 1; i >= 0; i-- {
+		if capability.IsNativeFlowLabel(blocked[i]) {
+			return blocked[i]
+		}
+	}
+	return blocked[len(blocked)-1]
 }
 
 // unionLabels merges declared into present, deduplicated, in canonical order (native classes

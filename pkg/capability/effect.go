@@ -897,6 +897,17 @@ func (s *BlastRadiusSpec) resolveRaw(args map[string]interface{}) (*big.Float, b
 	case []interface{}:
 		// A list argument (recipients, row ids) contributes its LENGTH: "how many things
 		// does this touch" is the quantity a recipient-count or row-count bound means.
+		//
+		// An element that is itself a list makes the count unreadable: an upstream that
+		// flattens nested lists touches every inner entry, so `[[a, b, ..., z]]` would
+		// otherwise count as one against both the per-call max and the cumulative budget
+		// — a wrapper the caller chooses. Unquantified exceeds every bound; a list of
+		// objects or scalars still counts by length.
+		for _, elem := range v {
+			if _, nested := elem.([]interface{}); nested {
+				return nil, false
+			}
+		}
 		return new(big.Float).SetInt64(int64(len(v))), true
 	default:
 		return nil, false

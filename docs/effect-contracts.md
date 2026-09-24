@@ -72,7 +72,9 @@ capabilities:
 
 - **`blastRadius`** is either a fixed `value` or the value of a named `argument` — exactly
   one, never both. A **list** argument contributes its **length** ("how many things does
-  this touch"). A non-numeric string has no magnitude and resolves to *unquantified*; it is
+  this touch"); a list with a list among its elements resolves to *unquantified* instead,
+  since an upstream that flattens it touches every inner entry and counting the wrapper as
+  one would let the caller pick the magnitude. A non-numeric string has no magnitude and resolves to *unquantified*; it is
   not counted by characters, because inventing a magnitude is the inference this layer
   refuses to do. A **negative** argument value also resolves to unquantified: a magnitude
   is non-negative by construction, so a negative one is caller-supplied nonsense, and

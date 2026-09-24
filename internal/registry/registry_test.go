@@ -134,6 +134,11 @@ func TestValidateRejectsATamperedEntry(t *testing.T) {
 		{"missing effect", func(c *Contract) { c.Effect = nil }, "missing 'effect'"},
 		{"self-referential ref", func(c *Contract) { c.Effect.Ref = "x@sha256:0" }, "must not carry its own 'ref'"},
 		{"digest does not match content", func(c *Contract) { c.Effect.Class = capability.EffectIrreversible }, "does not match its content digest"},
+		// A declared digest that is not a digest at all must be named as malformed, not as
+		// an entry edited after publishing — the two point at different repairs.
+		{"digest truncated", func(c *Contract) { c.Digest = c.Digest[:20] }, "hex part must be exactly 64 characters"},
+		{"digest missing prefix", func(c *Contract) { c.Digest = strings.TrimPrefix(c.Digest, "sha256:") }, `must start with "sha256:"`},
+		{"digest uppercase hex", func(c *Contract) { c.Digest = "sha256:" + strings.ToUpper(strings.TrimPrefix(c.Digest, "sha256:")) }, "must be lowercase"},
 		// The id is the half of Ref() before the "@", and SplitEffectRef cuts at the
 		// first one — so an id carrying an "@" digests cleanly here and yields a ref
 		// that can never resolve, surfacing much later as a mismatch at manifest load.
