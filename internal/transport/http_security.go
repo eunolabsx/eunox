@@ -466,7 +466,7 @@ func (p *HTTPProxy) routeRefusalRecorders(route *UpstreamRoute) refusalRecorders
 }
 
 // preSessionAudienceRecorder returns the recorder the session-creating initialize's
-// per-route audience pin (initAudienceDenial) must write its record through, or nil when
+// per-route audience pin (creationAudienceDenial) must write its record through, or nil when
 // the bucket suppressed this one (the request is still denied either way — only the
 // RECORD is elided). Mirrors preSessionKillRecorder: this fires for a caller who has
 // passed JWT validation (so is not a raw unauthenticated caller) but failed THIS route's

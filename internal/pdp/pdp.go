@@ -2923,9 +2923,9 @@ type jsonKeyScanOpts struct {
 	//
 	// nil keeps the tools/list rule: fold the ROOT object's keys, match exactly below.
 	// That rule is derived from encoding/json binding an entry's top-level keys to the
-	// mcp.ToolEntry STRUCT by a case-folding match (so {"description":"<INJECT>",
-	// "Description":"<CLEAN>"} decodes to <CLEAN> and hashes clean while a case-sensitive
-	// host renders <INJECT>), while nested values decode into map[string]interface{} with
+	// toolListEntry STRUCT (this package's twin of the transport's mcp.ToolEntry) by a
+	// case-folding match (so {"description":"<INJECT>", "Description":"<CLEAN>"} decodes to
+	// <CLEAN> and hashes clean while a case-sensitive host renders <INJECT>), while nested values decode into map[string]interface{} with
 	// exact keys (so a schema carrying sibling properties "Name" and "name" is legal and
 	// honest, and folding there would refuse it). See the scanToolEntry doc for the full
 	// derivation.
