@@ -311,7 +311,7 @@ func (c *JWKSCache) getKeysLive(ctx context.Context) (*jose.JSONWebKeySet, error
 // copyKeySet returns a set whose Keys SLICE is independent of the cached one, so a caller
 // appending to, reordering, or truncating the result cannot mutate the shared cache other
 // verifications are concurrently reading. Handing out the live pointer made that aliasing
-// defense bypassable by anyone calling GetKeys/Refresh directly.
+// defense bypassable by anyone calling GetKeys directly.
 //
 // The copy is one level deep: mutating a KEY'S INTERNALS still reaches the cache (inherent
 // to the type, same bound FindKeys has) — the realistic accident this closes is slice
@@ -321,15 +321,6 @@ func copyKeySet(set *jose.JSONWebKeySet) *jose.JSONWebKeySet {
 		return nil
 	}
 	return &jose.JSONWebKeySet{Keys: append([]jose.JSONWebKey(nil), set.Keys...)}
-}
-
-// Refresh returns a fresh JWKS, respecting the cache TTL: if the cached copy is still
-// within TTL it is returned without an HTTP fetch. The returned set's Keys slice is
-// independent of the cache's (see copyKeySet); individual jose.JSONWebKey values still
-// share their underlying crypto key, so treat the KEYS themselves as read-only.
-func (c *JWKSCache) Refresh(ctx context.Context) (*jose.JSONWebKeySet, error) {
-	keys, _, err := c.refresh(ctx, false)
-	return copyKeySet(keys), err
 }
 
 // ForceRefreshForKID performs a rate-limited forced fetch, but suppresses it for a kid

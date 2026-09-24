@@ -54,9 +54,8 @@ func TestIsLoopbackHost(t *testing.T) {
 }
 
 // TestJWKSCache_ForceRefresh_BypassesTTL verifies the force-refresh path that
-// fixes the kid-miss-during-rotation gap: GetKeys and Refresh
-// serve from cache while within the TTL, but ForceRefresh always issues an HTTP
-// fetch regardless of the TTL.
+// fixes the kid-miss-during-rotation gap: GetKeys serves from cache while within the TTL,
+// but ForceRefresh always issues an HTTP fetch regardless of the TTL.
 func TestJWKSCache_ForceRefresh_BypassesTTL(t *testing.T) {
 	t.Parallel()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -78,12 +77,10 @@ func TestJWKSCache_ForceRefresh_BypassesTTL(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int32(1), hits.Load())
 
-	// Within the TTL, GetKeys and Refresh both serve from cache — no new fetch.
+	// Within the TTL, GetKeys serves from cache — no new fetch.
 	_, err = cache.GetKeys(context.Background())
 	require.NoError(t, err)
-	_, err = cache.Refresh(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, int32(1), hits.Load(), "within TTL, GetKeys/Refresh must not re-fetch")
+	require.Equal(t, int32(1), hits.Load(), "within TTL, GetKeys must not re-fetch")
 
 	// A forced refresh ignores the TTL and always fetches.
 	_, _, err = cache.refresh(context.Background(), true)
@@ -151,7 +148,7 @@ func TestJWKSCache_ForceRefresh_DoesNotJoinInFlightNonForced(t *testing.T) {
 	// Leader: a non-forced refresh that blocks mid-fetch.
 	leaderDone := make(chan error, 1)
 	go func() {
-		_, e := cache.Refresh(context.Background())
+		_, _, e := cache.refresh(context.Background(), false)
 		leaderDone <- e
 	}()
 	<-entered
@@ -1132,7 +1129,7 @@ func TestJWKSCache_SlowBackgroundRefreshDoesNotClobberForcedRotation(t *testing.
 	// blocks mid-fetch.
 	bgDone := make(chan error, 1)
 	go func() {
-		_, e := cache.Refresh(context.Background())
+		_, _, e := cache.refresh(context.Background(), false)
 		bgDone <- e
 	}()
 	<-entered
