@@ -6,7 +6,8 @@
 // After the MCP initialize handshake the proxy fetches tools/list from the upstream and
 // compares the live tool set against the capability manifest. These failure modes are detected:
 //
-//	FM-1  A new upstream tool is matched by a manifest glob — silent over-permission.
+//	FM-1  A live upstream tool is reachable through a manifest glob — potential silent over-permission.
+//	      There is no baseline: it fires for every such tool on every probe, not only a newly added one.
 //	FM-2  A manifest resource entry matches no live upstream tool — dead reference.
 //	FM-3  A condition/argumentSchema argument name is absent from the live inputSchema — silent bypass risk.
 //	FM-4  The live server version does not satisfy the manifest's serverVersion pin.
