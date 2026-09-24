@@ -254,6 +254,31 @@ func TestKillDimensions_EveryEntryIsComplete(t *testing.T) {
 	}
 }
 
+// TestInMemory_ResetAndZeroValueCoverEveryDimension pins InMemory's two whole-set paths to
+// the table: both used to name the maps by field, so a dimension added to killDimensions
+// compiled while Reset left its kills in force and a zero-value write panicked on its nil map.
+func TestInMemory_ResetAndZeroValueCoverEveryDimension(t *testing.T) {
+	t.Parallel()
+
+	m := &InMemory{}
+	m.mu.Lock()
+	m.ensureSetsLocked()
+	m.mu.Unlock()
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		assert.NotNilf(t, dim.memCache(m), "zero-value InMemory has no %q set after ensureSetsLocked", dim.name)
+		dim.memReplace(m, map[string]bool{"id": true})
+	}
+
+	require.NoError(t, m.Reset(context.Background()))
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		set := dim.memCache(m)
+		assert.NotNilf(t, set, "Reset left the %q set nil", dim.name)
+		assert.Emptyf(t, set, "Reset left a %q kill in force", dim.name)
+	}
+}
+
 // TestKillDimensions_MethodNamesExistOnTheInterface pins the operator-facing half of an
 // empty-id error against the interface it names. The names used to be COMPOSED as
 // verb+entity, which spelled the jti axis's kill method "KillJTI" — a method that does not

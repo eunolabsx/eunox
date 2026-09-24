@@ -55,14 +55,11 @@ func NewInMemory() *InMemory {
 // PANICKED, taking down an admin handler mid-request instead of recording the kill. A
 // library-facing zero value must fail no worse than an unusable one.
 func (m *InMemory) ensureSetsLocked() {
-	if m.killedAgents == nil {
-		m.killedAgents = make(map[string]bool)
-	}
-	if m.killedSessions == nil {
-		m.killedSessions = make(map[string]bool)
-	}
-	if m.revokedJTIs == nil {
-		m.revokedJTIs = make(map[string]bool)
+	for i := range killDimensions {
+		dim := &killDimensions[i]
+		if dim.memCache(m) == nil {
+			dim.memReplace(m, make(map[string]bool))
+		}
 	}
 }
 
@@ -212,9 +209,9 @@ func (m *InMemory) Reset(_ context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.globalActive = false
-	m.killedAgents = make(map[string]bool)
-	m.killedSessions = make(map[string]bool)
-	m.revokedJTIs = make(map[string]bool)
+	for i := range killDimensions {
+		killDimensions[i].memReplace(m, make(map[string]bool))
+	}
 	return nil
 }
 
