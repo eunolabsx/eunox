@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -959,4 +960,57 @@ func TestCorrelateUpstreamReply(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hostileIDJSON is a string id of the shape a hostile peer controls end to end: far past the
+// console bound, carrying an ANSI escape and a newline that would forge a second log line.
+func hostileIDJSON() string {
+	return `"` + `\u001b[2J` + strings.Repeat("A", 64<<10) + `\n[eunox] forged line"`
+}
+
+// TestCorrelateUpstreamReply_HostileIDIsBounded pins that neither id in the mismatch refusal
+// reaches the error text raw: both are peer-chosen, and the text is printed to stderr and, on
+// the stdio bridge, relayed to the host as the JSON-RPC error message.
+func TestCorrelateUpstreamReply_HostileIDIsBounded(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		req, rsp string
+	}{
+		{"hostile upstream response id", `1`, hostileIDJSON()},
+		{"hostile host request id", hostileIDJSON(), `1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := mcp.RPCMsg{JSONRPC: "2.0", Method: "tools/call", ID: mcp.RawJSON(tc.req)}
+			resp := mcp.RPCMsg{JSONRPC: "2.0", ID: mcp.RawJSON(tc.rsp), Result: json.RawMessage(`{}`)}
+			_, err := correlateUpstreamReply(req, resp)
+			require.Error(t, err)
+			msg := err.Error()
+			require.Less(t, len(msg), 3*maxConsoleDetailBytes, "the id must be bounded, not carried to the body cap")
+			require.NotContains(t, msg, "\x1b")
+			require.NotContains(t, msg, "\n")
+		})
+	}
+}
+
+// TestAwaitNonced_DuplicateHostIDIsBounded pins the duplicate-id refusal's text: upstreamErrInfo
+// discards it today, and the bound is what keeps the next consumer that prints it from inheriting
+// a host-controlled string.
+func TestAwaitNonced_DuplicateHostIDIsBounded(t *testing.T) {
+	t.Parallel()
+
+	hostKey := mcp.MsgKey(mcp.RawJSON(hostileIDJSON()))
+	require.Greater(t, len(hostKey), 3*maxConsoleDetailBytes)
+	var mu sync.Mutex
+	var seq uint64
+	hostToUp := map[string]*json.RawMessage{hostKey: mcp.RawJSON(`"x"`)}
+	_, err := awaitNonced(context.Background(), &mu, map[string]chan upstreamResult{}, hostToUp, &seq, nil,
+		hostKey, func(*json.RawMessage) {}, func() error { return nil })
+	require.ErrorIs(t, err, errDuplicateID)
+	msg := err.Error()
+	require.Less(t, len(msg), 3*maxConsoleDetailBytes)
+	require.NotContains(t, msg, "\x1b")
+	require.NotContains(t, msg, "\n")
 }

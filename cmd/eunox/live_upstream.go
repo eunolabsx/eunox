@@ -291,7 +291,7 @@ func readResponseWithID(ctx context.Context, w *mcp.MsgWriter, r *mcp.MsgReader,
 			if mcp.MsgKey(msg.ID) == wantKey {
 				return msg, nil
 			}
-			return mcp.RPCMsg{}, fmt.Errorf("unexpected response id %q (wanted %q)", mcp.MsgKey(msg.ID), wantID)
+			return mcp.RPCMsg{}, fmt.Errorf("unexpected response id %s (wanted %q)", transport.BoundConsoleDetail(mcp.MsgKey(msg.ID)), wantID)
 		}
 		// An unsolicited server-initiated request blocks the upstream until answered;
 		// silently ignoring it would wedge the probe until the deadline.

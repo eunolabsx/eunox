@@ -273,7 +273,14 @@ func correlateUpstreamReply(req, resp mcp.RPCMsg) (mcp.RPCMsg, error) {
 		// content computed for a different call. Previously a mismatched error was
 		// re-stamped with the request id, letting an adversarial upstream inject one
 		// caller's error into another's reply channel.
-		return mcp.RPCMsg{}, fmt.Errorf("upstream response id %s does not match request id %s for %s", mcp.MsgKey(resp.ID), mcp.MsgKey(req.ID), req.Method)
+		//
+		// Both ids are foreign — the reply's is the upstream's to choose and the request's is the
+		// host's, forwarded verbatim — and a string id keys to its decoded text, bounded only by
+		// the body cap and carrying whatever control runes the peer put in it. This error reaches
+		// stderr, a session-create refusal, the drift WARN line, and on the stdio bridge the host
+		// itself as the JSON-RPC error message.
+		return mcp.RPCMsg{}, fmt.Errorf("upstream response id %s does not match request id %s for %s",
+			BoundConsoleDetail(mcp.MsgKey(resp.ID)), BoundConsoleDetail(mcp.MsgKey(req.ID)), req.Method)
 	}
 	// IsResponse() only checks id/method shape, so a reply carrying neither or both of
 	// result/error would otherwise pass through as malformed/empty.

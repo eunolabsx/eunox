@@ -6,6 +6,8 @@ package mcp
 import (
 	"encoding/json"
 	"errors"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -100,5 +102,42 @@ func TestDecodeParams_PreservesNumericPrecision(t *testing.T) {
 	}
 	if got := v.Arguments.N.String(); got != exact {
 		t.Fatalf("decoded n = %s, want %s (precision lost)", got, exact)
+	}
+}
+
+// TestRejectDuplicateJSONKeys_NestingDepthIsCapped pins the walk's depth cap at encoding/json's
+// own: the deepest input Decode accepts still passes, one level past it is ErrParse, and a frame
+// of nothing but opening brackets is refused without a per-byte stack. The default toolchain's
+// Token() already caps depth, so the refusal half only discriminates under
+// GOEXPERIMENT=nojsonv2 — which is the build the cap exists for.
+func TestRejectDuplicateJSONKeys_NestingDepthIsCapped(t *testing.T) {
+	nested := func(depth int) json.RawMessage {
+		return json.RawMessage(strings.Repeat("[", depth) + strings.Repeat("]", depth))
+	}
+
+	var v interface{}
+	if err := DecodeParams(nested(10000), &v); err != nil {
+		t.Fatalf("depth 10000 is accepted by encoding/json and must pass the walk too: %v", err)
+	}
+	if err := rejectDuplicateJSONKeys(nested(10001)); !errors.Is(err, ErrParse) {
+		t.Fatalf("depth 10001: got %v, want ErrParse", err)
+	}
+	if err := rejectDuplicateJSONKeys(json.RawMessage(strings.Repeat(`{"a":`, 10001) + "1" + strings.Repeat("}", 10001))); !errors.Is(err, ErrParse) {
+		t.Fatalf("object depth 10001: got %v, want ErrParse", err)
+	}
+
+	// Serial rather than parallel so TotalAlloc is this walk's alone. Uncapped, the walk built
+	// one stack frame per byte, some 25x the body; capped, it stops at the cap.
+	body := json.RawMessage(strings.Repeat("[", 4<<20))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	err := rejectDuplicateJSONKeys(body)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrParse) {
+		t.Fatalf("4 MiB of '[': got %v, want ErrParse", err)
+	}
+	if got := after.TotalAlloc - before.TotalAlloc; got > 4<<20 {
+		t.Fatalf("walk allocated %d bytes over a %d-byte body; the depth cap should stop it well short", got, len(body))
 	}
 }

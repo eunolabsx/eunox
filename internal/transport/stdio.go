@@ -1712,7 +1712,10 @@ func awaitNonced(
 	// request is in flight. Must not be nil, or a duplicate host ID would be silently admitted.
 	if _, exists := hostToUp[hostKey]; exists {
 		mu.Unlock()
-		return mcp.RPCMsg{}, fmt.Errorf("%w %q: request already pending", errDuplicateID, hostKey)
+		// hostKey is the host's id, bounded only by the frame cap. upstreamErrInfo discards this
+		// text today, which is exactly why it is bounded HERE: the next consumer to print it
+		// would not know it has to.
+		return mcp.RPCMsg{}, fmt.Errorf("%w %s: request already pending", errDuplicateID, BoundConsoleDetail(hostKey))
 	}
 	*seq++
 	upID, upKey := upstreamNonceID(*seq)

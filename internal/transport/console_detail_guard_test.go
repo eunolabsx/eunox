@@ -160,6 +160,80 @@ func TestConsoleDetail_EveryNetworkBodyIsBounded(t *testing.T) {
 	require.NotZero(t, found, "the walk found no response bodies reaching a printer at all; it is asserting nothing")
 }
 
+// TestConsoleDetail_EveryMessageKeyIsBounded walks for a JSON-RPC id's correlation key
+// (`mcp.MsgKey(...)`) reaching a formatting call, and requires it to pass through
+// BoundConsoleDetail.
+//
+// The third shape, and like the second it was found at a site rather than foreseen: a string id
+// keys to its DECODED text, so MsgKey hands back whatever the peer spelled — up to the frame cap,
+// control runes and newlines included — under a name that reads like an internal identifier. The
+// upstream response-id mismatch printed two of them raw while the SSE correlator one file over
+// already bounded the same value.
+//
+// Same residual as its siblings: a key bound to a local first and formatted later (the stdio
+// duplicate-id refusal's `hostKey`) is invisible here and is bounded at its site by hand.
+func TestConsoleDetail_EveryMessageKeyIsBounded(t *testing.T) {
+	t.Parallel()
+
+	found := 0
+	for _, dir := range consoleDetailGuardedDirs {
+		for _, src := range packageSourcesIn(t, dir) {
+			ast.Inspect(src.file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || !isFormattingCall(call) {
+					return true
+				}
+				for _, arg := range call.Args {
+					ast.Inspect(arg, func(n ast.Node) bool {
+						inner, ok := n.(*ast.CallExpr)
+						if !ok {
+							return true
+						}
+						if isBoundConsoleDetailCall(inner) {
+							if containsMsgKeyCall(inner) {
+								found++
+							}
+							return false
+						}
+						if isMsgKeyCall(inner) {
+							found++
+							require.Failf(t, "unbounded message key",
+								"%s: %s formats a JSON-RPC id's correlation key; wrap it in BoundConsoleDetail so the peer that chose the id cannot drive the operator's console",
+								src.fset.Position(inner.Pos()), types.ExprString(call.Fun))
+						}
+						return true
+					})
+				}
+				return true
+			})
+		}
+	}
+	require.NotZero(t, found, "the walk found no message keys reaching a printer at all; it is asserting nothing")
+}
+
+// isMsgKeyCall reports whether call is MsgKey(...), package-qualified or not.
+func isMsgKeyCall(call *ast.CallExpr) bool {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name == "MsgKey"
+	case *ast.SelectorExpr:
+		return fn.Sel.Name == "MsgKey"
+	}
+	return false
+}
+
+// containsMsgKeyCall reports whether a MsgKey call appears anywhere under n.
+func containsMsgKeyCall(n ast.Node) bool {
+	hit := false
+	ast.Inspect(n, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && isMsgKeyCall(call) {
+			hit = true
+		}
+		return !hit
+	})
+	return hit
+}
+
 // bodyBinding is one assignment of a name inside a function, and whether the value bound was a
 // wholesale read of a peer's response body.
 type bodyBinding struct {

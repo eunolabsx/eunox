@@ -379,6 +379,7 @@ func DecodeParams(raw json.RawMessage, v interface{}) error {
 // forwarded bytes decoded by an upstream whose binding shape this proxy does not
 // control.
 func rejectDuplicateJSONKeys(raw json.RawMessage) error {
+	const maxJSONNestingDepth = 10000
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -422,6 +423,17 @@ func rejectDuplicateJSONKeys(raw json.RawMessage) error {
 			case '}', ']':
 				stack = stack[:len(stack)-1]
 				markValueDone() // the composite just closed is a value in its parent
+			}
+			// Whether Token() bounds nesting is a property of which encoding/json is linked: the
+			// v2-backed one the pinned toolchain builds by default refuses past 10000, and the
+			// legacy one (GOEXPERIMENT=nojsonv2) enforces no limit at all, so a frame of nothing
+			// but `[[[[` grew this stack to one entry per byte — several times the frame's own
+			// size in live heap, per message, before the walk reached EOF. Held here so the
+			// bound is this walk's rather than a build flag's. The cap is encoding/json's own,
+			// so the Decode behind this walk refuses everything it refuses and it changes no
+			// accepted input.
+			if len(stack) > maxJSONNestingDepth {
+				return fmt.Errorf("%w: exceeded max nesting depth %d", ErrParse, maxJSONNestingDepth)
 			}
 		case string:
 			if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].expectKey {

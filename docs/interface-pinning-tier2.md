@@ -81,12 +81,17 @@ Tier-2 closes the two gaps `descriptionHash` leaves:
   or later. Not merely those already baselined, which on a session's *first* listing is
   none of them — that reading broke nothing at all and left the same response's remaining
   entries callable.
-- **The baseline is bounded.** A session pins at most 100,000 distinct tool names. Tier-2
-  pins every advertised tool and keeps a removed one's baseline, so the set is
-  upstream-driven; past the bound the session is broken **whole**, with one `ERROR
-  drift=tier2` line. Dropping entries instead would silently *un-pin* tools, and evicting
-  the oldest would let an upstream choose which pin to evict. No real catalog approaches
-  it: an upstream rotating 100k names within one session is itself the anomaly.
+- **The baseline is bounded.** A session pins at most 100,000 distinct tool names, and
+  retains at most 4 MiB of name bytes across its baseline and broken sets — the names are
+  the upstream's to choose at any length, so a count alone let a few huge names per listing
+  pin memory in the shared enforcement point for the session's life. Tier-2 pins every
+  advertised tool and keeps a removed one's baseline, so the set is upstream-driven; past
+  either bound the session is broken **whole**, with one `ERROR drift=tier2` line, and
+  retains no further names. Dropping entries instead would silently *un-pin* tools, and
+  evicting the oldest would let an upstream choose which pin to evict. No real catalog
+  approaches either: an upstream rotating 100k names within one session is itself the
+  anomaly. A tool name in a finding line is escaped and bounded, since it is the
+  upstream's text on the operator's console.
 - **Findings are logged, once each.** Each finding emits one structured stderr line
   (`[eunox] ERROR drift=tier2 tool="..." — ...`), matching the shape `internal/drift`
   emits for FM-1..FM-6 so an operator greps interface findings uniformly. A break is

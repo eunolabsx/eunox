@@ -710,6 +710,79 @@ func TestTier2_BaselineOverflowFailsClosed(t *testing.T) {
 	}
 }
 
+// TestTier2_NameBytesAreBounded pins the byte budget beside the entry cap. Names are the
+// upstream's to choose at any length, so a few huge names per tools/list stayed far below the
+// entry cap while pinning heap for the session's life in the route-shared PDP. Past the budget
+// the session breaks whole, reported once, and stops retaining anything new.
+func TestTier2_NameBytesAreBounded(t *testing.T) {
+	b := NewSurfaceBaseline()
+	huge := func(i int) string { return strconv.Itoa(i) + strings.Repeat("x", 256<<10) }
+
+	var overflows int
+	var findings []SurfaceChange
+	// Twice the budget's worth of names, one listing at a time, the way a list_changed-spamming
+	// upstream delivers them.
+	for i := range 2 * maxSessionSurfaceNameBytes / (256 << 10) {
+		for _, c := range b.Observe("s", []ToolSurface{{Name: huge(i), Hash: "h"}}, false) {
+			findings = append(findings, c)
+			if c.Kind == SurfaceOverflow {
+				overflows++
+			}
+		}
+	}
+	if overflows != 1 {
+		t.Fatalf("the byte budget must trip exactly one overflow finding, got %d", overflows)
+	}
+	if !b.Broken("s", "never-advertised") {
+		t.Fatal("past the byte budget every tool must be broken")
+	}
+
+	// MarkBroken is the other ingestion path, and the one an untrustworthy entry feeds with
+	// every name it could be presenting.
+	b.MarkBroken("s", huge(-1), huge(-2))
+
+	b.mu.RLock()
+	s := b.sessions["s"]
+	retained := 0
+	for name := range s.hashes {
+		retained += len(name)
+	}
+	for name := range s.broken {
+		retained += len(name)
+	}
+	accounted := s.nameBytes
+	b.mu.RUnlock()
+	if retained > maxSessionSurfaceNameBytes {
+		t.Errorf("session retains %d name bytes, want at most %d", retained, maxSessionSurfaceNameBytes)
+	}
+	if retained != accounted {
+		t.Errorf("nameBytes = %d but the maps hold %d name bytes; the budget is charged against the wrong total", accounted, retained)
+	}
+
+	// The finding names the tool that tripped it, which is one of the huge names; the line is
+	// the operator's console and must not carry it whole.
+	for _, c := range findings {
+		if line := c.LogLine(); len(line) > 2*maxLoggedToolNameBytes+512 {
+			t.Errorf("%s finding logged %d bytes; a tool name must be bounded in the line", c.Kind, len(line))
+		}
+	}
+}
+
+// TestTier2_MarkBrokenByteBudgetBreaksWhole pins the budget on the broken set alone, which a
+// session whose every listing is untrustworthy fills without ever baselining a tool.
+func TestTier2_MarkBrokenByteBudgetBreaksWhole(t *testing.T) {
+	b := NewSurfaceBaseline()
+	b.MarkBroken("s", strings.Repeat("a", maxSessionSurfaceNameBytes), "b")
+	if !b.Broken("s", "anything") {
+		t.Fatal("a name that does not fit the budget must break the session whole, not go unrecorded")
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if n := b.sessions["s"].nameBytes; n > maxSessionSurfaceNameBytes {
+		t.Fatalf("nameBytes = %d, past the budget", n)
+	}
+}
+
 // TestTier2_RemovalIsReportedOncePerDisappearance pins the advisory to the transition. A
 // removed tool's baseline is retained on purpose, so without this the finding re-fires on
 // every later listing — steady duplicate WARN noise in the one stream an operator greps

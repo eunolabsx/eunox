@@ -64,9 +64,9 @@ const (
 	// baseline entry is RETAINED (a tool that returns with a rewritten surface still
 	// trips a break), reported once per disappearance.
 	SurfaceRemoved SurfaceChangeKind = "removed"
-	// SurfaceOverflow — the baseline reached maxSessionSurfaceEntries; the whole
-	// session is sticky-broken rather than dropping the entry, which would silently
-	// leave a tool unpinned.
+	// SurfaceOverflow — the baseline reached maxSessionSurfaceEntries or
+	// maxSessionSurfaceNameBytes; the whole session is sticky-broken rather than dropping
+	// the entry, which would silently leave a tool unpinned.
 	SurfaceOverflow SurfaceChangeKind = "overflow"
 )
 
@@ -83,6 +83,21 @@ const (
 // be trusted breaks every name it could be presenting, baselined or not, so fresh names on
 // every response grew that map forever while the one beside it was capped for this threat.
 const maxSessionSurfaceEntries = 100_000
+
+// maxSessionSurfaceNameBytes bounds the tool-name BYTES one session's baseline retains, beside
+// the entry count: the names are the upstream's to choose at any length, so an entry cap alone
+// let a handful of multi-hundred-KiB names per tools/list pin heap for the session's life,
+// entries far below the cap. The state lives in the route-shared ManifestPDP, so in gateway
+// mode that heap is the enforcement point's, not the one session's.
+//
+// Reaching it takes the entry cap's disposition — the whole session sticky-broken — for the
+// entry cap's reason. 4 MiB is 32k names at the 128-byte length MCP recommends; a catalog that
+// needs more is not one this proxy can pin anyway.
+const maxSessionSurfaceNameBytes = 4 << 20
+
+// maxLoggedToolNameBytes bounds a tool name in a Tier-2 finding line. quote escapes what would
+// forge a line; this bounds what would flood one, since the name is the upstream's at any length.
+const maxLoggedToolNameBytes = 256
 
 // SurfaceChange is one Tier-2 finding. Baseline and Observed are the surface hashes
 // either side of the comparison; both are empty for an added/removed finding.
@@ -118,6 +133,11 @@ type sessionSurface struct {
 	// overflowed marks the cap was hit, so the ERROR line emits once per session, not
 	// once per over-cap tool.
 	overflowed bool
+	// nameBytes is what hashes and broken retain in names, charged per insertion into either
+	// (a name in both is two decodes, so two allocations) and held to
+	// maxSessionSurfaceNameBytes. reportedGone and reportedChanged are keyed by names hashes
+	// already holds and are not charged again.
+	nameBytes int
 	// reportedGone holds tools whose disappearance was already reported, so a
 	// vanished tool doesn't log on every later listing; dropped from the set when
 	// seen again, so a second disappearance reports.
@@ -145,18 +165,31 @@ type sessionSurface struct {
 // response feeds this one directly. Widening to allBroken is strictly stronger than any entry
 // it declines to store, so the overflow can only ever over-block.
 //
+// Once the session is broken whole, a per-name entry adds nothing Broken would read, so none is
+// stored — which is also what stops an upstream that has already tripped the break from
+// growing the map through it.
+//
 // Caller must hold the baseline's write lock.
 func (s *sessionSurface) markBroken(name string) (overflowed bool) {
+	if s.allBroken {
+		return false
+	}
 	if _, already := s.broken[name]; already {
 		return false
 	}
-	if len(s.broken) >= maxSessionSurfaceEntries {
-		wasBroken := s.allBroken
+	if !s.retains(len(s.broken), name) {
 		s.allBroken = true
-		return !wasBroken
+		return true
 	}
 	s.broken[name] = struct{}{}
+	s.nameBytes += len(name)
 	return false
+}
+
+// retains reports whether a map already holding held entries may take name without passing
+// either of the session's bounds.
+func (s *sessionSurface) retains(held int, name string) bool {
+	return held < maxSessionSurfaceEntries && s.nameBytes+len(name) <= maxSessionSurfaceNameBytes
 }
 
 // NewSurfaceBaseline creates an empty Tier-2 baseline.
@@ -201,7 +234,15 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 		baseline, known := s.hashes[t.Name]
 		switch {
 		case !known:
-			if len(s.hashes) >= maxSessionSurfaceEntries {
+			if s.allBroken {
+				// Every tool is already denied and hidden, so a new baseline pins nothing
+				// Broken would read — and storing it would keep growing the state the
+				// bounds cap, at the rate of the upstream that tripped them. Tools already
+				// baselined still compare below: BreakAll writes no line, and a genuine
+				// change to one of them is the finding an operator needs.
+				continue
+			}
+			if !s.retains(len(s.hashes), t.Name) {
 				// Fail closed instead of baselining an unbounded set; the tool is
 				// NOT recorded (so the map stops growing) and allBroken is what
 				// keeps that from meaning "unpinned". See maxSessionSurfaceEntries.
@@ -213,6 +254,7 @@ func (b *SurfaceBaseline) Observe(sessionID string, tools []ToolSurface, complet
 				continue
 			}
 			s.hashes[t.Name] = t.Hash
+			s.nameBytes += len(t.Name)
 			if reportMembership {
 				changes = append(changes, SurfaceChange{Tool: t.Name, Kind: SurfaceAdded})
 			}
@@ -367,7 +409,8 @@ func (c SurfaceChange) LogLine() string {
 	case SurfaceOverflow:
 		return "[eunox] ERROR drift=tier2 tool=" + quote(c.Tool) +
 			" — the upstream advertised more than " + strconv.Itoa(maxSessionSurfaceEntries) +
-			" distinct tool names in this session, past the interface-pinning baseline's bound; every tool is now denied and hidden for the rest of this session (an upstream rotating tool names is itself anomalous). Recovery is a new session"
+			" distinct tool names, or more than " + strconv.Itoa(maxSessionSurfaceNameBytes) +
+			" bytes of them, in this session, past the interface-pinning baseline's bound; every tool is now denied and hidden for the rest of this session (an upstream rotating tool names is itself anomalous). Recovery is a new session"
 	default:
 		return "[eunox] WARN drift=tier2 tool=" + quote(c.Tool)
 	}
@@ -377,7 +420,7 @@ func (c SurfaceChange) LogLine() string {
 // quote and a newline could otherwise forge additional log lines on the operator's
 // stderr stream.
 func quote(s string) string {
-	return fmt.Sprintf("%q", s)
+	return fmt.Sprintf("%q", capability.BoundString(s, maxLoggedToolNameBytes))
 }
 
 // surfaceLog is where Tier-2 findings are written. It is a package variable solely so a
