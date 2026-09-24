@@ -70,6 +70,10 @@ type killDimension struct {
 	// replace installs a fresh cache map for this dimension, for the reconcile commit and
 	// Reset. Called under r.mu.
 	replace func(r *Redis, m map[string]bool)
+	// memReplace is replace's in-memory twin, for InMemory's Reset and its zero-value set
+	// creation — both used to name the maps by field, so a dimension added here compiled
+	// while Reset left it in force. Called under m.mu held for writing.
+	memReplace func(m *InMemory, set map[string]bool)
 	// event builds the Revocation an observer is handed for this dimension.
 	event func(id string) Revocation
 	// subject reads this dimension's value out of a Subject, so a check can be written once
@@ -100,6 +104,7 @@ var killDimensions = []killDimension{
 		memCache:     func(m *InMemory) map[string]bool { return m.killedAgents },
 		slot:         func(st *Status) *[]string { return &st.KilledAgents },
 		replace:      func(r *Redis, m map[string]bool) { r.killedAgents = m },
+		memReplace:   func(m *InMemory, set map[string]bool) { m.killedAgents = set },
 		event:        func(id string) Revocation { return Revocation{AgentID: id} },
 		subject:      func(s Subject) string { return s.AgentID },
 	},
@@ -114,6 +119,7 @@ var killDimensions = []killDimension{
 		memCache:     func(m *InMemory) map[string]bool { return m.killedSessions },
 		slot:         func(st *Status) *[]string { return &st.KilledSessions },
 		replace:      func(r *Redis, m map[string]bool) { r.killedSessions = m },
+		memReplace:   func(m *InMemory, set map[string]bool) { m.killedSessions = set },
 		event:        func(id string) Revocation { return Revocation{SessionID: id} },
 		subject:      func(s Subject) string { return s.SessionID },
 	},
@@ -127,6 +133,7 @@ var killDimensions = []killDimension{
 		memCache:     func(m *InMemory) map[string]bool { return m.revokedJTIs },
 		slot:         func(st *Status) *[]string { return &st.RevokedJTIs },
 		replace:      func(r *Redis, m map[string]bool) { r.revokedJTIs = m },
+		memReplace:   func(m *InMemory, set map[string]bool) { m.revokedJTIs = set },
 		event:        func(id string) Revocation { return Revocation{JTI: id} },
 		subject:      func(s Subject) string { return s.JTI },
 	},

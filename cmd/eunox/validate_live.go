@@ -381,8 +381,8 @@ func renderLiveReport(rep liveReport, out io.Writer) int {
 		wln("    release and bump the manifest's 'serverVersion' pin once you have.")
 	}
 	if fm1Count > 0 {
-		wln("  - Glob match: a new live tool fell inside an existing glob (a silent over-permission). Confirm")
-		wln("    it is intended, or tighten the glob / add an explicit entry so the widening is deliberate.")
+		wln("  - Glob match: a live tool is reachable through a glob (a potential silent over-permission). Confirm")
+		wln("    it is intended, or replace the glob with explicit entries; this recurs on every probe until then.")
 	}
 	if fm2Count > 0 {
 		wln("  - Stale entry: a manifest entry matches no live tool (renamed or removed upstream). Delete the")
@@ -479,6 +479,9 @@ func cmdValidate(args []string) int {
 	// predicate cannot drift out of lockstep.
 	upstreamFlagsGiven := *upstreamURL != "" || *authHeader != "" || *tlsSkipVerify || transportSet ||
 		len(stdioCmd) > 0 || *protocolVersion != ""
+	// The refusals below name the same set the predicate reads; spelled once so a flag added
+	// to one cannot go missing from the other message, the omission the predicate once had.
+	const upstreamFlagNames = "--transport / --upstream-url / --upstream-auth-header / --upstream-protocol-version / --upstream-tls-skip-verify / a stdio command ('-- <cmd>')"
 
 	// Mode selection: --config is mutually exclusive with positional manifests
 	// and per-upstream flags — the config carries that wiring.
@@ -488,7 +491,7 @@ func cmdValidate(args []string) int {
 			return 2
 		}
 		if upstreamFlagsGiven {
-			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with --transport / --upstream-url / --upstream-auth-header / --upstream-protocol-version / --upstream-tls-skip-verify / a stdio command; each route's transport and upstream wiring is declared in the config\n")
+			fmt.Fprintf(os.Stderr, "eunox validate: --config cannot be combined with %s; each route's transport and upstream wiring is declared in the config\n", upstreamFlagNames)
 			return 2
 		}
 		cfg, err := config.LoadGatewayConfig(*configPath)
@@ -511,7 +514,7 @@ func cmdValidate(args []string) int {
 	// of them: it was the single exception to that rule, so a typo'd revision validated
 	// clean under both --config and a bare `validate` while selecting nothing.
 	if !*live && upstreamFlagsGiven {
-		fmt.Fprintf(os.Stderr, "eunox validate: --transport / --upstream-url / --upstream-auth-header / --upstream-protocol-version / --upstream-tls-skip-verify and a stdio command ('-- <cmd>') only apply with --live; add --live to drift-check against the upstream\n")
+		fmt.Fprintf(os.Stderr, "eunox validate: %s only apply with --live; add --live to drift-check against the upstream\n", upstreamFlagNames)
 		return 2
 	}
 

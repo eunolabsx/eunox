@@ -499,7 +499,7 @@ func TestPreSessionKillRecords_AreRateLimited(t *testing.T) {
 
 // TestPreSessionAudienceDenials_AreRateLimited is D1's regression: a caller who holds one
 // valid token for a SIBLING route's audience (accepted by the gateway's shared union JWT
-// validator) reaches initAudienceDenial on every session-creating initialize this route
+// validator) reaches creationAudienceDenial on every session-creating initialize this route
 // refuses — no session or upstream ever exists. Before catAudience, that record was written
 // through unbounded, the same audit-queue-flooding primitive the pre-session kill records
 // are bounded against.

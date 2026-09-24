@@ -206,7 +206,7 @@ func TestJWKSCache_NilRequestResponseRefusedClosed(t *testing.T) {
 // TestJWKSCache_GetKeysReturnsIndependentSlice pins that the cache never hands out its
 // live key slice. A caller that truncates, appends to, or reorders the returned set must
 // not disturb concurrent verifications reading the shared cache — the aliasing defense
-// FindKeys documents was bypassable by anyone calling GetKeys/Refresh directly.
+// FindKeys documents was bypassable by anyone calling GetKeys directly.
 func TestJWKSCache_GetKeysReturnsIndependentSlice(t *testing.T) {
 	t.Parallel()
 	const keys = `{"keys":[{"kty":"oct","kid":"a","k":"AAAA"},{"kty":"oct","kid":"b","k":"BBBB"}]}`

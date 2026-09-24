@@ -2807,7 +2807,7 @@ finding is classified `FM-1` through `FM-6` (or `uncovered`):
 Findings are emitted as structured log lines to stderr:
 
 ```
-[eunox] WARN drift=fm1 tool="delete_all_records" resource="delete_*" — new upstream tool matched by manifest glob; verify this is intentional before deploying
+[eunox] WARN drift=fm1 tool="delete_all_records" resource="delete_*" — upstream tool admitted by a manifest glob rather than an exact entry; verify this is intentional before deploying
 [eunox] WARN drift=fm2 resource="query_db" — manifest entry matches no live upstream tool (tool removed or renamed?)
 [eunox] WARN drift=fm3 resource="read_file" tool="read_file" argument="path" — pinned argument not in live inputSchema; the pin may not enforce if the upstream renamed it
 [eunox] WARN drift=fm4 serverVersion="1.4.*" actual="1.5.2" — server version does not satisfy manifest pin; server may have been updated

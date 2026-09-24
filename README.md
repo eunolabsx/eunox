@@ -317,7 +317,7 @@ After the `initialize` handshake — once the live tool list is available — th
 The advisory check never blocks session establishment — warnings are informational and ingestable by log aggregators. Timing differs by transport: the stdio host runs the check inline, before forwarding any traffic, whereas the HTTP transport runs it in the background, so a client that issues a tool call immediately after `initialize` returns may do so before the warning is logged (the call is still policed by the manifest either way). If `tools/list` is unavailable the check is skipped — a single `WARN` records the skip — rather than blocking startup.
 
 ```
-[eunox] WARN drift=fm1 tool="delete_all_records" resource="tool:delete_*" — new upstream tool matched by manifest glob; verify this is intentional before deploying
+[eunox] WARN drift=fm1 tool="delete_all_records" resource="tool:delete_*" — upstream tool admitted by a manifest glob rather than an exact entry; verify this is intentional before deploying
 [eunox] WARN drift=fm2 resource="tool:query_db" — manifest entry matches no live upstream tool (tool removed or renamed?)
 [eunox] WARN drift=fm3 resource="tool:read_file" tool="read_file" argument="path" — pinned argument not in live inputSchema; the pin may not enforce if the upstream renamed it
 [eunox] INFO drift=uncovered tool="summarize_document" — not covered by manifest; no allowlist entry matches it (denied in enforce mode)
