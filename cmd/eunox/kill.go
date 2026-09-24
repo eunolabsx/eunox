@@ -46,6 +46,14 @@ func killControlURL(host string, port int) string {
 	return fmt.Sprintf("http://%s/control/kill", net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
+// killControlClient refuses every redirect. net/http strips only the standard credential
+// headers on a cross-host hop, so X-Eunox-Control-Token (and, through GetBody, the kill body)
+// would follow a 307/308 from whatever holds the loopback port to any host it names. The real
+// endpoint never redirects, so the 3xx surfaces as the non-200 failure it is.
+var killControlClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
 // killUsage is the kill subcommand's help text. Split out of cmdKill because it is a screen
 // of prose in the middle of a control flow that reads as a sequence — parse, resolve a target,
 // pick a transport, execute — and the four kill dimensions made it long enough to bury that.
@@ -298,7 +306,7 @@ func killViaControlEndpoint(host string, port int, controlToken, controlTokenPat
 	}
 	req.Header.Set("Content-Type", transport.CTJSON)
 	req.Header.Set(transport.ControlTokenHeader, tok)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := killControlClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "eunox kill: request failed: %v\n", err)
 		return 1

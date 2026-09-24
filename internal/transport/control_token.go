@@ -209,13 +209,57 @@ func ResolveControlToken(flagToken, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(expanded) //nolint:gosec // G304: path is operator-configured via --control-token-path
+	data, err := readControlTokenFile(expanded)
 	if err != nil {
-		return "", fmt.Errorf("reading control token from %s: %w (start the proxy first, or pass --control-token / EUNOX_CONTROL_TOKEN)", expanded, err)
+		return "", err
 	}
 	tok := strings.TrimSpace(string(data))
 	if tok == "" {
 		return "", fmt.Errorf("control token file %s is empty", expanded)
 	}
 	return tok, nil
+}
+
+// maxControlTokenFileBytes bounds the read: the writer emits one 64-hex-char line, so
+// anything near this size is a misdirected path rather than a token.
+const maxControlTokenFileBytes = 4 << 10
+
+// readControlTokenFile takes all three substitution guards (Lstat refusal, O_NOFOLLOW plus
+// O_NONBLOCK on the open, and the fstat through the handle), because the file is the
+// emergency-stop credential and `eunox kill` sends its contents to the loopback listener: a
+// symlink planted in a shared --control-token-path directory would make the command send an
+// attacker-chosen file's first line, and a FIFO would hang it inside open(2) at exactly the
+// moment it is needed. Unlike an operator-named --config, refusing a non-regular file here
+// breaks no supported spelling: WriteControlTokenFile only ever renames a regular file into
+// place, and a token that lives elsewhere is passed through --control-token or
+// EUNOX_CONTROL_TOKEN instead.
+func readControlTokenFile(path string) ([]byte, error) {
+	const subject = "control token file"
+	if err := config.RefuseNonRegularPath(path, subject); err != nil {
+		return nil, err
+	}
+	return readGuardedControlTokenHandle(path)
+}
+
+// readGuardedControlTokenHandle is the half of readControlTokenFile past the Lstat, split out
+// so a test can reach it with a FIFO the path check would already have refused — the shape a
+// swap between the two syscalls produces.
+func readGuardedControlTokenHandle(path string) ([]byte, error) {
+	const subject = "control token file"
+	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow|config.OpenNonBlock, 0) //nolint:gosec // G304: path is operator-configured via --control-token-path, and guarded on both sides of the open
+	if err != nil {
+		return nil, fmt.Errorf("reading control token from %s: %w (start the proxy first, or pass --control-token / EUNOX_CONTROL_TOKEN)", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := config.RefuseNonRegularHandle(f, subject, path); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxControlTokenFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading control token from %s: %w", path, err)
+	}
+	if len(data) > maxControlTokenFileBytes {
+		return nil, fmt.Errorf("control token file %s is larger than %d bytes; refusing to send its contents as a credential", path, maxControlTokenFileBytes)
+	}
+	return data, nil
 }

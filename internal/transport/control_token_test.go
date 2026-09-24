@@ -462,3 +462,26 @@ func TestWriteControlTokenFile_GenerousDeadlinePublishes(t *testing.T) {
 		t.Errorf("token = %q, want %q", strings.TrimSpace(string(data)), "tok-ok")
 	}
 }
+
+func TestResolveControlToken_OversizeFile_Errors(t *testing.T) {
+	t.Setenv("EUNOX_CONTROL_TOKEN", "")
+	path := filepath.Join(t.TempDir(), "big.token")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), maxControlTokenFileBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveControlToken("", path); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("err = %v, want an over-size refusal", err)
+	}
+}
+
+// TestResolveControlToken_FileAtTheBoundStillReads pins the bound as inclusive.
+func TestResolveControlToken_FileAtTheBoundStillReads(t *testing.T) {
+	t.Setenv("EUNOX_CONTROL_TOKEN", "")
+	path := filepath.Join(t.TempDir(), "edge.token")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), maxControlTokenFileBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveControlToken("", path); err != nil {
+		t.Fatalf("a file exactly at the bound must load: %v", err)
+	}
+}
