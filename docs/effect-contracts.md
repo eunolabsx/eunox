@@ -479,7 +479,9 @@ callers. A receipt is a statement by the upstream about its own behavior — clo
 package signing than to an access token — so tying it to the caller's IdP would let any
 party who can mint a caller token also mint attestations about a server's behavior. The
 file is read once at startup and never fetched, for the same reason the registry is never
-fetched: the check's value is that it is local and unfalsifiable.
+fetched: the check's value is that it is local and unfalsifiable. It must be a regular
+file of at most 1 MiB: a symlink, FIFO or other special file is refused, as is an oversize
+one, since whoever substitutes the file chooses which receipts verify.
 
 Verdicts are a closed vocabulary, recorded under `details.effect_receipt`:
 

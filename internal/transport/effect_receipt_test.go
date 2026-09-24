@@ -260,6 +260,25 @@ func TestEffectReceiptDetailsAreNotMinedAsArguments(t *testing.T) {
 	}
 }
 
+// TestLoadEffectReceiptVerifier_RefusesAnOversizeKeySet pins that a key set past the bound
+// is refused by name rather than truncated: the truncated prefix used to reach the JOSE
+// parser and surface as a malformed-JWKS error, pointing the operator at the wrong repair.
+// A file exactly at the bound is past the size check and fails only as the non-JWKS it is.
+func TestLoadEffectReceiptVerifier_RefusesAnOversizeKeySet(t *testing.T) {
+	dir := t.TempDir()
+
+	over := filepath.Join(dir, "over.json")
+	require.NoError(t, os.WriteFile(over, make([]byte, maxEffectReceiptJWKSBytes+1), 0o600))
+	_, err := LoadEffectReceiptVerifier("", over)
+	require.ErrorContains(t, err, "larger than")
+
+	atLimit := filepath.Join(dir, "at-limit.json")
+	require.NoError(t, os.WriteFile(atLimit, make([]byte, maxEffectReceiptJWKSBytes), 0o600))
+	_, err = LoadEffectReceiptVerifier("", atLimit)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "larger than", "a file exactly at the bound must pass the size check")
+}
+
 // TestLoadEffectReceiptVerifierResolvesAgainstTheConfigDir pins that a relative key path
 // means the same thing however the proxy was launched — the same rule `policy:` follows.
 // Resolving against the process cwd instead either failed startup outright or silently

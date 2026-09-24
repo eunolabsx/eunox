@@ -767,20 +767,15 @@ func LoadEffectReceiptVerifier(baseDir, path string) (*capability.EffectReceiptV
 	if err != nil {
 		return nil, fmt.Errorf("resolving effectReceiptKeys path: %w", err)
 	}
-	// Same symlink and regular-file discipline every operator-supplied key path in the
-	// binary gets: a key set is a trust anchor, so following a symlink to one is how a
-	// local attacker substitutes it.
-	if err := config.RefuseNonRegularPath(resolved, "effect-receipt key set"); err != nil {
+	// A key set is a trust anchor, so following a symlink to one is how a local attacker
+	// substitutes it. The Lstat refusal gives the actionable error; the open below closes
+	// the window after it.
+	if err := config.RefuseNonRegularPath(resolved, effectReceiptKeysSubject); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(resolved, os.O_RDONLY|config.OpenNoFollow, 0) //nolint:gosec // G304: operator-configured key-set path, guarded above
+	data, err := readGuardedEffectReceiptKeys(resolved)
 	if err != nil {
-		return nil, fmt.Errorf("opening effectReceiptKeys %q: %w", resolved, err)
-	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, maxEffectReceiptJWKSBytes))
-	if err != nil {
-		return nil, fmt.Errorf("reading effectReceiptKeys %q: %w", resolved, err)
+		return nil, err
 	}
 	v, err := capability.NewEffectReceiptVerifier(data, capability.DefaultReceiptMaxAge, capability.DefaultReceiptLeeway)
 	if err != nil {
@@ -789,7 +784,41 @@ func LoadEffectReceiptVerifier(baseDir, path string) (*capability.EffectReceiptV
 	return v, nil
 }
 
+const effectReceiptKeysSubject = "effect-receipt key set"
+
+// readGuardedEffectReceiptKeys is the half of LoadEffectReceiptVerifier past the Lstat, split
+// out so a test can reach it with a FIFO the path check would already have refused — the
+// shape a swap between the two syscalls produces.
+//
+// It takes the same three substitution guards the audit key file does, for the same reason:
+// whoever chooses this file chooses which receipts verify. O_NOFOLLOW refuses a symlink
+// swapped in after the Lstat; O_NONBLOCK keeps a swapped-in FIFO from blocking INSIDE
+// open(2), which would wedge BuildRoutes before any transport stands with no diagnostic and
+// no later check reached; and the fstat through the handle refuses whatever non-regular
+// object the flags still let open (a FIFO another process holds open opens fine under
+// both). Refusing a non-regular file breaks no supported spelling, since the Lstat above
+// already refuses one by name.
+func readGuardedEffectReceiptKeys(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|config.OpenNoFollow|config.OpenNonBlock, 0) //nolint:gosec // G304: operator-configured key-set path, guarded on both sides of the open
+	if err != nil {
+		return nil, fmt.Errorf("opening effectReceiptKeys %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := config.RefuseNonRegularHandle(f, effectReceiptKeysSubject, path); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxEffectReceiptJWKSBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading effectReceiptKeys %q: %w", path, err)
+	}
+	if len(data) > maxEffectReceiptJWKSBytes {
+		return nil, fmt.Errorf("effectReceiptKeys %q is larger than %d bytes; refusing a truncated read of a trust anchor, which would surface as a misleading JWKS parse error", path, maxEffectReceiptJWKSBytes)
+	}
+	return data, nil
+}
+
 // maxEffectReceiptJWKSBytes bounds the key document read: a JWKS with a few dozen keys is
-// a handful of kilobytes, so a mistyped path pointing at something enormous fails as a
-// parse error rather than a startup that reads a gigabyte first.
+// a handful of kilobytes, so a mistyped path pointing at something enormous is refused
+// rather than a startup that reads a gigabyte first. Inclusive: a file exactly this size
+// still loads.
 const maxEffectReceiptJWKSBytes = 1 << 20
